@@ -482,6 +482,7 @@ fn inject_member_blocks(
                 scope: scope_id,
                 return_type: None,
                 deref_stack: Vec::new(),
+                attributes: Vec::new(),
             });
             // The role member emits the SAME `TypeName` edge the expanded field
             // did — the emission site moved, the edge is canonical (slice 2's
@@ -592,6 +593,7 @@ fn remap_spans(
         moved_from,
         domain_sites,
         macro_returns: _,
+        specializations: _,
     } = skel;
 
     for s in symbols.iter_mut() {
@@ -607,6 +609,7 @@ fn remap_spans(
             scope: _,
             return_type: _,
             deref_stack: _,
+            attributes: _,
         } = s;
         *start = r(*start);
         *end = r(*end);

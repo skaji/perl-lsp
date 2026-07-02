@@ -1805,9 +1805,17 @@ fn render_symbol_hover(
                         .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx))
                 })
                 .unwrap_or_else(|| sym.display_type(&ty));
+            // A union member's def-site hover carries the storage overlay,
+            // same as the member-access path (`FileAnalysis::member_hover`).
+            let overlay = match analysis.union_overlay(sym) {
+                Some(sibs) if !sibs.is_empty() => {
+                    format!(" — union member (overlays {})", sibs.join(", "))
+                }
+                _ => String::new(),
+            };
             return format!(
-                "```{}\n{}: {}\n```\n\n*variable*",
-                language, sym.name, display
+                "```{}\n{}: {}{}\n```\n\n*variable*",
+                language, sym.name, display, overlay
             );
         }
     }

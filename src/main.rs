@@ -1212,25 +1212,33 @@ fn run_one(
             // an enum TYPE's def fans out to the field-slot sites whose
             // recovered domain is that enum. Pack routing — the sites live
             // in pack-language files the Perl hub doesn't know.
-            {
-                let reg = language_driver::LanguageRegistry::with_enabled();
-                let pack = reg
-                    .for_path(std::path::Path::new(file))
-                    .map(|d| d.id())
-                    .filter(|id| *id != "perl")
-                    .and_then(|lang| idx.pack_index(lang));
-                if let Some(pidx) = pack.as_deref() {
-                    for (path, span) in symbols::domain_backrefs(&analysis, point, pidx) {
-                        let ps = path.display().to_string();
-                        let (line, col) = sources.display(&ps, span.start.row, span.start.column);
-                        results.push(serde_json::json!({"file": ps, "line": line, "col": col}));
-                    }
+            let reg = language_driver::LanguageRegistry::with_enabled();
+            let pack = reg
+                .for_path(std::path::Path::new(file))
+                .map(|d| d.id())
+                .filter(|id| *id != "perl")
+                .and_then(|lang| idx.pack_index(lang));
+            if let Some(pidx) = pack.as_deref() {
+                for (path, span) in symbols::domain_backrefs(&analysis, point, pidx) {
+                    let ps = path.display().to_string();
+                    let (line, col) = sources.display(&ps, span.start.row, span.start.column);
+                    results.push(serde_json::json!({"file": ps, "line": line, "col": col}));
                 }
             }
+            // Same pack routing + include-closure scope as the LSP handler,
+            // so the CLI mirror can't diverge (pack targets — spec families —
+            // resolve against the pack index, not the Perl hub).
+            let base_idx: &dyn file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => idx,
+            };
+            let self_path = std::fs::canonicalize(file).ok();
+            let scoped = file_analysis::ScopedLookup::new(
+                base_idx, &analysis.include_closure, self_path.as_deref());
             if let Some(resolve::ResolvedTarget::Target(t)) =
-                resolve::resolve_symbol(&analysis, point, Some(idx))
+                resolve::resolve_symbol(&analysis, point, Some(&scoped))
             {
-                for loc in resolve::implementations_of(&analysis, Some(idx), &t) {
+                for loc in resolve::implementations_of(&analysis, Some(&scoped), &t) {
                     let path = match &loc.key {
                         file_store::FileKey::Path(p) => p.display().to_string(),
                         file_store::FileKey::Url(u) => u.to_file_path()
@@ -1441,6 +1449,12 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
         // signal the outline carries beyond name/kind/line/col.
         if let Some(ref pkg) = sym.package {
             entry["package"] = serde_json::json!(pkg);
+        }
+        // Union members nest under their container in the LSP outline tree;
+        // this flat view carries the container explicitly (`package` stays
+        // the class — that's the completion/refs identity).
+        if let Some(container) = analysis.union_container_of(sym) {
+            entry["container"] = serde_json::json!(container.name);
         }
         if let file_analysis::SymbolDetail::Sub { ref params, is_method, ref display, .. } = sym.detail {
             if params.iter().any(|p| !p.is_invocant) {

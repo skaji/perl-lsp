@@ -4251,3 +4251,46 @@ mod pack_symmetry {
         );
     }
 }
+
+/// The specialization FAMILY view: `--implementations` on a primary
+/// template's class name enumerates every spec's def site, cross-file,
+/// via the `Specializes` edge — while gr on the primary stays "uses of
+/// the primary" (the spec def sites are Class symbols, not PackageRefs).
+#[test]
+fn test_implementations_on_primary_enumerates_specialization_family() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let cpp = |src: &str| {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        crate::query_extract::extract(&tree, src.as_bytes(), &crate::query_extract::cpp_pack())
+            .unwrap()
+            .into_file_analysis()
+    };
+    let primary_src = "template <typename T, typename C> struct formatter { int parse(int c); };\n";
+    let specs_src = "template <> struct formatter<int, char> { int f1(); };\n\
+                     template <typename T> struct formatter<T*, char> { int f2(); };\n";
+    let origin = cpp(primary_src);
+    let idx = ModuleIndex::new_for_test();
+    idx.register_symbols(PathBuf::from("/fake/base.h"), Arc::new(cpp(primary_src)));
+    idx.register_symbols(PathBuf::from("/fake/format.h"), Arc::new(cpp(specs_src)));
+
+    let target = TargetRef::new("formatter".to_string(), TargetKind::Package);
+    let results = implementations_of(&origin, Some(&idx), &target);
+    let files: Vec<String> = results
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.display().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["/fake/format.h", "/fake/format.h"],
+        "both specs' def sites, from the OTHER file: {results:?}"
+    );
+    // never rewritable — the spec's selection span is the whole spelling
+    assert!(results.iter().all(|r| !r.rewritable));
+}

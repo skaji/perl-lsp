@@ -1706,3 +1706,242 @@ int d(struct crate* c) { return c->kind == 7; }
     );
     assert_eq!(fa.field_domain("crate", "kind", None), None, "no cross-struct pooling");
 }
+
+// ---- C++ template extraction hygiene (specializations, instantiations,
+// out-of-line members, aliases, concepts, unions) ----
+
+fn cpp_fa(src: &str) -> crate::file_analysis::FileAnalysis {
+    let mut parser = cpp_parser();
+    let tree = parser.parse(src, None).unwrap();
+    extract(&tree, src.as_bytes(), &cpp_pack())
+        .unwrap()
+        .into_file_analysis()
+}
+
+#[test]
+fn canonical_template_spelling_normalizes_whitespace() {
+    assert_eq!(canonical_template_spelling("formatter"), "formatter");
+    assert_eq!(canonical_template_spelling("formatter<int,char>"), "formatter<int, char>");
+    assert_eq!(
+        canonical_template_spelling("formatter< int ,\n  char >"),
+        "formatter<int, char>"
+    );
+    assert_eq!(canonical_template_spelling("Buf<T *>"), "Buf<T*>");
+    // a load-bearing space between word tokens survives
+    assert_eq!(
+        canonical_template_spelling("Buf<unsigned long>"),
+        "Buf<unsigned long>"
+    );
+    assert_eq!(canonical_template_spelling("Buf< Buf<int> >"), "Buf<Buf<int>>");
+}
+
+#[test]
+fn cpp_class_specialization_mints_per_spec_class_with_owned_members() {
+    let fa = cpp_fa(
+        r#"
+template <typename T, typename Char> struct formatter { int parse(int ctx); };
+template <> struct formatter<int, char> { int fmt_full(); };
+template <typename T> struct formatter<T*, char> { int fmt_partial(); };
+"#,
+    );
+    let class = |n: &str| {
+        fa.symbols
+            .iter()
+            .find(|s| s.name == n && matches!(s.kind, crate::file_analysis::SymKind::Class))
+    };
+    assert!(class("formatter").is_some(), "primary still extracts");
+    assert!(class("formatter<int, char>").is_some(), "full spec is its own Class");
+    assert!(class("formatter<T*, char>").is_some(), "partial spec is its own Class");
+    // members are OWNED by the spec (package = the canonical spec name)
+    let member = |n: &str| fa.symbols.iter().find(|s| s.name == n).unwrap();
+    assert_eq!(member("fmt_full").package.as_deref(), Some("formatter<int, char>"));
+    assert_eq!(member("fmt_partial").package.as_deref(), Some("formatter<T*, char>"));
+    assert_eq!(member("parse").package.as_deref(), Some("formatter"));
+    // the family edges (spec → primary), NEVER package_parents
+    assert_eq!(fa.specializes.get("formatter<int, char>").map(String::as_str), Some("formatter"));
+    assert_eq!(fa.specializes.get("formatter<T*, char>").map(String::as_str), Some("formatter"));
+    assert!(
+        !fa.package_parents.contains_key("formatter<int, char>"),
+        "specialization is not inheritance — member resolution must not fall through"
+    );
+}
+
+#[test]
+fn cpp_out_of_line_template_member_joins_base_class() {
+    let fa = cpp_fa(
+        r#"
+template <typename T> struct Buf { void grow(int n); };
+template <typename T> void Buf<T>::grow(int n) { int local_g = n; }
+"#,
+    );
+    let grows: Vec<_> = fa.symbols.iter().filter(|s| s.name == "grow").collect();
+    assert_eq!(grows.len(), 2, "in-class decl + out-of-line def");
+    for g in &grows {
+        assert_eq!(
+            g.package.as_deref(),
+            Some("Buf"),
+            "the template qualifier peels to the base class — decl and def unify"
+        );
+    }
+}
+
+#[test]
+fn cpp_explicit_instantiation_outline_entry_and_no_param_leak() {
+    let fa = cpp_fa(
+        r#"
+template <typename T> struct Buf { void grow(int n); };
+template struct Buf<int>;
+template void Buf<float>::grow(int n2);
+template auto thousands_sep_impl(int loc) -> int;
+"#,
+    );
+    use crate::file_analysis::SymKind;
+    // enumerable outline items (fork 2): class + method + function forms
+    assert!(fa
+        .symbols
+        .iter()
+        .any(|s| s.name == "Buf<int>" && matches!(s.kind, SymKind::Class)));
+    assert!(fa
+        .symbols
+        .iter()
+        .any(|s| s.name == "grow"
+            && matches!(s.kind, SymKind::Method)
+            && s.package.as_deref() == Some("Buf")));
+    assert!(fa
+        .symbols
+        .iter()
+        .any(|s| s.name == "thousands_sep_impl" && matches!(s.kind, SymKind::Sub)));
+    // an instantiation is NOT a specialization — no family edge
+    assert!(!fa.specializes.contains_key("Buf<int>"));
+    // signature params live in a sub-body scope, out of the outline
+    for leak in ["n2", "loc"] {
+        let sym = fa.symbols.iter().find(|s| s.name == leak).unwrap();
+        assert!(
+            fa.scope_within_sub_body(sym.scope),
+            "{leak} must not float to the outline"
+        );
+    }
+}
+
+#[test]
+fn cpp_function_scopes_shield_params_and_locals_from_outline() {
+    let fa = cpp_fa(
+        r#"
+struct Point { int x; int y; };
+int compute(int a) { int b = a; return b; }
+struct W { int parse(int ctx); };
+"#,
+    );
+    for local in ["a", "b", "ctx"] {
+        let sym = fa.symbols.iter().find(|s| s.name == local).unwrap();
+        assert!(
+            fa.scope_within_sub_body(sym.scope),
+            "{local} is sub-body content"
+        );
+    }
+    // fields still surface (class-body scope is NOT a sub body)
+    for field in ["x", "y"] {
+        let sym = fa.symbols.iter().find(|s| s.name == field).unwrap();
+        assert!(!fa.scope_within_sub_body(sym.scope));
+        assert!(fa.symbol_is_class_content(sym), "{field} is class content");
+    }
+    // a method-body local never reads as class content, and a prototype
+    // param (sticky class package) doesn't either
+    let ctx = fa.symbols.iter().find(|s| s.name == "ctx").unwrap();
+    assert!(!fa.symbol_is_class_content(ctx));
+}
+
+#[test]
+fn cpp_using_alias_and_concept_mint_symbols() {
+    let fa = cpp_fa(
+        r#"
+using byte_alias = unsigned char;
+template <typename T> struct Buf { int n; };
+template <typename T> using vec_alias = Buf<T>;
+template <typename T> concept Addable = requires(T a) { a + a; };
+"#,
+    );
+    use crate::file_analysis::SymKind;
+    for name in ["byte_alias", "vec_alias", "Addable"] {
+        assert!(
+            fa.symbols
+                .iter()
+                .any(|s| s.name == name && matches!(s.kind, SymKind::Class)),
+            "{name} should be a findable type symbol"
+        );
+    }
+    // requires-expr params stop leaking to top level
+    let a = fa.symbols.iter().find(|s| s.name == "a").unwrap();
+    assert!(fa.scope_within_sub_body(a.scope));
+}
+
+#[test]
+fn cpp_template_base_inheritance_edges() {
+    let fa = cpp_fa(
+        r#"
+template <typename T> struct base { int common; };
+template <typename T> struct D : base<T> { int own; };
+"#,
+    );
+    let parents = fa.package_parents.get("D").expect("D records parents");
+    assert!(
+        parents.iter().any(|p| p == "base"),
+        "the bare base name joins the primary; got {parents:?}"
+    );
+    assert!(
+        parents.iter().any(|p| p == "base<T>"),
+        "the canonical spelling rides along for per-spec joins; got {parents:?}"
+    );
+}
+
+#[test]
+fn cpp_union_members_nest_and_overlay() {
+    let fa = cpp_fa(
+        r#"
+struct pm {
+  int op_first;
+  union {
+    long op_pmreplroot;
+    void* op_pmtargetgv;
+  };
+  union {
+    long u2a;
+    char u2b;
+  } named_u;
+};
+typedef union {
+  int any_i32;
+  long any_iv;
+} ANY;
+"#,
+    );
+    use crate::file_analysis::SymKind;
+    let sym = |n: &str| fa.symbols.iter().find(|s| s.name == n).unwrap();
+    // containers carry the union attribute; the anonymous one is synthetic
+    let anon = sym("(union)");
+    assert!(anon.attributes.iter().any(|a| a == "union"));
+    assert!(anon.attributes.iter().any(|a| a == "anonymous"));
+    let named = sym("named_u");
+    assert!(named.attributes.iter().any(|a| a == "union"));
+    assert!(matches!(sym("ANY").kind, SymKind::Class));
+    assert!(sym("ANY").attributes.iter().any(|a| a == "union"));
+    // members keep the STRUCT as package (flat completion/refs identity) …
+    assert_eq!(sym("op_pmreplroot").package.as_deref(), Some("pm"));
+    assert_eq!(sym("u2a").package.as_deref(), Some("pm"));
+    // … but nest under their container structurally
+    assert_eq!(fa.union_container_of(sym("op_pmreplroot")).unwrap().name, "(union)");
+    assert_eq!(fa.union_container_of(sym("u2b")).unwrap().name, "named_u");
+    assert_eq!(fa.union_container_of(sym("any_i32")).unwrap().name, "ANY");
+    assert!(fa.union_container_of(sym("op_first")).is_none());
+    // the overlay = the sibling group
+    let overlay = fa.union_overlay(sym("op_pmreplroot")).unwrap();
+    assert_eq!(overlay.len(), 1);
+    assert!(overlay[0].starts_with("op_pmtargetgv"), "{overlay:?}");
+    // completion: real members offered flat on pm; the synthetic container never
+    let cands = fa.complete_members_for_class("pm", None);
+    let labels: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
+    for want in ["op_first", "op_pmreplroot", "op_pmtargetgv", "u2a", "named_u"] {
+        assert!(labels.contains(&want), "{want} missing from {labels:?}");
+    }
+    assert!(!labels.contains(&"(union)"), "synthetic container leaked: {labels:?}");
+}

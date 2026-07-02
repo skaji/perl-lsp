@@ -38,19 +38,27 @@ pub enum EdgeKind {
     /// class → modules whose plugin namespaces bridge to it. Module
     /// nodes are terminal — bridge edges don't compose.
     Bridges,
+    /// primary template → its specializations (the family view:
+    /// goto-implementation enumerates them). NOT an inheritance edge —
+    /// a specialization REPLACES the primary's member table wholesale,
+    /// so member resolution must NEVER traverse this (a spec that also
+    /// really inherits carries a separate `Inherits` edge).
+    Specializes,
 }
 
 impl EdgeKind {
     /// Every variant. New kinds MUST be added here — the `edges_from`
     /// loop iterates it, so a forgotten kind is never traversed (and
     /// its `flag()` arm + match arm are compile errors meanwhile).
-    pub const ALL: [EdgeKind; 3] = [Self::Inherits, Self::InheritsInv, Self::Bridges];
+    pub const ALL: [EdgeKind; 4] =
+        [Self::Inherits, Self::InheritsInv, Self::Bridges, Self::Specializes];
 
     fn flag(self) -> EdgeKindMask {
         match self {
             EdgeKind::Inherits => EdgeKindMask::INHERITS,
             EdgeKind::InheritsInv => EdgeKindMask::INHERITS_INV,
             EdgeKind::Bridges => EdgeKindMask::BRIDGES,
+            EdgeKind::Specializes => EdgeKindMask::SPECIALIZES,
         }
     }
 }
@@ -64,6 +72,7 @@ bitflags::bitflags! {
         const INHERITS     = 1 << 0;
         const INHERITS_INV = 1 << 1;
         const BRIDGES      = 1 << 2;
+        const SPECIALIZES  = 1 << 3;
     }
 }
 
@@ -170,6 +179,26 @@ impl<'a> GraphView<'a> {
                                 out.push(Node::Module(module.to_string()));
                             }
                         });
+                    }
+                }
+                EdgeKind::Specializes => {
+                    // Local specs: this file's (spec → primary) map, inverted.
+                    // Deterministic order — HashMap iteration is randomized.
+                    let mut local: Vec<&String> = self
+                        .fa
+                        .specializes
+                        .iter()
+                        .filter(|(_, primary)| primary.as_str() == class)
+                        .map(|(spec, _)| spec)
+                        .collect();
+                    local.sort();
+                    for spec in local {
+                        out.push(Node::Class(spec.clone()));
+                    }
+                    if let Some(idx) = self.idx {
+                        for (spec, _module) in idx.direct_specializations_of(class) {
+                            out.push(Node::Class(spec));
+                        }
                     }
                 }
             }

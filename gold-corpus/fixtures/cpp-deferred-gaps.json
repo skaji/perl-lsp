@@ -2,12 +2,24 @@
   "capability": "outline",
   "rows": [
     {
-      "id": "cpp-xfail-concept-symbol",
-      "difficulty": "hard", "semantic_area": "cpp-multilang-modern",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
-      "file": "concept.cpp", "line": 0, "col": 0,
-      "expect": { "all": ["\"name\":\"Sortable\""], "none": [] },
-      "status": "xfail"
+      "id": "cpp-concept-symbol",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-modern",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "concept.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"name\":\"Sortable\""
+        ],
+        "none": [
+          "\"name\":\"a\"",
+          "\"name\":\"b\""
+        ]
+      },
+      "status": "gold"
     }
   ]
 }
