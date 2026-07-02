@@ -1,11 +1,13 @@
 # ADR: The resolution CandidateSet — one semantic core, features as projections
 
-Status: accepted (design). Implementation targets **main first** (see Landing
-strategy). Motivated by a recurring bug *class* on `spike/cpp-support`.
+Status: accepted; core landed on main (`resolve.rs::CandidateSet`).
+Originally motivated by a recurring bug *class* on `spike/cpp-support`; the
+seam is main-first and the spike's axes merge onto it.
 
 ## Context: the recurring asymmetry disease
 
-Five instances of the same bug wearing different costumes:
+Five instances of the same bug wearing different costumes (verified on the
+spike):
 
 1. gd resolved kinds that gr couldn't mirror (the refs-symmetry audit's whole
    matrix: macros, enum variants, members, globals, typedefs).
@@ -45,57 +47,153 @@ cross-cutting axes remained per-feature.
 
 ## Decision
 
-One semantic core: **`resolve(from_context, name_or_position) →
+One semantic core: **`resolve(files, origin, key, point, index, scope) →
 CandidateSet`** — the canonical answer to "what does this name mean, from
-here." The CandidateSet carries, computed ONCE, inside:
+here." The CandidateSet owns, computed once at the set level:
 
-- **candidates** — every def site (never pruned; multi-def is normal:
-  macro variants, specializations, decl+def),
-- **visibility** — closure/import/language gating applied at construction
-  (not decorated at entry points),
-- **edges** — delegation, `specializes`, family/inheritance relations the
-  walk may traverse (each consumer *declares* which edge kinds it follows),
-- **ranking** — reachability/specificity/proximity, total-ordered,
-  deterministic.
+- **identity** — what the cursor resolves to (`resolve_symbol_scoped`'s
+  Target / Group / Local verdict), minted exactly once,
+- **visibility** — the RoleMask verdict (`references_mask_for`) memoized on
+  the set, with a construction-time override (`with_visibility`) that every
+  projection inherits — the plug point for future axes (closure/import
+  gating, language boundaries), never an entry-point decorator,
+- **edges** — the override family / dispatch chain on `TargetRef.method_classes`,
+  group members with per-member rename rules, and the descendants walk
+  (`implementations_of` over `GraphView`); each projection declares which
+  edges it follows,
+- **per-site policy** — `RefLocation.rewritable`, `MemberRename` texts:
+  policy rides the candidates, handlers never re-derive it.
 
 Every feature is a **projection** of the same CandidateSet:
 
 | feature | projection |
 |---|---|
-| goto-def | forward-best; ranked multi-location (never prune) |
-| references | the backward image of the same set |
-| rename | references + rewritability policy (full edit or REFUSE — partial is unrepresentable) |
-| completion | prefix-enumeration of the same visible universe |
-| implementations | the family-edge walk over the same set |
-| hover | the top candidate's presentation (provenance chain intact) |
+| references | `references()` — the backward image of the set |
+| rename | `rename_edits(new)` — references + rewritability policy; an edit outside the references image is unrepresentable |
+| prepareRename | `renameable()` — mirrors `rename_edits`' arms |
+| implementations | `implementations()` — the family/descendants walk |
+| goto-def | `definitions()` — forward-best projection |
+| completion gathering | `complete(prefix, import_slot)` — prefix-enumeration of the visible identifier universe (Perl: in-scope + explicit imports on OPEN, export surfaces + auto-import firehose on DEPENDENCY; pack: the origin's include-closure universe); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `import_slot` is the slot's import affordance: `false` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code); candidates carry `ImportFact`, the adapter composes the edit |
+| hover | (future) the top candidate's presentation |
 
 Symmetry becomes **by construction**: an axis added to CandidateSet
-construction is inherited by every projection. C1 ("gd gated, gr not") and
-C2 ("rename edits a subset of refs") become unrepresentable states.
-The audit's gold *pairs* remain as the verification net — pairs verify,
-the seam prevents.
+construction is inherited by every projection — the test
+`candidate_set_visibility_axis_flows_to_every_projection` demonstrates the
+one-knob property, asserting references, rename, AND completion gathering
+narrow together. C1 ("gd gated, gr not") and C2 ("rename edits a subset
+of refs") become unrepresentable states, and disease #2's class
+("resolution cross-file, completion gathering same-file") is closed: the
+identifier candidates come from the same masked universe the navigation
+verbs walk. The audit's gold *pairs* remain as the verification net —
+pairs verify, the seam prevents.
 
-## Landing strategy: main first, spike rebases onto it
+## Completion: what moved, and the honest boundary
 
-The seam is not cpp-specific — main's Perl features have the same N-path
-shape. Building on main means the spike's remaining work lands ON TOP of
-the seam rather than the seam being excavated out of the spike later.
+The migration moved the candidate **sources** — where names come from —
+not the slot logic. Sources now on the set: in-scope names
+(`complete_general`, OPEN), explicitly imported names (origin's `use`
+lists, OPEN — the dep cache only enriches detail), imported modules'
+remaining export surfaces and the unimported auto-import firehose
+(DEPENDENCY), and loadable module names (`complete_modules`, DEPENDENCY —
+resolved cache + @INC availability behind
+`CrossFileLookup::complete_module_names`). The qualified-path drill takes
+both of its sub-package sources from the set.
 
-1. **Interim (spike, now):** the arc-review C1/C2 fixes land as per-path
-   patches — stop the CRITICAL bleeding; the seam subsumes them later.
-2. **Core (main):** implement CandidateSet + migrate Perl gd / gr / rename /
-   completion-gathering onto it. PR to main on its own timeline.
-3. **Merge main → spike:** the cpp axes (include-closure visibility /
-   `ScopedLookup`, delegation edges, `FileScopeValue`, macro variants)
-   migrate INTO CandidateSet construction as pluggable axes. This migration
-   is the opening slice of the template arc — which then adds its own axes
-   (spec selection, `Specializes` walks, lazy projection instances) to the
-   seam instead of to N feature paths.
+Deliberately NOT on the set (the seam's edge, kept honest):
+
+- **Cursor-context slot detection** (method position / hash key / variable
+  sigil / import list / dispatch arg-0) — decides WHICH slot the cursor is
+  in, never where names come from. Stays in `cursor_context`/the adapter.
+- **Entity-content gathering**: methods on a resolved class
+  (`complete_methods_for_class`), hash keys for a resolved owner, dispatch
+  handler names, keyval/`:param` keys, the `use Foo qw(|)` import-list
+  slot (one named module's export surface). These enumerate the content OF
+  an already-identified entity and ride the method/dispatch resolution
+  seams (`MethodOnClass`, `ReceiverGated`) — a different question than
+  "what names are visible from here." Folding them in would re-derive
+  those seams, not unify them.
+- **Presentation**: labels, kinds, details, sort priorities, snippet
+  items, and where the auto-import `use` edit lands (`auto_import_span` —
+  needs the LSP-side stable outline). Policy still rides the candidates
+  (`additional_edits`), placement is the adapter's.
+- **Plugin query hooks** — cursor-time, imperative, plugin-owned.
+- **Tiers with no source**: WORKSPACE contributes no completion names
+  (true before the seam too — workspace-package names and workspace
+  exporter surfaces were never gathered); BUILTIN has no name source
+  (`PERL_BUILTINS` only suppresses diagnostics). When either grows a
+  source it plugs into the same mask — that's the point of the seam.
+
+## Landing notes (main)
+
+- The set lives in `resolve.rs`, extending the existing
+  `resolve_symbol`/`refs_to` seam — not a parallel module. `refs_to`,
+  `group_refs`, `references_mask_for` are now the set's internals; handlers
+  and CLI mirrors construct the set and project.
+- Completion constructs the same set (`completion_items` → `resolve` →
+  `complete`/`complete_modules`); identity minting stays lazy, so slots
+  that never consult `resolution()` don't pay the override-family walk.
+  Completion has no resolved target for `references_mask_for` to judge, so
+  its default visibility is the full VISIBLE universe; the construction
+  override narrows it like every other projection.
+- Projections only READ the stores (`FileStore::for_each_open`), so an LSP
+  handler may hold its open-doc guard across a projection — the old
+  `drop(doc)`-before-walking discipline (a deadlock trap) is gone.
+- Behavior-preserving by design: each projection reproduces the exact
+  pre-seam composition. Known pre-existing asymmetries surfaced by the
+  migration are documented in the PR/commit trail rather than silently
+  fixed (e.g. group rename does not consult `rewritable` while target
+  rename does). `definitions()` now returns the never-pruned ranked
+  multi-set for macro-named words (the spike's ranking axis, below);
+  other lanes keep first-winning-path.
+
+## The cpp axes on the seam (merge landed)
+
+The spike's axes live in CandidateSet construction:
+
+- **closure visibility** — `resolve()` builds the per-origin
+  `ScopedLookup` (origin path + `include_closure`) once; identity
+  minting, goto-def, and implementations read through it, and the
+  backward walk driver (`refs_to`) applies the target's `def_paths`
+  connectivity gate per scanned file (`file_sees_target`) before the
+  matcher runs — no entry point re-applies a decorator, and every
+  projection that walks inherits the gate.
+- **pack routing** — `pack_routed()` declares the caller's per-language
+  sub-index routing; the set owns the consequences: visibility widens to
+  VISIBLE (pack workspace files ride the DEPENDENCY role), and
+  `rename_edits` → `Result` REFUSES on alias-spelled sites
+  (full-or-refuse) instead of silently skipping.
+- **delegation / `Specializes` / domain edges** — consumers declare
+  traversal: references walks delegation aliases (never the domain
+  bridge); `implementations()` walks `Specializes` families and the
+  enum-def → field-slot domain bridge; goto-def sees through direct
+  delegation on the top-ranked macro variant.
+- **macro variants / multi-def + ranking** — `with_source` feeds the
+  raw-word lane; a pack `definitions()` answers a macro-named word with
+  EVERY def site, reachability-ranked config-active first (the total
+  order, per candidate); `RefLocation.label` carries the per-candidate
+  fact (reachability verdict / see-through note) — the LSP adapter drops
+  it, the CLI renders it.
+- **completion** — the pack instance of `complete(prefix)`: the origin's
+  include closure is the identifier universe
+  (`CrossFileLookup::visible_defs_with_prefix`, no global fallback).
+- **name semantics** — the set's `bare_new_name` hook: Perl sigil rules
+  live in `conventions.rs::strip_variable_sigils`; pack spellings
+  canonicalize at extraction (the LangPack `shape_name` hook, cpp's
+  `canonical_template_spelling`).
+- **import facts, not edits** — import-sourced completion candidates
+  carry `ImportFact` (`AddToQw`/`NewUse`); the adapter composes fact +
+  slot affordance (`complete(prefix, import_slot: bool)`) into the edit.
+
+The invariant test has a per-language instance:
+`candidate_set_visibility_axis_flows_to_every_projection` (Perl,
+RoleMask knob) and
+`closure_visibility_axis_flows_to_every_cpp_projection` (cpp, the
+closure fact) each turn ONE construction knob and assert gd, gr, rename,
+and completion gathering move together.
 
 ## Consequences
 
 - New-axis review question shrinks from "did every feature get it?" to
   "is it in CandidateSet construction?"
-- The template arc's family/selection machinery lands once, not per-feature.
-- Migration risk is real (resolve.rs is hot); the gold pairs + the arc
-  review's repro battery are the migration net.
+- Migration risk is real (resolve.rs is hot); the gold pairs + e2e are the
+  migration net — full net green after every migration step.

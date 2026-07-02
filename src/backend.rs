@@ -22,6 +22,7 @@ use crate::symbols;
 /// cached list. Member completion and closure-less languages return a
 /// complete list (false).
 pub fn pack_completion(
+    files: &crate::file_store::FileStore,
     analysis: &crate::file_analysis::FileAnalysis,
     source: &str,
     tree: &tree_sitter::Tree,
@@ -69,8 +70,8 @@ pub fn pack_completion(
     }
     let mut items = symbols::in_scope_completion(analysis, point);
     let macros_live = macro_completion(source, point, language, path, &mut items);
-    let closure_live =
-        closure_symbol_completion(analysis, source, point, language, module_index, &mut items);
+    let closure_live = closure_symbol_completion(
+        files, analysis, source, point, language, path, module_index, &mut items);
     (items, macros_live || closure_live)
 }
 
@@ -103,10 +104,12 @@ fn identifier_prefix(source: &str, cursor: usize) -> &str {
 /// the `is_incomplete` signal, independent of whether the current prefix
 /// matched anything.
 fn closure_symbol_completion(
+    files: &crate::file_store::FileStore,
     analysis: &crate::file_analysis::FileAnalysis,
     source: &str,
     point: tree_sitter::Point,
     language: &str,
+    path: Option<&std::path::Path>,
     module_index: &ModuleIndex,
     items: &mut Vec<CompletionItem>,
 ) -> bool {
@@ -119,43 +122,34 @@ fn closure_symbol_completion(
         return true; // live source, waiting for a prefix
     }
     let pack = module_index.pack_index(language);
-    let idx: &ModuleIndex = pack.as_deref().unwrap_or(module_index);
-    let visible: std::collections::HashSet<String> =
-        analysis.include_closure.iter().cloned().collect();
+    let base_idx: &dyn crate::file_analysis::CrossFileLookup =
+        pack.as_deref().map_or(module_index, |i| i);
     let seen: std::collections::HashSet<String> =
         items.iter().map(|i| i.label.clone()).collect();
-    let defs = crate::timings::phase("completion.closure_symbols", || {
-        idx.visible_defs_with_prefix(prefix, &visible)
-    });
-    for (name, cached) in defs {
-        if seen.contains(&name) {
+    // The closure-gated identifier universe is the set's completion
+    // projection (the cpp instance of `complete(prefix)`); this adapter
+    // owns slot detection (the typed prefix), dedup against in-scope
+    // items, and presentation (the past-`z` sort tier).
+    let cs = crate::resolve::resolve(
+        files,
+        analysis,
+        crate::file_store::FileKey::Path(path.map(|p| p.to_path_buf()).unwrap_or_default()),
+        point,
+        Some(base_idx),
+        crate::resolve::OverrideScope::default(),
+    )
+    .pack_routed();
+    let candidates =
+        crate::timings::phase("completion.closure_symbols", || cs.complete(prefix, false));
+    for c in candidates {
+        if seen.contains(&c.label) {
             continue;
         }
-        let Some(sym) = cached
-            .analysis
-            .symbols_named(&name)
-            .iter()
-            .map(|id| cached.analysis.symbol(*id))
-            .find(|s| cached.analysis.is_linkage_visible(s))
-        else {
-            continue;
-        };
-        let header = cached
-            .path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // An enum constant carries its parent enum as `package` — show
-        // "opcode — opnames.h" so the domain reads at a glance.
-        let detail = match sym.package.as_deref() {
-            Some(p) if !p.is_empty() => format!("{} — {}", p, header),
-            _ => header,
-        };
         items.push(CompletionItem {
-            label: name.clone(),
-            kind: Some(symbols::fa_completion_kind(&sym.kind)),
-            detail: Some(detail),
-            sort_text: Some(format!("~{}", name)),
+            label: c.label.clone(),
+            kind: Some(symbols::fa_completion_kind(&c.kind)),
+            detail: c.detail,
+            sort_text: Some(format!("~{}", c.label)),
             ..Default::default()
         });
     }
@@ -676,29 +670,6 @@ impl Backend {
     }
 }
 
-/// Build a WorkspaceEdit by finding every reference to `target` and replacing
-/// each ref's span with `new_name`.
-///
-/// Rename shares the same resolution path as references — both go through
-/// `refs_to`. `resolve::rename_locations` is the single policy point deciding
-/// which spans get edited (mask per routing: Perl stops at EDITABLE, pack
-/// widens to its per-language cache) and when to REFUSE instead of emitting a
-/// partial edit — so rename and references can't diverge on which call sites
-/// qualify, and a refusal reads the same over LSP and CLI. `refs_to` handles
-/// inheritance fan-out for Method targets (via `method_rename_chain`) so
-/// callers on child classes of a base method are included without any
-/// special-casing here.
-fn rename_via_refs_to(
-    files: &FileStore,
-    module_index: Option<&dyn crate::file_analysis::CrossFileLookup>,
-    target: &crate::resolve::TargetRef,
-    new_name: &str,
-    pack: bool,
-) -> std::result::Result<Option<WorkspaceEdit>, String> {
-    let locations = crate::resolve::rename_locations(files, module_index, target, pack)?;
-    Ok(locations_to_workspace_edit(locations, new_name))
-}
-
 /// `(RefLocation, text)` pairs → one `WorkspaceEdit` (per-member texts).
 fn edit_pairs_to_workspace_edit(
     edits: Vec<(crate::resolve::RefLocation, String)>,
@@ -723,62 +694,6 @@ fn edit_pairs_to_workspace_edit(
     }
 }
 
-/// `RefLocation`s → one `WorkspaceEdit` writing `new_name` at every span.
-/// Callers guarantee every span covers exactly the renamable token
-/// (bare-name spans for groups, selection/name spans from `refs_to`).
-fn locations_to_workspace_edit(
-    locations: Vec<crate::resolve::RefLocation>,
-    new_name: &str,
-) -> Option<WorkspaceEdit> {
-    if locations.is_empty() {
-        return None;
-    }
-    let mut all_changes: std::collections::HashMap<Url, Vec<TextEdit>> =
-        std::collections::HashMap::new();
-    for loc in locations {
-        // Skip non-rewritable sites (a const-folded event name spelled by a
-        // variable): it's a reference, not a literal to rewrite. References
-        // (`refs_to_locations`) keeps it; only rename drops it.
-        if !loc.rewritable {
-            continue;
-        }
-        if let Some(uri) = loc.to_url() {
-            all_changes.entry(uri).or_default().push(TextEdit {
-                range: symbols::span_to_range(loc.span),
-                new_text: new_name.to_string(),
-            });
-        }
-    }
-    if all_changes.is_empty() {
-        None
-    } else {
-        Some(WorkspaceEdit {
-            changes: Some(all_changes),
-            ..Default::default()
-        })
-    }
-}
-
-/// Convert a resolve::RefLocation list into the LSP Location list expected by
-/// the `references` response, stable-sorted and deduplicated by (uri, span).
-/// Union domain-bridge extras with a handler's main result set, keeping the
-/// sorted/deduped shape. `None` only when BOTH sides are empty, so a
-/// domain-only answer (find-refs on an enum whose direct uses are elsewhere)
-/// still surfaces.
-fn merge_locations(extra: Vec<Location>, main: Option<Vec<Location>>) -> Option<Vec<Location>> {
-    let mut locations = main.unwrap_or_default();
-    locations.extend(extra);
-    if locations.is_empty() {
-        return None;
-    }
-    locations.sort_by(|a, b| {
-        a.uri.as_str().cmp(b.uri.as_str())
-            .then_with(|| a.range.start.line.cmp(&b.range.start.line))
-            .then_with(|| a.range.start.character.cmp(&b.range.start.character))
-    });
-    locations.dedup_by(|a, b| a.uri == b.uri && a.range == b.range);
-    Some(locations)
-}
 
 fn refs_to_locations(results: Vec<crate::resolve::RefLocation>) -> Option<Vec<Location>> {
     let mut locations: Vec<Location> = results
@@ -1126,38 +1041,55 @@ impl LanguageServer for Backend {
         let pack = (doc.language != "perl")
             .then(|| self.module_index.pack_index(doc.language))
             .flatten();
-        let base_idx = pack.as_deref().unwrap_or(&self.module_index);
-        // Resolve names against THIS file's include closure (C's flat linkage:
-        // prefer the `class Box` this file can see). Transparent for Perl.
+        let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+            Some(i) => i,
+            None => &*self.module_index,
+        };
+        // The raw-word lanes below (macro variants, cross-file word fallback)
+        // sit outside the CandidateSet and still need this file's closure
+        // scope; the set scopes itself at construction.
         let self_path = uri.to_file_path().ok();
         let scoped = crate::file_analysis::ScopedLookup::new(
             base_idx, &doc.analysis.include_closure, self_path.as_deref());
         let idx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-        // Macro-aware goto-def OWNS a macro-named word (pack languages): the
-        // `#define` wins over a use's self-span, variants come back ranked, and
-        // a delegation wrapper offers its callee. Runs BEFORE `find_definition`
-        // so gap #1 (bare use → itself) never surfaces. `docs/adr/macro-handling.md`.
-        if doc.language != "perl" {
-            // `#include "x.h"` path → the resolved header (`#include` = `use`).
-            if doc.language == "cpp" {
-                if let Some(loc) = symbols::pack_include_definition(
-                    &doc.analysis, symbols::position_to_point(pos), self_path.as_deref())
-                {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
-                }
-            }
-            if let Some(macros) =
-                symbols::pack_macro_definition(&doc.analysis, &doc.text, symbols::position_to_point(pos), uri, idx)
+        // `#include "x.h"` path → the resolved header (`#include` = `use`).
+        // A path token, not a name — slot-shaped, so it stays ahead of the
+        // set (the ADR's honest boundary).
+        if doc.language == "cpp" {
+            if let Some(loc) = symbols::pack_include_definition(
+                &doc.analysis, symbols::position_to_point(pos), self_path.as_deref())
             {
-                let locs: Vec<Location> = macros
-                    .into_iter()
-                    .map(|m| Location { uri: m.uri, range: m.range })
-                    .collect();
-                return Ok(Some(GotoDefinitionResponse::Array(locs)));
+                return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
             }
         }
-        if let Some(resp) = symbols::find_definition(&doc.analysis, pos, uri, idx) {
-            return Ok(Some(resp));
+        // Forward projection of the set. The source text unlocks the macro
+        // variant lane (ranked, never pruned, see-through delegate) for pack
+        // routing; labels ride the candidates and the editor adapter drops
+        // them (ordering conveys rank).
+        let mut cs = crate::resolve::resolve(
+            &self.files,
+            &doc.analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(base_idx),
+            crate::resolve::OverrideScope::default(),
+        )
+        .with_source(&doc.text);
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        let locs: Vec<Location> = cs
+            .definitions()
+            .into_iter()
+            .filter_map(|l| {
+                let uri = l.to_url()?;
+                Some(Location { uri, range: symbols::span_to_range(l.span) })
+            })
+            .collect();
+        match locs.len() {
+            0 => {}
+            1 => return Ok(Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap()))),
+            _ => return Ok(Some(GotoDefinitionResponse::Array(locs))),
         }
         // Member access (`obj->field`) now flows through `find_definition`
         // above: cpp mints a `MethodCall` ref core resolves like any other.
@@ -1185,9 +1117,8 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        use crate::resolve::{implementations_of, resolve_symbol, ResolvedTarget};
-        let point = symbols::position_to_point(pos);
-        // Same pack routing + include-closure scope as references/rename, so
+        // The family/descendants/domain projection of the same set references
+        // and rename resolve from — pack routing declared at construction so
         // the resolved target can't diverge across the three verbs.
         let pack = (doc.language != "perl")
             .then(|| self.module_index.pack_index(doc.language))
@@ -1196,34 +1127,18 @@ impl LanguageServer for Backend {
             Some(i) => i,
             None => &*self.module_index,
         };
-        let self_path = uri.to_file_path().ok();
-        let scoped = crate::file_analysis::ScopedLookup::new(
-            base_idx, &doc.analysis.include_closure, self_path.as_deref());
-        // Reverse domain bridge: goto-implementation on an enum TYPE's def
-        // fans out to the field-slot sites whose recovered domain is that
-        // enum — the implementations-style projection of the domain edge
-        // (deliberately not part of plain references; see
-        // `symbols::domain_backrefs`).
-        let mut extra: Vec<Location> = Vec::new();
-        if let Some(pidx) = pack.as_deref() {
-            for (path, span) in symbols::domain_backrefs(&doc.analysis, point, pidx) {
-                if let Ok(u) = Url::from_file_path(&path) {
-                    extra.push(Location { uri: u, range: symbols::span_to_range(span) });
-                }
-            }
+        let mut cs = crate::resolve::resolve(
+            &self.files,
+            &doc.analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(base_idx),
+            crate::resolve::OverrideScope::default(),
+        );
+        if pack.is_some() {
+            cs = cs.pack_routed();
         }
-        let target = match resolve_symbol(&doc.analysis, point, Some(&scoped)) {
-            Some(ResolvedTarget::Target(t)) => t,
-            // Groups (field projections) and lexicals have no
-            // descendant-implementation semantics.
-            _ => {
-                drop(doc);
-                return Ok((!extra.is_empty()).then_some(GotoDefinitionResponse::Array(extra)));
-            }
-        };
-        let results = implementations_of(&doc.analysis, Some(&scoped), &target);
-        drop(doc);
-        Ok(merge_locations(extra, refs_to_locations(results)).map(GotoDefinitionResponse::Array))
+        Ok(refs_to_locations(cs.implementations()).map(GotoDefinitionResponse::Array))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -1233,8 +1148,6 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-
-        use crate::resolve::{group_refs, refs_to, resolve_symbol_scoped, ResolvedTarget};
 
         let point = symbols::position_to_point(pos);
         // Pack languages resolve + collect through their sub-index (mirrors
@@ -1267,56 +1180,28 @@ impl LanguageServer for Backend {
             }
         }
         // (The reverse domain bridge — enum type → field-slot sites — is a
-        // goto-implementation projection, NOT part of plain references; see
-        // `symbols::domain_backrefs`.)
-        // Resolve names against THIS file's include closure (transparent for
-        // Perl: empty closure = the plain index).
-        let scoped = crate::file_analysis::ScopedLookup::new(
-            base_idx, &doc.analysis.include_closure, self_path.as_deref());
-        let target = match resolve_symbol_scoped(&doc.analysis, point, Some(&scoped), self.override_scope()) {
-            Some(ResolvedTarget::Target(t)) => t,
-            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
-                let origin = FileKey::Url(uri.clone());
-                drop(doc);
-                let results = group_refs(
-                    &self.files,
-                    Some(base_idx),
-                    &origin,
-                    &local_spans,
-                    &pinned_spans,
-                    &members,
-                    None,
-                );
-                return Ok(merge_locations(Vec::new(), refs_to_locations(results)));
-            }
-            // Lexical / unowned — single-file references.
-            Some(ResolvedTarget::Local) | None => {
-                let refs = symbols::find_references(&doc.analysis, pos, uri, Some(&scoped));
-                return Ok(merge_locations(Vec::new(), (!refs.is_empty()).then_some(refs)));
-            }
-        };
-
-        // Cross-file walk. Scope to editable space when the target is a
-        // project symbol so "find references" never scans CPAN; widen to
-        // VISIBLE only for dependency-defined targets — and always for pack
-        // languages, whose files ride the per-language cache (the DEPENDENCY
-        // role), not the Perl workspace store. See `references_mask_for`.
-        let is_pack = pack.is_some();
-        drop(doc); // release the DashMap read lock before the resolve walk
-        let mask = if is_pack {
-            crate::resolve::RoleMask::VISIBLE
-        } else {
-            crate::resolve::references_mask_for(&self.files, Some(base_idx), &target)
-        };
-        let results = refs_to(&self.files, Some(base_idx), &target, mask);
-        Ok(merge_locations(Vec::new(), refs_to_locations(results)))
+        // goto-implementation projection, NOT part of plain references.)
+        // One construction, one projection — target/group/lexical branching,
+        // visibility (incl. the origin's include-closure scope and the pack
+        // VISIBLE widening), and the cross-file walk all live inside the set.
+        let mut cs = crate::resolve::resolve(
+            &self.files,
+            &doc.analysis,
+            FileKey::Url(uri.clone()),
+            point,
+            Some(base_idx),
+            self.override_scope(),
+        );
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        Ok(refs_to_locations(cs.references()))
     }
 
     async fn prepare_rename(
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
         let doc = match self.files.get_open(&params.text_document.uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1331,11 +1216,7 @@ impl LanguageServer for Backend {
             Some(i) => i,
             None => &*self.module_index,
         };
-        let self_path = params.text_document.uri.to_file_path().ok();
-        let scoped = crate::file_analysis::ScopedLookup::new(
-            base_idx, &doc.analysis.include_closure, self_path.as_deref());
-        // The rename box's range + placeholder, captured while the doc lock is
-        // held (the pack probe below drops it before walking the store).
+        // The rename box's range + placeholder.
         let box_at = doc
             .analysis
             .symbol_at(point)
@@ -1344,31 +1225,22 @@ impl LanguageServer for Backend {
         // Only offer a rename box where `rename` would actually produce edits.
         // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
         // `@_` or an ownerless constructor key resolve to nothing renameable, so
-        // the user gets a box that silently no-ops. Mirror the rename handler's
-        // branching, probing the single-file `rename_at` for the kinds it routes
-        // there — which is why this gate tracks new single-file renameables (a
-        // lexical hash key) automatically, with no change here.
-        let renameable = match resolve_symbol_scoped(
+        // the user gets a box that silently no-ops. `renameable()` mirrors
+        // `rename_edits`' arms on the same set (incl. the pack probe: a rename
+        // the set would refuse or no-op on offers no box), so this gate tracks
+        // new renameable kinds automatically, with no change here.
+        let mut cs = crate::resolve::resolve(
+            &self.files,
             &doc.analysis,
+            FileKey::Url(params.text_document.uri.clone()),
             point,
-            Some(&scoped),
+            Some(base_idx),
             self.override_scope(),
-        ) {
-            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => {
-                if pack.is_some() {
-                    // Reflect reality: reject what rename would refuse (an
-                    // alias-spelled site in the set) or no-op on.
-                    drop(doc);
-                    crate::resolve::rename_locations(&self.files, Some(base_idx), &t, true)
-                        .is_ok_and(|locs| locs.iter().any(|l| l.rewritable))
-                } else {
-                    true
-                }
-            }
-            Some(ResolvedTarget::Group { .. }) => true,
-            Some(_) => doc.analysis.rename_at(point, "x").is_some_and(|e| !e.is_empty()),
-            None => false,
-        };
+        );
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        let renameable = cs.renameable();
         if !renameable {
             return Ok(None);
         }
@@ -1379,8 +1251,6 @@ impl LanguageServer for Backend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
-
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
@@ -1395,9 +1265,12 @@ impl LanguageServer for Backend {
         };
 
         let point = symbols::position_to_point(pos);
-        // Pack languages resolve + collect through their sub-index, scoped to
-        // this file's include closure — the same preamble references uses, or
-        // rename resolves a different target than references just listed.
+        // Rename is the references image + policy, projected from the same
+        // set: cross-file walk for workspace-stable targets, per-member texts
+        // for groups, the origin file's rename machinery for lexicals. The
+        // pack routing fact is declared at construction; the set widens the
+        // walk to the per-language cache and REFUSES on alias-spelled sites
+        // instead of emitting a partial edit.
         let pack = (doc.language != "perl")
             .then(|| self.module_index.pack_index(doc.language))
             .flatten();
@@ -1405,41 +1278,20 @@ impl LanguageServer for Backend {
             Some(i) => i,
             None => &*self.module_index,
         };
-        let self_path = uri.to_file_path().ok();
-        let scoped = crate::file_analysis::ScopedLookup::new(
-            base_idx, &doc.analysis.include_closure, self_path.as_deref());
-        match resolve_symbol_scoped(&doc.analysis, point, Some(&scoped), self.override_scope()) {
-            Some(ResolvedTarget::Target(target)) if target.supports_cross_file_rename() => {
-                let is_pack = pack.is_some();
-                drop(doc);
-                rename_via_refs_to(&self.files, Some(base_idx), &target, new_name, is_pack)
-                    .map_err(tower_lsp::jsonrpc::Error::invalid_params)
-            }
-            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
-                // Every spelling of the group, everywhere editable; each
-                // member carries its own replacement (bare vs re-derived
-                // affixed accessor names).
-                let origin = FileKey::Url(uri.clone());
-                drop(doc);
-                let bare_new = new_name.trim_start_matches(['$', '@', '%']);
-                let edits = crate::resolve::group_rename_edits(
-                    &self.files,
-                    Some(&*self.module_index),
-                    &origin,
-                    &local_spans,
-                    &pinned_spans,
-                    &members,
-                    bare_new,
-                );
-                Ok(edit_pairs_to_workspace_edit(edits))
-            }
-            // Lexical variables, hash keys, handlers: single-file rename
-            // (policy lives on `TargetRef::supports_cross_file_rename`).
-            Some(_) => {
-                Ok(symbols::rename(&doc.analysis, pos, uri, new_name))
-            }
-            None => Ok(None),
+        let mut cs = crate::resolve::resolve(
+            &self.files,
+            &doc.analysis,
+            FileKey::Url(uri.clone()),
+            point,
+            Some(base_idx),
+            self.override_scope(),
+        );
+        if pack.is_some() {
+            cs = cs.pack_routed();
         }
+        cs.rename_edits(new_name)
+            .map(edit_pairs_to_workspace_edit)
+            .map_err(tower_lsp::jsonrpc::Error::invalid_params)
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1507,6 +1359,7 @@ impl LanguageServer for Backend {
         };
         if doc.language != "perl" {
             let (items, is_incomplete) = pack_completion(
+                &self.files,
                 &doc.analysis,
                 &doc.text,
                 &doc.tree,
@@ -1528,6 +1381,8 @@ impl LanguageServer for Backend {
             }));
         }
         let items = symbols::completion_items(
+            &self.files,
+            &FileKey::Url(uri.clone()),
             &doc.analysis,
             &doc.tree,
             &doc.text,

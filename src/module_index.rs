@@ -14,6 +14,7 @@
 //! - `module_cache.rs` — SQLite persistence (schema v9, bincode+zstd blobs)
 //! - `cpanfile.rs` — cpanfile parsing
 
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -521,7 +522,7 @@ impl ModuleIndex {
     }
 
     /// Return cached module path only — never does I/O.
-    pub fn module_path_cached(&self, module_name: &str) -> Option<PathBuf> {
+    pub fn module_path_cached(&self, module_name: &str) -> Option<std::path::PathBuf> {
         self.cache
             .get(module_name)
             .and_then(|entry| entry.as_ref().map(|m| m.path.clone()))
@@ -1232,7 +1233,7 @@ impl CrossFileLookup for ModuleIndex {
         self.parents_cached(module_name)
     }
 
-    fn module_path_cached(&self, module_name: &str) -> Option<PathBuf> {
+    fn module_path_cached(&self, module_name: &str) -> Option<std::path::PathBuf> {
         self.module_path_cached(module_name)
     }
 
@@ -1344,6 +1345,18 @@ impl CrossFileLookup for ModuleIndex {
                 f(entry.key(), t);
             }
         }
+    }
+
+    fn complete_module_names(&self, prefix: &str) -> Vec<(String, bool)> {
+        self.complete_module_names(prefix)
+    }
+
+    fn visible_defs_with_prefix(
+        &self,
+        prefix: &str,
+        visible: &std::collections::HashSet<String>,
+    ) -> Vec<(String, Arc<CachedModule>)> {
+        self.visible_defs_with_prefix(prefix, visible)
     }
 }
 

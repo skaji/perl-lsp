@@ -23,6 +23,17 @@ pub fn is_conventional_invocant_name(name: &str) -> bool {
     )
 }
 
+/// Strip Perl variable sigils from a typed name: the bare identity token
+/// a rename writes at every collected span (`$total` → `total`). This is
+/// the PERL instance of the per-language name-semantics hook on the
+/// resolution CandidateSet's identity keying (`CandidateSet::bare_new_name`)
+/// — pack languages canonicalize spellings at extraction instead (the
+/// LangPack `shape_name` hook; cpp's `canonical_template_spelling`), so
+/// their typed names pass through bare.
+pub fn strip_variable_sigils(name: &str) -> &str {
+    name.trim_start_matches(['$', '@', '%'])
+}
+
 /// Conventional constructor method name. Perl has no `new` keyword — this is
 /// pure convention, but it's the convention every framework and the inference
 /// rules ("`Class->new` returns `Class`") build on.

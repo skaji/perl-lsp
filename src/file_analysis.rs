@@ -301,6 +301,25 @@ pub trait CrossFileLookup {
     /// INCLUDING packageless entrypoint scripts, which never enter the
     /// module cache.
     fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &InferredType));
+    /// Loadable module names matching `prefix` for completion, as
+    /// (name, is_resolved) — resolved modules have full analysis, the rest
+    /// are @INC-scanned availability. Defaults empty so lookups that have
+    /// no module universe stay honest without stubbing.
+    fn complete_module_names(&self, _prefix: &str) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+    /// Completion-GATHERING mirror of `get_cached_scoped`: every registered
+    /// name starting with `prefix` that has a definition candidate inside
+    /// `visible` (canonical paths — the querying file's `#include` closure).
+    /// No global fallback — a file is never offered symbols from headers it
+    /// doesn't include. Defaults empty (the Perl hub has no closure model).
+    fn visible_defs_with_prefix(
+        &self,
+        _prefix: &str,
+        _visible: &std::collections::HashSet<String>,
+    ) -> Vec<(String, std::sync::Arc<CachedModule>)> {
+        Vec::new()
+    }
 }
 
 /// A `CrossFileLookup` decorator scoped to ONE querying file's include-closure
@@ -413,6 +432,13 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     }
     fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &InferredType)) {
         self.inner.for_each_loader_shape(f)
+    }
+    fn visible_defs_with_prefix(
+        &self,
+        prefix: &str,
+        visible: &std::collections::HashSet<String>,
+    ) -> Vec<(String, std::sync::Arc<CachedModule>)> {
+        self.inner.visible_defs_with_prefix(prefix, visible)
     }
 }
 
@@ -5159,6 +5185,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
                 seen_names.insert("new".to_string());
@@ -5214,6 +5241,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                    import_fact: None,
                     display_override: None,
                 });
             }
@@ -5721,6 +5749,7 @@ impl FileAnalysis {
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                        import_fact: None,
                         display_override,
                     });
                 }
@@ -5753,6 +5782,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                    import_fact: None,
                     display_override,
                 });
             }
@@ -5800,6 +5830,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                    import_fact: None,
                     display_override,
                 });
             }
@@ -5823,6 +5854,7 @@ impl FileAnalysis {
                         insert_text: None,
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                        import_fact: None,
                         display_override,
                     });
                 }
@@ -9803,6 +9835,9 @@ pub const PRIORITY_LESS_RELEVANT: u8 = 20;
 pub const PRIORITY_UNIMPORTED: u8 = 25;
 /// Dynamic hash keys (may not exist).
 pub const PRIORITY_DYNAMIC: u8 = 50;
+/// Pack closure-universe names (headers' file-scope symbols) — sort after
+/// every in-scope identifier (the adapter renders this tier past `z`).
+pub const PRIORITY_CLOSURE: u8 = 90;
 
 // ---- Method resolution types ----
 
@@ -9859,6 +9894,22 @@ pub enum ResolvedSub<'a> {
 
 // ---- Completion types ----
 
+/// The model-level import fact on a completion candidate: this name is
+/// importable from a module. The candidate carries the FACT; the LSP
+/// adapter composes it with the slot's import affordance (where an edit
+/// may land) into the actual text edit — edit shaping never happens in
+/// the model.
+#[derive(Debug, Clone)]
+pub enum ImportFact {
+    /// The name can join an existing `use module qw(...)` list whose
+    /// closing paren sits at `qw_close` (an import-statement fact of the
+    /// origin file).
+    AddToQw { name: String, qw_close: Point },
+    /// No importing `use` exists yet — accepting the candidate needs a new
+    /// `use module qw(name);` statement (placement is the adapter's).
+    NewUse { module: String, name: String },
+}
+
 /// A completion candidate from FileAnalysis resolution (pure table lookup).
 #[derive(Debug, Clone)]
 pub struct CompletionCandidate {
@@ -9867,8 +9918,14 @@ pub struct CompletionCandidate {
     pub detail: Option<String>,
     pub insert_text: Option<String>,
     pub sort_priority: u8,
-    /// Additional text edits applied when this candidate is accepted (e.g. auto-import).
+    /// Additional text edits applied when this candidate is accepted.
+    /// Composed by the ADAPTER (from `import_fact` + the slot's
+    /// affordance, or a slot-local fix like the `.`→`->` operator swap) —
+    /// model-side gathering leaves this empty.
     pub additional_edits: Vec<(Span, String)>,
+    /// See `ImportFact` — the importable-from fact, when this candidate is
+    /// import-sourced.
+    pub import_fact: Option<ImportFact>,
     /// Plugin-provided display override. When `Some`, the LSP adapter renders
     /// the candidate with this kind instead of `kind`'s default mapping. Lets
     /// helpers/routes/DSL verbs carry their plugin-chosen icon all the way
@@ -10017,6 +10074,7 @@ impl FileAnalysis {
                 insert_text: None,
                 sort_priority: PRIORITY_FILE_WIDE,
                 additional_edits: vec![],
+                import_fact: None,
                 display_override: sub_display_override(&s.detail),
             })
             .collect()
@@ -10058,6 +10116,7 @@ impl FileAnalysis {
                 insert_text: None,
                 sort_priority: if is_dynamic { PRIORITY_DYNAMIC } else { PRIORITY_FILE_WIDE },
                 additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
             });
         }
@@ -10076,6 +10135,7 @@ impl FileAnalysis {
                             insert_text: None,
                             sort_priority: PRIORITY_FILE_WIDE,
                             additional_edits: vec![],
+                            import_fact: None,
                             display_override: None,
                         });
                     }
@@ -10188,6 +10248,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_FILE_WIDE,
                     additional_edits: vec![],
+                    import_fact: None,
                     display_override: None,
                 });
             }
@@ -10225,6 +10286,7 @@ impl FileAnalysis {
                         insert_text: None,
                         sort_priority: PRIORITY_FILE_WIDE,
                         additional_edits: vec![],
+                        import_fact: None,
                         display_override: None,
                     });
                 }
@@ -10260,6 +10322,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_FILE_WIDE,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10282,6 +10345,7 @@ impl FileAnalysis {
                     insert_text: None,
                     sort_priority: PRIORITY_LESS_RELEVANT,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10375,6 +10439,7 @@ impl FileAnalysis {
                         insert_text: Some(format!("{} => ", k)),
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                     })
                     .collect()
@@ -10395,6 +10460,7 @@ impl FileAnalysis {
                         insert_text: Some(format!("{} => ", k)),
                         sort_priority: PRIORITY_LOCAL,
                         additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                     })
                     .collect()
@@ -10694,6 +10760,7 @@ impl FileAnalysis {
                                     insert_text: Some(format!("{} => ", key)),
                                     sort_priority: PRIORITY_LOCAL,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                                 });
                             }
@@ -10754,6 +10821,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10765,6 +10833,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
                 out.push(CompletionCandidate {
@@ -10776,6 +10845,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("#{}", bare_name)),
                     sort_priority: priority.saturating_add(1),
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10787,6 +10857,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10800,6 +10871,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
                 out.push(CompletionCandidate {
@@ -10809,6 +10881,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority.saturating_add(1),
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10820,6 +10893,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10833,6 +10907,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(bare_name.to_string()),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
                 out.push(CompletionCandidate {
@@ -10842,6 +10917,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}{{", bare_name)),
                     sort_priority: priority.saturating_add(1),
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }
@@ -10853,6 +10929,7 @@ fn generate_cross_sigil_candidates(
                     insert_text: Some(format!("{}[", bare_name)),
                     sort_priority: priority,
                     additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
                 });
             }

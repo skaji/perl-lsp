@@ -1,20 +1,27 @@
 //! Unified query surface across FileStore + ModuleIndex.
 //!
-//! All cross-file LSP queries (references, rename, workspace/symbol) route
-//! through this module so that each handler is a one-liner against a single
-//! role-masked function instead of reinventing the per-tier walk.
+//! `resolve(cursor) → CandidateSet` is the one resolution entry point:
+//! identity (`resolve_symbol_scoped`'s Target/Group/Local verdict),
+//! visibility (RoleMask), edges, and per-site policy are owned by the set,
+//! and every navigation verb — goto-def, references, rename, prepareRename,
+//! implementations — is a projection of it. Handlers and CLI mirrors are
+//! one-liners over a projection; none re-derives identity or the per-tier
+//! walk inline (that's how the CLI and LSP used to disagree on hash-key
+//! references, and how visibility axes used to reach one feature and miss
+//! its siblings). See `docs/adr/resolution-candidate-set.md`.
 //!
-//! `resolve_symbol` is the inverse direction: cursor → target. Every handler
-//! that wants "what does this position refer to, cross-file" (LSP references,
-//! LSP rename, the CLI mirrors of both) calls it and then hands the
-//! `TargetRef` to `refs_to`. Handlers never re-derive the mapping inline —
-//! or the CLI and LSP drift apart (hash-key references are the cautionary tale).
+//! `refs_to` / `group_refs` / `references_mask_for` are the set's internals
+//! (still exercised directly by tests); new axes go into CandidateSet
+//! construction, never into a handler.
 
 use std::path::PathBuf;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::file_analysis::{AccessKind, CrossFileLookup, FileAnalysis, HandlerOwner, RefKind, Span, SymKind};
+use crate::file_analysis::{
+    AccessKind, CompletionCandidate, CrossFileLookup, FileAnalysis, HandlerOwner, RefKind, Span,
+    SymKind,
+};
 use crate::file_store::{FileKey, FileStore};
 
 bitflags::bitflags! {
@@ -317,10 +324,11 @@ fn attr_group_via_ancestors(
     Some(group_from_projections(p, &cached.analysis, Some(cached.path.clone()), Some(idx)))
 }
 
-/// Cursor → cross-file target. The single entry point for "what does this
-/// position refer to" — both LSP handlers (references, rename) and their CLI
-/// mirrors route here, so target identity can never diverge between them.
-/// `None` = nothing resolvable at the cursor at all.
+/// Cursor → cross-file target with the default override scope. Production
+/// callers go through `resolve()`/`CandidateSet` (which forces identity via
+/// `resolve_symbol_scoped`); this wrapper serves tests probing identity
+/// directly.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn resolve_symbol(
     analysis: &FileAnalysis,
     point: tree_sitter::Point,
@@ -604,6 +612,1269 @@ fn pack_member_of_class(
         .is_some_and(|c| check(&c.analysis))
 }
 
+/// The canonical answer to "what does this name mean, from here" — and the
+/// one object every navigation feature projects from. Identity (what the
+/// cursor resolves to), visibility (which file roles a walk may see), edges
+/// (override families / groups / descendants), and per-site policy
+/// (`rewritable`, per-member rename texts) are all owned here; goto-def,
+/// references, rename, and implementations are projections of the same set,
+/// so an axis added to construction is inherited by every feature at once.
+/// See `docs/adr/resolution-candidate-set.md`.
+///
+/// Borrow discipline: the set only ever READS the stores (projections walk
+/// via `FileStore::for_each_open`), so an LSP handler may hold its open-doc
+/// read guard for the set's whole lifetime.
+pub struct CandidateSet<'a> {
+    files: &'a FileStore,
+    origin: &'a FileAnalysis,
+    origin_key: FileKey,
+    point: tree_sitter::Point,
+    /// The routed base index (the Perl hub, or a per-language pack
+    /// sub-index). Backward walks (`refs_to`, group walks) take THIS —
+    /// `collect_from_analysis` re-scopes per scanned file.
+    module_index: Option<&'a dyn CrossFileLookup>,
+    /// The origin's include-closure scope over `module_index`, built once at
+    /// construction — the per-origin visibility rule every forward
+    /// resolution (identity minting, goto-def, implementations) reads, so no
+    /// entry point re-applies the `ScopedLookup` decorator (arc-review C1's
+    /// root shape). Transparent for Perl (empty closure).
+    scoped: Option<crate::file_analysis::ScopedLookup<'a>>,
+    /// Routed through a per-language pack sub-index (the caller's routing
+    /// fact). Two policy consequences, applied at the set level so every
+    /// projection agrees: visibility widens to VISIBLE (pack workspace
+    /// files ride the DEPENDENCY role — a storage artifact of the
+    /// per-language cache, which registers only workspace-walk files), and
+    /// rename REFUSES on alias-spelled sites instead of silently skipping.
+    pack: bool,
+    /// The origin document's raw text, when the caller has it. Feeds the
+    /// raw-word candidate lanes (macro variants): a macro use can vanish
+    /// from the reparsed analysis (expand-and-reparse), so the byte-level
+    /// word is the reliable key. `None` = those lanes stay silent.
+    source: Option<&'a str>,
+    scope: OverrideScope,
+    /// Identity, minted once via `resolve_symbol_scoped` — lazily, so a
+    /// projection that never consults it (goto-def's forward path) doesn't
+    /// pay the override-family walk. `None` = nothing cross-file-resolvable
+    /// at the cursor; local projections still answer from `origin`.
+    resolution: std::sync::OnceLock<Option<ResolvedTarget>>,
+    /// Visibility for a `Target` resolution, memoized — computed by
+    /// `references_mask_for` on first use (group members keep their
+    /// per-member masks inside the group projections).
+    visibility: std::sync::OnceLock<RoleMask>,
+    /// Construction-time visibility override: when set, EVERY projection
+    /// (references, rename, group walks) scopes to it — the seam future
+    /// axes (closure visibility, language boundaries) plug into.
+    visibility_override: Option<RoleMask>,
+}
+
+/// Cursor → CandidateSet: the single resolution entry point. Handlers and
+/// CLI mirrors construct the set once and project; none of them re-derive
+/// identity, visibility, or per-site policy on their own.
+pub fn resolve<'a>(
+    files: &'a FileStore,
+    origin: &'a FileAnalysis,
+    origin_key: FileKey,
+    point: tree_sitter::Point,
+    module_index: Option<&'a dyn CrossFileLookup>,
+    scope: OverrideScope,
+) -> CandidateSet<'a> {
+    // The per-origin closure scope is a construction fact: forward
+    // resolutions see the names THIS file's preprocessor would (C's flat
+    // linkage), and Perl origins pass through untouched (empty closure).
+    let self_path = match &origin_key {
+        FileKey::Path(p) => Some(p.clone()),
+        FileKey::Url(u) => u.to_file_path().ok(),
+    };
+    let scoped = module_index.map(|idx| {
+        crate::file_analysis::ScopedLookup::new(
+            idx,
+            &origin.include_closure,
+            self_path.as_deref(),
+        )
+    });
+    CandidateSet {
+        files,
+        origin,
+        origin_key,
+        point,
+        module_index,
+        scoped,
+        pack: false,
+        source: None,
+        scope,
+        resolution: std::sync::OnceLock::new(),
+        visibility: std::sync::OnceLock::new(),
+        visibility_override: None,
+    }
+}
+
+impl<'a> CandidateSet<'a> {
+    /// Constrain every projection to `mask`. The one knob demonstrating the
+    /// symmetry invariant: narrowing visibility here narrows references AND
+    /// rename AND group walks together — no per-feature re-application. The
+    /// seam future construction axes (closure visibility, language
+    /// boundaries) ride; exercised today by the invariant test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_visibility(mut self, mask: RoleMask) -> Self {
+        self.visibility_override = Some(mask);
+        self.visibility = std::sync::OnceLock::new();
+        self
+    }
+
+    /// Declare the caller routed this origin through a per-language pack
+    /// sub-index. A routing fact, like which store — the policy consequences
+    /// (VISIBLE-wide walks, rename's full-or-refuse) live on the set.
+    pub fn pack_routed(mut self) -> Self {
+        self.pack = true;
+        self
+    }
+
+    /// Supply the origin document's raw text — unlocks the raw-word
+    /// candidate lanes (macro variants in `definitions()`).
+    pub fn with_source(mut self, source: &'a str) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Per-language name semantics on the set's identity keying: normalize
+    /// a typed NEW NAME to the bare identity token edits write. Perl names
+    /// carry sigils (`conventions.rs` owns the rule); pack languages
+    /// canonicalize spellings at extraction (the LangPack `shape_name`
+    /// hook — cpp's `canonical_template_spelling` is that seam's cpp
+    /// instance), so their typed names pass through bare. New per-language
+    /// spelling rules plug in HERE, never inline in a projection.
+    fn bare_new_name<'n>(&self, typed: &'n str) -> &'n str {
+        if self.pack {
+            typed
+        } else {
+            crate::conventions::strip_variable_sigils(typed)
+        }
+    }
+
+    /// The origin-scoped index — every forward resolution (identity,
+    /// goto-def, implementations) reads through the closure scope built at
+    /// construction. Backward walks take `self.module_index` (the base):
+    /// `collect_from_analysis` re-scopes per scanned file.
+    fn idx(&self) -> Option<&dyn CrossFileLookup> {
+        self.scoped
+            .as_ref()
+            .map(|s| s as &dyn CrossFileLookup)
+    }
+
+    /// What the cursor resolved to. Exposed for callers that need
+    /// target-level policy questions (e.g. diagnostics asking a target's
+    /// kind); projections below cover the feature verbs.
+    pub fn resolution(&self) -> Option<&ResolvedTarget> {
+        self.resolution
+            .get_or_init(|| {
+                resolve_symbol_scoped(self.origin, self.point, self.idx(), self.scope)
+            })
+            .as_ref()
+    }
+
+    /// The set-level visibility for a `Target` resolution: the override when
+    /// present; VISIBLE for pack routing (pack workspace files ride the
+    /// DEPENDENCY role); else `references_mask_for`'s editable-vs-visible
+    /// verdict.
+    fn target_visibility(&self, target: &TargetRef) -> RoleMask {
+        *self.visibility.get_or_init(|| {
+            self.visibility_override.unwrap_or_else(|| {
+                if self.pack {
+                    RoleMask::VISIBLE
+                } else {
+                    references_mask_for(self.files, self.module_index, target)
+                }
+            })
+        })
+    }
+
+    /// The backward image of the set: every reference (declarations + use
+    /// sites) across the visible universe. Lexical/unowned cursors answer
+    /// from the origin file's in-file union.
+    pub fn references(&self) -> Vec<RefLocation> {
+        match self.resolution() {
+            Some(ResolvedTarget::Target(t)) => {
+                let mask = self.target_visibility(t);
+                refs_to(self.files, self.module_index, t, mask)
+            }
+            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => group_refs(
+                self.files,
+                self.module_index,
+                &self.origin_key,
+                local_spans,
+                pinned_spans,
+                members,
+                self.visibility_override,
+            ),
+            Some(ResolvedTarget::Local) | None => self
+                .origin
+                .find_references(self.point, self.idx())
+                .into_iter()
+                .map(|span| RefLocation {
+                    key: self.origin_key.clone(),
+                    span,
+                    access: AccessKind::Read,
+                    rewritable: true,
+                    label: None
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether rename at this cursor would produce edits — the prepareRename
+    /// gate. Mirrors `rename_edits`' arms so the box is offered exactly where
+    /// edits exist. Pack targets probe the real edit set: a set rename would
+    /// refuse (alias-spelled sites) or no-op on must not offer a box.
+    pub fn renameable(&self) -> bool {
+        match self.resolution() {
+            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => {
+                if self.pack {
+                    self.rename_edits("x").is_ok_and(|e| !e.is_empty())
+                } else {
+                    true
+                }
+            }
+            Some(ResolvedTarget::Group { .. }) => true,
+            Some(_) => self
+                .origin
+                .rename_at(self.point, "x")
+                .is_some_and(|e| !e.is_empty()),
+            None => false,
+        }
+    }
+
+    /// Rename = the references image + rewritability policy, with each span
+    /// paired to ITS replacement text (bare vs re-derived affixed accessor
+    /// names for groups). Policy lives on the set/locations, not in handlers:
+    /// non-rewritable sites (const-folded names) are references but never
+    /// edits, and the walk stops at editable space (for pack routing,
+    /// "editable" includes the per-language cache — see `pack_routed`).
+    /// `Ok(empty)` = nothing renameable here; `Err` = a rename that would
+    /// SILENTLY BREAK code — a pack set containing an alias-spelled site (a
+    /// use through a delegating `#define`, `rewritable: false`) refuses: the
+    /// macro's body isn't a collected span, so renaming the target would
+    /// leave the delegation chain pointing at the old name. Perl's
+    /// non-rewritable sites (variable-folded dispatch) keep their
+    /// long-standing skip.
+    pub fn rename_edits(&self, new_name: &str) -> Result<Vec<(RefLocation, String)>, String> {
+        let editable = if self.pack {
+            RoleMask::VISIBLE
+        } else {
+            self.visibility_override
+                .map(|m| m & RoleMask::EDITABLE)
+                .unwrap_or(RoleMask::EDITABLE)
+        };
+        Ok(match self.resolution() {
+            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => {
+                let locations = refs_to(self.files, self.module_index, t, editable);
+                if self.pack && locations.iter().any(|l| !l.rewritable) {
+                    return Err(format!(
+                        "rename of `{}` would leave sites spelled through a delegating macro \
+                         unchanged (the macro body is not rewritten) — refusing rather than \
+                         emitting a partial edit",
+                        t.name
+                    ));
+                }
+                locations
+                    .into_iter()
+                    .filter(|loc| loc.rewritable)
+                    .map(|loc| (loc, new_name.to_string()))
+                    .collect()
+            }
+            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
+                // Group spellings are bare name tokens; a sigil on the typed
+                // name applies only to variable-shaped members' own rules.
+                let bare_new = self.bare_new_name(new_name);
+                group_rename_edits(
+                    self.files,
+                    self.module_index,
+                    &self.origin_key,
+                    local_spans,
+                    pinned_spans,
+                    members,
+                    bare_new,
+                    editable,
+                )
+            }
+            // Lexical variables, unowned hash keys, non-cross-file targets:
+            // the origin file's rename machinery owns the edit set.
+            Some(_) => self
+                .origin
+                .rename_at(self.point, new_name)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(span, text)| {
+                    (
+                        RefLocation {
+                            key: self.origin_key.clone(),
+                            span,
+                            access: AccessKind::Read,
+                            rewritable: true,
+                            label: None
+                        },
+                        text,
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        })
+    }
+
+    /// The family/descendants walk over the set: every override/composer
+    /// definition of a Method target, the specialization family of a
+    /// template primary (Package targets), and — from an enum TYPE's own
+    /// def — the reverse domain bridge: the field-slot sites whose recovered
+    /// domain is that enum. The bridge is an implementations-style
+    /// projection of the domain edge, deliberately NOT part of plain
+    /// references (from an enumerator it fanned ~56 real references out to
+    /// the field's ~950 sites).
+    pub fn implementations(&self) -> Vec<RefLocation> {
+        // Domain slot sites come off the cursor's own Class def, before
+        // identity minting — the enum def resolves to a Package target whose
+        // family walk is a different edge set.
+        let mut out: Vec<RefLocation> = Vec::new();
+        if let Some(idx) = self.module_index {
+            if let Some(sym) = self.origin.symbol_at(self.point) {
+                if matches!(sym.kind, SymKind::Class) {
+                    let enum_name = sym.name.clone();
+                    idx.for_each_cached_file(&mut |cached| {
+                        for span in cached
+                            .analysis
+                            .field_sites_for_enum(&enum_name, Some(idx))
+                        {
+                            out.push(RefLocation {
+                                key: FileKey::Path(cached.path.clone()),
+                                span,
+                                access: AccessKind::Read,
+                                rewritable: false,
+                                label: None
+                            });
+                        }
+                    });
+                }
+            }
+        }
+        if let Some(ResolvedTarget::Target(t)) = self.resolution() {
+            out.extend(implementations_of(self.origin, self.idx(), t));
+        }
+        // Domain sites first (the bridge is the headline answer on an enum
+        // def), then the family walk; first occurrence wins the dedup.
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|l| seen.insert((key_for_sort(&l.key), l.span)));
+        out
+    }
+
+    /// A declaration site in the origin file.
+    fn origin_decl(&self, span: Span) -> RefLocation {
+        RefLocation {
+            key: self.origin_key.clone(),
+            span,
+            access: AccessKind::Declaration,
+            rewritable: true,
+            label: None
+        }
+    }
+
+    /// Forward projection: goto-definition. Returns the winning path's
+    /// location(s) — multi-location only for stacked handler registrations;
+    /// the never-pruned ranked multi-def is the documented residual the
+    /// spike's ranking axis fills in (see the ADR's merge plan).
+    pub fn definitions(&self) -> Vec<RefLocation> {
+        let analysis = self.origin;
+        let point = self.point;
+
+        // Macro-aware goto-def OWNS a macro-named word (pack routing): the
+        // `#define` wins over a use's self-span, EVERY def site comes back
+        // (config variants across files never pruned), reachability-RANKED
+        // config-active first — the total order `definitions()` returns is
+        // the ranking axis, per candidate — plus any direct-delegation
+        // see-through target, labeled. `docs/adr/macro-handling.md`.
+        if self.pack {
+            if let (Some(source), Some(idx)) = (self.source, self.idx()) {
+                if let Some(word) = word_at_point(source, point) {
+                    let ranked = ranked_macro_variants(analysis, word, &self.origin_key, idx);
+                    if !ranked.is_empty() {
+                        let mut out: Vec<RefLocation> = ranked
+                            .iter()
+                            .map(|(m, key, r)| RefLocation {
+                                key: key.clone(),
+                                span: m.selection_span,
+                                access: AccessKind::Declaration,
+                                rewritable: true,
+                                label: r.label(),
+                            })
+                            .collect();
+                        // See-through: a direct-delegation wrapper
+                        // (`#define F(x) G(x)`) also offers the delegate `G`,
+                        // resolved from the top-ranked delegating variant so
+                        // the offer follows the config-active body. A
+                        // self-delegation (`#define S S`) resolves to the
+                        // definition itself — already offered above.
+                        if let Some((m, _, _)) = ranked
+                            .iter()
+                            .find(|(m, _, _)| m.delegate.as_deref().is_some_and(|d| d != m.name))
+                        {
+                            if let Some(delegate) = &m.delegate {
+                                if let Some(mut loc) =
+                                    pack_symbol_def_location(analysis, &self.origin_key, delegate, idx)
+                                {
+                                    loc.label = Some(format!("delegates to {delegate}"));
+                                    out.push(loc);
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+
+        // Query-time dispatch goto-def: a `$minion->enqueue('task')` whose
+        // receiver isa-resolves (possibly cross-file) jumps to the handler,
+        // even when no `DispatchCall` ref was materialized for this site. The
+        // gate is applied in `dispatch_at`; we just map the resolved handler
+        // to its definition. Runs first because the cursor is on the
+        // name-string arg, which the paths below would otherwise treat as a
+        // plain string literal. See `docs/adr/receiver-gated-dispatch.md`.
+        if let Some(idx) = self.idx() {
+            if let Some(applied) = analysis.dispatch_at(point, Some(idx)) {
+                let locs = dispatch_handler_locations(&applied.owner, &applied.name, idx);
+                if !locs.is_empty() {
+                    return locs;
+                }
+            }
+        }
+
+        // Forward domain bridge: goto-def on a domain-typed field slot offers
+        // the DOMAIN enum's def IN ADDITION to the field decl (`op_type` →
+        // both its `PERL_BITFIELD16 op_type` decl AND `enum opcode`). The
+        // field decl stays FIRST (the primary); the enum is an extra offer.
+        // Runs before the local / member resolution below so it augments a
+        // same-file field too. When the field decl does NOT resolve here, the
+        // enum must not mask the shared member/cross-file paths below (that
+        // made goto-def site-dependent) — it becomes the LAST-resort fallback
+        // instead, returned only when every decl-resolving path has passed.
+        let mut domain_enum_fallback: Option<RefLocation> = None;
+        if let Some(idx) = self.idx() {
+            if let Some(r) = analysis.ref_at(point) {
+                if matches!(r.kind, RefKind::MethodCall { .. }) {
+                    if let Some(cn) = analysis.method_call_invocant_class(r, Some(idx)) {
+                        let field = r.unqualified_target_name();
+                        if let Some(dom) = analysis.field_domain(&cn, field, Some(idx)) {
+                            let el = self.type_def_location(&dom.domain, idx);
+                            if let Some(fl) = self.member_field_def_location(&cn, field, idx) {
+                                let mut locs: Vec<RefLocation> = vec![fl];
+                                if let Some(el) = el {
+                                    if !locs.iter().any(|l| {
+                                        file_key_eq(&l.key, &el.key) && l.span == el.span
+                                    }) {
+                                        locs.push(el);
+                                    }
+                                }
+                                return locs;
+                            }
+                            domain_enum_fallback = el;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Local definition first.
+        if let Some(span) = analysis.find_definition(point, self.idx()) {
+            return vec![self.origin_decl(span)];
+        }
+
+        let Some(idx) = self.idx() else {
+            return Vec::new();
+        };
+        let line_loc = |path: PathBuf, line: u32| -> RefLocation {
+            let p = tree_sitter::Point::new(line as usize, 0);
+            RefLocation {
+                key: FileKey::Path(path),
+                span: Span { start: p, end: p },
+                access: AccessKind::Declaration,
+                rewritable: true,
+                label: None
+            }
+        };
+
+        // Cross-file hash-key defs. Two shapes share the lookup:
+        //   * deferred ctor key (`owner: None`) — the build-time gate
+        //     couldn't see the class; derive the owner now (enclosing call's
+        //     invocant class, index in hand);
+        //   * resolved Class owner (`$row->{name}` upgraded post-fold to
+        //     `Class(NestedRow)`) whose class — and therefore its
+        //     `add_columns` / `has` / `:param` HashKeyDef — lives elsewhere.
+        // Either way: the class's cached analysis carries the def.
+        if let Some(r) = analysis.ref_at(point) {
+            if let RefKind::HashKeyAccess { ref owner, .. } = r.kind {
+                use crate::file_analysis::HashKeyOwner;
+                let owner = match owner {
+                    Some(o) => Some(o.clone()),
+                    None => analysis.deferred_hash_key_owner(r, Some(idx)),
+                };
+                let class = match &owner {
+                    Some(HashKeyOwner::Sub { package: Some(c), .. }) => Some(c.clone()),
+                    Some(HashKeyOwner::Class(c)) => Some(c.clone()),
+                    _ => None,
+                };
+                if let (Some(owner), Some(class)) = (owner, class) {
+                    if let Some(cached) = idx.get_cached(&class) {
+                        if let Some(def) = cached
+                            .analysis
+                            .hash_key_defs_for_owner(&owner)
+                            .into_iter()
+                            .find(|d| d.name == r.target_name)
+                        {
+                            return vec![RefLocation {
+                                key: FileKey::Path(cached.path.clone()),
+                                span: def.selection_span,
+                                access: AccessKind::Declaration,
+                                rewritable: true,
+                                label: None
+                            }];
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(r) = analysis.ref_at(point) {
+            // Function call matching an imported symbol.
+            if matches!(r.kind, RefKind::FunctionCall { .. }) {
+                if let Some((import, module_path, remote_name)) =
+                    resolve_imported_function(analysis, &r.target_name, idx)
+                {
+                    // Cross-file sub_info lookup uses the REMOTE name —
+                    // distinct from target_name for renaming imports.
+                    // Re-export aware: the def may live in a module
+                    // `import.module_name` re-exports (Test::Most →
+                    // Test::More's `ok`). Chase the edges to the defining
+                    // module; fall back to the directly-`use`d path.
+                    let defining =
+                        idx.defining_module_cached(&import.module_name, &remote_name);
+                    let module_path = defining
+                        .as_ref()
+                        .map(|m| m.path.clone())
+                        .unwrap_or(module_path);
+                    if Url::from_file_path(&module_path).is_ok() {
+                        // The defining sub's line in the .pm — `Some` only when
+                        // the module (or one it re-exports) defines the remote
+                        // name. One hop to it whenever known: landing on the
+                        // consumer's `use` line was never the goal.
+                        let def_line = defining.and_then(|cached| {
+                            cached.sub_info(&remote_name).map(|s| s.def_line())
+                        });
+                        if let Some(line) = def_line {
+                            return vec![line_loc(module_path, line)];
+                        }
+                        // Cursor on the import name with an unresolved def:
+                        // jump to the top of the .pm (better than the
+                        // consumer's use line).
+                        if crate::file_analysis::contains_point(&import.span, point) {
+                            return vec![line_loc(module_path, 0)];
+                        }
+                    }
+                    // Fall back to just the use statement.
+                    return vec![self.origin_decl(import.span)];
+                }
+
+                // Fully-qualified call (`Foo::Bar::baz()`) with no import: the
+                // qualifier names the package directly; the defining package
+                // lives in another module. Resolve via `resolved_package` (the
+                // qualifier) and the bare sub name.
+                if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
+                    let bare = r.unqualified_target_name();
+                    if let Some(cached) = idx.get_cached(pkg) {
+                        if Url::from_file_path(&cached.path).is_ok() {
+                            let def_line =
+                                cached.sub_info(bare).map(|s| s.def_line()).unwrap_or(0);
+                            return vec![line_loc(cached.path.clone(), def_line)];
+                        }
+                    }
+                }
+            }
+
+            // Fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`):
+            // the package lives in another module — resolve the package
+            // global through the index, mirroring the FQ-call path. Honest
+            // miss (no jump) when the package or its decl is absent.
+            if let Some((pkg, name)) = r.qualified_var_target() {
+                if let Some(cached) = idx.get_cached(pkg) {
+                    if Url::from_file_path(&cached.path).is_ok() {
+                        if let Some(def_line) = cached.package_var_def_line(&name, pkg) {
+                            return vec![line_loc(cached.path.clone(), def_line)];
+                        }
+                    }
+                }
+            }
+
+            // Cross-file package/type goto-def: resolve the name via the
+            // index. Land on the declaring symbol when the cached analysis
+            // knows it (a Perl `package Foo;` line, a cpp `struct op` /
+            // typedef name); fall back to the top of the file. Resolve the
+            // CachedModule ONCE and take path AND range from it — pairing
+            // `module_path_cached`'s file with a separately-scoped
+            // `get_cached`'s range splices two candidates when the name is
+            // defined in more than one file.
+            if matches!(r.kind, RefKind::PackageRef) {
+                if let Some(cached) = idx.get_cached(&r.target_name) {
+                    if Url::from_file_path(&cached.path).is_ok() {
+                        let span = cached
+                            .analysis
+                            .symbols
+                            .iter()
+                            .find(|s| {
+                                s.name == r.target_name
+                                    && matches!(
+                                        s.kind,
+                                        SymKind::Package | SymKind::Class | SymKind::Module
+                                    )
+                            })
+                            .map(|s| s.selection_span)
+                            .unwrap_or(Span {
+                                start: tree_sitter::Point::new(0, 0),
+                                end: tree_sitter::Point::new(0, 0),
+                            });
+                        return vec![RefLocation {
+                            key: FileKey::Path(cached.path.clone()),
+                            span,
+                            access: AccessKind::Declaration,
+                            rewritable: true,
+                            label: None
+                        }];
+                    }
+                }
+                // No analysis cached: the path map alone still beats no
+                // answer — land at the top of the file.
+                if let Some(path) = idx.module_path_cached(&r.target_name) {
+                    if Url::from_file_path(&path).is_ok() {
+                        return vec![line_loc(path, 0)];
+                    }
+                }
+            }
+
+            // Cross-file DispatchCall goto-def: `$consumer->emit('ready')` in
+            // one file jumps to `$producer->on('ready', sub)` in another.
+            // Stacked registrations all surface (multi-location picker).
+            if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
+                let locs = dispatch_handler_locations(owner, &r.target_name, idx);
+                if !locs.is_empty() {
+                    return locs;
+                }
+            }
+
+            // Cross-file method goto-def: inherited methods through the index.
+            if matches!(r.kind, RefKind::MethodCall { .. }) {
+                use crate::file_analysis::MethodResolution;
+                // FQ `$o->Foo::Bar::m` dispatches the bare `m` on the named class.
+                let method = r.unqualified_target_name();
+                if let Some(cn) = analysis.method_call_invocant_class(r, Some(idx)) {
+                    // The invocant resolved (e.g. a plugin-bridged route token
+                    // → controller class) but the controller lives in THIS
+                    // file: jump to the local method symbol. The build-time
+                    // freeze normally serves same-file dispatch, but a bridged
+                    // invocant is never frozen (its class needs the index), so
+                    // re-resolve here.
+                    if let Some(MethodResolution::Local { sym_id, .. }) =
+                        analysis.resolve_method_in_ancestors(&cn, method, Some(idx))
+                    {
+                        if let Some(sym) = analysis.symbols.iter().find(|s| s.id == sym_id) {
+                            return vec![self.origin_decl(sym.selection_span)];
+                        }
+                    }
+                    if let Some(MethodResolution::CrossFile { ref class, ref def_module }) =
+                        analysis.resolve_method_in_ancestors(&cn, method, Some(idx))
+                    {
+                        // One path for both: a real inherited method lives in
+                        // `class`'s own module; a plugin-bridged helper lives
+                        // in `def_module` (the bridging file). Same lookup
+                        // either way.
+                        let module = def_module.as_deref().unwrap_or(class);
+                        if let Some(cached) = idx.get_cached(module) {
+                            if let Some(sub_info) = cached.sub_info(method) {
+                                if Url::from_file_path(&cached.path).is_ok() {
+                                    return vec![line_loc(
+                                        cached.path.clone(),
+                                        sub_info.def_line(),
+                                    )];
+                                }
+                            }
+                            // cpp data field: a Variable/Field member, not a sub.
+                            if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                                matches!(s.kind, SymKind::Variable | SymKind::Field)
+                                    && s.name == method
+                                    && s.package.as_deref() == Some(class.as_str())
+                            }) {
+                                if Url::from_file_path(&cached.path).is_ok() {
+                                    return vec![RefLocation {
+                                        key: FileKey::Path(cached.path.clone()),
+                                        span: sym.selection_span,
+                                        access: AccessKind::Declaration,
+                                        rewritable: true,
+                                        label: None
+                                    }];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generic cross-file goto-def for a call OR a bare value read that
+        // didn't resolve locally or via Perl imports. Pack languages register
+        // free functions + file-scope vars/macros/enum-constants by name, so
+        // look the name up in the cross-file index → the file that
+        // declares/defines it → that symbol. A `Variable` ref reaches here
+        // only when it had no local `resolves_to` (the local path above
+        // already returned for resolved ones), so this is the cross-file
+        // tail: `OP_SCOPE` used in op.c resolving to its enumerator def in
+        // opnames.h. (Perl's cache is keyed by MODULE name, so a bare-name
+        // lookup no-ops.)
+        if let Some(r) = analysis.ref_at(point) {
+            if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
+                let name = r.unqualified_target_name();
+                if let Some(cached) = idx.get_cached(name) {
+                    if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                        s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Variable)
+                    }) {
+                        if Url::from_file_path(&cached.path).is_ok() {
+                            return vec![RefLocation {
+                                key: FileKey::Path(cached.path.clone()),
+                                span: sym.selection_span,
+                                access: AccessKind::Declaration,
+                                rewritable: true,
+                                label: None
+                            }];
+                        }
+                    }
+                }
+            }
+        }
+
+        // The domain bridge's enum offer, only when no path resolved the
+        // decl — better than nothing at a site whose member resolution is
+        // broken, and never masking a resolvable decl.
+        if let Some(el) = domain_enum_fallback {
+            return vec![el];
+        }
+        Vec::new()
+    }
+
+    /// The def location of a data field `field` on `class` (or an ancestor) —
+    /// local Symbol or a cross-file member — the SAME resolution the member
+    /// goto-def branch produces. Shared with the domain bridge so the field's
+    /// own decl stays the primary target while the enum is offered alongside.
+    fn member_field_def_location(
+        &self,
+        class: &str,
+        field: &str,
+        idx: &dyn CrossFileLookup,
+    ) -> Option<RefLocation> {
+        use crate::file_analysis::MethodResolution;
+        match self.origin.resolve_method_in_ancestors(class, field, Some(idx))? {
+            MethodResolution::Local { sym_id, .. } => {
+                Some(self.origin_decl(self.origin.symbol(sym_id).selection_span))
+            }
+            MethodResolution::CrossFile { class, def_module } => {
+                let module = def_module.as_deref().unwrap_or(&class);
+                let cached = idx.get_cached(module)?;
+                let sym = cached.analysis.symbols.iter().find(|s| {
+                    matches!(s.kind, SymKind::Variable | SymKind::Field)
+                        && s.name == field
+                        && s.package.as_deref() == Some(class.as_str())
+                })?;
+                Some(RefLocation {
+                    key: FileKey::Path(cached.path.clone()),
+                    span: sym.selection_span,
+                    access: AccessKind::Declaration,
+                    rewritable: true,
+                    label: None
+                })
+            }
+        }
+    }
+
+    /// The def location of a named type (a Class symbol — enum/struct/
+    /// typedef), local first, then cross-file by name. Used by the domain
+    /// bridge to offer the enum def alongside a domain-typed field.
+    fn type_def_location(&self, type_name: &str, idx: &dyn CrossFileLookup) -> Option<RefLocation> {
+        if let Some(sym) = self
+            .origin
+            .symbols
+            .iter()
+            .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))
+        {
+            return Some(self.origin_decl(sym.selection_span));
+        }
+        let cached = idx.get_cached(type_name)?;
+        let sym = cached
+            .analysis
+            .symbols
+            .iter()
+            .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))?;
+        Some(RefLocation {
+            key: FileKey::Path(cached.path.clone()),
+            span: sym.selection_span,
+            access: AccessKind::Declaration,
+            rewritable: true,
+            label: None
+        })
+    }
+
+    /// Completion visibility: unlike the navigation projections there is no
+    /// resolved target to run `references_mask_for` on (the cursor sits on a
+    /// prefix, not a name), so the default is the full VISIBLE universe; the
+    /// construction-time override still narrows it — the same one knob that
+    /// narrows references/rename.
+    fn completion_visibility(&self) -> RoleMask {
+        self.visibility_override.unwrap_or(RoleMask::VISIBLE)
+    }
+
+    /// Completion candidate gathering: the prefix-enumeration of the same
+    /// visible universe the navigation projections resolve against. This is
+    /// the SOURCE of identifier candidates only — cursor-context gating
+    /// (which slot the cursor is in) and item presentation stay in the LSP
+    /// adapter. Sources by tier:
+    ///
+    /// - OPEN — the origin file's in-scope names (variables, subs,
+    ///   packages: the origin is the document being edited, i.e. the open
+    ///   tier by definition of the completion verb) and the names its `use`
+    ///   statements explicitly import (origin-file facts; the dep cache only
+    ///   enriches their detail).
+    /// - DEPENDENCY — names supplied by other modules' export surfaces:
+    ///   the rest of an imported module's `@EXPORT`/`@EXPORT_OK`, and every
+    ///   cached exporter's surface as auto-import candidates.
+    ///
+    /// `import_slot` is the slot's import affordance: whether accepting an
+    /// import-sourced name here has somewhere to land its `use` edit.
+    /// `false` means the slot offers no import-sourced names at all (today:
+    /// every slot except the general identifier slot) — an import candidate
+    /// without a place for its edit would complete to broken code. The
+    /// candidates carry the importable-from FACT (`ImportFact`); the
+    /// adapter composes fact + affordance into the edit.
+    ///
+    /// The general slot passes `""` (clients filter by prefix); a non-empty
+    /// prefix narrows server-side for callers that want it.
+    pub fn complete(
+        &self,
+        prefix: &str,
+        import_slot: bool,
+    ) -> Vec<CompletionCandidate> {
+        let mask = self.completion_visibility();
+        // Pack routing: the identifier universe is the origin's #include
+        // closure — C's import surface ("C = Perl, everything exported": the
+        // closure IS the import list, so enum constants, free functions,
+        // typedefs and globals from included headers are candidates exactly
+        // like imported subs are for Perl). Same projection, same mask knob;
+        // the sources differ per routing because the languages' name-supply
+        // models differ, not the seam.
+        if self.pack {
+            let mut out = Vec::new();
+            if mask.contains(RoleMask::DEPENDENCY) && !self.origin.include_closure.is_empty() {
+                if let Some(idx) = self.module_index {
+                    let visible: std::collections::HashSet<String> =
+                        self.origin.include_closure.iter().cloned().collect();
+                    for (name, cached) in idx.visible_defs_with_prefix(prefix, &visible) {
+                        // Only linkage-visible defs (a TU-static never
+                        // completes elsewhere).
+                        let Some(sym) = cached
+                            .analysis
+                            .symbols_named(&name)
+                            .iter()
+                            .map(|id| cached.analysis.symbol(*id))
+                            .find(|s| cached.analysis.is_linkage_visible(s))
+                        else {
+                            continue;
+                        };
+                        let header = cached
+                            .path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        // An enum constant carries its parent enum as
+                        // `package` — "opcode — opnames.h" reads the domain
+                        // at a glance.
+                        let detail = match sym.package.as_deref() {
+                            Some(p) if !p.is_empty() => format!("{} — {}", p, header),
+                            _ => header,
+                        };
+                        out.push(CompletionCandidate {
+                            label: name.clone(),
+                            kind: sym.kind.clone(),
+                            detail: Some(detail),
+                            insert_text: None,
+                            sort_priority: crate::file_analysis::PRIORITY_CLOSURE,
+                            additional_edits: vec![],
+                            import_fact: None,
+                            display_override: None,
+                        });
+                    }
+                }
+            }
+            return out;
+        }
+        let mut out = Vec::new();
+        if mask.contains(RoleMask::OPEN) {
+            out.extend(self.origin.complete_general(self.point));
+        }
+        if let (true, Some(idx)) = (import_slot, self.module_index) {
+            import_candidates(self.origin, idx, mask, &mut out);
+            if mask.contains(RoleMask::DEPENDENCY) {
+                unimported_export_candidates(self.origin, idx, &mut out);
+            }
+        }
+        if !prefix.is_empty() {
+            out.retain(|c| c.label.starts_with(prefix));
+        }
+        out
+    }
+
+    /// The loadable-module half of the completion universe: names a `use`
+    /// statement (or a `Foo::` path drill) can reach, as
+    /// (name, is_resolved). Dependency-tier by construction — both the
+    /// resolved module cache and the @INC availability scan live behind the
+    /// index. Workspace-package names are a documented gap: the store holds
+    /// their analyses but no gathering source enumerates them yet, here or
+    /// pre-seam (see the ADR's honest-boundary list). In-file package names
+    /// ride `complete()`'s OPEN tier instead.
+    pub fn complete_modules(&self, prefix: &str) -> Vec<(String, bool)> {
+        let mask = self.completion_visibility();
+        let mut out = Vec::new();
+        if mask.contains(RoleMask::DEPENDENCY) {
+            if let Some(idx) = self.module_index {
+                out.extend(idx.complete_module_names(prefix));
+            }
+        }
+        out
+    }
+}
+
+/// Candidates for names a `use` statement makes (or could make) available:
+/// explicitly imported symbols, then the imported modules' remaining
+/// `@EXPORT`/`@EXPORT_OK` surfaces as auto-add-to-qw candidates. The `seen`
+/// set is marked unconditionally so a tier-masked explicit import can never
+/// be re-offered by the export walk under the wrong affordance.
+fn import_candidates(
+    origin: &FileAnalysis,
+    idx: &dyn CrossFileLookup,
+    mask: RoleMask,
+    out: &mut Vec<CompletionCandidate>,
+) {
+    use crate::file_analysis::{
+        format_inferred_type, SymKind as FaSymKind, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
+        PRIORITY_EXPLICIT_IMPORT,
+    };
+    let mut seen = std::collections::HashSet::new();
+
+    for import in &origin.imports {
+        let cached = idx.get_cached(&import.module_name);
+
+        // Explicitly imported symbols (from the qw list): origin-file names.
+        // Dedup/dispatch by LOCAL name (what the user types); resolve detail
+        // against REMOTE name (what exists in the source module) so renaming
+        // imports like `del` → `delete` show the real doc.
+        for is in &import.imported_symbols {
+            let local = &is.local_name;
+            if !seen.insert(local.clone()) {
+                continue;
+            }
+            if !origin.symbols_named(local).is_empty() {
+                continue;
+            }
+            if !mask.contains(RoleMask::OPEN) {
+                continue;
+            }
+            let detail =
+                completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
+            out.push(CompletionCandidate {
+                label: local.clone(),
+                kind: FaSymKind::Sub,
+                detail: Some(detail),
+                insert_text: None,
+                sort_priority: PRIORITY_EXPLICIT_IMPORT,
+                additional_edits: vec![],
+                import_fact: None,
+                display_override: None,
+            });
+        }
+
+        // The module's remaining export surface: dependency-file names.
+        if !mask.contains(RoleMask::DEPENDENCY) {
+            continue;
+        }
+        if let Some(ref cached) = cached {
+            let fa = &cached.analysis;
+            let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
+                // Bare `use Foo;` — offer @EXPORT
+                fa.export.iter().collect()
+            } else {
+                // `use Foo qw(bar)` — offer remaining @EXPORT + @EXPORT_OK
+                let mut all = Vec::new();
+                all.extend(fa.export.iter());
+                all.extend(fa.export_ok.iter());
+                all
+            };
+
+            for name in all_exported {
+                // Skip already-offered (explicitly imported) and locally defined
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if !origin.symbols_named(name).is_empty() {
+                    continue;
+                }
+
+                let rt_prefix = cached
+                    .sub_info(name)
+                    .and_then(|s| s.return_type(None))
+                    .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
+                    .unwrap_or_default();
+
+                // The FACT: this name can join the existing qw() list at
+                // its close paren. The adapter composes the edit; a bare
+                // `use Foo;` has no list to join (no fact, no edit).
+                let (detail, priority, import_fact) =
+                    if let Some(close_pos) = import.qw_close_paren {
+                        (
+                            format!("{}{} (auto-import)", rt_prefix, import.module_name),
+                            PRIORITY_AUTO_ADD_QW,
+                            Some(crate::file_analysis::ImportFact::AddToQw {
+                                name: name.clone(),
+                                qw_close: close_pos,
+                            }),
+                        )
+                    } else {
+                        (
+                            format!("{}imported from {}", rt_prefix, import.module_name),
+                            PRIORITY_BARE_IMPORT,
+                            None,
+                        )
+                    };
+
+                out.push(CompletionCandidate {
+                    label: name.clone(),
+                    kind: FaSymKind::Sub,
+                    detail: Some(detail),
+                    insert_text: None,
+                    sort_priority: priority,
+                    additional_edits: vec![],
+                    import_fact,
+                    display_override: None,
+                });
+            }
+        }
+    }
+}
+
+/// Auto-import candidates: every cached exporter's `@EXPORT`/`@EXPORT_OK`
+/// surface, each carrying the importable-from FACT (`ImportFact::NewUse`);
+/// the adapter composes the `use Module qw(func);` edit at the slot's
+/// affordance.
+fn unimported_export_candidates(
+    origin: &FileAnalysis,
+    idx: &dyn CrossFileLookup,
+    out: &mut Vec<CompletionCandidate>,
+) {
+    use crate::file_analysis::{SymKind as FaSymKind, PRIORITY_UNIMPORTED};
+    let mut candidates = Vec::new();
+
+    // Already-imported modules are the import walk's job, not this one's.
+    let imported_modules: std::collections::HashSet<&str> = origin
+        .imports
+        .iter()
+        .map(|i| i.module_name.as_str())
+        .collect();
+
+    idx.for_each_cached(&mut |module_name, cached| {
+        if imported_modules.contains(module_name) {
+            return;
+        }
+
+        let fa = &cached.analysis;
+        let all_exported = fa.export.iter().chain(fa.export_ok.iter());
+        for name in all_exported {
+            // Skip functions already defined locally
+            if !origin.symbols_named(name).is_empty() {
+                continue;
+            }
+            candidates.push(CompletionCandidate {
+                label: name.clone(),
+                kind: FaSymKind::Sub,
+                detail: Some(format!("{} (auto-import)", module_name)),
+                insert_text: None,
+                sort_priority: PRIORITY_UNIMPORTED,
+                additional_edits: vec![],
+                import_fact: Some(crate::file_analysis::ImportFact::NewUse {
+                    module: module_name.to_string(),
+                    name: name.clone(),
+                }),
+                display_override: None,
+            });
+        }
+    });
+
+    // Sort for deterministic order
+    candidates.sort_by(|a, b| a.label.cmp(&b.label).then(a.detail.cmp(&b.detail)));
+    out.extend(candidates);
+}
+
+fn completion_detail_for_import(
+    name: &str,
+    cached: Option<&crate::file_analysis::CachedModule>,
+    module_name: &str,
+) -> String {
+    use crate::file_analysis::format_inferred_type;
+    if let Some(cached) = cached {
+        if let Some(sub_info) = cached.sub_info(name) {
+            if let Some(rt) = sub_info.return_type(None) {
+                return format!("→ {} ({})", format_inferred_type(&rt), module_name);
+            }
+        }
+    }
+    format!("imported from {}", module_name)
+}
+
+/// All `Handler` definitions matching `(owner, name)` across cached modules.
+/// A dispatch (`$emitter->emit('ready')`) can target stacked registrations
+/// in different files; every hit surfaces so the editor can show a picker.
+/// Shared by the materialized-ref path and the query-time `dispatch_at` path
+/// so both resolve handlers identically.
+fn dispatch_handler_locations(
+    owner: &HandlerOwner,
+    name: &str,
+    module_index: &dyn CrossFileLookup,
+) -> Vec<RefLocation> {
+    use crate::file_analysis::SymbolDetail;
+    let mut locs: Vec<RefLocation> = Vec::new();
+    for module_name in module_index.modules_with_symbol(name) {
+        let Some(cached) = module_index.get_cached(&module_name) else { continue };
+        for sym in &cached.analysis.symbols {
+            if sym.name != name {
+                continue;
+            }
+            if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
+                if o == owner {
+                    locs.push(RefLocation {
+                        key: FileKey::Path(cached.path.clone()),
+                        span: sym.selection_span,
+                        access: AccessKind::Declaration,
+                        rewritable: true,
+                        label: None
+                    });
+                }
+            }
+        }
+    }
+    locs
+}
+
+/// How a function name relates to an importing `use` statement. Both
+/// goto-def and the unresolved-function diagnostic read this one verdict so
+/// they can never disagree on whether a name is resolvable as imported
+/// (NAV § (c): the divergent-export-surface root cause).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportResolution {
+    /// The name is brought into the caller's namespace: named in `qw(...)`,
+    /// pulled in by a `:tag` selector against the producer surface, or
+    /// auto-imported by a bare `use Foo;`. Goto-def jumps; the diagnostic
+    /// stays silent (the name is genuinely available here).
+    Brought,
+    /// The name is exported by the imported module but this `use` didn't
+    /// bring it in (e.g. a named `qw(other)` that omits it). Goto-def can
+    /// still jump to the def; the diagnostic offers the "exported but not
+    /// imported" hint.
+    ExportedNotBrought,
+}
+
+/// Classify a name against a single import. Routes through the consumer
+/// evaluator (`imported_names`) so the verdict is exactly "is this name in the
+/// bound set this `use` produces" — the single notion of import binding that
+/// diagnostics, goto-def, and references all read (NAV § (c)). Returns the
+/// resolved verdict plus the REMOTE (origin) name for the matched local name.
+///
+/// `cached` is the producer's `FileAnalysis` when known; its `export_surface`
+/// expands `:tag` selectors and supplies the `@EXPORT` defaults for a bare
+/// `use`. When absent (module not yet cached), the evaluator still binds
+/// explicitly-named `qw()` imports — those don't need the surface — so an
+/// explicit named import is never spuriously flagged while the resolver warms.
+fn classify_import(
+    import: &crate::file_analysis::Import,
+    func_name: &str,
+    cached: Option<&crate::file_analysis::CachedModule>,
+    module_index: &dyn CrossFileLookup,
+) -> Option<(ImportResolution, String)> {
+    if let Some(cached) = cached {
+        let surface = cached.analysis.export_surface_with_index(module_index);
+        let bound = crate::file_analysis::imported_names(import, &surface);
+        if let Some((_local, remote)) = bound.iter().find(|(local, _)| local == func_name) {
+            return Some((ImportResolution::Brought, remote.clone()));
+        }
+        // Not bound by this `use`, but on the producer surface → the actionable
+        // "exported but not imported" hint (a named `qw(other)` omitting it, or
+        // an `@EXPORT_OK` name reached only by a bare `use` — GATE-5).
+        if surface.exports(func_name) {
+            return Some((ImportResolution::ExportedNotBrought, func_name.to_string()));
+        }
+        return None;
+    }
+    // Module not cached yet: only an explicitly-named import can be judged
+    // `Brought` without the producer surface (tags / bare-use defaults need it).
+    // This keeps a `qw(foo)` import from being flagged while the resolver warms,
+    // and never resolves a bare/tagged name it can't actually verify.
+    if let Some(sym) = import.imported_symbols.iter().find(|s| s.local_name == *func_name) {
+        return Some((ImportResolution::Brought, sym.remote().to_string()));
+    }
+    None
+}
+
+/// Best resolution of `func_name` across all imports: the matched import, its
+/// remote name, the resolvability verdict, and — when known — the module path
+/// for navigation. `Brought` wins over `ExportedNotBrought` when several
+/// imports relate. The single resolvability query goto-def, the diagnostic, and
+/// references all read, so they can never disagree on the bound set.
+pub(crate) fn resolve_imported_function_classified<'b>(
+    analysis: &'b FileAnalysis,
+    func_name: &str,
+    module_index: &dyn CrossFileLookup,
+) -> Option<(&'b crate::file_analysis::Import, Option<PathBuf>, String, ImportResolution)> {
+    let mut best: Option<(
+        &'b crate::file_analysis::Import,
+        Option<PathBuf>,
+        String,
+        ImportResolution,
+    )> = None;
+    for import in &analysis.imports {
+        let cached = module_index.get_cached(&import.module_name);
+        let Some((res, remote)) = classify_import(import, func_name, cached.as_deref(), module_index) else { continue };
+        let path = cached.as_ref().map(|c| c.path.clone());
+        // `Brought` is the strongest verdict; once found, keep it.
+        if matches!(best, Some((_, _, _, ImportResolution::Brought))) {
+            continue;
+        }
+        best = Some((import, path, remote, res));
+    }
+    best
+}
+
+/// Find which import provides a given function name, with a concrete module
+/// path to jump to. Returns the matched Import, the module's path, and the
+/// REMOTE name (the sub's actual name in the source module — differs from the
+/// caller's `func_name` only for renaming imports like `del` → `delete`).
+/// Callers use the remote name for `cached.sub_info(...)` lookups so
+/// hover/gd/sig-help reach the real sub.
+pub(crate) fn resolve_imported_function<'b>(
+    analysis: &'b FileAnalysis,
+    func_name: &str,
+    module_index: &dyn CrossFileLookup,
+) -> Option<(&'b crate::file_analysis::Import, PathBuf, String)> {
+    // Goto-def needs a concrete module path to jump to.
+    resolve_imported_function_classified(analysis, func_name, module_index)
+        .and_then(|(import, path, remote, _)| path.map(|p| (import, p, remote)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetKind {
     /// An `our` (package-global) variable. `package` is the declaring
@@ -674,6 +1945,11 @@ pub struct RefLocation {
     /// References lists it (it's a real use); rename skips it (rewriting the
     /// variable would corrupt it). True for every literal occurrence.
     pub rewritable: bool,
+    /// A per-candidate fact worth surfacing beside the location — a macro
+    /// variant's reachability verdict, a delegation see-through note. LSP
+    /// `Location` has no label slot so the editor adapter drops it (ordering
+    /// conveys rank); the CLI renders it and the gold harness asserts on it.
+    pub label: Option<String>,
 }
 
 impl RefLocation {
@@ -808,6 +2084,7 @@ pub fn group_refs(
             span: *span,
             access: AccessKind::Read,
             rewritable: true,
+            label: None
         })
         .collect();
     out.extend(pinned_spans.iter().map(|(path, span)| RefLocation {
@@ -815,6 +2092,7 @@ pub fn group_refs(
         span: *span,
         access: AccessKind::Read,
         rewritable: true,
+        label: None
     }));
     for m in members {
         let mask = mask_override
@@ -840,13 +2118,14 @@ pub fn group_refs(
 /// Keyword/identifier-shape validation stays the client's job; this is the
 /// safety floor against silent corruption.
 pub fn is_valid_rename_name(new_name: &str) -> bool {
-    !new_name.trim().trim_start_matches(['$', '@', '%']).trim().is_empty()
+    !crate::conventions::strip_variable_sigils(new_name.trim()).trim().is_empty()
 }
 
 /// Rename edit set for a projection group: every span paired with ITS
 /// member's replacement text (bare for plain spellings, re-derived for
 /// affixed accessors). Bare-member spans win collisions — a synthesized
 /// accessor's decl token IS the group decl the bare edit covers.
+#[allow(clippy::too_many_arguments)]
 pub fn group_rename_edits(
     files: &FileStore,
     module_index: Option<&dyn CrossFileLookup>,
@@ -855,12 +2134,13 @@ pub fn group_rename_edits(
     pinned_spans: &[(PathBuf, Span)],
     members: &[GroupMember],
     bare_new: &str,
+    mask: RoleMask,
 ) -> Vec<(RefLocation, String)> {
     let mut out: Vec<(RefLocation, String)> = local_spans
         .iter()
         .map(|span| {
             (
-                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true },
+                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true, label: None},
                 bare_new.to_string(),
             )
         })
@@ -872,6 +2152,7 @@ pub fn group_rename_edits(
                 span: *span,
                 access: AccessKind::Read,
                 rewritable: true,
+                label: None
             },
             bare_new.to_string(),
         )
@@ -889,49 +2170,13 @@ pub fn group_rename_edits(
     );
     for m in ordered {
         let Some(text) = m.rename.text_for(bare_new) else { continue };
-        for loc in refs_to(files, module_index, &m.target, RoleMask::EDITABLE) {
+        for loc in refs_to(files, module_index, &m.target, mask) {
             out.push((loc, text.clone()));
         }
     }
     let mut seen = std::collections::HashSet::new();
     out.retain(|(loc, _)| seen.insert((key_for_sort(&loc.key), loc.span)));
     out
-}
-
-/// The rename edit set for a cross-file target, or a refusal. The ONE policy
-/// point both rename entry points (LSP handler + CLI) share, so what rename
-/// edits — and what it declines — can't diverge between them.
-///
-/// `pack` = the query is routed through a per-language sub-index (the caller's
-/// routing fact, mirroring the references handlers). Two policy consequences:
-///
-/// * mask widens to VISIBLE — pack workspace files ride the DEPENDENCY role
-///   (a storage artifact of the per-language cache, which registers only
-///   workspace-walk files, so VISIBLE still can't reach anything outside the
-///   project). EDITABLE would silently drop every non-open pack file and emit
-///   a partial edit that breaks the code on apply.
-/// * a set containing an alias-spelled site (a use through a delegating
-///   `#define`, `rewritable: false`) REFUSES: the macro's body isn't a
-///   collected span, so renaming the target would leave the delegation chain
-///   pointing at the old name — a silent semantic break. Perl's non-rewritable
-///   sites (variable-folded dispatch) keep their long-standing skip.
-pub fn rename_locations(
-    files: &FileStore,
-    module_index: Option<&dyn CrossFileLookup>,
-    target: &TargetRef,
-    pack: bool,
-) -> Result<Vec<RefLocation>, String> {
-    let mask = if pack { RoleMask::VISIBLE } else { RoleMask::EDITABLE };
-    let locations = refs_to(files, module_index, target, mask);
-    if pack && locations.iter().any(|l| !l.rewritable) {
-        return Err(format!(
-            "rename of `{}` would leave sites spelled through a delegating macro \
-             unchanged (the macro body is not rewritten) — refusing rather than \
-             emitting a partial edit",
-            target.name
-        ));
-    }
-    Ok(locations)
 }
 
 /// Collect every reference to `target` across the masked file set.
@@ -955,17 +2200,25 @@ pub fn refs_to(
     // Open files (canonical — workspace entries for open paths are skipped).
     let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if mask.contains(RoleMask::OPEN) {
-        files.for_each_open_mut(|url, doc| {
+        files.for_each_open(|url, doc| {
             let url = url.clone();
             if let Ok(p) = url.to_file_path() {
                 covered_paths.insert(p);
             }
-            collect_from_analysis(&FileKey::Url(url), &doc.analysis, target, &aliases, module_index, &mut out);
+            // The walk applies visibility: role mask picked the tier, the
+            // closure gate decides per file (`file_sees_target`); the
+            // matcher below only matches.
+            let key = FileKey::Url(url);
+            let file_str = canonical_file_str(&key);
+            if !file_sees_target(target, &doc.analysis, &file_str) {
+                return;
+            }
+            collect_from_analysis(&key, &doc.analysis, target, &aliases, module_index, &file_str, &mut out);
         });
     } else {
         // Even if open isn't in the mask, track the paths so a WORKSPACE walk
         // doesn't duplicate them (an open file's pre-close state isn't meaningful).
-        files.for_each_open_mut(|url, _doc| {
+        files.for_each_open(|url, _doc| {
             if let Ok(p) = url.to_file_path() {
                 covered_paths.insert(p);
             }
@@ -979,7 +2232,12 @@ pub fn refs_to(
                 continue;
             }
             covered_paths.insert(entry.key().clone());
-            collect_from_analysis(&FileKey::Path(entry.key().clone()), entry.value(), target, &aliases, module_index, &mut out);
+            let key = FileKey::Path(entry.key().clone());
+            let file_str = canonical_file_str(&key);
+            if !file_sees_target(target, entry.value(), &file_str) {
+                continue;
+            }
+            collect_from_analysis(&key, entry.value(), target, &aliases, module_index, &file_str, &mut out);
         }
     }
 
@@ -994,7 +2252,11 @@ pub fn refs_to(
                     return;
                 }
                 let key = FileKey::Path(cached.path.clone());
-                collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &mut out);
+                let file_str = canonical_file_str(&key);
+                if !file_sees_target(target, &cached.analysis, &file_str) {
+                    return;
+                }
+                collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &file_str, &mut out);
             });
         }
     }
@@ -1094,6 +2356,7 @@ pub fn implementations_of(
                         span: s.selection_span,
                         access: AccessKind::Declaration,
                         rewritable: true,
+                        label: None
                     });
                 }
             }
@@ -1150,6 +2413,7 @@ fn specialization_family(
                         span: s.selection_span,
                         access: AccessKind::Declaration,
                         rewritable: false,
+                        label: None
                     });
                 }
             }
@@ -1208,7 +2472,10 @@ fn delegation_aliases(
             }
         }
     };
-    files.for_each_open_mut(|url, doc| {
+    // Read-only walk: handlers hold their open-doc READ guard across
+    // projections (the set's borrow discipline), so a write lock here
+    // deadlocks the moment a diagnostics refresh queues behind it.
+    files.for_each_open(|url, doc| {
         let path = url
             .to_file_path()
             .map(|p| {
@@ -1253,6 +2520,190 @@ fn delegation_aliases(
     }
     out.sort_by(|a, b| (&a.name, &a.def_path).cmp(&(&b.name, &b.def_path)));
     out
+}
+
+/// The identifier under `point` in `source`, or `None` if the cursor is not
+/// on a `[A-Za-z0-9_]` word. Byte-scan (macros vanish from the analysis under
+/// the expand-and-reparse policy, so the raw word is the reliable key).
+pub fn word_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
+    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
+    let b = source.as_bytes();
+    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    if cursor > b.len() {
+        return None;
+    }
+    let mut start = cursor;
+    while start > 0 && is_id(b[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < b.len() && is_id(b[end]) {
+        end += 1;
+    }
+    (start < end).then(|| &source[start..end])
+}
+
+/// Every `#define` of `word` across the origin file + the cached modules,
+/// ranked config-active first by the SAME total order goto-def and hover both
+/// consume (`docs/adr/macro-handling.md`): reachability rank, then
+/// (path, row, col) so the winner is deterministic across processes (the
+/// cache iterates in randomized DashMap order). Empty when `word` names no
+/// macro. This is the one place the variant set is gathered +
+/// reachability-classified — `definitions()` returns all of them (never
+/// pruned), hover walks the top one's alias chain to its leaf.
+pub(crate) fn ranked_macro_variants(
+    analysis: &FileAnalysis,
+    word: &str,
+    origin_key: &FileKey,
+    module_index: &dyn CrossFileLookup,
+) -> Vec<(crate::file_analysis::MacroDef, FileKey, crate::cpp_macro_model::Reachability)> {
+    use crate::cpp_macro_model::classify;
+    use crate::file_analysis::MacroDef;
+    use std::collections::HashSet;
+
+    // One pass over every cached module + this file: collect the def sites for
+    // `word` (config variants live in different headers — win32.h vs perl.h; we
+    // keep them ALL, never the last-writer only) AND the reachability config
+    // (the whole macro universe). Enumerating the cache directly is robust to a
+    // cold reverse index — `modules_with_symbol` can be empty before it warms.
+    let mut sites: Vec<(MacroDef, FileKey)> = Vec::new();
+    let mut seen: HashSet<(PathBuf, usize, usize)> = HashSet::new();
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut universe: HashSet<String> = HashSet::new();
+    let mut push = |m: &MacroDef, k: &FileKey, sites: &mut Vec<(MacroDef, FileKey)>| {
+        let key = (key_for_sort(k), m.selection_span.start.row, m.selection_span.start.column);
+        if seen.insert(key) {
+            sites.push((m.clone(), k.clone()));
+        }
+    };
+    let note = |m: &MacroDef, defined: &mut HashSet<String>, universe: &mut HashSet<String>| {
+        universe.insert(m.name.clone());
+        if m.guards.is_empty() {
+            defined.insert(m.name.clone());
+        }
+    };
+    for m in &analysis.macro_defs {
+        note(m, &mut defined, &mut universe);
+        if m.name == word {
+            push(m, origin_key, &mut sites);
+        }
+    }
+    // Per-FILE sweep: the name-keyed cache view both repeats files and hides
+    // a file that lost every name tie.
+    module_index.for_each_cached_file(&mut |cached| {
+        let file_key = FileKey::Path(cached.path.clone());
+        for m in &cached.analysis.macro_defs {
+            note(m, &mut defined, &mut universe);
+            if m.name == word {
+                push(m, &file_key, &mut sites);
+            }
+        }
+    });
+
+    if sites.is_empty() {
+        return Vec::new();
+    }
+
+    // The include-guard idiom `#ifndef X … #define X … #endif` guards a macro's
+    // definition on its OWN not-yet-defined-ness. At that guard X is not yet
+    // defined, so X's own name must not count as `defined` when ranking X's
+    // variants — else every arm reads as unreachable. General over the pattern,
+    // not a per-name rule.
+    defined.remove(word);
+    // Toolchain predefined macros (`__GNUC__`, …) are ON here exactly as they
+    // are in build-side variant selection — navigation and minting share the
+    // one seeding point so they can't disagree on which arm is Active.
+    let cfg = crate::cpp_reparse::known_config_with_toolchain(defined, universe);
+
+    // Rank, active-first. Never prune — a lower-ranked (e.g. win32) def stays,
+    // labeled. The secondary (path, line, col) key is a TOTAL order so the
+    // result is deterministic across processes.
+    let mut ranked: Vec<(MacroDef, FileKey, _)> = sites
+        .into_iter()
+        .map(|(m, k)| {
+            let r = classify(&m.guards, &cfg);
+            (m, k, r)
+        })
+        .collect();
+    ranked.sort_by(|(ma, ka, ra), (mb, kb, rb)| {
+        ra.rank()
+            .cmp(&rb.rank())
+            .then_with(|| key_for_sort(ka).cmp(&key_for_sort(kb)))
+            .then_with(|| ma.selection_span.start.row.cmp(&mb.selection_span.start.row))
+            .then_with(|| ma.selection_span.start.column.cmp(&mb.selection_span.start.column))
+    });
+    ranked
+}
+
+/// Resolve a pack-language symbol NAME (a delegate callee, a free function) to
+/// its def location — local symbols and the cross-file index, preferring a
+/// DEFINITION over a prototype: a definition's body mints a scope spanning
+/// the symbol (the universal `(function_definition) @scope`), a declaration
+/// doesn't, so `fix_optchain` see-through lands in op.c, not proto.h. Ties
+/// break local-first then (path, position) so the pick is deterministic
+/// across the cache's randomized iteration order.
+fn pack_symbol_def_location(
+    analysis: &FileAnalysis,
+    origin_key: &FileKey,
+    name: &str,
+    module_index: &dyn CrossFileLookup,
+) -> Option<RefLocation> {
+    let wanted = |k: &SymKind| matches!(k, SymKind::Sub | SymKind::Variable | SymKind::Class);
+    let has_body = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
+        a.scopes.iter().any(|sc| sc.span == s.span)
+    };
+    // (bodied, local, path, row, col) — the bodied/local flags are inverted
+    // in the sort below so `true` ranks first.
+    let mut candidates: Vec<(bool, bool, PathBuf, usize, usize, RefLocation)> = Vec::new();
+    for sym in analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+        candidates.push((
+            has_body(analysis, sym),
+            true,
+            key_for_sort(origin_key),
+            sym.selection_span.start.row,
+            sym.selection_span.start.column,
+            RefLocation {
+                key: origin_key.clone(),
+                span: sym.selection_span,
+                access: AccessKind::Declaration,
+                rewritable: true,
+                label: None,
+            },
+        ));
+    }
+    // The FULL candidate table for `name` — a definition legitimately lives
+    // in a file the one-winner `get_cached` view (or the include closure)
+    // never serves (`Perl_fix_optchain`'s body is in peep.c; proto.h wins
+    // the scoped lookup).
+    let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for cached in module_index.def_candidates(name) {
+        if !seen_paths.insert(cached.path.clone()) {
+            continue;
+        }
+        for sym in cached.analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+            candidates.push((
+                has_body(&cached.analysis, sym),
+                false,
+                cached.path.clone(),
+                sym.selection_span.start.row,
+                sym.selection_span.start.column,
+                RefLocation {
+                    key: FileKey::Path(cached.path.clone()),
+                    span: sym.selection_span,
+                    access: AccessKind::Declaration,
+                    rewritable: true,
+                    label: None,
+                },
+            ));
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0) // bodied first
+            .then_with(|| b.1.cmp(&a.1)) // then local
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| (a.3, a.4).cmp(&(b.3, b.4)))
+    });
+    candidates.into_iter().next().map(|c| c.5)
 }
 
 fn key_for_sort(k: &FileKey) -> PathBuf {
@@ -1496,7 +2947,7 @@ pub fn references_mask_for(
     target: &TargetRef,
 ) -> RoleMask {
     let mut found_in_editable = false;
-    files.for_each_open_mut(|_url, doc| {
+    files.for_each_open(|_url, doc| {
         if doc.analysis.symbols.iter().any(|s| symbol_defines_target(s, target, &doc.analysis)) {
             found_in_editable = true;
         }
@@ -1584,6 +3035,7 @@ fn collect_package_var(
                 span: tail(sym.selection_span),
                 access: AccessKind::Declaration,
                 rewritable: true,
+                label: None
             });
         }
     }
@@ -1600,6 +3052,7 @@ fn collect_package_var(
                     span: tail(r.span),
                     access: r.access,
                     rewritable: true,
+                    label: None
                 });
             }
         } else if r.target_name == name && r.resolves_to.is_some_and(is_our_decl) {
@@ -1609,9 +3062,39 @@ fn collect_package_var(
                 span: tail(r.span),
                 access: r.access,
                 rewritable: true,
+                label: None
             });
         }
     }
+}
+
+/// The closure-connectivity half of the visibility axis (RoleMask is the
+/// role half): may `analysis` — living at canonical `file_str` — see one of
+/// the target's defining files? A scanned file whose closure reaches none of
+/// them can't be referring to the target: its same-named tokens resolve (or
+/// would resolve) to something else entirely (an unrelated TU's static,
+/// another header's same-named struct/enum, a Perl `croak` half a workspace
+/// away). Empty `def_paths` (every Perl target, unscoped callers) = no gate.
+/// Applied by the WALK driver (`refs_to`) before a file is scanned — decls
+/// included, so two same-named statics never cross-list — which is what
+/// makes every projection that walks inherit it (arc-review C1's fix, owned
+/// by the seam, not the matcher).
+fn file_sees_target(target: &TargetRef, analysis: &FileAnalysis, file_str: &str) -> bool {
+    target.def_paths.is_empty()
+        || target
+            .def_paths
+            .iter()
+            .any(|d| d == file_str || analysis.include_closure.iter().any(|c| c == d))
+}
+
+/// A `FileKey`'s canonical path string — the spelling the visibility facts
+/// (`def_paths`, alias def sites, include closures) are keyed in.
+fn canonical_file_str(key: &FileKey) -> String {
+    let file_path = key_for_sort(key);
+    std::fs::canonicalize(&file_path)
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn collect_from_analysis(
@@ -1620,34 +3103,10 @@ fn collect_from_analysis(
     target: &TargetRef,
     aliases: &[DelegationAlias],
     module_index: Option<&dyn CrossFileLookup>,
+    file_str: &str,
     out: &mut Vec<RefLocation>,
 ) {
     use crate::file_analysis::HashKeyOwner;
-
-    // This file's canonical path — the key both visibility gates below compare
-    // against (def_paths / alias def sites are canonical strings).
-    let file_path = key_for_sort(key);
-    let file_str = std::fs::canonicalize(&file_path)
-        .unwrap_or(file_path)
-        .to_string_lossy()
-        .into_owned();
-
-    // A pack target's identity includes VISIBILITY — the same
-    // include-closure model forward resolution uses. A scanned file whose
-    // closure reaches none of the target's defining files can't be referring
-    // to it: its same-named tokens resolve (or would resolve) to something
-    // else entirely (an unrelated TU's static, another header's same-named
-    // struct/enum, a Perl `croak` half a workspace away). Skip the whole
-    // file — decls included, so two same-named statics never cross-list.
-    // Empty `def_paths` (every Perl target, unscoped callers) = no gate.
-    if !target.def_paths.is_empty() {
-        let sees = target.def_paths.iter().any(|d| {
-            *d == file_str || analysis.include_closure.iter().any(|c| c == d)
-        });
-        if !sees {
-            return;
-        }
-    }
 
     // An alias applies in THIS file only if its `#define` is visible here
     // (macro expansion requires inclusion). Files of another language have
@@ -1721,6 +3180,7 @@ fn collect_from_analysis(
                 span: sym.selection_span,
                 access: AccessKind::Declaration,
                 rewritable: rewritable_at(sym.selection_span),
+                label: None
             });
         }
     }
@@ -1969,6 +3429,7 @@ fn collect_from_analysis(
                 span,
                 access: r.access,
                 rewritable: !alias_matched && rewritable_at(span),
+                label: None
             });
             // A call folded from a variable (`my $m = 'process'; $self->$m()`)
             // has a non-rewritable name token above; the rewrite belongs on the
@@ -1979,6 +3440,7 @@ fn collect_from_analysis(
                     span: src,
                     access: r.access,
                     rewritable: rewritable_at(src),
+                    label: None
                 });
             }
         }
@@ -1999,6 +3461,7 @@ fn collect_from_analysis(
                     span: applied.span,
                     access: AccessKind::Read,
                     rewritable: rewritable_at(applied.span),
+                    label: None
                 });
             }
         }

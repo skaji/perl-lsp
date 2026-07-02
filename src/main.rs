@@ -1076,11 +1076,8 @@ fn run_one(
             let pack = lang_id.and_then(|lang| idx.pack_index(lang));
             let base_idx: &dyn crate::file_analysis::CrossFileLookup =
                 pack.as_deref().map_or(idx as &dyn crate::file_analysis::CrossFileLookup, |i| i);
-            // Resolve names against this file's include closure (matches the LSP).
-            let scoped = crate::file_analysis::ScopedLookup::new(
-                base_idx, &analysis.include_closure, Some(abs.as_path()));
-            let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
             // `#include "x.h"` path → the resolved header (`#include` = `use`).
+            // A path token, not a name — slot-shaped, stays ahead of the set.
             if lang_id == Some("cpp") {
                 if let Some(loc) = symbols::pack_include_definition(&analysis, point, Some(abs.as_path())) {
                     let path = loc.uri.to_file_path().map(|p| p.display().to_string())
@@ -1088,55 +1085,39 @@ fn run_one(
                     return Ok(format!("{}:{}:{}", path, loc.range.start.line + 1, loc.range.start.character + 1));
                 }
             }
-            // Macro-aware goto-def owns a macro-named word — ranked, all sites
-            // kept (labeled), see-through delegate appended. `docs/adr/macro-handling.md`.
+            let _ = &uri;
+            // Forward projection of the set (mirrors the LSP handler): the
+            // source text unlocks the macro variant lane for pack routing.
+            // Print EVERY offered location (one per line), ranked as
+            // returned — macro variants config-active first (labels shown),
+            // a domain-typed field decl FIRST then its domain enum def.
+            let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
+            let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let mut cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(abs), point,
+                Some(base_idx), resolve::OverrideScope::default(),
+            )
+            .with_source(&source);
             if pack.is_some() {
-                if let Some(macros) =
-                    symbols::pack_macro_definition(&analysis, &source, point, &uri, xidx)
-                {
-                    let mut sources = SourceCache::new();
-                    let mut lines = Vec::new();
-                    for m in macros {
-                        let path = m.uri.to_file_path().map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| m.uri.to_string());
-                        let (line, col) = sources.display(
-                            &path, m.range.start.line as usize, m.range.start.character as usize);
-                        let label = m.label.map(|l| format!("  ({l})")).unwrap_or_default();
-                        lines.push(format!("{}:{}:{}{}", path, line, col, label));
-                    }
-                    return Ok(lines.join("\n"));
-                }
+                cs = cs.pack_routed();
             }
-            // Pack cross-file symbol goto-def uses the include-scoped pack index;
-            // Perl's module-keyed lookup is unaffected (empty closure = the hub).
-            if let Some(resp) = symbols::find_definition(&analysis, pos, &uri, xidx) {
-                use tower_lsp::lsp_types::GotoDefinitionResponse;
-                // Print EVERY offered location (one per line), ranked as
-                // returned: a plain goto-def yields one; a domain-typed field
-                // yields the field decl FIRST then its domain enum def.
-                let locs: Vec<tower_lsp::lsp_types::Location> = match resp {
-                    GotoDefinitionResponse::Scalar(loc) => vec![loc],
-                    GotoDefinitionResponse::Array(v) => v,
-                    GotoDefinitionResponse::Link(v) => v
-                        .into_iter()
-                        .map(|l| tower_lsp::lsp_types::Location {
-                            uri: l.target_uri,
-                            range: l.target_range,
-                        })
-                        .collect(),
-                };
-                if !locs.is_empty() {
-                    let mut sources = SourceCache::new();
-                    let mut lines = Vec::new();
-                    for loc in locs {
-                        let path = loc.uri.to_file_path().map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| loc.uri.to_string());
-                        let (line, col) = sources.display(
-                            &path, loc.range.start.line as usize, loc.range.start.character as usize);
-                        lines.push(format!("{}:{}:{}", path, line, col));
-                    }
-                    return Ok(lines.join("\n"));
+            let locs = cs.definitions();
+            if !locs.is_empty() {
+                let mut sources = SourceCache::new();
+                let mut lines = Vec::new();
+                for loc in locs {
+                    let path = match &loc.key {
+                        file_store::FileKey::Path(p) => p.display().to_string(),
+                        file_store::FileKey::Url(u) => u.to_file_path()
+                            .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+                    };
+                    let (line, col) = sources.display(
+                        &path, loc.span.start.row, loc.span.start.column);
+                    let label = loc.label.map(|l| format!("  ({l})")).unwrap_or_default();
+                    lines.push(format!("{}:{}:{}{}", path, line, col, label));
                 }
+                return Ok(lines.join("\n"));
             }
             Err(format!("No definition found at {}:{}", req.line, req.col))
         }
@@ -1172,58 +1153,29 @@ fn run_one(
                     return Ok(serde_json::to_string_pretty(&results).unwrap());
                 }
             }
-            // Clone the closure: `analysis` is moved into the staged
-            // workspace entry below while the scoped view must stay usable
-            // for the Local-arm fallback.
-            let closure = analysis.include_closure.clone();
-            let scoped = crate::file_analysis::ScopedLookup::new(
-                base_idx, &closure, Some(file_path.as_path()));
-            let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-            let resolved = resolve::resolve_symbol_scoped(&analysis, point, Some(xidx), override_scope_from_env());
-            // (The reverse domain bridge — enum type → field-slot sites — is
-            // an implementations projection, NOT part of plain references;
-            // see `symbols::domain_backrefs`.)
-            match resolved {
-                Some(resolve::ResolvedTarget::Local) | None => {
-                    let path_str = file_path.display().to_string();
-                    for span in &analysis.find_references(point, Some(xidx)) {
-                        let (line, col) = sources.display(&path_str, span.start.row, span.start.column);
-                        results.push(serde_json::json!({"file": path_str, "line": line, "col": col}));
-                    }
-                }
-                Some(resolved) => {
-                    let origin = file_store::FileKey::Path(file_path.clone());
-                    let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
-                    let locs = match resolved {
-                        resolve::ResolvedTarget::Target(t) => {
-                            // Pack files live in the per-language cache (the
-                            // DEPENDENCY role), not the Perl workspace store —
-                            // VISIBLE reaches them; `references_mask_for`'s
-                            // editable-scoping is a Perl/CPAN concern.
-                            let mask = if pack.is_some() {
-                                resolve::RoleMask::VISIBLE
-                            } else {
-                                resolve::references_mask_for(ws, Some(base_idx), &t)
-                            };
-                            resolve::refs_to(ws, Some(base_idx), &t, mask)
-                        }
-                        resolve::ResolvedTarget::Group { local_spans, pinned_spans, members } => {
-                            resolve::group_refs(
-                                ws, Some(base_idx), &origin, &local_spans, &pinned_spans, &members, None,
-                            )
-                        }
-                        resolve::ResolvedTarget::Local => unreachable!("handled above"),
-                    };
-                    for loc in locs {
-                        let path = match &loc.key {
-                            file_store::FileKey::Path(p) => p.display().to_string(),
-                            file_store::FileKey::Url(u) => u.to_file_path()
-                                .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
-                        };
-                        let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
-                        results.push(serde_json::json!({"file": path, "line": line, "col": col}));
-                    }
-                }
+            // Stage the enriched origin, then construct the set from the
+            // staged snapshot — the same one-construction/one-projection
+            // shape as the LSP handler, so CLI and editor answers can't
+            // diverge. Pack routing + the origin's closure scope are
+            // construction facts on the set.
+            let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
+            let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let mut cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(file_path), point,
+                Some(base_idx), override_scope_from_env(),
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            for loc in cs.references() {
+                let path = match &loc.key {
+                    file_store::FileKey::Path(p) => p.display().to_string(),
+                    file_store::FileKey::Url(u) => u.to_file_path()
+                        .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+                };
+                let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
+                results.push(serde_json::json!({"file": path, "line": line, "col": col}));
             }
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
@@ -1231,47 +1183,41 @@ fn run_one(
             let (_s, _t, mut analysis) = parse_file(file);
             resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
+            let file_path = std::path::Path::new(file).canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(file));
             let mut sources = SourceCache::new();
             let mut results = Vec::new();
-            // Reverse domain bridge (mirrors the LSP goto_implementation):
-            // an enum TYPE's def fans out to the field-slot sites whose
-            // recovered domain is that enum. Pack routing — the sites live
-            // in pack-language files the Perl hub doesn't know.
+            // Same pack routing as the LSP handler, declared at construction,
+            // so the CLI mirror can't diverge: the domain bridge (enum def →
+            // field-slot sites) and the family/spec walks are one projection.
             let reg = language_driver::LanguageRegistry::with_enabled();
             let pack = reg
                 .for_path(std::path::Path::new(file))
                 .map(|d| d.id())
                 .filter(|id| *id != "perl")
                 .and_then(|lang| idx.pack_index(lang));
-            if let Some(pidx) = pack.as_deref() {
-                for (path, span) in symbols::domain_backrefs(&analysis, point, pidx) {
-                    let ps = path.display().to_string();
-                    let (line, col) = sources.display(&ps, span.start.row, span.start.column);
-                    results.push(serde_json::json!({"file": ps, "line": line, "col": col}));
-                }
-            }
-            // Same pack routing + include-closure scope as the LSP handler,
-            // so the CLI mirror can't diverge (pack targets — spec families —
-            // resolve against the pack index, not the Perl hub).
             let base_idx: &dyn file_analysis::CrossFileLookup = match pack.as_deref() {
                 Some(i) => i,
                 None => idx,
             };
-            let self_path = std::fs::canonicalize(file).ok();
-            let scoped = file_analysis::ScopedLookup::new(
-                base_idx, &analysis.include_closure, self_path.as_deref());
-            if let Some(resolve::ResolvedTarget::Target(t)) =
-                resolve::resolve_symbol(&analysis, point, Some(&scoped))
-            {
-                for loc in resolve::implementations_of(&analysis, Some(&scoped), &t) {
-                    let path = match &loc.key {
-                        file_store::FileKey::Path(p) => p.display().to_string(),
-                        file_store::FileKey::Url(u) => u.to_file_path()
-                            .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
-                    };
-                    let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
-                    results.push(serde_json::json!({"file": path, "line": line, "col": col}));
-                }
+            let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
+            let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let mut cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(file_path), point,
+                Some(base_idx), resolve::OverrideScope::default(),
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            for loc in cs.implementations() {
+                let path = match &loc.key {
+                    file_store::FileKey::Path(p) => p.display().to_string(),
+                    file_store::FileKey::Url(u) => u.to_file_path()
+                        .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+                };
+                let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
+                results.push(serde_json::json!({"file": path, "line": line, "col": col}));
             }
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
@@ -1319,10 +1265,13 @@ fn run_one(
             // path the LSP server uses; Perl keeps cursor-context.
             let items = if doc.language != "perl" {
                 tphase!("completion_items", backend::pack_completion(
-                    &doc.analysis, &doc.text, &doc.tree, point, doc.language,
+                    ws, &doc.analysis, &doc.text, &doc.tree, point, doc.language,
                     doc.path.as_deref(), idx).0)
             } else {
+                let file_path = std::path::Path::new(file).canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(file));
                 tphase!("completion_items", symbols::completion_items(
+                    ws, &file_store::FileKey::Path(file_path),
                     &doc.analysis, &doc.tree, &doc.text, pos, idx,
                     Some(doc.stable_outline.package_lines())))
             };
@@ -1550,70 +1499,37 @@ fn run_rename(
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
     let (_s, _t, mut analysis) = parse_file(file);
     analysis.enrich_imported_types_with_keys(Some(idx));
-    // Pack languages resolve + collect through their sub-index, scoped to
-    // this file's include closure — the same routing references uses, so
-    // rename can't act on a different target than references just listed.
+    // Same shape as the LSP handler: pack routing declared at construction,
+    // stage the origin, construct the set once, project the rename — the
+    // per-arm policy (cross-file vs group vs single-file, rewritability,
+    // the pack full-or-refuse) lives on the set.
     let reg = language_driver::LanguageRegistry::with_enabled();
     let lang_id = reg.for_path(std::path::Path::new(file))
         .map(|d| d.id()).filter(|id| *id != "perl");
     let pack = lang_id.and_then(|lang| idx.pack_index(lang));
     let base_idx: &dyn crate::file_analysis::CrossFileLookup =
         pack.as_deref().map_or(idx as &dyn crate::file_analysis::CrossFileLookup, |i| i);
-    let closure = analysis.include_closure.clone();
-    let scoped = crate::file_analysis::ScopedLookup::new(
-        base_idx, &closure, Some(file_path.as_path()));
-    let resolved = resolve::resolve_symbol_scoped(&analysis, point, Some(&scoped), override_scope_from_env())
-        .ok_or_else(|| format!("Nothing renameable at {}:{}", point.row, point.column))?;
+    let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
+    let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
+        .expect("origin staged above");
+    let mut cs = resolve::resolve(
+        ws, &origin, file_store::FileKey::Path(file_path), point,
+        Some(base_idx), override_scope_from_env(),
+    );
+    if pack.is_some() {
+        cs = cs.pack_routed();
+    }
+    if cs.resolution().is_none() {
+        return Err(format!("Nothing renameable at {}:{}", point.row, point.column));
+    }
     let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-    let (locations, replacement) = match resolved {
-        resolve::ResolvedTarget::Target(t) if t.supports_cross_file_rename() => {
-            let _staged = ScopedWorkspaceEntry::insert(ws, file_path, analysis);
-            (
-                resolve::rename_locations(ws, Some(base_idx), &t, pack.is_some())?,
-                new_name.to_string(),
-            )
-        }
-        resolve::ResolvedTarget::Group { local_spans, pinned_spans, members } => {
-            // Per-member replacement texts (bare vs affixed accessors).
-            let origin = file_store::FileKey::Path(file_path.clone());
-            let _staged = ScopedWorkspaceEntry::insert(ws, file_path, analysis);
-            let bare_new = new_name.trim_start_matches(['$', '@', '%']);
-            let edits = resolve::group_rename_edits(
-                ws, Some(idx), &origin, &local_spans, &pinned_spans, &members, bare_new,
-            );
-            for (loc, text) in edits {
-                let path = match &loc.key {
-                    file_store::FileKey::Path(p) => p.display().to_string(),
-                    file_store::FileKey::Url(u) => u.to_file_path()
-                        .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
-                };
-                all_edits.entry(path).or_default().push(span_to_json(loc.span, text));
-            }
-            return Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap());
-        }
-        // Lexical variables, hash keys, handlers: single-file rename — the
-        // same policy split the LSP rename handler reads off the target.
-        _ => {
-            if let Some(edits) = analysis.rename_at(point, new_name) {
-                let json_edits: Vec<_> = edits.into_iter()
-                    .map(|(span, text)| span_to_json(span, text)).collect();
-                all_edits.insert(file_path.display().to_string(), json_edits);
-            }
-            return Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap());
-        }
-    };
-    for loc in locations {
-        // A non-rewritable site (a const-folded event name spelled by a
-        // variable) is a reference, not a renameable literal — skip it.
-        if !loc.rewritable {
-            continue;
-        }
+    for (loc, text) in cs.rename_edits(new_name)? {
         let path = match &loc.key {
             file_store::FileKey::Path(p) => p.display().to_string(),
             file_store::FileKey::Url(u) => u.to_file_path()
                 .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
         };
-        all_edits.entry(path).or_default().push(span_to_json(loc.span, replacement.clone()));
+        all_edits.entry(path).or_default().push(span_to_json(loc.span, text));
     }
     Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap())
 }

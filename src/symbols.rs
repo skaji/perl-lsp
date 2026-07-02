@@ -4,12 +4,12 @@ use tree_sitter::{Point, Tree};
 
 use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
-    contains_point, format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
+    format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
     HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
-    SymKind as FaSymKind, SymbolDetail, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
-    PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
+    SymKind as FaSymKind, SymbolDetail,
 };
 use crate::module_index::{CachedModule, ModuleIndex, SubInfo};
+use crate::resolve::{resolve_imported_function, ImportResolution};
 use std::sync::Arc;
 
 // ---- Coordinate conversion ----
@@ -177,565 +177,40 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
-/// Reverse domain bridge, **enum-TYPE grain only**: given the cursor is on an
-/// enum's own def, the field-slot sites across the project whose recovered
-/// domain is that enum (`enum opcode` → the `op_type` uses). Scans the cached
-/// modules' stored `domain_sites` (a targeted lookup keyed on the enum, not a
-/// witness sweep). `(path, slot_span)` per site.
-///
-/// Deliberately NOT reachable from an enumerator (def or use): a variant's
-/// relation to the field is "member of the domain enum", not a reference —
-/// traversing the bridge from `OP_SCOPE` fanned its ~56 real references out
-/// to every one of the field's ~950 sites. The fan-out is an
-/// implementations-style projection on the TYPE, so it is served by the
-/// goto-implementation handlers, never mixed into plain references.
-pub fn domain_backrefs(
-    analysis: &FileAnalysis,
-    point: Point,
-    module_index: &dyn CrossFileLookup,
-) -> Vec<(std::path::PathBuf, crate::file_analysis::Span)> {
-    use crate::file_analysis::SymKind;
-    let target = analysis.symbol_at(point).and_then(|sym| match sym.kind {
-        // The enum def itself.
-        SymKind::Class => Some(sym.name.clone()),
-        _ => None,
-    });
-    let Some(enum_name) = target else { return Vec::new() };
-    let mut out: Vec<(std::path::PathBuf, crate::file_analysis::Span)> = Vec::new();
-    module_index.for_each_cached_file(&mut |cached| {
-        for span in cached.analysis.field_sites_for_enum(&enum_name, Some(module_index)) {
-            out.push((cached.path.clone(), span));
-        }
-    });
-    out
-}
-
-/// The def location of a data field `field` on `class` (or an ancestor) —
-/// local Symbol or a cross-file member — the SAME resolution the member
-/// goto-def branch produces. Shared with the domain bridge so the field's
-/// own decl stays the primary target while the enum is offered alongside.
-fn member_field_def_location(
-    analysis: &FileAnalysis,
-    class: &str,
-    field: &str,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Option<Location> {
-    use crate::file_analysis::{MethodResolution, SymKind};
-    match analysis.resolve_method_in_ancestors(class, field, Some(module_index))? {
-        MethodResolution::Local { sym_id, .. } => Some(Location {
-            uri: uri.clone(),
-            range: span_to_range(analysis.symbol(sym_id).selection_span),
-        }),
-        MethodResolution::CrossFile { class, def_module } => {
-            let module = def_module.as_deref().unwrap_or(&class);
-            let cached = module_index.get_cached(module)?;
-            let sym = cached.analysis.symbols.iter().find(|s| {
-                matches!(s.kind, SymKind::Variable | SymKind::Field)
-                    && s.name == field
-                    && s.package.as_deref() == Some(class.as_str())
-            })?;
-            let uri = Url::from_file_path(&cached.path).ok()?;
-            Some(Location { uri, range: span_to_range(sym.selection_span) })
-        }
-    }
-}
-
-/// The def location of a named type (a Class symbol — enum/struct/typedef),
-/// local first, then cross-file by name. Used by the domain bridge to offer
-/// the enum def alongside a domain-typed field.
-fn type_def_location(
-    analysis: &FileAnalysis,
-    type_name: &str,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Option<Location> {
-    use crate::file_analysis::SymKind;
-    if let Some(sym) = analysis
-        .symbols
-        .iter()
-        .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))
-    {
-        return Some(Location { uri: uri.clone(), range: span_to_range(sym.selection_span) });
-    }
-    let cached = module_index.get_cached(type_name)?;
-    let sym = cached
-        .analysis
-        .symbols
-        .iter()
-        .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))?;
-    let uri = Url::from_file_path(&cached.path).ok()?;
-    Some(Location { uri, range: span_to_range(sym.selection_span) })
-}
-
+/// Goto-definition: the forward projection of the resolution CandidateSet,
+/// adapted to LSP types. One location → Scalar; several (stacked handler
+/// registrations) → Array so the editor shows a picker. The LSP handler and
+/// CLI construct the set themselves (they carry the source/pack routing
+/// facts); this adapter serves plain-cursor consumers and tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn find_definition(
+    files: &crate::file_store::FileStore,
     analysis: &FileAnalysis,
     pos: Position,
     uri: &Url,
     module_index: &dyn crate::file_analysis::CrossFileLookup,
 ) -> Option<GotoDefinitionResponse> {
-    let point = position_to_point(pos);
-
-    // Query-time dispatch goto-def: a `$minion->enqueue('task')` whose
-    // receiver isa-resolves (possibly cross-file) jumps to the handler, even
-    // when no `DispatchCall` ref was materialized for this site. The gate is
-    // applied in `dispatch_at`; we just map the resolved handler to its
-    // definition. Runs before `find_definition` because the cursor is on the
-    // name-string arg, which `find_definition` would otherwise treat as a
-    // plain string literal. See `docs/adr/receiver-gated-dispatch.md`.
-    if let Some(applied) = analysis.dispatch_at(point, Some(module_index)) {
-        if let Some(resp) = dispatch_handler_locations(&applied.owner, &applied.name, module_index) {
-            return Some(resp);
-        }
-    }
-
-    // Forward domain bridge: goto-def on a domain-typed field slot offers the
-    // DOMAIN enum's def IN ADDITION to the field decl (`op_type` → both its
-    // `PERL_BITFIELD16 op_type` decl AND `enum opcode`). The field decl stays
-    // FIRST (the primary); the enum is an extra offer. Runs before the local /
-    // member resolution below so it augments a same-file field too. When the
-    // field decl does NOT resolve here, the enum must not mask the shared
-    // member/cross-file paths below (that made goto-def site-dependent) —
-    // it becomes the LAST-resort fallback instead, returned only when every
-    // decl-resolving path has passed.
-    let mut domain_enum_fallback: Option<Location> = None;
-    if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::MethodCall { .. }) {
-            if let Some(cn) = analysis.method_call_invocant_class(r, Some(module_index)) {
-                let field = r.unqualified_target_name();
-                if let Some(dom) = analysis.field_domain(&cn, field, Some(module_index)) {
-                    let el = type_def_location(analysis, &dom.domain, uri, module_index);
-                    if let Some(fl) =
-                        member_field_def_location(analysis, &cn, field, uri, module_index)
-                    {
-                        let mut locs: Vec<Location> = vec![fl];
-                        if let Some(el) = el {
-                            if !locs.contains(&el) {
-                                locs.push(el);
-                            }
-                        }
-                        return Some(GotoDefinitionResponse::Array(locs));
-                    }
-                    domain_enum_fallback = el;
-                }
-            }
-        }
-    }
-
-    // Try local definition first
-    if let Some(span) = analysis.find_definition(point, Some(module_index)) {
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: span_to_range(span),
-        }));
-    }
-
-    // Cross-file hash-key defs. Two shapes share the lookup:
-    //   * deferred ctor key (`owner: None`) — the build-time gate
-    //     couldn't see the class; derive the owner now (enclosing call's
-    //     invocant class, index in hand);
-    //   * resolved Class owner (`$row->{name}` upgraded post-fold to
-    //     `Class(NestedRow)`) whose class — and therefore its
-    //     `add_columns` / `has` / `:param` HashKeyDef — lives elsewhere.
-    // Either way: the class's cached analysis carries the def.
-    if let Some(r) = analysis.ref_at(point) {
-        if let RefKind::HashKeyAccess { ref owner, .. } = r.kind {
-            let owner = match owner {
-                Some(o) => Some(o.clone()),
-                None => analysis.deferred_hash_key_owner(r, Some(module_index)),
-            };
-            let class = match &owner {
-                Some(crate::file_analysis::HashKeyOwner::Sub { package: Some(c), .. }) => {
-                    Some(c.clone())
-                }
-                Some(crate::file_analysis::HashKeyOwner::Class(c)) => Some(c.clone()),
-                _ => None,
-            };
-            if let (Some(owner), Some(class)) = (owner, class) {
-                if let Some(cached) = module_index.get_cached(&class) {
-                    if let Some(def) = cached
-                        .analysis
-                        .hash_key_defs_for_owner(&owner)
-                        .into_iter()
-                        .find(|d| d.name == r.target_name)
-                    {
-                        if let Ok(module_uri) = Url::from_file_path(&cached.path) {
-                            return Some(GotoDefinitionResponse::Scalar(Location {
-                                uri: module_uri,
-                                range: span_to_range(def.selection_span),
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Check if cursor is on a function call that matches an imported symbol
-    if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::FunctionCall { .. }) {
-            if let Some((import, module_path, remote_name)) =
-                resolve_imported_function(analysis, &r.target_name, module_index)
-            {
-                // Jump to the module's use statement in the current file
-                // (or the .pm file if we can resolve it). Cross-file
-                // sub_info lookup uses REMOTE name — distinct from
-                // target_name for renaming imports.
-                // Re-export aware: the def may live in a module `import.module_name`
-                // re-exports (Test::Most → Test::More's `ok`). Chase the edges to
-                // the defining module; fall back to the directly-`use`d path.
-                let defining = module_index.defining_module_cached(&import.module_name, &remote_name);
-                let module_path = defining
-                    .as_ref()
-                    .map(|m| m.path.clone())
-                    .unwrap_or(module_path);
-                if let Ok(module_uri) = Url::from_file_path(&module_path) {
-                    // The defining sub's line in the .pm — `Some` only when the
-                    // module (or one it re-exports) defines the remote name.
-                    let def_line = defining
-                        .and_then(|cached| cached.sub_info(&remote_name).map(|s| s.def_line()));
-
-                    // One-hop to the defining sub whenever we actually know
-                    // where it is (cursor on the call site OR on the import
-                    // name). Landing on the local `use` line was never the
-                    // goal — it's the consumer's import, not the definition.
-                    // The two-element Array (use stmt + def) made many editors
-                    // jump to the first entry = the `use` line. When the module
-                    // isn't cached (`def_line` is None) we can't pin the sub, so
-                    // fall back to the local `use` statement — an acceptable
-                    // landing until the resolver warms that module.
-                    if let Some(line) = def_line {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: module_uri,
-                            range: Range {
-                                start: Position { line, character: 0 },
-                                end: Position { line, character: 0 },
-                            },
-                        }));
-                    }
-
-                    // Cursor on the import name with an unresolved def: jump to
-                    // the top of the .pm (better than the consumer's use line).
-                    if contains_point(&import.span, point) {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: module_uri,
-                            range: Range::default(),
-                        }));
-                    }
-                }
-                // Fall back to just the use statement
-                return Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: uri.clone(),
-                    range: span_to_range(import.span),
-                }));
-            }
-
-            // Fully-qualified call (`Foo::Bar::baz()`) with no import: the
-            // qualifier names the package directly. `find_definition`
-            // already handled the same-file case; here the defining package
-            // lives in another module. Resolve via `resolved_package` (the
-            // qualifier) and the bare sub name.
-            if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
-                let bare = r.unqualified_target_name();
-                if let Some(path) = module_index.module_path_cached(pkg) {
-                    if let Ok(module_uri) = Url::from_file_path(&path) {
-                        let def_line = module_index
-                            .get_cached(pkg)
-                            .and_then(|cached| cached.sub_info(bare).map(|s| s.def_line()));
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: module_uri,
-                            range: Range {
-                                start: Position { line: def_line.unwrap_or(0), character: 0 },
-                                end: Position { line: def_line.unwrap_or(0), character: 0 },
-                            },
-                        }));
-                    }
-                }
-            }
-
-        }
-
-        // Fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`):
-        // the package lives in another module. `find_definition` handled
-        // the same-file case via `resolves_to`; here resolve the package
-        // global through the module index, mirroring the FQ-call path.
-        // Honest miss (no jump) when the package or its decl is absent.
-        if let Some((pkg, name)) = r.qualified_var_target() {
-            if let Some(path) = module_index.module_path_cached(pkg) {
-                if let Ok(module_uri) = Url::from_file_path(&path) {
-                    if let Some(def_line) = module_index
-                        .get_cached(pkg)
-                        .and_then(|cached| cached.package_var_def_line(&name, pkg))
-                    {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: module_uri,
-                            range: Range {
-                                start: Position { line: def_line, character: 0 },
-                                end: Position { line: def_line, character: 0 },
-                            },
-                        }));
-                    }
-                }
-            }
-        }
-
-        // Cross-file package/type goto-def: resolve the name via the module
-        // index. Land on the declaring symbol when the cached analysis knows
-        // it (a Perl `package Foo;` line, a cpp `struct op` / typedef name);
-        // fall back to the top of the file.
-        if matches!(r.kind, RefKind::PackageRef) {
-            use crate::file_analysis::SymKind;
-            // Resolve the CachedModule ONCE and take path AND range from it —
-            // pairing `module_path_cached`'s file with a separately-scoped
-            // `get_cached`'s range splices two candidates when the name is
-            // defined in more than one file (wrong file at a row that doesn't
-            // exist in it).
-            if let Some(cached) = module_index.get_cached(&r.target_name) {
-                if let Ok(module_uri) = Url::from_file_path(&cached.path) {
-                    let range = cached
-                        .analysis
-                        .symbols
-                        .iter()
-                        .find(|s| {
-                            s.name == r.target_name
-                                && matches!(
-                                    s.kind,
-                                    SymKind::Package | SymKind::Class | SymKind::Module
-                                )
-                        })
-                        .map(|s| span_to_range(s.selection_span))
-                        .unwrap_or_default();
-                    return Some(GotoDefinitionResponse::Scalar(Location {
-                        uri: module_uri,
-                        range,
-                    }));
-                }
-            }
-            // No analysis cached: the path map alone still beats no answer —
-            // land at the top of the file.
-            if let Some(path) = module_index.module_path_cached(&r.target_name) {
-                if let Ok(module_uri) = Url::from_file_path(&path) {
-                    return Some(GotoDefinitionResponse::Scalar(Location {
-                        uri: module_uri,
-                        range: Range::default(),
-                    }));
-                }
-            }
-        }
-
-        // Cross-file DispatchCall goto-def: a `$consumer->emit('ready', ...)`
-        // in one file should jump to `$producer->on('ready', sub)` in
-        // another. `find_definition` above only walks the current file's
-        // symbols; for DispatchCall we enumerate every cached module
-        // looking for Handlers matching (owner, name). Multiple stacked
-        // registrations → return all as an Array so the editor can show
-        // the picker.
-        if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
-            if let Some(resp) = dispatch_handler_locations(owner, &r.target_name, module_index) {
-                return Some(resp);
-            }
-        }
-
-        // Method/member goto-def: resolve `recv.field` / `$obj->m` through the
-        // invocant's class + the ancestor walk. Perl pre-fills `Local` into
-        // `resolved_method_target` (handled above); cpp mints the ref without a
-        // pre-fill, so re-resolve here — Local (same-file member) AND data
-        // fields, not just cross-file methods.
-        if matches!(r.kind, RefKind::MethodCall { .. }) {
-            use crate::file_analysis::{MethodResolution, SymKind};
-            // FQ `$o->Foo::Bar::m` dispatches the bare `m` on the named class.
-            let method = r.unqualified_target_name();
-            if let Some(ref cn) = analysis.method_call_invocant_class(r, Some(module_index)) {
-                match analysis.resolve_method_in_ancestors(cn, method, Some(module_index)) {
-                    Some(MethodResolution::Local { sym_id, .. }) => {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: uri.clone(),
-                            range: span_to_range(analysis.symbol(sym_id).selection_span),
-                        }));
-                    }
-                    Some(MethodResolution::CrossFile { ref class, ref def_module }) => {
-                        // A real inherited method lives in `class`'s module; a
-                        // plugin-bridged helper in `def_module`. Same lookup.
-                        let module = def_module.as_deref().unwrap_or(class);
-                        if let Some(cached) = module_index.get_cached(module) {
-                            if let Some(sub_info) = cached.sub_info(method) {
-                                if let Ok(module_uri) = Url::from_file_path(&cached.path) {
-                                    let line = sub_info.def_line();
-                                    return Some(GotoDefinitionResponse::Scalar(Location {
-                                        uri: module_uri,
-                                        range: Range {
-                                            start: Position { line, character: 0 },
-                                            end: Position { line, character: 0 },
-                                        },
-                                    }));
-                                }
-                            }
-                            // cpp data field: a Variable/Field member, not a sub.
-                            if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
-                                matches!(s.kind, SymKind::Variable | SymKind::Field)
-                                    && s.name == method
-                                    && s.package.as_deref() == Some(class.as_str())
-                            }) {
-                                if let Ok(module_uri) = Url::from_file_path(&cached.path) {
-                                    return Some(GotoDefinitionResponse::Scalar(Location {
-                                        uri: module_uri,
-                                        range: span_to_range(sym.selection_span),
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-    }
-
-
-    // Generic cross-file goto-def for a call OR a bare value read that didn't
-    // resolve locally or via Perl imports. Pack languages register free
-    // functions + file-scope vars/macros/enum-constants by name
-    // (register_symbols), so look the name up in the cross-file index -> the
-    // file that declares/defines it -> that symbol. A `Variable` ref reaches
-    // here only when it had no local `resolves_to` (the local path above
-    // already returned for resolved ones), so this is the cross-file tail:
-    // `OP_SCOPE` used in op.c resolving to its enumerator def in opnames.h.
-    // (Perl's cache is keyed by MODULE name, so a bare-name lookup no-ops.)
-    if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
-            let name = r.unqualified_target_name();
-            if let Some(cached) = module_index.get_cached(name) {
-                if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
-                    s.name == name
-                        && matches!(
-                            s.kind,
-                            crate::file_analysis::SymKind::Sub
-                                | crate::file_analysis::SymKind::Variable
-                        )
-                }) {
-                    if let Ok(uri) = Url::from_file_path(&cached.path) {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri,
-                            range: span_to_range(sym.selection_span),
-                        }));
-                    }
-                }
-            }
-        }
-    }
-    // The domain bridge's enum offer, only when no path resolved the decl —
-    // better than nothing at a site whose member resolution is broken, and
-    // never masking a resolvable decl.
-    if let Some(el) = domain_enum_fallback {
-        return Some(GotoDefinitionResponse::Scalar(el));
-    }
-    None
-}
-
-/// One resolved macro def-site (or see-through delegate) for goto-def. The
-/// `label` carries the reachability verdict / see-through note — LSP `Location`
-/// has no label slot, so the backend drops it (ordering conveys rank), but the
-/// CLI renders it (and the gold harness asserts on it).
-pub struct MacroGotoLocation {
-    pub uri: Url,
-    pub range: Range,
-    pub label: Option<String>,
-}
-
-/// Every `#define` of `word` across this file + the cached modules, ranked
-/// config-active first by the SAME total order goto-def and hover both consume
-/// (`docs/adr/macro-handling.md`): reachability rank, then (path, row, col) so
-/// the winner is deterministic across processes (the cache iterates in
-/// randomized DashMap order). Empty when `word` names no macro. This is the one
-/// place the variant set is gathered + reachability-classified — goto-def
-/// returns all of them, hover walks the top one's alias chain to its leaf.
-fn ranked_macro_variants(
-    analysis: &FileAnalysis,
-    word: &str,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Vec<(crate::file_analysis::MacroDef, Url, crate::cpp_macro_model::Reachability)> {
-    use crate::cpp_macro_model::classify;
-    use crate::file_analysis::MacroDef;
-    use std::collections::HashSet;
-
-    // One pass over every cached module + this file: collect the def sites for
-    // `word` (config variants live in different headers — win32.h vs perl.h; we
-    // keep them ALL, never the last-writer only) AND the reachability config
-    // (the whole macro universe). Enumerating the cache directly is robust to a
-    // cold reverse index — `modules_with_symbol` can be empty before it warms.
-    let mut sites: Vec<(MacroDef, Url)> = Vec::new();
-    let mut seen: HashSet<(String, usize, usize)> = HashSet::new();
-    let mut defined: HashSet<String> = HashSet::new();
-    let mut universe: HashSet<String> = HashSet::new();
-    let push = |m: &MacroDef,
-                    u: &Url,
-                    sites: &mut Vec<(MacroDef, Url)>,
-                    seen: &mut HashSet<(String, usize, usize)>| {
-        let key = (u.to_string(), m.selection_span.start.row, m.selection_span.start.column);
-        if seen.insert(key) {
-            sites.push((m.clone(), u.clone()));
-        }
-    };
-    let note = |m: &MacroDef, defined: &mut HashSet<String>, universe: &mut HashSet<String>| {
-        universe.insert(m.name.clone());
-        if m.guards.is_empty() {
-            defined.insert(m.name.clone());
-        }
-    };
-    for m in &analysis.macro_defs {
-        note(m, &mut defined, &mut universe);
-        if m.name == word {
-            push(m, uri, &mut sites, &mut seen);
-        }
-    }
-    // Per-FILE sweep: the name-keyed cache view both repeats files and hides
-    // a file that lost every name tie.
-    module_index.for_each_cached_file(&mut |cached| {
-        let file_uri = Url::from_file_path(&cached.path).ok();
-        for m in &cached.analysis.macro_defs {
-            note(m, &mut defined, &mut universe);
-            if m.name == word {
-                if let Some(u) = &file_uri {
-                    push(m, u, &mut sites, &mut seen);
-                }
-            }
-        }
-    });
-
-    if sites.is_empty() {
-        return Vec::new();
-    }
-
-    // The include-guard idiom `#ifndef X … #define X … #endif` guards a macro's
-    // definition on its OWN not-yet-defined-ness. At that guard X is not yet
-    // defined, so X's own name must not count as `defined` when ranking X's
-    // variants — else every arm reads as unreachable. General over the pattern,
-    // not a per-name rule.
-    defined.remove(word);
-    // Toolchain predefined macros (`__GNUC__`, …) are ON here exactly as they
-    // are in build-side variant selection — navigation and minting share the
-    // one seeding point so they can't disagree on which arm is Active.
-    let cfg = crate::cpp_reparse::known_config_with_toolchain(defined, universe);
-
-    // Rank, active-first. Never prune — a lower-ranked (e.g. win32) def stays,
-    // labeled. The secondary (path, line, col) key is a TOTAL order so the
-    // result is deterministic across processes.
-    let mut ranked: Vec<(MacroDef, Url, _)> = sites
+    let cs = crate::resolve::resolve(
+        files,
+        analysis,
+        crate::file_store::FileKey::Url(uri.clone()),
+        position_to_point(pos),
+        Some(module_index),
+        crate::resolve::OverrideScope::default(),
+    );
+    let locs: Vec<Location> = cs
+        .definitions()
         .into_iter()
-        .map(|(m, u)| {
-            let r = classify(&m.guards, &cfg);
-            (m, u, r)
+        .filter_map(|l| {
+            let uri = l.to_url()?;
+            Some(Location { uri, range: span_to_range(l.span) })
         })
         .collect();
-    ranked.sort_by(|(ma, ua, ra), (mb, ub, rb)| {
-        ra.rank()
-            .cmp(&rb.rank())
-            .then_with(|| ua.as_str().cmp(ub.as_str()))
-            .then_with(|| ma.selection_span.start.row.cmp(&mb.selection_span.start.row))
-            .then_with(|| ma.selection_span.start.column.cmp(&mb.selection_span.start.column))
-    });
-    ranked
+    match locs.len() {
+        0 => None,
+        1 => Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap())),
+        _ => Some(GotoDefinitionResponse::Array(locs)),
+    }
 }
 
 /// The concrete-leaf DISPLAY for a field/variable whose declared type is a
@@ -754,10 +229,10 @@ fn config_variant_leaf_display(
     module_index: &dyn CrossFileLookup,
 ) -> Option<String> {
     // Hover reads only the winning variant's BODY, never its location, so the
-    // queried file's own uri is immaterial — a placeholder keys its local
-    // `macro_defs` without colliding with the real cross-file def uris.
-    let local = Url::parse("file:///__hover_local__").ok()?;
-    let ranked = ranked_macro_variants(analysis, spelling, &local, module_index);
+    // queried file's own key is immaterial — a placeholder keys its local
+    // `macro_defs` without colliding with the real cross-file def paths.
+    let local = crate::file_store::FileKey::Path(std::path::PathBuf::from("/__hover_local__"));
+    let ranked = crate::resolve::ranked_macro_variants(analysis, spelling, &local, module_index);
     // A single-variant (or non-) macro flows to its leaf already; only the
     // config-variant JOIN abstraction needs the display-side variant pick.
     if ranked.len() < 2 {
@@ -777,13 +252,6 @@ fn config_variant_leaf_display(
     Some(display.to_string())
 }
 
-/// Macro-aware goto-def (the identity/navigation lane, `docs/adr/macro-handling.md`).
-/// When the cursor word names a `#define` — same-file OR cross-file — this
-/// OWNS the answer, preempting the generic symbol path so a bare use resolves
-/// to the `#define`, never its own span. Returns EVERY def site (config
-/// variants across files never pruned), reachability-RANKED config-active
-/// first, plus any direct-delegation see-through target. `None` when the word
-/// is not a macro (the generic path then runs).
 /// Goto-def on an `#include "x.h"` / `<x.h>` path token → the resolved header
 /// file (`#include` = `use`; the header is the module). `self_path` is the
 /// including file — the search anchor for the walk-up include resolver.
@@ -879,205 +347,13 @@ pub fn pack_include_references(
     None
 }
 
-pub fn pack_macro_definition(
-    analysis: &FileAnalysis,
-    source: &str,
-    point: Point,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Option<Vec<MacroGotoLocation>> {
-    let word = word_at_point(source, point)?;
-    let ranked = ranked_macro_variants(analysis, word, uri, module_index);
-    if ranked.is_empty() {
-        return None; // not a macro — let the generic goto-def path answer.
-    }
+/// Re-export: the raw-word key lives with the resolution seam
+/// (`resolve::word_at_point`); hover and the sig-help slot share it.
+pub use crate::resolve::word_at_point;
 
-    let mut out: Vec<MacroGotoLocation> = Vec::new();
-    for (m, u, r) in &ranked {
-        out.push(MacroGotoLocation {
-            uri: u.clone(),
-            range: span_to_range(m.selection_span),
-            label: r.label(),
-        });
-    }
 
-    // See-through: a direct-delegation wrapper (`#define F(x) G(x)`) also offers
-    // the delegate `G`. Resolve from the top-ranked delegating variant only, so
-    // the offer follows the config-active body. A self-delegation (`#define S S`)
-    // resolves to the definition itself — already offered above, skip it.
-    if let Some((m, _, _)) = ranked
-        .iter()
-        .find(|(m, _, _)| m.delegate.as_deref().is_some_and(|d| d != m.name))
-    {
-        if let Some(delegate) = &m.delegate {
-            if let Some(loc) = resolve_pack_symbol_location(analysis, delegate, uri, module_index) {
-                out.push(MacroGotoLocation {
-                    uri: loc.uri,
-                    range: loc.range,
-                    label: Some(format!("delegates to {delegate}")),
-                });
-            }
-        }
-    }
 
-    Some(out)
-}
 
-/// The identifier under `point` in `source`, or `None` if the cursor is not on
-/// a `[A-Za-z0-9_]` word. Byte-scan (macros vanish from the analysis under the
-/// current expand-and-reparse policy, so the raw word is the reliable key).
-pub fn word_at_point(source: &str, point: Point) -> Option<&str> {
-    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
-    let b = source.as_bytes();
-    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
-    if cursor > b.len() {
-        return None;
-    }
-    let mut start = cursor;
-    while start > 0 && is_id(b[start - 1]) {
-        start -= 1;
-    }
-    let mut end = cursor;
-    while end < b.len() && is_id(b[end]) {
-        end += 1;
-    }
-    (start < end).then(|| &source[start..end])
-}
-
-/// Resolve a pack-language symbol NAME (a delegate callee, a free function) to
-/// its def location — local symbols and the cross-file index, preferring a
-/// DEFINITION over a prototype: a definition's body mints a scope spanning
-/// the symbol (the universal `(function_definition) @scope`), a declaration
-/// doesn't, so `fix_optchain` see-through lands in op.c, not proto.h. Ties
-/// break local-first then (path, position) so the pick is deterministic
-/// across the cache's randomized iteration order.
-fn resolve_pack_symbol_location(
-    analysis: &FileAnalysis,
-    name: &str,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Option<Location> {
-    use crate::file_analysis::SymKind;
-    let wanted = |k: &SymKind| matches!(k, SymKind::Sub | SymKind::Variable | SymKind::Class);
-    let has_body = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
-        a.scopes.iter().any(|sc| sc.span == s.span)
-    };
-    // (bodied, local, path, row, col) — smaller sorts first after the
-    // bodied/local flags are inverted below.
-    let mut candidates: Vec<(bool, bool, String, usize, usize, Location)> = Vec::new();
-    for sym in analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
-        candidates.push((
-            has_body(analysis, sym),
-            true,
-            uri.to_string(),
-            sym.selection_span.start.row,
-            sym.selection_span.start.column,
-            Location { uri: uri.clone(), range: span_to_range(sym.selection_span) },
-        ));
-    }
-    // The FULL candidate table for `name` — a definition legitimately lives
-    // in a file the one-winner `get_cached` view (or the include closure)
-    // never serves (`Perl_fix_optchain`'s body is in peep.c; proto.h wins
-    // the scoped lookup).
-    let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-    for cached in module_index.def_candidates(name) {
-        if !seen_paths.insert(cached.path.clone()) {
-            continue;
-        }
-        let Ok(u) = Url::from_file_path(&cached.path) else { continue };
-        for sym in cached.analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
-            candidates.push((
-                has_body(&cached.analysis, sym),
-                false,
-                u.to_string(),
-                sym.selection_span.start.row,
-                sym.selection_span.start.column,
-                Location { uri: u.clone(), range: span_to_range(sym.selection_span) },
-            ));
-        }
-    }
-    candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0) // bodied first
-            .then_with(|| b.1.cmp(&a.1)) // then local
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| (a.3, a.4).cmp(&(b.3, b.4)))
-    });
-    candidates.into_iter().next().map(|c| c.5)
-}
-
-/// All `Handler` definitions matching `(owner, name)` across cached modules.
-/// A dispatch (`$emitter->emit('ready')`) can target stacked registrations
-/// in different files; multiple hits return an `Array` so the editor shows a
-/// picker. Shared by the materialized-ref path and the query-time
-/// `dispatch_at` path so both resolve handlers identically.
-fn dispatch_handler_locations(
-    owner: &crate::file_analysis::HandlerOwner,
-    name: &str,
-    module_index: &dyn crate::file_analysis::CrossFileLookup,
-) -> Option<GotoDefinitionResponse> {
-    use crate::file_analysis::SymbolDetail;
-    let mut locs: Vec<Location> = Vec::new();
-    for module_name in module_index.modules_with_symbol(name) {
-        let Some(cached) = module_index.get_cached(&module_name) else { continue };
-        for sym in &cached.analysis.symbols {
-            if sym.name != name { continue; }
-            if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
-                if o == owner {
-                    if let Ok(module_uri) = Url::from_file_path(&cached.path) {
-                        locs.push(Location {
-                            uri: module_uri,
-                            range: span_to_range(sym.selection_span),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    if locs.is_empty() {
-        return None;
-    }
-    Some(if locs.len() == 1 {
-        GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap())
-    } else {
-        GotoDefinitionResponse::Array(locs)
-    })
-}
-
-pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, module_index: Option<&dyn CrossFileLookup>) -> Vec<Location> {
-    analysis.find_references(position_to_point(pos), module_index)
-        .into_iter()
-        .map(|span| Location {
-            uri: uri.clone(),
-            range: span_to_range(span),
-        })
-        .collect()
-}
-
-pub fn rename(
-    analysis: &FileAnalysis,
-    pos: Position,
-    uri: &Url,
-    new_name: &str,
-) -> Option<WorkspaceEdit> {
-    let edits = analysis.rename_at(position_to_point(pos), new_name)?;
-
-    let text_edits: Vec<TextEdit> = edits
-        .into_iter()
-        .map(|(span, new_text)| TextEdit {
-            range: span_to_range(span),
-            new_text,
-        })
-        .collect();
-
-    let mut changes = HashMap::new();
-    changes.insert(uri.clone(), text_edits);
-
-    Some(WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    })
-}
 
 pub(crate) fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
     match kind {
@@ -1186,6 +462,8 @@ pub fn in_scope_completion(analysis: &FileAnalysis, point: Point) -> Vec<Complet
 }
 
 pub fn completion_items(
+    files: &crate::file_store::FileStore,
+    origin_key: &crate::file_store::FileKey,
     analysis: &FileAnalysis,
     tree: &Tree,
     source: &str,
@@ -1229,19 +507,39 @@ pub fn completion_items(
             return plugin_items;
         }
         if !plugin_items.is_empty() {
-            let native = completion_items_native(analysis, tree, source, pos, module_index, stable_packages);
+            let native = completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages);
             let mut out = plugin_items;
             out.extend(native);
             return out;
         }
     }
 
-    completion_items_native(analysis, tree, source, pos, module_index, stable_packages)
+    completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages)
+}
+
+/// Test-only convenience: completion against a bare analysis with an empty
+/// store (gathering still routes through the CandidateSet; visibility
+/// defaults to the full VISIBLE universe).
+#[cfg(test)]
+pub fn completion_items_for_test(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Vec<CompletionItem> {
+    let files = crate::file_store::FileStore::new();
+    let key = crate::file_store::FileKey::Path(std::path::PathBuf::from("/test/origin.pl"));
+    completion_items(&files, &key, analysis, tree, source, pos, module_index, stable_packages)
 }
 
 /// Original native completion path. Renamed from `completion_items`
 /// so the plugin-aware wrapper above can fall through to it.
+#[allow(clippy::too_many_arguments)]
 fn completion_items_native(
+    files: &crate::file_store::FileStore,
+    origin_key: &crate::file_store::FileKey,
     analysis: &FileAnalysis,
     tree: &Tree,
     source: &str,
@@ -1250,6 +548,19 @@ fn completion_items_native(
     stable_packages: Option<&[(String, usize)]>,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
+    // Candidate GATHERING routes through the resolution CandidateSet — the
+    // same visible universe references/rename/goto-def project from
+    // (docs/adr/resolution-candidate-set.md). The cursor-context matching
+    // below decides which slot the cursor is in; the set decides where the
+    // identifier names come from.
+    let cs = crate::resolve::resolve(
+        files,
+        analysis,
+        origin_key.clone(),
+        point,
+        Some(module_index),
+        crate::resolve::OverrideScope::default(),
+    );
 
     // Try tree-based detection first for expression-based contexts
     let ctx = cursor_context::detect_cursor_context_tree_with_index(
@@ -1355,7 +666,7 @@ fn completion_items_native(
                 // (Minion's `enqueue(..., [...], { | })` options).
                 // Skipping the short-circuit there lets the HashKey
                 // match run and populate `priority`/`queue`/etc.
-                let vars_only: Vec<CompletionCandidate> = analysis.complete_general(point)
+                let vars_only: Vec<CompletionCandidate> = cs.complete("", false)
                     .into_iter()
                     .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
                     .collect();
@@ -1411,7 +722,7 @@ fn completion_items_native(
                     return complete_import_list(name, module_index);
                 }
             } else {
-                return complete_module_names(module_prefix, module_index);
+                return complete_module_names(&cs, module_prefix);
             }
             Vec::new()
         }
@@ -1421,7 +732,7 @@ fn completion_items_native(
             // prefix so the client filter matches against what the
             // user typed. Suppress the global firehose; this branch
             // is the answer.
-            return qualified_path_completions(analysis, module_index, package);
+            return qualified_path_completions(&cs, analysis, module_index, package);
         }
         CursorContext::General => {
             let mut items = Vec::new();
@@ -1443,17 +754,34 @@ fn completion_items_native(
                     ));
                 }
             }
-            items.extend(analysis.complete_general(point));
-
-            // Global sub/module firehose: useful at top-level
-            // positions, harmful when we just offered dispatch
-            // handlers at arg-0 (they'd drown in it). `suppress_firehose`
-            // is set above when we know the cursor is at arg-0 of a
-            // known dispatcher call.
+            // Identifier universe from the CandidateSet: in-scope names,
+            // plus the import-sourced firehose when the slot has an
+            // import affordance. The firehose is useful at top-level
+            // positions, harmful when we just offered dispatch handlers
+            // at arg-0 (they'd drown in it) — `suppress_firehose` is set
+            // above when the cursor is at arg-0 of a known dispatcher
+            // call, and withholds the affordance. The candidates carry the
+            // importable-from FACT; the edit is composed HERE, fact + slot
+            // affordance (`auto_import_span` needs the LSP-side stable
+            // outline) — placement is the adapter's, not the model's.
+            let mut import_sourced = cs.complete("", !suppress_firehose);
             if !suppress_firehose {
-                items.extend(imported_function_completions(analysis, module_index));
-                items.extend(unimported_function_completions(analysis, module_index, point, stable_packages));
+                let insert_at = auto_import_span(analysis, point, stable_packages);
+                for c in &mut import_sourced {
+                    match &c.import_fact {
+                        Some(crate::file_analysis::ImportFact::AddToQw { name, qw_close }) => {
+                            let at = crate::file_analysis::Span { start: *qw_close, end: *qw_close };
+                            c.additional_edits.push((at, format!(" {}", name)));
+                        }
+                        Some(crate::file_analysis::ImportFact::NewUse { module, name }) => {
+                            c.additional_edits
+                                .push((insert_at, format!("use {} qw({});\n", module, name)));
+                        }
+                        None => {}
+                    }
+                }
             }
+            items.extend(import_sourced);
 
             items
         }
@@ -1485,9 +813,13 @@ fn completion_items_native(
     items
 }
 
-/// Complete module names on `use` lines from resolved + @INC-scanned modules.
-fn complete_module_names(prefix: &str, module_index: &ModuleIndex) -> Vec<CompletionItem> {
-    let modules = module_index.complete_module_names(prefix);
+/// Complete module names on `use` lines — the CandidateSet's loadable-module
+/// universe, formatted.
+fn complete_module_names(
+    cs: &crate::resolve::CandidateSet,
+    prefix: &str,
+) -> Vec<CompletionItem> {
+    let modules = cs.complete_modules(prefix);
     modules.into_iter().map(|(name, is_resolved)| {
         let (detail, priority) = if is_resolved {
             (Some("indexed".to_string()), 10u8)
@@ -1562,6 +894,7 @@ fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<Co
 /// user can drill in without leaving completion. Subs sort first
 /// (priority 010), sub-packages second (020).
 fn qualified_path_completions(
+    cs: &crate::resolve::CandidateSet,
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
     package: &str,
@@ -1585,23 +918,23 @@ fn qualified_path_completions(
         });
     }
 
-    // Sub-packages — both cross-file modules whose name starts with
-    // `Package::` AND in-file `package Package::Other` declarations.
+    // Sub-packages — both loadable modules whose name starts with
+    // `Package::` (the set's module universe) AND in-file
+    // `package Package::Other` declarations (the set's OPEN-tier
+    // identifier universe, kind-projected to packages).
     // Label is the suffix (what follows the typed prefix), so the
     // client's `Package::<typed>` filter matches naturally.
     let prefix = format!("{}::", package);
     let mut subpaths: Vec<(String, &'static str)> = Vec::new();
-    for (name, is_resolved) in module_index.complete_module_names(&prefix) {
+    for (name, is_resolved) in cs.complete_modules(&prefix) {
         let hint = if is_resolved { "indexed" } else { "available" };
         subpaths.push((name, hint));
     }
-    for sym in &analysis.symbols {
-        if !matches!(sym.kind, FaSymKind::Package | FaSymKind::Class) {
+    for c in cs.complete(&prefix, false) {
+        if !matches!(c.kind, FaSymKind::Package | FaSymKind::Class) {
             continue;
         }
-        if sym.name.starts_with(&prefix) && sym.name != package {
-            subpaths.push((sym.name.clone(), "in-file"));
-        }
+        subpaths.push((c.label, "in-file"));
     }
     for (name, hint) in subpaths {
         let suffix = match name.strip_prefix(&prefix) {
@@ -2245,6 +1578,7 @@ fn dispatch_target_completions(
             // this position when a dispatcher is declared for them.
             sort_priority: 0,
             additional_edits: Vec::new(),
+                import_fact: None,
                 display_override: None,
         }
     }).collect()
@@ -2929,129 +2263,15 @@ pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
 
 // ---- Import resolution helpers ----
 
-/// Build completion candidates for functions imported via `use` statements.
-/// Offers all @EXPORT_OK from already-imported modules — not just the ones
-/// currently in the qw() list. Functions not yet imported get an auto-import
-/// edit that adds them to the existing qw() list.
-fn imported_function_completions(
+/// Where a completion-accepted auto-import `use` edit lands: the standard
+/// insertion position for the package under `point`, clamped to fall at or
+/// above the cursor — an edit below the cursor would import after the call
+/// being completed.
+fn auto_import_span(
     analysis: &FileAnalysis,
-    module_index: &ModuleIndex,
-) -> Vec<CompletionCandidate> {
-    use crate::file_analysis::Span;
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for import in &analysis.imports {
-        let cached: Option<Arc<CachedModule>> = module_index.get_cached(&import.module_name);
-
-        // 1. Always offer explicitly imported symbols (from the qw list).
-        // Dedup/dispatch by LOCAL name (what the user types); resolve
-        // detail against REMOTE name (what exists in the source module)
-        // so renaming imports like `del` → `delete` show the real doc.
-        for is in &import.imported_symbols {
-            let local = &is.local_name;
-            if !seen.insert(local.clone()) {
-                continue;
-            }
-            if !analysis.symbols_named(local).is_empty() {
-                continue;
-            }
-            let detail = completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
-            candidates.push(CompletionCandidate {
-                label: local.clone(),
-                kind: FaSymKind::Sub,
-                detail: Some(detail),
-                insert_text: None,
-                sort_priority: PRIORITY_EXPLICIT_IMPORT,
-                additional_edits: vec![],
-                display_override: None,
-            });
-        }
-
-        // 2. Offer additional @EXPORT_OK functions (not yet imported) if we can resolve the module
-        if let Some(ref cached) = cached {
-            let fa = &cached.analysis;
-            let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
-                // Bare `use Foo;` — offer @EXPORT
-                fa.export.iter().collect()
-            } else {
-                // `use Foo qw(bar)` — offer remaining @EXPORT + @EXPORT_OK
-                let mut all = Vec::new();
-                all.extend(fa.export.iter());
-                all.extend(fa.export_ok.iter());
-                all
-            };
-
-            for name in all_exported {
-                // Skip already-offered (explicitly imported) and locally defined
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                if !analysis.symbols_named(name).is_empty() {
-                    continue;
-                }
-
-                let rt_prefix = cached.sub_info(name)
-                    .and_then(|s| s.return_type(None))
-                    .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
-                    .unwrap_or_default();
-
-                let (detail, priority, additional_edits) =
-                    if let Some(close_pos) = import.qw_close_paren {
-                        // Auto-add to existing qw() list
-                        let insert_point = Span {
-                            start: close_pos,
-                            end: close_pos,
-                        };
-                        (
-                            format!("{}{} (auto-import)", rt_prefix, import.module_name),
-                            PRIORITY_AUTO_ADD_QW,
-                            vec![(insert_point, format!(" {}", name))],
-                        )
-                    } else {
-                        // No qw() list to edit (bare `use Foo;`)
-                        (
-                            format!("{}imported from {}", rt_prefix, import.module_name),
-                            PRIORITY_BARE_IMPORT,
-                            vec![],
-                        )
-                    };
-
-                candidates.push(CompletionCandidate {
-                    label: name.clone(),
-                    kind: FaSymKind::Sub,
-                    detail: Some(detail),
-                    insert_text: None,
-                    sort_priority: priority,
-                    additional_edits,
-                    display_override: None,
-                });
-            }
-        }
-    }
-
-    candidates
-}
-
-/// Build completion candidates for functions from modules that aren't imported
-/// at all. Each candidate carries `additional_edits` that insert a full
-/// `use Module qw(func);` statement.
-fn unimported_function_completions(
-    analysis: &FileAnalysis,
-    module_index: &ModuleIndex,
     point: Point,
     stable_packages: Option<&[(String, usize)]>,
-) -> Vec<CompletionCandidate> {
-    use crate::file_analysis::Span;
-    let mut candidates = Vec::new();
-
-    // Collect already-imported module names so we skip them.
-    let imported_modules: std::collections::HashSet<&str> = analysis
-        .imports
-        .iter()
-        .map(|i| i.module_name.as_str())
-        .collect();
-
+) -> crate::file_analysis::Span {
     let mut insert_pos = find_use_insertion_position(analysis, point, stable_packages);
 
     // If the computed position is after the cursor, fall back to inserting
@@ -3073,169 +2293,11 @@ fn unimported_function_completions(
         }
     }
 
-    let insert_span = Span {
-        start: tree_sitter::Point {
-            row: insert_pos.line as usize,
-            column: insert_pos.character as usize,
-        },
-        end: tree_sitter::Point {
-            row: insert_pos.line as usize,
-            column: insert_pos.character as usize,
-        },
+    let p = tree_sitter::Point {
+        row: insert_pos.line as usize,
+        column: insert_pos.character as usize,
     };
-
-    module_index.for_each_cached(|module_name, cached| {
-        if imported_modules.contains(module_name) {
-            return;
-        }
-
-        let fa = &cached.analysis;
-        let all_exported = fa.export.iter().chain(fa.export_ok.iter());
-        for name in all_exported {
-            // Skip functions already defined locally
-            if !analysis.symbols_named(name).is_empty() {
-                continue;
-            }
-            candidates.push(CompletionCandidate {
-                label: name.clone(),
-                kind: FaSymKind::Sub,
-                detail: Some(format!("{} (auto-import)", module_name)),
-                insert_text: None,
-                sort_priority: PRIORITY_UNIMPORTED,
-                additional_edits: vec![(
-                    insert_span,
-                    format!("use {} qw({});\n", module_name, name),
-                )],
-                display_override: None,
-            });
-        }
-    });
-
-    // Sort for deterministic order
-    candidates.sort_by(|a, b| a.label.cmp(&b.label).then(a.detail.cmp(&b.detail)));
-    candidates
-}
-
-/// How a function name relates to an importing `use` statement. Both
-/// goto-def and the unresolved-function diagnostic read this one verdict so
-/// they can never disagree on whether a name is resolvable as imported
-/// (NAV § (c): the divergent-export-surface root cause).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImportResolution {
-    /// The name is brought into the caller's namespace: named in `qw(...)`,
-    /// pulled in by a `:tag` selector against the producer surface, or
-    /// auto-imported by a bare `use Foo;`. Goto-def jumps; the diagnostic
-    /// stays silent (the name is genuinely available here).
-    Brought,
-    /// The name is exported by the imported module but this `use` didn't
-    /// bring it in (e.g. a named `qw(other)` that omits it). Goto-def can
-    /// still jump to the def; the diagnostic offers the "exported but not
-    /// imported" hint.
-    ExportedNotBrought,
-}
-
-/// Classify a name against a single import. Routes through the consumer
-/// evaluator (`imported_names`) so the verdict is exactly "is this name in the
-/// bound set this `use` produces" — the single notion of import binding that
-/// diagnostics, goto-def, and references all read (NAV § (c)). Returns the
-/// resolved verdict plus the REMOTE (origin) name for the matched local name.
-///
-/// `cached` is the producer's `FileAnalysis` when known; its `export_surface`
-/// expands `:tag` selectors and supplies the `@EXPORT` defaults for a bare
-/// `use`. When absent (module not yet cached), the evaluator still binds
-/// explicitly-named `qw()` imports — those don't need the surface — so an
-/// explicit named import is never spuriously flagged while the resolver warms.
-fn classify_import(
-    import: &crate::file_analysis::Import,
-    func_name: &str,
-    cached: Option<&CachedModule>,
-    module_index: &dyn CrossFileLookup,
-) -> Option<(ImportResolution, String)> {
-    if let Some(cached) = cached {
-        let surface = cached.analysis.export_surface_with_index(module_index);
-        let bound = crate::file_analysis::imported_names(import, &surface);
-        if let Some((_local, remote)) = bound.iter().find(|(local, _)| local == func_name) {
-            return Some((ImportResolution::Brought, remote.clone()));
-        }
-        // Not bound by this `use`, but on the producer surface → the actionable
-        // "exported but not imported" hint (a named `qw(other)` omitting it, or
-        // an `@EXPORT_OK` name reached only by a bare `use` — GATE-5).
-        if surface.exports(func_name) {
-            return Some((ImportResolution::ExportedNotBrought, func_name.to_string()));
-        }
-        return None;
-    }
-    // Module not cached yet: only an explicitly-named import can be judged
-    // `Brought` without the producer surface (tags / bare-use defaults need it).
-    // This keeps a `qw(foo)` import from being flagged while the resolver warms,
-    // and never resolves a bare/tagged name it can't actually verify.
-    if let Some(sym) = import.imported_symbols.iter().find(|s| s.local_name == *func_name) {
-        return Some((ImportResolution::Brought, sym.remote().to_string()));
-    }
-    None
-}
-
-/// Best resolution of `func_name` across all imports: the matched import, its
-/// remote name, the resolvability verdict, and — when known — the module path
-/// for navigation. `Brought` wins over `ExportedNotBrought` when several
-/// imports relate. The single resolvability query goto-def, the diagnostic, and
-/// references all read, so they can never disagree on the bound set.
-fn resolve_imported_function_classified<'a>(
-    analysis: &'a FileAnalysis,
-    func_name: &str,
-    module_index: &dyn crate::file_analysis::CrossFileLookup,
-) -> Option<(&'a crate::file_analysis::Import, Option<std::path::PathBuf>, String, ImportResolution)> {
-    let mut best: Option<(
-        &'a crate::file_analysis::Import,
-        Option<std::path::PathBuf>,
-        String,
-        ImportResolution,
-    )> = None;
-    for import in &analysis.imports {
-        let cached = module_index.get_cached(&import.module_name);
-        let Some((res, remote)) = classify_import(import, func_name, cached.as_deref(), module_index) else { continue };
-        let path = cached
-            .as_ref()
-            .map(|c| c.path.clone())
-            .or_else(|| module_index.module_path_cached(&import.module_name));
-        // `Brought` is the strongest verdict; once found, keep it.
-        if matches!(best, Some((_, _, _, ImportResolution::Brought))) {
-            continue;
-        }
-        best = Some((import, path, remote, res));
-    }
-    best
-}
-
-/// Find which import provides a given function name, with a concrete module
-/// path to jump to. Returns the matched Import, the module's path, and the
-/// REMOTE name (the sub's actual name in the source module — differs from the
-/// caller's `func_name` only for renaming imports like `del` → `delete`).
-/// Callers use the remote name for `cached.sub_info(...)` lookups so
-/// hover/gd/sig-help reach the real sub.
-fn resolve_imported_function<'a>(
-    analysis: &'a FileAnalysis,
-    func_name: &str,
-    module_index: &dyn crate::file_analysis::CrossFileLookup,
-) -> Option<(&'a crate::file_analysis::Import, std::path::PathBuf, String)> {
-    // Goto-def needs a concrete module path to jump to.
-    resolve_imported_function_classified(analysis, func_name, module_index)
-        .and_then(|(import, path, remote, _)| path.map(|p| (import, p, remote)))
-}
-
-fn completion_detail_for_import(
-    name: &str,
-    cached: Option<&CachedModule>,
-    module_name: &str,
-) -> String {
-    if let Some(cached) = cached {
-        if let Some(sub_info) = cached.sub_info(name) {
-            if let Some(rt) = sub_info.return_type(None) {
-                return format!("→ {} ({})", format_inferred_type(&rt), module_name);
-            }
-        }
-    }
-    format!("imported from {}", module_name)
+    crate::file_analysis::Span { start: p, end: p }
 }
 
 fn format_imported_signature(name: &str, sub_info: &SubInfo<'_>) -> String {
