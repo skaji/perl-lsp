@@ -4007,6 +4007,43 @@ fn bare_use_binds_export_default_no_fp_and_gd_resolves() {
     assert!(gd_resolves(src, "always_here", &idx), "goto-def resolves @EXPORT name");
 }
 
+/// JSON::PP's exact export header: `use Exporter ()` + BEGIN-block @ISA +
+/// top-level `our @EXPORT = qw(...)`. A dual-life core module resolved from
+/// @INC rides the DEPENDENCY cache, so the bare-use default surface must
+/// bind from a dep-cached analysis too — `use JSON::PP;` +
+/// `encode_json(...)` is not an unresolved function.
+#[test]
+fn bare_use_of_dep_cached_exporter_binds_default_exports() {
+    let jsonpp = "package JSON::PP;\n\
+use strict;\n\
+use Exporter ();\n\
+BEGIN { our @ISA = ('Exporter') }\n\
+our @EXPORT = qw(encode_json decode_json from_json to_json);\n\
+sub encode_json { }\n\
+sub decode_json { }\n\
+sub from_json { }\n\
+sub to_json { }\n\
+1;\n";
+    let fa = parse_analysis(jsonpp);
+    assert_eq!(
+        fa.export,
+        vec!["encode_json", "decode_json", "from_json", "to_json"],
+        "the BEGIN-ISA Exporter spelling must not hide @EXPORT extraction"
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.set_workspace_root(None);
+    idx.insert_cache(
+        "JSON::PP",
+        Some(std::sync::Arc::new(crate::module_index::CachedModule::new(
+            std::path::PathBuf::from("/usr/lib/perl5/JSON/PP.pm"),
+            std::sync::Arc::new(fa),
+        ))),
+    );
+    let src = "use strict;\nuse JSON::PP;\nmy $s = encode_json({ a => 1 });\nmy $d = decode_json($s);\n";
+    assert!(!flags_fn(src, "encode_json", &idx), "bare use JSON::PP binds encode_json");
+    assert!(!flags_fn(src, "decode_json", &idx), "bare use JSON::PP binds decode_json");
+}
+
 #[test]
 fn named_import_still_works_regression() {
     let idx = modx_index();
@@ -4813,3 +4850,61 @@ fn test_helper_not_loaded_exempts_installed_plugins() {
 }
 
 
+#[cfg(feature = "cpp")]
+mod pack_macro_goto {
+    use super::*;
+
+    /// L1 lock: `#define S S` (self-delegation) must offer exactly the
+    /// definition — no duplicate "delegates to S" location pointing at the
+    /// same `#define`.
+    #[test]
+    fn self_delegating_macro_offers_single_location() {
+        let src = "#define S S\nint f(void) { return S; }\n";
+        let fa = crate::language_driver::LanguageRegistry::with_enabled()
+            .for_id("cpp")
+            .unwrap()
+            .analyze(src);
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let uri = Url::parse("file:///s.c").unwrap();
+        let locs = pack_macro_definition(
+            &fa,
+            src,
+            tree_sitter::Point { row: 1, column: 21 },
+            &uri,
+            &idx,
+        )
+        .expect("the macro use resolves");
+        assert_eq!(
+            locs.len(),
+            1,
+            "self-delegation must not add a duplicate see-through offer: {:?}",
+            locs.iter().map(|l| (l.range, l.label.clone())).collect::<Vec<_>>()
+        );
+    }
+
+    /// The see-through offer itself stays: a real delegation (`#define F G`)
+    /// offers the def AND the delegate.
+    #[test]
+    fn real_delegation_still_offers_delegate() {
+        let src = "void G(void) { }\n#define F G\nvoid h(void) { F(); }\n";
+        let fa = crate::language_driver::LanguageRegistry::with_enabled()
+            .for_id("cpp")
+            .unwrap()
+            .analyze(src);
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let uri = Url::parse("file:///f.c").unwrap();
+        let locs = pack_macro_definition(
+            &fa,
+            src,
+            tree_sitter::Point { row: 2, column: 15 },
+            &uri,
+            &idx,
+        )
+        .expect("the macro use resolves");
+        assert!(
+            locs.iter().any(|l| l.label.as_deref() == Some("delegates to G")),
+            "a real delegation keeps its see-through offer: {:?}",
+            locs.iter().map(|l| (l.range, l.label.clone())).collect::<Vec<_>>()
+        );
+    }
+}

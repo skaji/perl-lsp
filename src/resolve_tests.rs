@@ -4179,6 +4179,40 @@ mod pack_symmetry {
         );
     }
 
+    /// L2 lock: enum-constant rename is symmetric with refs/def — the full
+    /// cross-file edit set (decl + bare value reads), no locations frozen. A
+    /// bare enum read is a `Variable` ref whose token IS the literal name;
+    /// the Perl variable-fold heuristic must not mark it non-rewritable (that
+    /// made pack rename refuse with a bogus "delegating macro" reason).
+    #[test]
+    fn enum_constant_rename_emits_full_edit_set() {
+        let store = FileStore::new();
+        let decl = cpp("enum opcode { OP_NULL, OP_SCOPE };\n");
+        let target = match resolve_symbol(&decl, tree_sitter::Point::new(0, 24), None) {
+            Some(ResolvedTarget::Target(t)) => t,
+            other => panic!("enum-constant def resolves to a Method target: {other:?}"),
+        };
+        store.insert_workspace(PathBuf::from("/tmp/ren_opcodes.h"), decl);
+        store.insert_workspace(
+            PathBuf::from("/tmp/ren_use.c"),
+            cpp("int is_scope(int t) {\n    return t == OP_SCOPE;\n}\n"),
+        );
+        let locs = crate::resolve::rename_locations(&store, None, &target, true)
+            .expect("plain enum rename must not refuse");
+        assert!(
+            locs.iter().all(|l| l.rewritable),
+            "every plain-spelled site is rewritable: {locs:?}"
+        );
+        assert!(
+            locs.iter().any(|l| l.access == AccessKind::Declaration),
+            "the decl is edited: {locs:?}"
+        );
+        assert!(
+            locs.iter().any(|l| matches!(&l.key, FileKey::Path(p) if p.ends_with("ren_use.c"))),
+            "the cross-file use is edited: {locs:?}"
+        );
+    }
+
     #[test]
     fn object_like_macro_def_reaches_value_and_type_uses() {
         let store = FileStore::new();

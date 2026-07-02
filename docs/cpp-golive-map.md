@@ -98,10 +98,11 @@ import (`use`), field slot = one shared subject. Same machinery, C surface.
    (H1/M1/M2/H8/M7 — in-session header edits propagate, trustworthy persist
    keys, degraded-gen guard, progress gating); wave 2b: H5 bodyless
    `#define` config knobs + H6 honest domain vote + H7 owner-gated Field
-   subjects. Remaining small findings (M5 predefined-macro seed in
-   navigation, M6 cold-open None→warm flip, L1 self-delegation duplicate
-   offer, L2 enum rename no-op, L3 debounce-window staleness) queued for
-   the cleanup pass.
+   subjects. Remaining findings: M5 (predefined-macro seed in navigation),
+   L1 (self-delegation duplicate offer), L2 (enum rename no-op) fixed in
+   the cleanup pass; M6 (cold-open None→warm flip) recorded in
+   `gold-corpus/KNOWN-GAPS.md`; L3 (debounce-window stale analysis) is
+   inherent to the debounce design, listed for awareness.
 7. ✅ **cruft cleanup pass** — dead spike-superseded surface removed
    (`preprocess`/`preprocess_validated`, the `MacroVariants` model,
    `module_paths` driver method, `scope_depth`, `NominalDomain.storage`),

@@ -551,3 +551,26 @@ fn evict_analysis_caches_recovers_header_content_edits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M5 lock: a toolchain-predefined macro (`__GNUC__`) is a known-ON knob in
+/// the reachability config — the arm it guards ranks ACTIVE, not
+/// "unreachable: __GNUC__ undefined". `seed_predefined` is the one seeding
+/// point navigation (`symbols::ranked_macro_variants`) and build-side variant
+/// selection (`known_config`) share.
+#[test]
+fn predefined_macros_seed_reachability_config() {
+    use crate::cpp_macro_model::{classify, KnownConfig, Reachability};
+    let guards = vec!["defined(__GNUC__)".to_string()];
+    // Unseeded: __GNUC__ is defined nowhere in the closure → provably absent.
+    let bare = KnownConfig::new(Default::default(), Default::default());
+    assert!(matches!(classify(&guards, &bare), Reachability::Unreachable { .. }));
+    // Seeded with the toolchain's predefined set: the arm is ACTIVE.
+    let mut defined = std::collections::HashSet::new();
+    let mut universe = std::collections::HashSet::new();
+    crate::cpp_reparse::seed_predefined(
+        &mut defined,
+        &mut universe,
+        &[("__GNUC__".to_string(), "13".to_string())],
+    );
+    let seeded = KnownConfig::new(defined, universe);
+    assert_eq!(classify(&guards, &seeded), Reachability::Active);
+}

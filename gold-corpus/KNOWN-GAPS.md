@@ -233,3 +233,10 @@ references of the wrapped function). Deliberately out of scope / honest gaps:
 | rename through a macro alias / expanded use | alias call sites and expansion-erased uses are listed by references but marked non-rewritable (the token spells the macro's name); pack rename is full-or-refuse — a target whose reference set contains an alias-spelled site refuses outright rather than emitting a partial edit (macros/globals/enum constants/members with plain spellings rename cross-file) |
 | role-macro (`BASEOP`) gr does not list composer structs as "uses" | the standalone-in-struct-body use IS listed (the blanked token is re-minted); the composing struct itself shows via goto-implementation semantics, not references |
 | template extraction (slice a) landed | primaries + per-spec Class identity (`formatter<int, char>`), out-of-line `Buf<T>::` join, explicit-instantiation outline items, `using` alias + concept symbols — `thousands_sep_result` gd/gr green (7 refs / 3 files on fmt); residuals: `extern template` spellings parse as ERROR in tree-sitter-cpp (refs come from catch-alls only), instantiation typing is slice (c) |
+
+## LSP session determinism (C++ tier)
+
+| case | note |
+|---|---|
+| cold-open goto-def/hover return `None`, then answer after warm | the on-open analyze is cached-only (no cold header gather blocking `didOpen`) and the pack index attaches after the lazy background walk; a def/hover served in that window is `None` with no client re-request signal (completion self-heals via `isIncomplete`). A defer needs a completion signal on BOTH the gather refresh (`spawn_pack_gather_refresh`) and the pack index (`ensure_workspace_indexed`'s latch marks kickoff, not completion) plus a bounded wait in the handlers — deliberate design gap, recorded not queued (arc-review M6) |
+| debounce-window stale analysis | between a keystroke and the debounced rebuild, `doc.analysis` describes the previous text; positions can misattribute mid-typing. Inherent to the debounce design (arc-review L3) |

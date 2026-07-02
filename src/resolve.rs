@@ -1366,11 +1366,23 @@ fn pack_class_def_paths(
 /// `Sub`/`Method` target a coinciding `FunctionCall` is the callable's OWN call
 /// site (which MUST rename), not a fold; only handlers fold through a call.
 /// A literal name (`on('connect')`) sits at its string-content span, uncovered.
-fn span_is_folded_name(analysis: &FileAnalysis, span: Span, include_calls: bool) -> bool {
+///
+/// The covering ref must spell a DIFFERENT identifier (`$m`, `EVT`) than the
+/// target: a bare enum/global read is itself a `Variable` ref whose token IS
+/// the literal name — that's the collected use, not a fold, and it must stay
+/// rewritable. (Perl variable names carry their sigil, so they can never
+/// coincide with a callable name.)
+fn span_is_folded_name(
+    analysis: &FileAnalysis,
+    span: Span,
+    include_calls: bool,
+    literal_name: &str,
+) -> bool {
     analysis.refs.iter().any(|r| {
         (matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess)
             || (include_calls && matches!(r.kind, RefKind::FunctionCall { .. })))
             && r.span == span
+            && r.target_name != literal_name
     })
 }
 
@@ -1697,8 +1709,9 @@ fn collect_from_analysis(
         TargetKind::Sub { .. } | TargetKind::Method { .. } => (true, false),
         _ => (false, false),
     };
-    let rewritable_at =
-        |span: Span| !(foldable && span_is_folded_name(analysis, span, folds_through_calls));
+    let rewritable_at = |span: Span| {
+        !(foldable && span_is_folded_name(analysis, span, folds_through_calls, &target.name))
+    };
 
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {

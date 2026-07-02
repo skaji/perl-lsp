@@ -655,7 +655,7 @@ fn ranked_macro_variants(
     uri: &Url,
     module_index: &dyn CrossFileLookup,
 ) -> Vec<(crate::file_analysis::MacroDef, Url, crate::cpp_macro_model::Reachability)> {
-    use crate::cpp_macro_model::{classify, KnownConfig};
+    use crate::cpp_macro_model::classify;
     use crate::file_analysis::MacroDef;
     use std::collections::HashSet;
 
@@ -713,7 +713,10 @@ fn ranked_macro_variants(
     // variants — else every arm reads as unreachable. General over the pattern,
     // not a per-name rule.
     defined.remove(word);
-    let cfg = KnownConfig::new(defined, universe);
+    // Toolchain predefined macros (`__GNUC__`, …) are ON here exactly as they
+    // are in build-side variant selection — navigation and minting share the
+    // one seeding point so they can't disagree on which arm is Active.
+    let cfg = crate::cpp_reparse::known_config_with_toolchain(defined, universe);
 
     // Rank, active-first. Never prune — a lower-ranked (e.g. win32) def stays,
     // labeled. The secondary (path, line, col) key is a TOTAL order so the
@@ -900,8 +903,12 @@ pub fn pack_macro_definition(
 
     // See-through: a direct-delegation wrapper (`#define F(x) G(x)`) also offers
     // the delegate `G`. Resolve from the top-ranked delegating variant only, so
-    // the offer follows the config-active body.
-    if let Some((m, _, _)) = ranked.iter().find(|(m, _, _)| m.delegate.is_some()) {
+    // the offer follows the config-active body. A self-delegation (`#define S S`)
+    // resolves to the definition itself — already offered above, skip it.
+    if let Some((m, _, _)) = ranked
+        .iter()
+        .find(|(m, _, _)| m.delegate.as_deref().is_some_and(|d| d != m.name))
+    {
         if let Some(delegate) = &m.delegate {
             if let Some(loc) = resolve_pack_symbol_location(analysis, delegate, uri, module_index) {
                 out.push(MacroGotoLocation {
