@@ -1662,6 +1662,155 @@ pub fn canonical_template_spelling(raw: &str) -> String {
     out
 }
 
+/// Substitute a class's template parameters with a receiver instance's
+/// type arguments, structurally: a `ClassName` leaf naming `params[i]`
+/// becomes `args[i]`; a nested `Instance` recurses so a param one hop
+/// under a template spelling (`vector<T>`) substitutes; everything else
+/// passes through. The value-side twin of `ParametricOp::ParamOf` —
+/// fields substitute here at query time, methods through the reducer.
+pub fn substitute_type_params(
+    ty: &InferredType,
+    params: &[String],
+    args: &[InferredType],
+) -> InferredType {
+    match ty {
+        InferredType::ClassName(n) => {
+            if let Some(a) = params.iter().position(|p| p == n).and_then(|i| args.get(i)) {
+                return a.clone();
+            }
+            ty.clone()
+        }
+        InferredType::Parametric(p) => match p {
+            // A ResultSet's row/base are Perl package names — no C++
+            // template params can occur inside them.
+            ParametricType::ResultSet { .. } => ty.clone(),
+            ParametricType::Instance { base, args: inner } => {
+                InferredType::Parametric(ParametricType::Instance {
+                    base: base.clone(),
+                    args: inner
+                        .iter()
+                        .map(|a| substitute_type_params(a, params, args))
+                        .collect(),
+                })
+            }
+        },
+        other => other.clone(),
+    }
+}
+
+/// Structural match of a concrete template instance against a partial
+/// specialization's PATTERN (`formatter<vector<int>>` vs the spec
+/// `formatter<vector<T>>`, `params = ["T"]`). On success returns the
+/// bindings in PARAM ORDER (`T → int`) — the receiver args a member query
+/// on the spec's class substitutes — plus a specificity score (count of
+/// literal structure the pattern pinned; more literal = more specific,
+/// the tie-break when several partial patterns match). `None` when the
+/// shapes differ or a param stays unbound / binds inconsistently.
+///
+/// A general walk, never per-name: a pattern leaf that IS a param binds
+/// the whole concrete arg; a leaf with one param embedded at a word
+/// boundary (`T*`, `const T`) binds the middle against the literal
+/// prefix/suffix; nested instances recurse. Template-template patterns
+/// (a param in base position) are out of scope — parked with the
+/// deduction rungs.
+pub fn match_template_pattern(
+    pattern: &ParametricType,
+    params: &[String],
+    concrete: &ParametricType,
+) -> Option<(Vec<InferredType>, u32)> {
+    let (
+        ParametricType::Instance { base: pb, args: pa },
+        ParametricType::Instance { base: cb, args: ca },
+    ) = (pattern, concrete)
+    else {
+        return None;
+    };
+    if pb != cb || pa.len() != ca.len() {
+        return None;
+    }
+    let mut bound: Vec<Option<InferredType>> = vec![None; params.len()];
+    let mut score = 1u32; // the base literal itself
+    for (p, c) in pa.iter().zip(ca.iter()) {
+        match_pattern_arg(p, c, params, &mut bound, &mut score)?;
+    }
+    let bindings: Option<Vec<InferredType>> = bound.into_iter().collect();
+    bindings.map(|b| (b, score))
+}
+
+/// One pattern-arg vs concrete-arg step of `match_template_pattern`.
+/// `Some(())` = matched (bindings/score updated); `None` = mismatch.
+fn match_pattern_arg(
+    pattern: &InferredType,
+    concrete: &InferredType,
+    params: &[String],
+    bound: &mut [Option<InferredType>],
+    score: &mut u32,
+) -> Option<()> {
+    let bind = |i: usize, val: InferredType, bound: &mut [Option<InferredType>]| -> Option<()> {
+        match &bound[i] {
+            Some(prev) if *prev != val => None, // inconsistent re-binding
+            _ => {
+                bound[i] = Some(val);
+                Some(())
+            }
+        }
+    };
+    match pattern {
+        InferredType::ClassName(p) => {
+            // The leaf IS a param → binds the whole concrete arg.
+            if let Some(i) = params.iter().position(|q| q == p) {
+                return bind(i, concrete.clone(), bound);
+            }
+            // One param embedded at a word boundary (`T*`, `const T&`):
+            // the literal prefix/suffix anchors, the middle binds.
+            let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            for (i, q) in params.iter().enumerate() {
+                let Some(pos) = p.match_indices(q.as_str()).find_map(|(pos, _)| {
+                    let before_ok =
+                        pos == 0 || !p[..pos].chars().next_back().is_some_and(is_word);
+                    let after_ok = p[pos + q.len()..].chars().next().is_none_or(|c| !is_word(c));
+                    (before_ok && after_ok).then_some(pos)
+                }) else {
+                    continue;
+                };
+                let (prefix, suffix) = (&p[..pos], &p[pos + q.len()..]);
+                let InferredType::ClassName(cs) = concrete else { return None };
+                let mid = cs.strip_prefix(prefix)?.strip_suffix(suffix)?;
+                if mid.is_empty() {
+                    return None;
+                }
+                *score += 1; // the literal structure around the hole
+                return bind(i, InferredType::ClassName(mid.to_string()), bound);
+            }
+            // Pure literal: spellings must agree.
+            let InferredType::ClassName(cs) = concrete else { return None };
+            (cs == p).then(|| *score += 1)
+        }
+        InferredType::Parametric(pp) => {
+            // Recurse with the SAME binding table: an inner pattern
+            // (`vector<T>`) shares the spec's params.
+            let InferredType::Parametric(cp) = concrete else { return None };
+            let (
+                ParametricType::Instance { base: pb, args: pa },
+                ParametricType::Instance { base: cb, args: ca },
+            ) = (pp, cp)
+            else {
+                return None;
+            };
+            if pb != cb || pa.len() != ca.len() {
+                return None;
+            }
+            *score += 1; // the nested base literal
+            for (p, c) in pa.iter().zip(ca.iter()) {
+                match_pattern_arg(p, c, params, bound, score)?;
+            }
+            Some(())
+        }
+        // Peel-minted patterns only carry ClassName / Instance leaves.
+        _ => None,
+    }
+}
+
 impl InferredType {
     /// Extract the class name if this is an object type
     /// (ClassName, FirstParam, or Parametric — the latter
@@ -2857,6 +3006,17 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub specializes: HashMap<String, String>,
 
+    /// Per-class template parameter names, in declaration order — primary
+    /// templates keyed by base name (`Box` → `["T"]`), partial specs by
+    /// their canonical spelling (`formatter<vector<T>>` → `["T"]`). The
+    /// substitution axis instantiation-aware typing reads: a member type
+    /// naming a param resolves against the receiver `Instance`'s args at
+    /// the param's index (methods via `ParametricOp::ParamOf`, fields via
+    /// `substitute_type_params`). A full spec (`template<>`) has no
+    /// params, so its members never substitute — correct by construction.
+    #[serde(default)]
+    pub template_params: HashMap<String, Vec<String>>,
+
     /// Parent classes for each package in this file.
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
     pub package_parents: HashMap<String, Vec<String>>,
@@ -3344,6 +3504,7 @@ impl FileAnalysis {
         let mut fa = FileAnalysis {
             receiver_names: Vec::new(),
             specializes: HashMap::new(),
+            template_params: HashMap::new(),
             scopes,
             symbols,
             refs,
@@ -4243,6 +4404,48 @@ impl FileAnalysis {
                 _ => {}
             }
         }
+        // Pack member-access chain: the queried span is `recv.member` /
+        // `recv.member(...)` — a receiver expression whose value is the
+        // member's. A pack member ref spans ONLY the member token
+        // (`r.span == method_name_span`, the structural discriminator —
+        // a Perl MethodCall ref spans the whole call and never matches),
+        // so the exact-span arm above can't see it. Pick the RIGHTMOST
+        // member ref whose invocant opens this span and whose token ends
+        // inside it (the chain's last hop), type the receiver recursively
+        // (strictly narrower span, bounded), and resolve the member's
+        // value on it — methods through `MethodOnClass` with the receiver
+        // threaded (`ParamOf` substitutes), fields through the declared
+        // type with params substituted.
+        if let Some((inv, member, arity)) = self
+            .refs
+            .iter()
+            .filter_map(|r| {
+                let RefKind::MethodCall {
+                    invocant_span: Some(inv), method_name_span, ..
+                } = &r.kind
+                else {
+                    return None;
+                };
+                if r.span != *method_name_span
+                    || inv.start != span.start
+                    || (method_name_span.end.row, method_name_span.end.column)
+                        > (span.end.row, span.end.column)
+                    || (inv.end.row, inv.end.column)
+                        >= (method_name_span.start.row, method_name_span.start.column)
+                {
+                    return None;
+                }
+                Some((*inv, r, method_name_span.start))
+            })
+            .max_by_key(|(_, _, mstart)| (mstart.row, mstart.column))
+            .map(|(inv, r, _)| (inv, r.unqualified_target_name().to_string(), None::<usize>))
+        {
+            if let Some(recv_ty) = self.expr_type_at_span(inv, module_index) {
+                if let Some(t) = self.member_value_type(&recv_ty, &member, module_index, arity) {
+                    return Some(t);
+                }
+            }
+        }
         self.bag_query_expr_span(span, module_index)
     }
 
@@ -5042,6 +5245,38 @@ impl FileAnalysis {
         module_index: Option<&dyn CrossFileLookup>,
         arg_count: Option<usize>,
     ) -> Option<InferredType> {
+        // Default receiver = `ClassName(class_name)` so that
+        // `ReturnExpr::Receiver` evaluates correctly for class-keyed
+        // method-return queries that don't have a specific
+        // call-site invocant — Mojo `has 'title'` writer's
+        // Receiver evaluates to ClassName(Bar), DBIC `find`'s
+        // RowOf(Receiver) wraps the Parametric (when one is
+        // supplied via the `arg_count` Some path elsewhere). Same
+        // policy as `query_sub_return_type`'s class-fallback rule.
+        self.method_return_type_on(
+            class_name,
+            &InferredType::ClassName(class_name.to_string()),
+            method_name,
+            module_index,
+            arg_count,
+        )
+    }
+
+    /// `find_method_return_type` with the receiver's FULL value threaded
+    /// into the `MethodOnClass` query — the receiver-relative shapes
+    /// (`ReturnExpr::Receiver`, `Operator(RowOf/ParamOf)`) substitute the
+    /// rich value (`Parametric(Instance { args })`) rather than a bare
+    /// class projection. Callers with a value in hand pass it here (via
+    /// `member_value_type` / `dispatch_of`); the string-keyed wrapper
+    /// above defaults the receiver to the class identity.
+    pub(crate) fn method_return_type_on(
+        &self,
+        class_name: &str,
+        receiver: &InferredType,
+        method_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+        arg_count: Option<usize>,
+    ) -> Option<InferredType> {
         use crate::witnesses::{
             FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
@@ -5056,20 +5291,12 @@ impl FileAnalysis {
             name: method_name.to_string(),
         };
         let ctx = self.bag_context(module_index);
-        // Default receiver = `ClassName(class_name)` so that
-        // `ReturnExpr::Receiver` evaluates correctly for class-keyed
-        // method-return queries that don't have a specific
-        // call-site invocant — Mojo `has 'title'` writer's
-        // Receiver evaluates to ClassName(Bar), DBIC `find`'s
-        // RowOf(Receiver) wraps the Parametric (when one is
-        // supplied via the `arg_count` Some path elsewhere). Same
-        // policy as `query_sub_return_type`'s class-fallback rule.
         let q = ReducerQuery {
             attachment: &att,
             point: None,
             framework,
             arity_hint: arg_count.map(|n| n as u32),
-            receiver: Some(InferredType::ClassName(class_name.to_string())),
+            receiver: Some(receiver.clone()),
             context: Some(&ctx),
         };
         let reg = ReducerRegistry::with_defaults();
@@ -5324,6 +5551,7 @@ impl FileAnalysis {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
                         && s.package.as_deref() == Some(class.as_str())
+                        && cached.analysis.symbol_is_class_content(s)
                 })?;
                 Some(render(&cached.analysis, sym))
             }
@@ -5394,6 +5622,7 @@ impl FileAnalysis {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
                         && s.package.as_deref() == Some(class.as_str())
+                        && cached.analysis.symbol_is_class_content(s)
                 })?;
                 cached.analysis.inferred_type_via_bag(field, sym.span.end)
             }
@@ -7820,16 +8049,167 @@ impl FileAnalysis {
         t: &InferredType,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
+        self.dispatch_of(t, module_index).map(|(class, _)| class)
+    }
+
+    /// `dispatch_class_of` plus the EFFECTIVE RECEIVER member queries on
+    /// that class should carry: for the exact/primary rungs the value
+    /// itself; for a partial-spec match, the value REBOUND into the spec's
+    /// own param space (`formatter<vector<int>>` dispatching to
+    /// `formatter<vector<T>>` hands members `Instance { args: [int] }`,
+    /// so `ParamOf(0)` / field substitution read the PATTERN's bindings,
+    /// not the primary's positional args).
+    pub fn dispatch_of(
+        &self,
+        t: &InferredType,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<(String, InferredType)> {
+        self.dispatch_ladder_of(t, module_index).into_iter().next()
+    }
+
+    /// The full specificity ladder for a value's member dispatch, ranked:
+    /// exact-spelling spec > partial-pattern specs (most literal structure
+    /// first) > base primary. `dispatch_of` takes the head; the goto-def
+    /// family projection walks the whole ladder so a use resolving against
+    /// a spec still OFFERS the primary's def (ranked, never pruned).
+    /// Non-Instance types get their single `class_name()` rung.
+    pub fn dispatch_ladder_of(
+        &self,
+        t: &InferredType,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<(String, InferredType)> {
         let mut t = t;
         while let Some(inner) = t.optional_inner() {
             t = inner;
         }
-        if let Some(spelling) = t.as_parametric().and_then(|p| p.exact_spelling()) {
-            if self.class_exists(&spelling, module_index) {
-                return Some(spelling);
+        let mut out: Vec<(String, InferredType)> = Vec::new();
+        if let Some(p) = t.as_parametric() {
+            if let Some(spelling) = p.exact_spelling() {
+                if self.class_exists(&spelling, module_index) {
+                    out.push((spelling, t.clone()));
+                }
+                // Partial-pattern rung: every spec of the base whose
+                // pattern matches, most-specific first. The rebound
+                // receiver carries the pattern's bindings.
+                for (spec, bindings, _score) in self.matching_partial_specs(p, module_index) {
+                    if out.iter().any(|(c, _)| *c == spec) {
+                        continue;
+                    }
+                    let recv = InferredType::Parametric(ParametricType::Instance {
+                        base: spec.clone(),
+                        args: bindings,
+                    });
+                    out.push((spec, recv));
+                }
             }
         }
-        t.class_name().map(|s| s.to_string())
+        if let Some(cn) = t.class_name() {
+            if !out.iter().any(|(c, _)| c == cn) {
+                out.push((cn.to_string(), t.clone()));
+            }
+        }
+        out
+    }
+
+    /// Partial specializations of `concrete`'s base whose pattern matches
+    /// it, with bindings in spec-param order — sorted most-specific first
+    /// (score desc, then spelling asc for determinism). Candidates come
+    /// from the local `specializes` edges ∪ the index's spec map; each
+    /// spec's param names ride `template_params` in its defining file.
+    fn matching_partial_specs(
+        &self,
+        concrete: &ParametricType,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<(String, Vec<InferredType>, u32)> {
+        let Some(base) = concrete.class_name() else { return Vec::new() };
+        // (spec spelling, params) candidates, local first.
+        let mut cands: Vec<(String, Vec<String>)> = Vec::new();
+        let push_cand = |spec: &str, params: Option<&Vec<String>>, cands: &mut Vec<(String, Vec<String>)>| {
+            let Some(params) = params else { return };
+            if params.is_empty() || cands.iter().any(|(s, _)| s == spec) {
+                return; // a full spec is the exact rung's business
+            }
+            cands.push((spec.to_string(), params.clone()));
+        };
+        for (spec, primary) in &self.specializes {
+            if primary == base {
+                push_cand(spec, self.template_params.get(spec), &mut cands);
+            }
+        }
+        if let Some(idx) = module_index {
+            for (spec, module) in idx.direct_specializations_of(base) {
+                if let Some(cached) = idx.get_cached(&module) {
+                    push_cand(&spec, cached.analysis.template_params.get(&spec), &mut cands);
+                }
+            }
+        }
+        let mut out: Vec<(String, Vec<InferredType>, u32)> = Vec::new();
+        for (spec, params) in cands {
+            let Some(pattern) = ParametricType::instance_from_spelling(&spec) else { continue };
+            if let Some((bindings, score)) = match_template_pattern(&pattern, &params, concrete) {
+                out.push((spec, bindings, score));
+            }
+        }
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// The declaration-order template parameter names of `class` — local
+    /// `template_params`, else the class's own cached file. Empty for
+    /// non-template classes and full specs.
+    fn class_template_params(
+        &self,
+        class: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
+        if let Some(p) = self.template_params.get(class) {
+            return p.clone();
+        }
+        if let Some(cached) = module_index.and_then(|idx| idx.get_cached(class)) {
+            if let Some(p) = cached.analysis.template_params.get(class) {
+                return p.clone();
+            }
+        }
+        Vec::new()
+    }
+
+    /// A member's VALUE on a receiver — the receiver-typed entry every
+    /// tree-free member consumer routes through (the pack chain arm of
+    /// `expr_type_at_span`, the sentinel's receiver typing, member hover).
+    /// Dispatch runs the specificity ladder (`dispatch_of`), method
+    /// returns thread the (rebound) receiver into the `MethodOnClass`
+    /// query so `ReturnExpr::ParamOf` substitutes; a data field falls
+    /// back to its declared type with the class's params substituted
+    /// against the receiver's instance args.
+    pub fn member_value_type(
+        &self,
+        receiver: &InferredType,
+        member: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+        arg_count: Option<usize>,
+    ) -> Option<InferredType> {
+        // The whole ladder, most-specific first: a member the winning spec
+        // doesn't define falls through to the next rung (ultimately the
+        // primary) — same never-pruned order goto-def presents.
+        for (class, recv) in self.dispatch_ladder_of(receiver, module_index) {
+            if let Some(t) =
+                self.method_return_type_on(&class, &recv, member, module_index, arg_count)
+            {
+                return Some(t);
+            }
+            let Some(raw) = self.field_type_on_class(&class, member, module_index) else {
+                continue;
+            };
+            let params = self.class_template_params(&class, module_index);
+            if params.is_empty() {
+                return Some(raw);
+            }
+            let InferredType::Parametric(ParametricType::Instance { args, .. }) = &recv else {
+                return Some(raw);
+            };
+            return Some(substitute_type_params(&raw, &params, args));
+        }
+        None
     }
 
     /// `dispatch_class_of`'s type-to-type twin for consumers that hand a
@@ -7842,9 +8222,15 @@ impl FileAnalysis {
         t: InferredType,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> InferredType {
-        if let Some(spelling) = t.as_parametric().and_then(|p| p.exact_spelling()) {
-            if self.class_exists(&spelling, module_index) {
-                return InferredType::ClassName(spelling);
+        if t.as_parametric().is_some() {
+            if let Some((class, _)) = self.dispatch_of(&t, module_index) {
+                // Collapse ONLY when the ladder picked a spec class (exact
+                // or partial-pattern) — a primary dispatch already projects
+                // the base via `class_name()`, and keeping the Instance
+                // preserves its args for downstream typing.
+                if t.class_name() != Some(class.as_str()) {
+                    return InferredType::ClassName(class);
+                }
             }
         }
         t
@@ -8499,14 +8885,18 @@ impl FileAnalysis {
         // (a) Local symbols in this file packaged under `cls`. Methods AND
         // data members: cpp `obj->field` mints the same `MethodCall` ref as a
         // method call, and a `Variable`/`Field` member is its def. (Perl
-        // members are always Sub/Method, so this is a no-op there.)
+        // members are always Sub/Method, so this is a no-op there.) A
+        // Variable/Field must be the class's OWN content — a lexical local
+        // inside an inline method carries the class as sticky `package` too
+        // (`T* data = this->data();` in a member body is NOT member `data`).
         for &sid in self.symbols_named(method_name) {
             let sym = self.symbol(sid);
-            if matches!(
-                sym.kind,
-                SymKind::Sub | SymKind::Method | SymKind::Variable | SymKind::Field
-            ) && self.symbol_in_class(sid, cls)
-            {
+            let member_kind = match sym.kind {
+                SymKind::Sub | SymKind::Method => true,
+                SymKind::Variable | SymKind::Field => self.symbol_is_class_content(sym),
+                _ => false,
+            };
+            if member_kind && self.symbol_in_class(sid, cls) {
                 return Some(MethodResolution::Local { class: cls.to_string(), sym_id: sid });
             }
         }
@@ -8532,6 +8922,7 @@ impl FileAnalysis {
                         matches!(s.kind, SymKind::Variable | SymKind::Field)
                             && s.name == method_name
                             && s.package.as_deref() == Some(cls)
+                            && cached.analysis.symbol_is_class_content(s)
                     });
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });

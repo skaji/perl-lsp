@@ -1113,3 +1113,72 @@ fn resultset_flavor_has_no_exact_spelling() {
     let p = ParametricType::ResultSet { base: "RS".into(), row: "Row".into() };
     assert_eq!(p.exact_spelling(), None);
 }
+
+// ---- slice (c): pattern matching + substitution (Model layer) ----
+
+#[test]
+fn match_template_pattern_binds_scores_and_rejects() {
+    use crate::file_analysis::{match_template_pattern, InferredType};
+    let peel = |s: &str| ParametricType::instance_from_spelling(s).unwrap();
+    let params = vec!["T".to_string()];
+
+    // bare-param arg binds the whole concrete arg
+    let (b, s_bare) =
+        match_template_pattern(&peel("c<T, char>"), &params, &peel("c<int, char>")).unwrap();
+    assert_eq!(b, vec![InferredType::ClassName("int".into())]);
+
+    // embedded param (`T*`) anchors on the literal suffix
+    let (b, s_ptr) =
+        match_template_pattern(&peel("c<T*, char>"), &params, &peel("c<int*, char>")).unwrap();
+    assert_eq!(b, vec![InferredType::ClassName("int".into())]);
+    assert!(s_ptr > s_bare, "structure around the hole is more specific");
+
+    // nested instance recurses (the formatter<vector<T>> shape)
+    let (b, _) = match_template_pattern(
+        &peel("c<vector<T>, char>"),
+        &params,
+        &peel("c<vector<Widget>, char>"),
+    )
+    .unwrap();
+    assert_eq!(b, vec![InferredType::ClassName("Widget".into())]);
+
+    // literal mismatch / arity mismatch / unbound param all reject
+    assert!(match_template_pattern(&peel("c<T, char>"), &params, &peel("c<int, wchar>")).is_none());
+    assert!(match_template_pattern(&peel("c<T>"), &params, &peel("c<int, char>")).is_none());
+    assert!(match_template_pattern(&peel("c<int, char>"), &params, &peel("c<int, char>")).is_none(),
+        "param never bound -> no substitution basis");
+
+    // inconsistent re-binding rejects (`c<T, T>` vs `c<int, char>`)
+    assert!(match_template_pattern(&peel("c<T, T>"), &params, &peel("c<int, char>")).is_none());
+    // …and a consistent one binds once
+    let (b, _) =
+        match_template_pattern(&peel("c<T, T>"), &params, &peel("c<int, int>")).unwrap();
+    assert_eq!(b, vec![InferredType::ClassName("int".into())]);
+}
+
+#[test]
+fn substitute_type_params_walks_structure() {
+    use crate::file_analysis::{substitute_type_params, InferredType};
+    let params = vec!["T".to_string()];
+    let args = vec![InferredType::ClassName("int".into())];
+    let t = InferredType::ClassName("T".into());
+    assert_eq!(
+        substitute_type_params(&t, &params, &args),
+        InferredType::ClassName("int".into())
+    );
+    let nested = InferredType::Parametric(
+        ParametricType::instance_from_spelling("vector<T>").unwrap(),
+    );
+    assert_eq!(
+        substitute_type_params(&nested, &params, &args),
+        InferredType::Parametric(ParametricType::instance_from_spelling("vector<int>").unwrap())
+    );
+    // non-param leaves and unrelated shapes pass through untouched
+    let plain = InferredType::ClassName("Widget".into());
+    assert_eq!(substitute_type_params(&plain, &params, &args), plain);
+    let rs = InferredType::Parametric(ParametricType::ResultSet {
+        base: "RS".into(),
+        row: "T".into(),
+    });
+    assert_eq!(substitute_type_params(&rs, &params, &args), rs, "ResultSet fields are not param sites");
+}

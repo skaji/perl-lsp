@@ -67,6 +67,9 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("overload_pi", Build),
         // productive Perl projection: plugin symbol generators (spike)
         ("perl_generators", Build),
+        // the shared metaprogram-projection engine (worklist + seen-set +
+        // root-chained provenance); pure std, importable from any layer
+        ("projection", Model),
         ("module_index", Index),
         ("module_resolver", Index),
         ("module_cache", Index),

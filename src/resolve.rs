@@ -964,6 +964,42 @@ impl<'a> CandidateSet<'a> {
         out
     }
 
+    /// The def site of `member` on `class` — origin symbols first, then the
+    /// class's own cached file. Serves the template-family ranked goto-def
+    /// (one location per ladder class that actually defines the member).
+    fn member_def_location(&self, class: &str, member: &str) -> Option<RefLocation> {
+        let is_member = |fa: &crate::file_analysis::FileAnalysis,
+                         s: &crate::file_analysis::Symbol| {
+            s.name == member
+                && s.package.as_deref() == Some(class)
+                && match s.kind {
+                    SymKind::Method | SymKind::Sub => true,
+                    // A data member must be the class's OWN content, not a
+                    // sub-body local carrying the class as sticky package.
+                    SymKind::Variable | SymKind::Field => fa.symbol_is_class_content(s),
+                    _ => false,
+                }
+        };
+        if let Some(sym) = self.origin.symbols.iter().find(|s| is_member(self.origin, s)) {
+            return Some(self.origin_decl(sym.selection_span));
+        }
+        let idx = self.idx()?;
+        let cached = idx.get_cached(class)?;
+        let sym = cached
+            .analysis
+            .symbols
+            .iter()
+            .find(|s| is_member(&cached.analysis, s))?;
+        Url::from_file_path(&cached.path).ok()?;
+        Some(RefLocation {
+            key: FileKey::Path(cached.path.clone()),
+            span: sym.selection_span,
+            access: AccessKind::Declaration,
+            rewritable: true,
+            label: None,
+        })
+    }
+
     /// A declaration site in the origin file.
     fn origin_decl(&self, span: Span) -> RefLocation {
         RefLocation {
@@ -1074,6 +1110,41 @@ impl<'a> CandidateSet<'a> {
                                 return locs;
                             }
                             domain_enum_fallback = el;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Template-family ranked member goto-def: a member use on a template
+        // INSTANCE resolves down the specificity ladder (exact spec >
+        // partial-pattern spec > primary) — the dispatch winner FIRST, and
+        // every other family class defining the same member kept (ranked,
+        // never pruned), so a spec's override and the primary's generic def
+        // both offer.
+        if self.pack {
+            if let Some(r) = analysis.ref_at(point) {
+                if let RefKind::MethodCall { invocant_span: Some(inv), .. } = &r.kind {
+                    if let Some(recv_ty) = analysis.expr_type_at_span(*inv, self.idx()) {
+                        if recv_ty.as_parametric().is_some() {
+                            let member = r.unqualified_target_name();
+                            let mut out: Vec<RefLocation> = Vec::new();
+                            for (class, _) in
+                                analysis.dispatch_ladder_of(&recv_ty, self.idx())
+                            {
+                                let Some(loc) = self.member_def_location(&class, member)
+                                else {
+                                    continue;
+                                };
+                                if !out.iter().any(|l| {
+                                    file_key_eq(&l.key, &loc.key) && l.span == loc.span
+                                }) {
+                                    out.push(loc);
+                                }
+                            }
+                            if !out.is_empty() {
+                                return out;
+                            }
                         }
                     }
                 }
@@ -1306,6 +1377,7 @@ impl<'a> CandidateSet<'a> {
                                 matches!(s.kind, SymKind::Variable | SymKind::Field)
                                     && s.name == method
                                     && s.package.as_deref() == Some(class.as_str())
+                                    && cached.analysis.symbol_is_class_content(s)
                             }) {
                                 if Url::from_file_path(&cached.path).is_ok() {
                                     return vec![RefLocation {

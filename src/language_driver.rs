@@ -586,6 +586,8 @@ fn remap_spans(
         domain_sites,
         macro_returns: _,
         specializations: _,
+        // name-keyed, ordered by byte position pre-remap — no spans to fix.
+        template_params: _,
     } = skel;
 
     for s in symbols.iter_mut() {

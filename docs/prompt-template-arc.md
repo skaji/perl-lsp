@@ -248,34 +248,64 @@ the "resolve the member" level (returns still untyped where they mention
 params). Gold: `tmpl_instance.cpp` rows (gd/gr pair, completion, hover,
 typedef-chase, spec-exact vs primary).
 
-**(c) Instantiation-aware typing — the real projections slice.** Member
-signatures that mention template params substitute the receiver's args:
-`Box<int>::get()` → `int`; `vector<string>::front()` → `string`. Scoped
-honestly as an additive-depth ladder (evaluate cost per level, per the
-golive map's framing):
+**(c) Instantiation-aware typing — LANDED** (c1 + c2 + the fork-4
+selection ladder + the fork-3 engine unification). As implemented:
 
-  - c1. Template-def side: record param-mentions in member return types
-    (the `T get()` case — a bare param) + emit `ParamOf(i)`-shaped
-    `ReturnExpr` witnesses on `MethodOnClass{base, member}`.
-  - c2. Reducer side: substitute from the receiver's `Instance.args` at
-    query time (lazy, like `RowOf` — see fork #1). Chains compose free:
-    `b.get().spin()` works once `get()` answers `Widget`.
-  - c3. Dependent types one hop (`T::value_type` where `T`'s witness has
-    a member/alias by that name) — needs the alias graph; only if a
-    corpus case demands it.
-  - c4. Deduction from value args (`ident(4)` infers `T=int` → the
-    template-join spike's lattice lane). Explicit-args and
-    declared-variable witnesses (c1/c2) cover the LSP-navigation bulk;
-    deduction mostly matters for call-graph/overload work — likely
-    deferred with (d).
+  - c1. Template-def side: `@tmpl.param`/`@tmpl.owner` skeleton captures
+    → `FileAnalysis.template_params` (per-class ordered param names —
+    primaries by base, partial specs by canonical spelling). The
+    writeback translates a param-mentioning member return into a
+    deferred `ReturnExpr` on `Symbol(sid)`: bare param →
+    `Operator(ParamOf { index, of: Receiver })`; a param one hop under a
+    template spelling (`vector<T>`) → `Operator(InstanceOf { base,
+    args })`. Trailing returns (`auto f() -> T*` — the fmt idiom)
+    extract via sibling skeleton patterns (an optional-quantified
+    capture silently kills a pattern's other captures) with
+    rettype-preferring dedup.
+  - c2. Reducer side: `ParamOf` evaluates beside `RowOf` in
+    `eval_return_expr` — the receiver's i-th instance arg, lazily at
+    query time; the receiver rides the existing `MethodOnClass` chase
+    (inheritance hops included, so `basic_memory_buffer<char>` reaching
+    `buffer<T>::data()` substitutes `char`). Fields substitute
+    value-side via `substitute_type_params` in
+    `FileAnalysis::member_value_type` — the ONE receiver-typed member
+    entry the sentinel completion, member hover, and the new tree-free
+    pack member-chain arm of `expr_type_at_span` all route through.
+    Chains compose: `b.get().spin()` / `b.v_.spin()` resolve.
+  - Spec selection (fork 4's middle rung): `dispatch_ladder_of` ranks
+    exact-spelling spec > partial-pattern specs
+    (`match_template_pattern` — structural walk binding the spec's
+    params from the concrete spelling; specificity = literal-structure
+    count, NOT C++ partial-ordering) > primary. A partial match REBINDS
+    the receiver into the spec's param space so its members substitute
+    the pattern's bindings. `definitions()` presents the family ranked,
+    never pruned (matching spec first, primary kept). Gold:
+    `tmpl_typing.cpp` / `tmpl_dangle.cpp` rows.
+  - c3. Dependent types one hop (`T::value_type`) — PARKED (needs the
+    alias graph; no corpus case demanded it yet).
+  - c4. Deduction from value args (`ident(4)` infers `T=int`) — PARKED
+    with (d), the call-graph/overload lane.
+
+**Engine unification (fork 3) — LANDED.** `src/projection.rs::
+project_fixpoint` is the ONE worklist + seen-set + root-chained-
+provenance spine; `perl_generators::synthesize` and
+`cpp_templates::instantiate_to_fixpoint` are thin domain closures over
+it (strings/eager vs types/whole-program — emission policy and seen-set
+granularity are the CALLER's, expressed by call boundary). PR #100
+re-extracts by making its `project(defs, root)` a one-root
+`project_fixpoint` whose step interpolates `${param}` templates.
 
 **(d) Stays parked** (recorded, not queued): SFINAE selection, the full
 overload ranking lattice (gold-roadmap Tier 2 — `exact ≻ promotion ≻
 standard-conversion ≻ user-defined`, partial-ordering), concept
 *checking* (we extract the name; we don't evaluate `requires`), variadic
-packs, template-template params, constexpr/NTTP evaluation, and the
-combinatorial call-graph join (`cpp_template_join.rs` stays a spike until
-a heatmap/call-graph consumer pulls it).
+packs, template-template params (a param in base position never
+pattern-matches), constexpr/NTTP evaluation, dependent-type and
+value-deduction rungs (c3/c4 above), template members hidden behind
+declarator-position macros (`FMT_CONSTEXPR auto data()` — the macro
+arc's lane), and the combinatorial call-graph join
+(`cpp_template_join.rs` stays a spike until a heatmap/call-graph
+consumer pulls it).
 
 Sequencing note: (a) and (b) are independent of PR #100 entirely — they
 need no generator machinery and can tee off immediately. (c) is where the
@@ -283,7 +313,7 @@ projection design commitments (forks below) bind.
 
 ---
 
-## 4. Design forks — DECIDED (user, 2026-07-02) except #4
+## 4. Design forks — ALL FIVE LOCKED (user, 2026-07-02) and LANDED
 
 - **1 LOCKED: lazy** ("lazy for certain").
 - **2 LOCKED: primaries + explicit instantiations in outline.**
@@ -398,12 +428,15 @@ Original fork writeups (kept for the reasoning):
 - The `parents_of` seam, `MethodOnClass` inheritance walk, and the
   refs-symmetry machinery are language-neutral and already carry cpp.
 
+**Real since slice (c):**
+- A *single* projection engine (fork #3) — `src/projection.rs`, both
+  producers are domain closures over it. Emission model stays per-policy
+  on purpose (eager symbols vs lazy types); the SPINE is one function.
+
 **Aspirational (don't claim it yet):**
-- A *single* projection engine (fork #3) — today it's two twins.
-- Perl generators and C++ templates sharing an emission model — eager
-  symbols vs (recommended) lazy types are different policies on purpose.
-- Any consumer of `cpp_templates.rs` — the spike is measured by its own
-  tests and wired to nothing; the join spike likewise.
+- A pipeline consumer of `cpp_templates.rs`'s monomorphizer — it runs on
+  the shared engine but is wired to nothing (the call-graph/heatmap
+  lane); the join spike likewise.
 - Python generics riding the same flavor — plausible (`list[int]` is an
   `Instance`), unprobed.
 

@@ -31,6 +31,10 @@ mod c_superpose;
 mod overload_pi;
 #[allow(dead_code)]
 mod perl_generators;
+// the shared projection engine both metaprogram spikes run on; wired into
+// the pipeline when a producer lands (PR #100 / the monomorphizing consumer)
+#[allow(dead_code)]
+mod projection;
 #[allow(dead_code)]
 mod cpp_multidispatch;
 mod language_driver;
