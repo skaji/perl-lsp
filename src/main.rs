@@ -1265,7 +1265,7 @@ fn run_one(
             // path the LSP server uses; Perl keeps cursor-context.
             let items = if doc.language != "perl" {
                 tphase!("completion_items", backend::pack_completion(
-                    &doc.analysis, &doc.text, &doc.tree, point, doc.language,
+                    ws, &doc.analysis, &doc.text, &doc.tree, point, doc.language,
                     doc.path.as_deref(), idx).0)
             } else {
                 let file_path = std::path::Path::new(file).canonicalize()

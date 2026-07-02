@@ -22,6 +22,7 @@ use crate::symbols;
 /// cached list. Member completion and closure-less languages return a
 /// complete list (false).
 pub fn pack_completion(
+    files: &crate::file_store::FileStore,
     analysis: &crate::file_analysis::FileAnalysis,
     source: &str,
     tree: &tree_sitter::Tree,
@@ -69,8 +70,8 @@ pub fn pack_completion(
     }
     let mut items = symbols::in_scope_completion(analysis, point);
     let macros_live = macro_completion(source, point, language, path, &mut items);
-    let closure_live =
-        closure_symbol_completion(analysis, source, point, language, module_index, &mut items);
+    let closure_live = closure_symbol_completion(
+        files, analysis, source, point, language, path, module_index, &mut items);
     (items, macros_live || closure_live)
 }
 
@@ -103,10 +104,12 @@ fn identifier_prefix(source: &str, cursor: usize) -> &str {
 /// the `is_incomplete` signal, independent of whether the current prefix
 /// matched anything.
 fn closure_symbol_completion(
+    files: &crate::file_store::FileStore,
     analysis: &crate::file_analysis::FileAnalysis,
     source: &str,
     point: tree_sitter::Point,
     language: &str,
+    path: Option<&std::path::Path>,
     module_index: &ModuleIndex,
     items: &mut Vec<CompletionItem>,
 ) -> bool {
@@ -119,43 +122,34 @@ fn closure_symbol_completion(
         return true; // live source, waiting for a prefix
     }
     let pack = module_index.pack_index(language);
-    let idx: &ModuleIndex = pack.as_deref().unwrap_or(module_index);
-    let visible: std::collections::HashSet<String> =
-        analysis.include_closure.iter().cloned().collect();
+    let base_idx: &dyn crate::file_analysis::CrossFileLookup =
+        pack.as_deref().map_or(module_index, |i| i);
     let seen: std::collections::HashSet<String> =
         items.iter().map(|i| i.label.clone()).collect();
-    let defs = crate::timings::phase("completion.closure_symbols", || {
-        idx.visible_defs_with_prefix(prefix, &visible)
-    });
-    for (name, cached) in defs {
-        if seen.contains(&name) {
+    // The closure-gated identifier universe is the set's completion
+    // projection (the cpp instance of `complete(prefix)`); this adapter
+    // owns slot detection (the typed prefix), dedup against in-scope
+    // items, and presentation (the past-`z` sort tier).
+    let cs = crate::resolve::resolve(
+        files,
+        analysis,
+        crate::file_store::FileKey::Path(path.map(|p| p.to_path_buf()).unwrap_or_default()),
+        point,
+        Some(base_idx),
+        crate::resolve::OverrideScope::default(),
+    )
+    .pack_routed();
+    let candidates =
+        crate::timings::phase("completion.closure_symbols", || cs.complete(prefix, false));
+    for c in candidates {
+        if seen.contains(&c.label) {
             continue;
         }
-        let Some(sym) = cached
-            .analysis
-            .symbols_named(&name)
-            .iter()
-            .map(|id| cached.analysis.symbol(*id))
-            .find(|s| cached.analysis.is_linkage_visible(s))
-        else {
-            continue;
-        };
-        let header = cached
-            .path
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // An enum constant carries its parent enum as `package` — show
-        // "opcode — opnames.h" so the domain reads at a glance.
-        let detail = match sym.package.as_deref() {
-            Some(p) if !p.is_empty() => format!("{} — {}", p, header),
-            _ => header,
-        };
         items.push(CompletionItem {
-            label: name.clone(),
-            kind: Some(symbols::fa_completion_kind(&sym.kind)),
-            detail: Some(detail),
-            sort_text: Some(format!("~{}", name)),
+            label: c.label.clone(),
+            kind: Some(symbols::fa_completion_kind(&c.kind)),
+            detail: c.detail,
+            sort_text: Some(format!("~{}", c.label)),
             ..Default::default()
         });
     }
@@ -1365,6 +1359,7 @@ impl LanguageServer for Backend {
         };
         if doc.language != "perl" {
             let (items, is_incomplete) = pack_completion(
+                &self.files,
                 &doc.analysis,
                 &doc.text,
                 &doc.tree,

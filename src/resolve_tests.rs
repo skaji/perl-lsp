@@ -4150,6 +4150,107 @@ mod pack_symmetry {
     use super::*;
     use crate::file_analysis::AccessKind;
 
+    /// THE cross-language symmetry invariant, cpp instance: the origin's
+    /// include-closure — ONE construction fact on the set — moves goto-def,
+    /// references, AND completion gathering together. A closure-bearing
+    /// origin resolves the enum constant in its included header, walks a
+    /// references image that EXCLUDES a closure-disconnected file's
+    /// same-named token, and gathers the header's names as completion
+    /// candidates. Strip the closure (the same knob, nothing per-feature)
+    /// and the projections move coherently: no completion universe, and no
+    /// visibility identity to gate the backward walk with.
+    #[test]
+    fn closure_visibility_axis_flows_to_every_cpp_projection() {
+        use std::sync::Arc;
+        let header_src = "enum opcode { OP_VIS_A, OP_VIS_B };\n";
+        let use_src = "int f(int t) {\n    return t == OP_VIS_A;\n}\n";
+
+        let header = cpp(header_src);
+        let mut user = cpp(use_src);
+        user.include_closure = vec!["/fake/vis/def.h".to_string()];
+        let user_bare = cpp(use_src); // same tokens, no closure
+        let stranger = cpp("int g(void) { return OP_VIS_A; }\n");
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        idx.register_symbols(PathBuf::from("/fake/vis/def.h"), Arc::new(header));
+        idx.register_symbols(PathBuf::from("/fake/vis/use.c"), Arc::new(user));
+        idx.register_symbols(PathBuf::from("/fake/vis/use2.c"), Arc::new(user_bare));
+        idx.register_symbols(PathBuf::from("/fake/vis/other.c"), Arc::new(stranger));
+
+        let store = FileStore::new();
+        let origin = idx.get_cached("f").expect("use.c registered by its fn name");
+        assert!(origin.path.ends_with("use.c"));
+        let cs = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/vis/use.c")),
+            tree_sitter::Point { row: 1, column: 16 }, // on OP_VIS_A
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .pack_routed();
+
+        // goto-def: through the closure to the header's enumerator.
+        let defs = cs.definitions();
+        assert!(
+            defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("def.h"))),
+            "gd resolves through the origin's closure: {defs:?}"
+        );
+
+        // references: the closure-connected files only. The disconnected
+        // file's same-named token is NOT a reference to this target.
+        let refs = cs.references();
+        assert!(
+            refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p.ends_with("use.c"))),
+            "the origin's own use is in the image: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p.ends_with("def.h"))
+                && r.access == AccessKind::Declaration),
+            "the header decl is in the image: {refs:?}"
+        );
+        assert!(
+            !refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p.ends_with("other.c"))),
+            "a closure-disconnected file's same-named token stays OUT: {refs:?}"
+        );
+
+        // completion gathering: the closure IS the identifier universe.
+        let names: Vec<String> =
+            cs.complete("OP_", false).into_iter().map(|c| c.label).collect();
+        assert!(
+            names.contains(&"OP_VIS_A".to_string()) && names.contains(&"OP_VIS_B".to_string()),
+            "the included header's names are the completion universe: {names:?}"
+        );
+
+        // The SAME knob, absent: a closure-less origin has no completion
+        // universe (no global fallback by design) and no visibility
+        // identity to gate the backward walk with (honest fallback: the
+        // ungated name walk — the disconnected file's token now matches).
+        let origin2 = idx.get_cached_scoped(
+            "f",
+            &["/fake/vis/use2.c".to_string()].iter().cloned().collect(),
+        ).expect("use2.c registered");
+        assert!(origin2.path.ends_with("use2.c"));
+        let cs2 = resolve(
+            &store,
+            &origin2.analysis,
+            FileKey::Path(PathBuf::from("/fake/vis/use2.c")),
+            tree_sitter::Point { row: 1, column: 16 },
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .pack_routed();
+        assert!(
+            cs2.complete("OP_", false).is_empty(),
+            "no closure, no completion universe"
+        );
+        let refs2 = cs2.references();
+        assert!(
+            refs2.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p.ends_with("other.c"))),
+            "no closure, no visibility identity — the ungated walk matches by name: {refs2:?}"
+        );
+    }
+
     fn cpp(source: &str) -> FileAnalysis {
         crate::language_driver::LanguageRegistry::with_enabled()
             .for_id("cpp")
@@ -4444,10 +4545,6 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
         "package My::Extra;\nour @EXPORT = qw/extra_fn/;\nsub extra_fn { 3 }\n1;\n",
     );
 
-    let edit_at = Span {
-        start: tree_sitter::Point { row: 0, column: 0 },
-        end: tree_sitter::Point { row: 0, column: 0 },
-    };
     let labels = |cands: &[crate::file_analysis::CompletionCandidate]| -> Vec<String> {
         cands.iter().map(|c| c.label.clone()).collect()
     };
@@ -4457,7 +4554,7 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
     let wide_edits = wide.rename_edits("food").expect("perl rename never refuses");
     assert!(wide_refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_b)));
     assert!(wide_edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &path_b)));
-    let wide_names = labels(&wide.complete("", Some(edit_at)));
+    let wide_names = labels(&wide.complete("", true));
     assert!(wide_names.contains(&"foo".to_string()), "local sub gathered: {wide_names:?}");
     assert!(
         wide_names.contains(&"imported_fn".to_string()),
@@ -4487,7 +4584,7 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
         narrow.rename_edits("food").expect("perl rename never refuses").is_empty(),
         "rename projection inherits the SAME narrowed visibility — not its own copy",
     );
-    let narrow_names = labels(&narrow.complete("", Some(edit_at)));
+    let narrow_names = labels(&narrow.complete("", true));
     assert!(
         narrow_names.contains(&"foo".to_string())
             && narrow_names.contains(&"imported_fn".to_string()),

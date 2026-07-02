@@ -736,6 +736,21 @@ impl<'a> CandidateSet<'a> {
         self
     }
 
+    /// Per-language name semantics on the set's identity keying: normalize
+    /// a typed NEW NAME to the bare identity token edits write. Perl names
+    /// carry sigils (`conventions.rs` owns the rule); pack languages
+    /// canonicalize spellings at extraction (the LangPack `shape_name`
+    /// hook — cpp's `canonical_template_spelling` is that seam's cpp
+    /// instance), so their typed names pass through bare. New per-language
+    /// spelling rules plug in HERE, never inline in a projection.
+    fn bare_new_name<'n>(&self, typed: &'n str) -> &'n str {
+        if self.pack {
+            typed
+        } else {
+            crate::conventions::strip_variable_sigils(typed)
+        }
+    }
+
     /// The origin-scoped index — every forward resolution (identity,
     /// goto-def, implementations) reads through the closure scope built at
     /// construction. Backward walks take `self.module_index` (the base):
@@ -869,7 +884,7 @@ impl<'a> CandidateSet<'a> {
             Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
                 // Group spellings are bare name tokens; a sigil on the typed
                 // name applies only to variable-shaped members' own rules.
-                let bare_new = new_name.trim_start_matches(['$', '@', '%']);
+                let bare_new = self.bare_new_name(new_name);
                 group_rename_edits(
                     self.files,
                     self.module_index,
@@ -1433,28 +1448,82 @@ impl<'a> CandidateSet<'a> {
     ///   the rest of an imported module's `@EXPORT`/`@EXPORT_OK`, and every
     ///   cached exporter's surface as auto-import candidates.
     ///
-    /// `auto_import_at` is the slot's import affordance: the position where
-    /// an auto-import `use` edit would land. `None` means the slot offers no
-    /// import-sourced names at all (today: every slot except the general
-    /// identifier slot) — an import candidate without a place to put its
-    /// edit would complete to broken code.
+    /// `import_slot` is the slot's import affordance: whether accepting an
+    /// import-sourced name here has somewhere to land its `use` edit.
+    /// `false` means the slot offers no import-sourced names at all (today:
+    /// every slot except the general identifier slot) — an import candidate
+    /// without a place for its edit would complete to broken code. The
+    /// candidates carry the importable-from FACT (`ImportFact`); the
+    /// adapter composes fact + affordance into the edit.
     ///
     /// The general slot passes `""` (clients filter by prefix); a non-empty
     /// prefix narrows server-side for callers that want it.
     pub fn complete(
         &self,
         prefix: &str,
-        auto_import_at: Option<Span>,
+        import_slot: bool,
     ) -> Vec<CompletionCandidate> {
         let mask = self.completion_visibility();
+        // Pack routing: the identifier universe is the origin's #include
+        // closure — C's import surface ("C = Perl, everything exported": the
+        // closure IS the import list, so enum constants, free functions,
+        // typedefs and globals from included headers are candidates exactly
+        // like imported subs are for Perl). Same projection, same mask knob;
+        // the sources differ per routing because the languages' name-supply
+        // models differ, not the seam.
+        if self.pack {
+            let mut out = Vec::new();
+            if mask.contains(RoleMask::DEPENDENCY) && !self.origin.include_closure.is_empty() {
+                if let Some(idx) = self.module_index {
+                    let visible: std::collections::HashSet<String> =
+                        self.origin.include_closure.iter().cloned().collect();
+                    for (name, cached) in idx.visible_defs_with_prefix(prefix, &visible) {
+                        // Only linkage-visible defs (a TU-static never
+                        // completes elsewhere).
+                        let Some(sym) = cached
+                            .analysis
+                            .symbols_named(&name)
+                            .iter()
+                            .map(|id| cached.analysis.symbol(*id))
+                            .find(|s| cached.analysis.is_linkage_visible(s))
+                        else {
+                            continue;
+                        };
+                        let header = cached
+                            .path
+                            .file_name()
+                            .map(|f| f.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        // An enum constant carries its parent enum as
+                        // `package` — "opcode — opnames.h" reads the domain
+                        // at a glance.
+                        let detail = match sym.package.as_deref() {
+                            Some(p) if !p.is_empty() => format!("{} — {}", p, header),
+                            _ => header,
+                        };
+                        out.push(CompletionCandidate {
+                            label: name.clone(),
+                            kind: sym.kind.clone(),
+                            detail: Some(detail),
+                            insert_text: None,
+                            sort_priority: crate::file_analysis::PRIORITY_CLOSURE,
+                            additional_edits: vec![],
+                            import_fact: None,
+                            display_override: None,
+                        });
+                    }
+                }
+            }
+            return out;
+        }
         let mut out = Vec::new();
         if mask.contains(RoleMask::OPEN) {
             out.extend(self.origin.complete_general(self.point));
         }
-        if let (Some(insert_at), Some(idx)) = (auto_import_at, self.module_index) {
+        if let (true, Some(idx)) = (import_slot, self.module_index) {
             import_candidates(self.origin, idx, mask, &mut out);
             if mask.contains(RoleMask::DEPENDENCY) {
-                unimported_export_candidates(self.origin, idx, insert_at, &mut out);
+                unimported_export_candidates(self.origin, idx, &mut out);
             }
         }
         if !prefix.is_empty() {
@@ -1527,6 +1596,7 @@ fn import_candidates(
                 insert_text: None,
                 sort_priority: PRIORITY_EXPLICIT_IMPORT,
                 additional_edits: vec![],
+                import_fact: None,
                 display_override: None,
             });
         }
@@ -1563,21 +1633,24 @@ fn import_candidates(
                     .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
                     .unwrap_or_default();
 
-                let (detail, priority, additional_edits) =
+                // The FACT: this name can join the existing qw() list at
+                // its close paren. The adapter composes the edit; a bare
+                // `use Foo;` has no list to join (no fact, no edit).
+                let (detail, priority, import_fact) =
                     if let Some(close_pos) = import.qw_close_paren {
-                        // Auto-add to existing qw() list
-                        let insert_point = Span { start: close_pos, end: close_pos };
                         (
                             format!("{}{} (auto-import)", rt_prefix, import.module_name),
                             PRIORITY_AUTO_ADD_QW,
-                            vec![(insert_point, format!(" {}", name))],
+                            Some(crate::file_analysis::ImportFact::AddToQw {
+                                name: name.clone(),
+                                qw_close: close_pos,
+                            }),
                         )
                     } else {
-                        // No qw() list to edit (bare `use Foo;`)
                         (
                             format!("{}imported from {}", rt_prefix, import.module_name),
                             PRIORITY_BARE_IMPORT,
-                            vec![],
+                            None,
                         )
                     };
 
@@ -1587,7 +1660,8 @@ fn import_candidates(
                     detail: Some(detail),
                     insert_text: None,
                     sort_priority: priority,
-                    additional_edits,
+                    additional_edits: vec![],
+                    import_fact,
                     display_override: None,
                 });
             }
@@ -1596,11 +1670,12 @@ fn import_candidates(
 }
 
 /// Auto-import candidates: every cached exporter's `@EXPORT`/`@EXPORT_OK`
-/// surface, each carrying the `use Module qw(func);` edit at `insert_at`.
+/// surface, each carrying the importable-from FACT (`ImportFact::NewUse`);
+/// the adapter composes the `use Module qw(func);` edit at the slot's
+/// affordance.
 fn unimported_export_candidates(
     origin: &FileAnalysis,
     idx: &dyn CrossFileLookup,
-    insert_at: Span,
     out: &mut Vec<CompletionCandidate>,
 ) {
     use crate::file_analysis::{SymKind as FaSymKind, PRIORITY_UNIMPORTED};
@@ -1631,10 +1706,11 @@ fn unimported_export_candidates(
                 detail: Some(format!("{} (auto-import)", module_name)),
                 insert_text: None,
                 sort_priority: PRIORITY_UNIMPORTED,
-                additional_edits: vec![(
-                    insert_at,
-                    format!("use {} qw({});\n", module_name, name),
-                )],
+                additional_edits: vec![],
+                import_fact: Some(crate::file_analysis::ImportFact::NewUse {
+                    module: module_name.to_string(),
+                    name: name.clone(),
+                }),
                 display_override: None,
             });
         }
@@ -2042,7 +2118,7 @@ pub fn group_refs(
 /// Keyword/identifier-shape validation stays the client's job; this is the
 /// safety floor against silent corruption.
 pub fn is_valid_rename_name(new_name: &str) -> bool {
-    !new_name.trim().trim_start_matches(['$', '@', '%']).trim().is_empty()
+    !crate::conventions::strip_variable_sigils(new_name.trim()).trim().is_empty()
 }
 
 /// Rename edit set for a projection group: every span paired with ITS

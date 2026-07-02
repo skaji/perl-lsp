@@ -1350,6 +1350,14 @@ impl CrossFileLookup for ModuleIndex {
     fn complete_module_names(&self, prefix: &str) -> Vec<(String, bool)> {
         self.complete_module_names(prefix)
     }
+
+    fn visible_defs_with_prefix(
+        &self,
+        prefix: &str,
+        visible: &std::collections::HashSet<String>,
+    ) -> Vec<(String, Arc<CachedModule>)> {
+        self.visible_defs_with_prefix(prefix, visible)
+    }
 }
 
 // ---- Module-level helpers ----

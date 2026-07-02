@@ -666,7 +666,7 @@ fn completion_items_native(
                 // (Minion's `enqueue(..., [...], { | })` options).
                 // Skipping the short-circuit there lets the HashKey
                 // match run and populate `priority`/`queue`/etc.
-                let vars_only: Vec<CompletionCandidate> = cs.complete("", None)
+                let vars_only: Vec<CompletionCandidate> = cs.complete("", false)
                     .into_iter()
                     .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
                     .collect();
@@ -760,10 +760,28 @@ fn completion_items_native(
             // positions, harmful when we just offered dispatch handlers
             // at arg-0 (they'd drown in it) — `suppress_firehose` is set
             // above when the cursor is at arg-0 of a known dispatcher
-            // call, and withholds the affordance.
-            let auto_import_at = (!suppress_firehose)
-                .then(|| auto_import_span(analysis, point, stable_packages));
-            items.extend(cs.complete("", auto_import_at));
+            // call, and withholds the affordance. The candidates carry the
+            // importable-from FACT; the edit is composed HERE, fact + slot
+            // affordance (`auto_import_span` needs the LSP-side stable
+            // outline) — placement is the adapter's, not the model's.
+            let mut import_sourced = cs.complete("", !suppress_firehose);
+            if !suppress_firehose {
+                let insert_at = auto_import_span(analysis, point, stable_packages);
+                for c in &mut import_sourced {
+                    match &c.import_fact {
+                        Some(crate::file_analysis::ImportFact::AddToQw { name, qw_close }) => {
+                            let at = crate::file_analysis::Span { start: *qw_close, end: *qw_close };
+                            c.additional_edits.push((at, format!(" {}", name)));
+                        }
+                        Some(crate::file_analysis::ImportFact::NewUse { module, name }) => {
+                            c.additional_edits
+                                .push((insert_at, format!("use {} qw({});\n", module, name)));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            items.extend(import_sourced);
 
             items
         }
@@ -912,7 +930,7 @@ fn qualified_path_completions(
         let hint = if is_resolved { "indexed" } else { "available" };
         subpaths.push((name, hint));
     }
-    for c in cs.complete(&prefix, None) {
+    for c in cs.complete(&prefix, false) {
         if !matches!(c.kind, FaSymKind::Package | FaSymKind::Class) {
             continue;
         }
@@ -1560,6 +1578,7 @@ fn dispatch_target_completions(
             // this position when a dispatcher is declared for them.
             sort_priority: 0,
             additional_edits: Vec::new(),
+                import_fact: None,
                 display_override: None,
         }
     }).collect()
