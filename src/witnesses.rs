@@ -311,6 +311,24 @@ pub enum ParametricOp {
     /// eagerly: `ResultSet { row, .. }` → `ClassName(row)`, anything else
     /// → `None`.
     RowOf(Box<ReturnExpr>),
+    /// `ParamOf<i>` — projects a template `Instance { args }` to its i-th
+    /// type argument (`Box<int>::get() → int`). The param-indexed sibling
+    /// of `RowOf`: same lazy receiver substitution, a positional axis
+    /// instead of the row axis. An operand with no instance args (a bare
+    /// `ClassName`, a `ResultSet`) has no i-th parameter → `None`.
+    ///
+    /// Kept AFTER `RowOf` for bincode variant-index stability (bump
+    /// `EXTRACT_VERSION`).
+    ParamOf { index: u32, of: Box<ReturnExpr> },
+    /// Re-wraps evaluated sub-positions as a template instance —
+    /// `vector<T> all()` on `Box<int>` evaluates each arg (`ParamOf`)
+    /// and yields `Instance { base: "vector", args: [Numeric] }`, so a
+    /// param nested one hop under a template spelling substitutes. Any
+    /// arg evaluating to `None` fails the whole instance (an
+    /// under-substituted spelling would lie).
+    ///
+    /// Kept at the END for bincode variant-index stability.
+    InstanceOf { base: String, args: Vec<ReturnExpr> },
 }
 
 /// Guard for `ReturnExpr::UnionOnArgs` branches, matched against
@@ -1360,6 +1378,29 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
                     }
                     _ => None,
                 }
+            }
+            ParametricOp::ParamOf { index, of } => {
+                // The receiver's i-th type argument. Only a template
+                // `Instance` carries the positional-arg axis; anything
+                // else has no i-th parameter, so → `None` (a bare
+                // `ClassName(Box)` receiver honestly can't answer what
+                // `T` is).
+                match eval_return_expr(of, q)? {
+                    InferredType::Parametric(ParametricType::Instance { args, .. }) => {
+                        args.get(*index as usize).cloned()
+                    }
+                    _ => None,
+                }
+            }
+            ParametricOp::InstanceOf { base, args } => {
+                let mut out = Vec::with_capacity(args.len());
+                for a in args {
+                    out.push(eval_return_expr(a, q)?);
+                }
+                Some(InferredType::Parametric(ParametricType::Instance {
+                    base: base.clone(),
+                    args: out,
+                }))
             }
         },
         ReturnExpr::UnionOnArgs { branches } => {

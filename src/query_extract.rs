@@ -115,6 +115,11 @@ pub struct SkeletonAnalysis {
     /// `FileAnalysis.specializes`; the graph's `Specializes` edge derives from
     /// it (member resolution never traverses it — a spec REPLACES wholesale).
     pub specializations: Vec<(String, String)>,
+    /// (owner class, param name, param position) triples from
+    /// `@tmpl.owner`/`@tmpl.param` — one per template parameter, joined per
+    /// match. Sorted by position into `FileAnalysis.template_params`
+    /// (declaration order is the `ParamOf` index axis).
+    pub template_params: Vec<(String, String, usize)>,
     /// Variable reads (`@expr.read.var`): (name, scope, span). Each resolves
     /// to the nearest visible Variable declaration by lexical scope walk →
     /// local goto-def + hover. Resolution runs in `into_file_analysis`.
@@ -190,27 +195,35 @@ impl SkeletonAnalysis {
             });
         }
         // A free function matches both the rettype-carrying and the rettype-free
-        // `@def.sub` pattern (a type-less constructor/K&R def only the latter) —
-        // one node, two SkelSymbols. Keep the one WITH a return type; dedup by
-        // the name span (same node → identical span).
+        // `@def.sub` pattern (a type-less constructor/K&R def only the latter),
+        // and a trailing-return function/method matches both its leading-`auto`
+        // pattern and the trailing sibling — one node, two SkelSymbols. Keep
+        // the one WITH a return type; dedup by the name span (same node →
+        // identical span). Per kind, so a sub and a method never cross-dedup.
         {
             use std::collections::HashMap;
-            let mut best: HashMap<(usize, usize, usize, usize), bool> = HashMap::new();
+            let dedup_kinds = ["sub", "method"];
+            let mut best: HashMap<(&str, usize, usize, usize, usize), bool> = HashMap::new();
             for s in &self.symbols {
-                if s.kind == "sub" {
-                    let key = (s.name_start.row, s.name_start.column, s.name_end.row, s.name_end.column);
+                if dedup_kinds.contains(&s.kind.as_str()) {
+                    let key = (s.kind.as_str(), s.name_start.row, s.name_start.column, s.name_end.row, s.name_end.column);
                     let has = s.return_type.is_some();
                     best.entry(key).and_modify(|v| *v |= has).or_insert(has);
                 }
             }
-            let mut kept: std::collections::HashSet<(usize, usize, usize, usize)> = Default::default();
+            let resolved: HashMap<(String, usize, usize, usize, usize), bool> = best
+                .into_iter()
+                .map(|((k, a, b, c, d), v)| ((k.to_string(), a, b, c, d), v))
+                .collect();
+            let mut kept: std::collections::HashSet<(String, usize, usize, usize, usize)> =
+                Default::default();
             self.symbols.retain(|s| {
-                if s.kind != "sub" {
+                if !dedup_kinds.contains(&s.kind.as_str()) {
                     return true;
                 }
-                let key = (s.name_start.row, s.name_start.column, s.name_end.row, s.name_end.column);
+                let key = (s.kind.clone(), s.name_start.row, s.name_start.column, s.name_end.row, s.name_end.column);
                 // Keep the rettype-bearing copy; if none has one, keep the first.
-                if best.get(&key) == Some(&true) && s.return_type.is_none() {
+                if resolved.get(&key) == Some(&true) && s.return_type.is_none() {
                     return false;
                 }
                 kept.insert(key)
@@ -367,6 +380,20 @@ impl SkeletonAnalysis {
                 s.kind = SymKind::Method;
             }
         }
+        // Per-class template parameter lists (declaration order) — the
+        // `ParamOf` index axis. Built here so the writeback below can route
+        // param-mentioning member returns through the deferred shape; rides
+        // onto `FileAnalysis.template_params` after construction.
+        let template_params: std::collections::HashMap<String, Vec<String>> = {
+            let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
+            for (owner, param, _) in &self.template_params {
+                let v = map.entry(owner.clone()).or_default();
+                if !v.contains(param) {
+                    v.push(param.clone());
+                }
+            }
+            map
+        };
         // Writeback-lite: route method returns through MethodOnClass so
         // `box.getInner().` chains, inherited returns, and cross-file all
         // resolve via the SAME chase Perl uses — no bypass. Declared
@@ -385,14 +412,25 @@ impl SkeletonAnalysis {
                     continue;
                 }
                 if let Some(ret) = &self.symbols[i].return_type {
-                    // A class-shaped declared return edges into the alias graph
-                    // (it may be a typedef) instead of committing the spelling;
-                    // primitives are leaves. `TypeName` resolves the typedef or
-                    // falls back to the same `ClassName`, so struct returns are
-                    // unchanged and aliased returns now chase. (edges-not-values)
-                    let pay = match ret {
-                        InferredType::ClassName(cn) => WP::Edge(WA::TypeName(cn.clone())),
-                        other => WP::InferredType(other.clone()),
+                    // A return that MENTIONS the owning class's template
+                    // params publishes the deferred receiver-substituting
+                    // shape (`ParamOf` — lazy, like `RowOf`); a concrete
+                    // class-shaped return edges into the alias graph (it may
+                    // be a typedef) instead of committing the spelling;
+                    // primitives are leaves. `TypeName` resolves the typedef
+                    // or falls back to the same `ClassName`, so struct
+                    // returns are unchanged and aliased returns chase.
+                    // (edges-not-values)
+                    let class_params = sym
+                        .package
+                        .as_deref()
+                        .and_then(|p| template_params.get(p));
+                    let pay = match class_params.and_then(|ps| param_return_expr(ret, ps)) {
+                        Some(re) => WP::ReturnExpr(re),
+                        None => match ret {
+                            InferredType::ClassName(cn) => WP::Edge(WA::TypeName(cn.clone())),
+                            other => WP::InferredType(other.clone()),
+                        },
                     };
                     bag.push(mk(WA::Symbol(sym.id), pay, sym.span));
                 }
@@ -664,6 +702,10 @@ impl SkeletonAnalysis {
         // so member resolution must never fall through this edge — only the
         // graph's `Specializes` family view reads it.
         fa.specializes = self.specializations.drain(..).collect();
+        // Per-class ordered template params — the substitution axis the
+        // dispatch ladder + field substitution read (methods already carry
+        // `ParamOf` witnesses from the writeback above).
+        fa.template_params = template_params;
         // Include/import path tokens carry a span so goto-def can resolve the
         // header (the bare `imports` list is span-less). Resolution to an
         // absolute path happens where the file path is in hand (the driver).
@@ -1125,6 +1167,50 @@ pub fn cpp_pack() -> LangPack {
     }
 }
 
+/// Translate a member's declared return type into the deferred
+/// receiver-substituting `ReturnExpr` when it MENTIONS one of the owning
+/// class's template params: a bare param (`T get()`) becomes
+/// `ParamOf(i, Receiver)`; a param one hop under a template spelling
+/// (`vector<T> all()`) becomes `InstanceOf { base, args }` with the
+/// param positions deferred and the literal positions baked. `None` when
+/// no param occurs — the concrete-return path handles it.
+fn param_return_expr(
+    ret: &InferredType,
+    params: &[String],
+) -> Option<crate::witnesses::ReturnExpr> {
+    use crate::witnesses::{ParametricOp, ReturnExpr};
+    match ret {
+        InferredType::ClassName(n) => {
+            params.iter().position(|p| p == n).map(|i| {
+                ReturnExpr::Operator(ParametricOp::ParamOf {
+                    index: i as u32,
+                    of: Box::new(ReturnExpr::Receiver),
+                })
+            })
+        }
+        InferredType::Parametric(p) => match p {
+            crate::file_analysis::ParametricType::ResultSet { .. } => None,
+            crate::file_analysis::ParametricType::Instance { base, args } => {
+                if !args.iter().any(|a| param_return_expr(a, params).is_some()) {
+                    return None;
+                }
+                let exprs = args
+                    .iter()
+                    .map(|a| {
+                        param_return_expr(a, params)
+                            .unwrap_or_else(|| ReturnExpr::Concrete(a.clone()))
+                    })
+                    .collect();
+                Some(ReturnExpr::Operator(ParametricOp::InstanceOf {
+                    base: base.clone(),
+                    args: exprs,
+                }))
+            }
+        },
+        _ => None,
+    }
+}
+
 /// Peel `T` out of a `std::optional<T>` declared-type text, unqualified
 /// (matching how `annot_type` keys classes by their last `::` segment). `None`
 /// when the text isn't an optional — the type-side gate that keeps the
@@ -1384,6 +1470,10 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // the empty sentinel: it stays a SITE (counter-evidence in the coherence
     // vote's denominator) without persisting arbitrary expression text.
     let mut domain_value_by_match: HashMap<usize, String> = HashMap::new();
+    // `@tmpl.param`/`@tmpl.owner` — one template parameter + the class it
+    // parameterizes per match; joined below into ordered per-class lists.
+    let mut tmpl_param_by_match: HashMap<usize, (String, usize)> = HashMap::new();
+    let mut tmpl_owner_by_match: HashMap<usize, String> = HashMap::new();
     for e in &events {
         if e.cap == "type.annot" {
             annot_by_match.insert(e.match_id, e.text.clone());
@@ -1407,6 +1497,12 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         if e.cap == "spec.primary" {
             spec_primary_by_match.insert(e.match_id, e.text.clone());
         }
+        if e.cap == "tmpl.param" {
+            tmpl_param_by_match.insert(e.match_id, (e.text.clone(), e.start_byte));
+        }
+        if e.cap == "tmpl.owner" {
+            tmpl_owner_by_match.insert(e.match_id, e.text.clone());
+        }
     }
     let mut annot_text_by_var: HashMap<(String, crate::file_analysis::ScopeId), String> =
         HashMap::new();
@@ -1414,6 +1510,21 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // ---- the state machine: scope stack + sticky contexts ----
     let mut out = SkeletonAnalysis::default();
     out.receiver_names = pack.receiver_names.iter().map(|s| s.to_string()).collect();
+    // Template params joined to their owner class — the owner shaped like a
+    // def name (a partial spec's spelling canonicalizes) so the key matches
+    // the Class symbol's identity. Source order = the `ParamOf` index axis.
+    {
+        let mut rows: Vec<(String, String, usize)> = tmpl_param_by_match
+            .iter()
+            .filter_map(|(mid, (param, pos))| {
+                let owner = tmpl_owner_by_match.get(mid)?;
+                Some(((pack.shape_name)("tmpl.owner", owner), param.clone(), *pos))
+            })
+            .collect();
+        rows.sort_by_key(|&(_, _, pos)| pos);
+        rows.dedup();
+        out.template_params = rows;
+    }
     // (end_byte, ScopeId) — real Scope rows are minted as we go so the
     // resulting FileAnalysis carries a genuine lexical tree.
     let mut scope_stack: Vec<(usize, crate::file_analysis::ScopeId)> = Vec::new();
@@ -1986,7 +2097,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     }
 
     // ---- def dedup: `f <- function` matches both the sub and the
-    // generic var pattern; keep the more specific kind per name site ----
+    // generic var pattern (keep the more specific kind per name site), and
+    // a trailing-return function matches both its leading-`auto` pattern
+    // and the trailing sibling (keep the rettype-bearing copy) ----
     {
         let mut best: HashMap<(usize, usize), usize> = HashMap::new();
         let mut keep = vec![true; out.symbols.len()];
@@ -1999,7 +2112,10 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 Some(&j) => {
                     let (gen_i, gen_j) =
                         (out.symbols[i].kind == "var", out.symbols[j].kind == "var");
-                    if gen_j && !gen_i {
+                    let upgrade_ret = out.symbols[i].kind == out.symbols[j].kind
+                        && out.symbols[i].return_type.is_some()
+                        && out.symbols[j].return_type.is_none();
+                    if (gen_j && !gen_i) || upgrade_ret {
                         keep[j] = false;
                         best.insert(key, i);
                     } else {

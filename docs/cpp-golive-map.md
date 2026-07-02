@@ -108,11 +108,21 @@ import (`use`), field slot = one shared subject. Same machinery, C surface.
    `module_paths` driver method, `scope_depth`, `NominalDomain.storage`),
    kept-as-spike PoC modules explicitly annotated, history-narrating
    comments rewritten, both feature builds warning-clean.
-8. **TEMPLATE ARC** 🔵 IN PROGRESS — tee-off brief in
-   `docs/prompt-template-arc.md`; slice (a) landed (spec identity +
-   Specializes edge, explicit-inst outline, aliases/concepts, ScopeKind
-   fix, union DX). Dark residue: instantiation typing (slice c),
-   `extern template` ERROR parse.
+8. ✅ **TEMPLATE ARC** — brief in `docs/prompt-template-arc.md`; all three
+   slices landed. (a) spec identity + Specializes edge, explicit-inst
+   outline, aliases/concepts, ScopeKind fix, union DX. (b) the instance
+   joins the class (`ParametricType::Instance`, exact-spelling dispatch).
+   (c) instantiation-aware typing: lazy `ParamOf`/`InstanceOf` receiver
+   substitution beside `RowOf` (methods, incl. trailing returns) +
+   `substitute_type_params` (fields), the partial-pattern spec-selection
+   ladder (exact > partial > primary; `match_template_pattern` binds the
+   spec's params from the concrete spelling), ranked never-pruned family
+   goto-def, the tree-free pack member-chain arm of `expr_type_at_span`
+   (chained gd/completion), and the unified projection engine
+   (`src/projection.rs` — Perl generators + template monomorphization
+   share the worklist/seen-set/provenance spine). Parked residue: the
+   deduction/dependent-type rungs, template-template params,
+   `extern template` ERROR parse (see the brief's parked list).
 
 **Deferred (recorded, not queued):** Perl domain typing (needs a synthetic
 constant-group / `Type::Tiny` enum-domain model — `docs/adr/field-projections.md`);

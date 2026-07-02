@@ -136,6 +136,31 @@
           "use_crate"
         ]
       }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_dangle.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-chained-member-completion-substitutes",
+      "line": 15,
+      "col": 13,
+      "expect": {
+        "all": [
+          "spin\tWidget",
+          "weight"
+        ],
+        "none": [
+          "go",
+          "cw"
+        ],
+        "exact_labels": [
+          "spin",
+          "weight"
+        ]
+      }
     }
   ]
 }

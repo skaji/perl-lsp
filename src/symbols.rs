@@ -1051,15 +1051,54 @@ pub fn pack_hover_markdown(
         if let Some(midx) = module_index {
             if let Some(cn) = analysis.method_call_invocant_class(r, Some(midx)) {
                 let field = r.unqualified_target_name();
+                // The receiver's full VALUE (not just its dispatch class):
+                // a template instance's args refine a param-shaped member
+                // type (`T get()` on a `Box<int>` receiver → `int`) — shown
+                // only when the substitution actually changed the answer,
+                // so non-template hovers stay byte-identical.
+                let recv_ty = match &r.kind {
+                    RefKind::MethodCall { invocant_span: Some(sp), .. } => {
+                        analysis.expr_type_at_span(*sp, Some(midx))
+                    }
+                    _ => None,
+                };
+                let substituted = |raw: Option<InferredType>| -> Option<InferredType> {
+                    let sub = recv_ty
+                        .as_ref()
+                        .and_then(|t| analysis.member_value_type(t, field, Some(midx), None))?;
+                    (raw.as_ref() != Some(&sub)).then_some(sub)
+                };
                 if let Some(crate::file_analysis::MethodResolution::Local { sym_id, .. }) =
                     analysis.resolve_method_in_ancestors(&cn, field, Some(midx))
                 {
                     let sym = analysis.symbol(sym_id);
                     if matches!(sym.kind, FaSymKind::Method | FaSymKind::Sub) {
-                        return Some(render_symbol_hover(
+                        let mut text = render_symbol_hover(
                             sym, source, &sym.span.start, language, analysis, sym.span.start, Some(midx),
-                        ));
+                        );
+                        if let Some(rt) = substituted(
+                            analysis.find_method_return_type(&cn, field, Some(midx), None),
+                        ) {
+                            text.push_str(&format!(
+                                "\n\n*returns: {}*",
+                                crate::file_analysis::format_inferred_type(&rt)
+                            ));
+                        }
+                        return Some(text);
                     }
+                }
+                // A param-typed member substitutes the same way (`T v_;` on
+                // `Box<int>` reads `v_: int`; a cross-file method's return
+                // lands here too, so the label stays kind-agnostic).
+                if let Some(sub) =
+                    substituted(analysis.field_type_on_class(&cn, field, Some(midx)))
+                {
+                    return Some(format!(
+                        "```{}\n{}: {}\n```\n\n*member*",
+                        language,
+                        field,
+                        crate::file_analysis::format_inferred_type(&sub)
+                    ));
                 }
                 // The member's declared type may be a config-variant macro whose
                 // flow type is the join abstraction (`Numeric`); display the

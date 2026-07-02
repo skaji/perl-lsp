@@ -72,6 +72,19 @@
   name: (template_type name: (type_identifier) @spec.primary) @def.class.name @context.class
   body: (field_declaration_list) @scope) @def.class
 
+; ---- template parameter names, joined to the class they parameterize
+; (`template <typename T, class U> class Box` → Box's params [T, U];
+; a partial spec `template <typename T> struct fmt<vector<T>>` keys its
+; params under the spec's canonical spelling). One match per param; the
+; driver orders by source position. This is the substitution axis
+; instantiation-aware typing reads (`FileAnalysis.template_params`).
+(template_declaration
+  parameters: (template_parameter_list
+    [(type_parameter_declaration (type_identifier) @tmpl.param)
+     (optional_type_parameter_declaration name: (type_identifier) @tmpl.param)])
+  [(class_specifier name: (_) @tmpl.owner)
+   (struct_specifier name: (_) @tmpl.owner)])
+
 ; ---- inheritance: `class Circle : public Shape` → Circle parent Shape.
 ; A dedicated pattern (non-inheriting classes keep matching the body
 ; pattern above); one @parent per base, so multiple inheritance works.
@@ -234,6 +247,25 @@
   type: (_) @rettype
   declarator: (function_declarator
     declarator: (field_identifier) @def.method.name)) @def.method
+; Trailing returns (`auto f() -> T`) — SIBLING patterns, not an optional
+; tail on the ones above (a quantified capture silently kills the whole
+; pattern's other captures). The descriptor's `type:` field (not the whole
+; descriptor) drops cv-qualifiers/pointers, matching how leading returns
+; extract. The leading pattern still fires with `auto` (annot_type → None);
+; the name-span dedup in `into_file_analysis` keeps this rettype-bearing
+; row. No @scope.sub here — the base patterns already mint the scope.
+(function_definition
+  declarator: (function_declarator
+    declarator: (identifier) @def.sub.name
+    (trailing_return_type (type_descriptor type: (_) @rettype)))) @def.sub
+(function_definition
+  declarator: (function_declarator
+    declarator: (field_identifier) @def.method.name
+    (trailing_return_type (type_descriptor type: (_) @rettype)))) @def.method
+(field_declaration
+  declarator: (function_declarator
+    declarator: (field_identifier) @def.method.name
+    (trailing_return_type (type_descriptor type: (_) @rettype)))) @def.method
 ; out-of-line definition `RetT Class::method(...) { ... }` — @qualifier
 ; carries the `Class::` so the method attributes to its class, not the
 ; enclosing namespace.

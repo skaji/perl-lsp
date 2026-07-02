@@ -132,19 +132,24 @@ fn string_args(call: Node, src: &[u8]) -> Vec<String> {
     out
 }
 
-/// Project the generators over the witnesses into synthesized symbols.
-/// A fixpoint worklist: nested `Generate` actions become new witnesses
-/// (carrying the ROOT span for provenance); the seen-set bounds recursive
-/// generators — we never execute, so we never diverge.
+/// Project the generators over the witnesses into synthesized symbols —
+/// one `projection::project_fixpoint` run (worklist + seen-set +
+/// root-chained provenance live in the shared engine; only the
+/// substitution domain — `${param}` string interpolation into declared
+/// `SynthAction`s — is this module's). One run over ALL witnesses =
+/// whole-file dedup policy; a per-call-site policy (PR #100's
+/// `generators::project`) is the same engine called once per root.
 pub fn synthesize(defs: &HashMap<String, GeneratorDef>, witnesses: &[Witness]) -> Vec<Synthesized> {
-    let mut seen: HashSet<(String, Vec<String>)> = HashSet::new();
-    let mut queue: Vec<Witness> = witnesses.to_vec();
-    let mut out = Vec::new();
-    while let Some(w) = queue.pop() {
-        if !seen.insert((w.generator.clone(), w.args.clone())) {
-            continue;
-        }
-        let Some(def) = defs.get(&w.generator) else { continue };
+    let roots = witnesses
+        .iter()
+        .map(|w| crate::projection::ProjWitness {
+            name: w.generator.clone(),
+            args: w.args.clone(),
+            prov: w.span,
+        })
+        .collect();
+    crate::projection::project_fixpoint(roots, |w, out, nested| {
+        let Some(def) = defs.get(&w.name) else { return };
         let subst: HashMap<String, String> =
             def.params.iter().cloned().zip(w.args.iter().cloned()).collect();
         for action in &def.actions {
@@ -152,18 +157,16 @@ pub fn synthesize(defs: &HashMap<String, GeneratorDef>, witnesses: &[Witness]) -
                 SynthAction::Emit { name_tmpl, kind } => out.push(Synthesized {
                     name: interpolate(name_tmpl, &subst),
                     kind,
-                    from_generator: w.generator.clone(),
-                    witness: w.span,
+                    from_generator: w.name.clone(),
+                    witness: w.prov,
                 }),
-                SynthAction::Generate { generator, arg_tmpls } => queue.push(Witness {
-                    generator: generator.clone(),
-                    args: arg_tmpls.iter().map(|t| interpolate(t, &subst)).collect(),
-                    span: w.span, // provenance chains to the root call site
-                }),
+                SynthAction::Generate { generator, arg_tmpls } => nested.push((
+                    generator.clone(),
+                    arg_tmpls.iter().map(|t| interpolate(t, &subst)).collect(),
+                )),
             }
         }
-    }
-    out
+    })
 }
 
 /// `${param}` interpolation against the substitution.

@@ -35,7 +35,7 @@
 //! primary design.) Not wired into the pipeline; measured by
 //! `cpp_templates_tests.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tree_sitter::{Node, Tree};
 
 /// A type argument in an instantiation: a concrete type, or one of the
@@ -147,27 +147,31 @@ fn collect_seeds(node: Node, src: &[u8], out: &mut Vec<Instantiation>) {
 
 // ---- projection + the fixpoint worklist ----
 
-/// Monomorphize to a fixpoint. Start from `seeds`; for each concrete
-/// instantiation, project its template's body — dependent types dissolve,
-/// nested instantiations become new concrete witnesses — and chase those
-/// transitively. The seen-set bounds recursive templates (the
-/// Turing-complete trap): we never execute, so we never diverge.
+/// Monomorphize to a fixpoint — one `projection::project_fixpoint` run
+/// (the shared engine owns the worklist + seen-set; the substitution
+/// domain here is type-args: dependent types dissolve, nested
+/// instantiations go concrete and requeue). ONE run over every seed =
+/// whole-program dedup, the policy a monomorphizing consumer wants.
+/// Lazy per-query typing (`ReturnExpr::ParamOf`) never calls this.
 pub fn instantiate_to_fixpoint(
     templates: &HashMap<String, Template>,
     seeds: &[Instantiation],
 ) -> Vec<Resolved> {
-    let mut seen: HashSet<Instantiation> = HashSet::new();
-    let mut queue: Vec<Instantiation> = seeds.to_vec();
-    let mut out = Vec::new();
-    while let Some(inst) = queue.pop() {
-        if !seen.insert(inst.clone()) {
-            continue; // already monomorphized — bounds recursion
-        }
-        let Some(tmpl) = templates.get(&inst.template) else {
+    let roots = seeds
+        .iter()
+        .map(|i| crate::projection::ProjWitness {
+            name: i.template.clone(),
+            args: i.args.clone(),
+            prov: (),
+        })
+        .collect();
+    crate::projection::project_fixpoint(roots, |w, out, nested| {
+        let inst = Instantiation { template: w.name.clone(), args: w.args.clone() };
+        let Some(tmpl) = templates.get(&w.name) else {
             out.push(Resolved { inst, concrete_types: vec![] }); // opaque template
-            continue;
+            return;
         };
-        let subst = substitution(&tmpl.params, &inst.args);
+        let subst = substitution(&tmpl.params, &w.args);
         // dependent types dissolve: `param::member` → `Concrete::member`
         let concrete_types = tmpl
             .dependent_types
@@ -184,11 +188,10 @@ pub fn instantiate_to_fixpoint(
                     c => c.clone(),
                 })
                 .collect();
-            queue.push(Instantiation { template: bi.template.clone(), args });
+            nested.push((bi.template.clone(), args));
         }
         out.push(Resolved { inst, concrete_types });
-    }
-    out
+    })
 }
 
 fn substitution(params: &[String], args: &[TypeArg]) -> HashMap<String, String> {

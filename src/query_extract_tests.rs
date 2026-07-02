@@ -2021,3 +2021,185 @@ typedef union {
     }
     assert!(!labels.contains(&"(union)"), "synthetic container leaked: {labels:?}");
 }
+
+
+
+// ---- Instantiation-aware typing (template arc slice (c)) ----
+
+#[test]
+fn cpp_template_params_extract_in_declaration_order() {
+    let fa = cpp_fa(
+        "template <typename T, class U = int>\nclass Box { T get(); };\n\
+         template <typename T> struct fmtr<vector<T>, char> { T front(); };\n",
+    );
+    assert_eq!(
+        fa.template_params.get("Box"),
+        Some(&vec!["T".to_string(), "U".to_string()]),
+        "primary params, declaration order (defaulted param included)"
+    );
+    assert_eq!(
+        fa.template_params.get("fmtr<vector<T>, char>"),
+        Some(&vec!["T".to_string()]),
+        "a partial spec keys its params under the canonical spelling"
+    );
+}
+
+#[test]
+fn cpp_instance_member_types_substitute_lazily() {
+    // The typing ladder, rungs 1 + 2: a member whose type IS a param
+    // (`T get()` / `T v_`), and a param one hop under a template spelling
+    // (`vector<T> all()`) / behind a trailing return (`-> T*`). All lazy:
+    // nothing per-instantiation is materialized — `ParamOf` (methods) and
+    // `substitute_type_params` (fields) read the receiver's args at query
+    // time.
+    use crate::file_analysis::{InferredType, ParametricType};
+    let fa = cpp_fa(
+        "\
+template <typename T>
+class Box {
+public:
+    T get();
+    vector<T> all();
+    auto tail() -> T*;
+    T v_;
+    int size();
+};
+",
+    );
+    let recv = InferredType::Parametric(
+        ParametricType::instance_from_spelling("Box<int>").unwrap(),
+    );
+    let mvt = |m: &str| fa.member_value_type(&recv, m, None, None);
+    assert_eq!(mvt("get"), Some(InferredType::ClassName("int".into())), "bare param return");
+    assert_eq!(mvt("v_"), Some(InferredType::ClassName("int".into())), "bare param field");
+    assert_eq!(
+        mvt("all"),
+        Some(InferredType::Parametric(
+            ParametricType::instance_from_spelling("vector<int>").unwrap()
+        )),
+        "param one hop under a template spelling"
+    );
+    assert_eq!(
+        mvt("tail"),
+        Some(InferredType::ClassName("int".into())),
+        "trailing return -> T* substitutes (pointer dropped for navigation)"
+    );
+    assert_eq!(mvt("size"), Some(InferredType::Numeric), "concrete member unchanged");
+    // No receiver args → no invented answer for param-shaped members.
+    let bare = InferredType::ClassName("Box".into());
+    assert_eq!(fa.member_value_type(&bare, "get", None, None), None);
+    assert_eq!(fa.member_value_type(&bare, "size", None, None), Some(InferredType::Numeric));
+}
+
+#[test]
+fn cpp_partial_pattern_spec_dispatch_binds_params() {
+    // The selection ladder (fork 4): exact-spelling spec > partial-pattern
+    // spec (structural match, params bind) > base primary — and a member
+    // query on a partial spec substitutes the PATTERN's bindings, not the
+    // primary's positional args.
+    use crate::file_analysis::{InferredType, ParametricType};
+    let fa = cpp_fa(
+        "\
+template <typename T, typename C> struct codec {
+    int parse();
+};
+template <typename T> struct codec<T*, char> {
+    T deref();
+};
+template <typename T> struct codec<vector<T>, char> {
+    T front();
+};
+template <> struct codec<int, char> {
+    int whole();
+};
+",
+    );
+    let inst = |s: &str| {
+        InferredType::Parametric(ParametricType::instance_from_spelling(s).unwrap())
+    };
+    // exact beats partial beats primary
+    assert_eq!(
+        fa.dispatch_class_of(&inst("codec<int, char>"), None).as_deref(),
+        Some("codec<int, char>")
+    );
+    assert_eq!(
+        fa.dispatch_class_of(&inst("codec<Widget*, char>"), None).as_deref(),
+        Some("codec<T*, char>")
+    );
+    assert_eq!(
+        fa.dispatch_class_of(&inst("codec<vector<int>, char>"), None).as_deref(),
+        Some("codec<vector<T>, char>"),
+        "nested pattern (the formatter<vector<T>> shape)"
+    );
+    assert_eq!(
+        fa.dispatch_class_of(&inst("codec<double, double>"), None).as_deref(),
+        Some("codec"),
+        "no spec matches → primary"
+    );
+    // pattern bindings feed member substitution: T bound THROUGH the shape
+    assert_eq!(
+        fa.member_value_type(&inst("codec<Widget*, char>"), "deref", None, None),
+        Some(InferredType::ClassName("Widget".into()))
+    );
+    assert_eq!(
+        fa.member_value_type(&inst("codec<vector<Widget>, char>"), "front", None, None),
+        Some(InferredType::ClassName("Widget".into()))
+    );
+    // a member the spec doesn't define falls through the ladder to the primary
+    assert_eq!(
+        fa.member_value_type(&inst("codec<Widget*, char>"), "parse", None, None),
+        Some(InferredType::Numeric)
+    );
+    // the ladder itself is ranked and never pruned
+    let ladder: Vec<String> = fa
+        .dispatch_ladder_of(&inst("codec<Widget*, char>"), None)
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+    assert_eq!(ladder, vec!["codec<T*, char>".to_string(), "codec".to_string()]);
+}
+
+#[test]
+fn cpp_member_chain_types_through_substituted_returns() {
+    // `w.get().spin()` — the invocant `w.get()` types via the pack
+    // member-chain arm of `expr_type_at_span` (tree-free), so gd on `spin`
+    // resolves on Widget. Chains compose because `get()` answers Widget.
+    let src = "\
+struct Widget {
+    void spin();
+};
+template <typename T>
+class Box {
+public:
+    T get();
+    T v_;
+};
+void go() {
+    Box<Widget> w;
+    w.get().spin();
+    w.v_.spin();
+}
+";
+    let fa = cpp_fa(src);
+    let gd = |line: u32, character: u32| {
+        let uri = tower_lsp::lsp_types::Url::from_file_path("/fake/cpp/chain.cpp").unwrap();
+        let store = crate::file_store::FileStore::new();
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        match crate::symbols::find_definition(
+            &store,
+            &fa,
+            tower_lsp::lsp_types::Position { line, character },
+            &uri,
+            &idx,
+        ) {
+            Some(tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(l)) => {
+                Some((l.range.start.line, l.range.start.character))
+            }
+            None => None,
+            other => panic!("expected a single location, got {other:?}"),
+        }
+    };
+    assert_eq!(gd(11, 13), Some((1, 9)), "w.get().spin() resolves spin on Widget");
+    assert_eq!(gd(12, 9), Some((1, 9)), "w.v_.spin() resolves through the field's type");
+}
+

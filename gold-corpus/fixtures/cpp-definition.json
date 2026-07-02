@@ -370,6 +370,134 @@
           "tmpl_instance.cpp:25"
         ]
       }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-chain-gd-through-substituted-return",
+      "line": 32,
+      "col": 13,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:7:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-chain-gd-through-param-field",
+      "line": 33,
+      "col": 14,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:7:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-partial-spec-member-gd",
+      "line": 36,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:22:7"
+        ],
+        "none": [
+          "tmpl_typing.cpp:19"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-chain-gd-through-partial-spec-binding",
+      "line": 36,
+      "col": 15,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:7:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-family-gd-ranked-spec-first-primary-kept",
+      "line": 37,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:23:9",
+          "tmpl_typing.cpp:19:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-exact-spec-beats-partial-gd",
+      "line": 39,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:26:9"
+        ],
+        "none": [
+          "tmpl_typing.cpp:23",
+          "tmpl_typing.cpp:19"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-no-spec-match-falls-to-primary-gd",
+      "line": 41,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:19:9"
+        ],
+        "none": [
+          "tmpl_typing.cpp:23",
+          "tmpl_typing.cpp:26"
+        ]
+      }
     }
   ]
 }

@@ -327,27 +327,30 @@ fn resolve_node_type(
     analysis: &FileAnalysis,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> Option<InferredType> {
-    // a member ACCESS `recv.field` — field-on-class.
+    // a member ACCESS `recv.field` — the member's value on the receiver
+    // (`member_value_type`: dispatch ladder + receiver-threaded method
+    // return, falling back to the field's declared type with template
+    // params substituted).
     if cfg.member_kinds.contains(&node.kind()) {
         let base = node.named_child(0)?;
         let field = node.named_child(node.named_child_count() - 1)?;
         let base_ty = resolve_node_type(base, cfg, src, analysis, module_index)?;
-        let class = analysis.dispatch_class_of(&base_ty, module_index)?;
         let field_name = field.utf8_text(src.as_bytes()).ok()?;
-        return analysis.field_type_on_class(&class, field_name, module_index);
+        return analysis.member_value_type(&base_ty, field_name, module_index, None);
     }
     // a method CALL `recv.method(...)` — the method's return on the
     // receiver's class, resolved through MethodOnClass (inheritance +
-    // cross-file flow through the same chase, no special-casing).
+    // cross-file flow through the same chase, no special-casing). The
+    // receiver's full value threads through so a param-shaped return
+    // (`T get()`) substitutes the instance's args.
     if cfg.call_kinds.contains(&node.kind()) {
         let func = node.child_by_field_name("function")?;
         if cfg.member_kinds.contains(&func.kind()) {
             let recv = func.named_child(0)?;
             let method = func.named_child(func.named_child_count() - 1)?;
             let recv_ty = resolve_node_type(recv, cfg, src, analysis, module_index)?;
-            let class = analysis.dispatch_class_of(&recv_ty, module_index)?;
             let method_name = method.utf8_text(src.as_bytes()).ok()?;
-            return analysis.find_method_return_type(&class, method_name, module_index, None);
+            return analysis.member_value_type(&recv_ty, method_name, module_index, None);
         }
         return None;
     }

@@ -327,7 +327,7 @@
       "col": 17,
       "expect": {
         "all": [
-          "op_pmreplroot: OPX* \u2014 union member (overlays op_pmtargetoff)"
+          "op_pmreplroot: OPX* — union member (overlays op_pmtargetoff)"
         ],
         "none": []
       },
@@ -347,6 +347,61 @@
         "all": [
           "c: Crate<Payload>",
           "*variable*"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-param-return-substitutes",
+      "line": 29,
+      "col": 7,
+      "expect": {
+        "all": [
+          "T get()",
+          "*returns: int*"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-param-field-substitutes",
+      "line": 30,
+      "col": 7,
+      "expect": {
+        "all": [
+          "item_: int"
+        ],
+        "none": [
+          "item_: T"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-trailing-return-substitutes",
+      "line": 34,
+      "col": 7,
+      "expect": {
+        "all": [
+          "auto tail() -> T*",
+          "*returns: Widget*"
         ],
         "none": []
       }
