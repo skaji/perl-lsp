@@ -539,7 +539,7 @@ fn completion_items_native(
                     return complete_import_list(name, module_index);
                 }
             } else {
-                return complete_module_names(module_prefix, module_index);
+                return complete_module_names(&cs, module_prefix);
             }
             Vec::new()
         }
@@ -549,7 +549,7 @@ fn completion_items_native(
             // prefix so the client filter matches against what the
             // user typed. Suppress the global firehose; this branch
             // is the answer.
-            return qualified_path_completions(analysis, module_index, package);
+            return qualified_path_completions(&cs, analysis, module_index, package);
         }
         CursorContext::General => {
             let mut items = Vec::new();
@@ -612,9 +612,13 @@ fn completion_items_native(
     items
 }
 
-/// Complete module names on `use` lines from resolved + @INC-scanned modules.
-fn complete_module_names(prefix: &str, module_index: &ModuleIndex) -> Vec<CompletionItem> {
-    let modules = module_index.complete_module_names(prefix);
+/// Complete module names on `use` lines — the CandidateSet's loadable-module
+/// universe, formatted.
+fn complete_module_names(
+    cs: &crate::resolve::CandidateSet,
+    prefix: &str,
+) -> Vec<CompletionItem> {
+    let modules = cs.complete_modules(prefix);
     modules.into_iter().map(|(name, is_resolved)| {
         let (detail, priority) = if is_resolved {
             (Some("indexed".to_string()), 10u8)
@@ -689,6 +693,7 @@ fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<Co
 /// user can drill in without leaving completion. Subs sort first
 /// (priority 010), sub-packages second (020).
 fn qualified_path_completions(
+    cs: &crate::resolve::CandidateSet,
     analysis: &FileAnalysis,
     module_index: &ModuleIndex,
     package: &str,
@@ -712,23 +717,23 @@ fn qualified_path_completions(
         });
     }
 
-    // Sub-packages — both cross-file modules whose name starts with
-    // `Package::` AND in-file `package Package::Other` declarations.
+    // Sub-packages — both loadable modules whose name starts with
+    // `Package::` (the set's module universe) AND in-file
+    // `package Package::Other` declarations (the set's OPEN-tier
+    // identifier universe, kind-projected to packages).
     // Label is the suffix (what follows the typed prefix), so the
     // client's `Package::<typed>` filter matches naturally.
     let prefix = format!("{}::", package);
     let mut subpaths: Vec<(String, &'static str)> = Vec::new();
-    for (name, is_resolved) in module_index.complete_module_names(&prefix) {
+    for (name, is_resolved) in cs.complete_modules(&prefix) {
         let hint = if is_resolved { "indexed" } else { "available" };
         subpaths.push((name, hint));
     }
-    for sym in &analysis.symbols {
-        if !matches!(sym.kind, FaSymKind::Package | FaSymKind::Class) {
+    for c in cs.complete(&prefix, None) {
+        if !matches!(c.kind, FaSymKind::Package | FaSymKind::Class) {
             continue;
         }
-        if sym.name.starts_with(&prefix) && sym.name != package {
-            subpaths.push((sym.name.clone(), "in-file"));
-        }
+        subpaths.push((c.label, "in-file"));
     }
     for (name, hint) in subpaths {
         let suffix = match name.strip_prefix(&prefix) {

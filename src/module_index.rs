@@ -984,6 +984,10 @@ impl CrossFileLookup for ModuleIndex {
             }
         }
     }
+
+    fn complete_module_names(&self, prefix: &str) -> Vec<(String, bool)> {
+        self.complete_module_names(prefix)
+    }
 }
 
 // ---- Module-level helpers ----

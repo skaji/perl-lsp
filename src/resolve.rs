@@ -936,6 +936,25 @@ impl<'a> CandidateSet<'a> {
         }
         out
     }
+
+    /// The loadable-module half of the completion universe: names a `use`
+    /// statement (or a `Foo::` path drill) can reach, as
+    /// (name, is_resolved). Dependency-tier by construction — both the
+    /// resolved module cache and the @INC availability scan live behind the
+    /// index. Workspace-package names are a documented gap: the store holds
+    /// their analyses but no gathering source enumerates them yet, here or
+    /// pre-seam (see the ADR's honest-boundary list). In-file package names
+    /// ride `complete()`'s OPEN tier instead.
+    pub fn complete_modules(&self, prefix: &str) -> Vec<(String, bool)> {
+        let mask = self.completion_visibility();
+        let mut out = Vec::new();
+        if mask.contains(RoleMask::DEPENDENCY) {
+            if let Some(idx) = self.module_index {
+                out.extend(idx.complete_module_names(prefix));
+            }
+        }
+        out
+    }
 }
 
 /// Candidates for names a `use` statement makes (or could make) available:
