@@ -629,7 +629,23 @@ pub struct CandidateSet<'a> {
     origin: &'a FileAnalysis,
     origin_key: FileKey,
     point: tree_sitter::Point,
+    /// The routed base index (the Perl hub, or a per-language pack
+    /// sub-index). Backward walks (`refs_to`, group walks) take THIS —
+    /// `collect_from_analysis` re-scopes per scanned file.
     module_index: Option<&'a dyn CrossFileLookup>,
+    /// The origin's include-closure scope over `module_index`, built once at
+    /// construction — the per-origin visibility rule every forward
+    /// resolution (identity minting, goto-def, implementations) reads, so no
+    /// entry point re-applies the `ScopedLookup` decorator (arc-review C1's
+    /// root shape). Transparent for Perl (empty closure).
+    scoped: Option<crate::file_analysis::ScopedLookup<'a>>,
+    /// Routed through a per-language pack sub-index (the caller's routing
+    /// fact). Two policy consequences, applied at the set level so every
+    /// projection agrees: visibility widens to VISIBLE (pack workspace
+    /// files ride the DEPENDENCY role — a storage artifact of the
+    /// per-language cache, which registers only workspace-walk files), and
+    /// rename REFUSES on alias-spelled sites instead of silently skipping.
+    pack: bool,
     scope: OverrideScope,
     /// Identity, minted once via `resolve_symbol_scoped` — lazily, so a
     /// projection that never consults it (goto-def's forward path) doesn't
@@ -657,12 +673,28 @@ pub fn resolve<'a>(
     module_index: Option<&'a dyn CrossFileLookup>,
     scope: OverrideScope,
 ) -> CandidateSet<'a> {
+    // The per-origin closure scope is a construction fact: forward
+    // resolutions see the names THIS file's preprocessor would (C's flat
+    // linkage), and Perl origins pass through untouched (empty closure).
+    let self_path = match &origin_key {
+        FileKey::Path(p) => Some(p.clone()),
+        FileKey::Url(u) => u.to_file_path().ok(),
+    };
+    let scoped = module_index.map(|idx| {
+        crate::file_analysis::ScopedLookup::new(
+            idx,
+            &origin.include_closure,
+            self_path.as_deref(),
+        )
+    });
     CandidateSet {
         files,
         origin,
         origin_key,
         point,
         module_index,
+        scoped,
+        pack: false,
         scope,
         resolution: std::sync::OnceLock::new(),
         visibility: std::sync::OnceLock::new(),
@@ -683,23 +715,48 @@ impl<'a> CandidateSet<'a> {
         self
     }
 
+    /// Declare the caller routed this origin through a per-language pack
+    /// sub-index. A routing fact, like which store — the policy consequences
+    /// (VISIBLE-wide walks, rename's full-or-refuse) live on the set.
+    pub fn pack_routed(mut self) -> Self {
+        self.pack = true;
+        self
+    }
+
+    /// The origin-scoped index — every forward resolution (identity,
+    /// goto-def, implementations) reads through the closure scope built at
+    /// construction. Backward walks take `self.module_index` (the base):
+    /// `collect_from_analysis` re-scopes per scanned file.
+    fn idx(&self) -> Option<&dyn CrossFileLookup> {
+        self.scoped
+            .as_ref()
+            .map(|s| s as &dyn CrossFileLookup)
+    }
+
     /// What the cursor resolved to. Exposed for callers that need
     /// target-level policy questions (e.g. diagnostics asking a target's
     /// kind); projections below cover the feature verbs.
     pub fn resolution(&self) -> Option<&ResolvedTarget> {
         self.resolution
             .get_or_init(|| {
-                resolve_symbol_scoped(self.origin, self.point, self.module_index, self.scope)
+                resolve_symbol_scoped(self.origin, self.point, self.idx(), self.scope)
             })
             .as_ref()
     }
 
     /// The set-level visibility for a `Target` resolution: the override when
-    /// present, else `references_mask_for`'s editable-vs-visible verdict.
+    /// present; VISIBLE for pack routing (pack workspace files ride the
+    /// DEPENDENCY role); else `references_mask_for`'s editable-vs-visible
+    /// verdict.
     fn target_visibility(&self, target: &TargetRef) -> RoleMask {
         *self.visibility.get_or_init(|| {
-            self.visibility_override
-                .unwrap_or_else(|| references_mask_for(self.files, self.module_index, target))
+            self.visibility_override.unwrap_or_else(|| {
+                if self.pack {
+                    RoleMask::VISIBLE
+                } else {
+                    references_mask_for(self.files, self.module_index, target)
+                }
+            })
         })
     }
 
@@ -723,7 +780,7 @@ impl<'a> CandidateSet<'a> {
             ),
             Some(ResolvedTarget::Local) | None => self
                 .origin
-                .find_references(self.point, self.module_index)
+                .find_references(self.point, self.idx())
                 .into_iter()
                 .map(|span| RefLocation {
                     key: self.origin_key.clone(),
@@ -737,10 +794,17 @@ impl<'a> CandidateSet<'a> {
 
     /// Whether rename at this cursor would produce edits — the prepareRename
     /// gate. Mirrors `rename_edits`' arms so the box is offered exactly where
-    /// edits exist.
+    /// edits exist. Pack targets probe the real edit set: a set rename would
+    /// refuse (alias-spelled sites) or no-op on must not offer a box.
     pub fn renameable(&self) -> bool {
         match self.resolution() {
-            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => true,
+            Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => {
+                if self.pack {
+                    self.rename_edits("x").is_ok_and(|e| !e.is_empty())
+                } else {
+                    true
+                }
+            }
             Some(ResolvedTarget::Group { .. }) => true,
             Some(_) => self
                 .origin
@@ -754,16 +818,35 @@ impl<'a> CandidateSet<'a> {
     /// paired to ITS replacement text (bare vs re-derived affixed accessor
     /// names for groups). Policy lives on the set/locations, not in handlers:
     /// non-rewritable sites (const-folded names) are references but never
-    /// edits, and the walk stops at editable space. Empty = nothing
-    /// renameable here.
-    pub fn rename_edits(&self, new_name: &str) -> Vec<(RefLocation, String)> {
-        let editable = self
-            .visibility_override
-            .map(|m| m & RoleMask::EDITABLE)
-            .unwrap_or(RoleMask::EDITABLE);
-        match self.resolution() {
+    /// edits, and the walk stops at editable space (for pack routing,
+    /// "editable" includes the per-language cache — see `pack_routed`).
+    /// `Ok(empty)` = nothing renameable here; `Err` = a rename that would
+    /// SILENTLY BREAK code — a pack set containing an alias-spelled site (a
+    /// use through a delegating `#define`, `rewritable: false`) refuses: the
+    /// macro's body isn't a collected span, so renaming the target would
+    /// leave the delegation chain pointing at the old name. Perl's
+    /// non-rewritable sites (variable-folded dispatch) keep their
+    /// long-standing skip.
+    pub fn rename_edits(&self, new_name: &str) -> Result<Vec<(RefLocation, String)>, String> {
+        let editable = if self.pack {
+            RoleMask::VISIBLE
+        } else {
+            self.visibility_override
+                .map(|m| m & RoleMask::EDITABLE)
+                .unwrap_or(RoleMask::EDITABLE)
+        };
+        Ok(match self.resolution() {
             Some(ResolvedTarget::Target(t)) if t.supports_cross_file_rename() => {
-                refs_to(self.files, self.module_index, t, editable)
+                let locations = refs_to(self.files, self.module_index, t, editable);
+                if self.pack && locations.iter().any(|l| !l.rewritable) {
+                    return Err(format!(
+                        "rename of `{}` would leave sites spelled through a delegating macro \
+                         unchanged (the macro body is not rewritten) — refusing rather than \
+                         emitting a partial edit",
+                        t.name
+                    ));
+                }
+                locations
                     .into_iter()
                     .filter(|loc| loc.rewritable)
                     .map(|loc| (loc, new_name.to_string()))
@@ -804,19 +887,50 @@ impl<'a> CandidateSet<'a> {
                 })
                 .collect(),
             None => Vec::new(),
-        }
+        })
     }
 
     /// The family/descendants walk over the set: every override/composer
-    /// definition of a Method target. Non-callable resolutions have no
-    /// implementation semantics.
+    /// definition of a Method target, the specialization family of a
+    /// template primary (Package targets), and — from an enum TYPE's own
+    /// def — the reverse domain bridge: the field-slot sites whose recovered
+    /// domain is that enum. The bridge is an implementations-style
+    /// projection of the domain edge, deliberately NOT part of plain
+    /// references (from an enumerator it fanned ~56 real references out to
+    /// the field's ~950 sites).
     pub fn implementations(&self) -> Vec<RefLocation> {
-        match self.resolution() {
-            Some(ResolvedTarget::Target(t)) => {
-                implementations_of(self.origin, self.module_index, t)
+        // Domain slot sites come off the cursor's own Class def, before
+        // identity minting — the enum def resolves to a Package target whose
+        // family walk is a different edge set.
+        let mut out: Vec<RefLocation> = Vec::new();
+        if let Some(idx) = self.module_index {
+            if let Some(sym) = self.origin.symbol_at(self.point) {
+                if matches!(sym.kind, SymKind::Class) {
+                    let enum_name = sym.name.clone();
+                    idx.for_each_cached_file(&mut |cached| {
+                        for span in cached
+                            .analysis
+                            .field_sites_for_enum(&enum_name, Some(idx))
+                        {
+                            out.push(RefLocation {
+                                key: FileKey::Path(cached.path.clone()),
+                                span,
+                                access: AccessKind::Read,
+                                rewritable: false,
+                            });
+                        }
+                    });
+                }
             }
-            _ => Vec::new(),
         }
+        if let Some(ResolvedTarget::Target(t)) = self.resolution() {
+            out.extend(implementations_of(self.origin, self.idx(), t));
+        }
+        // Domain sites first (the bridge is the headline answer on an enum
+        // def), then the family walk; first occurrence wins the dedup.
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|l| seen.insert((key_for_sort(&l.key), l.span)));
+        out
     }
 
     /// A declaration site in the origin file.
@@ -844,7 +958,7 @@ impl<'a> CandidateSet<'a> {
         // to its definition. Runs first because the cursor is on the
         // name-string arg, which the paths below would otherwise treat as a
         // plain string literal. See `docs/adr/receiver-gated-dispatch.md`.
-        if let Some(idx) = self.module_index {
+        if let Some(idx) = self.idx() {
             if let Some(applied) = analysis.dispatch_at(point, Some(idx)) {
                 let locs = dispatch_handler_locations(&applied.owner, &applied.name, idx);
                 if !locs.is_empty() {
@@ -863,7 +977,7 @@ impl<'a> CandidateSet<'a> {
         // made goto-def site-dependent) — it becomes the LAST-resort fallback
         // instead, returned only when every decl-resolving path has passed.
         let mut domain_enum_fallback: Option<RefLocation> = None;
-        if let Some(idx) = self.module_index {
+        if let Some(idx) = self.idx() {
             if let Some(r) = analysis.ref_at(point) {
                 if matches!(r.kind, RefKind::MethodCall { .. }) {
                     if let Some(cn) = analysis.method_call_invocant_class(r, Some(idx)) {
@@ -889,11 +1003,11 @@ impl<'a> CandidateSet<'a> {
         }
 
         // Local definition first.
-        if let Some(span) = analysis.find_definition(point, self.module_index) {
+        if let Some(span) = analysis.find_definition(point, self.idx()) {
             return vec![self.origin_decl(span)];
         }
 
-        let Some(idx) = self.module_index else {
+        let Some(idx) = self.idx() else {
             return Vec::new();
         };
         let line_loc = |path: PathBuf, line: u32| -> RefLocation {
@@ -1910,42 +2024,6 @@ pub fn group_rename_edits(
     out
 }
 
-/// The rename edit set for a cross-file target, or a refusal. The ONE policy
-/// point both rename entry points (LSP handler + CLI) share, so what rename
-/// edits — and what it declines — can't diverge between them.
-///
-/// `pack` = the query is routed through a per-language sub-index (the caller's
-/// routing fact, mirroring the references handlers). Two policy consequences:
-///
-/// * mask widens to VISIBLE — pack workspace files ride the DEPENDENCY role
-///   (a storage artifact of the per-language cache, which registers only
-///   workspace-walk files, so VISIBLE still can't reach anything outside the
-///   project). EDITABLE would silently drop every non-open pack file and emit
-///   a partial edit that breaks the code on apply.
-/// * a set containing an alias-spelled site (a use through a delegating
-///   `#define`, `rewritable: false`) REFUSES: the macro's body isn't a
-///   collected span, so renaming the target would leave the delegation chain
-///   pointing at the old name — a silent semantic break. Perl's non-rewritable
-///   sites (variable-folded dispatch) keep their long-standing skip.
-pub fn rename_locations(
-    files: &FileStore,
-    module_index: Option<&dyn CrossFileLookup>,
-    target: &TargetRef,
-    pack: bool,
-) -> Result<Vec<RefLocation>, String> {
-    let mask = if pack { RoleMask::VISIBLE } else { RoleMask::EDITABLE };
-    let locations = refs_to(files, module_index, target, mask);
-    if pack && locations.iter().any(|l| !l.rewritable) {
-        return Err(format!(
-            "rename of `{}` would leave sites spelled through a delegating macro \
-             unchanged (the macro body is not rewritten) — refusing rather than \
-             emitting a partial edit",
-            target.name
-        ));
-    }
-    Ok(locations)
-}
-
 /// Collect every reference to `target` across the masked file set.
 ///
 /// - `files`   — open + workspace store
@@ -1972,7 +2050,15 @@ pub fn refs_to(
             if let Ok(p) = url.to_file_path() {
                 covered_paths.insert(p);
             }
-            collect_from_analysis(&FileKey::Url(url), &doc.analysis, target, &aliases, module_index, &mut out);
+            // The walk applies visibility: role mask picked the tier, the
+            // closure gate decides per file (`file_sees_target`); the
+            // matcher below only matches.
+            let key = FileKey::Url(url);
+            let file_str = canonical_file_str(&key);
+            if !file_sees_target(target, &doc.analysis, &file_str) {
+                return;
+            }
+            collect_from_analysis(&key, &doc.analysis, target, &aliases, module_index, &file_str, &mut out);
         });
     } else {
         // Even if open isn't in the mask, track the paths so a WORKSPACE walk
@@ -1991,7 +2077,12 @@ pub fn refs_to(
                 continue;
             }
             covered_paths.insert(entry.key().clone());
-            collect_from_analysis(&FileKey::Path(entry.key().clone()), entry.value(), target, &aliases, module_index, &mut out);
+            let key = FileKey::Path(entry.key().clone());
+            let file_str = canonical_file_str(&key);
+            if !file_sees_target(target, entry.value(), &file_str) {
+                continue;
+            }
+            collect_from_analysis(&key, entry.value(), target, &aliases, module_index, &file_str, &mut out);
         }
     }
 
@@ -2006,7 +2097,11 @@ pub fn refs_to(
                     return;
                 }
                 let key = FileKey::Path(cached.path.clone());
-                collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &mut out);
+                let file_str = canonical_file_str(&key);
+                if !file_sees_target(target, &cached.analysis, &file_str) {
+                    return;
+                }
+                collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &file_str, &mut out);
             });
         }
     }
@@ -2220,7 +2315,10 @@ fn delegation_aliases(
             }
         }
     };
-    files.for_each_open_mut(|url, doc| {
+    // Read-only walk: handlers hold their open-doc READ guard across
+    // projections (the set's borrow discipline), so a write lock here
+    // deadlocks the moment a diagnostics refresh queues behind it.
+    files.for_each_open(|url, doc| {
         let path = url
             .to_file_path()
             .map(|p| {
@@ -2626,40 +2724,45 @@ fn collect_package_var(
     }
 }
 
+/// The closure-connectivity half of the visibility axis (RoleMask is the
+/// role half): may `analysis` — living at canonical `file_str` — see one of
+/// the target's defining files? A scanned file whose closure reaches none of
+/// them can't be referring to the target: its same-named tokens resolve (or
+/// would resolve) to something else entirely (an unrelated TU's static,
+/// another header's same-named struct/enum, a Perl `croak` half a workspace
+/// away). Empty `def_paths` (every Perl target, unscoped callers) = no gate.
+/// Applied by the WALK driver (`refs_to`) before a file is scanned — decls
+/// included, so two same-named statics never cross-list — which is what
+/// makes every projection that walks inherit it (arc-review C1's fix, owned
+/// by the seam, not the matcher).
+fn file_sees_target(target: &TargetRef, analysis: &FileAnalysis, file_str: &str) -> bool {
+    target.def_paths.is_empty()
+        || target
+            .def_paths
+            .iter()
+            .any(|d| d == file_str || analysis.include_closure.iter().any(|c| c == d))
+}
+
+/// A `FileKey`'s canonical path string — the spelling the visibility facts
+/// (`def_paths`, alias def sites, include closures) are keyed in.
+fn canonical_file_str(key: &FileKey) -> String {
+    let file_path = key_for_sort(key);
+    std::fs::canonicalize(&file_path)
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn collect_from_analysis(
     key: &FileKey,
     analysis: &FileAnalysis,
     target: &TargetRef,
     aliases: &[DelegationAlias],
     module_index: Option<&dyn CrossFileLookup>,
+    file_str: &str,
     out: &mut Vec<RefLocation>,
 ) {
     use crate::file_analysis::HashKeyOwner;
-
-    // This file's canonical path — the key both visibility gates below compare
-    // against (def_paths / alias def sites are canonical strings).
-    let file_path = key_for_sort(key);
-    let file_str = std::fs::canonicalize(&file_path)
-        .unwrap_or(file_path)
-        .to_string_lossy()
-        .into_owned();
-
-    // A pack target's identity includes VISIBILITY — the same
-    // include-closure model forward resolution uses. A scanned file whose
-    // closure reaches none of the target's defining files can't be referring
-    // to it: its same-named tokens resolve (or would resolve) to something
-    // else entirely (an unrelated TU's static, another header's same-named
-    // struct/enum, a Perl `croak` half a workspace away). Skip the whole
-    // file — decls included, so two same-named statics never cross-list.
-    // Empty `def_paths` (every Perl target, unscoped callers) = no gate.
-    if !target.def_paths.is_empty() {
-        let sees = target.def_paths.iter().any(|d| {
-            *d == file_str || analysis.include_closure.iter().any(|c| c == d)
-        });
-        if !sees {
-            return;
-        }
-    }
 
     // An alias applies in THIS file only if its `#define` is visible here
     // (macro expansion requires inclusion). Files of another language have

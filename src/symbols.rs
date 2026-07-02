@@ -177,39 +177,6 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
-/// Reverse domain bridge, **enum-TYPE grain only**: given the cursor is on an
-/// enum's own def, the field-slot sites across the project whose recovered
-/// domain is that enum (`enum opcode` → the `op_type` uses). Scans the cached
-/// modules' stored `domain_sites` (a targeted lookup keyed on the enum, not a
-/// witness sweep). `(path, slot_span)` per site.
-///
-/// Deliberately NOT reachable from an enumerator (def or use): a variant's
-/// relation to the field is "member of the domain enum", not a reference —
-/// traversing the bridge from `OP_SCOPE` fanned its ~56 real references out
-/// to every one of the field's ~950 sites. The fan-out is an
-/// implementations-style projection on the TYPE, so it is served by the
-/// goto-implementation handlers, never mixed into plain references.
-pub fn domain_backrefs(
-    analysis: &FileAnalysis,
-    point: Point,
-    module_index: &dyn CrossFileLookup,
-) -> Vec<(std::path::PathBuf, crate::file_analysis::Span)> {
-    use crate::file_analysis::SymKind;
-    let target = analysis.symbol_at(point).and_then(|sym| match sym.kind {
-        // The enum def itself.
-        SymKind::Class => Some(sym.name.clone()),
-        _ => None,
-    });
-    let Some(enum_name) = target else { return Vec::new() };
-    let mut out: Vec<(std::path::PathBuf, crate::file_analysis::Span)> = Vec::new();
-    module_index.for_each_cached_file(&mut |cached| {
-        for span in cached.analysis.field_sites_for_enum(&enum_name, Some(module_index)) {
-            out.push((cached.path.clone(), span));
-        }
-    });
-    out
-}
-
 /// Goto-definition: the forward projection of the resolution CandidateSet,
 /// adapted to LSP types. One location → Scalar; several (stacked handler
 /// registrations) → Array so the editor shows a picker.
@@ -617,40 +584,7 @@ fn resolve_pack_symbol_location(
     candidates.into_iter().next().map(|c| c.5)
 }
 
-pub fn find_references(analysis: &FileAnalysis, pos: Position, uri: &Url, module_index: Option<&dyn CrossFileLookup>) -> Vec<Location> {
-    analysis.find_references(position_to_point(pos), module_index)
-        .into_iter()
-        .map(|span| Location {
-            uri: uri.clone(),
-            range: span_to_range(span),
-        })
-        .collect()
-}
 
-pub fn rename(
-    analysis: &FileAnalysis,
-    pos: Position,
-    uri: &Url,
-    new_name: &str,
-) -> Option<WorkspaceEdit> {
-    let edits = analysis.rename_at(position_to_point(pos), new_name)?;
-
-    let text_edits: Vec<TextEdit> = edits
-        .into_iter()
-        .map(|(span, new_text)| TextEdit {
-            range: span_to_range(span),
-            new_text,
-        })
-        .collect();
-
-    let mut changes = HashMap::new();
-    changes.insert(uri.clone(), text_edits);
-
-    Some(WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    })
-}
 
 pub(crate) fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
     match kind {

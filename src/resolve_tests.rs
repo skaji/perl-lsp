@@ -4205,28 +4205,32 @@ mod pack_symmetry {
     fn enum_constant_rename_emits_full_edit_set() {
         let store = FileStore::new();
         let decl = cpp("enum opcode { OP_NULL, OP_SCOPE };\n");
-        let target = match resolve_symbol(&decl, tree_sitter::Point::new(0, 24), None) {
-            Some(ResolvedTarget::Target(t)) => t,
-            other => panic!("enum-constant def resolves to a Method target: {other:?}"),
-        };
-        store.insert_workspace(PathBuf::from("/tmp/ren_opcodes.h"), decl);
+        let hpath = PathBuf::from("/tmp/ren_opcodes.h");
+        store.insert_workspace(hpath.clone(), decl);
         store.insert_workspace(
             PathBuf::from("/tmp/ren_use.c"),
             cpp("int is_scope(int t) {\n    return t == OP_SCOPE;\n}\n"),
         );
-        let locs = crate::resolve::rename_locations(&store, None, &target, true)
+        let origin = store.workspace_raw().get(&hpath).unwrap().value().clone();
+        let cs = resolve(
+            &store,
+            &origin,
+            FileKey::Path(hpath),
+            tree_sitter::Point::new(0, 24),
+            None,
+            OverrideScope::default(),
+        )
+        .pack_routed();
+        let edits = cs
+            .rename_edits("OP_RANGE")
             .expect("plain enum rename must not refuse");
         assert!(
-            locs.iter().all(|l| l.rewritable),
-            "every plain-spelled site is rewritable: {locs:?}"
+            edits.iter().any(|(l, _)| l.access == AccessKind::Declaration),
+            "the decl is edited: {edits:?}"
         );
         assert!(
-            locs.iter().any(|l| l.access == AccessKind::Declaration),
-            "the decl is edited: {locs:?}"
-        );
-        assert!(
-            locs.iter().any(|l| matches!(&l.key, FileKey::Path(p) if p.ends_with("ren_use.c"))),
-            "the cross-file use is edited: {locs:?}"
+            edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p.ends_with("ren_use.c"))),
+            "the cross-file use is edited: {edits:?}"
         );
     }
 
@@ -4392,7 +4396,7 @@ fn candidate_set_rename_is_subset_of_references() {
 
     // Rename is the same set + policy — every edit span must be a reference
     // span (partial-edit-beyond-references is unrepresentable).
-    let edits = cs.rename_edits("food");
+    let edits = cs.rename_edits("food").expect("perl rename never refuses");
     assert!(!edits.is_empty());
     for (loc, text) in &edits {
         assert_eq!(text, "food");
@@ -4450,7 +4454,7 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
 
     let wide = resolve(&store, &fa_a, FileKey::Path(path_a.clone()), point, Some(&idx), OverrideScope::default());
     let wide_refs = wide.references();
-    let wide_edits = wide.rename_edits("food");
+    let wide_edits = wide.rename_edits("food").expect("perl rename never refuses");
     assert!(wide_refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_b)));
     assert!(wide_edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &path_b)));
     let wide_names = labels(&wide.complete("", Some(edit_at)));
@@ -4480,7 +4484,7 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
         "references projection inherits the narrowed visibility",
     );
     assert!(
-        narrow.rename_edits("food").is_empty(),
+        narrow.rename_edits("food").expect("perl rename never refuses").is_empty(),
         "rename projection inherits the SAME narrowed visibility — not its own copy",
     );
     let narrow_names = labels(&narrow.complete("", Some(edit_at)));
@@ -4514,7 +4518,7 @@ fn candidate_set_local_projections() {
     assert!(cs.renameable());
     let refs = cs.references();
     assert_eq!(refs.len(), 3, "decl + two uses: {refs:?}");
-    let edits = cs.rename_edits("$total");
+    let edits = cs.rename_edits("$total").expect("perl rename never refuses");
     assert_eq!(edits.len(), 3, "rename covers the same in-file set: {edits:?}");
     assert!(cs.implementations().is_empty());
 }
