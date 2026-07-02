@@ -854,9 +854,13 @@ impl Symbol {
     /// member hover, inlay hints, and signature help all render through it, so
     /// the pointer stars can't vanish on some surfaces and not others.
     pub fn display_type(&self, ty: &InferredType) -> String {
+        // A template instance displays its full spelling (`Box<Widget>`)
+        // — presentation keeps the args even though dispatch keys the
+        // base. Other flavors keep the dispatch-class display.
         let base = ty
-            .class_name()
-            .map(String::from)
+            .as_parametric()
+            .and_then(|p| p.exact_spelling())
+            .or_else(|| ty.class_name().map(String::from))
             .unwrap_or_else(|| format_inferred_type(ty));
         let stars: String = self.deref_stack.iter().map(|s| s.render()).collect();
         format!("{}{}", base, stars)
@@ -1381,6 +1385,22 @@ pub enum ParametricType {
     /// `eval_return_expr` projects eagerly to `ClassName(row)` — there is
     /// no value-side `RowOf` variant.
     ResultSet { base: String, row: String },
+
+    /// A template/generic instance — `Box<Widget> b;` peeled from its
+    /// declared-type spelling. `base` is the unqualified template name
+    /// (`Box`) — the dispatch axis, so member gd / completion / refs
+    /// resolve through the SAME `MethodOnClass`/ancestor machinery a
+    /// plain class uses. `args` ride along un-consumed (each is a
+    /// `ClassName(canonical spelling)` leaf or a nested `Instance`):
+    /// they are the substitution witness instantiation-aware typing
+    /// consumes; nothing here interprets them. `exact_spelling()`
+    /// reconstructs the canonical full spelling (`Box<Widget>`) —
+    /// presentation, and the per-spec dispatch key when a
+    /// specialization class by that exact spelling exists.
+    ///
+    /// Kept AFTER `ResultSet` for bincode variant-index stability
+    /// (bump `EXTRACT_VERSION`).
+    Instance { base: String, args: Vec<InferredType> },
 }
 
 impl ParametricType {
@@ -1389,6 +1409,7 @@ impl ParametricType {
     pub fn class_name(&self) -> Option<&str> {
         match self {
             ParametricType::ResultSet { base, .. } => Some(base.as_str()),
+            ParametricType::Instance { base, .. } => Some(base.as_str()),
         }
     }
 
@@ -1400,6 +1421,9 @@ impl ParametricType {
     pub fn hash_key_class(&self) -> Option<&str> {
         match self {
             ParametricType::ResultSet { row, .. } => Some(row.as_str()),
+            // No key/value duality on a template instance — hash-key
+            // access (if it ever occurs) reads the same class methods do.
+            ParametricType::Instance { base, .. } => Some(base.as_str()),
         }
     }
 
@@ -1422,6 +1446,7 @@ impl ParametricType {
                 }
                 _ => None,
             },
+            ParametricType::Instance { .. } => None,
         }
     }
 
@@ -1460,8 +1485,155 @@ impl ParametricType {
                     .map(|m| (*m, row_of_receiver.clone()))
                     .collect()
             }
+            // Members come from the base class's own defs; return
+            // projection (arg substitution) is instantiation-aware
+            // typing's job, not a declaration table.
+            ParametricType::Instance { .. } => Vec::new(),
         }
     }
+
+    /// The canonical full spelling of a template `Instance`
+    /// (`Box<Widget>`, `formatter<int, char>`) — `None` for every other
+    /// flavor. Two consumers: presentation (hover shows the args even
+    /// though dispatch uses the base), and the per-spec dispatch key —
+    /// when a specialization class by this exact spelling exists
+    /// (`template<> struct formatter<int>` minted `formatter<int>`),
+    /// member resolution keys there instead of the base primary
+    /// (`FileAnalysis::dispatch_class_of`). Canonical by construction:
+    /// args were canonicalized at peel time and joined `", "`, matching
+    /// `canonical_template_spelling`'s output for the source text.
+    pub fn exact_spelling(&self) -> Option<String> {
+        match self {
+            ParametricType::ResultSet { .. } => None,
+            ParametricType::Instance { base, args } => {
+                let parts: Vec<String> = args
+                    .iter()
+                    .map(|a| match a {
+                        // A leaf arg IS its carried spelling.
+                        InferredType::ClassName(n) => n.clone(),
+                        // A nested instance reconstructs recursively;
+                        // anything else (never minted by the peel, but
+                        // reachable if a future pass substitutes) renders
+                        // through the shared formatter.
+                        InferredType::Parametric(p) => p
+                            .exact_spelling()
+                            .unwrap_or_else(|| format_parametric_type(p)),
+                        other => format_inferred_type(other),
+                    })
+                    .collect();
+                Some(format!("{}<{}>", base, parts.join(", ")))
+            }
+        }
+    }
+
+    /// Structurally peel a `Base<Args>` type spelling into
+    /// `Instance { base, args }` — the ONE peel every consumer routes
+    /// through (cpp `annot_type`, the `TypeName` alias-chase terminal).
+    /// `None` when the text isn't a well-formed template spelling
+    /// (no `<…>`, unbalanced brackets, non-identifier base) — callers
+    /// fall through to their existing non-template handling.
+    ///
+    /// The base keeps its LAST `::` segment (matching how `annot_type`
+    /// keys classes unqualified); arg spellings are carried VERBATIM
+    /// (namespace-qualified, uninterpreted — `int` stays
+    /// `ClassName("int")`, not `Numeric`) so the exact-spelling dispatch
+    /// key reconstructs and substitution stays a later pass's decision.
+    /// Whitespace canonicalizes per `canonical_template_spelling`; a
+    /// template-shaped arg recurses into its own `Instance`.
+    pub fn instance_from_spelling(text: &str) -> Option<ParametricType> {
+        let t = text.trim();
+        let lt = t.find('<')?;
+        if !t.ends_with('>') || t.len() < lt + 2 {
+            return None;
+        }
+        let base_full = t[..lt].trim_end();
+        let ident_ok = !base_full.is_empty()
+            && base_full.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && base_full.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':');
+        if !ident_ok {
+            return None;
+        }
+        let inner = &t[lt + 1..t.len() - 1];
+        // Split on top-level commas only — nested `<…>` / `(…)` / `[…]`
+        // keep their commas.
+        let mut raw_args: Vec<&str> = Vec::new();
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        for (i, c) in inner.char_indices() {
+            match c {
+                '<' | '(' | '[' => depth += 1,
+                '>' | ')' | ']' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return None;
+                    }
+                }
+                ',' if depth == 0 => {
+                    raw_args.push(&inner[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        raw_args.push(&inner[start..]);
+        let base = base_full.rsplit("::").next().unwrap_or(base_full).to_string();
+        let mut args = Vec::with_capacity(raw_args.len());
+        for raw in raw_args {
+            let spelling = canonical_template_spelling(raw.trim());
+            if spelling.is_empty() {
+                return None;
+            }
+            args.push(match ParametricType::instance_from_spelling(&spelling) {
+                Some(p) => InferredType::Parametric(p),
+                None => InferredType::ClassName(spelling),
+            });
+        }
+        Some(ParametricType::Instance { base, args })
+    }
+}
+
+/// The ONE whitespace-canonical form for a C++ template spelling — the
+/// identity key a specialization/instantiation is filed under
+/// (`formatter<int, char>`), however the source spaced or wrapped it. Rules:
+/// every whitespace RUN collapses; a space survives only between two word
+/// characters (`[A-Za-z0-9_]`), where it is lexically load-bearing
+/// (`unsigned long`); a comma is followed by exactly one space when more
+/// text follows. Ordinary identifiers (no whitespace, no comma) pass
+/// through unchanged. Lives in the Model layer so the `Instance` peel and
+/// the Build-layer pack `shape_name` share one rule.
+pub fn canonical_template_spelling(raw: &str) -> String {
+    if !raw.contains(|c: char| c.is_whitespace() || c == ',') {
+        return raw.to_string();
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            let prev_word = out.chars().next_back().is_some_and(is_word);
+            let next_word = chars.peek().copied().is_some_and(is_word);
+            if prev_word && next_word {
+                out.push(' ');
+            }
+        } else if c == ',' {
+            out.push(',');
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            if chars.peek().is_some() {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl InferredType {
@@ -7602,6 +7774,60 @@ impl FileAnalysis {
     /// `module_index` lets chain receivers whose return type lives in
     /// another package resolve (e.g. `$r->get('/x')->to(...)`). Pass
     /// `None` only for CLI debug / isolated tests.
+    /// The class a value's MEMBER ACCESS dispatches against, index-aware.
+    /// `class_name_lenient()` plus one refinement the pure projection
+    /// can't make: a template `Instance` whose EXACT canonical spelling
+    /// names an existing class (a per-spec Class — `template<> struct
+    /// formatter<int>`) dispatches there; otherwise the base primary.
+    /// Exact-spelling-or-primary only — no partial-pattern specificity
+    /// ladder (that selection tier is deferred; fork #4 in
+    /// `docs/prompt-template-arc.md`). Non-Instance types are unchanged
+    /// by construction (`exact_spelling()` answers `None`).
+    pub fn dispatch_class_of(
+        &self,
+        t: &InferredType,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
+        let mut t = t;
+        while let Some(inner) = t.optional_inner() {
+            t = inner;
+        }
+        if let Some(spelling) = t.as_parametric().and_then(|p| p.exact_spelling()) {
+            if self.class_exists(&spelling, module_index) {
+                return Some(spelling);
+            }
+        }
+        t.class_name().map(|s| s.to_string())
+    }
+
+    /// `dispatch_class_of`'s type-to-type twin for consumers that hand a
+    /// receiver TYPE onward (the sentinel completion context, whose
+    /// downstream projects `class_name()` without an index): an
+    /// `Instance` with an existing exact-spelling class collapses to
+    /// `ClassName(spelling)`; everything else passes through untouched.
+    pub fn refine_instance_dispatch(
+        &self,
+        t: InferredType,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> InferredType {
+        if let Some(spelling) = t.as_parametric().and_then(|p| p.exact_spelling()) {
+            if self.class_exists(&spelling, module_index) {
+                return InferredType::ClassName(spelling);
+            }
+        }
+        t
+    }
+
+    /// Does a class by this exact name exist — locally (a Class/Package
+    /// symbol) or as a cached module? The existence gate behind the
+    /// exact-spelling dispatch refinement.
+    fn class_exists(&self, name: &str, module_index: Option<&dyn CrossFileLookup>) -> bool {
+        self.symbols
+            .iter()
+            .any(|s| matches!(s.kind, SymKind::Class | SymKind::Package) && s.name == name)
+            || module_index.is_some_and(|mi| mi.get_cached(name).is_some())
+    }
+
     pub fn method_call_invocant_class(
         &self,
         r: &Ref,
@@ -7680,7 +7906,7 @@ impl FileAnalysis {
             if InvocantText::parse(invocant).is_element_place() {
                 if let Some(cn) = self
                     .inferred_type_via_bag_ctx(invocant, span.start, module_index)
-                    .and_then(|t| t.class_name_lenient().map(|s| s.to_string()))
+                    .and_then(|t| self.dispatch_class_of(&t, module_index))
                 {
                     return Some(cn);
                 }
@@ -7694,7 +7920,7 @@ impl FileAnalysis {
         if let Some(span) = invocant_span {
             if let Some(cn) = self
                 .expr_type_at_span(*span, module_index)
-                .and_then(|t| t.class_name_lenient().map(|s| s.to_string()))
+                .and_then(|t| self.dispatch_class_of(&t, module_index))
             {
                 return Some(cn);
             }
@@ -7733,7 +7959,7 @@ impl FileAnalysis {
                                     module_index,
                                     None,
                                 )
-                                .and_then(|t| t.class_name_lenient().map(|s| s.to_string()))
+                                .and_then(|t| self.dispatch_class_of(&t, module_index))
                             {
                                 return Some(cn);
                             }
@@ -7758,7 +7984,7 @@ impl FileAnalysis {
         if first == b'$' || first == b'@' || first == b'%' {
             if let Some(cn) = self
                 .inferred_type_via_bag_ctx(invocant, point, module_index)
-                .and_then(|t| t.class_name_lenient().map(|s| s.to_string()))
+                .and_then(|t| self.dispatch_class_of(&t, module_index))
             {
                 return Some(cn);
             }
@@ -10807,6 +11033,11 @@ fn format_parametric_type(p: &ParametricType) -> String {
     match p {
         ParametricType::ResultSet { base, row } => {
             format!("{}<{}>", base, row)
+        }
+        // Presentation keeps the args (`b: Box<Widget>`) even though
+        // dispatch projects the base.
+        ParametricType::Instance { base, .. } => {
+            p.exact_spelling().unwrap_or_else(|| base.clone())
         }
     }
 }

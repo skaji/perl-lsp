@@ -1047,3 +1047,69 @@ my $y = $plain->{adhoc};
         r.kind,
     );
 }
+
+// ---- ParametricType::Instance (the template-instance flavor) ----
+// Shape pins per the parametric-types ADR test discipline: one pin per
+// load-bearing variant so a refactor to a single-class encoding can't
+// silently drop the carried args (slice (c)'s substitution witness) or
+// the exact-spelling dispatch key.
+
+#[test]
+fn instance_peel_carries_base_and_args() {
+    use crate::file_analysis::InferredType;
+    let p = ParametricType::instance_from_spelling("Box<Widget>").expect("peels");
+    let ParametricType::Instance { ref base, ref args } = p else {
+        panic!("expected Instance, got {p:?}");
+    };
+    assert_eq!(base, "Box");
+    assert_eq!(args, &[InferredType::ClassName("Widget".into())]);
+    // dispatch axis = the base; presentation keeps the args
+    assert_eq!(p.class_name(), Some("Box"));
+    assert_eq!(p.exact_spelling().as_deref(), Some("Box<Widget>"));
+}
+
+#[test]
+fn instance_peel_recurses_and_canonicalizes() {
+    use crate::file_analysis::InferredType;
+    let p = ParametricType::instance_from_spelling(
+        "std::map< std::string ,  Buf<unsigned long> >",
+    )
+    .expect("peels");
+    // base keys unqualified (annot_type's last-`::`-segment discipline);
+    // arg spellings stay verbatim, whitespace-canonical
+    assert_eq!(p.class_name(), Some("map"));
+    assert_eq!(
+        p.exact_spelling().as_deref(),
+        Some("map<std::string, Buf<unsigned long>>")
+    );
+    let ParametricType::Instance { ref args, .. } = p else { unreachable!() };
+    assert!(
+        matches!(&args[1], InferredType::Parametric(ParametricType::Instance { base, .. }) if base == "Buf"),
+        "template-shaped arg recurses into its own Instance: {:?}",
+        args[1],
+    );
+    // leaf args stay UNINTERPRETED spellings (`int` is not folded to
+    // Numeric): substitution is the instantiation-typing slice's job, and
+    // the exact-spelling dispatch key needs the source text back.
+    let q = ParametricType::instance_from_spelling("vec<int>").unwrap();
+    let ParametricType::Instance { ref args, .. } = q else { unreachable!() };
+    assert_eq!(args, &[InferredType::ClassName("int".into())]);
+}
+
+#[test]
+fn instance_peel_rejects_non_template_spellings() {
+    for s in ["Widget", "unsigned long", "Box<", "Box<>", "a<b", "operator<<", "1<2>"] {
+        assert!(
+            ParametricType::instance_from_spelling(s).is_none(),
+            "must not peel {s:?}",
+        );
+    }
+}
+
+#[test]
+fn resultset_flavor_has_no_exact_spelling() {
+    // The exact-spelling dispatch key is an Instance policy; ResultSet's
+    // dual identity dispatches through `base` unconditionally.
+    let p = ParametricType::ResultSet { base: "RS".into(), row: "Row".into() };
+    assert_eq!(p.exact_spelling(), None);
+}

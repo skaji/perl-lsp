@@ -280,7 +280,11 @@ pub fn member_completion_ctx_incremental(
     let node = find_sentinel(tree.root_node(), &patched, cursor)?;
     let member = climb_to_member(node, cfg)?;
     let receiver = member.named_child(0)?;
-    let receiver_type = resolve_node_type(receiver, cfg, &patched, analysis, module_index);
+    // Downstream projects `class_name()` without an index, so the
+    // exact-spelling-vs-primary dispatch call (a spec class exists for
+    // `formatter<int>`) is made HERE, while the index is in hand.
+    let receiver_type = resolve_node_type(receiver, cfg, &patched, analysis, module_index)
+        .map(|t| analysis.refine_instance_dispatch(t, module_index));
     let op_fix = operator_fix(member, receiver, &patched, analysis, cfg);
     Some(MemberCompletionCtx { receiver_type, op_fix })
 }
@@ -327,7 +331,8 @@ fn resolve_node_type(
     if cfg.member_kinds.contains(&node.kind()) {
         let base = node.named_child(0)?;
         let field = node.named_child(node.named_child_count() - 1)?;
-        let class = resolve_node_type(base, cfg, src, analysis, module_index)?.class_name()?.to_string();
+        let base_ty = resolve_node_type(base, cfg, src, analysis, module_index)?;
+        let class = analysis.dispatch_class_of(&base_ty, module_index)?;
         let field_name = field.utf8_text(src.as_bytes()).ok()?;
         return analysis.field_type_on_class(&class, field_name, module_index);
     }
@@ -339,9 +344,8 @@ fn resolve_node_type(
         if cfg.member_kinds.contains(&func.kind()) {
             let recv = func.named_child(0)?;
             let method = func.named_child(func.named_child_count() - 1)?;
-            let class = resolve_node_type(recv, cfg, src, analysis, module_index)?
-                .class_name()?
-                .to_string();
+            let recv_ty = resolve_node_type(recv, cfg, src, analysis, module_index)?;
+            let class = analysis.dispatch_class_of(&recv_ty, module_index)?;
             let method_name = method.utf8_text(src.as_bytes()).ok()?;
             return analysis.find_method_return_type(&class, method_name, module_index, None);
         }

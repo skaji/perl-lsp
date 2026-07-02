@@ -299,6 +299,43 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-member-gr-includes-sites",
+      "line": 14,
+      "col": 8,
+      "expect": {
+        "all": [
+          "\"file\":\"tmpl_instance.cpp\",\"line\":\"15\"",
+          "\"file\":\"tmpl_instance.cpp\",\"line\":\"30\"",
+          "\"file\":\"tmpl_instance.cpp\",\"line\":\"33\""
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-instance-spec-member-gr-includes-site",
+      "line": 24,
+      "col": 9,
+      "expect": {
+        "all": [
+          "\"file\":\"tmpl_instance.cpp\",\"line\":\"25\"",
+          "\"file\":\"tmpl_instance.cpp\",\"line\":\"36\""
+        ],
+        "none": []
+      }
     }
   ]
 }

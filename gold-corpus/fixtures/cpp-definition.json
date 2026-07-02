@@ -281,6 +281,95 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-member-goto-def",
+      "line": 29,
+      "col": 6,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:15:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-param-typed-member-goto-def",
+      "line": 30,
+      "col": 6,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:14:7"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-typedef-chase-to-instance-member-goto-def",
+      "line": 32,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:15:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-instance-spec-exact-spelling-wins-goto-def",
+      "line": 35,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:25:10"
+        ],
+        "none": [
+          "tmpl_instance.cpp:22"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-instance-no-spec-falls-to-primary-goto-def",
+      "line": 36,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:22:10"
+        ],
+        "none": [
+          "tmpl_instance.cpp:25"
+        ]
+      }
     }
   ]
 }

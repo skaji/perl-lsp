@@ -226,18 +226,27 @@ residue of the shape matrix, as implemented:
     half of the fmt outline-noise item, and it benefits every pack
     language, not just templates.
 
-**(b) The instance joins the class — the "class with unbound params"
-slice.** Declared type `Box<Widget>` becomes
-`Parametric(Instance { base: "Box", args: [...] })` (peeled structurally
-from the `template_type` node at `@type.annot` — the node has
-`name`/`arguments` fields; do NOT regex the text). `class_name()`
-projects `"Box"`, so member gd / completion / refs / hover light up
-through the *existing* `MethodOnClass` path with zero projection logic —
-plus the `base_class_clause (template_type ...)` `@parent` pattern so
-`: base<T>` inheritance walks. The args are carried, unused-for-now: they
-are the projection witness slice (c) consumes. Closes anchor #3 at the
-"resolve the member" level (returns still untyped where they mention
-params). This is where most of the *felt* DX lives.
+**(b) The instance joins the class — LANDED.** Declared type
+`Box<Widget>` becomes `Parametric(Instance { base: "Box", args: [...] })`
+— one structural peel (`ParametricType::instance_from_spelling`, Model
+layer) shared by cpp `annot_type` and the `TypeName` alias-chase terminal,
+so a typedef/`using` landing on a template spelling chases to the same
+Instance. `class_name()` projects `"Box"`, so member gd / completion /
+refs / hover light up through the *existing* `MethodOnClass` path with
+zero projection logic; `FileAnalysis::dispatch_class_of` adds the one
+index-aware refinement — an instance whose exact canonical spelling names
+a per-spec class (slice (a)'s identity) dispatches there,
+exact-or-primary only. Hover keeps the full spelling
+(`Symbol::display_type` prefers `exact_spelling()`). The
+`base_class_clause` `@parent` patterns now also cover namespace-qualified
+bases (`: public detail::buffer<T>` — the fmt idiom). The args are
+carried, unused-for-now: `ClassName(canonical spelling)` leaves /
+recursive `Instance`s, deliberately UNINTERPRETED (`int` stays
+`ClassName("int")`, not `Numeric`) so the exact-spelling key reconstructs
+— they are the projection witness slice (c) consumes. Closes anchor #3 at
+the "resolve the member" level (returns still untyped where they mention
+params). Gold: `tmpl_instance.cpp` rows (gd/gr pair, completion, hover,
+typedef-chase, spec-exact vs primary).
 
 **(c) Instantiation-aware typing — the real projections slice.** Member
 signatures that mention template params substitute the receiver's args:
