@@ -18,7 +18,10 @@ use std::path::PathBuf;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::file_analysis::{AccessKind, CrossFileLookup, FileAnalysis, HandlerOwner, RefKind, Span, SymKind};
+use crate::file_analysis::{
+    AccessKind, CompletionCandidate, CrossFileLookup, FileAnalysis, HandlerOwner, RefKind, Span,
+    SymKind,
+};
 use crate::file_store::{FileKey, FileStore};
 
 bitflags::bitflags! {
@@ -878,6 +881,39 @@ impl<'a> CandidateSet<'a> {
         }
 
         Vec::new()
+    }
+
+    /// Completion visibility: unlike the navigation projections there is no
+    /// resolved target to run `references_mask_for` on (the cursor sits on a
+    /// prefix, not a name), so the default is the full VISIBLE universe; the
+    /// construction-time override still narrows it — the same one knob that
+    /// narrows references/rename.
+    fn completion_visibility(&self) -> RoleMask {
+        self.visibility_override.unwrap_or(RoleMask::VISIBLE)
+    }
+
+    /// Completion candidate gathering: the prefix-enumeration of the same
+    /// visible universe the navigation projections resolve against. This is
+    /// the SOURCE of identifier candidates only — cursor-context gating
+    /// (which slot the cursor is in) and item presentation stay in the LSP
+    /// adapter. Sources by tier:
+    ///
+    /// - OPEN — the origin file's in-scope names (variables, subs,
+    ///   packages). The origin is the document being edited, i.e. the open
+    ///   tier by definition of the completion verb.
+    ///
+    /// The general slot passes `""` (clients filter by prefix); a non-empty
+    /// prefix narrows server-side for callers that want it.
+    pub fn complete(&self, prefix: &str) -> Vec<CompletionCandidate> {
+        let mask = self.completion_visibility();
+        let mut out = Vec::new();
+        if mask.contains(RoleMask::OPEN) {
+            out.extend(self.origin.complete_general(self.point));
+        }
+        if !prefix.is_empty() {
+            out.retain(|c| c.label.starts_with(prefix));
+        }
+        out
     }
 }
 

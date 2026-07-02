@@ -596,6 +596,8 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let items = symbols::completion_items(
+            &self.files,
+            &FileKey::Url(uri.clone()),
             &doc.analysis,
             &doc.tree,
             &doc.text,

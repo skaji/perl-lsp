@@ -280,6 +280,8 @@ fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
 }
 
 pub fn completion_items(
+    files: &crate::file_store::FileStore,
+    origin_key: &crate::file_store::FileKey,
     analysis: &FileAnalysis,
     tree: &Tree,
     source: &str,
@@ -323,19 +325,39 @@ pub fn completion_items(
             return plugin_items;
         }
         if !plugin_items.is_empty() {
-            let native = completion_items_native(analysis, tree, source, pos, module_index, stable_packages);
+            let native = completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages);
             let mut out = plugin_items;
             out.extend(native);
             return out;
         }
     }
 
-    completion_items_native(analysis, tree, source, pos, module_index, stable_packages)
+    completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages)
+}
+
+/// Test-only convenience: completion against a bare analysis with an empty
+/// store (gathering still routes through the CandidateSet; visibility
+/// defaults to the full VISIBLE universe).
+#[cfg(test)]
+pub fn completion_items_for_test(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Vec<CompletionItem> {
+    let files = crate::file_store::FileStore::new();
+    let key = crate::file_store::FileKey::Path(std::path::PathBuf::from("/test/origin.pl"));
+    completion_items(&files, &key, analysis, tree, source, pos, module_index, stable_packages)
 }
 
 /// Original native completion path. Renamed from `completion_items`
 /// so the plugin-aware wrapper above can fall through to it.
+#[allow(clippy::too_many_arguments)]
 fn completion_items_native(
+    files: &crate::file_store::FileStore,
+    origin_key: &crate::file_store::FileKey,
     analysis: &FileAnalysis,
     tree: &Tree,
     source: &str,
@@ -344,6 +366,19 @@ fn completion_items_native(
     stable_packages: Option<&[(String, usize)]>,
 ) -> Vec<CompletionItem> {
     let point = position_to_point(pos);
+    // Candidate GATHERING routes through the resolution CandidateSet — the
+    // same visible universe references/rename/goto-def project from
+    // (docs/adr/resolution-candidate-set.md). The cursor-context matching
+    // below decides which slot the cursor is in; the set decides where the
+    // identifier names come from.
+    let cs = crate::resolve::resolve(
+        files,
+        analysis,
+        origin_key.clone(),
+        point,
+        Some(module_index),
+        crate::resolve::OverrideScope::default(),
+    );
 
     // Try tree-based detection first for expression-based contexts
     let ctx = cursor_context::detect_cursor_context_tree_with_index(
@@ -449,7 +484,7 @@ fn completion_items_native(
                 // (Minion's `enqueue(..., [...], { | })` options).
                 // Skipping the short-circuit there lets the HashKey
                 // match run and populate `priority`/`queue`/etc.
-                let vars_only: Vec<CompletionCandidate> = analysis.complete_general(point)
+                let vars_only: Vec<CompletionCandidate> = cs.complete("")
                     .into_iter()
                     .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
                     .collect();
@@ -537,7 +572,7 @@ fn completion_items_native(
                     ));
                 }
             }
-            items.extend(analysis.complete_general(point));
+            items.extend(cs.complete(""));
 
             // Global sub/module firehose: useful at top-level
             // positions, harmful when we just offered dispatch

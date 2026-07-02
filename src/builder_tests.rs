@@ -6880,7 +6880,7 @@ sub list {
         line: 5,
         character: 25,
     };
-    let items = crate::symbols::completion_items(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
     let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
 
     for expected in &["users_list", "Users#list", "/hello"] {
@@ -6958,7 +6958,7 @@ sub list {
         .set_language(&ts_parser_perl::LANGUAGE.into())
         .unwrap();
     let tree = parser.parse(empty_src, None).unwrap();
-    let items = crate::symbols::completion_items(
+    let items = crate::symbols::completion_items_for_test(
         &empty_fa,
         &tree,
         empty_src,
@@ -7000,7 +7000,7 @@ sub list {
         std::sync::Arc::new(build_fa(typed_src)),
     );
     let tree = parser.parse(typed_src, None).unwrap();
-    let items = crate::symbols::completion_items(
+    let items = crate::symbols::completion_items_for_test(
         &typed_fa,
         &tree,
         typed_src,
@@ -7529,7 +7529,7 @@ sub session { my ($self, $key) = @_; }
         items.iter().map(|it| it.label.clone()).collect()
     };
 
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(7, 8), &idx, None);
     let labels = call_label_set(&items);
     for expected in &["list", "render", "stash", "current_user", "users", "admin"] {
         assert!(
@@ -7545,7 +7545,7 @@ sub session { my ($self, $key) = @_; }
     // fix: cursor_context couldn't resolve the chain without a
     // module_index, so completion fell through to Users's own
     // methods (`list`).
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(8, 15), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(8, 15), &idx, None);
     let labels = call_label_set(&items);
     assert_eq!(
         labels.iter().collect::<std::collections::HashSet<_>>(),
@@ -7566,7 +7566,7 @@ sub session { my ($self, $key) = @_; }
 
     // Part 3: `$c->admin->` resolves through the first-level proxy
     // to the innermost `users` step.
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(9, 15), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(9, 15), &idx, None);
     let labels = call_label_set(&items);
     assert_eq!(
         labels,
@@ -7578,7 +7578,7 @@ sub session { my ($self, $key) = @_; }
     // Part 4: the proxy's detail is suppressed (opaque_return).
     // No `_Helper::...` string should leak into the user-facing
     // detail of a helper-root completion entry, even cross-file.
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(7, 8), &idx, None);
     let users_item = items.iter().find(|it| it.label == "users").unwrap();
     let admin_item = items.iter().find(|it| it.label == "admin").unwrap();
     for (name, item) in [("users", users_item), ("admin", admin_item)] {
@@ -8675,7 +8675,7 @@ $minion->enqueue(task_x => ['a'], {  });
     };
 
     let idx = crate::module_index::ModuleIndex::new_for_test();
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     for expected in &["priority", "queue", "delay", "attempts"] {
@@ -8724,7 +8724,7 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
     };
 
     let idx = crate::module_index::ModuleIndex::new_for_test();
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     assert!(
@@ -9205,7 +9205,7 @@ sub foreground  { my ($self, $id) = @_; }
         character: col as u32,
     };
 
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     assert!(

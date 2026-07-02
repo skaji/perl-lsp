@@ -314,7 +314,7 @@ fn test_unimported_completion_with_auto_import() {
     let tree = crate::document::Document::new(source.to_string())
         .unwrap()
         .tree;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -379,7 +379,7 @@ fn test_unimported_completion_skips_imported_modules() {
     let tree = crate::document::Document::new(source.to_string())
         .unwrap()
         .tree;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -467,7 +467,7 @@ my $sq   = Math::Util::s
     // Line: `my $sq   = Math::Util::s` — cursor sits past the `s`.
     let line_text = source.lines().nth(10).unwrap();
     let cursor_col = line_text.len() as u32;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -554,7 +554,7 @@ my $x = Math::
     // Cursor at end of `Math::` on the last source line.
     let last_line_idx = source.lines().count() as u32 - 1;
     let line_text = source.lines().last().unwrap();
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -627,7 +627,7 @@ $pkg->squ
     // Cursor sits past the `q` in `$pkg->squ`.
     let line_text = source.lines().nth(5).unwrap();
     let cursor_col = line_text.len() as u32;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -1105,7 +1105,7 @@ sub fire {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
 
     // Every registered handler shows up as a top-priority suggestion.
     let connect = items
@@ -1192,7 +1192,7 @@ sub use_it {
     let col = line.find("$r->").unwrap() + "$r->".len();
     let pos = Position { line: line_idx as u32, character: col as u32 };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     assert!(
         items.iter().any(|i| i.label == "go"),
         "Optional<Foo> receiver should offer Foo's methods (peeled): {:?}",
@@ -1235,7 +1235,7 @@ sub fire { my $self = shift; $self->emit(); }
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let connect = items
         .iter()
         .find(|i| i.label == "connect")
@@ -1295,7 +1295,7 @@ sub fire {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let connect = items
         .iter()
         .find(|i| i.label == "connect")
@@ -1406,7 +1406,7 @@ sub list {
         character: pr_col,
     };
 
-    let items = completion_items(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
+    let items = completion_items_for_test(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
 
     let path_item = items
         .iter()
@@ -1467,7 +1467,7 @@ sub list {
         line: 5,
         character: past_hash_col,
     };
-    let items = completion_items(&ctrl_fa_hash, &tree_hash, ctrl_src_hash, pos, &idx, None);
+    let items = completion_items_for_test(&ctrl_fa_hash, &tree_hash, ctrl_src_hash, pos, &idx, None);
     let hash_item = items
         .iter()
         .find(|i| i.label == "Users#list")
@@ -1563,7 +1563,7 @@ sub list {
     ];
 
     for (label, col) in cursor_variants {
-        let items = completion_items(
+        let items = completion_items_for_test(
             &ctrl_fa,
             &tree,
             ctrl_src,
@@ -1656,7 +1656,7 @@ sub fire {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     assert!(
@@ -1714,7 +1714,7 @@ $r->get('/users')->to('Users#lis');
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     // Prefix-filtered: only `list` starts with `lis`; `login`,
@@ -1788,7 +1788,7 @@ $r->get('/users')->to('Us');
     // Doesn't assert what IS offered — just that it doesn't panic
     // and doesn't return complete nonsense. This is the honest
     // edge-case: without a `#` yet, no plugin-emitted ref exists.
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let _ = items;
 }
 
@@ -1829,7 +1829,7 @@ sub other {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     assert!(
         !items.iter().any(|i| i.label == "connect"),
         "non-dispatcher method must not surface handler completions"
@@ -1998,7 +1998,7 @@ fn data_printer_use_line_options_completion() {
         line: 0,
         character: 10,
     };
-    let items = completion_items(&analysis, &tree, source, pos, &module_index, None);
+    let items = completion_items_for_test(&analysis, &tree, source, pos, &module_index, None);
 
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     // Sample of keys from Data::Printer's actual options. If the
@@ -2218,7 +2218,7 @@ fn data_printer_use_line_options_completion_for_data_printer_module() {
         line: 0,
         character: 20,
     };
-    let items = completion_items(&analysis, &tree, source, pos, &module_index, None);
+    let items = completion_items_for_test(&analysis, &tree, source, pos, &module_index, None);
 
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     assert!(
@@ -2707,7 +2707,7 @@ $r->get('/users')->
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     for expected in &["to", "name", "get"] {
         assert!(

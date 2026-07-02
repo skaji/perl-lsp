@@ -850,7 +850,10 @@ fn run_one(
         }
         "completion" => {
             let doc = cli_open_document(file, idx);
+            let file_path = std::path::Path::new(file).canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(file));
             let items = tphase!("completion_items", symbols::completion_items(
+                ws, &file_store::FileKey::Path(file_path),
                 &doc.analysis, &doc.tree, &doc.text, pos, idx,
                 Some(doc.stable_outline.package_lines())));
             let mut out = String::new();
