@@ -73,7 +73,7 @@ Every feature is a **projection** of the same CandidateSet:
 | prepareRename | `renameable()` — mirrors `rename_edits`' arms |
 | implementations | `implementations()` — the family/descendants walk |
 | goto-def | `definitions()` — forward-best projection |
-| completion gathering | `complete(prefix, auto_import_at)` — prefix-enumeration of the visible identifier universe (in-scope + explicit imports on OPEN; export surfaces + auto-import firehose on DEPENDENCY); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `auto_import_at` is the slot's import affordance: `None` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code) |
+| completion gathering | `complete(prefix, import_slot)` — prefix-enumeration of the visible identifier universe (Perl: in-scope + explicit imports on OPEN, export surfaces + auto-import firehose on DEPENDENCY; pack: the origin's include-closure universe); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `import_slot` is the slot's import affordance: `false` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code); candidates carry `ImportFact`, the adapter composes the edit |
 | hover | (future) the top candidate's presentation |
 
 Symmetry becomes **by construction**: an axis added to CandidateSet
@@ -142,26 +142,54 @@ Deliberately NOT on the set (the seam's edge, kept honest):
   pre-seam composition. Known pre-existing asymmetries surfaced by the
   migration are documented in the PR/commit trail rather than silently
   fixed (e.g. group rename does not consult `rewritable` while target
-  rename does; `definitions()` returns the first winning path rather than
-  the never-pruned ranked multi-set).
+  rename does). `definitions()` now returns the never-pruned ranked
+  multi-set for macro-named words (the spike's ranking axis, below);
+  other lanes keep first-winning-path.
 
-## Merge plan: spike rebases onto this
+## The cpp axes on the seam (merge landed)
 
-The cpp axes (include-closure visibility / `ScopedLookup`, delegation
-edges, `FileScopeValue`, macro variants) migrate INTO CandidateSet
-construction as pluggable axes:
+The spike's axes live in CandidateSet construction:
 
-- closure visibility → the `with_visibility`/`target_visibility` seam
-  (a per-origin gate computed at construction, not per entry point),
-- delegation / `Specializes` edges → alongside `method_classes` and the
-  group-member edge set,
-- macro variants / multi-def → additional candidates (the set never
-  prunes; projections rank),
-- ranking (reachability/specificity/proximity) → a total order on
-  candidates that `definitions()` consults for forward-best.
+- **closure visibility** — `resolve()` builds the per-origin
+  `ScopedLookup` (origin path + `include_closure`) once; identity
+  minting, goto-def, and implementations read through it, and the
+  backward walk driver (`refs_to`) applies the target's `def_paths`
+  connectivity gate per scanned file (`file_sees_target`) before the
+  matcher runs — no entry point re-applies a decorator, and every
+  projection that walks inherits the gate.
+- **pack routing** — `pack_routed()` declares the caller's per-language
+  sub-index routing; the set owns the consequences: visibility widens to
+  VISIBLE (pack workspace files ride the DEPENDENCY role), and
+  `rename_edits` → `Result` REFUSES on alias-spelled sites
+  (full-or-refuse) instead of silently skipping.
+- **delegation / `Specializes` / domain edges** — consumers declare
+  traversal: references walks delegation aliases (never the domain
+  bridge); `implementations()` walks `Specializes` families and the
+  enum-def → field-slot domain bridge; goto-def sees through direct
+  delegation on the top-ranked macro variant.
+- **macro variants / multi-def + ranking** — `with_source` feeds the
+  raw-word lane; a pack `definitions()` answers a macro-named word with
+  EVERY def site, reachability-ranked config-active first (the total
+  order, per candidate); `RefLocation.label` carries the per-candidate
+  fact (reachability verdict / see-through note) — the LSP adapter drops
+  it, the CLI renders it.
+- **completion** — the pack instance of `complete(prefix)`: the origin's
+  include closure is the identifier universe
+  (`CrossFileLookup::visible_defs_with_prefix`, no global fallback).
+- **name semantics** — the set's `bare_new_name` hook: Perl sigil rules
+  live in `conventions.rs::strip_variable_sigils`; pack spellings
+  canonicalize at extraction (the LangPack `shape_name` hook, cpp's
+  `canonical_template_spelling`).
+- **import facts, not edits** — import-sourced completion candidates
+  carry `ImportFact` (`AddToQw`/`NewUse`); the adapter composes fact +
+  slot affordance (`complete(prefix, import_slot: bool)`) into the edit.
 
-The template arc's family/selection machinery then lands once, on the
-seam, instead of per-feature.
+The invariant test has a per-language instance:
+`candidate_set_visibility_axis_flows_to_every_projection` (Perl,
+RoleMask knob) and
+`closure_visibility_axis_flows_to_every_cpp_projection` (cpp, the
+closure fact) each turn ONE construction knob and assert gd, gr, rename,
+and completion gathering move together.
 
 ## Consequences
 
