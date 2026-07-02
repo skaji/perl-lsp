@@ -1058,31 +1058,44 @@ impl LanguageServer for Backend {
         let scoped = crate::file_analysis::ScopedLookup::new(
             base_idx, &doc.analysis.include_closure, self_path.as_deref());
         let idx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-        // Macro-aware goto-def OWNS a macro-named word (pack languages): the
-        // `#define` wins over a use's self-span, variants come back ranked, and
-        // a delegation wrapper offers its callee. Runs BEFORE `find_definition`
-        // so gap #1 (bare use → itself) never surfaces. `docs/adr/macro-handling.md`.
-        if doc.language != "perl" {
-            // `#include "x.h"` path → the resolved header (`#include` = `use`).
-            if doc.language == "cpp" {
-                if let Some(loc) = symbols::pack_include_definition(
-                    &doc.analysis, symbols::position_to_point(pos), self_path.as_deref())
-                {
-                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
-                }
-            }
-            if let Some(macros) =
-                symbols::pack_macro_definition(&doc.analysis, &doc.text, symbols::position_to_point(pos), uri, idx)
+        // `#include "x.h"` path → the resolved header (`#include` = `use`).
+        // A path token, not a name — slot-shaped, so it stays ahead of the
+        // set (the ADR's honest boundary).
+        if doc.language == "cpp" {
+            if let Some(loc) = symbols::pack_include_definition(
+                &doc.analysis, symbols::position_to_point(pos), self_path.as_deref())
             {
-                let locs: Vec<Location> = macros
-                    .into_iter()
-                    .map(|m| Location { uri: m.uri, range: m.range })
-                    .collect();
-                return Ok(Some(GotoDefinitionResponse::Array(locs)));
+                return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
             }
         }
-        if let Some(resp) = symbols::find_definition(&self.files, &doc.analysis, pos, uri, base_idx) {
-            return Ok(Some(resp));
+        // Forward projection of the set. The source text unlocks the macro
+        // variant lane (ranked, never pruned, see-through delegate) for pack
+        // routing; labels ride the candidates and the editor adapter drops
+        // them (ordering conveys rank).
+        let mut cs = crate::resolve::resolve(
+            &self.files,
+            &doc.analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(base_idx),
+            crate::resolve::OverrideScope::default(),
+        )
+        .with_source(&doc.text);
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        let locs: Vec<Location> = cs
+            .definitions()
+            .into_iter()
+            .filter_map(|l| {
+                let uri = l.to_url()?;
+                Some(Location { uri, range: symbols::span_to_range(l.span) })
+            })
+            .collect();
+        match locs.len() {
+            0 => {}
+            1 => return Ok(Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap()))),
+            _ => return Ok(Some(GotoDefinitionResponse::Array(locs))),
         }
         // Member access (`obj->field`) now flows through `find_definition`
         // above: cpp mints a `MethodCall` ref core resolves like any other.

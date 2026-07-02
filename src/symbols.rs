@@ -179,7 +179,10 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
 
 /// Goto-definition: the forward projection of the resolution CandidateSet,
 /// adapted to LSP types. One location → Scalar; several (stacked handler
-/// registrations) → Array so the editor shows a picker.
+/// registrations) → Array so the editor shows a picker. The LSP handler and
+/// CLI construct the set themselves (they carry the source/pack routing
+/// facts); this adapter serves plain-cursor consumers and tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn find_definition(
     files: &crate::file_store::FileStore,
     analysis: &FileAnalysis,
@@ -210,112 +213,6 @@ pub fn find_definition(
     }
 }
 
-/// One resolved macro def-site (or see-through delegate) for goto-def. The
-/// `label` carries the reachability verdict / see-through note — LSP `Location`
-/// has no label slot, so the backend drops it (ordering conveys rank), but the
-/// CLI renders it (and the gold harness asserts on it).
-pub struct MacroGotoLocation {
-    pub uri: Url,
-    pub range: Range,
-    pub label: Option<String>,
-}
-
-/// Every `#define` of `word` across this file + the cached modules, ranked
-/// config-active first by the SAME total order goto-def and hover both consume
-/// (`docs/adr/macro-handling.md`): reachability rank, then (path, row, col) so
-/// the winner is deterministic across processes (the cache iterates in
-/// randomized DashMap order). Empty when `word` names no macro. This is the one
-/// place the variant set is gathered + reachability-classified — goto-def
-/// returns all of them, hover walks the top one's alias chain to its leaf.
-fn ranked_macro_variants(
-    analysis: &FileAnalysis,
-    word: &str,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Vec<(crate::file_analysis::MacroDef, Url, crate::cpp_macro_model::Reachability)> {
-    use crate::cpp_macro_model::classify;
-    use crate::file_analysis::MacroDef;
-    use std::collections::HashSet;
-
-    // One pass over every cached module + this file: collect the def sites for
-    // `word` (config variants live in different headers — win32.h vs perl.h; we
-    // keep them ALL, never the last-writer only) AND the reachability config
-    // (the whole macro universe). Enumerating the cache directly is robust to a
-    // cold reverse index — `modules_with_symbol` can be empty before it warms.
-    let mut sites: Vec<(MacroDef, Url)> = Vec::new();
-    let mut seen: HashSet<(String, usize, usize)> = HashSet::new();
-    let mut defined: HashSet<String> = HashSet::new();
-    let mut universe: HashSet<String> = HashSet::new();
-    let push = |m: &MacroDef,
-                    u: &Url,
-                    sites: &mut Vec<(MacroDef, Url)>,
-                    seen: &mut HashSet<(String, usize, usize)>| {
-        let key = (u.to_string(), m.selection_span.start.row, m.selection_span.start.column);
-        if seen.insert(key) {
-            sites.push((m.clone(), u.clone()));
-        }
-    };
-    let note = |m: &MacroDef, defined: &mut HashSet<String>, universe: &mut HashSet<String>| {
-        universe.insert(m.name.clone());
-        if m.guards.is_empty() {
-            defined.insert(m.name.clone());
-        }
-    };
-    for m in &analysis.macro_defs {
-        note(m, &mut defined, &mut universe);
-        if m.name == word {
-            push(m, uri, &mut sites, &mut seen);
-        }
-    }
-    // Per-FILE sweep: the name-keyed cache view both repeats files and hides
-    // a file that lost every name tie.
-    module_index.for_each_cached_file(&mut |cached| {
-        let file_uri = Url::from_file_path(&cached.path).ok();
-        for m in &cached.analysis.macro_defs {
-            note(m, &mut defined, &mut universe);
-            if m.name == word {
-                if let Some(u) = &file_uri {
-                    push(m, u, &mut sites, &mut seen);
-                }
-            }
-        }
-    });
-
-    if sites.is_empty() {
-        return Vec::new();
-    }
-
-    // The include-guard idiom `#ifndef X … #define X … #endif` guards a macro's
-    // definition on its OWN not-yet-defined-ness. At that guard X is not yet
-    // defined, so X's own name must not count as `defined` when ranking X's
-    // variants — else every arm reads as unreachable. General over the pattern,
-    // not a per-name rule.
-    defined.remove(word);
-    // Toolchain predefined macros (`__GNUC__`, …) are ON here exactly as they
-    // are in build-side variant selection — navigation and minting share the
-    // one seeding point so they can't disagree on which arm is Active.
-    let cfg = crate::cpp_reparse::known_config_with_toolchain(defined, universe);
-
-    // Rank, active-first. Never prune — a lower-ranked (e.g. win32) def stays,
-    // labeled. The secondary (path, line, col) key is a TOTAL order so the
-    // result is deterministic across processes.
-    let mut ranked: Vec<(MacroDef, Url, _)> = sites
-        .into_iter()
-        .map(|(m, u)| {
-            let r = classify(&m.guards, &cfg);
-            (m, u, r)
-        })
-        .collect();
-    ranked.sort_by(|(ma, ua, ra), (mb, ub, rb)| {
-        ra.rank()
-            .cmp(&rb.rank())
-            .then_with(|| ua.as_str().cmp(ub.as_str()))
-            .then_with(|| ma.selection_span.start.row.cmp(&mb.selection_span.start.row))
-            .then_with(|| ma.selection_span.start.column.cmp(&mb.selection_span.start.column))
-    });
-    ranked
-}
-
 /// The concrete-leaf DISPLAY for a field/variable whose declared type is a
 /// config-variant type macro (`docs/adr/macro-handling.md`, "Typing vs.
 /// display"). The type that FLOWS stays the join abstraction (`Numeric`); this
@@ -332,10 +229,10 @@ fn config_variant_leaf_display(
     module_index: &dyn CrossFileLookup,
 ) -> Option<String> {
     // Hover reads only the winning variant's BODY, never its location, so the
-    // queried file's own uri is immaterial — a placeholder keys its local
-    // `macro_defs` without colliding with the real cross-file def uris.
-    let local = Url::parse("file:///__hover_local__").ok()?;
-    let ranked = ranked_macro_variants(analysis, spelling, &local, module_index);
+    // queried file's own key is immaterial — a placeholder keys its local
+    // `macro_defs` without colliding with the real cross-file def paths.
+    let local = crate::file_store::FileKey::Path(std::path::PathBuf::from("/__hover_local__"));
+    let ranked = crate::resolve::ranked_macro_variants(analysis, spelling, &local, module_index);
     // A single-variant (or non-) macro flows to its leaf already; only the
     // config-variant JOIN abstraction needs the display-side variant pick.
     if ranked.len() < 2 {
@@ -355,13 +252,6 @@ fn config_variant_leaf_display(
     Some(display.to_string())
 }
 
-/// Macro-aware goto-def (the identity/navigation lane, `docs/adr/macro-handling.md`).
-/// When the cursor word names a `#define` — same-file OR cross-file — this
-/// OWNS the answer, preempting the generic symbol path so a bare use resolves
-/// to the `#define`, never its own span. Returns EVERY def site (config
-/// variants across files never pruned), reachability-RANKED config-active
-/// first, plus any direct-delegation see-through target. `None` when the word
-/// is not a macro (the generic path then runs).
 /// Goto-def on an `#include "x.h"` / `<x.h>` path token → the resolved header
 /// file (`#include` = `use`; the header is the module). `self_path` is the
 /// including file — the search anchor for the walk-up include resolver.
@@ -457,132 +347,11 @@ pub fn pack_include_references(
     None
 }
 
-pub fn pack_macro_definition(
-    analysis: &FileAnalysis,
-    source: &str,
-    point: Point,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Option<Vec<MacroGotoLocation>> {
-    let word = word_at_point(source, point)?;
-    let ranked = ranked_macro_variants(analysis, word, uri, module_index);
-    if ranked.is_empty() {
-        return None; // not a macro — let the generic goto-def path answer.
-    }
+/// Re-export: the raw-word key lives with the resolution seam
+/// (`resolve::word_at_point`); hover and the sig-help slot share it.
+pub use crate::resolve::word_at_point;
 
-    let mut out: Vec<MacroGotoLocation> = Vec::new();
-    for (m, u, r) in &ranked {
-        out.push(MacroGotoLocation {
-            uri: u.clone(),
-            range: span_to_range(m.selection_span),
-            label: r.label(),
-        });
-    }
 
-    // See-through: a direct-delegation wrapper (`#define F(x) G(x)`) also offers
-    // the delegate `G`. Resolve from the top-ranked delegating variant only, so
-    // the offer follows the config-active body. A self-delegation (`#define S S`)
-    // resolves to the definition itself — already offered above, skip it.
-    if let Some((m, _, _)) = ranked
-        .iter()
-        .find(|(m, _, _)| m.delegate.as_deref().is_some_and(|d| d != m.name))
-    {
-        if let Some(delegate) = &m.delegate {
-            if let Some(loc) = resolve_pack_symbol_location(analysis, delegate, uri, module_index) {
-                out.push(MacroGotoLocation {
-                    uri: loc.uri,
-                    range: loc.range,
-                    label: Some(format!("delegates to {delegate}")),
-                });
-            }
-        }
-    }
-
-    Some(out)
-}
-
-/// The identifier under `point` in `source`, or `None` if the cursor is not on
-/// a `[A-Za-z0-9_]` word. Byte-scan (macros vanish from the analysis under the
-/// current expand-and-reparse policy, so the raw word is the reliable key).
-pub fn word_at_point(source: &str, point: Point) -> Option<&str> {
-    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
-    let b = source.as_bytes();
-    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
-    if cursor > b.len() {
-        return None;
-    }
-    let mut start = cursor;
-    while start > 0 && is_id(b[start - 1]) {
-        start -= 1;
-    }
-    let mut end = cursor;
-    while end < b.len() && is_id(b[end]) {
-        end += 1;
-    }
-    (start < end).then(|| &source[start..end])
-}
-
-/// Resolve a pack-language symbol NAME (a delegate callee, a free function) to
-/// its def location — local symbols and the cross-file index, preferring a
-/// DEFINITION over a prototype: a definition's body mints a scope spanning
-/// the symbol (the universal `(function_definition) @scope`), a declaration
-/// doesn't, so `fix_optchain` see-through lands in op.c, not proto.h. Ties
-/// break local-first then (path, position) so the pick is deterministic
-/// across the cache's randomized iteration order.
-fn resolve_pack_symbol_location(
-    analysis: &FileAnalysis,
-    name: &str,
-    uri: &Url,
-    module_index: &dyn CrossFileLookup,
-) -> Option<Location> {
-    use crate::file_analysis::SymKind;
-    let wanted = |k: &SymKind| matches!(k, SymKind::Sub | SymKind::Variable | SymKind::Class);
-    let has_body = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
-        a.scopes.iter().any(|sc| sc.span == s.span)
-    };
-    // (bodied, local, path, row, col) — smaller sorts first after the
-    // bodied/local flags are inverted below.
-    let mut candidates: Vec<(bool, bool, String, usize, usize, Location)> = Vec::new();
-    for sym in analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
-        candidates.push((
-            has_body(analysis, sym),
-            true,
-            uri.to_string(),
-            sym.selection_span.start.row,
-            sym.selection_span.start.column,
-            Location { uri: uri.clone(), range: span_to_range(sym.selection_span) },
-        ));
-    }
-    // The FULL candidate table for `name` — a definition legitimately lives
-    // in a file the one-winner `get_cached` view (or the include closure)
-    // never serves (`Perl_fix_optchain`'s body is in peep.c; proto.h wins
-    // the scoped lookup).
-    let mut seen_paths: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
-    for cached in module_index.def_candidates(name) {
-        if !seen_paths.insert(cached.path.clone()) {
-            continue;
-        }
-        let Ok(u) = Url::from_file_path(&cached.path) else { continue };
-        for sym in cached.analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
-            candidates.push((
-                has_body(&cached.analysis, sym),
-                false,
-                u.to_string(),
-                sym.selection_span.start.row,
-                sym.selection_span.start.column,
-                Location { uri: u.clone(), range: span_to_range(sym.selection_span) },
-            ));
-        }
-    }
-    candidates.sort_by(|a, b| {
-        b.0.cmp(&a.0) // bodied first
-            .then_with(|| b.1.cmp(&a.1)) // then local
-            .then_with(|| a.2.cmp(&b.2))
-            .then_with(|| (a.3, a.4).cmp(&(b.3, b.4)))
-    });
-    candidates.into_iter().next().map(|c| c.5)
-}
 
 
 

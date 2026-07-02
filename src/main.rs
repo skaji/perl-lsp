@@ -1076,11 +1076,8 @@ fn run_one(
             let pack = lang_id.and_then(|lang| idx.pack_index(lang));
             let base_idx: &dyn crate::file_analysis::CrossFileLookup =
                 pack.as_deref().map_or(idx as &dyn crate::file_analysis::CrossFileLookup, |i| i);
-            // Resolve names against this file's include closure (matches the LSP).
-            let scoped = crate::file_analysis::ScopedLookup::new(
-                base_idx, &analysis.include_closure, Some(abs.as_path()));
-            let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
             // `#include "x.h"` path → the resolved header (`#include` = `use`).
+            // A path token, not a name — slot-shaped, stays ahead of the set.
             if lang_id == Some("cpp") {
                 if let Some(loc) = symbols::pack_include_definition(&analysis, point, Some(abs.as_path())) {
                     let path = loc.uri.to_file_path().map(|p| p.display().to_string())
@@ -1088,55 +1085,39 @@ fn run_one(
                     return Ok(format!("{}:{}:{}", path, loc.range.start.line + 1, loc.range.start.character + 1));
                 }
             }
-            // Macro-aware goto-def owns a macro-named word — ranked, all sites
-            // kept (labeled), see-through delegate appended. `docs/adr/macro-handling.md`.
+            let _ = &uri;
+            // Forward projection of the set (mirrors the LSP handler): the
+            // source text unlocks the macro variant lane for pack routing.
+            // Print EVERY offered location (one per line), ranked as
+            // returned — macro variants config-active first (labels shown),
+            // a domain-typed field decl FIRST then its domain enum def.
+            let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
+            let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let mut cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(abs), point,
+                Some(base_idx), resolve::OverrideScope::default(),
+            )
+            .with_source(&source);
             if pack.is_some() {
-                if let Some(macros) =
-                    symbols::pack_macro_definition(&analysis, &source, point, &uri, xidx)
-                {
-                    let mut sources = SourceCache::new();
-                    let mut lines = Vec::new();
-                    for m in macros {
-                        let path = m.uri.to_file_path().map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| m.uri.to_string());
-                        let (line, col) = sources.display(
-                            &path, m.range.start.line as usize, m.range.start.character as usize);
-                        let label = m.label.map(|l| format!("  ({l})")).unwrap_or_default();
-                        lines.push(format!("{}:{}:{}{}", path, line, col, label));
-                    }
-                    return Ok(lines.join("\n"));
-                }
+                cs = cs.pack_routed();
             }
-            // Pack cross-file symbol goto-def uses the include-scoped pack index;
-            // Perl's module-keyed lookup is unaffected (empty closure = the hub).
-            if let Some(resp) = symbols::find_definition(ws, &analysis, pos, &uri, base_idx) {
-                use tower_lsp::lsp_types::GotoDefinitionResponse;
-                // Print EVERY offered location (one per line), ranked as
-                // returned: a plain goto-def yields one; a domain-typed field
-                // yields the field decl FIRST then its domain enum def.
-                let locs: Vec<tower_lsp::lsp_types::Location> = match resp {
-                    GotoDefinitionResponse::Scalar(loc) => vec![loc],
-                    GotoDefinitionResponse::Array(v) => v,
-                    GotoDefinitionResponse::Link(v) => v
-                        .into_iter()
-                        .map(|l| tower_lsp::lsp_types::Location {
-                            uri: l.target_uri,
-                            range: l.target_range,
-                        })
-                        .collect(),
-                };
-                if !locs.is_empty() {
-                    let mut sources = SourceCache::new();
-                    let mut lines = Vec::new();
-                    for loc in locs {
-                        let path = loc.uri.to_file_path().map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| loc.uri.to_string());
-                        let (line, col) = sources.display(
-                            &path, loc.range.start.line as usize, loc.range.start.character as usize);
-                        lines.push(format!("{}:{}:{}", path, line, col));
-                    }
-                    return Ok(lines.join("\n"));
+            let locs = cs.definitions();
+            if !locs.is_empty() {
+                let mut sources = SourceCache::new();
+                let mut lines = Vec::new();
+                for loc in locs {
+                    let path = match &loc.key {
+                        file_store::FileKey::Path(p) => p.display().to_string(),
+                        file_store::FileKey::Url(u) => u.to_file_path()
+                            .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
+                    };
+                    let (line, col) = sources.display(
+                        &path, loc.span.start.row, loc.span.start.column);
+                    let label = loc.label.map(|l| format!("  ({l})")).unwrap_or_default();
+                    lines.push(format!("{}:{}:{}{}", path, line, col, label));
                 }
+                return Ok(lines.join("\n"));
             }
             Err(format!("No definition found at {}:{}", req.line, req.col))
         }

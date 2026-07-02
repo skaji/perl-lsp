@@ -4855,31 +4855,40 @@ fn test_helper_not_loaded_exempts_installed_plugins() {
 mod pack_macro_goto {
     use super::*;
 
+    /// The macro variant lane via the CandidateSet: pack routing + source.
+    fn macro_defs_at(src: &str, point: tree_sitter::Point) -> Vec<crate::resolve::RefLocation> {
+        let fa = crate::language_driver::LanguageRegistry::with_enabled()
+            .for_id("cpp")
+            .unwrap()
+            .analyze(src);
+        let store = crate::file_store::FileStore::new();
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        let key = crate::file_store::FileKey::Path(std::path::PathBuf::from("/fake/macro.c"));
+        crate::resolve::resolve(
+            &store,
+            &fa,
+            key,
+            point,
+            Some(&idx),
+            crate::resolve::OverrideScope::default(),
+        )
+        .pack_routed()
+        .with_source(src)
+        .definitions()
+    }
+
     /// L1 lock: `#define S S` (self-delegation) must offer exactly the
     /// definition — no duplicate "delegates to S" location pointing at the
     /// same `#define`.
     #[test]
     fn self_delegating_macro_offers_single_location() {
         let src = "#define S S\nint f(void) { return S; }\n";
-        let fa = crate::language_driver::LanguageRegistry::with_enabled()
-            .for_id("cpp")
-            .unwrap()
-            .analyze(src);
-        let idx = crate::module_index::ModuleIndex::new_for_test();
-        let uri = Url::parse("file:///s.c").unwrap();
-        let locs = pack_macro_definition(
-            &fa,
-            src,
-            tree_sitter::Point { row: 1, column: 21 },
-            &uri,
-            &idx,
-        )
-        .expect("the macro use resolves");
+        let locs = macro_defs_at(src, tree_sitter::Point { row: 1, column: 21 });
         assert_eq!(
             locs.len(),
             1,
             "self-delegation must not add a duplicate see-through offer: {:?}",
-            locs.iter().map(|l| (l.range, l.label.clone())).collect::<Vec<_>>()
+            locs.iter().map(|l| (l.span, l.label.clone())).collect::<Vec<_>>()
         );
     }
 
@@ -4888,24 +4897,11 @@ mod pack_macro_goto {
     #[test]
     fn real_delegation_still_offers_delegate() {
         let src = "void G(void) { }\n#define F G\nvoid h(void) { F(); }\n";
-        let fa = crate::language_driver::LanguageRegistry::with_enabled()
-            .for_id("cpp")
-            .unwrap()
-            .analyze(src);
-        let idx = crate::module_index::ModuleIndex::new_for_test();
-        let uri = Url::parse("file:///f.c").unwrap();
-        let locs = pack_macro_definition(
-            &fa,
-            src,
-            tree_sitter::Point { row: 2, column: 15 },
-            &uri,
-            &idx,
-        )
-        .expect("the macro use resolves");
+        let locs = macro_defs_at(src, tree_sitter::Point { row: 2, column: 15 });
         assert!(
             locs.iter().any(|l| l.label.as_deref() == Some("delegates to G")),
             "a real delegation keeps its see-through offer: {:?}",
-            locs.iter().map(|l| (l.range, l.label.clone())).collect::<Vec<_>>()
+            locs.iter().map(|l| (l.span, l.label.clone())).collect::<Vec<_>>()
         );
     }
 }

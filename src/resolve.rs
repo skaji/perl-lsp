@@ -646,6 +646,11 @@ pub struct CandidateSet<'a> {
     /// per-language cache, which registers only workspace-walk files), and
     /// rename REFUSES on alias-spelled sites instead of silently skipping.
     pack: bool,
+    /// The origin document's raw text, when the caller has it. Feeds the
+    /// raw-word candidate lanes (macro variants): a macro use can vanish
+    /// from the reparsed analysis (expand-and-reparse), so the byte-level
+    /// word is the reliable key. `None` = those lanes stay silent.
+    source: Option<&'a str>,
     scope: OverrideScope,
     /// Identity, minted once via `resolve_symbol_scoped` — lazily, so a
     /// projection that never consults it (goto-def's forward path) doesn't
@@ -695,6 +700,7 @@ pub fn resolve<'a>(
         module_index,
         scoped,
         pack: false,
+        source: None,
         scope,
         resolution: std::sync::OnceLock::new(),
         visibility: std::sync::OnceLock::new(),
@@ -720,6 +726,13 @@ impl<'a> CandidateSet<'a> {
     /// (VISIBLE-wide walks, rename's full-or-refuse) live on the set.
     pub fn pack_routed(mut self) -> Self {
         self.pack = true;
+        self
+    }
+
+    /// Supply the origin document's raw text — unlocks the raw-word
+    /// candidate lanes (macro variants in `definitions()`).
+    pub fn with_source(mut self, source: &'a str) -> Self {
+        self.source = Some(source);
         self
     }
 
@@ -787,6 +800,7 @@ impl<'a> CandidateSet<'a> {
                     span,
                     access: AccessKind::Read,
                     rewritable: true,
+                    label: None
                 })
                 .collect(),
         }
@@ -881,6 +895,7 @@ impl<'a> CandidateSet<'a> {
                             span,
                             access: AccessKind::Read,
                             rewritable: true,
+                            label: None
                         },
                         text,
                     )
@@ -917,6 +932,7 @@ impl<'a> CandidateSet<'a> {
                                 span,
                                 access: AccessKind::Read,
                                 rewritable: false,
+                                label: None
                             });
                         }
                     });
@@ -940,6 +956,7 @@ impl<'a> CandidateSet<'a> {
             span,
             access: AccessKind::Declaration,
             rewritable: true,
+            label: None
         }
     }
 
@@ -950,6 +967,52 @@ impl<'a> CandidateSet<'a> {
     pub fn definitions(&self) -> Vec<RefLocation> {
         let analysis = self.origin;
         let point = self.point;
+
+        // Macro-aware goto-def OWNS a macro-named word (pack routing): the
+        // `#define` wins over a use's self-span, EVERY def site comes back
+        // (config variants across files never pruned), reachability-RANKED
+        // config-active first — the total order `definitions()` returns is
+        // the ranking axis, per candidate — plus any direct-delegation
+        // see-through target, labeled. `docs/adr/macro-handling.md`.
+        if self.pack {
+            if let (Some(source), Some(idx)) = (self.source, self.idx()) {
+                if let Some(word) = word_at_point(source, point) {
+                    let ranked = ranked_macro_variants(analysis, word, &self.origin_key, idx);
+                    if !ranked.is_empty() {
+                        let mut out: Vec<RefLocation> = ranked
+                            .iter()
+                            .map(|(m, key, r)| RefLocation {
+                                key: key.clone(),
+                                span: m.selection_span,
+                                access: AccessKind::Declaration,
+                                rewritable: true,
+                                label: r.label(),
+                            })
+                            .collect();
+                        // See-through: a direct-delegation wrapper
+                        // (`#define F(x) G(x)`) also offers the delegate `G`,
+                        // resolved from the top-ranked delegating variant so
+                        // the offer follows the config-active body. A
+                        // self-delegation (`#define S S`) resolves to the
+                        // definition itself — already offered above.
+                        if let Some((m, _, _)) = ranked
+                            .iter()
+                            .find(|(m, _, _)| m.delegate.as_deref().is_some_and(|d| d != m.name))
+                        {
+                            if let Some(delegate) = &m.delegate {
+                                if let Some(mut loc) =
+                                    pack_symbol_def_location(analysis, &self.origin_key, delegate, idx)
+                                {
+                                    loc.label = Some(format!("delegates to {delegate}"));
+                                    out.push(loc);
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
 
         // Query-time dispatch goto-def: a `$minion->enqueue('task')` whose
         // receiver isa-resolves (possibly cross-file) jumps to the handler,
@@ -1017,6 +1080,7 @@ impl<'a> CandidateSet<'a> {
                 span: Span { start: p, end: p },
                 access: AccessKind::Declaration,
                 rewritable: true,
+                label: None
             }
         };
 
@@ -1053,6 +1117,7 @@ impl<'a> CandidateSet<'a> {
                                 span: def.selection_span,
                                 access: AccessKind::Declaration,
                                 rewritable: true,
+                                label: None
                             }];
                         }
                     }
@@ -1162,6 +1227,7 @@ impl<'a> CandidateSet<'a> {
                             span,
                             access: AccessKind::Declaration,
                             rewritable: true,
+                            label: None
                         }];
                     }
                 }
@@ -1232,6 +1298,7 @@ impl<'a> CandidateSet<'a> {
                                         span: sym.selection_span,
                                         access: AccessKind::Declaration,
                                         rewritable: true,
+                                        label: None
                                     }];
                                 }
                             }
@@ -1264,6 +1331,7 @@ impl<'a> CandidateSet<'a> {
                                 span: sym.selection_span,
                                 access: AccessKind::Declaration,
                                 rewritable: true,
+                                label: None
                             }];
                         }
                     }
@@ -1308,6 +1376,7 @@ impl<'a> CandidateSet<'a> {
                     span: sym.selection_span,
                     access: AccessKind::Declaration,
                     rewritable: true,
+                    label: None
                 })
             }
         }
@@ -1336,6 +1405,7 @@ impl<'a> CandidateSet<'a> {
             span: sym.selection_span,
             access: AccessKind::Declaration,
             rewritable: true,
+            label: None
         })
     }
 
@@ -1616,6 +1686,7 @@ fn dispatch_handler_locations(
                         span: sym.selection_span,
                         access: AccessKind::Declaration,
                         rewritable: true,
+                        label: None
                     });
                 }
             }
@@ -1798,6 +1869,11 @@ pub struct RefLocation {
     /// References lists it (it's a real use); rename skips it (rewriting the
     /// variable would corrupt it). True for every literal occurrence.
     pub rewritable: bool,
+    /// A per-candidate fact worth surfacing beside the location — a macro
+    /// variant's reachability verdict, a delegation see-through note. LSP
+    /// `Location` has no label slot so the editor adapter drops it (ordering
+    /// conveys rank); the CLI renders it and the gold harness asserts on it.
+    pub label: Option<String>,
 }
 
 impl RefLocation {
@@ -1932,6 +2008,7 @@ pub fn group_refs(
             span: *span,
             access: AccessKind::Read,
             rewritable: true,
+            label: None
         })
         .collect();
     out.extend(pinned_spans.iter().map(|(path, span)| RefLocation {
@@ -1939,6 +2016,7 @@ pub fn group_refs(
         span: *span,
         access: AccessKind::Read,
         rewritable: true,
+        label: None
     }));
     for m in members {
         let mask = mask_override
@@ -1986,7 +2064,7 @@ pub fn group_rename_edits(
         .iter()
         .map(|span| {
             (
-                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true },
+                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true, label: None},
                 bare_new.to_string(),
             )
         })
@@ -1998,6 +2076,7 @@ pub fn group_rename_edits(
                 span: *span,
                 access: AccessKind::Read,
                 rewritable: true,
+                label: None
             },
             bare_new.to_string(),
         )
@@ -2201,6 +2280,7 @@ pub fn implementations_of(
                         span: s.selection_span,
                         access: AccessKind::Declaration,
                         rewritable: true,
+                        label: None
                     });
                 }
             }
@@ -2257,6 +2337,7 @@ fn specialization_family(
                         span: s.selection_span,
                         access: AccessKind::Declaration,
                         rewritable: false,
+                        label: None
                     });
                 }
             }
@@ -2363,6 +2444,190 @@ fn delegation_aliases(
     }
     out.sort_by(|a, b| (&a.name, &a.def_path).cmp(&(&b.name, &b.def_path)));
     out
+}
+
+/// The identifier under `point` in `source`, or `None` if the cursor is not
+/// on a `[A-Za-z0-9_]` word. Byte-scan (macros vanish from the analysis under
+/// the expand-and-reparse policy, so the raw word is the reliable key).
+pub fn word_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
+    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
+    let b = source.as_bytes();
+    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    if cursor > b.len() {
+        return None;
+    }
+    let mut start = cursor;
+    while start > 0 && is_id(b[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < b.len() && is_id(b[end]) {
+        end += 1;
+    }
+    (start < end).then(|| &source[start..end])
+}
+
+/// Every `#define` of `word` across the origin file + the cached modules,
+/// ranked config-active first by the SAME total order goto-def and hover both
+/// consume (`docs/adr/macro-handling.md`): reachability rank, then
+/// (path, row, col) so the winner is deterministic across processes (the
+/// cache iterates in randomized DashMap order). Empty when `word` names no
+/// macro. This is the one place the variant set is gathered +
+/// reachability-classified — `definitions()` returns all of them (never
+/// pruned), hover walks the top one's alias chain to its leaf.
+pub(crate) fn ranked_macro_variants(
+    analysis: &FileAnalysis,
+    word: &str,
+    origin_key: &FileKey,
+    module_index: &dyn CrossFileLookup,
+) -> Vec<(crate::file_analysis::MacroDef, FileKey, crate::cpp_macro_model::Reachability)> {
+    use crate::cpp_macro_model::classify;
+    use crate::file_analysis::MacroDef;
+    use std::collections::HashSet;
+
+    // One pass over every cached module + this file: collect the def sites for
+    // `word` (config variants live in different headers — win32.h vs perl.h; we
+    // keep them ALL, never the last-writer only) AND the reachability config
+    // (the whole macro universe). Enumerating the cache directly is robust to a
+    // cold reverse index — `modules_with_symbol` can be empty before it warms.
+    let mut sites: Vec<(MacroDef, FileKey)> = Vec::new();
+    let mut seen: HashSet<(PathBuf, usize, usize)> = HashSet::new();
+    let mut defined: HashSet<String> = HashSet::new();
+    let mut universe: HashSet<String> = HashSet::new();
+    let mut push = |m: &MacroDef, k: &FileKey, sites: &mut Vec<(MacroDef, FileKey)>| {
+        let key = (key_for_sort(k), m.selection_span.start.row, m.selection_span.start.column);
+        if seen.insert(key) {
+            sites.push((m.clone(), k.clone()));
+        }
+    };
+    let note = |m: &MacroDef, defined: &mut HashSet<String>, universe: &mut HashSet<String>| {
+        universe.insert(m.name.clone());
+        if m.guards.is_empty() {
+            defined.insert(m.name.clone());
+        }
+    };
+    for m in &analysis.macro_defs {
+        note(m, &mut defined, &mut universe);
+        if m.name == word {
+            push(m, origin_key, &mut sites);
+        }
+    }
+    // Per-FILE sweep: the name-keyed cache view both repeats files and hides
+    // a file that lost every name tie.
+    module_index.for_each_cached_file(&mut |cached| {
+        let file_key = FileKey::Path(cached.path.clone());
+        for m in &cached.analysis.macro_defs {
+            note(m, &mut defined, &mut universe);
+            if m.name == word {
+                push(m, &file_key, &mut sites);
+            }
+        }
+    });
+
+    if sites.is_empty() {
+        return Vec::new();
+    }
+
+    // The include-guard idiom `#ifndef X … #define X … #endif` guards a macro's
+    // definition on its OWN not-yet-defined-ness. At that guard X is not yet
+    // defined, so X's own name must not count as `defined` when ranking X's
+    // variants — else every arm reads as unreachable. General over the pattern,
+    // not a per-name rule.
+    defined.remove(word);
+    // Toolchain predefined macros (`__GNUC__`, …) are ON here exactly as they
+    // are in build-side variant selection — navigation and minting share the
+    // one seeding point so they can't disagree on which arm is Active.
+    let cfg = crate::cpp_reparse::known_config_with_toolchain(defined, universe);
+
+    // Rank, active-first. Never prune — a lower-ranked (e.g. win32) def stays,
+    // labeled. The secondary (path, line, col) key is a TOTAL order so the
+    // result is deterministic across processes.
+    let mut ranked: Vec<(MacroDef, FileKey, _)> = sites
+        .into_iter()
+        .map(|(m, k)| {
+            let r = classify(&m.guards, &cfg);
+            (m, k, r)
+        })
+        .collect();
+    ranked.sort_by(|(ma, ka, ra), (mb, kb, rb)| {
+        ra.rank()
+            .cmp(&rb.rank())
+            .then_with(|| key_for_sort(ka).cmp(&key_for_sort(kb)))
+            .then_with(|| ma.selection_span.start.row.cmp(&mb.selection_span.start.row))
+            .then_with(|| ma.selection_span.start.column.cmp(&mb.selection_span.start.column))
+    });
+    ranked
+}
+
+/// Resolve a pack-language symbol NAME (a delegate callee, a free function) to
+/// its def location — local symbols and the cross-file index, preferring a
+/// DEFINITION over a prototype: a definition's body mints a scope spanning
+/// the symbol (the universal `(function_definition) @scope`), a declaration
+/// doesn't, so `fix_optchain` see-through lands in op.c, not proto.h. Ties
+/// break local-first then (path, position) so the pick is deterministic
+/// across the cache's randomized iteration order.
+fn pack_symbol_def_location(
+    analysis: &FileAnalysis,
+    origin_key: &FileKey,
+    name: &str,
+    module_index: &dyn CrossFileLookup,
+) -> Option<RefLocation> {
+    let wanted = |k: &SymKind| matches!(k, SymKind::Sub | SymKind::Variable | SymKind::Class);
+    let has_body = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
+        a.scopes.iter().any(|sc| sc.span == s.span)
+    };
+    // (bodied, local, path, row, col) — the bodied/local flags are inverted
+    // in the sort below so `true` ranks first.
+    let mut candidates: Vec<(bool, bool, PathBuf, usize, usize, RefLocation)> = Vec::new();
+    for sym in analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+        candidates.push((
+            has_body(analysis, sym),
+            true,
+            key_for_sort(origin_key),
+            sym.selection_span.start.row,
+            sym.selection_span.start.column,
+            RefLocation {
+                key: origin_key.clone(),
+                span: sym.selection_span,
+                access: AccessKind::Declaration,
+                rewritable: true,
+                label: None,
+            },
+        ));
+    }
+    // The FULL candidate table for `name` — a definition legitimately lives
+    // in a file the one-winner `get_cached` view (or the include closure)
+    // never serves (`Perl_fix_optchain`'s body is in peep.c; proto.h wins
+    // the scoped lookup).
+    let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for cached in module_index.def_candidates(name) {
+        if !seen_paths.insert(cached.path.clone()) {
+            continue;
+        }
+        for sym in cached.analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+            candidates.push((
+                has_body(&cached.analysis, sym),
+                false,
+                cached.path.clone(),
+                sym.selection_span.start.row,
+                sym.selection_span.start.column,
+                RefLocation {
+                    key: FileKey::Path(cached.path.clone()),
+                    span: sym.selection_span,
+                    access: AccessKind::Declaration,
+                    rewritable: true,
+                    label: None,
+                },
+            ));
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0) // bodied first
+            .then_with(|| b.1.cmp(&a.1)) // then local
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| (a.3, a.4).cmp(&(b.3, b.4)))
+    });
+    candidates.into_iter().next().map(|c| c.5)
 }
 
 fn key_for_sort(k: &FileKey) -> PathBuf {
@@ -2694,6 +2959,7 @@ fn collect_package_var(
                 span: tail(sym.selection_span),
                 access: AccessKind::Declaration,
                 rewritable: true,
+                label: None
             });
         }
     }
@@ -2710,6 +2976,7 @@ fn collect_package_var(
                     span: tail(r.span),
                     access: r.access,
                     rewritable: true,
+                    label: None
                 });
             }
         } else if r.target_name == name && r.resolves_to.is_some_and(is_our_decl) {
@@ -2719,6 +2986,7 @@ fn collect_package_var(
                 span: tail(r.span),
                 access: r.access,
                 rewritable: true,
+                label: None
             });
         }
     }
@@ -2836,6 +3104,7 @@ fn collect_from_analysis(
                 span: sym.selection_span,
                 access: AccessKind::Declaration,
                 rewritable: rewritable_at(sym.selection_span),
+                label: None
             });
         }
     }
@@ -3084,6 +3353,7 @@ fn collect_from_analysis(
                 span,
                 access: r.access,
                 rewritable: !alias_matched && rewritable_at(span),
+                label: None
             });
             // A call folded from a variable (`my $m = 'process'; $self->$m()`)
             // has a non-rewritable name token above; the rewrite belongs on the
@@ -3094,6 +3364,7 @@ fn collect_from_analysis(
                     span: src,
                     access: r.access,
                     rewritable: rewritable_at(src),
+                    label: None
                 });
             }
         }
@@ -3114,6 +3385,7 @@ fn collect_from_analysis(
                     span: applied.span,
                     access: AccessKind::Read,
                     rewritable: rewritable_at(applied.span),
+                    label: None
                 });
             }
         }
