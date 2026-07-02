@@ -4117,7 +4117,7 @@ fn candidate_fixture() -> (FileStore, std::sync::Arc<FileAnalysis>, PathBuf, Pat
     let path_a = PathBuf::from("/tmp/cs_test_a.pm");
     let path_b = PathBuf::from("/tmp/cs_test_b.pm");
     let fa_a = std::sync::Arc::new(parse(
-        "package A;\nour @EXPORT_OK = qw/foo/;\nsub foo { 42 }\n1;\n",
+        "package A;\nour @EXPORT_OK = qw/foo/;\nsub foo { 42 }\n1;\nuse My::Dep qw/imported_fn/;\n",
     ));
     store.insert_workspace_arc(path_a.clone(), fa_a.clone());
     let fa_b = parse("package B;\nuse A qw/foo/;\nsub bar { foo(); }\n1;\n");
@@ -4170,20 +4170,70 @@ fn candidate_set_rename_is_subset_of_references() {
 
 /// THE symmetry invariant: a visibility change made once, at construction,
 /// moves every projection together. No projection has its own copy of the
-/// axis to forget.
+/// axis to forget — completion's candidate gathering included.
 #[test]
 fn candidate_set_visibility_axis_flows_to_every_projection() {
+    use crate::module_index::{CachedModule, ModuleIndex};
+    use std::sync::Arc;
+
     let (store, fa_a, path_a, path_b) = candidate_fixture();
     let point = tree_sitter::Point { row: 2, column: 4 };
 
-    let wide = resolve(&store, &fa_a, FileKey::Path(path_a.clone()), point, None, OverrideScope::default());
+    // A dependency-tier module universe: one module A imports from (with a
+    // remaining export surface), one it doesn't (auto-import candidate).
+    let idx = ModuleIndex::new_for_test();
+    let insert = |name: &str, src: &str| {
+        idx.insert_cache(
+            name,
+            Some(Arc::new(CachedModule::new(
+                PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+                Arc::new(parse(src)),
+            ))),
+        );
+    };
+    insert(
+        "My::Dep",
+        "package My::Dep;\nour @EXPORT_OK = qw/imported_fn other_fn/;\nsub imported_fn { 1 }\nsub other_fn { 2 }\n1;\n",
+    );
+    insert(
+        "My::Extra",
+        "package My::Extra;\nour @EXPORT = qw/extra_fn/;\nsub extra_fn { 3 }\n1;\n",
+    );
+
+    let edit_at = Span {
+        start: tree_sitter::Point { row: 0, column: 0 },
+        end: tree_sitter::Point { row: 0, column: 0 },
+    };
+    let labels = |cands: &[crate::file_analysis::CompletionCandidate]| -> Vec<String> {
+        cands.iter().map(|c| c.label.clone()).collect()
+    };
+
+    let wide = resolve(&store, &fa_a, FileKey::Path(path_a.clone()), point, Some(&idx), OverrideScope::default());
     let wide_refs = wide.references();
     let wide_edits = wide.rename_edits("food");
     assert!(wide_refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &path_b)));
     assert!(wide_edits.iter().any(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &path_b)));
+    let wide_names = labels(&wide.complete("", Some(edit_at)));
+    assert!(wide_names.contains(&"foo".to_string()), "local sub gathered: {wide_names:?}");
+    assert!(
+        wide_names.contains(&"imported_fn".to_string()),
+        "explicitly imported name gathered (origin-file fact): {wide_names:?}",
+    );
+    assert!(
+        wide_names.contains(&"other_fn".to_string()),
+        "imported module's remaining export surface gathered: {wide_names:?}",
+    );
+    assert!(
+        wide_names.contains(&"extra_fn".to_string()),
+        "unimported exporter's surface gathered as auto-import: {wide_names:?}",
+    );
+    assert!(
+        wide.complete_modules("My::").iter().any(|(n, _)| n == "My::Dep"),
+        "module-name universe gathered",
+    );
 
-    // One knob turned at construction: exclude the WORKSPACE tier.
-    let narrow = resolve(&store, &fa_a, FileKey::Path(path_a), point, None, OverrideScope::default())
+    // One knob turned at construction: only the OPEN tier stays visible.
+    let narrow = resolve(&store, &fa_a, FileKey::Path(path_a), point, Some(&idx), OverrideScope::default())
         .with_visibility(RoleMask::OPEN);
     assert!(
         narrow.references().is_empty(),
@@ -4192,6 +4242,21 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
     assert!(
         narrow.rename_edits("food").is_empty(),
         "rename projection inherits the SAME narrowed visibility — not its own copy",
+    );
+    let narrow_names = labels(&narrow.complete("", Some(edit_at)));
+    assert!(
+        narrow_names.contains(&"foo".to_string())
+            && narrow_names.contains(&"imported_fn".to_string()),
+        "origin-file names (in-scope + explicit imports) are OPEN-tier: {narrow_names:?}",
+    );
+    assert!(
+        !narrow_names.contains(&"other_fn".to_string())
+            && !narrow_names.contains(&"extra_fn".to_string()),
+        "dependency-supplied names inherit the SAME narrowed visibility: {narrow_names:?}",
+    );
+    assert!(
+        narrow.complete_modules("My::").is_empty(),
+        "module-name gathering inherits the SAME narrowed visibility",
     );
 }
 

@@ -73,15 +73,55 @@ Every feature is a **projection** of the same CandidateSet:
 | prepareRename | `renameable()` — mirrors `rename_edits`' arms |
 | implementations | `implementations()` — the family/descendants walk |
 | goto-def | `definitions()` — forward-best projection |
-| completion gathering | (next step) prefix-enumeration of the same visible universe |
+| completion gathering | `complete(prefix, auto_import_at)` — prefix-enumeration of the visible identifier universe (in-scope + explicit imports on OPEN; export surfaces + auto-import firehose on DEPENDENCY); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `auto_import_at` is the slot's import affordance: `None` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code) |
 | hover | (future) the top candidate's presentation |
 
 Symmetry becomes **by construction**: an axis added to CandidateSet
 construction is inherited by every projection — the test
 `candidate_set_visibility_axis_flows_to_every_projection` demonstrates the
-one-knob property. C1 ("gd gated, gr not") and C2 ("rename edits a subset
-of refs") become unrepresentable states. The audit's gold *pairs* remain as
-the verification net — pairs verify, the seam prevents.
+one-knob property, asserting references, rename, AND completion gathering
+narrow together. C1 ("gd gated, gr not") and C2 ("rename edits a subset
+of refs") become unrepresentable states, and disease #2's class
+("resolution cross-file, completion gathering same-file") is closed: the
+identifier candidates come from the same masked universe the navigation
+verbs walk. The audit's gold *pairs* remain as the verification net —
+pairs verify, the seam prevents.
+
+## Completion: what moved, and the honest boundary
+
+The migration moved the candidate **sources** — where names come from —
+not the slot logic. Sources now on the set: in-scope names
+(`complete_general`, OPEN), explicitly imported names (origin's `use`
+lists, OPEN — the dep cache only enriches detail), imported modules'
+remaining export surfaces and the unimported auto-import firehose
+(DEPENDENCY), and loadable module names (`complete_modules`, DEPENDENCY —
+resolved cache + @INC availability behind
+`CrossFileLookup::complete_module_names`). The qualified-path drill takes
+both of its sub-package sources from the set.
+
+Deliberately NOT on the set (the seam's edge, kept honest):
+
+- **Cursor-context slot detection** (method position / hash key / variable
+  sigil / import list / dispatch arg-0) — decides WHICH slot the cursor is
+  in, never where names come from. Stays in `cursor_context`/the adapter.
+- **Entity-content gathering**: methods on a resolved class
+  (`complete_methods_for_class`), hash keys for a resolved owner, dispatch
+  handler names, keyval/`:param` keys, the `use Foo qw(|)` import-list
+  slot (one named module's export surface). These enumerate the content OF
+  an already-identified entity and ride the method/dispatch resolution
+  seams (`MethodOnClass`, `ReceiverGated`) — a different question than
+  "what names are visible from here." Folding them in would re-derive
+  those seams, not unify them.
+- **Presentation**: labels, kinds, details, sort priorities, snippet
+  items, and where the auto-import `use` edit lands (`auto_import_span` —
+  needs the LSP-side stable outline). Policy still rides the candidates
+  (`additional_edits`), placement is the adapter's.
+- **Plugin query hooks** — cursor-time, imperative, plugin-owned.
+- **Tiers with no source**: WORKSPACE contributes no completion names
+  (true before the seam too — workspace-package names and workspace
+  exporter surfaces were never gathered); BUILTIN has no name source
+  (`PERL_BUILTINS` only suppresses diagnostics). When either grows a
+  source it plugs into the same mask — that's the point of the seam.
 
 ## Landing notes (main)
 
@@ -89,6 +129,12 @@ the verification net — pairs verify, the seam prevents.
   `resolve_symbol`/`refs_to` seam — not a parallel module. `refs_to`,
   `group_refs`, `references_mask_for` are now the set's internals; handlers
   and CLI mirrors construct the set and project.
+- Completion constructs the same set (`completion_items` → `resolve` →
+  `complete`/`complete_modules`); identity minting stays lazy, so slots
+  that never consult `resolution()` don't pay the override-family walk.
+  Completion has no resolved target for `references_mask_for` to judge, so
+  its default visibility is the full VISIBLE universe; the construction
+  override narrows it like every other projection.
 - Projections only READ the stores (`FileStore::for_each_open`), so an LSP
   handler may hold its open-doc guard across a projection — the old
   `drop(doc)`-before-walking discipline (a deadlock trap) is gone.
