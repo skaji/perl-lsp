@@ -1014,7 +1014,11 @@ int main() {
     assert!(!raw_defs.contains(&("class".into(), "Box".into())), "class lost pre-reparse: {raw_defs:?}");
 
     // reparse (validated macro expansion), then extract + query
-    let (rewritten, _map) = crate::cpp_reparse::preprocess_validated(&mut parser, src);
+    let (rewritten, _map, _) = crate::cpp_reparse::preprocess_validated_with(
+        &mut parser,
+        src,
+        &crate::cpp_reparse::PreExpandedExternal::empty(),
+    );
     let skel = cpp_skel(&rewritten);
     let defs: Vec<(String, String)> = skel.symbols.iter().map(|s| (s.kind.clone(), s.name.clone())).collect();
     assert!(defs.contains(&("class".into(), "Box".into())), "class recovered: {defs:?}");

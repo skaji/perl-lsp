@@ -1217,7 +1217,7 @@ pub fn domain_coherence(ws: &[&Witness]) -> Option<(String, usize, usize)> {
         }
     }
     let (dom, dom_count) = best?;
-    // Mostly-agree: a strict majority. The spike measured ~99.9% coherence
+    // Mostly-agree: a strict majority. op_type shows ~99.9% coherence
     // on real op_type, so any threshold in (0.5, 0.99) fires cleanly;
     // majority is the simplest defensible line.
     if dom_count * 2 > total {

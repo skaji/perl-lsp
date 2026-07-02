@@ -230,6 +230,6 @@ references of the wrapped function). Deliberately out of scope / honest gaps:
 
 | case | note |
 |---|---|
-| rename through a macro alias / expanded use | alias call sites and expansion-erased uses are listed by references but marked non-rewritable (the token spells the macro's name); `FileScopeValue` targets are excluded from cross-file rename entirely — pack rename is its own arc |
+| rename through a macro alias / expanded use | alias call sites and expansion-erased uses are listed by references but marked non-rewritable (the token spells the macro's name); pack rename is full-or-refuse — a target whose reference set contains an alias-spelled site refuses outright rather than emitting a partial edit (macros/globals/enum constants/members with plain spellings rename cross-file) |
 | role-macro (`BASEOP`) gr does not list composer structs as "uses" | the standalone-in-struct-body use IS listed (the blanked token is re-minted); the composing struct itself shows via goto-implementation semantics, not references |
 | template extraction (slice a) landed | primaries + per-spec Class identity (`formatter<int, char>`), out-of-line `Buf<T>::` join, explicit-instantiation outline items, `using` alias + concept symbols — `thousands_sep_result` gd/gr green (7 refs / 3 files on fmt); residuals: `extern template` spellings parse as ERROR in tree-sitter-cpp (refs come from catch-alls only), instantiation typing is slice (c) |

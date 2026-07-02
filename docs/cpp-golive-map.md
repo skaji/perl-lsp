@@ -91,18 +91,27 @@ import (`use`), field slot = one shared subject. Same machinery, C surface.
    Symmetry by construction, not diligence — the resolution tier's witness
    bag. **Lands on MAIN first** (the seam isn't cpp-specific), then
    main→spike merge migrates the cpp axes (ScopedLookup/delegation/
-   FileScopeValue) into it as the template arc's opening slice. Sequenced:
-   after wave-1/2 interim fixes stop the bleeding.
-7. **cruft cleanup pass** ⬜ NEXT — the arc accumulated fast:
-   back-compat wrappers, superseded comments, dead gates, duplicated fixture
-   shapes, always-`None` fields (e.g. `NominalDomain.storage`). A /simplify-
-   style sweep over the arc's touched files, guarded by the full net.
-
-**Next arc, mapped:** TEMPLATES — tee-off brief in
-`docs/prompt-template-arc.md` (measured shape matrix: primaries already
-extract, the dark residue is specializations/explicit-instantiation/
-out-of-line members/instance-typing; projections model mapped onto PR #100;
-slice sequence + the user's design forks).
+   FileScopeValue) into it as the template arc's opening slice.
+6d. ✅ **arc-review fix waves** (`docs/arc-review-findings.md`) — wave 1:
+   C1 gr visibility gating + C2 rename full-or-refuse + H2 path/range
+   splice + H3 brace-init + H4 span-remap; wave 2a: cache lifecycle
+   (H1/M1/M2/H8/M7 — in-session header edits propagate, trustworthy persist
+   keys, degraded-gen guard, progress gating); wave 2b: H5 bodyless
+   `#define` config knobs + H6 honest domain vote + H7 owner-gated Field
+   subjects. Remaining small findings (M5 predefined-macro seed in
+   navigation, M6 cold-open None→warm flip, L1 self-delegation duplicate
+   offer, L2 enum rename no-op, L3 debounce-window staleness) queued for
+   the cleanup pass.
+7. ✅ **cruft cleanup pass** — dead spike-superseded surface removed
+   (`preprocess`/`preprocess_validated`, the `MacroVariants` model,
+   `module_paths` driver method, `scope_depth`, `NominalDomain.storage`),
+   kept-as-spike PoC modules explicitly annotated, history-narrating
+   comments rewritten, both feature builds warning-clean.
+8. **TEMPLATE ARC** 🔵 IN PROGRESS — tee-off brief in
+   `docs/prompt-template-arc.md`; slice (a) landed (spec identity +
+   Specializes edge, explicit-inst outline, aliases/concepts, ScopeKind
+   fix, union DX). Dark residue: instantiation typing (slice c),
+   `extern template` ERROR parse.
 
 **Deferred (recorded, not queued):** Perl domain typing (needs a synthetic
 constant-group / `Type::Tiny` enum-domain model — `docs/adr/field-projections.md`);
@@ -143,20 +152,14 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
          · lazy per-language workspace index .............. ✅
              op.c first-open 50s→seconds — a cpp session no longer eagerly
              scans the 4000+ `.pm` tree (that eager scan WAS the stall)
-         · `cpp.gather` rework: PARALLEL async-background
-             work-queue — memoize `header_info` per
-             `(path, mtime)` (shared across the closure AND
-             across files), remove the 1000-header cap, run
-             ahead of interaction (NOT on-demand: lazy just
-             relocates the stall to the hover) ............. 🔵 IN PROGRESS (agent)
-             Parallel is strictly better regardless of the
-             cache; the cache still matters (a hit skips the
-             gather) — cold≈warm today means tier-2 isn't
-             hitting, being diagnosed alongside.
-         · stdlib compiler-probe MODULE (`cc -E -v`/`-dM`) . ✅ (gather-wiring
-             🔵 IN PROGRESS — feeds `resolve_include` so op.c
-             `<sys/mman.h>` resolves; predefined_macros exposed
-             for the macro-model `#if` eval)
+         · `cpp.gather` rework: PARALLEL memoized gather —
+             `header_info` memoized per (path, mtime), shared
+             across the closure AND across files ............ ✅ (warm 1413→106ms)
+         · stdlib compiler-probe MODULE (`cc -E -v`/`-dM`) . ✅ wired:
+             `include_dirs` feeds `resolve_include` (op.c
+             `<sys/mman.h>` resolves); `predefined_macros`
+             seeds the reachability config for BOTH variant
+             minting and goto-def/hover navigation
          · per-TOOLCHAIN global system-header cache ........ ⬜ PARKED
              (behind toolchain discovery — "almost-global",
              keyed per toolchain; the in-process memoize above
@@ -180,47 +183,36 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              EXPECTED type — rank/filter completions by the type tier we
              already have. Flow-aware, additive; clangd does a weak version.
 
-       KNOWN LIVE BUGS (op.c stress — ⬜, being investigated):
-         · macro/type goto-def resolves the WRONG def: `PERL_BITFIELD16` use
-             in op.h jumps to win32.h's `#define` instead of surfacing ALL
-             three config-variant defs. MODEL LANDED (233a71f, unmerged):
-             every `#define` carries its `#if` guard trail; 3-valued
-             reachability (ACTIVE/UNKNOWN/UNREACHABLE) seeded by the def
-             UNIVERSE, not a hardcoded platform list (rule #10 clean); the
-             variant JOIN for typing; nothing pruned. SURFACES RESIDUAL —
-             the model has the data, the LSP doesn't read it yet:
-               - multi-location ranked goto-def + hover ⬜ (needs guard
-                 storage on `Symbol` + cross-file same-name enum + the probe's
-                 predefined_macros as the ACTIVE seed) → the reported bug is
-                 NOT user-visibly fixed yet.
+       KNOWN LIVE BUGS (op.c stress):
+         · config-variant macro goto-def ✅ — every `#define` carries its
+             `#if` guard trail; 3-valued reachability (ACTIVE/UNKNOWN/
+             UNREACHABLE) seeded by the def UNIVERSE ∪ the toolchain's
+             predefined macros (rule #10 clean, one seeding point for
+             minting AND navigation); multi-location RANKED goto-def +
+             provenance-leaf hover consume the same ranking. Residual:
                - join→typing ⬜ (`op_type` still untyped: `PERL_BITFIELD16 →
                  U16` is the TYPEDEF case; needs typedef resolution `U16 →
                  unsigned short → Numeric` + a join override seam).
-         · `op_p` member completion peel `(*op_p)->` not firing.
-         · `op_type` hover shows a spurious/random line.
-         · op.c still slow per-analyze (the `cpp.gather` lever, above).
+         · `op_p` member completion peel `(*op_p)->` not firing. ⬜
+         · `op_type` hover shows a spurious/random line. ⬜
 
        TABLE STAKES — the ship gate (dogfooding, hitlist.md). The honest
-         read: we built DIFFERENTIATORS (narrowing, use-after-move,
-         function-scope) on a core tier that under-emits for cpp, so the
-         first surfaces anyone touches — outline, references, macro-as-symbol,
-         `#include` nav, completion — are broken. NOT six features: ONE
-         core-emission gap wearing six hats. The LSP surfaces are thin
-         adapters over `FileAnalysis` (rules #2/#3/#7) — sharpen the EMISSION
-         to the Perl bar and they light up for free. Each hitlist symptom is
-         the same sentence "the model doesn't emit X, so nothing flows":
-           - macro USES aren't Refs → the macro Symbol (+ provenance to the
-             inner def) → fixes no-gr, no-callers, wrapper-gd opacity, and
-             transparent see-through, all from one emission. ⬜
-           - `#include` path isn't ONE claimed import edge w/ a resolvable
-             target → gd dead + a sub-token (`h`) leaks as a stray var ref.
-             Claim whole path + resolve to header (like `use`). ⬜
-           - outline noise = template-wrapped defs unextracted +
-             every `#define` mints a kindless `@def.var`. Extract through
-             `template_declaration` + give macros a real `SymbolKind`. ⬜
-           - enum members ARE symbols already (skeleton.scm:77); op.c:185
-             fails because completion doesn't know the SLOT wants an OP value
-             → the type-constrained/flow tier, one level up. ⬜
+         read: the DIFFERENTIATORS (narrowing, use-after-move, function-scope)
+         sat on a core tier that under-emitted for cpp — ONE core-emission gap
+         wearing six hats. The LSP surfaces are thin adapters over
+         `FileAnalysis` (rules #2/#3/#7); sharpening the EMISSION to the Perl
+         bar lit them up:
+           - macro USES are Refs (+ provenance to the inner def): gr,
+             callers, wrapper-gd see-through — the macro arc + queue #6
+             symmetry. ✅
+           - `#include` is one claimed import edge with a resolvable target
+             (goto-def + who-includes-this-header gr) — queue #4/#6. ✅
+           - outline: extraction reaches through `template_declaration`
+             (template arc slice a); macros carry a real `SymbolKind`. ✅
+           - enum members ARE symbols; bare-identifier completion offers the
+             include closure's file-scope names (queue 6b). The SLOT-aware
+             refinement (op.c:185 wants an OP value at `op_type == |`) is
+             the type-constrained/flow tier, one level up. ⬜
          This IS the "sharpen the core so it flows" thesis. Table stakes gate
          ARC 5; lock each hitlist line as an e2e/gold row so it can't regress
          back to "useless" silently.
@@ -233,9 +225,9 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
          "which depth is worth it here", not "impossible".
 
        PLUMBING (`==perl`→capability): diagnostics already DISPATCH (cpp gets
-         `pack_member_op` + the gated use-after-move), so not fully gated; the
-         file-watch glob is still `**/*.pm` only (`backend.rs`) — cpp/py files
-         aren't watched for incremental updates. ⬜
+         `pack_member_op`; use-after-move stays gated); file watchers cover
+         every served language's extensions, and a pack change runs the
+         eviction + open-consumer refresh path. ✅
 
 ARC 5  SHIP cpp ...................................... ⬜ THE GOAL
 ```

@@ -668,7 +668,7 @@ fn ranked_macro_variants(
     let mut seen: HashSet<(String, usize, usize)> = HashSet::new();
     let mut defined: HashSet<String> = HashSet::new();
     let mut universe: HashSet<String> = HashSet::new();
-    let mut push = |m: &MacroDef,
+    let push = |m: &MacroDef,
                     u: &Url,
                     sites: &mut Vec<(MacroDef, Url)>,
                     seen: &mut HashSet<(String, usize, usize)>| {
@@ -677,7 +677,7 @@ fn ranked_macro_variants(
             sites.push((m.clone(), u.clone()));
         }
     };
-    let mut note = |m: &MacroDef, defined: &mut HashSet<String>, universe: &mut HashSet<String>| {
+    let note = |m: &MacroDef, defined: &mut HashSet<String>, universe: &mut HashSet<String>| {
         universe.insert(m.name.clone());
         if m.guards.is_empty() {
             defined.insert(m.name.clone());
@@ -919,7 +919,7 @@ pub fn pack_macro_definition(
 /// The identifier under `point` in `source`, or `None` if the cursor is not on
 /// a `[A-Za-z0-9_]` word. Byte-scan (macros vanish from the analysis under the
 /// current expand-and-reparse policy, so the raw word is the reliable key).
-fn word_at_point(source: &str, point: Point) -> Option<&str> {
+pub fn word_at_point(source: &str, point: Point) -> Option<&str> {
     let cursor = crate::cursor_sentinel::point_to_byte(source, point);
     let b = source.as_bytes();
     let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
@@ -3941,7 +3941,10 @@ pub fn pack_member_op_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
 /// Mode C: use-after-move. One WARNING per `use_after_move_reads()` read —
 /// a variable read after a `std::move` of it, before any reassignment. The
 /// region + cutoff logic lives on `FileAnalysis` (the edge-driven moved-from
-/// window); this is the thin LSP projection.
+/// window); this is the thin LSP projection. Parked: not wired into
+/// `pack_diagnostics` (see the gate comment there); kept dark with its tests
+/// until the residual FP classes close.
+#[allow(dead_code)]
 pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
     analysis
         .use_after_move_reads()
@@ -3961,18 +3964,14 @@ pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnosti
 /// One seam so a backend dispatch never enumerates the individual checks.
 pub fn pack_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
     let diags = pack_member_op_diagnostics(analysis);
-    // use-after-move stays GATED. A real-project re-audit (json/fmt/spdlog on the
-    // library headers that showed 105 FPs) drops to 17 after: per-function-body
-    // @scope (operators/casts/dtors no longer leak the moved-from region across
-    // siblings), if/else arm scopes + method-reset rebinds (conditional +
-    // reset-via-method FPs), and dropping moves in unevaluated operands
-    // (noexcept/sizeof/decltype). The residual 17 need analysis this tier can't
-    // do: partial/member move (move a base subobject, then use other members —
-    // thread_pool), braceless/ternary conditional move on a returning path
-    // (fmt/json), switch-case conditional move (binary_reader), and
-    // pass-by-mutable-ref reset (interprocedural). 17 false warnings on common
-    // headers is still bad signal, so keep it dark. `pack_use_after_move_diagnostics`
-    // + its tests stay; re-wire here once the residual classes close.
+    // use-after-move stays GATED: on real library headers (json/fmt/spdlog) it
+    // still emits ~17 false positives — the residual classes need analysis this
+    // tier can't do: partial/member move (move a base subobject, then use other
+    // members), braceless/ternary conditional move on a returning path,
+    // switch-case conditional move, and pass-by-mutable-ref reset
+    // (interprocedural). Bad signal on common headers, so keep it dark.
+    // `pack_use_after_move_diagnostics` + its tests stay; re-wire here once the
+    // residual classes close.
     diags
 }
 

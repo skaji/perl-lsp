@@ -387,7 +387,11 @@ fn h4_synthetic() -> (String, String, crate::cpp_reparse::SpliceMap) {
     let src = "#define LOG emit_log_record_with_a_long_name(1, 2, 3)\nvoid f() { LOG; tail(); }\n";
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
-    let (rewritten, map) = crate::cpp_reparse::preprocess_validated(&mut parser, src);
+    let (rewritten, map, _) = crate::cpp_reparse::preprocess_validated_with(
+        &mut parser,
+        src,
+        &crate::cpp_reparse::PreExpandedExternal::empty(),
+    );
     assert_ne!(rewritten, src, "the LOG use must actually splice");
     (src.to_string(), rewritten, map)
 }

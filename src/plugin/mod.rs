@@ -910,6 +910,7 @@ pub trait FrameworkPlugin: Send + Sync {
     /// they signal (see `AttributeMacro`). Read once at plugin load, unioned,
     /// and applied to recovered classes in the pack analyze path. Default
     /// empty; only the C++ attributes plugin declares.
+    #[cfg_attr(not(feature = "cpp"), allow(dead_code))]
     fn attribute_macros(&self) -> &[AttributeMacro] {
         &[]
     }
@@ -1277,6 +1278,7 @@ impl PluginRegistry {
 
     /// Yield every attribute-macro declaration across the registry.
     /// Trigger-independent, same rationale as `dispatch_verbs`.
+    #[cfg_attr(not(feature = "cpp"), allow(dead_code))]
     pub fn attribute_macros<'a>(&'a self) -> impl Iterator<Item = &'a AttributeMacro> + 'a {
         self.plugins.iter().flat_map(|p| p.attribute_macros().iter())
     }
@@ -1284,6 +1286,7 @@ impl PluginRegistry {
     /// Collapse the attribute-macro union into a `macro name → signal` map —
     /// the lookup the pack analyze path performs per recovered class. A later
     /// plugin's entry for the same name wins (registration order).
+    #[cfg_attr(not(feature = "cpp"), allow(dead_code))]
     pub fn attribute_macro_signals(&self) -> std::collections::HashMap<String, String> {
         self.attribute_macros()
             .map(|m| (m.name.clone(), m.signal.clone()))

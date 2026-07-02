@@ -4812,3 +4812,4 @@ fn test_helper_not_loaded_exempts_installed_plugins() {
     assert!(lint_messages(&idx, consumer).is_empty());
 }
 
+

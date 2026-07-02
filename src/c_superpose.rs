@@ -146,7 +146,7 @@ fn declarator_name(node: Node, src: &[u8]) -> Option<String> {
 
 /// The type of a `return <expr>;` value (literals only in this spike;
 /// call/identifier returns defer — they'd resolve through the bag).
-fn return_value_type(ret: Node, src: &[u8]) -> Option<InferredType> {
+fn return_value_type(ret: Node, _src: &[u8]) -> Option<InferredType> {
     let mut cur = ret.walk();
     for c in ret.children(&mut cur) {
         match c.kind() {

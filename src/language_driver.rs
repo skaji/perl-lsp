@@ -37,8 +37,6 @@ pub trait LanguageDriver: Send + Sync {
     fn analyze_with_path(&self, source: &str, _path: Option<&Path>) -> FileAnalysis {
         self.analyze(source)
     }
-    /// Module name → workspace-relative candidate paths.
-    fn module_paths(&self, module: &str) -> Vec<String>;
     /// Completion trigger characters for this language — the registry
     /// unions them into the LSP `completionProvider` slot, so the client
     /// auto-fires completion (e.g. on `.`/`->`) for the right files.
@@ -81,9 +79,6 @@ impl LanguageDriver for PerlDriver {
             Some(tree) => crate::builder::build(&tree, source.as_bytes()),
             None => FileAnalysis::new(Default::default()),
         }
-    }
-    fn module_paths(&self, module: &str) -> Vec<String> {
-        vec![format!("{}.pm", module.replace("::", "/"))]
     }
     fn trigger_chars(&self) -> &[&'static str] {
         // Sigils open variable completion; `>`/`:`/`{` open
@@ -250,8 +245,8 @@ impl LanguageDriver for PackDriver {
             }
             Err(e) => {
                 // Fail LOUD, and mark the empty stand-in degraded so the
-                // persist tier can't freeze it (H8: a cached empty analysis
-                // is re-served forever — the source file never changes).
+                // persist tier can't freeze it (a cached empty analysis would
+                // be re-served forever — the source file never changes).
                 log::warn!(
                     "query extract failed for {:?}: {e:?} — serving an empty (non-cacheable) analysis",
                     path
@@ -261,9 +256,6 @@ impl LanguageDriver for PackDriver {
                 fa
             }
         }
-    }
-    fn module_paths(&self, module: &str) -> Vec<String> {
-        ((self.pack)().module_paths)(module)
     }
     fn lang_pack(&self) -> Option<crate::query_extract::LangPack> {
         Some((self.pack)())
@@ -431,6 +423,7 @@ fn macro_return_hints(
     out
 }
 
+#[cfg_attr(not(feature = "cpp"), allow(dead_code))]
 fn inject_member_blocks(
     skel: &mut crate::query_extract::SkeletonAnalysis,
     plan: &crate::cpp_reparse::MemberBlockPlan,
@@ -478,15 +471,14 @@ fn inject_member_blocks(
                 name_start: m.name_span.start,
                 name_end: m.name_span.end,
                 package: Some(base.macro_name.clone()),
-                scope_depth: 1,
                 scope: scope_id,
                 return_type: None,
                 deref_stack: Vec::new(),
                 attributes: Vec::new(),
             });
-            // The role member emits the SAME `TypeName` edge the expanded field
-            // did — the emission site moved, the edge is canonical (slice 2's
-            // hover leaf + the type chase resolve `op_type` → `unsigned short`).
+            // The role member emits the SAME `TypeName` edge an expanded field
+            // does — the edge is canonical (the hover leaf + the type chase
+            // resolve `op_type` → `unsigned short`).
             let payload = match annot_type(&m.type_text) {
                 Some(InferredType::ClassName(cn)) => {
                     Some(WitnessPayload::Edge(WitnessAttachment::TypeName(cn)))
@@ -605,7 +597,6 @@ fn remap_spans(
             name_start,
             name_end,
             package: _,
-            scope_depth: _,
             scope: _,
             return_type: _,
             deref_stack: _,
@@ -800,6 +791,10 @@ pub struct LanguageRegistry {
 
 impl LanguageRegistry {
     pub fn with_enabled() -> Self {
+        #[cfg_attr(
+            not(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake")),
+            allow(unused_mut)
+        )]
         let mut drivers: Vec<Box<dyn LanguageDriver>> = vec![Box::new(PerlDriver)];
         #[cfg(feature = "cpp")]
         drivers.push(Box::new(cpp_driver()));

@@ -61,7 +61,7 @@ fn object_macro_recovers_corrupted_class() {
     assert!(!extracted_names(&mut p, src).contains(&"Widget".to_string()), "Widget lost pre-reparse");
 
     let tree = parse(&mut p, src);
-    let (rewritten, map) = preprocess(&tree, src);
+    let (rewritten, map) = preprocess_with(&tree, src, &PreExpandedExternal::empty());
 
     // the corrected parse: a real class, error-free
     let after = parse(&mut p, &rewritten);
@@ -90,7 +90,7 @@ fn function_macro_expands_to_member_declarations() {
     assert!(!extracted_names(&mut p, src).contains(&"GetRuntimeClass".to_string()));
 
     let tree = parse(&mut p, src);
-    let (rewritten, _map) = preprocess(&tree, src);
+    let (rewritten, _map) = preprocess_with(&tree, src, &PreExpandedExternal::empty());
 
     // DECLARE_DYNAMIC(MyObj) expanded its body with cls→MyObj; the
     // virtual method is now a real, extractable symbol.
@@ -113,7 +113,7 @@ fn two_tier_matches_single_tier_expansion() {
 
     // EXTERNAL macros (as if gathered from #included headers).
     let mut ext = std::collections::BTreeMap::new();
-    let mut def = |m: &mut std::collections::BTreeMap<String, Macro>, n: &str, params: Option<&[&str]>, body: &str| {
+    let def = |m: &mut std::collections::BTreeMap<String, Macro>, n: &str, params: Option<&[&str]>, body: &str| {
         m.insert(
             n.to_string(),
             Macro {
@@ -167,7 +167,7 @@ fn no_macros_is_identity() {
     let mut p = cpp_parser();
     let src = sample("clean_baseline").src;
     let tree = parse(&mut p, src);
-    let (rewritten, map) = preprocess(&tree, src);
+    let (rewritten, map) = preprocess_with(&tree, src, &PreExpandedExternal::empty());
     assert_eq!(rewritten, src, "no expandable macros → identity");
     assert_eq!(map.to_original(42), 42);
 }
@@ -188,7 +188,7 @@ fn cpp_reparse_obstacle_delta_report() {
         let hb = s.expected.iter().filter(|n| nb.iter().any(|g| g == *n)).count();
 
         let _ = tree;
-        let (rewritten, _) = preprocess_validated(&mut p, s.src);
+        let (rewritten, _, _) = preprocess_validated_with(&mut p, s.src, &PreExpandedExternal::empty());
         let ta = parse(&mut p, &rewritten);
         let ea = errors(ta.root_node());
         let na = extracted_names(&mut p, &rewritten);
@@ -327,16 +327,13 @@ fn bodyless_define_joins_the_config_universe() {
     assert!(matches!(classify(&else_arm.guards, &cfg), Reachability::Unreachable { .. }));
 }
 
-/// End-to-end reachability + join over the captured variants: WIN32 absent →
-/// its variant is UNREACHABLE-labeled (not dropped); the HAS knob's two
-/// branches are UNKNOWN; the body join types the macro as an integer.
+/// End-to-end reachability over the captured variants: WIN32 absent → its
+/// variant is UNREACHABLE-labeled (not dropped); the HAS knob's two branches
+/// are UNKNOWN.
 #[test]
-fn variant_model_ranks_and_joins() {
-    use crate::cpp_macro_model::{KnownConfig, MacroSite, MacroVariant, MacroVariants, Reachability};
+fn variant_model_ranks_by_reachability() {
+    use crate::cpp_macro_model::{classify, KnownConfig, Reachability};
     let mut p = cpp_parser();
-    // Primitive bodies so the REAL cpp_pack annot_type types every variant
-    // (a typedef'd integer alias like `U16` needs typedef resolution — a
-    // documented residual; the join model itself is body-agnostic).
     let src = "\
 #ifdef WIN32
 #define M short
@@ -349,25 +346,18 @@ fn variant_model_ranks_and_joins() {
 ";
     let tree = parse(&mut p, src);
     let raw = collect_macro_variants(&tree, src.as_bytes());
-    let m = MacroVariants {
-        name: "M".into(),
-        variants: raw["M"]
-            .iter()
-            .map(|v| MacroVariant {
-                body: v.body.clone(),
-                params: v.params.clone(),
-                guards: v.guards.clone(),
-                site: MacroSite { file: None, line: v.def_line },
-            })
-            .collect(),
-    };
     // Known config: nothing predefined; HAS_NON_INT_BITFIELDS is a knob we've
     // seen #defined somewhere (universe), WIN32 is not.
     let cfg = KnownConfig::new(
         Default::default(),
         ["HAS_NON_INT_BITFIELDS".to_string()].into_iter().collect(),
     );
-    let ranked = m.ranked(&cfg);
+    let mut ranked: Vec<_> = raw["M"]
+        .iter()
+        .map(|v| (v, classify(&v.guards, &cfg)))
+        .collect();
+    ranked.sort_by_key(|(_, r)| r.rank());
+    assert_eq!(ranked.len(), 3, "nothing is ever pruned");
     // last one is the win32 variant, unreachable + labeled.
     let (last, r) = ranked.last().unwrap();
     assert_eq!(last.body, "short");
@@ -377,12 +367,6 @@ fn variant_model_ranks_and_joins() {
     assert!(ranked[..2]
         .iter()
         .all(|(_, r)| matches!(r, Reachability::Unknown { .. })));
-    // join over the REAL pack predicate: short ∨ unsigned ∨ int → integer.
-    let pack = crate::query_extract::cpp_pack();
-    assert_eq!(
-        m.join_type(pack.annot_type),
-        Some(crate::file_analysis::InferredType::Numeric)
-    );
 }
 
 #[test]
@@ -566,3 +550,4 @@ fn evict_analysis_caches_recovers_header_content_edits() {
     assert_eq!(include_closure(&main_c, src).len(), 2, "closure re-walked");
     let _ = std::fs::remove_dir_all(&dir);
 }
+

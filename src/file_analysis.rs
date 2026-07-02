@@ -2963,7 +2963,7 @@ pub struct FileAnalysisParts {
 /// One domain-typing use-site: the `slot` field was compared/assigned
 /// against `value` at `slot_span`. `value`'s enum resolves cross-file at
 /// query time — an enumerator carries its `enum` (the enum-container
-/// work). Language-generic evidence: a Perl field source (queue #3) mints
+/// work). Language-generic evidence: a Perl field source mints
 /// the same rows off its own accesses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainSite {
@@ -2972,14 +2972,13 @@ pub struct DomainSite {
     pub slot_span: Span,
 }
 
-/// A slot's resolved domain: the enum it is *used as*, with the storage
-/// type it is *stored as* underneath. The domain is a defeasible
-/// refinement for human surfaces; storage is what flows. `confidence` is
-/// the dominant enum's share of the coherence vote.
+/// A slot's resolved domain: the enum it is *used as*. The domain is a
+/// defeasible refinement for human surfaces; the storage type underneath is
+/// what flows (the hover site composes its own storage-leaf display).
+/// `confidence` is the dominant enum's share of the coherence vote.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NominalDomain {
     pub domain: String,
-    pub storage: Option<String>,
     pub confidence: f32,
 }
 
@@ -3675,6 +3674,9 @@ impl FileAnalysis {
     /// enclosing scope's end. Reads are matched on name + access AND filtered
     /// to the move's scope subtree, so a same-named var in another function
     /// never false-flags. Returns (var name, read span).
+    /// Parked with its LSP projection `pack_use_after_move_diagnostics` (see
+    /// the gate comment in `symbols::pack_diagnostics`).
+    #[allow(dead_code)]
     pub fn use_after_move_reads(&self) -> Vec<(String, Span)> {
         let key = |p: &Point| (p.row, p.column);
         let mut out = Vec::new();
@@ -5299,6 +5301,9 @@ impl FileAnalysis {
     /// `field_subject`, so the field's FLAVOR never enters here. This is the
     /// projection every source-agnostic field consumer calls to fold a use
     /// onto the one subject (the Perl analog of the C domain-site routing).
+    /// Parked: Perl domain typing isn't surfaced yet (go-live map "Deferred");
+    /// the tests keep the routing proven until it is.
+    #[allow(dead_code)]
     pub fn field_subject_of_ref(
         &self,
         r: &Ref,
@@ -5345,9 +5350,7 @@ impl FileAnalysis {
     /// recovered from usage (`slot == OP_CONST`, `slot = OP_FREED`, …).
     /// Keyed by the canonical `field_subject` (declaring-class owner), so
     /// every access — whatever the receiver's concrete struct — folds onto
-    /// ONE subject. `storage` is left `None` here; the hover site composes it
-    /// from its own storage-leaf display (keeps the LSP-layer
-    /// alias/config-variant logic out of the model).
+    /// ONE subject.
     pub fn field_domain(
         &self,
         class: &str,
@@ -5424,7 +5427,7 @@ impl FileAnalysis {
         let confidence = domain_coherence(&ws)
             .map(|(_, count, total)| count as f32 / total as f32)
             .unwrap_or(0.0);
-        Some(NominalDomain { domain, storage: None, confidence })
+        Some(NominalDomain { domain, confidence })
     }
 
     /// The canonical `Field` owner of one domain site: the member ref at the

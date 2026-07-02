@@ -182,6 +182,7 @@ pub struct RhaiPlugin {
     triggers: Vec<Trigger>,
     overrides: Vec<TypeOverride>,
     dispatch_verbs: Vec<DispatchVerb>,
+    #[cfg_attr(not(feature = "cpp"), allow(dead_code))]
     attribute_macros: Vec<AttributeMacro>,
     load_verbs: Vec<crate::plugin::LoadVerb>,
     param_types: Vec<ParamType>,

@@ -13,6 +13,9 @@
 /// (name, what-it-probes, expected-symbol-names, source)
 pub struct Sample {
     pub name: &'static str,
+    /// Human-facing corpus annotation (what this sample probes); not read by
+    /// the harness.
+    #[allow(dead_code)]
     pub probes: &'static str,
     /// Symbols a human reading the source expects navigation to reach.
     pub expected: &'static [&'static str],

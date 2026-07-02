@@ -1,4 +1,4 @@
-//! SPIKE: the zero-config C/C++ toolchain probe.
+//! The zero-config C/C++ toolchain probe.
 //!
 //! `docs/cpp-stdlib-autoconfig-research.md` L2 — the load-bearing
 //! layer. The `<...>` macro-gather in `cpp_reparse.rs` skips system
@@ -18,13 +18,12 @@
 //!                                gcc has no such flag — those dirs
 //!                                already surface in (1).
 //!
-//! Deliberately **not** wired into the gather yet — that consumption
-//! (feed `predefined_macros` as the EXTERNAL seed, add `include_dirs`
-//! to the `<...>` search) is a separate commit that would collide with
-//! a concurrent reparse refactor. This module is the self-contained,
-//! tested producer; `cpp_toolchain_tests.rs` exercises the parsers on
-//! captured compiler output so the tests never depend on the host's
-//! compiler.
+//! Consumed through `cpp_reparse::toolchain_info` (a OnceLock over one
+//! probe): `include_dirs` feeds the `<...>` search in `resolve_include`,
+//! `predefined_macros` seeds the reachability config (`known_config`) and
+//! the external-table hash. This module is the self-contained, tested
+//! producer; `cpp_toolchain_tests.rs` exercises the parsers on captured
+//! compiler output so the tests never depend on the host's compiler.
 //!
 //! Caching: results are stable per (compiler abs-path, version, `-std`,
 //! `--target`, lang) — a toolchain UPGRADE must invalidate this, a
@@ -45,6 +44,11 @@ use std::sync::{Mutex, OnceLock};
 /// choice is part of the cache key, not a post-filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
+    /// Not probed yet: `.c` files currently ride the C++ toolchain info
+    /// (a superset for include roots; the predefined-macro delta is small).
+    /// The variant is the seam for a per-language probe when that stops
+    /// being good enough.
+    #[allow(dead_code)]
     C,
     Cpp,
 }

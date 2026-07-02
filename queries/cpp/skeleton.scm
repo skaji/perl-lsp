@@ -193,8 +193,8 @@
 ; below — one pattern for EVERY body shape (operator[]/operator=/conversion
 ; operators/constructors/destructors/templated/out-of-line), so no function's
 ; body ever leaks into the enclosing class scope. The name patterns here only
-; carry @def; they no longer double as the scope source (which missed the
-; operator/cast/in-class-destructor declarator shapes).
+; carry @def; they are not the scope source (a name-shaped scope source would
+; miss the operator/cast/in-class-destructor declarator shapes).
 ; A free function carries its declared return type like a method does, so a
 ; call (and a function-like macro delegating to it) types through the sub-return
 ; path. A type-less definition (a constructor `Foo(){}`, K&R) still matches the
@@ -231,8 +231,8 @@
 ; `Ret Class::m()` bodies ALL mint a @scope, not just the plain/field/qualified
 ; declarator shapes the name patterns above enumerate. Params sit inside the
 ; function_definition span, so they scope to the function (drives declared-type
-; inference); the scope-based moved-from region + narrowing cutoff no longer
-; leak across scope-less sibling functions.
+; inference); the scope-based moved-from region + narrowing cutoff stay
+; bounded instead of leaking across scope-less sibling functions.
 ; `@scope.sub` (not plain `@scope`): a function's params/locals are
 ; sub-body content — `scope_within_sub_body` shields them from the outline
 ; and keeps them out of the class-content lane a sticky class package
@@ -304,8 +304,8 @@
 ; `buffer`). The template NAME token inside fires the @ref.type /
 ; @expr.read catch-alls, so gr on the primary reaches the site; renaming
 ; the primary rewrites it. The node-wide `@scope.sub` swallows the
-; signature's parameter_declarations — the `loc`/`x` top-level Variable
-; leak this shape used to produce. ----
+; signature's parameter_declarations, so this shape can't leak `loc`/`x`
+; as top-level Variables. ----
 (template_instantiation) @scope.sub
 (template_instantiation
   type: (struct_specifier name: (template_type) @def.class.name)) @def.class
