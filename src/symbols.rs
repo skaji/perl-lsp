@@ -6,8 +6,7 @@ use crate::cursor_context::{self, CursorContext};
 use crate::file_analysis::{
     format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
     HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
-    SymKind as FaSymKind, SymbolDetail, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
-    PRIORITY_EXPLICIT_IMPORT, PRIORITY_UNIMPORTED,
+    SymKind as FaSymKind, SymbolDetail,
 };
 use crate::module_index::{CachedModule, ModuleIndex, SubInfo};
 use crate::resolve::{resolve_imported_function, ImportResolution};
@@ -484,7 +483,7 @@ fn completion_items_native(
                 // (Minion's `enqueue(..., [...], { | })` options).
                 // Skipping the short-circuit there lets the HashKey
                 // match run and populate `priority`/`queue`/etc.
-                let vars_only: Vec<CompletionCandidate> = cs.complete("")
+                let vars_only: Vec<CompletionCandidate> = cs.complete("", None)
                     .into_iter()
                     .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
                     .collect();
@@ -572,17 +571,16 @@ fn completion_items_native(
                     ));
                 }
             }
-            items.extend(cs.complete(""));
-
-            // Global sub/module firehose: useful at top-level
-            // positions, harmful when we just offered dispatch
-            // handlers at arg-0 (they'd drown in it). `suppress_firehose`
-            // is set above when we know the cursor is at arg-0 of a
-            // known dispatcher call.
-            if !suppress_firehose {
-                items.extend(imported_function_completions(analysis, module_index));
-                items.extend(unimported_function_completions(analysis, module_index, point, stable_packages));
-            }
+            // Identifier universe from the CandidateSet: in-scope names,
+            // plus the import-sourced firehose when the slot has an
+            // import affordance. The firehose is useful at top-level
+            // positions, harmful when we just offered dispatch handlers
+            // at arg-0 (they'd drown in it) — `suppress_firehose` is set
+            // above when the cursor is at arg-0 of a known dispatcher
+            // call, and withholds the affordance.
+            let auto_import_at = (!suppress_firehose)
+                .then(|| auto_import_span(analysis, point, stable_packages));
+            items.extend(cs.complete("", auto_import_at));
 
             items
         }
@@ -1839,129 +1837,15 @@ pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
 
 // ---- Import resolution helpers ----
 
-/// Build completion candidates for functions imported via `use` statements.
-/// Offers all @EXPORT_OK from already-imported modules — not just the ones
-/// currently in the qw() list. Functions not yet imported get an auto-import
-/// edit that adds them to the existing qw() list.
-fn imported_function_completions(
+/// Where a completion-accepted auto-import `use` edit lands: the standard
+/// insertion position for the package under `point`, clamped to fall at or
+/// above the cursor — an edit below the cursor would import after the call
+/// being completed.
+fn auto_import_span(
     analysis: &FileAnalysis,
-    module_index: &ModuleIndex,
-) -> Vec<CompletionCandidate> {
-    use crate::file_analysis::Span;
-    let mut candidates = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for import in &analysis.imports {
-        let cached: Option<Arc<CachedModule>> = module_index.get_cached(&import.module_name);
-
-        // 1. Always offer explicitly imported symbols (from the qw list).
-        // Dedup/dispatch by LOCAL name (what the user types); resolve
-        // detail against REMOTE name (what exists in the source module)
-        // so renaming imports like `del` → `delete` show the real doc.
-        for is in &import.imported_symbols {
-            let local = &is.local_name;
-            if !seen.insert(local.clone()) {
-                continue;
-            }
-            if !analysis.symbols_named(local).is_empty() {
-                continue;
-            }
-            let detail = completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
-            candidates.push(CompletionCandidate {
-                label: local.clone(),
-                kind: FaSymKind::Sub,
-                detail: Some(detail),
-                insert_text: None,
-                sort_priority: PRIORITY_EXPLICIT_IMPORT,
-                additional_edits: vec![],
-                display_override: None,
-            });
-        }
-
-        // 2. Offer additional @EXPORT_OK functions (not yet imported) if we can resolve the module
-        if let Some(ref cached) = cached {
-            let fa = &cached.analysis;
-            let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
-                // Bare `use Foo;` — offer @EXPORT
-                fa.export.iter().collect()
-            } else {
-                // `use Foo qw(bar)` — offer remaining @EXPORT + @EXPORT_OK
-                let mut all = Vec::new();
-                all.extend(fa.export.iter());
-                all.extend(fa.export_ok.iter());
-                all
-            };
-
-            for name in all_exported {
-                // Skip already-offered (explicitly imported) and locally defined
-                if !seen.insert(name.clone()) {
-                    continue;
-                }
-                if !analysis.symbols_named(name).is_empty() {
-                    continue;
-                }
-
-                let rt_prefix = cached.sub_info(name)
-                    .and_then(|s| s.return_type(None))
-                    .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
-                    .unwrap_or_default();
-
-                let (detail, priority, additional_edits) =
-                    if let Some(close_pos) = import.qw_close_paren {
-                        // Auto-add to existing qw() list
-                        let insert_point = Span {
-                            start: close_pos,
-                            end: close_pos,
-                        };
-                        (
-                            format!("{}{} (auto-import)", rt_prefix, import.module_name),
-                            PRIORITY_AUTO_ADD_QW,
-                            vec![(insert_point, format!(" {}", name))],
-                        )
-                    } else {
-                        // No qw() list to edit (bare `use Foo;`)
-                        (
-                            format!("{}imported from {}", rt_prefix, import.module_name),
-                            PRIORITY_BARE_IMPORT,
-                            vec![],
-                        )
-                    };
-
-                candidates.push(CompletionCandidate {
-                    label: name.clone(),
-                    kind: FaSymKind::Sub,
-                    detail: Some(detail),
-                    insert_text: None,
-                    sort_priority: priority,
-                    additional_edits,
-                    display_override: None,
-                });
-            }
-        }
-    }
-
-    candidates
-}
-
-/// Build completion candidates for functions from modules that aren't imported
-/// at all. Each candidate carries `additional_edits` that insert a full
-/// `use Module qw(func);` statement.
-fn unimported_function_completions(
-    analysis: &FileAnalysis,
-    module_index: &ModuleIndex,
     point: Point,
     stable_packages: Option<&[(String, usize)]>,
-) -> Vec<CompletionCandidate> {
-    use crate::file_analysis::Span;
-    let mut candidates = Vec::new();
-
-    // Collect already-imported module names so we skip them.
-    let imported_modules: std::collections::HashSet<&str> = analysis
-        .imports
-        .iter()
-        .map(|i| i.module_name.as_str())
-        .collect();
-
+) -> crate::file_analysis::Span {
     let mut insert_pos = find_use_insertion_position(analysis, point, stable_packages);
 
     // If the computed position is after the cursor, fall back to inserting
@@ -1983,62 +1867,11 @@ fn unimported_function_completions(
         }
     }
 
-    let insert_span = Span {
-        start: tree_sitter::Point {
-            row: insert_pos.line as usize,
-            column: insert_pos.character as usize,
-        },
-        end: tree_sitter::Point {
-            row: insert_pos.line as usize,
-            column: insert_pos.character as usize,
-        },
+    let p = tree_sitter::Point {
+        row: insert_pos.line as usize,
+        column: insert_pos.character as usize,
     };
-
-    module_index.for_each_cached(|module_name, cached| {
-        if imported_modules.contains(module_name) {
-            return;
-        }
-
-        let fa = &cached.analysis;
-        let all_exported = fa.export.iter().chain(fa.export_ok.iter());
-        for name in all_exported {
-            // Skip functions already defined locally
-            if !analysis.symbols_named(name).is_empty() {
-                continue;
-            }
-            candidates.push(CompletionCandidate {
-                label: name.clone(),
-                kind: FaSymKind::Sub,
-                detail: Some(format!("{} (auto-import)", module_name)),
-                insert_text: None,
-                sort_priority: PRIORITY_UNIMPORTED,
-                additional_edits: vec![(
-                    insert_span,
-                    format!("use {} qw({});\n", module_name, name),
-                )],
-                display_override: None,
-            });
-        }
-    });
-
-    // Sort for deterministic order
-    candidates.sort_by(|a, b| a.label.cmp(&b.label).then(a.detail.cmp(&b.detail)));
-    candidates
-}
-
-fn completion_detail_for_import(
-    name: &str,
-    cached: Option<&CachedModule>,
-    module_name: &str,
-) -> String {
-    if let Some(cached) = cached {
-        if let Some(sub_info) = cached.sub_info(name) {
-            if let Some(rt) = sub_info.return_type(None) {
-                return format!("→ {} ({})", format_inferred_type(&rt), module_name);
-            }
-        }
-    }
-    format!("imported from {}", module_name)
+    crate::file_analysis::Span { start: p, end: p }
 }
 
 fn format_imported_signature(name: &str, sub_info: &SubInfo<'_>) -> String {

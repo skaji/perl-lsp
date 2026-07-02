@@ -899,22 +899,221 @@ impl<'a> CandidateSet<'a> {
     /// adapter. Sources by tier:
     ///
     /// - OPEN — the origin file's in-scope names (variables, subs,
-    ///   packages). The origin is the document being edited, i.e. the open
-    ///   tier by definition of the completion verb.
+    ///   packages: the origin is the document being edited, i.e. the open
+    ///   tier by definition of the completion verb) and the names its `use`
+    ///   statements explicitly import (origin-file facts; the dep cache only
+    ///   enriches their detail).
+    /// - DEPENDENCY — names supplied by other modules' export surfaces:
+    ///   the rest of an imported module's `@EXPORT`/`@EXPORT_OK`, and every
+    ///   cached exporter's surface as auto-import candidates.
+    ///
+    /// `auto_import_at` is the slot's import affordance: the position where
+    /// an auto-import `use` edit would land. `None` means the slot offers no
+    /// import-sourced names at all (today: every slot except the general
+    /// identifier slot) — an import candidate without a place to put its
+    /// edit would complete to broken code.
     ///
     /// The general slot passes `""` (clients filter by prefix); a non-empty
     /// prefix narrows server-side for callers that want it.
-    pub fn complete(&self, prefix: &str) -> Vec<CompletionCandidate> {
+    pub fn complete(
+        &self,
+        prefix: &str,
+        auto_import_at: Option<Span>,
+    ) -> Vec<CompletionCandidate> {
         let mask = self.completion_visibility();
         let mut out = Vec::new();
         if mask.contains(RoleMask::OPEN) {
             out.extend(self.origin.complete_general(self.point));
+        }
+        if let (Some(insert_at), Some(idx)) = (auto_import_at, self.module_index) {
+            import_candidates(self.origin, idx, mask, &mut out);
+            if mask.contains(RoleMask::DEPENDENCY) {
+                unimported_export_candidates(self.origin, idx, insert_at, &mut out);
+            }
         }
         if !prefix.is_empty() {
             out.retain(|c| c.label.starts_with(prefix));
         }
         out
     }
+}
+
+/// Candidates for names a `use` statement makes (or could make) available:
+/// explicitly imported symbols, then the imported modules' remaining
+/// `@EXPORT`/`@EXPORT_OK` surfaces as auto-add-to-qw candidates. The `seen`
+/// set is marked unconditionally so a tier-masked explicit import can never
+/// be re-offered by the export walk under the wrong affordance.
+fn import_candidates(
+    origin: &FileAnalysis,
+    idx: &dyn CrossFileLookup,
+    mask: RoleMask,
+    out: &mut Vec<CompletionCandidate>,
+) {
+    use crate::file_analysis::{
+        format_inferred_type, SymKind as FaSymKind, PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT,
+        PRIORITY_EXPLICIT_IMPORT,
+    };
+    let mut seen = std::collections::HashSet::new();
+
+    for import in &origin.imports {
+        let cached = idx.get_cached(&import.module_name);
+
+        // Explicitly imported symbols (from the qw list): origin-file names.
+        // Dedup/dispatch by LOCAL name (what the user types); resolve detail
+        // against REMOTE name (what exists in the source module) so renaming
+        // imports like `del` → `delete` show the real doc.
+        for is in &import.imported_symbols {
+            let local = &is.local_name;
+            if !seen.insert(local.clone()) {
+                continue;
+            }
+            if !origin.symbols_named(local).is_empty() {
+                continue;
+            }
+            if !mask.contains(RoleMask::OPEN) {
+                continue;
+            }
+            let detail =
+                completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
+            out.push(CompletionCandidate {
+                label: local.clone(),
+                kind: FaSymKind::Sub,
+                detail: Some(detail),
+                insert_text: None,
+                sort_priority: PRIORITY_EXPLICIT_IMPORT,
+                additional_edits: vec![],
+                display_override: None,
+            });
+        }
+
+        // The module's remaining export surface: dependency-file names.
+        if !mask.contains(RoleMask::DEPENDENCY) {
+            continue;
+        }
+        if let Some(ref cached) = cached {
+            let fa = &cached.analysis;
+            let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
+                // Bare `use Foo;` — offer @EXPORT
+                fa.export.iter().collect()
+            } else {
+                // `use Foo qw(bar)` — offer remaining @EXPORT + @EXPORT_OK
+                let mut all = Vec::new();
+                all.extend(fa.export.iter());
+                all.extend(fa.export_ok.iter());
+                all
+            };
+
+            for name in all_exported {
+                // Skip already-offered (explicitly imported) and locally defined
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                if !origin.symbols_named(name).is_empty() {
+                    continue;
+                }
+
+                let rt_prefix = cached
+                    .sub_info(name)
+                    .and_then(|s| s.return_type(None))
+                    .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
+                    .unwrap_or_default();
+
+                let (detail, priority, additional_edits) =
+                    if let Some(close_pos) = import.qw_close_paren {
+                        // Auto-add to existing qw() list
+                        let insert_point = Span { start: close_pos, end: close_pos };
+                        (
+                            format!("{}{} (auto-import)", rt_prefix, import.module_name),
+                            PRIORITY_AUTO_ADD_QW,
+                            vec![(insert_point, format!(" {}", name))],
+                        )
+                    } else {
+                        // No qw() list to edit (bare `use Foo;`)
+                        (
+                            format!("{}imported from {}", rt_prefix, import.module_name),
+                            PRIORITY_BARE_IMPORT,
+                            vec![],
+                        )
+                    };
+
+                out.push(CompletionCandidate {
+                    label: name.clone(),
+                    kind: FaSymKind::Sub,
+                    detail: Some(detail),
+                    insert_text: None,
+                    sort_priority: priority,
+                    additional_edits,
+                    display_override: None,
+                });
+            }
+        }
+    }
+}
+
+/// Auto-import candidates: every cached exporter's `@EXPORT`/`@EXPORT_OK`
+/// surface, each carrying the `use Module qw(func);` edit at `insert_at`.
+fn unimported_export_candidates(
+    origin: &FileAnalysis,
+    idx: &dyn CrossFileLookup,
+    insert_at: Span,
+    out: &mut Vec<CompletionCandidate>,
+) {
+    use crate::file_analysis::{SymKind as FaSymKind, PRIORITY_UNIMPORTED};
+    let mut candidates = Vec::new();
+
+    // Already-imported modules are the import walk's job, not this one's.
+    let imported_modules: std::collections::HashSet<&str> = origin
+        .imports
+        .iter()
+        .map(|i| i.module_name.as_str())
+        .collect();
+
+    idx.for_each_cached(&mut |module_name, cached| {
+        if imported_modules.contains(module_name) {
+            return;
+        }
+
+        let fa = &cached.analysis;
+        let all_exported = fa.export.iter().chain(fa.export_ok.iter());
+        for name in all_exported {
+            // Skip functions already defined locally
+            if !origin.symbols_named(name).is_empty() {
+                continue;
+            }
+            candidates.push(CompletionCandidate {
+                label: name.clone(),
+                kind: FaSymKind::Sub,
+                detail: Some(format!("{} (auto-import)", module_name)),
+                insert_text: None,
+                sort_priority: PRIORITY_UNIMPORTED,
+                additional_edits: vec![(
+                    insert_at,
+                    format!("use {} qw({});\n", module_name, name),
+                )],
+                display_override: None,
+            });
+        }
+    });
+
+    // Sort for deterministic order
+    candidates.sort_by(|a, b| a.label.cmp(&b.label).then(a.detail.cmp(&b.detail)));
+    out.extend(candidates);
+}
+
+fn completion_detail_for_import(
+    name: &str,
+    cached: Option<&crate::file_analysis::CachedModule>,
+    module_name: &str,
+) -> String {
+    use crate::file_analysis::format_inferred_type;
+    if let Some(cached) = cached {
+        if let Some(sub_info) = cached.sub_info(name) {
+            if let Some(rt) = sub_info.return_type(None) {
+                return format!("→ {} ({})", format_inferred_type(&rt), module_name);
+            }
+        }
+    }
+    format!("imported from {}", module_name)
 }
 
 /// All `Handler` definitions matching `(owner, name)` across cached modules.
