@@ -1,0 +1,27 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "completion-exact-hash-key-slot-no-nested-leak",
+      "difficulty": "moderate",
+      "semantic_area": "completion-noise",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 8,
+      "col": 24,
+      "expect": { "exact_labels": ["db", "debug"] },
+      "status": "xfail"
+    },
+    {
+      "id": "completion-hash-key-slot-noise-ceiling",
+      "difficulty": "moderate",
+      "semantic_area": "completion-noise",
+      "root": "gold-corpus/nested-fixture",
+      "file": "main.pl",
+      "line": 8,
+      "col": 24,
+      "expect": { "all": ["db", "debug"], "max_items": 4 },
+      "status": "gold"
+    }
+  ]
+}
