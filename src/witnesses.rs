@@ -1898,7 +1898,15 @@ impl ReducerRegistry {
                     }
                 }
             }
-            return ReducedValue::Type(InferredType::ClassName(name.clone()));
+            // A template-shaped terminal (`TypeName("Box<Widget>")` — an
+            // alias chain that bottomed out on a template spelling) peels
+            // into the Instance flavor so dispatch keys the base, same as
+            // an annot-site spelling.
+            return ReducedValue::Type(
+                crate::file_analysis::ParametricType::instance_from_spelling(name)
+                    .map(InferredType::Parametric)
+                    .unwrap_or_else(|| InferredType::ClassName(name.clone())),
+            );
         }
 
         ReducedValue::None

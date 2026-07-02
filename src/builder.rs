@@ -11536,9 +11536,9 @@ impl<'a> Builder<'a> {
     /// happens once during the live walk.
     fn emit_parametric_return_expr_decls(&mut self, ty: &InferredType) {
         let Some(p) = ty.as_parametric() else { return };
-        let base_class = match p {
-            crate::file_analysis::ParametricType::ResultSet { base, .. } => base.clone(),
-        };
+        // The flavor's own dispatch class pins the slot — no per-variant
+        // match, so a flavor with no declarations (empty vec) is a no-op.
+        let Some(base_class) = p.class_name().map(|s| s.to_string()) else { return };
         let zero = Span {
             start: Point { row: 0, column: 0 },
             end: Point { row: 0, column: 0 },

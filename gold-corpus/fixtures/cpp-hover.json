@@ -332,6 +332,24 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-hover-keeps-args",
+      "line": 29,
+      "col": 4,
+      "expect": {
+        "all": [
+          "c: Crate<Payload>",
+          "*variable*"
+        ],
+        "none": []
+      }
     }
   ]
 }

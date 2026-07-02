@@ -115,6 +115,27 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-member-completion",
+      "line": 29,
+      "col": 6,
+      "expect": {
+        "all": [
+          "get",
+          "size",
+          "item_"
+        ],
+        "none": [
+          "use_crate"
+        ]
+      }
     }
   ]
 }
