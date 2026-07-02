@@ -1119,7 +1119,8 @@ fn cpp_cross_file_enum_variant_goto_def() {
 
     let uri = tower_lsp::lsp_types::Url::from_file_path("/fake/cpp/use.c").unwrap();
     let pos = tower_lsp::lsp_types::Position { line: 1, character: 16 };
-    let resp = crate::symbols::find_definition(&use_fa, pos, &uri, &idx)
+    let store = crate::file_store::FileStore::new();
+    let resp = crate::symbols::find_definition(&store, &use_fa, pos, &uri, &idx)
         .expect("cross-file enum-variant goto-def resolves");
     let loc = match resp {
         tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(l) => l,

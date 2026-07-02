@@ -301,6 +301,13 @@ pub trait CrossFileLookup {
     /// INCLUDING packageless entrypoint scripts, which never enter the
     /// module cache.
     fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &InferredType));
+    /// Loadable module names matching `prefix` for completion, as
+    /// (name, is_resolved) — resolved modules have full analysis, the rest
+    /// are @INC-scanned availability. Defaults empty so lookups that have
+    /// no module universe stay honest without stubbing.
+    fn complete_module_names(&self, _prefix: &str) -> Vec<(String, bool)> {
+        Vec::new()
+    }
 }
 
 /// A `CrossFileLookup` decorator scoped to ONE querying file's include-closure

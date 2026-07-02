@@ -699,33 +699,6 @@ fn rename_via_refs_to(
     Ok(locations_to_workspace_edit(locations, new_name))
 }
 
-/// `(RefLocation, text)` pairs → one `WorkspaceEdit` (per-member texts).
-fn edit_pairs_to_workspace_edit(
-    edits: Vec<(crate::resolve::RefLocation, String)>,
-) -> Option<WorkspaceEdit> {
-    if edits.is_empty() {
-        return None;
-    }
-    let mut all_changes: std::collections::HashMap<Url, Vec<TextEdit>> =
-        std::collections::HashMap::new();
-    for (loc, text) in edits {
-        if let Some(uri) = loc.to_url() {
-            all_changes.entry(uri).or_default().push(TextEdit {
-                range: symbols::span_to_range(loc.span),
-                new_text: text,
-            });
-        }
-    }
-    if all_changes.is_empty() {
-        None
-    } else {
-        Some(WorkspaceEdit { changes: Some(all_changes), ..Default::default() })
-    }
-}
-
-/// `RefLocation`s → one `WorkspaceEdit` writing `new_name` at every span.
-/// Callers guarantee every span covers exactly the renamable token
-/// (bare-name spans for groups, selection/name spans from `refs_to`).
 fn locations_to_workspace_edit(
     locations: Vec<crate::resolve::RefLocation>,
     new_name: &str,
@@ -756,6 +729,30 @@ fn locations_to_workspace_edit(
             changes: Some(all_changes),
             ..Default::default()
         })
+    }
+}
+
+/// `(RefLocation, text)` pairs → one `WorkspaceEdit` (per-member texts).
+fn edit_pairs_to_workspace_edit(
+    edits: Vec<(crate::resolve::RefLocation, String)>,
+) -> Option<WorkspaceEdit> {
+    if edits.is_empty() {
+        return None;
+    }
+    let mut all_changes: std::collections::HashMap<Url, Vec<TextEdit>> =
+        std::collections::HashMap::new();
+    for (loc, text) in edits {
+        if let Some(uri) = loc.to_url() {
+            all_changes.entry(uri).or_default().push(TextEdit {
+                range: symbols::span_to_range(loc.span),
+                new_text: text,
+            });
+        }
+    }
+    if all_changes.is_empty() {
+        None
+    } else {
+        Some(WorkspaceEdit { changes: Some(all_changes), ..Default::default() })
     }
 }
 
@@ -1156,7 +1153,7 @@ impl LanguageServer for Backend {
                 return Ok(Some(GotoDefinitionResponse::Array(locs)));
             }
         }
-        if let Some(resp) = symbols::find_definition(&doc.analysis, pos, uri, idx) {
+        if let Some(resp) = symbols::find_definition(&self.files, &doc.analysis, pos, uri, idx) {
             return Ok(Some(resp));
         }
         // Member access (`obj->field`) now flows through `find_definition`
@@ -1316,7 +1313,6 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
         let doc = match self.files.get_open(&params.text_document.uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1344,10 +1340,10 @@ impl LanguageServer for Backend {
         // Only offer a rename box where `rename` would actually produce edits.
         // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
         // `@_` or an ownerless constructor key resolve to nothing renameable, so
-        // the user gets a box that silently no-ops. Mirror the rename handler's
-        // branching, probing the single-file `rename_at` for the kinds it routes
-        // there — which is why this gate tracks new single-file renameables (a
-        // lexical hash key) automatically, with no change here.
+        // the user gets a box that silently no-ops. `renameable()` mirrors
+        // `rename_edits`' arms on the same set, so this gate tracks new
+        // renameable kinds automatically, with no change here.
+        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
         let renameable = match resolve_symbol_scoped(
             &doc.analysis,
             point,
@@ -1379,8 +1375,6 @@ impl LanguageServer for Backend {
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
-
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = &params.new_name;
@@ -1394,6 +1388,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
+        use crate::resolve::{resolve_symbol_scoped, ResolvedTarget};
         let point = symbols::position_to_point(pos);
         // Pack languages resolve + collect through their sub-index, scoped to
         // this file's include closure — the same preamble references uses, or
@@ -1430,6 +1425,7 @@ impl LanguageServer for Backend {
                     &pinned_spans,
                     &members,
                     bare_new,
+                    crate::resolve::RoleMask::EDITABLE,
                 );
                 Ok(edit_pairs_to_workspace_edit(edits))
             }
@@ -1528,6 +1524,8 @@ impl LanguageServer for Backend {
             }));
         }
         let items = symbols::completion_items(
+            &self.files,
+            &FileKey::Url(uri.clone()),
             &doc.analysis,
             &doc.tree,
             &doc.text,

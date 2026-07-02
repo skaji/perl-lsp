@@ -12,6 +12,10 @@
 # asserts its NORMALIZED output:
 #     expect.all  — every string MUST appear
 #     expect.none — no string may appear
+#     expect.exact_labels — (line-oriented caps, e.g. completion) the output's
+#                   non-empty lines, as a SET, must equal exactly this list —
+#                   extra entries FAIL. The noise guard containment can't give.
+#     expect.max_items — line-count ceiling; more entries FAIL.
 #   status:
 #     gold        — assertion MUST hold; else FAIL (regression)
 #     xfail       — known gap: assertion must currently NOT hold; if it starts
@@ -310,6 +314,15 @@ for my $key (@order) {
     my $ok = 1;
     for my $s (@{ $r->{expect}{all}  || [] }) { $ok = 0, last if index($norm, $s) < 0; }
     if ($ok) { for my $s (@{ $r->{expect}{none} || [] }) { $ok = 0, last if index($norm, $s) >= 0; } }
+    if ($ok && $r->{expect}{exact_labels}) {
+        my @got  = sort grep { length } map { my $l = (split /\t/, $_)[0] // ''; $l =~ s/^\s+|\s+$//g; $l } split /\n/, $norm;
+        my @want = sort @{ $r->{expect}{exact_labels} };
+        $ok = 0 unless @got == @want && join("\0", @got) eq join("\0", @want);
+    }
+    if ($ok && defined $r->{expect}{max_items}) {
+        my @got = grep { length } map { my $l = (split /\t/, $_)[0] // ''; $l =~ s/^\s+|\s+$//g; $l } split /\n/, $norm;
+        $ok = 0 if @got > $r->{expect}{max_items};
+    }
     if ($status eq 'gold') {
         if ($ok) { $pass++ } else { push @fail, "$key\n      expect: " . encode_json($r->{expect}) . "\n      got: " . substr($norm, 0, 200) }
     } elsif ($status eq 'xfail') {

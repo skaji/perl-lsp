@@ -1109,7 +1109,7 @@ fn run_one(
             }
             // Pack cross-file symbol goto-def uses the include-scoped pack index;
             // Perl's module-keyed lookup is unaffected (empty closure = the hub).
-            if let Some(resp) = symbols::find_definition(&analysis, pos, &uri, xidx) {
+            if let Some(resp) = symbols::find_definition(ws, &analysis, pos, &uri, xidx) {
                 use tower_lsp::lsp_types::GotoDefinitionResponse;
                 // Print EVERY offered location (one per line), ranked as
                 // returned: a plain goto-def yields one; a domain-typed field
@@ -1322,7 +1322,10 @@ fn run_one(
                     &doc.analysis, &doc.text, &doc.tree, point, doc.language,
                     doc.path.as_deref(), idx).0)
             } else {
+                let file_path = std::path::Path::new(file).canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(file));
                 tphase!("completion_items", symbols::completion_items(
+                    ws, &file_store::FileKey::Path(file_path),
                     &doc.analysis, &doc.tree, &doc.text, pos, idx,
                     Some(doc.stable_outline.package_lines())))
             };
@@ -1580,6 +1583,7 @@ fn run_rename(
             let bare_new = new_name.trim_start_matches(['$', '@', '%']);
             let edits = resolve::group_rename_edits(
                 ws, Some(idx), &origin, &local_spans, &pinned_spans, &members, bare_new,
+                resolve::RoleMask::EDITABLE,
             );
             for (loc, text) in edits {
                 let path = match &loc.key {
