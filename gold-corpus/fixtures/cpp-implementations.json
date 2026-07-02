@@ -1,0 +1,23 @@
+{
+  "capability": "implementations",
+  "rows": [
+    {
+      "id": "cpp-implementations-primary-enumerates-spec-family",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_spec.cpp",
+      "line": 2,
+      "col": 44,
+      "expect": {
+        "all": [
+          "{\"col\":\"20\",\"file\":\"tmpl_spec.cpp\",\"line\":\"6\"}",
+          "{\"col\":\"30\",\"file\":\"tmpl_spec.cpp\",\"line\":\"9\"}"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

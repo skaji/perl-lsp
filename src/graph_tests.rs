@@ -183,3 +183,30 @@ fn ancestor_funnel_includes_self_then_mro_order() {
     // DFS, not BFS — and Base seen-once despite the diamond.
     assert_eq!(order, vec!["A", "Left", "Base", "Right"]);
 }
+
+#[test]
+fn walk_specializes_is_family_view_only() {
+    // Local (spec → primary) map drives the edge; member resolution's
+    // INHERITS mask never traverses it.
+    let mut fa = parse("package Probe;\n1;\n");
+    fa.specializes.insert("formatter<int, char>".into(), "formatter".into());
+    fa.specializes.insert("formatter<T*, char>".into(), "formatter".into());
+    let g = GraphView::new(&fa, None);
+    let mut fam: Vec<String> = Vec::new();
+    g.walk(Node::Class("formatter".into()), EdgeKindMask::SPECIALIZES, &mut |n| {
+        if let Node::Class(c) = n {
+            fam.push(c.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    assert_eq!(fam, vec!["formatter<T*, char>", "formatter<int, char>"], "sorted, deterministic");
+    // the inheritance mask sees nothing — a spec REPLACES, never inherits
+    let mut inh: Vec<String> = Vec::new();
+    g.walk(Node::Class("formatter".into()), EdgeKindMask::INHERITS | EdgeKindMask::INHERITS_INV, &mut |n| {
+        if let Node::Class(c) = n {
+            inh.push(c.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    assert!(inh.is_empty(), "member resolution must not fall through Specializes: {inh:?}");
+}

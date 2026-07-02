@@ -1027,6 +1027,13 @@ pub fn implementations_of(
     module_index: Option<&dyn CrossFileLookup>,
     target: &TargetRef,
 ) -> Vec<RefLocation> {
+    // On a class/package name: the specialization FAMILY view — every spec
+    // of the primary template (`formatter` → all `formatter<...>` defs).
+    // gr on the primary stays "uses of the primary"; the family is this
+    // verb's answer (fork 4, docs/prompt-template-arc.md).
+    if matches!(target.kind, TargetKind::Package) {
+        return specialization_family(origin, module_index, &target.name);
+    }
     let TargetKind::Method { class } = &target.kind else {
         return Vec::new();
     };
@@ -1087,6 +1094,62 @@ pub fn implementations_of(
                         span: s.selection_span,
                         access: AccessKind::Declaration,
                         rewritable: true,
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
+}
+
+/// The specialization family of primary template `name`: every spec class's
+/// def site, cross-file. Spec NAMES come off the graph's `Specializes` edges
+/// (local `FileAnalysis.specializes` + the index's spec map); def sites
+/// resolve through the by-name index (spec Class symbols are indexed under
+/// their canonical spelling). `rewritable: false` — a spec's selection span
+/// is the whole `X<args>` spelling; renaming the primary rewrites the base
+/// TOKEN inside it via its PackageRef, never this span wholesale.
+fn specialization_family(
+    origin: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+    primary: &str,
+) -> Vec<RefLocation> {
+    let mut specs: Vec<String> = Vec::new();
+    let probe = crate::graph::GraphView::new(origin, module_index);
+    probe.walk(
+        crate::graph::Node::Class(primary.to_string()),
+        crate::graph::EdgeKindMask::SPECIALIZES,
+        &mut |n| {
+            if let crate::graph::Node::Class(c) = n {
+                specs.push(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    let mut out: Vec<RefLocation> = Vec::new();
+    for spec in &specs {
+        // Def sites resolve through the index alone (the origin file is
+        // itself indexed, so its own specs surface with a real path key).
+        // `def_candidates` is the by-name candidate table the pack index
+        // keys everything on — every file defining this spec spelling.
+        let Some(idx) = module_index else { continue };
+        for cached in idx.def_candidates(spec) {
+            for s in &cached.analysis.symbols {
+                if &s.name == spec && matches!(s.kind, SymKind::Class) {
+                    out.push(RefLocation {
+                        key: FileKey::Path(cached.path.clone()),
+                        span: s.selection_span,
+                        access: AccessKind::Declaration,
+                        rewritable: false,
                     });
                 }
             }

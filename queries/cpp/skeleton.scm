@@ -54,6 +54,24 @@
     name: (type_identifier) @def.class.name @context.class)
   body: (field_declaration_list) @scope) @def.class
 
+; ---- class template specializations (full `template<> struct X<A>` and
+; partial `struct X<T*>`): the name is a `template_type`, and the spec is
+; its OWN Class (per-spec identity — a spec REPLACES the primary's members
+; wholesale, so it must own a distinct member table; fork 4 of
+; docs/prompt-template-arc.md). The symbol/package name is the canonical
+; template spelling (`formatter<int, char>` — see
+; `canonical_template_spelling`); @spec.primary records the base name so
+; extraction mints the `Specializes` family edge (goto-implementation
+; traverses it; member resolution never does). The inner `type_identifier`
+; also fires the @ref.type catch-all, so gr/rename on the primary reach
+; each spec's name token. ----
+(class_specifier
+  name: (template_type name: (type_identifier) @spec.primary) @def.class.name @context.class
+  body: (field_declaration_list) @scope) @def.class
+(struct_specifier
+  name: (template_type name: (type_identifier) @spec.primary) @def.class.name @context.class
+  body: (field_declaration_list) @scope) @def.class
+
 ; ---- inheritance: `class Circle : public Shape` → Circle parent Shape.
 ; A dedicated pattern (non-inheriting classes keep matching the body
 ; pattern above); one @parent per base, so multiple inheritance works.
@@ -63,7 +81,34 @@
 (struct_specifier
   name: (type_identifier) @def.class.name
   (base_class_clause (type_identifier) @parent))
+; template BASE (`struct D : base<T>` / the fmt idiom `formatter<X> :
+; formatter<string_view>`): TWO parent edges per base — the canonical
+; template spelling (joins a per-spec Class when one exists) and the bare
+; base name (joins the primary; the dependent `base<T>` spelling names no
+; class, so member resolution falls through to the primary). The walk's
+; seen-set dedups; a miss on either edge resolves to nothing, harmlessly.
+(class_specifier
+  name: [(type_identifier) (template_type)] @def.class.name
+  (base_class_clause (template_type name: (type_identifier) @parent) @parent))
+(struct_specifier
+  name: [(type_identifier) (template_type)] @def.class.name
+  (base_class_clause (template_type name: (type_identifier) @parent) @parent))
+; spec defs inherit through plain bases too
+(class_specifier
+  name: (template_type) @def.class.name
+  (base_class_clause (type_identifier) @parent))
+(struct_specifier
+  name: (template_type) @def.class.name
+  (base_class_clause (type_identifier) @parent))
 (union_specifier name: (type_identifier) @def.class.name) @def.class
+; a BODIED named union additionally scopes its members (outline nesting +
+; the hover overlay's sibling group) and tags them with the union's name.
+; `@def.union` (not `@def.class`) so the Symbol carries the "union"
+; attribute the overlay/outline consumers key on; the bare pattern above
+; still fires, and the type-kind family dedup keeps the union-tagged row.
+(union_specifier
+  name: (type_identifier) @def.union.name @context.class
+  body: (field_declaration_list) @scope) @def.union
 (enum_specifier name: (type_identifier) @def.class.name) @def.class
 
 ; ---- C typedef'd aggregates: `typedef struct { ... } Name;` — the
@@ -76,10 +121,20 @@
   declarator: (type_identifier) @def.class.name) @def.class
 (type_definition
   type: (union_specifier body: (field_declaration_list) @scope)
-  declarator: (type_identifier) @def.class.name) @def.class
+  declarator: (type_identifier) @def.union.name) @def.union
 (type_definition
   type: (enum_specifier)
   declarator: (type_identifier) @def.class.name) @def.class
+
+; ---- field-unions: a union declared inline as a struct member. The
+; members stay flat on the ENCLOSING struct for completion/refs (C's
+; access model — sticky @context.class tags them), but the outline nests
+; them under a container: the field itself when named (`op_pmreplrootu`),
+; a synthetic `(union)` node when anonymous. The body @scope is the
+; overlay's sibling group: members sharing it overlay the same storage.
+(field_declaration
+  type: (union_specifier body: (field_declaration_list) @scope)
+  declarator: (field_identifier)? @def.unionfield.name) @def.unionfield
 ; enum CONSTANTS (RED, GREEN) — named values, findable + completable.
 ; @def.enumerator (not @def.var) marks them so the extractor can tag each
 ; with its parent enum (span-contained): `enum Color { RED }` → RED's
@@ -178,18 +233,27 @@
 ; function_definition span, so they scope to the function (drives declared-type
 ; inference); the scope-based moved-from region + narrowing cutoff no longer
 ; leak across scope-less sibling functions.
-(function_definition) @scope
+; `@scope.sub` (not plain `@scope`): a function's params/locals are
+; sub-body content — `scope_within_sub_body` shields them from the outline
+; and keeps them out of the class-content lane a sticky class package
+; would otherwise drag them into.
+(function_definition) @scope.sub
 
 ; ---- top-level / namespaced function prototypes (the bulk of any
-; header file) — a `declaration`, not a `function_definition` ----
+; header file) — a `declaration`, not a `function_definition`. A
+; prototype has no body, so its parameter_list is the whole signature
+; region: `@scope.sub` there keeps the params (referenced by nothing)
+; out of the outline and the class-content lane. ----
 (declaration
   declarator: (function_declarator
-    declarator: (identifier) @def.sub.name)) @def.sub
+    declarator: (identifier) @def.sub.name
+    parameters: (parameter_list) @scope.sub)) @def.sub
 (declaration
   declarator: (function_declarator
     declarator: (qualified_identifier
       scope: (_) @qualifier
-      name: (identifier) @def.method.name))) @def.method
+      name: (identifier) @def.method.name)
+    parameters: (parameter_list) @scope.sub)) @def.method
 
 ; ---- in-class method declarations (prototypes) & member fields ----
 ; @rettype carries the declared return type → the method's return-type
@@ -197,19 +261,22 @@
 (field_declaration
   type: (_) @rettype
   declarator: (function_declarator
-    declarator: (field_identifier) @def.method.name)) @def.method
+    declarator: (field_identifier) @def.method.name
+    parameters: (parameter_list) @scope.sub)) @def.method
 ; pointer- / reference-returning methods (`Foo* m()`, `Foo& m()`):
 ; the function_declarator nests inside a pointer/reference wrapper.
 (field_declaration
   type: (_) @rettype
   declarator: (pointer_declarator
     declarator: (function_declarator
-      declarator: (field_identifier) @def.method.name))) @def.method
+      declarator: (field_identifier) @def.method.name
+      parameters: (parameter_list) @scope.sub))) @def.method
 (field_declaration
   type: (_) @rettype
   declarator: (reference_declarator
     (function_declarator
-      declarator: (field_identifier) @def.method.name))) @def.method
+      declarator: (field_identifier) @def.method.name
+      parameters: (parameter_list) @scope.sub))) @def.method
 ; destructor `~Widget()` — tree-sitter parses it as a `declaration` (no
 ; return type), with a `destructor_name` declarator, so the field_declaration
 ; method patterns above miss it. @def.sub + the in-class method
@@ -225,6 +292,61 @@
     declarator: (qualified_identifier
       scope: (_) @qualifier
       name: (destructor_name) @def.method.name))) @def.method
+
+; ---- explicit instantiation (`template struct X<int>;` / `template void
+; f<char>(..);` — fmt's src/format.cc is entirely this shape). It is a USE
+; of the named template, not a def-with-body — but a deliberate,
+; enumerable one, so it mints an outline symbol (fork 2 of
+; docs/prompt-template-arc.md): the class form under the canonical
+; instantiation spelling, the function form under the function's name
+; (qualified forms join their class via @qualifier, whose template_type
+; is peeled to the base name — `buffer<char>::append` files under
+; `buffer`). The template NAME token inside fires the @ref.type /
+; @expr.read catch-alls, so gr on the primary reaches the site; renaming
+; the primary rewrites it. The node-wide `@scope.sub` swallows the
+; signature's parameter_declarations — the `loc`/`x` top-level Variable
+; leak this shape used to produce. ----
+(template_instantiation) @scope.sub
+(template_instantiation
+  type: (struct_specifier name: (template_type) @def.class.name)) @def.class
+(template_instantiation
+  type: (class_specifier name: (template_type) @def.class.name)) @def.class
+(template_instantiation
+  type: (union_specifier name: (template_type) @def.class.name)) @def.class
+(template_instantiation
+  declarator: (function_declarator
+    declarator: (identifier) @def.sub.name)) @def.sub
+(template_instantiation
+  declarator: (pointer_declarator
+    (function_declarator
+      declarator: (identifier) @def.sub.name))) @def.sub
+(template_instantiation
+  declarator: (function_declarator
+    declarator: (template_function name: (identifier) @def.sub.name))) @def.sub
+(template_instantiation
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      scope: (_) @qualifier
+      name: (identifier) @def.method.name))) @def.method
+(template_instantiation
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      scope: (_) @qualifier
+      name: (template_function name: (identifier) @def.method.name)))) @def.method
+
+; ---- `using X = T;` aliases (plain and template): the name is a findable,
+; renamable TYPE symbol; the @alias.name/@alias.of witness below carries
+; the same edge it always did (the symbol adds identity, not typing). ----
+(alias_declaration
+  name: (type_identifier) @def.class.name) @def.class
+
+; ---- concepts: the name is a findable type-level symbol; the
+; requires-expression's parameters (`requires(T a, T b)`) are signature
+; machinery, not file structure — `@scope.sub` shields them like any
+; other sub-body content. ----
+(concept_definition
+  name: (identifier) @def.class.name) @def.class
+(requires_expression) @scope.sub
 
 (field_declaration
   declarator: (field_identifier) @def.var.name) @def.var

@@ -116,7 +116,7 @@
         ]
       },
       "status": "gold",
-      "note": "gr on OP_SCOPE is OP_SCOPE's own references only — a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
+      "note": "gr on OP_SCOPE is OP_SCOPE's own references only \u2014 a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
     },
     {
       "id": "cpp-sym-enum-variant-def-to-uses",
@@ -280,6 +280,25 @@
         ],
         "none": []
       }
+    },
+    {
+      "id": "cpp-template-struct-gr-from-def-cross-file",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_sep.h",
+      "line": 2,
+      "col": 33,
+      "expect": {
+        "all": [
+          "{\"col\":\"29\",\"file\":\"tmpl_sep.cpp\",\"line\":\"3\"}",
+          "{\"col\":\"33\",\"file\":\"tmpl_sep.h\",\"line\":\"3\"}",
+          "{\"col\":\"29\",\"file\":\"tmpl_sep.h\",\"line\":\"7\"}"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

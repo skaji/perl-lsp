@@ -264,6 +264,23 @@
         ],
         "none": []
       }
+    },
+    {
+      "id": "cpp-template-struct-gd-from-trailing-return-cross-file",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_sep.cpp",
+      "line": 2,
+      "col": 28,
+      "expect": {
+        "all": [
+          "tmpl_sep.h:3:33"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

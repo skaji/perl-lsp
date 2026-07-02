@@ -75,12 +75,117 @@
       "file": "brace_init.cpp",
       "expect": {
         "all": [
-          "{\"col\":\"15\",\"kind\":\"Variable\",\"line\":\"2\",\"name\":\"p\"}"
+          "\"kind\":\"Sub\",\"line\":\"1\",\"name\":\"main\""
         ],
         "none": [
-          "\"kind\":\"Class\",\"line\":\"2\",\"name\":\"p\""
+          "\"kind\":\"Class\",\"line\":\"2\",\"name\":\"p\"",
+          "\"kind\":\"Variable\",\"line\":\"2\",\"name\":\"p\""
         ]
       }
+    },
+    {
+      "id": "cpp-template-spec-per-spec-class-owned-members",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_spec.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"col\":\"44\",\"kind\":\"Class\",\"line\":\"2\",\"name\":\"formatter\"",
+          "\"kind\":\"Class\",\"line\":\"5\",\"name\":\"formatter<int, char>\"",
+          "\"name\":\"fmt_full\",\"package\":\"formatter<int, char>\"",
+          "\"kind\":\"Class\",\"line\":\"8\",\"name\":\"formatter<T*, char>\"",
+          "\"name\":\"fmt_partial\",\"package\":\"formatter<T*, char>\""
+        ],
+        "none": [
+          "\"name\":\"fmt_full\",\"package\":\"formatter\"}"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-explicit-instantiation-outline-no-param-leak",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_inst.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Class\",\"line\":\"6\",\"name\":\"Buf<int>\"",
+          "{\"col\":\"26\",\"kind\":\"Method\",\"line\":\"7\",\"name\":\"grow\",\"package\":\"Buf\"}",
+          "\"kind\":\"Sub\",\"line\":\"9\",\"name\":\"sep_impl\""
+        ],
+        "none": [
+          "\"name\":\"n2\"",
+          "\"name\":\"loc\"",
+          "\"name\":\"local_g\"",
+          "\"package\":\"Buf<T>\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-out-of-line-template-member-joins-base",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_inst.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "{\"col\":\"35\",\"kind\":\"Method\",\"line\":\"5\",\"name\":\"grow\",\"package\":\"Buf\"}"
+        ],
+        "none": [
+          "\"package\":\"Buf<T>\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-using-alias-symbols",
+      "difficulty": "simple",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_alias.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Class\",\"line\":\"1\",\"name\":\"byte_alias\"",
+          "\"kind\":\"Class\",\"line\":\"3\",\"name\":\"vec_alias\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "c-union-members-nest-under-container",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-unions",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "union_nest.c",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Variable\",\"line\":\"8\",\"name\":\"op_pmreplrootu\",\"package\":\"pmop2\"",
+          "\"container\":\"op_pmreplrootu\",\"kind\":\"Variable\",\"line\":\"6\",\"name\":\"op_pmreplroot\",\"package\":\"pmop2\"",
+          "\"container\":\"op_pmreplrootu\",\"kind\":\"Variable\",\"line\":\"7\",\"name\":\"op_pmtargetoff\",\"package\":\"pmop2\"",
+          "\"container\":\"(union)\",\"kind\":\"Variable\",\"line\":\"10\",\"name\":\"anon_a\",\"package\":\"pmop2\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

@@ -14,7 +14,10 @@
 (function_definition
   name: (identifier) @def.sub.name) @def.sub
 
-(function_definition) @scope
+; `@scope.sub`: params/locals are sub-body content — shielded from the
+; outline and the class-content lane (a method local carries the sticky
+; class package; the Sub boundary is what marks it a local, not a member).
+(function_definition) @scope.sub
 
 ; `self.attr = ...` → an instance attribute: a member of the enclosing
 ; class (the sticky @context.package tags it). THE dominant Python member

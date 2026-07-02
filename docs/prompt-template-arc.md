@@ -199,9 +199,11 @@ requests, not blockers):
 
 ## 3. Slice sequence
 
-**(a) Extraction hygiene through template shapes — CHEAP, no projection
-machinery.** Smaller than originally briefed (primaries already extract);
-what's left is the enumerated residue of the shape matrix:
+**(a) Extraction hygiene through template shapes — LANDED.** (per-spec
+Class identity + `EdgeKind::Specializes` family view, explicit-instantiation
+outline items, out-of-line qualifier join, `using`/concept symbols, pack
+sub-body ScopeKind, union member nesting + overlay hover.) The enumerated
+residue of the shape matrix, as implemented:
 
   - a1. **Explicit instantiation / `extern template`** → mint a
     *reference* to the primary template (it's a use, not a def) and stop

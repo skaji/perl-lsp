@@ -72,6 +72,11 @@ pub struct SkelSymbol {
     /// Pointer/reference declarator stack, unravelled by `peel_nested` from
     /// a `@nested.target` capture (empty otherwise). Flows to `Symbol.deref_stack`.
     pub deref_stack: Vec<crate::file_analysis::DerefStep>,
+    /// Structural markers carried onto `Symbol.attributes`: "anonymous" when
+    /// the name came from the pack's `default_name` (not addressable by name —
+    /// completion skips it), "union" for union containers (the hover-overlay /
+    /// outline-nesting key), stamped in `into_file_analysis` from the kind.
+    pub attributes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +112,11 @@ pub struct SkeletonAnalysis {
     pub witnesses: Vec<crate::witnesses::Witness>,
     /// (child class, parent class) inheritance edges — `@parent` captures.
     pub parents: Vec<(String, String)>,
+    /// (specialization, primary) family edges — a `@spec.primary` capture in
+    /// a class-def match whose name is a template spelling. Rides onto
+    /// `FileAnalysis.specializes`; the graph's `Specializes` edge derives from
+    /// it (member resolution never traverses it — a spec REPLACES wholesale).
+    pub specializations: Vec<(String, String)>,
     /// Variable reads (`@expr.read.var`): (name, scope, span). Each resolves
     /// to the nearest visible Variable declaration by lexical scope walk →
     /// local goto-def + hover. Resolution runs in `into_file_analysis`.
@@ -163,11 +173,23 @@ impl SkeletonAnalysis {
         };
         // A NAMED typedef `typedef struct N {...} N;` matches both the
         // struct_specifier and the type_definition → two `class N`. C
-        // can't have two types of one name, so keep the first.
+        // can't have two types of one name, so keep one. "class" and
+        // "union" are one type-kind family (a bodied named union matches
+        // both the generic class pattern and the union-tagged one); the
+        // union-tagged row wins so the "union" attribute survives.
         {
+            let union_names: std::collections::HashSet<String> = self
+                .symbols
+                .iter()
+                .filter(|s| s.kind == "union")
+                .map(|s| s.name.clone())
+                .collect();
             let mut seen = std::collections::HashSet::new();
-            self.symbols
-                .retain(|s| s.kind != "class" || seen.insert(s.name.clone()));
+            self.symbols.retain(|s| match s.kind.as_str() {
+                "class" => !union_names.contains(&s.name) && seen.insert(s.name.clone()),
+                "union" => seen.insert(s.name.clone()),
+                _ => true,
+            });
         }
         // A free function matches both the rettype-carrying and the rettype-free
         // `@def.sub` pattern (a type-less constructor/K&R def only the latter) —
@@ -226,9 +248,12 @@ impl SkeletonAnalysis {
                 name: s.name.clone(),
                 kind: match s.kind.as_str() {
                     "package" => SymKind::Package,
-                    "class" => SymKind::Class,
+                    // "union": a named union TYPE (its members are its own).
+                    "class" | "union" => SymKind::Class,
                     "sub" | "anon" | "constant" => SymKind::Sub,
                     "method" => SymKind::Method,
+                    // "unionfield" (an inline union member-field container)
+                    // lands here too — a field, outline-nesting its body.
                     _ => SymKind::Variable,
                 },
                 span: Span { start: s.start, end: s.end },
@@ -238,7 +263,16 @@ impl SkeletonAnalysis {
                 detail: SymbolDetail::None,
                 namespace: crate::file_analysis::Namespace::Language,
                 outline_label: None,
-                attributes: Vec::new(),
+                attributes: {
+                    let mut a = s.attributes.clone();
+                    // union containers carry the marker the hover-overlay /
+                    // outline-nesting consumers key on — a value-borne
+                    // property, never a name test.
+                    if matches!(s.kind.as_str(), "union" | "unionfield") {
+                        a.push("union".to_string());
+                    }
+                    a
+                },
                 deref_stack: s.deref_stack.clone(),
             })
             .collect();
@@ -627,6 +661,11 @@ impl SkeletonAnalysis {
         // outline filters can exclude them generically (lang semantics in
         // the pack, generic logic in core).
         fa.receiver_names = std::mem::take(&mut self.receiver_names);
+        // Specialization family edges (spec → primary). NOT package_parents:
+        // a spec inherits nothing from its primary (it replaces wholesale),
+        // so member resolution must never fall through this edge — only the
+        // graph's `Specializes` family view reads it.
+        fa.specializes = self.specializations.drain(..).collect();
         // Include/import path tokens carry a span so goto-def can resolve the
         // header (the bare `imports` list is span-less). Resolution to an
         // absolute path happens where the file path is in hand (the driver).
@@ -730,6 +769,11 @@ pub struct LangPack {
     /// `deref_stack` resolves by name to decide the expected operator. Also the
     /// cursor-completion "is this receiver a bare variable" test.
     pub simple_var_kinds: &'static [&'static str],
+    /// `@qualifier` node kinds whose `name` FIELD supplies the owner text —
+    /// the structural peel for a templated qualifier (`Buf<T>::grow` files
+    /// under class `Buf`, unifying the out-of-line def with the in-class
+    /// decl). Never string-splitting on `<`. Empty = qualifiers verbatim.
+    pub qualifier_peel: &'static [&'static str],
     /// Member-access node kinds (`field_expression` / `attribute`): a `recv.m`
     /// the cursor-completion path climbs to + types the receiver of. Empty =
     /// no member-access completion (Perl uses `cursor_context`).
@@ -805,6 +849,7 @@ pub fn perl_pack() -> LangPack {
         recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         op_map: &[],
         simple_var_kinds: &[],
+        qualifier_peel: &[],
         member_kinds: &[],
         skip_kinds: &[],
         call_kinds: &[],
@@ -855,6 +900,7 @@ pub fn python_pack() -> LangPack {
         // Python has one member operator (`.`), so no op-DX (op_map empty).
         op_map: &[],
         simple_var_kinds: &["identifier"],
+        qualifier_peel: &[],
         member_kinds: &["attribute"],
         skip_kinds: &["string", "string_content", "comment", "concatenated_string"],
         call_kinds: &["call"],
@@ -888,6 +934,7 @@ pub fn r_pack() -> LangPack {
         recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         op_map: &[],
         simple_var_kinds: &[],
+        qualifier_peel: &[],
         member_kinds: &[],
         skip_kinds: &[],
         call_kinds: &[],
@@ -934,6 +981,7 @@ pub fn cmake_pack() -> LangPack {
         recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
         op_map: &[],
         simple_var_kinds: &[],
+        qualifier_peel: &[],
         member_kinds: &[],
         skip_kinds: &[],
         call_kinds: &[],
@@ -943,8 +991,18 @@ pub fn cmake_pack() -> LangPack {
 pub fn cpp_pack() -> LangPack {
     LangPack {
         query_source: include_str!("../queries/cpp/skeleton.scm"),
-        shape_name: |_, raw| raw.to_string(),
-        default_name: |_| None,
+        // Template spellings get ONE canonical whitespace form so a
+        // specialization's identity (`formatter<int, char>`) matches
+        // however the source wrapped it. Identity for every non-template
+        // name (no whitespace, no comma → unchanged).
+        shape_name: |_, raw| canonical_template_spelling(raw),
+        // an anonymous inline union has no name token of its own; the
+        // synthetic container is outline structure, not an addressable
+        // member (the "anonymous" attribute keeps it out of completion).
+        default_name: |kind| match kind {
+            "unionfield" => Some("(union)"),
+            _ => None,
+        },
         // C++ declared types ARE the witness source. Primitives → the
         // value lattice; `auto`/`void` defer (None → edge carries);
         // anything else identifier-shaped is a class instance.
@@ -1044,6 +1102,8 @@ pub fn cpp_pack() -> LangPack {
             (".", crate::file_analysis::MemberOp::Dot),
         ],
         simple_var_kinds: &["identifier"],
+        // a templated qualifier (`Buf<T>::grow`) owns by its BASE class name
+        qualifier_peel: &["template_type"],
         member_kinds: &["field_expression"],
         skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
         call_kinds: &["call_expression"],
@@ -1218,13 +1278,24 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 });
                 continue;
             }
+            // `@qualifier` on a templated owner (`Buf<T>::grow`): the class
+            // the def joins is the BASE name — peel the `name` field where
+            // the node is live (structural, never a string split on `<`).
+            let text = if cap == "qualifier" && pack.qualifier_peel.contains(&node.kind()) {
+                node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or(node.utf8_text(source).unwrap_or(""))
+                    .to_string()
+            } else {
+                node.utf8_text(source).unwrap_or("").to_string()
+            };
             events.push(Event {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 start: node.start_position(),
                 end: node.end_position(),
                 cap: cap.to_string(),
-                text: node.utf8_text(source).unwrap_or("").to_string(),
+                text,
                 match_id: match_counter,
             });
         }
@@ -1238,7 +1309,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         a.start_byte
             .cmp(&b.start_byte)
             .then(b.end_byte.cmp(&a.end_byte))
-            .then((a.cap == "scope").cmp(&(b.cap == "scope")))
+            .then(a.cap.starts_with("scope").cmp(&b.cap.starts_with("scope")))
     });
 
     // ---- join def name-captures to their def event ----
@@ -1287,6 +1358,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // TypeName witnesses for).
     let mut macro_alias_name_by_match: HashMap<usize, String> = HashMap::new();
     let mut macro_alias_of_by_match: HashMap<usize, String> = HashMap::new();
+    // `@spec.primary` — the base name a class-spec def specializes; joined to
+    // its `@def.class` by match to mint the (spec, primary) family edge.
+    let mut spec_primary_by_match: HashMap<usize, String> = HashMap::new();
     // `@domain.value` — the operand a field slot is compared/assigned
     // against. Joined to its `@domain.slot` by match_id (the slot event
     // pushes the site); the value's own enum resolves cross-file later. Only
@@ -1314,6 +1388,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         }
         if e.cap == "macro.alias.of" {
             macro_alias_of_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "spec.primary" {
+            spec_primary_by_match.insert(e.match_id, e.text.clone());
         }
     }
     let mut annot_text_by_var: HashMap<(String, crate::file_analysis::ScopeId), String> =
@@ -1394,7 +1471,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // scope start; defer such contexts to the scope push.
     let mut scope_start_by_match: HashMap<usize, usize> = HashMap::new();
     for e in &events {
-        if e.cap == "scope" {
+        if e.cap.starts_with("scope") {
             scope_start_by_match.entry(e.match_id).or_insert(e.start_byte);
         }
     }
@@ -1429,12 +1506,22 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         let cur_scope = scope_stack.last().unwrap().1;
         let package: Option<String> = context_stack.last().map(|(_, p)| p.clone());
         match e.cap.as_str() {
-            "scope" => {
+            // `@scope` = a plain lexical Block; `@scope.sub` = sub-body
+            // content (function bodies, prototype signatures, explicit
+            // instantiations, requires-expressions) — the kind
+            // `scope_within_sub_body` reads to shield params/locals from the
+            // outline and the class-content lane. Pack subs carry no name on
+            // the scope (the Symbol holds identity).
+            "scope" | "scope.sub" => {
                 let id = ScopeId(out.scopes.len() as u32);
                 out.scopes.push(Scope {
                     id,
                     parent: Some(cur_scope),
-                    kind: ScopeKind::Block,
+                    kind: if e.cap == "scope.sub" {
+                        ScopeKind::Sub { name: String::new() }
+                    } else {
+                        ScopeKind::Block
+                    },
                     span: Span { start: e.start, end: e.end },
                     package: package.clone(),
                 });
@@ -1522,11 +1609,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 }
             }
             cap if cap.starts_with("context.") => {
+                // Shape the context like a def name (cpp canonicalizes a
+                // spec's template spelling) so members' `package` matches
+                // the container Symbol's identity exactly.
+                let text = (pack.shape_name)(&e.cap, &e.text);
                 // If this match's `@scope` starts AFTER this context, the
                 // context belongs to that (not-yet-pushed) body — defer it
                 // so it registers at the body depth and pops with the block.
                 if scope_start_by_match.get(&e.match_id).is_some_and(|&s| s > e.start_byte) {
-                    pending_context.insert(e.match_id, e.text.clone());
+                    pending_context.insert(e.match_id, text);
                 } else {
                     // Replace any context at the same depth; deeper ones
                     // were already popped with their scopes.
@@ -1545,18 +1636,24 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 if let Some((child, _, _)) =
                     names_by_match.get(&(e.match_id, "def.class".to_string()))
                 {
-                    out.parents.push((child.clone(), e.text.clone()));
+                    // Shaped like the child's def name (cpp canonicalizes a
+                    // template-spelled base) so the edge joins the identity
+                    // the target class was filed under.
+                    out.parents
+                        .push((child.clone(), (pack.shape_name)("parent", &e.text)));
                 }
             }
             cap if cap.starts_with("def.") && !cap.ends_with(".name") => {
                 let kind = cap.strip_prefix("def.").unwrap().to_string();
-                let (name, name_start, name_end) = names_by_match
+                let (name, name_start, name_end, defaulted) = names_by_match
                     .get(&(e.match_id, e.cap.clone()))
                     .cloned()
+                    .map(|(n, s, en)| (n, s, en, false))
                     .or_else(|| {
-                        (pack.default_name)(&kind).map(|n| (n.to_string(), e.start, e.start))
+                        (pack.default_name)(&kind)
+                            .map(|n| (n.to_string(), e.start, e.start, true))
                     })
-                    .unwrap_or((e.text.clone(), e.start, e.end));
+                    .unwrap_or((e.text.clone(), e.start, e.end, false));
                 def_name_spans.push((e.start_byte, e.end_byte));
                 // An out-of-line def's `Class::` qualifier names its owner
                 // (the LAST `::` segment, the unqualified class the engine
@@ -1565,8 +1662,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     .get(&e.match_id)
                     .map(|q| q.rsplit("::").next().unwrap_or(q).to_string())
                     .or_else(|| package.clone());
+                let shaped = (pack.shape_name)(&format!("def.{kind}"), &name);
+                // A class-spec def carries its primary's name — the
+                // (spec, primary) family edge `Specializes` derives from.
+                if let Some(primary) = spec_primary_by_match.get(&e.match_id) {
+                    out.specializations
+                        .push((shaped.clone(), (pack.shape_name)("spec.primary", primary)));
+                }
                 out.symbols.push(SkelSymbol {
-                    name: (pack.shape_name)(&format!("def.{kind}"), &name),
+                    name: shaped,
                     kind,
                     start: e.start,
                     end: e.end,
@@ -1579,6 +1683,13 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         .get(&e.match_id)
                         .and_then(|t| (pack.annot_type)(t)),
                     deref_stack: nested_stacks.get(&e.match_id).cloned().unwrap_or_default(),
+                    // a default-named symbol is structure, not an
+                    // addressable name — completion skips it.
+                    attributes: if defaulted {
+                        vec!["anonymous".to_string()]
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
             "ref.label" => {
@@ -1917,6 +2028,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                             scope: *scope,
                             return_type: None,
                             deref_stack: Vec::new(),
+                            attributes: Vec::new(),
                         });
                     }
                 }
@@ -2130,6 +2242,46 @@ pub(crate) fn type_alias_payload(
         Some(t) => WitnessPayload::InferredType(t),
         None => WitnessPayload::InferredType(InferredType::ClassName(underlying.to_string())),
     }
+}
+
+/// The ONE whitespace-canonical form for a C++ template spelling — the
+/// identity key a specialization/instantiation is filed under
+/// (`formatter<int, char>`), however the source spaced or wrapped it. Rules:
+/// every whitespace RUN collapses; a space survives only between two word
+/// characters (`[A-Za-z0-9_]`), where it is lexically load-bearing
+/// (`unsigned long`); a comma is followed by exactly one space when more
+/// text follows. Ordinary identifiers (no whitespace, no comma) pass
+/// through unchanged.
+pub fn canonical_template_spelling(raw: &str) -> String {
+    if !raw.contains(|c: char| c.is_whitespace() || c == ',') {
+        return raw.to_string();
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            let prev_word = out.chars().next_back().is_some_and(is_word);
+            let next_word = chars.peek().copied().is_some_and(is_word);
+            if prev_word && next_word {
+                out.push(' ');
+            }
+        } else if c == ',' {
+            out.push(',');
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            if chars.peek().is_some() {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Is `body` a bare TYPE spelling (a macro that aliases a type), rather than a

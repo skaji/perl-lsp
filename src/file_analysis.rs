@@ -289,6 +289,13 @@ pub trait CrossFileLookup {
     /// — the `children_index` inverse, depth 1 (the graph walker
     /// supplies transitivity).
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)>;
+    /// Template specializations of `primary` as (spec, module) pairs — the
+    /// cross-file half of the graph's `Specializes` family edge (the local
+    /// half reads `FileAnalysis.specializes`). Default: none (the Perl hub
+    /// and language-less impls have no specialization index).
+    fn direct_specializations_of(&self, _primary: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
     /// Registration-time loader-config shapes: every (load_name, shape)
     /// projected from `PluginLoad` facts across the workspace —
     /// INCLUDING packageless entrypoint scripts, which never enter the
@@ -400,6 +407,9 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     }
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
         self.inner.direct_children_of(class)
+    }
+    fn direct_specializations_of(&self, primary: &str) -> Vec<(String, String)> {
+        self.inner.direct_specializations_of(primary)
     }
     fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &InferredType)) {
         self.inner.for_each_loader_shape(f)
@@ -2641,6 +2651,14 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub receiver_names: Vec<String>,
 
+    /// Template-specialization family edges: canonical spec spelling
+    /// (`formatter<int, char>`) → primary base name (`formatter`). NOT an
+    /// inheritance edge — a spec REPLACES the primary wholesale (its member
+    /// table is its own), so member resolution never falls through it; only
+    /// the graph's `Specializes` family view (goto-implementation) traverses.
+    #[serde(default)]
+    pub specializes: HashMap<String, String>,
+
     /// Parent classes for each package in this file.
     /// Populated by the builder from use parent/base, @ISA, and class :isa.
     pub package_parents: HashMap<String, Vec<String>>,
@@ -3128,6 +3146,7 @@ impl FileAnalysis {
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
             receiver_names: Vec::new(),
+            specializes: HashMap::new(),
             scopes,
             symbols,
             refs,
@@ -5000,8 +5019,18 @@ impl FileAnalysis {
         for sym in &self.symbols {
             if matches!(sym.kind, SymKind::Variable | SymKind::Field)
                 && self.symbol_in_class(sym.id, cls)
-                && class_body.is_none_or(|cb| sym.scope == cb)
+                // the class body itself, or a nested container body inside it
+                // (an inline union's members complete flat on the struct) —
+                // but never a method body (its locals carry the sticky class
+                // package too; the Sub boundary is what marks them locals).
+                && class_body.is_none_or(|cb| {
+                    self.scope_chain(sym.scope).contains(&cb)
+                        && !self.scope_within_sub_body(sym.scope)
+                })
                 && !self.receiver_names.contains(&sym.name)
+                // an anonymous container (`(union)`) is structure, not an
+                // addressable member
+                && !sym.attributes.iter().any(|a| a == "anonymous")
                 && seen.insert(sym.name.clone())
             {
                 candidates.push(CompletionCandidate {
@@ -5033,12 +5062,11 @@ impl FileAnalysis {
         self.collect_ancestor_methods(
             class_name, class_name, module_index, &mut candidates, &mut seen, 0,
         );
-        // Data members from this class AND its ancestors. A field lives
-        // DIRECTLY in its class body scope; a Variable in a deeper (method)
-        // scope is a local/param (Python's `self`), not a field. Pack
-        // scopes are all `Block` (scope_within_sub_body can't tell them
-        // apart), so anchor on where each class's methods are declared —
-        // that IS the body scope, whichever node carries it.
+        // Data members from this class AND its ancestors. A field lives in
+        // its class body scope (or a nested container body — inline unions);
+        // a Variable inside a Sub-kind scope is a local/param. Anchored on
+        // where each class's methods are declared — that IS the body scope,
+        // whichever node carries it.
         self.for_each_ancestor_class(class_name, module_index, |cls| {
             self.collect_class_fields(cls, &mut candidates, &mut seen);
             // a class defined in ANOTHER file — pull its fields from the
@@ -5071,11 +5099,20 @@ impl FileAnalysis {
         field: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
-        let render = |analysis: &FileAnalysis, sym: &Symbol| match analysis
-            .inferred_type_via_bag_ctx(field, sym.span.end, module_index)
-        {
-            Some(ty) => format!("{}: {}", field, sym.display_type(&ty)),
-            None => field.to_string(),
+        let render = |analysis: &FileAnalysis, sym: &Symbol| {
+            let base = match analysis.inferred_type_via_bag_ctx(field, sym.span.end, module_index)
+            {
+                Some(ty) => format!("{}: {}", field, sym.display_type(&ty)),
+                None => field.to_string(),
+            };
+            // A union member shares storage with its siblings — surface the
+            // overlay so the reader sees what else lives in those bytes.
+            match analysis.union_overlay(sym) {
+                Some(sibs) if !sibs.is_empty() => {
+                    format!("{} — union member (overlays {})", base, sibs.join(", "))
+                }
+                _ => base,
+            }
         };
         match self.resolve_method_in_ancestors(class, field, module_index)? {
             MethodResolution::Local { sym_id, .. } => Some(render(self, self.symbol(sym_id))),
@@ -5089,6 +5126,48 @@ impl FileAnalysis {
                 Some(render(&cached.analysis, sym))
             }
         }
+    }
+
+    /// The union container symbol whose body scope declares `sym`, if any —
+    /// the symbol carrying the "union" attribute (a named union type, a named
+    /// field-union, or a synthetic `(union)` container) whose span holds the
+    /// member's declaring scope. Value-borne identification: the attribute is
+    /// stamped at extraction; no name/shape test here.
+    pub fn union_container_of(&self, sym: &Symbol) -> Option<&Symbol> {
+        let sc = self.scope(sym.scope);
+        let contains = |o: &Span, i: &Span| {
+            (o.start.row, o.start.column) <= (i.start.row, i.start.column)
+                && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
+        };
+        self.symbols.iter().find(|c| {
+            c.id != sym.id
+                && c.attributes.iter().any(|a| a == "union")
+                && Some(c.scope) == sc.parent
+                && contains(&c.span, &sc.span)
+        })
+    }
+
+    /// The other members overlaying `sym`'s storage — Variables sharing its
+    /// union body scope, rendered `name: type` (bare name when untyped).
+    /// `None` when `sym` isn't a union member.
+    pub fn union_overlay(&self, sym: &Symbol) -> Option<Vec<String>> {
+        self.union_container_of(sym)?;
+        Some(
+            self.symbols
+                .iter()
+                .filter(|s| {
+                    s.id != sym.id
+                        && s.scope == sym.scope
+                        && matches!(s.kind, SymKind::Variable | SymKind::Field)
+                })
+                .map(|s| {
+                    match self.inferred_type_via_bag(&s.name, s.span.end) {
+                        Some(ty) => format!("{}: {}", s.name, s.display_type(&ty)),
+                        None => s.name.clone(),
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// The declared type of data field `field` on `class` (or an ancestor) —
@@ -8854,13 +8933,25 @@ impl FileAnalysis {
         if contains(&sc.span, &class_span) {
             return true;
         }
-        // Direct member: the declaring scope is the class's own body — its
-        // parent sits outside the class span (a local's parent, the class
-        // body, sits inside).
-        match sc.parent {
-            None => true,
-            Some(p) => !contains(&class_span, &self.scope(p).span),
+        // Member vs method-body local: walk the chain outward. Exiting the
+        // class span first = class content (the class body, or a nested
+        // container body — an inline union's members are still the class's);
+        // crossing a Sub/Method scope first = a local inside a method (the
+        // sticky class package tags those too, so the package alone would
+        // over-claim). A chain that ends inside (parentless synthetic
+        // scopes) was already handled by the role-member check above.
+        let mut cur = Some(sym.scope);
+        while let Some(id) = cur {
+            let s = self.scope(id);
+            if !contains(&class_span, &s.span) {
+                return true;
+            }
+            if matches!(s.kind, ScopeKind::Sub { .. } | ScopeKind::Method { .. }) {
+                return false;
+            }
+            cur = s.parent;
         }
+        true
     }
 
     /// Is `sym` a file-scope value a bare name reaches from anywhere — a C
@@ -9183,18 +9274,30 @@ impl FileAnalysis {
                 SymKind::Module => continue,
                 SymKind::Variable => {
                     if self.scope_within_sub_body(sym.scope) { continue; }
-                    let detail = match &sym.detail {
-                        SymbolDetail::Variable { decl_kind, .. } => match decl_kind {
-                            DeclKind::My => "my",
-                            DeclKind::Our => "our",
-                            DeclKind::State => "state",
-                            DeclKind::Field => "field",
-                            DeclKind::Param => "param",
-                            DeclKind::ForVar => "for",
-                        },
-                        _ => "my",
-                    };
-                    (sym.name.clone(), Some(detail.to_string()), Vec::new())
+                    // A union CONTAINER (named field-union / synthetic
+                    // `(union)`) nests its members: the body scope inside its
+                    // span holds them. Attribute-gated — plain variables
+                    // never own nested outline structure.
+                    if sym.attributes.iter().any(|a| a == "union") {
+                        let children = self
+                            .find_body_scope(sym)
+                            .map(|s| self.outline_children_of(s))
+                            .unwrap_or_default();
+                        (sym.name.clone(), Some("union".to_string()), children)
+                    } else {
+                        let detail = match &sym.detail {
+                            SymbolDetail::Variable { decl_kind, .. } => match decl_kind {
+                                DeclKind::My => "my",
+                                DeclKind::Our => "our",
+                                DeclKind::State => "state",
+                                DeclKind::Field => "field",
+                                DeclKind::Param => "param",
+                                DeclKind::ForVar => "for",
+                            },
+                            _ => "my",
+                        };
+                        (sym.name.clone(), Some(detail.to_string()), Vec::new())
+                    }
                 }
                 SymKind::Field => {
                     (sym.name.clone(), Some("field".to_string()), Vec::new())
@@ -9275,8 +9378,11 @@ impl FileAnalysis {
         // above can't find them. A container's body is the Block scope
         // directly inside its span whose parent is the container's own
         // scope. Gated on `Block` so Perl's named containers (which take
-        // the exact arm) are untouched.
-        if matches!(sym.kind, SymKind::Package | SymKind::Class) {
+        // the exact arm) are untouched. Union-attributed Variables (inline
+        // field-union containers) own a body the same way.
+        if matches!(sym.kind, SymKind::Package | SymKind::Class)
+            || sym.attributes.iter().any(|a| a == "union")
+        {
             let start = (sym.span.start.row, sym.span.start.column);
             let end = (sym.span.end.row, sym.span.end.column);
             return self.scopes.iter().find(|s| {

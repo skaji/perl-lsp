@@ -118,6 +118,10 @@ pub struct ModuleEdgeIndexes {
     names: DashMap<String, Vec<String>>,
     bridges: DashMap<String, Vec<String>>,
     children: DashMap<String, Vec<String>>,
+    /// primary template → modules declaring a specialization of it (inverse
+    /// `FileAnalysis.specializes`). The `Specializes` family edge's
+    /// cross-file half; member resolution never reads it.
+    specs: DashMap<String, Vec<String>>,
 }
 
 impl ModuleEdgeIndexes {
@@ -126,6 +130,7 @@ impl ModuleEdgeIndexes {
             names: DashMap::new(),
             bridges: DashMap::new(),
             children: DashMap::new(),
+            specs: DashMap::new(),
         }
     }
 
@@ -151,13 +156,19 @@ impl ModuleEdgeIndexes {
                 .or_default()
                 .push(module_name.to_string());
         }
+        for primary in Self::spec_primaries(analysis) {
+            self.specs
+                .entry(primary)
+                .or_default()
+                .push(module_name.to_string());
+        }
     }
 
     /// Remove `module_name` from every bucket of every map. Runs
     /// before re-registration so stale edges from a prior version of
     /// the same module don't accumulate (phantom-module lookups).
     pub fn purge_module(&self, module_name: &str) {
-        for map in [&self.names, &self.bridges, &self.children] {
+        for map in [&self.names, &self.bridges, &self.children, &self.specs] {
             map.retain(|_key, mods| {
                 mods.retain(|m| m != module_name);
                 !mods.is_empty()
@@ -169,6 +180,7 @@ impl ModuleEdgeIndexes {
         self.names.clear();
         self.bridges.clear();
         self.children.clear();
+        self.specs.clear();
     }
 
     /// Every name `find_exporters` might need to locate a module by:
@@ -198,6 +210,16 @@ impl ModuleEdgeIndexes {
             for crate::file_analysis::Bridge::Class(c) in &ns.bridges {
                 seen.insert(c.clone());
             }
+        }
+        seen.into_iter().collect()
+    }
+
+    /// Every primary a specialization in the analysis names — the values of
+    /// `specializes`, deduped.
+    fn spec_primaries(analysis: &FileAnalysis) -> Vec<String> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for primary in analysis.specializes.values() {
+            seen.insert(primary.clone());
         }
         seen.into_iter().collect()
     }
@@ -911,6 +933,18 @@ impl ModuleIndex {
                 }
             }
         }
+        // Specialization family edges: primary → spec NAMES. A spec's Class
+        // symbol registered above makes `get_cached(spec_name)` resolve, so
+        // the reverse map's values are the same by-name keys the rest of the
+        // pack index uses. A stale entry (edited file dropped a spec)
+        // self-heals at read: `direct_specializations_of` re-checks the pair
+        // against the CURRENT analysis.
+        for (spec, primary) in &analysis.specializes {
+            let mut v = self.edges.specs.entry(primary.clone()).or_default();
+            if !v.iter().any(|m| m == spec) {
+                v.push(spec.clone());
+            }
+        }
     }
 
     /// Remove a pack file's registrations: its `all_files` entry, its
@@ -1276,6 +1310,27 @@ impl CrossFileLookup for ModuleIndex {
             for (pkg, parents) in &cached.analysis.package_parents {
                 if parents.iter().any(|p| p == class) {
                     out.push((pkg.clone(), module.clone()));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn direct_specializations_of(&self, primary: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let modules: Vec<String> = self
+            .edges
+            .specs
+            .get(primary)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        for module in modules {
+            let Some(cached) = self.get_cached(&module) else { continue };
+            for (spec, prim) in &cached.analysis.specializes {
+                if prim == primary {
+                    out.push((spec.clone(), module.clone()));
                 }
             }
         }

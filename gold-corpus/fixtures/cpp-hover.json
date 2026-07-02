@@ -315,6 +315,23 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "c-union-member-hover-shows-overlay",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-unions",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "union_nest.c",
+      "line": 6,
+      "col": 17,
+      "expect": {
+        "all": [
+          "op_pmreplroot: OPX* \u2014 union member (overlays op_pmtargetoff)"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }
