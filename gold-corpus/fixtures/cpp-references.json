@@ -75,7 +75,7 @@
       "status": "gold"
     },
     {
-      "id": "cpp-references-domain-typing-enum-surfaces-field-sites",
+      "id": "cpp-references-enum-type-stays-plain-refs-no-domain-fanout",
       "difficulty": "hard",
       "semantic_area": "cpp-multilang-domain",
       "lang": "cpp",
@@ -85,13 +85,38 @@
       "col": 5,
       "expect": {
         "all": [
+          "\"file\":\"domain_enum.c\",\"line\":\"4\""
+        ],
+        "none": [
           "\"file\":\"domain_enum.c\",\"line\":\"7\"",
           "\"file\":\"domain_enum.c\",\"line\":\"10\"",
           "\"file\":\"domain_enum.c\",\"line\":\"11\""
-        ],
-        "none": []
+        ]
       },
-      "status": "gold"
+      "status": "gold",
+      "note": "plain gr on the enum TYPE is references to the type; the field-site fan-out is the goto-implementation projection (see cpp-implementations-domain-enum-type-fans-to-field-sites)."
+    },
+    {
+      "id": "cpp-references-enum-variant-stays-variant-grain",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 3,
+      "col": 33,
+      "expect": {
+        "all": [
+          "\"col\":\"34\",\"file\":\"domain_enum.c\",\"line\":\"4\"",
+          "\"col\":\"23\",\"file\":\"domain_enum.c\",\"line\":\"10\""
+        ],
+        "none": [
+          "\"file\":\"domain_enum.c\",\"line\":\"7\"",
+          "\"file\":\"domain_enum.c\",\"line\":\"11\""
+        ]
+      },
+      "status": "gold",
+      "note": "gr on OP_SCOPE is OP_SCOPE's own references only — a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
     },
     {
       "id": "cpp-sym-enum-variant-def-to-uses",

@@ -315,7 +315,11 @@ fn same_second_same_size_rewrite_invalidates_row() {
         // Same byte length, different content.
         std::fs::write(&pm, "package SubSecond;\nsub b { 2 }\n1;\n").unwrap();
         let s2 = std::fs::metadata(&pm).unwrap().modified().unwrap();
-        if secs(s1) == secs(s2) {
+        // Require DIFFERENT nanos within the SAME second: that's the window
+        // the nanosecond stamp fixed. Two writes inside one clock tick get
+        // identical mtimes — the stamp's residual one-tick blind spot, not
+        // the regression under test — so retry those instead of asserting.
+        if secs(s1) == secs(s2) && s1 != s2 {
             let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
             let (n, _) = warm_cache(&conn, &cache);
             assert_eq!(n, 0, "same-second same-size rewrite must invalidate the row");

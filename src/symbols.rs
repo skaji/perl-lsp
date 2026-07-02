@@ -177,33 +177,29 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
-/// Reverse domain bridge: given the cursor is on an enum (its def) or one of
-/// its enumerators, the field-slot sites across the project whose recovered
-/// domain is that enum — the backward half of the gd/gr symmetry (a find-refs
-/// on `enum opcode` surfaces the `op_type` uses). Scans the cached modules'
-/// stored `domain_sites` (a targeted lookup keyed on the enum, not a witness
-/// sweep). `(path, slot_span)` per site.
+/// Reverse domain bridge, **enum-TYPE grain only**: given the cursor is on an
+/// enum's own def, the field-slot sites across the project whose recovered
+/// domain is that enum (`enum opcode` → the `op_type` uses). Scans the cached
+/// modules' stored `domain_sites` (a targeted lookup keyed on the enum, not a
+/// witness sweep). `(path, slot_span)` per site.
+///
+/// Deliberately NOT reachable from an enumerator (def or use): a variant's
+/// relation to the field is "member of the domain enum", not a reference —
+/// traversing the bridge from `OP_SCOPE` fanned its ~56 real references out
+/// to every one of the field's ~950 sites. The fan-out is an
+/// implementations-style projection on the TYPE, so it is served by the
+/// goto-implementation handlers, never mixed into plain references.
 pub fn domain_backrefs(
     analysis: &FileAnalysis,
     point: Point,
     module_index: &dyn CrossFileLookup,
 ) -> Vec<(std::path::PathBuf, crate::file_analysis::Span)> {
     use crate::file_analysis::SymKind;
-    let target = analysis
-        .symbol_at(point)
-        .and_then(|sym| match sym.kind {
-            // The enum def itself.
-            SymKind::Class => Some(sym.name.clone()),
-            // An enumerator def carries its enum as its package.
-            SymKind::Variable | SymKind::Field => sym.package.clone(),
-            _ => None,
-        })
-        .or_else(|| {
-            // A USE of an enumerator (resolves cross-file to its enum).
-            analysis.ref_at(point).and_then(|r| {
-                analysis.resolve_enumerator_enum(r.unqualified_target_name(), Some(module_index))
-            })
-        });
+    let target = analysis.symbol_at(point).and_then(|sym| match sym.kind {
+        // The enum def itself.
+        SymKind::Class => Some(sym.name.clone()),
+        _ => None,
+    });
     let Some(enum_name) = target else { return Vec::new() };
     let mut out: Vec<(std::path::PathBuf, crate::file_analysis::Span)> = Vec::new();
     module_index.for_each_cached_file(&mut |cached| {
@@ -297,26 +293,30 @@ pub fn find_definition(
     // DOMAIN enum's def IN ADDITION to the field decl (`op_type` → both its
     // `PERL_BITFIELD16 op_type` decl AND `enum opcode`). The field decl stays
     // FIRST (the primary); the enum is an extra offer. Runs before the local /
-    // member resolution below so it augments a same-file field too.
+    // member resolution below so it augments a same-file field too. When the
+    // field decl does NOT resolve here, the enum must not mask the shared
+    // member/cross-file paths below (that made goto-def site-dependent) —
+    // it becomes the LAST-resort fallback instead, returned only when every
+    // decl-resolving path has passed.
+    let mut domain_enum_fallback: Option<Location> = None;
     if let Some(r) = analysis.ref_at(point) {
         if matches!(r.kind, RefKind::MethodCall { .. }) {
             if let Some(cn) = analysis.method_call_invocant_class(r, Some(module_index)) {
                 let field = r.unqualified_target_name();
                 if let Some(dom) = analysis.field_domain(&cn, field, Some(module_index)) {
-                    let mut locs: Vec<Location> = Vec::new();
+                    let el = type_def_location(analysis, &dom.domain, uri, module_index);
                     if let Some(fl) =
                         member_field_def_location(analysis, &cn, field, uri, module_index)
                     {
-                        locs.push(fl);
-                    }
-                    if let Some(el) = type_def_location(analysis, &dom.domain, uri, module_index) {
-                        if !locs.contains(&el) {
-                            locs.push(el);
+                        let mut locs: Vec<Location> = vec![fl];
+                        if let Some(el) = el {
+                            if !locs.contains(&el) {
+                                locs.push(el);
+                            }
                         }
-                    }
-                    if !locs.is_empty() {
                         return Some(GotoDefinitionResponse::Array(locs));
                     }
+                    domain_enum_fallback = el;
                 }
             }
         }
@@ -622,6 +622,12 @@ pub fn find_definition(
                 }
             }
         }
+    }
+    // The domain bridge's enum offer, only when no path resolved the decl —
+    // better than nothing at a site whose member resolution is broken, and
+    // never masking a resolvable decl.
+    if let Some(el) = domain_enum_fallback {
+        return Some(GotoDefinitionResponse::Scalar(el));
     }
     None
 }

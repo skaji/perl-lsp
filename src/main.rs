@@ -1155,16 +1155,9 @@ fn run_one(
                 base_idx, &closure, Some(file_path.as_path()));
             let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
             let resolved = resolve::resolve_symbol_scoped(&analysis, point, Some(xidx), override_scope_from_env());
-            // Reverse domain bridge: a find-refs on an enum (or an enumerator)
-            // surfaces the field-slot sites whose domain is that enum. Uses the
-            // pack index (op_type sites live in pack-language files).
-            if let Some(pidx) = pack.as_deref() {
-                for (path, span) in symbols::domain_backrefs(&analysis, point, pidx) {
-                    let ps = path.display().to_string();
-                    let (line, col) = sources.display(&ps, span.start.row, span.start.column);
-                    results.push(serde_json::json!({"file": ps, "line": line, "col": col}));
-                }
-            }
+            // (The reverse domain bridge — enum type → field-slot sites — is
+            // an implementations projection, NOT part of plain references;
+            // see `symbols::domain_backrefs`.)
             match resolved {
                 Some(resolve::ResolvedTarget::Local) | None => {
                     let path_str = file_path.display().to_string();
@@ -1215,6 +1208,25 @@ fn run_one(
             analysis.enrich_imported_types_with_keys(Some(idx));
             let mut sources = SourceCache::new();
             let mut results = Vec::new();
+            // Reverse domain bridge (mirrors the LSP goto_implementation):
+            // an enum TYPE's def fans out to the field-slot sites whose
+            // recovered domain is that enum. Pack routing — the sites live
+            // in pack-language files the Perl hub doesn't know.
+            {
+                let reg = language_driver::LanguageRegistry::with_enabled();
+                let pack = reg
+                    .for_path(std::path::Path::new(file))
+                    .map(|d| d.id())
+                    .filter(|id| *id != "perl")
+                    .and_then(|lang| idx.pack_index(lang));
+                if let Some(pidx) = pack.as_deref() {
+                    for (path, span) in symbols::domain_backrefs(&analysis, point, pidx) {
+                        let ps = path.display().to_string();
+                        let (line, col) = sources.display(&ps, span.start.row, span.start.column);
+                        results.push(serde_json::json!({"file": ps, "line": line, "col": col}));
+                    }
+                }
+            }
             if let Some(resolve::ResolvedTarget::Target(t)) =
                 resolve::resolve_symbol(&analysis, point, Some(idx))
             {

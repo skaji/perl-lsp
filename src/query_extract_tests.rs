@@ -1678,7 +1678,31 @@ void b(struct op* o) { if (o->op_type == 1) { } }
 void c(struct op* o) { if (o->op_type == OP_CONST) { } }
 ";
     let fa = cpp_skel(src).into_file_analysis();
-    // The `== 0` / `== 1` operands are number literals, not enumerators, so
-    // only one site resolves to an enum — below the majority.
+    // ALL three interactions are sites — the `== 0` / `== 1` number-literal
+    // operands are counter-evidence (value capture is ungated), so the one
+    // enum site is 1/3: below the strict majority over the honest total.
+    assert_eq!(fa.domain_sites.len(), 3, "sites: {:?}", fa.domain_sites);
     assert_eq!(fa.field_domain_for_owner("op", "op_type", None), None);
+}
+
+#[test]
+fn cpp_domain_typing_owner_gates_same_named_fields() {
+    // Two structs each declare an `int kind`; only basket's is used against
+    // the enum. The vote is owner-gated at gather time — crate's kind must
+    // not inherit basket's domain through the shared slot NAME.
+    let src = "\
+enum fruit { APPLE, BANANA, CHERRY };
+struct basket { int kind; };
+struct crate { int kind; };
+int a(struct basket* b) { return b->kind == APPLE; }
+int b2(struct basket* b) { return b->kind == BANANA; }
+int c(struct crate* c) { return c->kind == 3; }
+int d(struct crate* c) { return c->kind == 7; }
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    assert_eq!(
+        fa.field_domain("basket", "kind", None).map(|d| d.domain),
+        Some("fruit".to_string()),
+    );
+    assert_eq!(fa.field_domain("crate", "kind", None), None, "no cross-struct pooling");
 }

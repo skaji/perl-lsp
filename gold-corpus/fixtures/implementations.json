@@ -2,6 +2,26 @@
   "capability": "implementations",
   "rows": [
     {
+      "id": "cpp-implementations-domain-enum-type-fans-to-field-sites",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 3,
+      "col": 5,
+      "expect": {
+        "all": [
+          "\"file\":\"domain_enum.c\",\"line\":\"7\"",
+          "\"file\":\"domain_enum.c\",\"line\":\"10\"",
+          "\"file\":\"domain_enum.c\",\"line\":\"11\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "the domain edge's fan-out (enum type → every field-slot site whose recovered domain is the enum) is a goto-implementation projection, kept OUT of plain references."
+    },
+    {
       "id": "role-requires-impl-from-atom",
       "difficulty": "tricky",
       "semantic_area": "roles",

@@ -257,6 +257,64 @@
           "struct Widget {"
         ]
       }
+    },
+    {
+      "id": "cpp-hover-domain-mixed-slot-stays-storage",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_mixed.c",
+      "line": 3,
+      "col": 11,
+      "expect": {
+        "all": [
+          "tag: Numeric",
+          "*field*"
+        ],
+        "none": [
+          "opcode2"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hover-domain-owner-separation-enum-side",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 3,
+      "col": 38,
+      "expect": {
+        "all": [
+          "kind: fruit",
+          "*field*"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hover-domain-owner-separation-int-side",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 6,
+      "col": 37,
+      "expect": {
+        "all": [
+          "kind: Numeric",
+          "*field*"
+        ],
+        "none": [
+          "fruit"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

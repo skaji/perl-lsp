@@ -1214,15 +1214,31 @@ impl LanguageServer for Backend {
         let self_path = uri.to_file_path().ok();
         let scoped = crate::file_analysis::ScopedLookup::new(
             base_idx, &doc.analysis.include_closure, self_path.as_deref());
+        // Reverse domain bridge: goto-implementation on an enum TYPE's def
+        // fans out to the field-slot sites whose recovered domain is that
+        // enum — the implementations-style projection of the domain edge
+        // (deliberately not part of plain references; see
+        // `symbols::domain_backrefs`).
+        let mut extra: Vec<Location> = Vec::new();
+        if let Some(pidx) = pack.as_deref() {
+            for (path, span) in symbols::domain_backrefs(&doc.analysis, point, pidx) {
+                if let Ok(u) = Url::from_file_path(&path) {
+                    extra.push(Location { uri: u, range: symbols::span_to_range(span) });
+                }
+            }
+        }
         let target = match resolve_symbol(&doc.analysis, point, Some(&scoped)) {
             Some(ResolvedTarget::Target(t)) => t,
             // Groups (field projections) and lexicals have no
             // descendant-implementation semantics.
-            _ => return Ok(None),
+            _ => {
+                drop(doc);
+                return Ok((!extra.is_empty()).then_some(GotoDefinitionResponse::Array(extra)));
+            }
         };
         let results = implementations_of(&doc.analysis, Some(&scoped), &target);
         drop(doc);
-        Ok(refs_to_locations(results).map(GotoDefinitionResponse::Array))
+        Ok(merge_locations(extra, refs_to_locations(results)).map(GotoDefinitionResponse::Array))
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -1265,16 +1281,9 @@ impl LanguageServer for Backend {
                 return Ok((!locs.is_empty()).then_some(locs));
             }
         }
-        // Reverse domain bridge: find-refs on an enum (or enumerator)
-        // surfaces the field-slot sites whose recovered domain is that enum.
-        let mut extra: Vec<Location> = Vec::new();
-        if let Some(pidx) = pack.as_deref() {
-            for (path, span) in symbols::domain_backrefs(&doc.analysis, point, pidx) {
-                if let Ok(u) = Url::from_file_path(&path) {
-                    extra.push(Location { uri: u, range: symbols::span_to_range(span) });
-                }
-            }
-        }
+        // (The reverse domain bridge — enum type → field-slot sites — is a
+        // goto-implementation projection, NOT part of plain references; see
+        // `symbols::domain_backrefs`.)
         // Resolve names against THIS file's include closure (transparent for
         // Perl: empty closure = the plain index).
         let scoped = crate::file_analysis::ScopedLookup::new(
@@ -1293,12 +1302,12 @@ impl LanguageServer for Backend {
                     &members,
                     None,
                 );
-                return Ok(merge_locations(extra, refs_to_locations(results)));
+                return Ok(merge_locations(Vec::new(), refs_to_locations(results)));
             }
             // Lexical / unowned — single-file references.
             Some(ResolvedTarget::Local) | None => {
                 let refs = symbols::find_references(&doc.analysis, pos, uri, Some(&scoped));
-                return Ok(merge_locations(extra, (!refs.is_empty()).then_some(refs)));
+                return Ok(merge_locations(Vec::new(), (!refs.is_empty()).then_some(refs)));
             }
         };
 
@@ -1315,7 +1324,7 @@ impl LanguageServer for Backend {
             crate::resolve::references_mask_for(&self.files, Some(base_idx), &target)
         };
         let results = refs_to(&self.files, Some(base_idx), &target, mask);
-        Ok(merge_locations(extra, refs_to_locations(results)))
+        Ok(merge_locations(Vec::new(), refs_to_locations(results)))
     }
 
     async fn prepare_rename(
