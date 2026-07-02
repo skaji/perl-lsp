@@ -63,8 +63,6 @@ pub struct SkelSymbol {
     pub name_end: Point,
     /// Sticky `@context.package` value in force at the def site.
     pub package: Option<String>,
-    /// Innermost `@scope` nesting depth (0 = file).
-    pub scope_depth: usize,
     pub scope: crate::file_analysis::ScopeId,
     /// Declared return type (`@rettype`), for methods/functions — drives
     /// method-return resolution + chaining through MethodOnClass.
@@ -683,7 +681,7 @@ impl SkeletonAnalysis {
 }
 
 /// Per-language bundle: the query pack plus host predicates. The
-/// predicates are the official escape hatch — the spike keeps them
+/// predicates are the official escape hatch — kept
 /// MINIMAL on purpose so the findings honestly measure how far
 /// patterns alone go.
 pub struct LangPack {
@@ -706,6 +704,9 @@ pub struct LangPack {
     /// Module-name → workspace-relative candidate paths — the entire
     /// per-language cross-file resolution strategy ("the one executable
     /// line"). Python: `pkg.mod` → pkg/mod.py | pkg/mod/__init__.py.
+    /// The Index-layer consumer is future work; the cross-file spike tests
+    /// (`resolve_imports_with_pack` in query_extract_tests.rs) drive it today.
+    #[allow(dead_code)]
     pub module_paths: fn(module: &str) -> Vec<String>,
     /// Does a call to `callee` construct a KEYED value whose named
     /// arguments are `$`-style accessible keys? (R: list / data.frame.)
@@ -821,6 +822,11 @@ pub enum CmdEffect {
     Import { arg: usize },
 }
 
+/// The Perl-on-query-engine seam (go-live map ARC 3, the builder.rs shrink):
+/// not registered as a driver — the native builder still owns Perl — but the
+/// parity tests in query_extract_tests.rs measure it against the builder so
+/// the migration path stays proven.
+#[allow(dead_code)]
 pub fn perl_pack() -> LangPack {
     LangPack {
         query_source: include_str!("../queries/perl/skeleton.scm"),
@@ -918,7 +924,7 @@ pub fn r_pack() -> LangPack {
         ctor_class: |_| None,
         // source("util.R") hands us the path verbatim; library(pkg)
         // resolves into the installed-library tree (a real install
-        // would consult .libPaths() — out of spike scope).
+        // would consult .libPaths() — not modeled here).
         module_paths: |m| vec![m.to_string()],
         shape_ctor: |callee| matches!(callee, "list" | "data.frame" | "tibble"),
         import_call: |callee, arg| match callee {
@@ -1677,7 +1683,6 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     name_start,
                     name_end,
                     package: pkg,
-                    scope_depth: scope_stack.len(),
                     scope: cur_scope,
                     return_type: rettype_by_match
                         .get(&e.match_id)
@@ -2024,7 +2029,6 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                             name_start: span.start,
                             name_end: span.end,
                             package: None,
-                            scope_depth: 0,
                             scope: *scope,
                             return_type: None,
                             deref_stack: Vec::new(),

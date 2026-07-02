@@ -5,10 +5,8 @@
 //! A config-dependent macro (`PERL_BITFIELD16`: `U16` on WIN32, `U16` under
 //! `HAS_NON_INT_BITFIELDS`, `unsigned` otherwise) is NOT one definition the
 //! collection order happened to keep — it is all of them. Modeling it as a
-//! variant SET fixes the goto-def bug where the winner was picked
-//! unprincipled (jumping to the win32 def on Linux) and lets typing take the
-//! JOIN of the variant bodies, so a `PERL_BITFIELD16` bitfield types as an
-//! integer regardless of which config is live.
+//! variant SET keeps goto-def from jumping to an arbitrary winner (e.g. the
+//! win32 def on Linux).
 //!
 //! Nothing is ever pruned. Portability is a first-class output — the
 //! programmer frequently WANTS the win32 def. Reachability is RANKING +
@@ -28,40 +26,7 @@
 //! don't know here (UNKNOWN); one that is defined nowhere and is not
 //! predefined cannot be turned on by any code we can see (UNREACHABLE).
 
-use crate::file_analysis::InferredType;
 use std::collections::HashSet;
-use std::path::PathBuf;
-
-/// Where one variant's `#define` lives — for the goto-def location.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MacroSite {
-    /// `None` for a same-file def (the caller knows the file); `Some` for a
-    /// def gathered from an `#include`d header.
-    pub file: Option<PathBuf>,
-    /// 0-based line of the `#define`.
-    pub line: usize,
-}
-
-/// One config-variant definition of a macro.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MacroVariant {
-    /// Object-like body / function-like body text.
-    pub body: String,
-    /// `Some(params)` = function-like; `None` = object-like.
-    pub params: Option<Vec<String>>,
-    /// Enclosing `#if`/`#ifdef`/`#else` conditions, OUTERMOST first — the
-    /// guard trail. Empty = unconditional. Each entry is a printable
-    /// condition (`defined(WIN32)`, `!defined(HAS)`, `FOO && !BAR`).
-    pub guards: Vec<String>,
-    pub site: MacroSite,
-}
-
-/// The COMPLETE variant set for one macro name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MacroVariants {
-    pub name: String,
-    pub variants: Vec<MacroVariant>,
-}
 
 /// What we can decide about the live config. `defined` are the macros known
 /// ON (predefined ∪ accumulated `#define`s); `universe` is every macro name
@@ -204,51 +169,6 @@ fn defined_tri(x: &str, cfg: &KnownConfig) -> Tri {
         Tri::Unknown
     } else {
         Tri::False
-    }
-}
-
-impl MacroVariants {
-    /// Rank the variants ACTIVE → UNKNOWN → UNREACHABLE (stable within rank),
-    /// each paired with its verdict. Nothing is dropped.
-    pub fn ranked(&self, cfg: &KnownConfig) -> Vec<(&MacroVariant, Reachability)> {
-        let mut out: Vec<(&MacroVariant, Reachability)> = self
-            .variants
-            .iter()
-            .map(|v| (v, classify(&v.guards, cfg)))
-            .collect();
-        out.sort_by_key(|(_, r)| r.rank());
-        out
-    }
-
-    /// The abstraction type: the JOIN of the variant bodies' types under the
-    /// pack's `annot_type`. Bodies that don't type (`auto`/`void`/unknown) are
-    /// skipped; agreeing types stay exact, integer families widen to Numeric,
-    /// genuinely divergent bodies yield `None` (no sound abstraction). This is
-    /// the type a macro-as-type use resolves to regardless of live config.
-    pub fn join_type(&self, annot_type: impl Fn(&str) -> Option<InferredType>) -> Option<InferredType> {
-        let mut acc: Option<InferredType> = None;
-        let mut any = false;
-        for v in &self.variants {
-            let Some(t) = annot_type(v.body.trim()) else { continue };
-            acc = Some(match acc {
-                None => t,
-                Some(prev) => join_two(prev, t)?,
-            });
-            any = true;
-        }
-        any.then_some(acc).flatten()
-    }
-}
-
-/// Join two body types. Equal → itself; two numerics → Numeric (integer
-/// widening); otherwise no sound common type.
-fn join_two(a: InferredType, b: InferredType) -> Option<InferredType> {
-    if a == b {
-        Some(a)
-    } else if a == InferredType::Numeric && b == InferredType::Numeric {
-        Some(InferredType::Numeric)
-    } else {
-        None
     }
 }
 

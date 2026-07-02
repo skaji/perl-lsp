@@ -53,7 +53,11 @@ pub fn point_to_byte(src: &str, point: Point) -> usize {
 }
 
 /// The receiver of a dangling member access, recovered by sentinel
-/// re-parse.
+/// re-parse. Test-only probe surface: production consumes
+/// `member_completion_ctx_incremental`; these wrappers exercise the shared
+/// sentinel mechanics (`find_sentinel` / `climb_to_member` / `cursor_in_skip`)
+/// with a directly assertable result.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Receiver {
     /// Receiver source text (`box`, `obj`, `a.b`, `make()` ...).
@@ -100,12 +104,13 @@ fn cursor_in_skip(orig: &Tree, src: &str, cursor: usize, cfg: &crate::query_extr
     false
 }
 
-/// The whole spike: patch a sentinel at `cursor`, re-parse, and return
-/// the receiver of the member access the sentinel completed. `None` when
-/// the cursor is not at a member access (or sits in a string/comment).
+/// Patch a sentinel at `cursor`, re-parse, and return the receiver of the
+/// member access the sentinel completed. `None` when the cursor is not at a
+/// member access (or sits in a string/comment).
 ///
 /// `parser` must already be set to the target language; `cfg` selects
 /// the per-language node vocabulary.
+#[cfg(test)]
 pub fn receiver_at(
     parser: &mut Parser,
     cfg: &crate::query_extract::LangPack,
@@ -167,6 +172,7 @@ fn climb_to_member<'a>(node: Node<'a>, cfg: &crate::query_extract::LangPack) -> 
 /// Extract the receiver (first named child) of a member-access node and
 /// map its span back to original coordinates. Since the receiver lies
 /// entirely before `cursor`, patched and original offsets coincide.
+#[cfg(test)]
 fn receiver_of(member: Node, patched: &str, cursor: usize) -> Option<Receiver> {
     let receiver = member.named_child(0)?;
     // Defensive: the receiver must end at or before the splice site.
@@ -194,6 +200,7 @@ fn operator_token<'a>(member: Node<'a>, patched: &str) -> Option<Node<'a>> {
 }
 
 /// Detect `->` vs `.` by scanning the member node's anonymous children.
+#[cfg(test)]
 fn member_uses_arrow(member: Node, patched: &str) -> bool {
     operator_token(member, patched).map(|t| t.utf8_text(patched.as_bytes()) == Ok("->")).unwrap_or(false)
 }
@@ -204,6 +211,7 @@ fn member_uses_arrow(member: Node, patched: &str) -> bool {
 /// region around the cursor — the cost completion actually pays per
 /// keystroke once the document tree is already in hand (it always is:
 /// `document.rs` keeps it). Same recovery, a fraction of the work.
+#[cfg(test)]
 pub fn receiver_at_incremental(
     parser: &mut Parser,
     cfg: &crate::query_extract::LangPack,

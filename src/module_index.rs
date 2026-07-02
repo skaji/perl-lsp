@@ -607,8 +607,8 @@ impl ModuleIndex {
     }
 
     /// Generic "find modules with a symbol named N" primitive —
-    /// O(1) hash + O(matches) scan, replaces every `for_each_cached`
-    /// pattern where the predicate is name-based. Callers apply their
+    /// O(1) hash + O(matches) scan for name-keyed predicates (never
+    /// `for_each_cached` over the whole store). Callers apply their
     /// own kind/detail filter + override/stacking semantics after
     /// picking which specific symbols matter to them.
     pub fn modules_with_symbol(&self, name: &str) -> Vec<String> {
@@ -1151,11 +1151,10 @@ impl ModuleIndex {
                 if !bridges_class { continue; }
                 // Namespace membership IS the filter — if this namespace
                 // bridges to `class_name`, every entity it owns is
-                // visible from `class_name`. We used to additionally
-                // require `sym.package == class_name`, which forced
-                // mojo-helpers to fan-out one Method per bridge class.
-                // Now the plugin picks ONE canonical home package and
-                // the namespace's bridges control visibility.
+                // visible from `class_name`. No `sym.package` gate: the
+                // plugin picks ONE canonical home package and the
+                // namespace's bridges control visibility, so no
+                // per-bridge Method fan-out is needed.
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
                     let Some(sym) = cached.analysis.symbols.get(idx) else { continue };

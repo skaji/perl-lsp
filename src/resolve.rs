@@ -8,7 +8,7 @@
 //! that wants "what does this position refer to, cross-file" (LSP references,
 //! LSP rename, the CLI mirrors of both) calls it and then hands the
 //! `TargetRef` to `refs_to`. Handlers never re-derive the mapping inline —
-//! that's how the CLI and LSP used to disagree on hash-key references.
+//! or the CLI and LSP drift apart (hash-key references are the cautionary tale).
 
 use std::path::PathBuf;
 
@@ -582,7 +582,7 @@ pub fn resolve_symbol_scoped(
 
 /// Is `name` a pack-language class-content member (struct field, member-block
 /// role member, enum constant) of `class` — in the origin file or the class's
-/// module as the origin sees it? The discriminator that keeps the C1
+/// module as the origin sees it? The discriminator that keeps the pack
 /// visibility gate off Perl Method targets minted from the same cursor kinds.
 fn pack_member_of_class(
     name: &str,
@@ -1366,11 +1366,23 @@ fn pack_class_def_paths(
 /// `Sub`/`Method` target a coinciding `FunctionCall` is the callable's OWN call
 /// site (which MUST rename), not a fold; only handlers fold through a call.
 /// A literal name (`on('connect')`) sits at its string-content span, uncovered.
-fn span_is_folded_name(analysis: &FileAnalysis, span: Span, include_calls: bool) -> bool {
+///
+/// The covering ref must spell a DIFFERENT identifier (`$m`, `EVT`) than the
+/// target: a bare enum/global read is itself a `Variable` ref whose token IS
+/// the literal name — that's the collected use, not a fold, and it must stay
+/// rewritable. (Perl variable names carry their sigil, so they can never
+/// coincide with a callable name.)
+fn span_is_folded_name(
+    analysis: &FileAnalysis,
+    span: Span,
+    include_calls: bool,
+    literal_name: &str,
+) -> bool {
     analysis.refs.iter().any(|r| {
         (matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess)
             || (include_calls && matches!(r.kind, RefKind::FunctionCall { .. })))
             && r.span == span
+            && r.target_name != literal_name
     })
 }
 
@@ -1620,7 +1632,7 @@ fn collect_from_analysis(
         .to_string_lossy()
         .into_owned();
 
-    // C1: a pack target's identity includes VISIBILITY — the same
+    // A pack target's identity includes VISIBILITY — the same
     // include-closure model forward resolution uses. A scanned file whose
     // closure reaches none of the target's defining files can't be referring
     // to it: its same-named tokens resolve (or would resolve) to something
@@ -1697,8 +1709,9 @@ fn collect_from_analysis(
         TargetKind::Sub { .. } | TargetKind::Method { .. } => (true, false),
         _ => (false, false),
     };
-    let rewritable_at =
-        |span: Span| !(foldable && span_is_folded_name(analysis, span, folds_through_calls));
+    let rewritable_at = |span: Span| {
+        !(foldable && span_is_folded_name(analysis, span, folds_through_calls, &target.name))
+    };
 
     // Include declaration spans when this file defines the target.
     for sym in &analysis.symbols {

@@ -292,7 +292,7 @@ impl Backend {
         let root = self.module_index.workspace_root();
         // Server-initiated progress requires the client capability; a client
         // that never advertised it may also never ANSWER the create request —
-        // and indexing must proceed regardless (LSP spec; M7).
+        // and indexing must proceed regardless (LSP spec).
         let progress = self
             .work_done_progress
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -553,7 +553,7 @@ impl Backend {
     }
 
     /// A pack file's bytes changed on disk (save or watcher event) — run the
-    /// H1 invalidation off the message loop: evict its per-file caches +
+    /// invalidation off the message loop: evict its per-file caches +
     /// every consumer's (reverse-closure), re-register the pack index, then
     /// refresh every OPEN pack document whose include closure contains the
     /// changed file (or that IS it), so in-session edits become visible
@@ -618,22 +618,7 @@ impl Backend {
         pos: Position,
         idx: &dyn crate::file_analysis::CrossFileLookup,
     ) -> Option<(Option<Url>, crate::file_analysis::Span, String)> {
-        let cursor =
-            crate::cursor_sentinel::point_to_byte(&doc.text, symbols::position_to_point(pos));
-        let bytes = doc.text.as_bytes();
-        let is_id = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-        let mut start = cursor;
-        while start > 0 && is_id(bytes[start - 1]) {
-            start -= 1;
-        }
-        let mut end = cursor;
-        while end < bytes.len() && is_id(bytes[end]) {
-            end += 1;
-        }
-        if start == end {
-            return None;
-        }
-        let word = &doc.text[start..end];
+        let word = symbols::word_at_point(&doc.text, symbols::position_to_point(pos))?;
         // Pick the best DEFINITION among same-named symbols (a `#define X` plus
         // its raw usages): prefer the `#define` line, else the earliest.
         let pick = |analysis: &crate::file_analysis::FileAnalysis, src: &str| {
@@ -1024,8 +1009,8 @@ impl LanguageServer for Backend {
         let mut needs_gather_refresh = false;
         if opened {
             if let Some(doc) = self.files.get_open(&uri) {
-                // Lazily index this file's language family (once) — the reason a
-                // C++ open no longer waits on the perl tree.
+                // Lazily index this file's language family (once) so a C++
+                // open doesn't wait on the perl tree.
                 self.ensure_workspace_indexed(&doc.language);
                 // A pack file's first analyze was cached-only; warm the gather
                 // and re-analyze in the background so full cross-file macros land.

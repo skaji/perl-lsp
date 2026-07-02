@@ -1,7 +1,6 @@
-//! Config-variant macro model: guard eval, reachability ranking, join typing.
+//! Config-variant macro model: guard eval + reachability classification.
 
 use super::*;
-use crate::file_analysis::InferredType;
 
 fn cfg(defined: &[&str], universe: &[&str]) -> KnownConfig {
     KnownConfig::new(
@@ -10,24 +9,6 @@ fn cfg(defined: &[&str], universe: &[&str]) -> KnownConfig {
         // trivially in the closure's definition set)
         universe.iter().chain(defined.iter()).map(|s| s.to_string()).collect(),
     )
-}
-
-fn variant(body: &str, guards: &[&str]) -> MacroVariant {
-    MacroVariant {
-        body: body.to_string(),
-        params: None,
-        guards: guards.iter().map(|s| s.to_string()).collect(),
-        site: MacroSite { file: None, line: 0 },
-    }
-}
-
-/// cpp `annot_type` (subset) so the join test doesn't depend on the pack.
-fn annot(text: &str) -> Option<InferredType> {
-    match text.trim() {
-        "int" | "unsigned" | "short" | "long" | "U16" => Some(InferredType::Numeric),
-        "auto" | "void" => None,
-        t => Some(InferredType::ClassName(t.to_string())),
-    }
 }
 
 #[test]
@@ -87,72 +68,12 @@ fn conjunction_three_valued() {
 }
 
 #[test]
-fn ranking_puts_active_first_unreachable_last() {
-    // The PERL_BITFIELD16 shape: three variants, three configs. Known: HAS is
-    // ON, WIN32 is a platform macro absent here, CFG is a seen-but-unresolved
-    // knob → one of each outcome.
-    let mv = MacroVariants {
-        name: "M".into(),
-        variants: vec![
-            variant("U16", &["defined(WIN32)"]),  // unreachable
-            variant("unsigned", &["defined(HAS)"]), // active
-            variant("int", &["defined(CFG)"]),    // unknown
-        ],
-    };
-    let c = cfg(&["HAS"], &["CFG"]);
-    let ranked = mv.ranked(&c);
-    assert_eq!(ranked.len(), 3, "nothing is ever pruned");
-    // active first
-    assert_eq!(ranked[0].0.body, "unsigned");
-    assert_eq!(ranked[0].1, Reachability::Active);
-    // unknown middle
-    assert!(matches!(ranked[1].1, Reachability::Unknown { .. }));
-    assert_eq!(ranked[1].0.body, "int");
-    // unreachable last, labeled
-    assert_eq!(ranked[2].0.body, "U16");
-    assert_eq!(
-        ranked[2].1.label().as_deref(),
-        Some("unreachable: WIN32 undefined")
-    );
-}
-
-#[test]
-fn join_agrees_to_exact_type() {
-    let mv = MacroVariants {
-        name: "M".into(),
-        variants: vec![variant("int", &[]), variant("int", &[])],
-    };
-    assert_eq!(mv.join_type(annot), Some(InferredType::Numeric));
-}
-
-#[test]
-fn join_integer_family_widens_to_numeric() {
-    // U16 ∨ unsigned → an integer type (the op_type fix).
-    let mv = MacroVariants {
-        name: "PERL_BITFIELD16".into(),
-        variants: vec![
-            variant("U16", &["defined(WIN32)"]),
-            variant("U16", &["defined(HAS)"]),
-            variant("unsigned", &["!defined(HAS)"]),
-        ],
-    };
-    assert_eq!(mv.join_type(annot), Some(InferredType::Numeric));
-}
-
-#[test]
-fn join_divergent_types_have_no_abstraction() {
-    let mv = MacroVariants {
-        name: "M".into(),
-        variants: vec![variant("int", &[]), variant("Widget", &[])],
-    };
-    assert_eq!(mv.join_type(annot), None);
-}
-
-#[test]
-fn join_skips_untypable_void_auto() {
-    let mv = MacroVariants {
-        name: "M".into(),
-        variants: vec![variant("void", &[]), variant("int", &[])],
-    };
-    assert_eq!(mv.join_type(annot), Some(InferredType::Numeric));
+fn rank_orders_active_unknown_unreachable() {
+    // The sort key goto-def/hover ranking rides on: ACTIVE < UNKNOWN < UNREACHABLE.
+    let active = Reachability::Active;
+    let unknown = Reachability::Unknown { guard: "defined(CFG)".into() };
+    let unreachable = Reachability::Unreachable { reason: "WIN32 undefined".into() };
+    assert!(active.rank() < unknown.rank());
+    assert!(unknown.rank() < unreachable.rank());
+    assert_eq!(unreachable.label().as_deref(), Some("unreachable: WIN32 undefined"));
 }

@@ -703,34 +703,16 @@ fn strip_declarator_macros(
     (out, recovered)
 }
 
-/// Expand, then **let the parser validate**: keep the transform only if
-/// it does not increase parse damage. This is the doc's load-bearing
-/// principle — an expansion that helps (declarator macros, simple
+/// Expand seeded with EXTERNAL macros from `#include`d headers, then **let
+/// the parser validate**: keep the transform only if it does not increase
+/// parse damage. An expansion that helps (declarator macros, simple
 /// declaration macros) lands; one that hurts (nested macro CALLS like
-/// X-macros, `##` token-paste — the tail this single-pass spike does
-/// not model) is discarded, so expansion never regresses a file.
+/// X-macros, `##` token-paste — the tail this single pass does not model)
+/// is discarded, so expansion never regresses a file.
 ///
 /// Production refinement (noted, not built): validate per-splice rather
 /// than per-file, so a good expansion and a bad one in the same file
 /// don't share a fate.
-pub fn preprocess_validated(parser: &mut tree_sitter::Parser, src: &str) -> (String, SpliceMap) {
-    let Some(tree) = parser.parse(src, None) else {
-        return (src.to_string(), SpliceMap::default());
-    };
-    let before = parse_damage(tree.root_node());
-    let (rewritten, map) = preprocess(&tree, src);
-    if rewritten == src {
-        return (rewritten, map);
-    }
-    match parser.parse(&rewritten, None) {
-        Some(after) if parse_damage(after.root_node()) <= before => (rewritten, map),
-        _ => (src.to_string(), SpliceMap::default()),
-    }
-}
-
-/// `preprocess_validated` seeded with EXTERNAL macros from #included
-/// headers — the cross-file path. Same validate-by-reparse gate (keep the
-/// rewrite only if it doesn't raise parse damage).
 pub fn preprocess_validated_with(
     parser: &mut tree_sitter::Parser,
     src: &str,
@@ -1144,7 +1126,7 @@ fn with_pooled_parser<T>(
 /// the abseil `mutex.h`-vs-`thread_annotations.h` invariant. Determinism under
 /// parallelism: a level is canonicalized + deduped SERIALLY in queue order, and
 /// the parsed results are merged (and their children enqueued) in that same
-/// order, so the macro table is byte-identical to the old single-queue BFS.
+/// order, so the macro table is deterministic regardless of parallelism.
 fn gather_included_macros(
     file_path: &std::path::Path,
     src: &str,
@@ -1488,15 +1470,6 @@ fn include_paths_tree(tree: &Tree, src: &str) -> Vec<String> {
     out
 }
 
-/// The transform: expand macro invocations in `src`, returning the
-/// rewritten source and the anchor map. Single source-level pass.
-pub fn preprocess(tree: &Tree, src: &str) -> (String, SpliceMap) {
-    preprocess_with(tree, src, &PreExpandedExternal::empty())
-}
-
-/// `preprocess` plus EXTERNAL macros (gathered from #included headers via
-/// `included_macros`). The file's own #defines win on conflict; the
-/// external set fills in cross-file names like `SPDLOG_NAMESPACE_BEGIN`.
 /// An object-like macro whose body is a single bare identifier — a pure
 /// rename (`op_prune_chain_head → Perl_op_prune_chain_head`). Expanding it
 /// is provably parse-safe (an identifier replaces an identifier; the token
@@ -1508,6 +1481,10 @@ fn is_identifier_alias(m: &Macro) -> bool {
         && m.body.bytes().all(is_ident_byte)
 }
 
+/// The transform: expand macro invocations in `src`, returning the rewritten
+/// source and the anchor map. Single source-level pass. The file's own
+/// `#define`s win on conflict; `external` (gathered from `#include`d headers)
+/// fills in cross-file names like `SPDLOG_NAMESPACE_BEGIN`.
 pub fn preprocess_with(
     tree: &Tree,
     src: &str,
@@ -2226,7 +2203,7 @@ fn field_block_variant_sites(
 
 /// The reachability config for variant ranking — every `#define` name is a
 /// knob (`universe`); unconditional ones are known ON (`defined`) ∪ the
-/// toolchain's predefined macros. Mirrors `symbols::ranked_macro_variants`.
+/// toolchain's predefined macros.
 fn known_config(variants: &BTreeMap<String, Vec<Macro>>) -> crate::cpp_macro_model::KnownConfig {
     let mut defined = std::collections::HashSet::new();
     let mut universe = std::collections::HashSet::new();
@@ -2236,13 +2213,35 @@ fn known_config(variants: &BTreeMap<String, Vec<Macro>>) -> crate::cpp_macro_mod
             defined.insert(name.clone());
         }
     }
+    known_config_with_toolchain(defined, universe)
+}
+
+/// Fold the toolchain's predefined macros (`__GNUC__`, `__x86_64__`, …) into a
+/// reachability config as known-ON knobs. The ONE seeding point for build-side
+/// variant selection AND goto-def/hover navigation (`ranked_macro_variants`),
+/// so minting and navigation can't disagree on which config arm is Active.
+pub fn known_config_with_toolchain(
+    mut defined: std::collections::HashSet<String>,
+    mut universe: std::collections::HashSet<String>,
+) -> crate::cpp_macro_model::KnownConfig {
     if let Some(tc) = toolchain_info() {
-        for (name, _) in &tc.predefined_macros {
-            defined.insert(name.clone());
-            universe.insert(name.clone());
-        }
+        seed_predefined(&mut defined, &mut universe, &tc.predefined_macros);
     }
     crate::cpp_macro_model::KnownConfig::new(defined, universe)
+}
+
+/// Predefined macros are unconditional defines: ON in `defined`, known knobs
+/// in `universe`. Split from the `toolchain_info()` wrapper so the seeding is
+/// unit-testable without a compiler probe.
+pub fn seed_predefined(
+    defined: &mut std::collections::HashSet<String>,
+    universe: &mut std::collections::HashSet<String>,
+    predefined: &[(String, String)],
+) {
+    for (name, _) in predefined {
+        defined.insert(name.clone());
+        universe.insert(name.clone());
+    }
 }
 
 /// Advance a Point over `bytes` (newlines bump the row, reset the column).

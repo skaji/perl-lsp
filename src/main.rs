@@ -16,20 +16,45 @@ mod plugin;
 mod plugin_cli;
 mod pod;
 mod query_cache;
+// Kept-as-spike PoC modules: measured by their own tests, deliberately not
+// wired into the build pipeline (the go-live map's "ADDITIVE DEPTH" tier —
+// overload/dispatch/templates/superposition — plus the Perl seams they
+// prototype). The allow covers the whole module: nothing here is production
+// dead code, it's evidence.
+#[allow(dead_code)]
 mod c_preproc;
+#[allow(dead_code)]
 mod c_reparse;
+#[allow(dead_code)]
 mod c_superpose;
+#[allow(dead_code)]
 mod overload_pi;
+#[allow(dead_code)]
 mod perl_generators;
+#[allow(dead_code)]
 mod cpp_multidispatch;
 mod language_driver;
+#[allow(dead_code)]
 mod cpp_templates;
+#[allow(dead_code)]
 mod cpp_template_join;
+// Compiled unconditionally (symbols.rs consumes the macro-model surface in
+// every build); the driver registration is feature-gated, so a perl-only
+// build leaves most of the module unreferenced — silence dead-code there
+// while keeping the all-langs build strict.
+#[cfg_attr(not(feature = "cpp"), allow(dead_code))]
 mod cpp_reparse;
 mod cpp_macro_model;
 mod cpp_toolchain;
 mod cursor_sentinel;
+#[cfg_attr(
+    not(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake")),
+    allow(dead_code)
+)]
 mod query_extract;
+// Kept-as-spike: the Perl prototype reparenthesizer that proved the
+// pre-extraction reparse seam (whose production form is cpp_reparse).
+#[allow(dead_code)]
 mod reparse;
 mod resolve;
 mod symbols;
