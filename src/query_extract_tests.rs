@@ -1790,8 +1790,10 @@ void use_box() {
     let fa = cpp_fa(src);
     let idx = crate::module_index::ModuleIndex::new_for_test();
     let uri = tower_lsp::lsp_types::Url::from_file_path("/fake/cpp/box.cpp").unwrap();
+    let store = crate::file_store::FileStore::new();
     let gd = |line: u32, character: u32| {
         match crate::symbols::find_definition(
+            &store,
             &fa,
             tower_lsp::lsp_types::Position { line, character },
             &uri,
