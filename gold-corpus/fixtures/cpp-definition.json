@@ -105,6 +105,65 @@
       "status": "gold"
     },
     {
+      "id": "cpp-definition-domain-mixed-slot-real-decl-no-enum",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_mixed.c",
+      "line": 3,
+      "col": 11,
+      "expect": {
+        "all": [
+          "domain_mixed.c:2:19"
+        ],
+        "none": [
+          "domain_mixed.c:1:"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-owner-separation-enum-side",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 3,
+      "col": 38,
+      "expect": {
+        "all": [
+          "domain_owner.c:2:21",
+          "domain_owner.c:1:6"
+        ],
+        "none": [
+          "domain_owner.c:3:20"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-owner-separation-int-side",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 6,
+      "col": 37,
+      "expect": {
+        "all": [
+          "domain_owner.c:3:20"
+        ],
+        "none": [
+          "domain_owner.c:1:6",
+          "domain_owner.c:2:21"
+        ]
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-sym-typedef-use-to-def",
       "difficulty": "moderate",
       "semantic_area": "cpp-symmetry",

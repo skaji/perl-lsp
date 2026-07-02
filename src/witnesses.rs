@@ -113,12 +113,16 @@ pub enum WitnessAttachment {
     /// **language-generically** by `{owner, name}` (a C struct member, a
     /// Corinna `field`, a Moo `has`; NOT `{struct, name}`). Distinct from
     /// the bag's local subjects (`Variable{name,scope}`, `Expr{span}`):
-    /// every access to the slot, in any scope/file, folds onto the SAME
-    /// `Field` subject — project-wide gathering. `DomainCompare` witnesses
-    /// on this attachment carry the enum a use compares/assigns the slot
-    /// against; `DomainCoherenceFold` folds them into the slot's DOMAIN
-    /// type (`op_type: uint16_t` storage → `opcode` domain). The domain is
-    /// a defeasible refinement for human surfaces; it never changes the
+    /// every access to the slot, in any scope, folds onto the SAME `Field`
+    /// subject — the IDENTITY is project-wide (the `field_subject` ancestor
+    /// walk converges subtypes on the declaring owner), while the domain
+    /// fold GATHERS per querying file (`FileAnalysis::field_domain_for_owner`
+    /// reads that file's own `domain_sites`; owner-gated per site).
+    /// `DomainCompare` witnesses on this attachment carry the enum a use
+    /// compares/assigns the slot against (or `None` counter-evidence);
+    /// `DomainCoherenceFold` folds them into the slot's DOMAIN type
+    /// (`op_type: uint16_t` storage → `opcode` domain). The domain is a
+    /// defeasible refinement for human surfaces; it never changes the
     /// storage type that flows. Kept at the END for bincode variant-index
     /// stability (bump `EXTRACT_VERSION`).
     Field { owner: String, name: String },
@@ -231,14 +235,18 @@ pub enum WitnessPayload {
         step: ProjectionStep,
     },
     /// **Domain evidence** for a `Field` slot: a single use-site where the
-    /// slot interacts with a typed value from `enum_type` (a comparison
-    /// `slot == E`, an assignment `slot = E`, a `switch(slot){case E}`, a
-    /// typed-arg position). `enum_type` is the value operand's domain — an
-    /// enumerator carries its `enum`, resolved (cross-file) before the
-    /// witness is pushed. `DomainCoherenceFold` counts these across every
-    /// site: mostly-agree → that domain, truly-mixed → none. Kept at the
-    /// END for bincode variant-index stability (bump `EXTRACT_VERSION`).
-    DomainCompare { enum_type: String },
+    /// slot interacts with a value operand (a comparison `slot == E`, an
+    /// assignment `slot = E`, a `switch(slot){case E}`, a typed-arg
+    /// position). `Some(enum)` when the operand resolves to an enumerator
+    /// (its enum, resolved cross-file before the witness is pushed);
+    /// `None` when it does not — an integer literal, arithmetic, a call —
+    /// which is COUNTER-evidence: the site still counts in the coherence
+    /// vote's denominator, so a slot that is dominantly a plain integer
+    /// with a minority enum idiom refuses a domain instead of reporting
+    /// 100% confidence. `DomainCoherenceFold` folds every site:
+    /// mostly-agree → that domain, truly-mixed → none. Kept at the END for
+    /// bincode variant-index stability (bump `EXTRACT_VERSION`).
+    DomainCompare { enum_type: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1178,18 +1186,24 @@ impl WitnessReducer for DomainCoherenceFold {
 
 /// The coherence vote over `DomainCompare` witnesses: the dominant enum,
 /// its site count, and the total, when the dominant share is a strict
-/// majority over ≥2 sites; else `None`. Deterministic (sorted counts,
+/// majority over ≥2 sites; else `None`. The total counts EVERY site,
+/// including `enum_type: None` counter-evidence — the denominator is the
+/// slot's whole interaction story, so the enum must be a majority of all
+/// uses, not of the enum-shaped subset. Deterministic (sorted counts,
 /// name-ascending tie-break). Shared by the reducer and the query method
 /// (which reports `confidence = count / total`).
 pub fn domain_coherence(ws: &[&Witness]) -> Option<(String, usize, usize)> {
     use std::collections::BTreeMap;
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut total: usize = 0;
     for w in ws {
         if let WitnessPayload::DomainCompare { enum_type } = &w.payload {
-            *counts.entry(enum_type.clone()).or_default() += 1;
+            total += 1;
+            if let Some(e) = enum_type {
+                *counts.entry(e.clone()).or_default() += 1;
+            }
         }
     }
-    let total: usize = counts.values().sum();
     if total < 2 {
         return None;
     }

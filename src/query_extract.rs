@@ -1287,16 +1287,21 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // TypeName witnesses for).
     let mut macro_alias_name_by_match: HashMap<usize, String> = HashMap::new();
     let mut macro_alias_of_by_match: HashMap<usize, String> = HashMap::new();
-    // `@domain.value` — the enum-valued operand a field slot is compared/
-    // assigned against. Joined to its `@domain.slot` by match_id (the slot
-    // event pushes the site); the value's own enum resolves cross-file later.
+    // `@domain.value` — the operand a field slot is compared/assigned
+    // against. Joined to its `@domain.slot` by match_id (the slot event
+    // pushes the site); the value's own enum resolves cross-file later. Only
+    // an identifier-shaped operand can name an enumerator, so anything else
+    // (a literal, arithmetic, a call — the capture is ungated) is stored as
+    // the empty sentinel: it stays a SITE (counter-evidence in the coherence
+    // vote's denominator) without persisting arbitrary expression text.
     let mut domain_value_by_match: HashMap<usize, String> = HashMap::new();
     for e in &events {
         if e.cap == "type.annot" {
             annot_by_match.insert(e.match_id, e.text.clone());
         }
         if e.cap == "domain.value" {
-            domain_value_by_match.insert(e.match_id, e.text.clone());
+            let v = if is_identifier_text(&e.text) { e.text.clone() } else { String::new() };
+            domain_value_by_match.insert(e.match_id, v);
         }
         if e.cap == "alias.name" {
             alias_name_by_match.insert(e.match_id, e.text.clone());
@@ -2142,6 +2147,15 @@ pub(crate) fn looks_like_type_spelling(body: &str) -> bool {
         return false;
     }
     b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == ' ')
+}
+
+/// A bare identifier lexeme — the only shape that can name an enumerator.
+/// Pure string test (no node-kind probe) so every language's capture text
+/// routes through the same rule.
+fn is_identifier_text(s: &str) -> bool {
+    !s.is_empty()
+        && !s.as_bytes()[0].is_ascii_digit()
+        && s.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
 }
 
 fn byte_range_of(events: &[Event], match_id: usize, cap: &str) -> Option<(usize, usize)> {

@@ -284,6 +284,49 @@ struct s { M x:9; };
     assert_eq!(by_line[&6].body, "unsigned");
 }
 
+/// A bodyless `#define FLAG` is the canonical config knob — it must enter
+/// the macro universe (and the defined set when unconditional), or the
+/// reachability ranking of `#ifdef FLAG` arms comes out exactly inverted.
+#[test]
+fn bodyless_define_joins_the_config_universe() {
+    use crate::cpp_macro_model::{classify, KnownConfig, Reachability};
+    let mut p = cpp_parser();
+    let src = "\
+#define MY_FEATURE
+#ifdef MY_FEATURE
+#define LIMIT 42
+#else
+#define LIMIT 7
+#endif
+";
+    // Identity lane: the flag is a MacroDef (goto-def on the flag lands).
+    let defs = crate::cpp_reparse::collect_macro_defs(&mut p, src);
+    let flag = defs.iter().find(|d| d.name == "MY_FEATURE").expect("bodyless define collected");
+    assert!(flag.body.is_empty());
+    assert!(flag.guards.is_empty());
+    assert!(flag.delegate.is_none());
+
+    // Reachability: with the flag ON, the #ifdef arm is ACTIVE and the
+    // #else arm provably unreachable — not the inverse.
+    let tree = parse(&mut p, src);
+    let variants = collect_macro_variants(&tree, src.as_bytes());
+    let mut defined = std::collections::HashSet::new();
+    let mut universe = std::collections::HashSet::new();
+    for (name, vs) in &variants {
+        universe.insert(name.clone());
+        if vs.iter().any(|m| m.guards.is_empty()) {
+            defined.insert(name.clone());
+        }
+    }
+    assert!(defined.contains("MY_FEATURE"), "unconditional bodyless define is known ON");
+    let cfg = KnownConfig::new(defined, universe);
+    let lim = &variants["LIMIT"];
+    let ifdef_arm = lim.iter().find(|m| m.def_line == 2).expect("#ifdef arm");
+    let else_arm = lim.iter().find(|m| m.def_line == 4).expect("#else arm");
+    assert_eq!(classify(&ifdef_arm.guards, &cfg), Reachability::Active);
+    assert!(matches!(classify(&else_arm.guards, &cfg), Reachability::Unreachable { .. }));
+}
+
 /// End-to-end reachability + join over the captured variants: WIN32 absent →
 /// its variant is UNREACHABLE-labeled (not dropped); the HAS knob's two
 /// branches are UNKNOWN; the body join types the macro as an integer.

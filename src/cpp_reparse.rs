@@ -153,6 +153,7 @@ impl SpliceMap {
 
 const MACRO_DEF_QUERY: &str = r#"
 (preproc_def name: (identifier) @oname value: (preproc_arg) @obody)
+(preproc_def name: (identifier) @bname !value)
 (preproc_function_def
   name: (identifier) @fname
   parameters: (preproc_params) @fparams
@@ -216,6 +217,7 @@ fn walk_macro_defs(
     while let Some(m) = it.next() {
         let mut oname = None;
         let mut obody = None;
+        let mut bname = None;
         let mut fname = None;
         let mut fparams: Option<Vec<String>> = None;
         let mut fbody = None;
@@ -229,6 +231,10 @@ fn walk_macro_defs(
                     name_node = Some(c.node);
                 }
                 "obody" => obody = Some(clean_body(txt)),
+                "bname" => {
+                    bname = Some(txt.to_string());
+                    name_node = Some(c.node);
+                }
                 "fname" => {
                     fname = Some(txt.to_string());
                     name_node = Some(c.node);
@@ -254,6 +260,18 @@ fn walk_macro_defs(
             .unwrap_or_default();
         if let (Some(n), Some(b)) = (oname, obody) {
             emit(n, Macro { params: None, body: b, guards: guards.clone(), def_line }, name_span);
+        }
+        // Bodyless `#define FLAG` — the canonical config knob (feature
+        // toggles, include guards, `PERL_CORE`-style markers). It must enter
+        // the definition universe or reachability ranks `#ifdef FLAG` arms
+        // exactly inverted; its empty body is also C-correct for expansion
+        // (a bare use of the flag expands to nothing).
+        if let Some(n) = bname {
+            emit(
+                n,
+                Macro { params: None, body: String::new(), guards: guards.clone(), def_line },
+                name_span,
+            );
         }
         if let (Some(n), Some(p), Some(b)) = (fname, fparams, fbody) {
             emit(n, Macro { params: Some(p), body: b, guards, def_line }, name_span);
@@ -790,7 +808,7 @@ fn include_set_hash(src: &str) -> u64 {
 
 /// Bump when the persisted macro-table format or the gather's semantics
 /// change in a way that invalidates on-disk blobs.
-const MACRO_CACHE_VERSION: i64 = 2;
+const MACRO_CACHE_VERSION: i64 = 3;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedMacros {

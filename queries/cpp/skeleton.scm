@@ -264,21 +264,24 @@
   field: (field_identifier) @ref.member)
 
 ; ---- domain typing (int-used-as-enum): a struct-field SLOT compared or
-; assigned against a typed (enum) value. `o->op_type == OP_CONST` /
-; `o->op_type = OP_FREED`. @domain.slot is the field access, @domain.value the
-; other operand — an enumerator carries its `enum`, resolved cross-file at
-; query time, then the sites fold onto `Field{owner,name}` (op_type → opcode).
-; Both operand orders; no operator gate (any comparison/assignment against an
-; enumerator is domain evidence — the coherence vote filters raw-int noise). ----
+; assigned against ANY value. `o->op_type == OP_CONST` / `o->op_type =
+; OP_FREED` / `o->op_targ = pad_alloc(...)`. @domain.slot is the field access,
+; @domain.value the other operand — an enumerator carries its `enum`, resolved
+; cross-file at query time, then the sites fold onto `Field{owner,name}`
+; (op_type → opcode). The value is deliberately UNGATED (`(_)`): a site whose
+; operand is NOT an enumerator (integer literal, arithmetic, a call) is
+; counter-evidence in the coherence vote's denominator — capturing only
+; enum-shaped operands made a dominantly-plain-int slot look 100% coherent.
+; Both operand orders; no operator gate. ----
 (binary_expression
   left: (field_expression field: (field_identifier) @domain.slot)
-  right: (identifier) @domain.value)
+  right: (_) @domain.value)
 (binary_expression
-  left: (identifier) @domain.value
+  left: (_) @domain.value
   right: (field_expression field: (field_identifier) @domain.slot))
 (assignment_expression
   left: (field_expression field: (field_identifier) @domain.slot)
-  right: (identifier) @domain.value)
+  right: (_) @domain.value)
 
 ; ---- type witnesses: C++ leaks types at every DECLARATION site (its
 ; static-typing richness — the annot_type predicate carries the load).

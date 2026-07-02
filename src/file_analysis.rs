@@ -5150,6 +5150,11 @@ impl FileAnalysis {
         value: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
+        // "" is the extraction sentinel for a non-identifier operand — it
+        // can't name an enumerator, so skip the symbol sweep + cache probe.
+        if value.is_empty() {
+            return None;
+        }
         let packaged = |a: &FileAnalysis| {
             a.symbols
                 .iter()
@@ -5267,11 +5272,21 @@ impl FileAnalysis {
         self.field_domain_for_owner(&owner, field, module_index)
     }
 
-    /// Fold this file's domain sites for `field` onto `Field{owner, name}`
-    /// and query `DomainCoherenceFold`. The witnesses are built into a
-    /// scratch bag at query time because a site's enum resolves cross-file
-    /// (the module index is only in hand here); the fold + majority rule
-    /// live in the reducer (`witnesses::domain_coherence`).
+    /// Fold this file's domain sites for `Field{owner, field}` and query
+    /// `DomainCoherenceFold`. The witnesses are built into a scratch bag at
+    /// query time because a site's enum resolves cross-file (the module
+    /// index is only in hand here); the fold + majority rule live in the
+    /// reducer (`witnesses::domain_coherence`).
+    ///
+    /// Two gates keep the vote honest:
+    /// - **owner**: a site votes only when its own receiver resolves to the
+    ///   SAME declaring owner as the queried subject (`domain_site_owner`) —
+    ///   name-keyed pooling let `struct basket { int kind; }` contaminate
+    ///   `struct crate { int kind; }`. A site whose receiver doesn't resolve
+    ///   votes nowhere (we don't know whose slot it is).
+    /// - **counter-evidence**: a gathered site whose value operand is not an
+    ///   enumerator pushes `enum_type: None`, so the denominator is the
+    ///   slot's whole interaction story, not the enum-shaped subset.
     pub fn field_domain_for_owner(
         &self,
         owner: &str,
@@ -5288,9 +5303,10 @@ impl FileAnalysis {
             if site.slot != field {
                 continue;
             }
-            let Some(enum_name) = self.resolve_enumerator_enum(&site.value, module_index) else {
+            if self.domain_site_owner(site, module_index).as_deref() != Some(owner) {
                 continue;
-            };
+            }
+            let enum_name = self.resolve_enumerator_enum(&site.value, module_index);
             bag.push(Witness {
                 attachment: att.clone(),
                 source: WitnessSource::Builder("field_domain".into()),
@@ -5319,6 +5335,31 @@ impl FileAnalysis {
             .map(|(_, count, total)| count as f32 / total as f32)
             .unwrap_or(0.0);
         Some(NominalDomain { domain, storage: None, confidence })
+    }
+
+    /// The canonical `Field` owner of one domain site: the member ref at the
+    /// site's own span (the member pattern captures the same field token the
+    /// domain pattern does), its receiver's class, then the SAME
+    /// `field_subject` ancestor walk that minted the queried subject — so an
+    /// access through a subtype converges on the declaring owner (perl5's
+    /// BASEOP-role structs all collapse to one `op_type` subject). `None`
+    /// when the receiver doesn't resolve — such a site belongs to no subject.
+    fn domain_site_owner(
+        &self,
+        site: &DomainSite,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
+        let r = self
+            .refs
+            .iter()
+            .find(|r| r.span == site.slot_span && matches!(r.kind, RefKind::MethodCall { .. }))?;
+        let class = self.method_call_invocant_class(r, module_index)?;
+        let crate::witnesses::WitnessAttachment::Field { owner, .. } =
+            self.field_subject(&class, &site.slot, module_index)
+        else {
+            return None;
+        };
+        Some(owner)
     }
 
     /// Reverse bridge: the slot spans in THIS file whose domain value

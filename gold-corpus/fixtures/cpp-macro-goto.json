@@ -38,6 +38,20 @@
       "status": "gold"
     },
     {
+      "id": "cpp-macro-goto-bodyless-flag-activates-ifdef-arm",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macrogoto/flagmacro.c",
+      "line": 6, "col": 16,
+      "expect": {
+        "all": ["flagmacro.c:3:11\nflagmacro.c:5:11  (unreachable: MY_FEATURE defined)"],
+        "none": ["MY_FEATURE undefined"]
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-macro-goto-delegation-see-through",
       "difficulty": "hard",
       "semantic_area": "cpp-multilang-macros",
