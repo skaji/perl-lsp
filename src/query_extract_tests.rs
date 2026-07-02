@@ -1741,6 +1741,75 @@ fn canonical_template_spelling_normalizes_whitespace() {
 }
 
 #[test]
+fn cpp_annot_type_peels_template_spellings_to_instance() {
+    use crate::file_analysis::{InferredType, ParametricType};
+    let at = cpp_pack().annot_type;
+    match at("Box<Widget>") {
+        Some(InferredType::Parametric(ParametricType::Instance { base, .. })) => {
+            assert_eq!(base, "Box")
+        }
+        other => panic!("expected Instance, got {other:?}"),
+    }
+    // an embedded-space arg used to fail the typeish gate entirely
+    assert!(matches!(at("Buf<unsigned long>"), Some(InferredType::Parametric(_))));
+    // non-template spellings unchanged
+    assert!(matches!(at("Widget"), Some(InferredType::ClassName(c)) if c == "Widget"));
+    assert!(matches!(at("int"), Some(InferredType::Numeric)));
+}
+
+#[test]
+fn cpp_template_instance_member_gd_dispatches_on_base_or_exact_spec() {
+    // Row 11 of the template arc: `Box<Widget> b; b.size()` resolves the
+    // member through the Instance's BASE with zero template-specific
+    // resolution code; an instance whose exact canonical spelling names a
+    // per-spec class dispatches THERE instead (exact-or-primary only).
+    let src = "\
+template <typename T>
+class Box {
+public:
+    T get();
+    int size();
+    T v_;
+};
+template <typename T> struct codec {
+    void parse();
+};
+template <> struct codec<int> {
+    void pack_int();
+};
+struct Widget { int w_; };
+void use_box() {
+    Box<Widget> b;
+    b.size();
+    codec<int> ci;
+    ci.pack_int();
+    codec<char> cc;
+    cc.parse();
+}
+";
+    let fa = cpp_fa(src);
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let uri = tower_lsp::lsp_types::Url::from_file_path("/fake/cpp/box.cpp").unwrap();
+    let gd = |line: u32, character: u32| {
+        match crate::symbols::find_definition(
+            &fa,
+            tower_lsp::lsp_types::Position { line, character },
+            &uri,
+            &idx,
+        ) {
+            Some(tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(l)) => {
+                Some((l.range.start.line, l.range.start.character))
+            }
+            None => None,
+            other => panic!("expected a single location, got {other:?}"),
+        }
+    };
+    assert_eq!(gd(16, 6), Some((4, 8)), "b.size() lands on Box::size via the base");
+    assert_eq!(gd(18, 7), Some((11, 9)), "codec<int> instance keys the exact-spelling spec");
+    assert_eq!(gd(20, 7), Some((8, 9)), "codec<char> (no spec) falls to the primary");
+}
+
+#[test]
 fn cpp_class_specialization_mints_per_spec_class_with_owned_members() {
     let fa = cpp_fa(
         r#"

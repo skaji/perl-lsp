@@ -100,6 +100,27 @@
 (struct_specifier
   name: (template_type) @def.class.name
   (base_class_clause (type_identifier) @parent))
+; namespace-QUALIFIED bases (`: public detail::buffer<T>`, `: detail::tag`)
+; — the fmt idiom. The qualifier drops (classes key unqualified, same as
+; `annot_type`); the template form gets the same two edges as above.
+(class_specifier
+  name: [(type_identifier) (template_type)] @def.class.name
+  (base_class_clause
+    (qualified_identifier
+      name: (template_type name: (type_identifier) @parent) @parent)))
+(struct_specifier
+  name: [(type_identifier) (template_type)] @def.class.name
+  (base_class_clause
+    (qualified_identifier
+      name: (template_type name: (type_identifier) @parent) @parent)))
+(class_specifier
+  name: [(type_identifier) (template_type)] @def.class.name
+  (base_class_clause
+    (qualified_identifier name: (type_identifier) @parent)))
+(struct_specifier
+  name: [(type_identifier) (template_type)] @def.class.name
+  (base_class_clause
+    (qualified_identifier name: (type_identifier) @parent)))
 (union_specifier name: (type_identifier) @def.class.name) @def.class
 ; a BODIED named union additionally scopes its members (outline nesting +
 ; the hover overlay's sibling group) and tags them with the union's name.
@@ -161,8 +182,11 @@
 ; the underlying type TEXT, joined to @alias.name by match; the extractor
 ; mints a `TypeName(alias) → <underlying>` witness so a declared `U16 x;`
 ; chases the alias to its leaf type (`unsigned short`) for hover / typing.
+; A `template_type` underlying (`typedef vec<int> IntVec;`) rides the same
+; edge — `annot_type` peels the spelling into the `Instance` flavor, so an
+; `IntVec v; v.size()` dispatches through the template base.
 (type_definition
-  type: [(primitive_type) (sized_type_specifier) (type_identifier)] @alias.of
+  type: [(primitive_type) (sized_type_specifier) (type_identifier) (template_type)] @alias.of
   declarator: (type_identifier) @alias.name)
 ; C++ `using U16 = unsigned short;` — same alias, `alias_declaration` shape.
 (alias_declaration

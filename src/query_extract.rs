@@ -1030,6 +1030,15 @@ pub fn cpp_pack() -> LangPack {
                         .or_else(|| t.strip_prefix("enum "))
                         .unwrap_or(t)
                         .trim();
+                    // A template spelling (`Box<Widget>`, `vector<int>`)
+                    // peels into the Instance flavor: dispatch keys the
+                    // BASE so members resolve through the plain-class
+                    // machinery; the args ride along for substitution.
+                    if let Some(p) =
+                        crate::file_analysis::ParametricType::instance_from_spelling(tag)
+                    {
+                        return Some(Parametric(p));
+                    }
                     let typeish = !tag.is_empty()
                         && !tag.contains(' ')
                         && tag.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
@@ -2248,45 +2257,10 @@ pub(crate) fn type_alias_payload(
     }
 }
 
-/// The ONE whitespace-canonical form for a C++ template spelling — the
-/// identity key a specialization/instantiation is filed under
-/// (`formatter<int, char>`), however the source spaced or wrapped it. Rules:
-/// every whitespace RUN collapses; a space survives only between two word
-/// characters (`[A-Za-z0-9_]`), where it is lexically load-bearing
-/// (`unsigned long`); a comma is followed by exactly one space when more
-/// text follows. Ordinary identifiers (no whitespace, no comma) pass
-/// through unchanged.
-pub fn canonical_template_spelling(raw: &str) -> String {
-    if !raw.contains(|c: char| c.is_whitespace() || c == ',') {
-        return raw.to_string();
-    }
-    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_whitespace() {
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
-            let prev_word = out.chars().next_back().is_some_and(is_word);
-            let next_word = chars.peek().copied().is_some_and(is_word);
-            if prev_word && next_word {
-                out.push(' ');
-            }
-        } else if c == ',' {
-            out.push(',');
-            while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                chars.next();
-            }
-            if chars.peek().is_some() {
-                out.push(' ');
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+// The canonical template-spelling rule lives in the Model layer
+// (`file_analysis.rs`) so the `ParametricType::Instance` peel shares it;
+// re-exported here because the pack `shape_name`s are its Build-side home.
+pub use crate::file_analysis::canonical_template_spelling;
 
 /// Is `body` a bare TYPE spelling (a macro that aliases a type), rather than a
 /// value/expression? Accepts identifier/keyword words possibly `::`-qualified
