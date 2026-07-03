@@ -290,6 +290,50 @@ fn walk_macro_defs(
     }
 }
 
+/// A cheap structural signature over a file's first ~1KB, for routing a file
+/// whose extension no driver claims (hitlist-2 #13: `commands.def`, a 12.7k
+/// line C dispatch table with an unowned extension, went entirely dark under
+/// the Perl fallback). NOT an extension list — `.def` is ambiguous across
+/// ecosystems (a Windows module-definition file is `LIBRARY`/`EXPORTS`
+/// stanzas, not C) so the extension alone can't decide; this reads content.
+/// Scores C-preprocessor directives and brace/semicolon statement shape
+/// against Perl's sigils/keywords, over full lines only (a truncated last
+/// line contributes nothing either way).
+pub fn looks_like_c_family(prefix: &str) -> bool {
+    let mut c_score = 0i32;
+    let mut perl_score = 0i32;
+    for raw in prefix.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('#')
+            && (line[1..].trim_start().starts_with("include")
+                || line[1..].trim_start().starts_with("define")
+                || line[1..].trim_start().starts_with("ifndef")
+                || line[1..].trim_start().starts_with("ifdef")
+                || line[1..].trim_start().starts_with("if ")
+                || line[1..].trim_start().starts_with("endif")
+                || line[1..].trim_start().starts_with("pragma"))
+        {
+            c_score += 3;
+        } else if line.starts_with("package ")
+            || line.starts_with("use strict")
+            || line.starts_with("use warnings")
+            || line.starts_with("sub ")
+            || line.starts_with('$')
+            || line.starts_with('@')
+            || line.starts_with('%')
+        {
+            perl_score += 3;
+        } else if line.ends_with(';') || line.ends_with('{') || line == "}" || line.ends_with("};")
+        {
+            c_score += 1;
+        }
+    }
+    c_score > 0 && c_score > perl_score
+}
+
 pub fn collect_macros(tree: &Tree, src: &[u8]) -> BTreeMap<String, Macro> {
     let mut out = BTreeMap::new();
     walk_macro_defs(tree, src, |n, m, _span| {
@@ -487,12 +531,23 @@ fn guard_trail(node: tree_sitter::Node, src: &[u8]) -> Vec<String> {
                     .and_then(|s| std::str::from_utf8(s).ok())
                     .map(|s| s.trim_start().starts_with("#ifndef"))
                     .unwrap_or(false);
-                let base = if ndef {
-                    format!("!defined({name})")
+                // The header-guard idiom (`#ifndef X` / `#define X` as the
+                // FIRST thing inside it) makes X true for the rest of the
+                // file from here on — it's not a real config knob, so a
+                // descendant nested in the primary branch must not inherit
+                // "!defined(X)" as a guard term (hitlist-2 #17: every macro
+                // in a guarded header was picking up its file's own include
+                // guard as a bogus UNKNOWN reachability label).
+                if ndef && !is_alt && is_self_defining_guard(p, &name, src) {
+                    // term suppressed — always-true past this point.
                 } else {
-                    format!("defined({name})")
-                };
-                terms.push(if is_alt { negate(&base) } else { base });
+                    let base = if ndef {
+                        format!("!defined({name})")
+                    } else {
+                        format!("defined({name})")
+                    };
+                    terms.push(if is_alt { negate(&base) } else { base });
+                }
             }
             // #else contributes no condition of its own — the negation of the
             // arm it belongs to is applied when we ascend into the parent
@@ -504,6 +559,20 @@ fn guard_trail(node: tree_sitter::Node, src: &[u8]) -> Vec<String> {
     }
     terms.reverse();
     terms
+}
+
+/// True when `p` (a `#ifndef NAME` / `#ifdef NAME` `preproc_ifdef`) directly
+/// `#define`s `NAME` as one of its own children — the canonical include-guard
+/// idiom (`#ifndef X` / `#define X` / ... / `#endif`). Structural, not a name
+/// list: any macro whose enclosing conditional it also defines is self-
+/// guarding, regardless of the guard's own spelling.
+fn is_self_defining_guard(p: tree_sitter::Node, name: &str, src: &[u8]) -> bool {
+    let mut c = p.walk();
+    let hit = p.named_children(&mut c).any(|child| {
+        child.kind() == "preproc_def"
+            && child.child_by_field_name("name").and_then(|n| n.utf8_text(src).ok()) == Some(name)
+    });
+    hit
 }
 
 fn negate(cond: &str) -> String {
@@ -2337,6 +2406,57 @@ impl MemberBlockPlan {
     pub fn is_empty(&self) -> bool {
         self.edges.is_empty() && self.bases.is_empty()
     }
+}
+
+/// One class/struct-body member's access region (hitlist-2 #18): its own
+/// declaration span, and whether it's reachable from OUTSIDE the class
+/// (`false` = public). Two-state — `private`/`protected` both fold to
+/// non-public; friend declarations and the protected-vs-private distinction
+/// are noted as a follow-up, not modeled here.
+pub struct AccessRegion {
+    pub span: crate::file_analysis::Span,
+    pub non_public: bool,
+}
+
+/// Walk every `field_declaration_list` in `source`, tracking the current
+/// `public:`/`private:`/`protected:` label as a flat linear scan over its
+/// direct children (the label applies to every following member until the
+/// next label or the body's end — access specifiers are siblings, not
+/// nesting, so this can't be a declarative query). `class` bodies default
+/// private, `struct` bodies default public — the language's own rule, read
+/// off the body's parent node kind rather than guessed.
+pub fn access_regions(parser: &mut tree_sitter::Parser, source: &str) -> Vec<AccessRegion> {
+    let Some(tree) = parser.parse(source, None) else { return Vec::new() };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "field_declaration_list" {
+            let mut non_public =
+                node.parent().is_some_and(|p| p.kind() == "class_specifier");
+            let mut c = node.walk();
+            for child in node.named_children(&mut c) {
+                if child.kind() == "access_specifier" {
+                    non_public = match child.utf8_text(src) {
+                        Ok("public") => false,
+                        Ok("private") | Ok("protected") => true,
+                        _ => non_public,
+                    };
+                    continue;
+                }
+                out.push(AccessRegion {
+                    span: crate::file_analysis::Span {
+                        start: child.start_position(),
+                        end: child.end_position(),
+                    },
+                    non_public,
+                });
+            }
+        }
+        let mut c = node.walk();
+        stack.extend(node.children(&mut c));
+    }
+    out
 }
 
 /// Classify member-block macros by struct-body usage, blank the uses, and mint

@@ -284,6 +284,70 @@ struct s { M x:9; };
     assert_eq!(by_line[&6].body, "unsigned");
 }
 
+/// Content sniff (hitlist-2 #13): a `.def`-style C dispatch table (no
+/// recognizable extension) reads as C-family on its preprocessor/brace
+/// shape; a Perl script with the same unowned extension must NOT.
+#[test]
+fn sniff_c_family_vs_perl_on_content() {
+    let c_src = "\
+/* Automatically generated */
+const char *COMMAND_GROUP_STR[] = {
+    \"generic\",
+    \"string\",
+};
+#ifndef SKIP_CMD_HISTORY_TABLE
+struct redisCommand cmd;
+#endif
+";
+    assert!(looks_like_c_family(c_src), "C dispatch-table shape should sniff as C-family");
+
+    let perl_src = "\
+use strict;
+use warnings;
+package Foo::Bar;
+
+sub greet {
+    my ($self, $name) = @_;
+    return \"hi $name\";
+}
+";
+    assert!(!looks_like_c_family(perl_src), "a Perl script must not sniff as C-family");
+
+    assert!(!looks_like_c_family(""), "empty content has no opinion");
+}
+
+/// The header-guard idiom (`#ifndef X` / `#define X`) is NOT a real config
+/// knob: a macro nested under it must not inherit "!defined(X)" as a guard
+/// term (hitlist-2 #17 — gd on nearly every macro in a guarded header was
+/// printing a bogus `(if !defined(__REDIS_H))` label). A genuinely
+/// conditional macro nested in the SAME guarded region keeps its own guard.
+#[test]
+fn header_guard_is_not_a_config_knob() {
+    let mut p = cpp_parser();
+    let src = "\
+#ifndef FOO_H
+#define FOO_H
+#define PLAIN 1
+#ifdef ENABLE_X
+#define GATED 2
+#endif
+#endif
+";
+    let tree = parse(&mut p, src);
+    let variants = collect_macro_variants(&tree, src.as_bytes());
+    assert!(variants["FOO_H"][0].guards.is_empty(), "the guard's own #define carries no terms");
+    assert!(
+        variants["PLAIN"][0].guards.is_empty(),
+        "a plain macro nested in the header guard doesn't inherit it: {:?}",
+        variants["PLAIN"][0].guards
+    );
+    assert_eq!(
+        variants["GATED"][0].guards,
+        vec!["defined(ENABLE_X)".to_string()],
+        "a REAL conditional nested in the same guard keeps its own guard"
+    );
+}
+
 /// A bodyless `#define FLAG` is the canonical config knob — it must enter
 /// the macro universe (and the defined set when unconditional), or the
 /// reachability ranking of `#ifdef FLAG` arms comes out exactly inverted.

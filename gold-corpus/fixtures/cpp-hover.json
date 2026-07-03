@@ -210,7 +210,7 @@
       "expect": {
         "all": [
           "RED: Color",
-          "*variable*"
+          "*enumerator*"
         ],
         "none": [
           "```perl"

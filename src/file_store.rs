@@ -80,12 +80,17 @@ impl FileStore {
     /// Open a file from text. Parses and builds analysis. If a workspace entry
     /// exists for the same path, it's replaced by the Open entry.
     pub fn open(&self, url: Url, text: String) -> bool {
-        // Route by extension: a PACK language (cpp, ...) goes through its
-        // driver; Perl and unknown extensions keep the exact existing path
-        // (Document::new) so the reference behaviour is byte-for-byte.
+        // Route by extension, falling back to a content sniff when no driver
+        // claims it (hitlist-2 #13): a PACK language (cpp, ...) goes through
+        // its driver; Perl and truly-unrecognized files keep the exact
+        // existing path (Document::new) so the reference behaviour is
+        // byte-for-byte.
         let reg = crate::language_driver::LanguageRegistry::with_enabled();
         let path = url.to_file_path().ok();
-        let pack = path.as_ref().and_then(|p| reg.for_path(p)).filter(|d| d.id() != "perl");
+        let pack = path
+            .as_ref()
+            .and_then(|p| reg.for_path_sniffed(p, &text))
+            .filter(|d| d.id() != "perl");
         let doc = match pack {
             Some(driver) => match Document::new_routed(text, driver, path.clone()) {
                 Some(d) => d,

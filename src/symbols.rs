@@ -38,7 +38,9 @@ fn fa_sym_kind_to_lsp(kind: &FaSymKind) -> SymbolKind {
     match kind {
         FaSymKind::Sub => SymbolKind::FUNCTION,
         FaSymKind::Method => SymbolKind::METHOD,
-        FaSymKind::Variable | FaSymKind::Field => SymbolKind::VARIABLE,
+        FaSymKind::Variable => SymbolKind::VARIABLE,
+        FaSymKind::Field => SymbolKind::FIELD,
+        FaSymKind::Enumerator => SymbolKind::ENUM_MEMBER,
         FaSymKind::Package => SymbolKind::NAMESPACE,
         FaSymKind::Class => SymbolKind::CLASS,
         FaSymKind::Module => SymbolKind::MODULE,
@@ -359,7 +361,9 @@ pub(crate) fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
     match kind {
         FaSymKind::Sub => CompletionItemKind::FUNCTION,
         FaSymKind::Method => CompletionItemKind::METHOD,
-        FaSymKind::Variable | FaSymKind::Field => CompletionItemKind::VARIABLE,
+        FaSymKind::Variable => CompletionItemKind::VARIABLE,
+        FaSymKind::Field => CompletionItemKind::FIELD,
+        FaSymKind::Enumerator => CompletionItemKind::ENUM_MEMBER,
         FaSymKind::Package => CompletionItemKind::CLASS,
         FaSymKind::Class => CompletionItemKind::CLASS,
         FaSymKind::Module => CompletionItemKind::MODULE,
@@ -1009,8 +1013,17 @@ pub fn member_completion_for_class(
     class: &str,
     module_index: &dyn crate::file_analysis::CrossFileLookup,
     op_fix: Option<(crate::file_analysis::Span, String)>,
+    point: Point,
 ) -> Option<Vec<CompletionItem>> {
-    let candidates = analysis.complete_members_for_class(class, Some(module_index));
+    // The access-specifier gate (hitlist-2 #18) needs to know whether the
+    // CURSOR itself is lexically inside `class`'s own body — self-access
+    // sees non-public members, an external receiver doesn't.
+    let requesting_class = analysis
+        .scope_at(point)
+        .and_then(|sc| analysis.enclosing_class_for_scope(sc));
+    let candidates = analysis.complete_members_for_class(
+        class, Some(module_index), requesting_class.as_deref(),
+    );
     if candidates.is_empty() {
         return None;
     }
@@ -1217,6 +1230,31 @@ fn render_candidate_hover(
 /// type — exact class for objects, generic for primitives) rather than the
 /// raw decl line, which for a PARAM is the whole function signature. Other
 /// kinds show their declaration line + kind (+ class attribute signals).
+/// The hover/label word for `sym` — one mapping shared by every render path
+/// below (the typed-variable early return AND the declaration-line
+/// fallback), so a kind never gets a different label depending on which
+/// branch happened to serve it. A `#define`-backed callable is a real
+/// `SymKind::Sub` everywhere else (dispatch/completion/goto-def), but its
+/// `"macro"` attribute (stamped at extraction) overrides the label here —
+/// the attribute is the value-borne "this Sub is macro-shaped" fact,
+/// checked before the kind match rather than re-deriving it from the name
+/// (hitlist-2 #19).
+fn hover_kind_label(sym: &crate::file_analysis::Symbol) -> &'static str {
+    if sym.attributes.iter().any(|a| a == "macro") {
+        return "macro";
+    }
+    match sym.kind {
+        FaSymKind::Sub => "function",
+        FaSymKind::Method => "method",
+        FaSymKind::Class => "class",
+        FaSymKind::Package => "namespace",
+        FaSymKind::Variable => "variable",
+        FaSymKind::Field => "field",
+        FaSymKind::Enumerator => "enumerator",
+        _ => "symbol",
+    }
+}
+
 fn render_symbol_hover(
     sym: &crate::file_analysis::Symbol,
     source: &str,
@@ -1226,7 +1264,7 @@ fn render_symbol_hover(
     type_point: Point,
     module_index: Option<&dyn crate::file_analysis::CrossFileLookup>,
 ) -> String {
-    if matches!(sym.kind, FaSymKind::Variable | FaSymKind::Field) {
+    if matches!(sym.kind, FaSymKind::Variable | FaSymKind::Field | FaSymKind::Enumerator) {
         if let Some(ty) = analysis.inferred_type_via_bag_ctx(&sym.name, type_point, module_index) {
             // Config-variant macro type → display the concrete leaf recovered
             // from the config-active variant's alias chain, not the join
@@ -1247,22 +1285,14 @@ fn render_symbol_hover(
                 _ => String::new(),
             };
             return format!(
-                "```{}\n{}: {}{}\n```\n\n*variable*",
-                language, sym.name, display, overlay
+                "```{}\n{}: {}{}\n```\n\n*{}*",
+                language, sym.name, display, overlay, hover_kind_label(sym)
             );
         }
     }
     let line = source.lines().nth(line_at.row).unwrap_or("").trim();
     let sig = line.trim_end_matches([' ', '{', ';']).trim();
-    let kind = match sym.kind {
-        FaSymKind::Sub => "function",
-        FaSymKind::Method => "method",
-        FaSymKind::Class => "class",
-        FaSymKind::Package => "namespace",
-        FaSymKind::Variable | FaSymKind::Field => "variable",
-        _ => "symbol",
-    };
-    let mut out = format!("```{}\n{}\n```\n\n*{}*", language, sig, kind);
+    let mut out = format!("```{}\n{}\n```\n\n*{}*", language, sig, hover_kind_label(sym));
     if matches!(sym.kind, FaSymKind::Class) {
         for attr in &sym.attributes {
             out.push_str(&format!("\n\n*{}*", attr));

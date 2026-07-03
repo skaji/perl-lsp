@@ -184,6 +184,35 @@ fn class_content_gate_admits_members_not_locals() {
 }
 
 #[cfg(feature = "cpp")]
+#[test]
+fn member_completion_filters_by_access_specifier() {
+    // Member completion filters by access specifier (hitlist-2 #18): from
+    // OUTSIDE the class only public members offer; from a method of the
+    // SAME class (self-access) everything offers, including private ones.
+    // Must go through `cpp_driver().analyze` (not the raw skeleton→FA path)
+    // — the access-region stamp is a language_driver post-process pass.
+    let fa = cpp_driver().analyze(
+        "class Status {\n\
+         public:\n  bool ok() const;\n  void Update(int x);\n\
+         private:\n  void Ref();\n  void Unref();\n  int rep_;\n\
+         };\n",
+    );
+    let outside_cands = fa.complete_members_for_class("Status", None, None);
+    let outside: Vec<&str> = outside_cands.iter().map(|c| c.label.as_str()).collect();
+    assert!(outside.contains(&"ok"), "{outside:?}");
+    assert!(outside.contains(&"Update"), "{outside:?}");
+    assert!(!outside.contains(&"Ref"), "private method leaked: {outside:?}");
+    assert!(!outside.contains(&"Unref"), "private method leaked: {outside:?}");
+    assert!(!outside.contains(&"rep_"), "private field leaked: {outside:?}");
+
+    let inside = fa.complete_members_for_class("Status", None, Some("Status"));
+    let inside_labels: Vec<&str> = inside.iter().map(|c| c.label.as_str()).collect();
+    for want in ["ok", "Update", "Ref", "Unref", "rep_"] {
+        assert!(inside_labels.contains(&want), "{want} missing from self-access: {inside_labels:?}");
+    }
+}
+
+#[cfg(feature = "cpp")]
 fn sym_in<'a>(
     fa: &'a crate::file_analysis::FileAnalysis,
     n: &str,

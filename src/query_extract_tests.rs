@@ -931,7 +931,7 @@ fn cpp_clean_baseline_outline() {
     assert!(defs.contains(&("class".into(), "Shape".into())), "{defs:?}");
     assert!(defs.contains(&("class".into(), "Circle".into())), "{defs:?}");
     assert!(defs.contains(&("method".into(), "area".into())), "{defs:?}");
-    assert!(defs.contains(&("var".into(), "radius".into())), "{defs:?}");
+    assert!(defs.contains(&("field".into(), "radius".into())), "{defs:?}");
     assert!(defs.contains(&("sub".into(), "main".into())), "{defs:?}");
     // namespace stickiness: Shape/Circle carry package=geo
     let shape = skel.symbols.iter().find(|s| s.name == "Shape").unwrap();
@@ -1022,7 +1022,7 @@ int main() {
     let skel = cpp_skel(&rewritten);
     let defs: Vec<(String, String)> = skel.symbols.iter().map(|s| (s.kind.clone(), s.name.clone())).collect();
     assert!(defs.contains(&("class".into(), "Box".into())), "class recovered: {defs:?}");
-    assert!(defs.contains(&("var".into(), "width".into())), "field recovered: {defs:?}");
+    assert!(defs.contains(&("field".into(), "width".into())), "field recovered: {defs:?}");
 
     use crate::file_analysis::InferredType;
     let fa = skel.into_file_analysis();
@@ -1723,6 +1723,38 @@ fn cpp_fa(src: &str) -> crate::file_analysis::FileAnalysis {
         .into_file_analysis()
 }
 
+/// Class dedup keys on (name, span), not name alone (hitlist-2 #21): an
+/// EXACT re-capture of the same node (a class with a base clause matches
+/// both the bodied pattern and the inheritance pattern in skeleton.scm)
+/// still collapses to one entry, but two GENUINELY DISTINCT classes that
+/// happen to share a bare name in different namespaces must both survive —
+/// the old name-only dedup silently dropped the second one.
+#[test]
+fn class_dedup_keys_on_name_and_span_not_name_alone() {
+    // same-span double-capture (bodied + inheritance patterns, one node)
+    // still collapses to a single `Circle`.
+    let fa = cpp_fa(
+        "class Shape { public: int x; };\n\
+         class Circle : public Shape { public: int r; };\n",
+    );
+    let circles: Vec<_> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, crate::file_analysis::SymKind::Class) && s.name == "Circle")
+        .collect();
+    assert_eq!(circles.len(), 1, "one node, two matching patterns, still one symbol");
+
+    // two DIFFERENT classes sharing a bare name in different namespaces
+    // both survive (previously the second `Node` vanished).
+    let fa2 = cpp_fa("namespace A { struct Node { int a; }; }\nnamespace B { struct Node { int b; }; }\n");
+    let nodes: Vec<_> = fa2
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, crate::file_analysis::SymKind::Class) && s.name == "Node")
+        .collect();
+    assert_eq!(nodes.len(), 2, "distinct classes at distinct spans must both survive: {nodes:?}");
+}
+
 #[test]
 fn canonical_template_spelling_normalizes_whitespace() {
     assert_eq!(canonical_template_spelling("formatter"), "formatter");
@@ -2014,7 +2046,7 @@ typedef union {
     assert_eq!(overlay.len(), 1);
     assert!(overlay[0].starts_with("op_pmtargetgv"), "{overlay:?}");
     // completion: real members offered flat on pm; the synthetic container never
-    let cands = fa.complete_members_for_class("pm", None);
+    let cands = fa.complete_members_for_class("pm", None, None);
     let labels: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
     for want in ["op_first", "op_pmreplroot", "op_pmtargetgv", "u2a", "named_u"] {
         assert!(labels.contains(&want), "{want} missing from {labels:?}");

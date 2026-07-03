@@ -57,6 +57,16 @@ pub trait LanguageDriver: Send + Sync {
     fn analysis_input_fingerprint(&self) -> u64 {
         0
     }
+    /// Content sniff for a file whose extension no driver claims (the
+    /// `for_path` registry lookup came up empty) — a structural signature
+    /// over the first ~1KB, never a name/extension list (rule #10:
+    /// `commands.def` is C, a Windows `.def` module-definition file isn't,
+    /// same extension). Default: no opinion: an unclaimed extension is a
+    /// weak, ambiguous signal, so only a driver that positively recognizes
+    /// its own shape should claim it.
+    fn sniff(&self, _prefix: &str) -> bool {
+        false
+    }
 }
 
 /// Perl — the reference driver. Wraps the production builder; behaviour
@@ -143,6 +153,17 @@ pub struct PackDriver {
     /// `LanguageDriver::analysis_input_fingerprint`). `None` = no external
     /// inputs (fingerprint 0).
     input_fingerprint: Option<fn() -> u64>,
+    /// Content-sniff for the unknown-extension fallback (see
+    /// `LanguageDriver::sniff`). `None` = this driver never claims an
+    /// extension it doesn't already list (python/R/cmake have unambiguous
+    /// extensions; only C/C++ shares its extension space with unrelated
+    /// formats).
+    sniff: Option<fn(&str) -> bool>,
+    /// `public:`/`private:`/`protected:` region scan (C preprocessor-free
+    /// languages only; `None` when the language has no access-specifier
+    /// concept). Stamps a `non_public` attribute on member symbols so
+    /// completion can filter by visibility (hitlist-2 #18).
+    access_regions: Option<fn(&mut tree_sitter::Parser, &str) -> Vec<crate::cpp_reparse::AccessRegion>>,
 }
 
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
@@ -234,6 +255,16 @@ impl LanguageDriver for PackDriver {
                 let mut fa = skel.into_file_analysis();
                 fa.macro_defs = macro_defs;
                 apply_attribute_macros(&mut fa, &recovered);
+                // Access-specifier regions (hitlist-2 #18): a fresh parse of
+                // the ORIGINAL source (spans already in original coords, no
+                // remap needed) tags each member symbol non-public when its
+                // declaration falls under `private:`/`protected:`.
+                if let Some(f) = self.access_regions {
+                    let regions = crate::timings::phase("cpp.access_regions", || {
+                        f(&mut parser, source)
+                    });
+                    stamp_access_regions(&mut fa, &regions);
+                }
                 // The file's include closure is the cross-file visibility key
                 // (`ScopedLookup`). Computed here — the driver holds the path the
                 // resolver needs; empty on-open until the header cache warms.
@@ -268,6 +299,9 @@ impl LanguageDriver for PackDriver {
     fn analysis_input_fingerprint(&self) -> u64 {
         self.input_fingerprint.map(|f| f()).unwrap_or(0)
     }
+    fn sniff(&self, prefix: &str) -> bool {
+        self.sniff.is_some_and(|f| f(prefix))
+    }
 }
 
 #[cfg(feature = "cpp")]
@@ -292,6 +326,8 @@ fn cpp_driver() -> PackDriver {
         member_blocks: Some(crate::cpp_reparse::plan_member_blocks),
         include_closure: Some(crate::cpp_reparse::include_closure),
         input_fingerprint: Some(crate::cpp_reparse::toolchain_fingerprint),
+        sniff: Some(crate::cpp_reparse::looks_like_c_family),
+        access_regions: Some(crate::cpp_reparse::access_regions),
     }
 }
 
@@ -313,6 +349,8 @@ fn python_driver() -> PackDriver {
         member_blocks: None,
         include_closure: None,
         input_fingerprint: None,
+        sniff: None,
+        access_regions: None,
     }
 }
 
@@ -334,6 +372,8 @@ fn r_driver() -> PackDriver {
         member_blocks: None,
         include_closure: None,
         input_fingerprint: None,
+        sniff: None,
+        access_regions: None,
     }
 }
 
@@ -356,6 +396,8 @@ fn cmake_driver() -> PackDriver {
         member_blocks: None,
         include_closure: None,
         input_fingerprint: None,
+        sniff: None,
+        access_regions: None,
     }
 }
 
@@ -496,6 +538,38 @@ fn inject_member_blocks(
                     span: m.name_span,
                 });
             }
+        }
+    }
+}
+
+/// Tag every member symbol whose declaration falls inside a non-public
+/// access region with a `"non_public"` attribute (hitlist-2 #18) — a
+/// value-borne fact on the symbol, so member completion filters by asking
+/// the symbol, never by re-deriving visibility from a name/kind guess.
+/// Span containment (not equality) because a region's span is the whole
+/// declaration node (`field_declaration`/`function_definition`) while a
+/// Method/Sub Symbol's own span can be the narrower body-having node.
+#[cfg_attr(not(feature = "cpp"), allow(dead_code))]
+fn stamp_access_regions(fa: &mut FileAnalysis, regions: &[crate::cpp_reparse::AccessRegion]) {
+    use crate::file_analysis::Span;
+    let contains = |o: &Span, i: &Span| {
+        (o.start.row, o.start.column) <= (i.start.row, i.start.column)
+            && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
+    };
+    for sym in &mut fa.symbols {
+        if sym.package.is_none() {
+            continue;
+        }
+        let non_public = regions
+            .iter()
+            .filter(|r| contains(&r.span, &sym.span))
+            .min_by_key(|r| {
+                let s = r.span;
+                (s.end.row - s.start.row, s.end.column.saturating_sub(s.start.column))
+            })
+            .is_some_and(|r| r.non_public);
+        if non_public && !sym.attributes.iter().any(|a| a == "non_public") {
+            sym.attributes.push("non_public".to_string());
         }
     }
 }
@@ -861,6 +935,23 @@ impl LanguageRegistry {
 
     pub fn for_id(&self, id: &str) -> Option<&dyn LanguageDriver> {
         self.drivers.iter().find(|d| d.id() == id).map(|d| d.as_ref())
+    }
+
+    /// `for_path`, falling back to a content sniff when no driver claims the
+    /// extension (hitlist-2 #13). `source` is the file text the caller
+    /// already has in hand — no extra I/O. Perl never sniffs (it's the
+    /// default fallback the caller uses when this also returns `None`), so
+    /// only pack drivers get a vote.
+    pub fn for_path_sniffed(&self, path: &Path, source: &str) -> Option<&dyn LanguageDriver> {
+        if let Some(d) = self.for_path(path) {
+            return Some(d);
+        }
+        let mut cut = source.len().min(1024);
+        while cut > 0 && !source.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let prefix = &source[..cut];
+        self.drivers.iter().find(|d| d.id() != "perl" && d.sniff(prefix)).map(|d| d.as_ref())
     }
 
     /// Configured language ids — what this distribution serves.

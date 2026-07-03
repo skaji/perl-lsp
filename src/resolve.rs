@@ -1095,9 +1095,12 @@ impl<'a> CandidateSet<'a> {
                 && s.package.as_deref() == Some(class)
                 && match s.kind {
                     SymKind::Method | SymKind::Sub => true,
-                    // A data member must be the class's OWN content, not a
-                    // sub-body local carrying the class as sticky package.
-                    SymKind::Variable | SymKind::Field => fa.symbol_is_class_content(s),
+                    // A data member (or enum constant) must be the class's
+                    // OWN content, not a sub-body local carrying the class
+                    // as sticky package.
+                    SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
+                        fa.symbol_is_class_content(s)
+                    }
                     _ => false,
                 }
         };
@@ -1639,10 +1642,13 @@ impl<'a> CandidateSet<'a> {
                                     )];
                                 }
                             }
-                            // cpp data field: a Variable/Field member, not a sub.
+                            // cpp data field (or enum constant): a
+                            // Variable/Field/Enumerator member, not a sub.
                             if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
-                                matches!(s.kind, SymKind::Variable | SymKind::Field)
-                                    && s.name == method
+                                matches!(
+                                    s.kind,
+                                    SymKind::Variable | SymKind::Field | SymKind::Enumerator
+                                ) && s.name == method
                                     && s.package.as_deref() == Some(class.as_str())
                                     && cached.analysis.symbol_is_class_content(s)
                             }) {
@@ -1691,7 +1697,8 @@ impl<'a> CandidateSet<'a> {
                 let name = r.unqualified_target_name();
                 if let Some(cached) = idx.get_cached(name) {
                     if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
-                        s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Variable)
+                        s.name == name
+                            && matches!(s.kind, SymKind::Sub | SymKind::Variable | SymKind::Enumerator)
                     }) {
                         if Url::from_file_path(&cached.path).is_ok() {
                             // A call resolving to a header PROTOTYPE offers

@@ -179,9 +179,9 @@
       "expect": {
         "all": [
           "\"kind\":\"Variable\",\"line\":\"8\",\"name\":\"op_pmreplrootu\",\"package\":\"pmop2\"",
-          "\"container\":\"op_pmreplrootu\",\"kind\":\"Variable\",\"line\":\"6\",\"name\":\"op_pmreplroot\",\"package\":\"pmop2\"",
-          "\"container\":\"op_pmreplrootu\",\"kind\":\"Variable\",\"line\":\"7\",\"name\":\"op_pmtargetoff\",\"package\":\"pmop2\"",
-          "\"container\":\"(union)\",\"kind\":\"Variable\",\"line\":\"10\",\"name\":\"anon_a\",\"package\":\"pmop2\""
+          "\"container\":\"op_pmreplrootu\",\"kind\":\"Field\",\"line\":\"6\",\"name\":\"op_pmreplroot\",\"package\":\"pmop2\"",
+          "\"container\":\"op_pmreplrootu\",\"kind\":\"Field\",\"line\":\"7\",\"name\":\"op_pmtargetoff\",\"package\":\"pmop2\"",
+          "\"container\":\"(union)\",\"kind\":\"Field\",\"line\":\"10\",\"name\":\"anon_a\",\"package\":\"pmop2\""
         ],
         "none": []
       },
