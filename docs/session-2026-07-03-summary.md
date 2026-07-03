@@ -77,3 +77,49 @@ parked ledger. Spike tip: `3efdd9bb`. Main tip: `460419e` (PR #107 merged).
 Dogfood squadron over `/home/veesh/personal/cpp-bench/` (abseil, fmt,
 folly, json, redis) probing outline/gd/gr/gi via the CLI on the spike
 binary — findings land in `docs/hitlist-2.md`.
+
+## Part 2 — dogfood round 2 + the hitlist-2 fix run (session close)
+
+**Dogfood round 2** (3 sonnet agents on abseil/fmt+json/redis, task-driven,
+grep-sanity-checked; wave 2: repro-reducer + root-causer): 21 findings →
+`docs/hitlist-2.md`. Root causes CONFIRMED (not guessed): the gr undercounts
+were split macro identity + namespace-blind qualified calls (the
+include-closure hypothesis was tested and REFUTED); basic_json's
+invisibility was per-FILE expansion validation discarding good splices.
+
+**The fix run (slices A–E, all landed + swept):**
+- **A+B identity**: unified macro identity (GUARDED_BY gr 56/56/56 from any
+  origin, grep-exact), owner-keyed member refs (`format` 1621→17), namespace
+  participation (`format_to` 10→90; detail:: separated), spec-ladder
+  type-gd, qualified/middle-segment enum gd. Arity ranking evaluated,
+  deferred (needs extraction-minted arg facts).
+- **C extraction**: all 8 wave-2 xfails promoted — operators (fmt 0→42),
+  pointer prototypes, fn-ptr typedefs, nested unions, scope-desync repair,
+  macro-guarded namespaces, per-macro-name splice salvage (basic_json
+  Class restored; raw_hash_set's ~800 lines parented). KEY INVARIANT:
+  `parse_damage` alone is gameable — every repair gate now pairs it with
+  a bodied-structure-count floor.
+- **D**: hover = a CandidateSet projection (gd/hover agreement invariant
+  tested; the GUARDED_BY wrong-hover fixed); decl→def ranking (bodied
+  defs first, decls kept); the Function-lane visibility gate re-activated
+  (caught + fixed the textually-#included-.c closure case; zmalloc 330
+  exact, croak 199 — +5 legit from C's prototype extraction).
+- **E polish**: `.def` content-sniffing (commands.def: 906 symbols
+  recovered), header-guard label suppression, access-filtered member
+  completion (two-state), SymKind::Enumerator/Field + macro kind labels,
+  CLI convention docs, (name,span) dedup.
+- **Cruft sweep**: −13 LOC, 0 warnings all builds, docs current,
+  leave-alone verdicts recorded.
+
+**Open forks awaiting ratification** (`docs/open-forks.md`): hover
+presentation payload (picked bare RefLocation); Function-lane def_paths
+minting location (picked set-level under pack_routed). Both cheap to undo.
+
+**Residuals pinned** (hitlist-2 + KNOWN-GAPS): json.hpp #if-in-class
+attribution stop (config-superposition tier), one `private:` leak shape,
+strip-blanked tokens not re-minted as refs, per-macro-name salvage
+granularity, bool→Numeric (needs InferredType::Bool across the lattice).
+
+**Next session opens on:** dogfood round 3 (folly/spdlog debut + re-probes
+of the fixed items), the forks review, and the standing parked ledger
+(Part 1 above).
