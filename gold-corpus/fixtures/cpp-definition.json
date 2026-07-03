@@ -498,6 +498,42 @@
           "tmpl_typing.cpp:26"
         ]
       }
+    },
+    {
+      "id": "cpp-hitlist2-fnptr-typedef-gd-dark",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` — a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use — verbs disagree on one symbol).",
+      "file": "fnptr_typedef.cpp",
+      "line": 1,
+      "col": 0,
+      "expect": {
+        "all": [
+          "fnptr_typedef.cpp:1:17"
+        ],
+        "none": []
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist2-nested-union-cross-file-gd-dark",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/nestunion",
+      "comment": "hitlist-2 #16: `union U { struct { int ping; } data; }` in a header, accessed cross-file as `u->data.ping`. gd on `ping` at the use site can't reach the field decl (the anonymous-struct-in-union DX covers the defining file's own outline/completion, per union_nest.c, but not cross-file access).",
+      "file": "use.c",
+      "line": 2,
+      "col": 12,
+      "expect": {
+        "all": [
+          "msg.h:3:13"
+        ],
+        "none": []
+      },
+      "status": "xfail"
     }
   ]
 }

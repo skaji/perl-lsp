@@ -405,6 +405,26 @@
         ],
         "none": []
       }
+    },
+    {
+      "id": "cpp-hitlist2-using-reexport-hover-wrong-bare-name",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #8 companion, hitlist theme #14 (cross-verb disagreement): hover on `x.insert()` (Derived, re-exporting Base::insert via `using Base::insert;`) resolves to the WRONG bare-name match `Other::insert` (an unrelated same-named plant) even though gd on the identical position already reaches Base::insert correctly.",
+      "file": "using_reexport.cpp",
+      "line": 13,
+      "col": 6,
+      "expect": {
+        "all": [
+          "struct Base { void insert(); }"
+        ],
+        "none": [
+          "struct Other"
+        ]
+      },
+      "status": "xfail"
     }
   ]
 }
