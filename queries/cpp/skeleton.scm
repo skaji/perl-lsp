@@ -169,6 +169,14 @@
 (field_declaration
   type: (union_specifier body: (field_declaration_list) @scope)
   declarator: (field_identifier)? @def.unionfield.name) @def.unionfield
+; a field typed by an ANONYMOUS aggregate (`struct { int ping; } data;`
+; inside a named union/struct): the anon members are flattened onto the
+; enclosing NAMED container (sticky @context.class), so the field's own
+; type IS that container — the anon hop is identity. `u->data.ping` then
+; resolves `ping` where the model put it, including cross-file.
+(field_declaration
+  type: [(struct_specifier !name body: (_)) (union_specifier !name body: (_))]
+  declarator: (field_identifier) @anonagg.member)
 ; enum CONSTANTS (RED, GREEN) — named values, findable + completable.
 ; @def.enumerator (not @def.var) marks them so the extractor can tag each
 ; with its parent enum (span-contained): `enum Color { RED }` → RED's
@@ -183,10 +191,21 @@
 ; name-dedup in into_file_analysis collapses the overlap.)
 (type_definition
   declarator: (type_identifier) @def.class.name) @def.class
+; the fn-ptr name sits inside a parenthesized_declarator:
+; `(*CB)` = parenthesized_declarator > pointer_declarator > type_identifier.
+; A pointer-RETURNING fn-ptr (`typedef void *(*loader)(int);`) wraps the
+; whole function_declarator in one more pointer_declarator — second pattern.
 (type_definition
   declarator: (function_declarator
-    declarator: (pointer_declarator
-      declarator: (type_identifier) @def.class.name))) @def.class
+    declarator: (parenthesized_declarator
+      (pointer_declarator
+        declarator: (type_identifier) @def.class.name)))) @def.class
+(type_definition
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (parenthesized_declarator
+        (pointer_declarator
+          declarator: (type_identifier) @def.class.name))))) @def.class
 
 ; ---- scalar / primitive / alias-chain typedefs → the alias EDGE. ----
 ; `typedef unsigned short U16;`, `typedef uint32_t u32;`, `typedef V16 W16;`
@@ -310,6 +329,22 @@
       scope: (_) @qualifier
       name: (identifier) @def.method.name)
     parameters: (parameter_list) @scope.sub)) @def.method
+; pointer-returning prototypes (`struct T *make_t(int a);`): the
+; function_declarator nests inside a pointer_declarator, same as the
+; definition form above — without this the decl is dropped and its
+; params leak as top-level Variables.
+(declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @def.sub.name
+      parameters: (parameter_list) @scope.sub))) @def.sub
+(declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @qualifier
+        name: (identifier) @def.method.name)
+      parameters: (parameter_list) @scope.sub))) @def.method
 
 ; ---- in-class method declarations (prototypes) & member fields ----
 ; @rettype carries the declared return type → the method's return-type
@@ -333,6 +368,47 @@
     (function_declarator
       declarator: (field_identifier) @def.method.name
       parameters: (parameter_list) @scope.sub))) @def.method
+; operator overloads: the declarator name is an `operator_name` token
+; (`operator+`, `operator<<`), not an identifier/field_identifier, so the
+; name patterns above never see them. In-class decls are Methods; free
+; forms mint @def.sub (the Sub-owned-by-class reclassification in
+; `into_file_analysis` flips in-class definitions to Method). Out-of-line
+; `Ret Vec2::operator+(...)` joins its class via @qualifier.
+(field_declaration
+  type: (_) @rettype
+  declarator: (function_declarator
+    declarator: (operator_name) @def.method.name
+    parameters: (parameter_list) @scope.sub)) @def.method
+(declaration
+  declarator: (function_declarator
+    declarator: (operator_name) @def.sub.name
+    parameters: (parameter_list) @scope.sub)) @def.sub
+(function_definition
+  type: (_) @rettype
+  declarator: (function_declarator
+    declarator: (operator_name) @def.sub.name)) @def.sub
+(function_definition
+  declarator: (function_declarator
+    declarator: (operator_name) @def.sub.name)) @def.sub
+(function_definition
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      scope: (_) @qualifier
+      name: (operator_name) @def.method.name))) @def.method
+; pointer-/reference-returning operator decls (`Vec2& operator+=(...)`)
+(field_declaration
+  type: (_) @rettype
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (operator_name) @def.method.name
+      parameters: (parameter_list) @scope.sub))) @def.method
+(field_declaration
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (operator_name) @def.method.name
+      parameters: (parameter_list) @scope.sub))) @def.method
+
 ; destructor `~Widget()` — tree-sitter parses it as a `declaration` (no
 ; return type), with a `destructor_name` declarator, so the field_declaration
 ; method patterns above miss it. @def.sub + the in-class method
@@ -395,6 +471,18 @@
 ; the same edge it always did (the symbol adds identity, not typing). ----
 (alias_declaration
   name: (type_identifier) @def.class.name) @def.class
+
+; ---- `using Base::insert;` inside a class body: a member RE-EXPORT — an
+; import edge, not a definition. It mints an outline entry under the class
+; (the re-exported name IS part of the class's API) carried as a Method
+; with the "reexport" attribute; member resolution sees THROUGH it to the
+; origin (`method_resolution_on_class` skips reexports), so hover/gd land
+; on the ancestor's real def. Scoped to field_declaration_list so a
+; namespace-level `using std::swap;` mints nothing. ----
+(field_declaration_list
+  (using_declaration
+    (qualified_identifier
+      name: (identifier) @def.reexport.name)) @def.reexport)
 
 ; ---- concepts: the name is a findable type-level symbol; the
 ; requires-expression's parameters (`requires(T a, T b)`) are signature

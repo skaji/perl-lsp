@@ -394,7 +394,7 @@ fn splicemap_binsearch_matches_linear_scan() {
             let end = (start + next(4)).min(src_len); // width 0..3
             let rep_len = next(4); // 0..3, incl. empty
             let replacement: String = std::iter::repeat('X').take(rep_len).collect();
-            splices.push(Splice { start, end, replacement });
+            splices.push(Splice { start, end, replacement, name: String::new() });
             cur = end + 1;
         }
         let (out, map) = apply(&src, &mut splices);

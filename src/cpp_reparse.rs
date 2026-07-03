@@ -57,6 +57,9 @@ struct Splice {
     start: usize,
     end: usize,
     replacement: String,
+    /// The macro NAME this splice expands — the salvage's grouping key
+    /// (a broken body breaks every use, so validation is per-macro).
+    name: String,
 }
 
 /// Transformed-source ↔ original-source map under arbitrary splices.
@@ -561,6 +564,27 @@ fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphanumeric()
 }
 
+/// C/C++ reserved words (the union — this grammar parses both). A closed
+/// language fact, not a macro-name list: a token spelled like one of these
+/// is grammar structure wherever it appears, so the expansion pass must
+/// never rewrite it even when a gathered header #defines it.
+fn is_reserved_keyword(word: &str) -> bool {
+    static KW: &[&str] = &[
+        "alignas", "alignof", "asm", "auto", "bool", "break", "case", "catch", "char",
+        "char16_t", "char32_t", "char8_t", "class", "co_await", "co_return", "co_yield",
+        "concept", "const", "const_cast", "consteval", "constexpr", "constinit", "continue",
+        "decltype", "default", "delete", "do", "double", "dynamic_cast", "else", "enum",
+        "explicit", "export", "extern", "false", "float", "for", "friend", "goto", "if",
+        "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "nullptr",
+        "operator", "private", "protected", "public", "register", "reinterpret_cast",
+        "requires", "restrict", "return", "short", "signed", "sizeof", "static",
+        "static_assert", "static_cast", "struct", "switch", "template", "this",
+        "thread_local", "throw", "true", "try", "typedef", "typeid", "typename", "union",
+        "unsigned", "using", "virtual", "void", "volatile", "wchar_t", "while",
+    ];
+    KW.binary_search(&word).is_ok()
+}
+
 /// Expand object-like macros in a free text fragment (used for body
 /// pre-expansion; no arg machinery — function-like refs in bodies are
 /// left for the source pass). `exclude` is the macro being expanded (blue
@@ -598,6 +622,33 @@ pub fn parse_damage(node: tree_sitter::Node) -> usize {
     let mut stack = vec![node];
     while let Some(x) = stack.pop() {
         if x.is_error() || x.is_missing() {
+            n += 1;
+        }
+        for c in x.children(&mut cur) {
+            stack.push(c);
+        }
+    }
+    n
+}
+
+/// BODIED structure-container count (class/struct/union/enum/namespace) —
+/// the damage count's blind spot. tree-sitter's recovery can trade many
+/// small ERRORs for one giant ERROR that swallows a whole class: the damage
+/// COUNT drops while the file's structure evaporates (abseil's
+/// `raw_hash_set` did exactly this under a blanking round). A repair gate
+/// that only compares damage adopts that trade; pairing it with "bodied
+/// containers must not decrease" rejects it.
+fn structure_count(node: tree_sitter::Node) -> usize {
+    let mut n = 0;
+    let mut cur = node.walk();
+    let mut stack = vec![node];
+    while let Some(x) = stack.pop() {
+        if matches!(
+            x.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+                | "namespace_definition"
+        ) && x.child_by_field_name("body").is_some()
+        {
             n += 1;
         }
         for c in x.children(&mut cur) {
@@ -716,11 +767,9 @@ fn strip_declarator_macros(
 /// parse damage. An expansion that helps (declarator macros, simple
 /// declaration macros) lands; one that hurts (nested macro CALLS like
 /// X-macros, `##` token-paste — the tail this single pass does not model)
-/// is discarded, so expansion never regresses a file.
-///
-/// Production refinement (noted, not built): validate per-splice rather
-/// than per-file, so a good expansion and a bad one in the same file
-/// don't share a fate.
+/// is salvaged per-splice: the good expansions land, only the bad ones are
+/// dropped (or blank-degraded), so one bad macro never discards a whole
+/// file's recoveries.
 pub fn preprocess_validated_with(
     parser: &mut tree_sitter::Parser,
     src: &str,
@@ -733,11 +782,16 @@ pub fn preprocess_validated_with(
     // the class with the macro's signal — surviving regardless of which return
     // arm fires below, since `src` is the stripped text throughout.
     let (stripped, recovered) = strip_declarator_macros(parser, src);
+    // Blank UNRESOLVED structural macros (macro-before-`namespace`, macro
+    // before a constructor) — expansion can't repair a token it has no
+    // definition for; known names are left for the expansion below.
+    let stripped = strip_unresolved_structural_macros(parser, &stripped, external);
     let src = stripped.as_str();
     let Some(tree) = parser.parse(src, None) else {
         return (src.to_string(), SpliceMap::default(), recovered);
     };
     let before = parse_damage(tree.root_node());
+    let structure = structure_count(tree.root_node());
     let (rewritten, map) = preprocess_with(&tree, src, external);
     if rewritten == src {
         return (rewritten, map, recovered);
@@ -745,11 +799,64 @@ pub fn preprocess_validated_with(
     match parser.parse(&rewritten, None) {
         Some(after) if parse_damage(after.root_node()) <= before => (rewritten, map, recovered),
         _ => {
-            // Full rewrite raised damage (perl.h-style macro soup, all-or-
-            // nothing). Keep only the provably-safe IDENTIFIER-ALIAS
-            // expansions (`op_prune_chain_head → Perl_op_prune_chain_head`)
-            // so macro-name indirection — goto-def + references THROUGH the
-            // alias — survives even when the rest is discarded.
+            // The full rewrite raised damage — one bad expansion (an
+            // unexpanded `##` call inside a namespace-open macro's body)
+            // must not discard the file's GOOD expansions. Bisect the
+            // splice set against the parser's own damage verdict, keeping
+            // every subset that stays at-or-below the baseline; a rejected
+            // splice degrades to a length-preserving blank when THAT
+            // validates (leaving the raw token glues the next declaration
+            // into garbage — the reason it was spliced at all).
+            let full = compute_splices(&tree, src, external, false);
+            let mut budget: u32 = SALVAGE_PARSE_BUDGET;
+            let mut good =
+                salvage_splices(parser, src, &full, (before, structure), &mut budget);
+            if std::env::var_os("PERL_LSP_SALVAGE_DEBUG").is_some() {
+                eprintln!(
+                    "salvage-debug: before_damage={} splices={} kept={} (blanked={}) budget_left={}",
+                    before,
+                    full.len(),
+                    good.len(),
+                    good.iter().filter(|s| s.replacement.bytes().all(|b| b == b' ')).count(),
+                    budget
+                );
+                let mut names: Vec<&str> = full
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .filter(|n| !good.iter().any(|g| g.name == *n))
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                eprintln!("salvage-debug: dropped-names={names:?}");
+                let mut blanked: Vec<&str> = good
+                    .iter()
+                    .filter(|s| s.replacement.bytes().all(|b| b == b' '))
+                    .map(|s| s.name.as_str())
+                    .collect();
+                blanked.sort_unstable();
+                blanked.dedup();
+                eprintln!("salvage-debug: blanked-names={blanked:?}");
+                if let Ok(p) = std::env::var("PERL_LSP_SALVAGE_DUMP") {
+                    let mut g = good.clone();
+                    let (rw, _) = apply(src, &mut g);
+                    let _ = std::fs::write(p, rw);
+                }
+            }
+            if !good.is_empty() {
+                let (rw, map) = apply(src, &mut good);
+                if let Some(t) = parser.parse(&rw, None) {
+                    if parse_damage(t.root_node()) <= before
+                        && structure_count(t.root_node()) >= structure
+                    {
+                        return (rw, map, recovered);
+                    }
+                }
+            }
+            // Nothing salvageable splice-wise. Keep only the provably-safe
+            // IDENTIFIER-ALIAS expansions (`op_prune_chain_head →
+            // Perl_op_prune_chain_head`) so macro-name indirection —
+            // goto-def + references THROUGH the alias — survives even when
+            // the rest is discarded.
             let (alias_rw, alias_map) = preprocess_with_mode(&tree, src, external, true);
             match (alias_rw != src).then(|| parser.parse(&alias_rw, None)).flatten() {
                 Some(a) if parse_damage(a.root_node()) <= before => (alias_rw, alias_map, recovered),
@@ -757,6 +864,248 @@ pub fn preprocess_validated_with(
             }
         }
     }
+}
+
+/// Reparse budget for the per-splice salvage: each `validates` probe is one
+/// full parse of the file, so the bisection is bounded. Exhaustion degrades
+/// to dropping the unprocessed subset — never to keeping an unvalidated one.
+const SALVAGE_PARSE_BUDGET: u32 = 48;
+
+/// Bisect `splices` down to a subset whose application keeps parse damage
+/// at or below `base`. Returns a VALIDATED subset or an empty vec — never an
+/// unvalidated one (the damage-never-rises invariant holds by construction).
+///
+/// Bisection runs over per-MACRO-NAME groups, not individual splices: a
+/// broken body (`##` token paste the single pass doesn't model) breaks
+/// EVERY use of that macro, so the group is the natural validation unit —
+/// and it keeps the reparse count O(names), not O(uses) (json.hpp: ~500
+/// splices, a few dozen names). A rejected group is retried as
+/// length-preserving BLANKS of its use tokens: for a statement-position
+/// macro (the namespace-open idiom) the blank recovers the region even when
+/// the expansion is broken; a blank that breaks an expression fails its own
+/// validation and is dropped — the parser's verdict decides, never the
+/// macro's shape. Paired open/close macros couple through the whole-file
+/// validation: an END whose `}}` lands without its BEGIN raises damage,
+/// fails, and degrades to blanks alongside it.
+fn salvage_splices(
+    parser: &mut tree_sitter::Parser,
+    src: &str,
+    splices: &[Splice],
+    base: (usize, usize),
+    budget: &mut u32,
+) -> Vec<Splice> {
+    let mut by_name: BTreeMap<&str, Vec<Splice>> = BTreeMap::new();
+    for s in splices {
+        by_name.entry(&s.name).or_default().push(s.clone());
+    }
+    let groups: Vec<Vec<Splice>> = by_name.into_values().collect();
+    let mut kept = salvage_groups(parser, src, &groups, base, budget);
+    kept.sort_by_key(|s| s.start);
+    kept
+}
+
+fn salvage_validates(
+    parser: &mut tree_sitter::Parser,
+    src: &str,
+    set: &[Splice],
+    base: (usize, usize),
+    budget: &mut u32,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let mut v = set.to_vec();
+    let (rw, _) = apply(src, &mut v);
+    parser.parse(&rw, None).is_some_and(|t| {
+        parse_damage(t.root_node()) <= base.0 && structure_count(t.root_node()) >= base.1
+    })
+}
+
+fn salvage_groups(
+    parser: &mut tree_sitter::Parser,
+    src: &str,
+    groups: &[Vec<Splice>],
+    base: (usize, usize),
+    budget: &mut u32,
+) -> Vec<Splice> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let all: Vec<Splice> = groups.iter().flatten().cloned().collect();
+    if salvage_validates(parser, src, &all, base, budget) {
+        return all;
+    }
+    if groups.len() == 1 {
+        // The group's expansions hurt — degrade to blanking its use tokens.
+        let blanks: Vec<Splice> = all
+            .iter()
+            .map(|s| Splice {
+                start: s.start,
+                end: s.end,
+                replacement: " ".repeat(s.end - s.start),
+                name: s.name.clone(),
+            })
+            .collect();
+        if salvage_validates(parser, src, &blanks, base, budget) {
+            return blanks;
+        }
+        return Vec::new();
+    }
+    let (l, r) = groups.split_at(groups.len() / 2);
+    let lk = salvage_groups(parser, src, l, base, budget);
+    let rk = salvage_groups(parser, src, r, base, budget);
+    if lk.is_empty() {
+        return rk;
+    }
+    if rk.is_empty() {
+        return lk;
+    }
+    let mut keep = lk.clone();
+    keep.extend(rk.iter().cloned());
+    if salvage_validates(parser, src, &keep, base, budget) {
+        return keep;
+    }
+    // The halves validated separately but interact when combined — keep the
+    // larger half, which validated on its own.
+    if lk.len() >= rk.len() {
+        lk
+    } else {
+        rk
+    }
+}
+
+/// Blank (length-preserving) UNRESOLVED macro tokens in the two structural
+/// positions expansion cannot repair because no definition exists:
+///
+///   * **before `namespace`** — `NS_BEGIN\nnamespace d {…}`: the macro token
+///     absorbs the keyword (`function_definition` with an `identifier`
+///     declarator spelled "namespace") and the whole block's symbols orphan.
+///     The grammar's own verdict is the gate: a `namespace` KEYWORD can never
+///     parse as an `identifier` node in valid C++ (`using namespace` parses
+///     as a using_declaration), so an identifier node spelled "namespace"
+///     proves the token before it is a macro.
+///   * **before a constructor** — `ATTR_NOINLINE Widget(Widget&& w)…` inside
+///     `class Widget`: a member function whose name equals its class can
+///     never carry a return type, so the token in the type slot is a macro.
+///     (With a ctor-initializer the misparse cascades — the init list becomes
+///     a `bitfield_clause` and the rest of the class reparents wrong.)
+///
+/// KNOWN names (file-local or gathered `#define`s) are skipped — expansion
+/// owns those, and blanking a namespace-OPEN macro whose END expands to `}}`
+/// would break brace balance. Iterates to a small fixpoint (blanking one
+/// macro can expose the next misconsumed `namespace`); each round's blanking
+/// must not raise parse damage or it is reverted.
+fn strip_unresolved_structural_macros(
+    parser: &mut tree_sitter::Parser,
+    src: &str,
+    external: &PreExpandedExternal,
+) -> String {
+    let mut cur = src.to_string();
+    for _ in 0..4 {
+        let Some(tree) = parser.parse(&cur, None) else { return cur };
+        let damage = parse_damage(tree.root_node());
+        let structure = structure_count(tree.root_node());
+        let local = collect_macros(&tree, cur.as_bytes());
+        let known = |name: &str| local.contains_key(name) || external.raw.contains_key(name);
+        let bytes = cur.as_bytes();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        let mut walk = tree.root_node().walk();
+        while let Some(n) = stack.pop() {
+            // An ERROR whose entire content is one bare identifier sitting
+            // right AFTER a function_declarator — the post-declarator
+            // attribute-macro position (`T m(...) ATTR { ... }`); no valid
+            // C++ token can stand there, the parser's own verdict. The
+            // sibling gate keeps this away from other single-identifier
+            // ERRORs (a namespace/class NAME stranded inside a macro-glued
+            // misparse must never be blanked).
+            if n.is_error()
+                && n.named_child_count() == 1
+                && n.prev_named_sibling().is_some_and(|p| p.kind() == "function_declarator")
+            {
+                if let Some(c) = n.named_child(0) {
+                    let txt = c.utf8_text(bytes).unwrap_or("");
+                    if c.kind() == "identifier"
+                        && n.utf8_text(bytes).map(str::trim) == Ok(txt)
+                        && !is_reserved_keyword(txt)
+                        && !known(txt)
+                    {
+                        ranges.push((c.start_byte(), c.end_byte()));
+                    }
+                }
+            }
+            match n.kind() {
+                "identifier" if n.utf8_text(bytes) == Ok("namespace") => {
+                    // The token before the misconsumed keyword: skip
+                    // whitespace backward, read the identifier.
+                    let mut e = n.start_byte();
+                    while e > 0 && bytes[e - 1].is_ascii_whitespace() {
+                        e -= 1;
+                    }
+                    let mut s = e;
+                    while s > 0 && is_ident_byte(bytes[s - 1]) {
+                        s -= 1;
+                    }
+                    if s < e && !known(&cur[s..e]) {
+                        ranges.push((s, e));
+                    }
+                }
+                "field_declaration" => {
+                    let mac = n
+                        .child_by_field_name("type")
+                        .filter(|t| t.kind() == "type_identifier");
+                    let leaf = n
+                        .child_by_field_name("declarator")
+                        .filter(|d| d.kind() == "function_declarator")
+                        .and_then(|d| descend_declarator_name(d, bytes));
+                    if let (Some(t), Some(leaf)) = (mac, leaf) {
+                        let class = enclosing_aggregate_name(
+                            tree.root_node(),
+                            &cur,
+                            n.start_byte(),
+                        );
+                        let tt = t.utf8_text(bytes).unwrap_or("");
+                        if class.as_deref() == leaf.utf8_text(bytes).ok()
+                            && class.as_deref() != Some(tt)
+                            && !known(tt)
+                        {
+                            ranges.push((t.start_byte(), t.end_byte()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for c in n.children(&mut walk) {
+                stack.push(c);
+            }
+        }
+        if ranges.is_empty() {
+            return cur;
+        }
+        // Per-candidate adopt/revert: each blank must individually keep
+        // damage from rising AND keep every bodied container (a blank that
+        // trades three small ERRORs for one class-swallowing ERROR lowers
+        // the damage COUNT while erasing the structure — reject it).
+        let mut adopted = false;
+        for (s, e) in ranges {
+            let tentative = blank_ranges(&cur, std::iter::once((s, e)));
+            let Some(t) = parser.parse(&tentative, None) else { continue };
+            if parse_damage(t.root_node()) <= damage
+                && structure_count(t.root_node()) >= structure
+            {
+                if std::env::var_os("PERL_LSP_SALVAGE_DEBUG").is_some() {
+                    eprintln!("strip-debug: blanking {:?}", &cur[s..e]);
+                }
+                cur = tentative;
+                adopted = true;
+            }
+        }
+        if !adopted {
+            return cur;
+        }
+    }
+    cur
 }
 
 /// Gather macros from a C++ file's transitively `#include`d headers, so a
@@ -1668,11 +2017,33 @@ fn preprocess_with_mode_inner(
     alias_only: bool,
     force_slow: bool,
 ) -> (String, SpliceMap) {
+    let mut splices = compute_splices_inner(tree, src, external, alias_only, force_slow);
+    apply(src, &mut splices)
+}
+
+/// The splice set the expansion pass would apply — exposed separately so the
+/// per-splice salvage can bisect it (`salvage_splices`).
+fn compute_splices(
+    tree: &Tree,
+    src: &str,
+    external: &PreExpandedExternal,
+    alias_only: bool,
+) -> Vec<Splice> {
+    compute_splices_inner(tree, src, external, alias_only, force_slow_path())
+}
+
+fn compute_splices_inner(
+    tree: &Tree,
+    src: &str,
+    external: &PreExpandedExternal,
+    alias_only: bool,
+    force_slow: bool,
+) -> Vec<Splice> {
     let eff = crate::timings::phase("cpp.macro_expand", || {
         build_effective_macros(tree, src, external, alias_only, force_slow)
     });
     if eff.is_empty() {
-        return (src.to_string(), SpliceMap::default());
+        return Vec::new();
     }
     let excludes = exclusion_spans(tree);
     // The expansion-policy flip: leave a use unexpanded when it already parses
@@ -1720,6 +2091,14 @@ fn preprocess_with_mode_inner(
                 lc += 1;
             }
             let is_clean_call = lc < leave_calls.len() && leave_calls[lc] == start;
+            // A reserved keyword is never an expansion candidate, whatever
+            // the gathered table says: system headers #define keyword names
+            // in config branches this pass doesn't evaluate (`assert.h`'s
+            // C-only `static_assert`, lint-era `else`), and rewriting a
+            // keyword token corrupts every construct that uses it.
+            if is_reserved_keyword(word) {
+                continue;
+            }
             if let Some(m) = eff.get(word) {
                 if m.params.is_some() && is_clean_call {
                     continue; // leave: parses clean as a call → sub-return types it
@@ -1729,11 +2108,17 @@ fn preprocess_with_mode_inner(
                         start,
                         end: i,
                         replacement: m.body.clone(),
+                        name: word.to_string(),
                     }),
                     Some(params) => {
                         if let Some((args_end, args)) = scan_call_args(bytes, i) {
                             let replacement = substitute(&m.body, params, &args);
-                            splices.push(Splice { start, end: args_end, replacement });
+                            splices.push(Splice {
+                                start,
+                                end: args_end,
+                                replacement,
+                                name: word.to_string(),
+                            });
                             i = args_end;
                         }
                     }
@@ -1743,7 +2128,7 @@ fn preprocess_with_mode_inner(
         }
         i += 1;
     }
-    apply(src, &mut splices)
+    splices
 }
 
 /// From just after a macro name, skip whitespace, require `(`, and scan

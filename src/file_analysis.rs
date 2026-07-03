@@ -860,6 +860,13 @@ pub fn earliest_rebind_in(flow_edges: &[FlowEdge], var: &str, region: Span) -> O
 }
 
 impl Symbol {
+    /// A member RE-EXPORT (`using Base::insert;` in a class body): part of
+    /// the class's API surface (outline/completion) but not a definition —
+    /// member resolution sees through it to the origin ancestor.
+    pub fn is_reexport(&self) -> bool {
+        self.attributes.iter().any(|a| a == "reexport")
+    }
+
     /// Bare variable/field name without the sigil. Uses the sigil stored
     /// in `detail` so we never re-derive it by text-stripping (which would
     /// mis-handle forms like `$$ref` if the name ever carried that shape).
@@ -8905,7 +8912,9 @@ impl FileAnalysis {
                 SymKind::Variable | SymKind::Field => self.symbol_is_class_content(sym),
                 _ => false,
             };
-            if member_kind && self.symbol_in_class(sid, cls) {
+            // A re-export (`using Base::m;`) is API surface, not a def —
+            // fall through so the walk reaches the origin ancestor.
+            if member_kind && !sym.is_reexport() && self.symbol_in_class(sid, cls) {
                 return Some(MethodResolution::Local { class: cls.to_string(), sym_id: sid });
             }
         }
@@ -8926,13 +8935,19 @@ impl FileAnalysis {
         // bridged_to`).
         if let Some(idx) = module_index {
             if let Some(cached) = idx.get_cached(cls) {
-                let has_member = cached.has_sub(method_name)
-                    || cached.analysis.symbols.iter().any(|s| {
-                        matches!(s.kind, SymKind::Variable | SymKind::Field)
-                            && s.name == method_name
-                            && s.package.as_deref() == Some(cls)
-                            && cached.analysis.symbol_is_class_content(s)
-                    });
+                // Class-scoped, not file-scoped: a pack file holds MANY
+                // classes, so "some sub of this name exists in cls's file"
+                // (`has_sub`) would let an unrelated same-named member hijack
+                // the walk at `cls` and stop it before the true ancestor.
+                // Re-exports fall through, same as the local arm.
+                let has_member = cached.analysis.symbols.iter().any(|s| {
+                    s.name == method_name
+                        && s.package.as_deref() == Some(cls)
+                        && !s.is_reexport()
+                        && (matches!(s.kind, SymKind::Sub | SymKind::Method)
+                            || (matches!(s.kind, SymKind::Variable | SymKind::Field)
+                                && cached.analysis.symbol_is_class_content(s)))
+                });
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
                 }
