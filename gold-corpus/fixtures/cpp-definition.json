@@ -505,7 +505,7 @@
       "semantic_area": "cpp-hitlist2",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` — a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use — verbs disagree on one symbol).",
+      "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` \u2014 a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use \u2014 verbs disagree on one symbol).",
       "file": "fnptr_typedef.cpp",
       "line": 1,
       "col": 0,
@@ -534,6 +534,101 @@
         "none": []
       },
       "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist2-spec-ladder-type-gd",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-identity-precision",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typegd.cpp",
+      "line": 6,
+      "col": 14,
+      "comment": "Type-REFERENCE gd consults the specificity ladder: the base-clause fmtr<int> offers the exact spec (ranked first) AND the primary (kept, never pruned) \u2014 the chrono.h:1904 -> 2101 shape.",
+      "expect": {
+        "all": [
+          "tmpl_typegd.cpp:4:20",
+          "tmpl_typegd.cpp:1:30"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-enum-constant-gd",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsenum/use.cc",
+      "line": 2,
+      "col": 24,
+      "comment": "ns::EnumClass::kValue gd: the constant resolves through its owning class (the qualifier segment), not the file-scope by-name tail \u2014 the abseil status.cc:223 shape.",
+      "expect": {
+        "all": [
+          "codes.h:5:3"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-namespace-middle-segment-gd",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsenum/use.cc",
+      "line": 2,
+      "col": 18,
+      "comment": "gd on the MIDDLE segment (the enum-class name inside ns::Code::kBad) resolves to the enum def via the bare-word fallback.",
+      "expect": {
+        "all": [
+          "codes.h:4:12"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-call-gd-alpha",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsqual.cpp",
+      "line": 6,
+      "col": 32,
+      "comment": "gd from a qualified call lands on the SAME-namespace overload, not the sibling namespace's.",
+      "expect": {
+        "all": [
+          "nsqual.cpp:2:5"
+        ],
+        "none": [
+          "nsqual.cpp:5:5"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-call-gd-beta",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsqual.cpp",
+      "line": 6,
+      "col": 47,
+      "comment": "\u2026and the sibling namespace's call lands on ITS def \u2014 the pair proves qualifier-keyed selection.",
+      "expect": {
+        "all": [
+          "nsqual.cpp:5:5"
+        ],
+        "none": [
+          "nsqual.cpp:2:5"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

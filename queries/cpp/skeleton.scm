@@ -429,6 +429,12 @@
 ; ---- calls ----
 (call_expression function: (identifier) @ref.call) @expr.call
 
+; qualified calls (`fmt::format_to(...)`, `detail::vformat_to(...)`,
+; `Widget::create(...)`): the whole path is captured; extraction narrows the
+; ref span to the bare name token and carries the qualifier as
+; `resolved_package` — the namespace-participation half of gr identity.
+(call_expression function: (qualified_identifier) @ref.qcall) @expr.call
+
 ; ---- member access (`recv.field` / `recv->field`, AND `recv.method(...)`):
 ; the field is the "method", the receiver subtree the invocant. Mints the same
 ; MethodCall ref core resolves for Perl `$obj->m` — goto-def / hover /

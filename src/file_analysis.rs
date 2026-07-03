@@ -7695,7 +7695,16 @@ impl FileAnalysis {
                 SymKind::Variable | SymKind::Field => Some(RenameKind::Variable),
                 SymKind::Sub => Some(RenameKind::Function {
                     name: sym.name.clone(),
-                    package: sym.package.clone(),
+                    // Pack analyses attribute namespaces partially (macro-
+                    // guarded opens desync the sticky context) — recover the
+                    // def's namespace positionally so `detail::f` and
+                    // `fmt::f` mint distinct targets. Perl attribution is
+                    // total (closure empty → untouched).
+                    package: sym.package.clone().or_else(|| {
+                        (!self.include_closure.is_empty())
+                            .then(|| self.enclosing_package_of(&sym.span))
+                            .flatten()
+                    }),
                 }),
                 SymKind::Method => {
                     let class = sym.package.clone()?;
@@ -9604,6 +9613,57 @@ impl FileAnalysis {
             cur = s.parent;
         }
         true
+    }
+
+    /// Among class-content symbols, is `sym` an ENUM-CONSTANT shape — a name
+    /// C injects into the ENCLOSING scope, so a bare unresolved read
+    /// (`case OP_SCOPE:`) is a legitimate use? Struct fields, methods, and
+    /// member-block role members are receiver-reached (`o->op_type`); a bare
+    /// same-named token elsewhere is NOT a use of them (the `format`
+    /// 1621-hit sweep). Structurally: the constant's declaring scope
+    /// CONTAINS its enum's Class span (the hoist); a member's scope sits
+    /// inside the class span.
+    pub(crate) fn class_content_is_bare_constant(&self, sym: &Symbol) -> bool {
+        if !self.symbol_is_class_content(sym) {
+            return false;
+        }
+        let sc = self.scope(sym.scope);
+        // Role-macro member region (parentless synthetic scope) — a struct
+        // body, never bare-reachable.
+        if sc.parent.is_none() && !matches!(sc.kind, ScopeKind::File) {
+            return false;
+        }
+        let Some(pkg) = sym.package.as_deref() else { return false };
+        let contains = |o: &Span, i: &Span| {
+            (o.start.row, o.start.column) <= (i.start.row, i.start.column)
+                && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
+        };
+        self.symbols_named(pkg)
+            .iter()
+            .map(|&sid| self.symbol(sid))
+            .any(|c| {
+                matches!(c.kind, SymKind::Class)
+                    && contains(&c.span, &sym.span)
+                    && contains(&sc.span, &c.span)
+            })
+    }
+
+    /// The innermost namespace (`Package` symbol) whose span contains `span`
+    /// — the def-side namespace fact recovered POSITIONALLY, so it stays
+    /// correct where the walk's sticky context desynced (macro-guarded
+    /// namespace opens, mid-file scope desync). Callers gate on pack-shaped
+    /// analyses; Perl attribution is total at build time.
+    pub(crate) fn enclosing_package_of(&self, span: &Span) -> Option<String> {
+        let contains = |o: &Span, i: &Span| {
+            (o.start.row, o.start.column) <= (i.start.row, i.start.column)
+                && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
+                && !(o.start == i.start && o.end == i.end)
+        };
+        self.symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Package) && contains(&s.span, span))
+            .max_by_key(|s| (s.span.start.row, s.span.start.column))
+            .map(|s| s.name.clone())
     }
 
     /// Is `sym` a file-scope value a bare name reaches from anywhere — a C

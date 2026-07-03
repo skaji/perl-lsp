@@ -100,6 +100,14 @@ impl SpliceMap {
         &self.edits
     }
 
+    /// The raw `(orig_start, orig_end, new_len)` edit list, ordered. The
+    /// erased-use re-mint walks the BETWEEN-edit segments with it to find
+    /// tokens the transform changed outside any recorded splice (the
+    /// length-preserving declarator-macro strip).
+    pub(crate) fn edits(&self) -> &[(usize, usize, usize)] {
+        &self.edits
+    }
+
     /// Locate `transformed`'s region. `partition_point` returns the count
     /// of edits whose replacement starts at or before `transformed`; the
     /// last of them (`pp - 1`) is the only edit that can contain it
@@ -1293,6 +1301,14 @@ fn resolve_include(file_path: &std::path::Path, inc: &str) -> Option<std::path::
     if let Some(mut dir) = file_path.parent() {
         loop {
             let cand = dir.join(inc);
+            if cand.is_file() {
+                return Some(cand);
+            }
+            // The conventional `-Iinclude` layout: a test/src file spelling
+            // `#include "fmt/format.h"` reaches `<root>/include/fmt/format.h`.
+            // Without this the whole test/src tree gets an empty project
+            // closure and the visibility gate cuts it off from every target.
+            let cand = dir.join("include").join(inc);
             if cand.is_file() {
                 return Some(cand);
             }

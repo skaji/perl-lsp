@@ -603,8 +603,25 @@ impl SkeletonAnalysis {
             .iter()
             .filter_map(|r| {
                 use crate::file_analysis::RefKind;
+                let mut span = Span { start: r.start, end: r.end };
                 let kind = match r.kind.as_str() {
                     "call" => RefKind::FunctionCall { resolved_package: None },
+                    // Qualified call (`fmt::format_to(...)`): Perl parity —
+                    // the full path rides `target_name`, the qualifier
+                    // `resolved_package`, and the span narrows to the bare
+                    // name token (the rename/highlight unit; also what
+                    // suppresses the `@expr.read.var` duplicate at the same
+                    // start). The tail segment is an identifier, so it never
+                    // spans rows — the end-anchored column math is safe.
+                    "qcall" => {
+                        let (pkg, bare) = crate::file_analysis::split_qualified(&r.name);
+                        let pkg = pkg?;
+                        span.start = tree_sitter::Point {
+                            row: r.end.row,
+                            column: r.end.column.saturating_sub(bare.len()),
+                        };
+                        RefKind::FunctionCall { resolved_package: Some(pkg.to_string()) }
+                    }
                     // `recv.field` / `recv->field`: the SAME MethodCall ref
                     // core resolves for Perl `$obj->m`. The invocant types
                     // query-time via `expr_type_at_span(invocant_span)`;
@@ -636,7 +653,7 @@ impl SkeletonAnalysis {
                 };
                 Some(crate::file_analysis::Ref {
                     kind,
-                    span: Span { start: r.start, end: r.end },
+                    span,
                     scope: r.scope,
                     target_name: r.name.clone(),
                     access: crate::file_analysis::AccessKind::Read,
@@ -651,18 +668,32 @@ impl SkeletonAnalysis {
         // in `int compute(...)`), neither of which is a bare value read — the
         // first already carries a FunctionCall ref, the second IS the
         // declaration. Don't shadow either with a stray unresolved Variable
-        // ref (it would displace the decl from references/highlight).
-        let claimed: std::collections::HashSet<(usize, usize)> = refs
+        // ref (it would displace the decl from references/highlight). Claims
+        // are NAME-keyed (a ref by its unqualified TAIL, so a qualified
+        // call's name token still claims the read at its own start): a read
+        // spelling a DIFFERENT name at the same start is a different token —
+        // the erased-macro re-mint (`ABSL_GUARDED_BY`) must survive the
+        // expansion-body ref (`guarded_by`) remapped onto the same call
+        // site, or the macro's use vanishes from gr.
+        let claimed: std::collections::HashSet<(usize, usize, String)> = refs
             .iter()
-            .map(|r| (r.span.start.row, r.span.start.column))
-            .chain(
-                symbols
-                    .iter()
-                    .map(|s| (s.selection_span.start.row, s.selection_span.start.column)),
-            )
+            .map(|r| {
+                (
+                    r.span.start.row,
+                    r.span.start.column,
+                    r.unqualified_target_name().to_string(),
+                )
+            })
+            .chain(symbols.iter().map(|s| {
+                (
+                    s.selection_span.start.row,
+                    s.selection_span.start.column,
+                    s.name.clone(),
+                )
+            }))
             .collect();
         for (name, scope, span) in unresolved_reads {
-            if claimed.contains(&(span.start.row, span.start.column)) {
+            if claimed.contains(&(span.start.row, span.start.column, name.clone())) {
                 continue;
             }
             local_refs.push(crate::file_analysis::Ref {

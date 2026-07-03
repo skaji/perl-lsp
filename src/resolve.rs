@@ -83,6 +83,15 @@ pub struct TargetRef {
     /// declaration of the same callable — see `symbol_defines_target`.
     /// Empty for non-Method kinds (their decl match is the strict scope).
     pub method_classes: Vec<String>,
+    /// Whether the target's defining symbol is an enum-constant shape — a
+    /// name C hoists into the enclosing scope, so BARE unresolved reads
+    /// (`case OP_SCOPE:`) are legitimate uses. False for receiver-reached
+    /// members (fields/methods) and every Perl target: bare same-named
+    /// tokens elsewhere are noise, not references (the `formatter::format`
+    /// 1621-hit sweep). Minted from the defining symbol
+    /// (`class_content_is_bare_constant`); the matcher may also re-derive it
+    /// per scanned file when the index is in hand.
+    pub bare_constant: bool,
     /// Pack-language visibility identity: the canonical paths of the files
     /// that define this target AS THE ORIGIN FILE SEES IT (the origin itself,
     /// candidates in its include closure, and candidates whose closure reaches
@@ -117,6 +126,7 @@ impl TargetRef {
             method_classes,
             scope,
             def_paths: Vec::new(),
+            bare_constant: false,
         }
     }
 
@@ -132,6 +142,7 @@ impl TargetRef {
             method_classes: Vec::new(),
             scope: OverrideScope::default(),
             def_paths: Vec::new(),
+            bare_constant: false,
         }
     }
 
@@ -179,12 +190,22 @@ impl TargetRef {
                     Some(class) => method_classes_for(origin, class, &name, module_index, scope),
                     None => Vec::new(),
                 };
+                // Function targets keep EMPTY def_paths (gate inactive) for
+                // now — deliberately, not as an oversight: the closure gate
+                // keys on the decl header being a def CANDIDATE, and pointer-
+                // returning prototypes (`void *zmalloc(size_t);`) are still
+                // dropped by extraction (hitlist-2 #9), so gating here starves
+                // real reference sets (zmalloc 330 → 3). Activate by minting
+                // `pack_def_paths` here once prototype extraction lands.
+                // Macro-named cursors never reach this arm (the canonical
+                // FileScopeValue lanes claim them first, WITH def_paths).
                 TargetRef {
                     name,
                     kind: TargetKind::Sub { package },
                     method_classes,
                     scope,
                     def_paths: Vec::new(),
+                    bare_constant: false,
                 }
             }
             RenameKind::Method { name, class } => {
@@ -483,6 +504,7 @@ pub fn resolve_symbol_scoped(
                 scope,
             );
             t.def_paths = pack_class_def_paths(&t, analysis, module_index);
+            t.bare_constant = analysis.class_content_is_bare_constant(sym);
             return Some(ResolvedTarget::Target(t));
         }
         // A file-scope global / anonymous-enum constant: bare-name-keyed,
@@ -492,12 +514,44 @@ pub fn resolve_symbol_scoped(
             t.def_paths = pack_def_paths(&sym.name, true, module_index);
             return Some(ResolvedTarget::Target(t));
         }
+        // An unexpanded function-like macro use in DECLARATION position
+        // parses as a Sub/Method decl (`int x ABSL_GUARDED_BY(mu);` — the
+        // attribute macro reads as a function declarator) or a Variable decl
+        // (`string_view s ABSL_ATTRIBUTE_LIFETIME_BOUND` — a phantom second
+        // parameter). The token IS the macro: mint the same canonical
+        // `FileScopeValue` identity the `#define` site and the erased-use
+        // re-mints carry, so gr agrees from any spelling (the two-lane split
+        // was the gr-undercount root). Class content and file-scope values
+        // claimed above, so a Variable reaching here is the artifact shape.
+        if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Variable)
+            && names_visible_macro(&sym.name, analysis, module_index)
+        {
+            let mut t = TargetRef::new(sym.name.clone(), TargetKind::FileScopeValue);
+            t.def_paths = pack_def_paths(
+                &sym.name,
+                analysis.names_macro_def(&sym.name, None),
+                module_index,
+            );
+            return Some(ResolvedTarget::Target(t));
+        }
     }
     // The same lanes from a USE site, so gr from a use equals gr from the
     // def: a bare read / type token that resolves (locally or by name
     // cross-file) to a macro, class content, or file-scope value mints the
     // identical target the def site does.
     if let Some(r) = analysis.ref_at(point) {
+        // A left-unexpanded function-like macro CALL (`ABSL_PREDICT_TRUE(x)`)
+        // is call-shaped, never a per-package Sub — same canonical macro
+        // identity as the def site.
+        if matches!(r.kind, RefKind::FunctionCall { .. }) {
+            let name = r.unqualified_target_name();
+            if names_visible_macro(name, analysis, module_index) {
+                let mut t = TargetRef::new(name.to_string(), TargetKind::FileScopeValue);
+                t.def_paths =
+                    pack_def_paths(name, analysis.names_macro_def(name, None), module_index);
+                return Some(ResolvedTarget::Target(t));
+            }
+        }
         if matches!(r.kind, RefKind::Variable | RefKind::PackageRef) {
             let class_or_value = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
                 if a.names_macro_def(&s.name, Some(s.selection_span))
@@ -505,20 +559,30 @@ pub fn resolve_symbol_scoped(
                 {
                     Some(None)
                 } else if a.symbol_is_class_content(s) {
-                    Some(s.package.clone())
+                    s.package
+                        .clone()
+                        .map(|p| Some((p, a.class_content_is_bare_constant(s))))
                 } else {
                     None
                 }
             };
-            let resolved: Option<Option<String>> = match r.resolves_to {
-                Some(id) => class_or_value(analysis, analysis.symbol(id)),
-                None if analysis.names_macro_def(&r.target_name, None) => Some(None),
+            let resolved: Option<Option<(String, bool)>> = match r.resolves_to {
+                // A read that resolved to an unexpanded-use artifact (the
+                // phantom Variable a decl-position macro mints) still keys
+                // the macro identity — the class-content/file-scope shapes
+                // claim first.
+                Some(id) => class_or_value(analysis, analysis.symbol(id)).or_else(|| {
+                    names_visible_macro(&r.target_name, analysis, module_index).then_some(None)
+                }),
+                // Any-candidate macro check (not the one-winner `get_cached`
+                // view): a macro whose name loses the name tie to a same-named
+                // function's file still keys the macro identity.
+                None if names_visible_macro(&r.target_name, analysis, module_index) => {
+                    Some(None)
+                }
                 None => module_index
                     .and_then(|idx| idx.get_cached(&r.target_name))
                     .and_then(|cached| {
-                        if cached.analysis.names_macro_def(&r.target_name, None) {
-                            return Some(None);
-                        }
                         cached
                             .analysis
                             .symbols
@@ -528,7 +592,7 @@ pub fn resolve_symbol_scoped(
                     }),
             };
             match resolved {
-                Some(Some(class)) => {
+                Some(Some((class, bare))) => {
                     let mut t = TargetRef::method(
                         r.target_name.clone(),
                         class,
@@ -537,6 +601,7 @@ pub fn resolve_symbol_scoped(
                         scope,
                     );
                     t.def_paths = pack_class_def_paths(&t, analysis, module_index);
+                    t.bare_constant = bare;
                     return Some(ResolvedTarget::Target(t));
                 }
                 Some(None) => {
@@ -579,8 +644,9 @@ pub fn resolve_symbol_scoped(
             // visibility identity. Perl methods are Sub/Method symbols —
             // never class content — and keep empty `def_paths` (no gate).
             if let TargetKind::Method { class } = &t.kind {
-                if pack_member_of_class(&t.name, class, analysis, module_index) {
+                if let Some(bare) = pack_member_of_class(&t.name, class, analysis, module_index) {
                     t.def_paths = pack_class_def_paths(&t, analysis, module_index);
+                    t.bare_constant = bare;
                 }
             }
             ResolvedTarget::Target(t)
@@ -590,26 +656,30 @@ pub fn resolve_symbol_scoped(
 
 /// Is `name` a pack-language class-content member (struct field, member-block
 /// role member, enum constant) of `class` — in the origin file or the class's
-/// module as the origin sees it? The discriminator that keeps the pack
+/// module as the origin sees it? `Some(bare)` when it is, where `bare` is the
+/// enum-constant verdict (`class_content_is_bare_constant`): whether bare
+/// unresolved reads of the name count as uses. `None` keeps the pack
 /// visibility gate off Perl Method targets minted from the same cursor kinds.
 fn pack_member_of_class(
     name: &str,
     class: &str,
     origin: &FileAnalysis,
     idx: Option<&dyn CrossFileLookup>,
-) -> bool {
+) -> Option<bool> {
     let check = |a: &FileAnalysis| {
-        a.symbols.iter().any(|s| {
-            s.name == name
-                && s.package.as_deref() == Some(class)
-                && a.symbol_is_class_content(s)
-        })
+        a.symbols
+            .iter()
+            .find(|s| {
+                s.name == name
+                    && s.package.as_deref() == Some(class)
+                    && a.symbol_is_class_content(s)
+            })
+            .map(|s| a.class_content_is_bare_constant(s))
     };
-    if check(origin) {
-        return true;
-    }
-    idx.and_then(|i| i.get_cached(class))
-        .is_some_and(|c| check(&c.analysis))
+    check(origin).or_else(|| {
+        idx.and_then(|i| i.get_cached(class))
+            .and_then(|c| check(&c.analysis))
+    })
 }
 
 /// The canonical answer to "what does this name mean, from here" — and the
@@ -1151,6 +1221,41 @@ impl<'a> CandidateSet<'a> {
             }
         }
 
+        // Type-REFERENCE gd consults the specificity ladder: a template-
+        // instance spelling in type position (a base clause `: formatter<
+        // std::tm, Char>`, a declared type) resolves canonical-spelling →
+        // per-spec class FIRST, partial patterns next, the primary ranked
+        // behind — never pruned. Plain (non-template) type refs fall through
+        // untouched (`template_instance_spelling` answers `None`).
+        if self.pack {
+            if let (Some(source), Some(r)) = (self.source, analysis.ref_at(point)) {
+                if matches!(r.kind, RefKind::PackageRef) {
+                    if let Some(spelling) = template_instance_spelling(source, r.span) {
+                        if let Some(p) =
+                            crate::file_analysis::ParametricType::instance_from_spelling(&spelling)
+                        {
+                            let t = crate::file_analysis::InferredType::Parametric(p);
+                            let mut out: Vec<RefLocation> = Vec::new();
+                            for (class, _) in analysis.dispatch_ladder_of(&t, self.idx()) {
+                                let Some(idx) = self.idx() else { break };
+                                let Some(loc) = self.type_def_location(&class, idx) else {
+                                    continue;
+                                };
+                                if !out.iter().any(|l| {
+                                    file_key_eq(&l.key, &loc.key) && l.span == loc.span
+                                }) {
+                                    out.push(loc);
+                                }
+                            }
+                            if !out.is_empty() {
+                                return out;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Local definition first.
         if let Some(span) = analysis.find_definition(point, self.idx()) {
             return vec![self.origin_decl(span)];
@@ -1405,6 +1510,20 @@ impl<'a> CandidateSet<'a> {
         // tail: `OP_SCOPE` used in op.c resolving to its enumerator def in
         // opnames.h. (Perl's cache is keyed by MODULE name, so a bare-name
         // lookup no-ops.)
+        // A `::`-qualified value read (`absl::StatusCode::kNotFound`): the
+        // owning class is the qualifier segment touching the token — resolve
+        // the member on it. Enum-class constants are class content, invisible
+        // to the by-name file-scope tail below (they aren't file-scope names).
+        if let (Some(source), Some(r)) = (self.source, analysis.ref_at(point)) {
+            if matches!(r.kind, RefKind::Variable) && r.resolves_to.is_none() {
+                if let Some(owner) = qualifier_before(source, r.span) {
+                    if let Some(loc) = self.member_def_location(owner, &r.target_name) {
+                        return vec![loc];
+                    }
+                }
+            }
+        }
+
         if let Some(r) = analysis.ref_at(point) {
             if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
                 let name = r.unqualified_target_name();
@@ -1431,6 +1550,19 @@ impl<'a> CandidateSet<'a> {
         // broken, and never masking a resolvable decl.
         if let Some(el) = domain_enum_fallback {
             return vec![el];
+        }
+        // Last resort (pack): a token no query captures — a namespace middle
+        // segment (`StatusCode` in `absl::StatusCode::kNotFound` is a
+        // namespace_identifier, ref-less) — resolves by word to a named
+        // type/namespace def.
+        if self.pack {
+            if let Some(source) = self.source {
+                if let Some(word) = word_at_point(source, point) {
+                    if let Some(loc) = self.type_def_location(word, idx) {
+                        return vec![loc];
+                    }
+                }
+            }
         }
         Vec::new()
     }
@@ -1470,14 +1602,18 @@ impl<'a> CandidateSet<'a> {
     }
 
     /// The def location of a named type (a Class symbol — enum/struct/
-    /// typedef), local first, then cross-file by name. Used by the domain
-    /// bridge to offer the enum def alongside a domain-typed field.
+    /// typedef — or a namespace/module), local first, then cross-file by
+    /// name. Used by the domain bridge to offer the enum def alongside a
+    /// domain-typed field, the spec-ladder type gd, and the bare-word
+    /// fallback.
     fn type_def_location(&self, type_name: &str, idx: &dyn CrossFileLookup) -> Option<RefLocation> {
+        let wanted =
+            |k: &SymKind| matches!(k, SymKind::Class | SymKind::Package | SymKind::Module);
         if let Some(sym) = self
             .origin
             .symbols
             .iter()
-            .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))
+            .find(|s| s.name == type_name && wanted(&s.kind))
         {
             return Some(self.origin_decl(sym.selection_span));
         }
@@ -1486,7 +1622,7 @@ impl<'a> CandidateSet<'a> {
             .analysis
             .symbols
             .iter()
-            .find(|s| s.name == type_name && matches!(s.kind, SymKind::Class))?;
+            .find(|s| s.name == type_name && wanted(&s.kind))?;
         Some(RefLocation {
             key: FileKey::Path(cached.path.clone()),
             span: sym.selection_span,
@@ -2615,6 +2751,56 @@ pub fn word_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
     (start < end).then(|| &source[start..end])
 }
 
+/// The full `Base<...>` spelling at a type ref: `span` covers the base token;
+/// when `<` follows immediately, extend to the balanced `>` and canonicalize
+/// (`canonical_template_spelling` — the identity key specs are filed under).
+/// `None` for plain type refs, unbalanced brackets, or a statement boundary
+/// before the close (a stray comparison, not template args).
+fn template_instance_spelling(source: &str, span: Span) -> Option<String> {
+    let start = crate::cursor_sentinel::point_to_byte(source, span.start);
+    let mut i = crate::cursor_sentinel::point_to_byte(source, span.end);
+    let b = source.as_bytes();
+    if i >= b.len() || b[i] != b'<' {
+        return None;
+    }
+    let mut depth = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(crate::file_analysis::canonical_template_spelling(
+                        &source[start..=i],
+                    ));
+                }
+            }
+            b';' | b'{' | b'}' => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The qualifier segment immediately before `span` — `StatusCode` for the
+/// `kNotFound` span in `absl::StatusCode::kNotFound`. `None` when the token
+/// isn't preceded by `::`.
+fn qualifier_before(source: &str, span: Span) -> Option<&str> {
+    let start = crate::cursor_sentinel::point_to_byte(source, span.start);
+    if start < 2 || !source.is_char_boundary(start) || &source[start - 2..start] != "::" {
+        return None;
+    }
+    let b = source.as_bytes();
+    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    let e = start - 2;
+    let mut s = e;
+    while s > 0 && is_id(b[s - 1]) {
+        s -= 1;
+    }
+    (s < e).then(|| &source[s..e])
+}
+
 /// Every `#define` of `word` across the origin file + the cached modules,
 /// ranked config-active first by the SAME total order goto-def and hover both
 /// consume (`docs/adr/macro-handling.md`): reachability rank, then
@@ -2805,6 +2991,49 @@ fn method_classes_for(
     }
 }
 
+/// Does `name` name a `#define` anywhere the origin can reach — its own macro
+/// table or any cached def candidate? The macro-identity discriminator for the
+/// canonical `FileScopeValue` lane: a function-like macro's occurrences appear
+/// as Sub-shaped decls/calls (left unexpanded) AND re-minted Variable reads
+/// (expanded-and-erased), and every spelling must mint the SAME target or gr
+/// sweeps only its own lane. Perl analyses carry no `macro_defs`, and the Perl
+/// hub's name-keyed cache holds no macro tables, so Perl cursors never enter.
+fn names_visible_macro(
+    name: &str,
+    origin: &FileAnalysis,
+    idx: Option<&dyn CrossFileLookup>,
+) -> bool {
+    origin.names_macro_def(name, None)
+        || idx.is_some_and(|i| {
+            i.def_candidates(name)
+                .iter()
+                .any(|c| c.analysis.names_macro_def(name, None))
+        })
+}
+
+/// Namespace-aware package agreement. Exact equality is the total rule (Perl
+/// packages are absolute). `relative` — true only for closure-carrying (pack)
+/// analyses — adds C++'s relative-lookup semantics: a call's qualifier and a
+/// def's namespace both carry only their innermost segment, so tails compare;
+/// and a side with NO attribution (the macro-guarded-namespace-open gap, or a
+/// plain unqualified call) matches rather than silently dropping the site —
+/// references bias to recall under partial attribution, and the `def_paths`
+/// closure gate has already pinned file connectivity.
+fn pkg_agrees(relative: bool, a: Option<&str>, b: Option<&str>) -> bool {
+    if a == b {
+        return true;
+    }
+    if !relative {
+        return false;
+    }
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            x.rsplit("::").next().unwrap_or(x) == y.rsplit("::").next().unwrap_or(y)
+        }
+        _ => true,
+    }
+}
+
 /// The visibility identity (`TargetRef::def_paths`) of a pack-language target
 /// keyed on `name` (a class for member/enum-constant targets, the bare value
 /// name for `FileScopeValue`): every def candidate closure-connected to the
@@ -2939,13 +3168,22 @@ fn symbol_defines_target(
         TargetKind::Sub { package } => {
             // Exact scope, OR — under Hierarchy — any class in the override
             // family (so a base-`sub` rename also rewrites every override's
-            // decl). Dispatch keeps the strict single-scope match.
-            let in_scope = sym.package == *package
+            // decl). Dispatch keeps the strict single-scope match. Pack
+            // analyses compare namespace-aware (`pkg_agrees`), recovering an
+            // unattributed def's namespace positionally so a `detail::` def
+            // still declares its `detail`-scoped target.
+            let relative = !analysis.include_closure.is_empty();
+            let recovered = match (sym.package.as_deref(), relative) {
+                (None, true) => analysis.enclosing_package_of(&sym.span),
+                _ => None,
+            };
+            let sym_pkg = sym.package.as_deref().or(recovered.as_deref());
+            let in_scope = pkg_agrees(relative, sym_pkg, package.as_deref())
                 || (target.scope == OverrideScope::Hierarchy
                     && target
                         .method_classes
                         .iter()
-                        .any(|c| Some(c.as_str()) == sym.package.as_deref()));
+                        .any(|c| Some(c.as_str()) == sym_pkg));
             matches!(sym.kind, SymKind::Sub | SymKind::Method) && in_scope
         }
         TargetKind::Method { class } => {
@@ -3000,10 +3238,17 @@ fn symbol_defines_target(
         // Every `#define` of the name is a declaration (config variants in
         // different headers all surface, matching the forward macro lane's
         // never-prune rule — a `#define`'s symbol can be Variable, Sub, or a
-        // member-block role's Class), as is a file-scope global's def.
+        // member-block role's Class), as is a file-scope global's def. A
+        // Sub/Method symbol elsewhere is an unexpanded function-like macro
+        // USE parsed as a declaration (`int x ABSL_GUARDED_BY(mu);`) — the
+        // preprocessor would expand that token, so it joins the same
+        // identity; the `def_paths` gate already pinned this file as one
+        // that sees the macro.
         TargetKind::FileScopeValue => {
             analysis.names_macro_def(&sym.name, Some(sym.selection_span))
                 || analysis.symbol_is_file_scope_value(sym)
+                || ((!analysis.include_closure.is_empty() || !analysis.macro_defs.is_empty())
+                    && matches!(sym.kind, SymKind::Sub | SymKind::Method))
         }
     }
 }
@@ -3227,6 +3472,29 @@ fn collect_from_analysis(
     let mut rename_chain_cache: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
 
+    // Pack (closure-carrying) files speak C++'s relative name lookup and may
+    // carry only partial namespace attribution — `pkg_agrees` reads this.
+    let relative_ns = !analysis.include_closure.is_empty();
+    // Bare unresolved reads count as uses of a Method target only when the
+    // member is an enum-constant shape (its name hoists into the enclosing
+    // scope). Receiver-reached members (struct fields, methods) are matched
+    // through their call sites — a bare same-named token elsewhere is noise
+    // (the `formatter::format` 1621-hit sweep). Resolved once per scanned
+    // file, under this file's own closure scope.
+    let bare_constant_member = match &target.kind {
+        TargetKind::Method { class } => {
+            pack_member_of_class(&target.name, class, analysis, module_index).unwrap_or(false)
+        }
+        _ => false,
+    };
+    // A FileScopeValue whose name is a macro THIS file can see: any resolved
+    // same-named read here is a macro use (the preprocessor would have
+    // expanded the token), even when it bound to an unexpanded-use artifact
+    // symbol. A GLOBAL-flavored target keeps the strict resolved-symbol
+    // check, so a shadowing local named like the global stays out.
+    let macro_visible_here = matches!(target.kind, TargetKind::FileScopeValue)
+        && names_visible_macro(&target.name, analysis, module_index);
+
     // A callable/handler name can be FOLDED from another identifier: a variable
     // (`$obj->on($evt)`, `$self->$m()`) or, for handlers, a constant
     // (`on(EVT)`). The folded site is a *reference* to that variable/constant,
@@ -3305,14 +3573,33 @@ fn collect_from_analysis(
                 // (`use Bank;` auto-imports `@EXPORT`, invisible at build) has
                 // `resolved_package: None` — re-derive it here, where the index
                 // is in hand.
+                // Relative-namespace semantics apply to namespace-scoped Subs
+                // only: a Method target's scope is a CLASS, which an
+                // unqualified call can't name-look-up into from outside — the
+                // tolerance would re-open the bare-name sweep on members.
+                let ns_relative = relative_ns && matches!(target.kind, TargetKind::Sub { .. });
                 let pkg_matches = |pkg: &Option<String>| {
-                    pkg == scope
+                    pkg_agrees(ns_relative, pkg.as_deref(), scope.as_deref())
                         || (target.scope == OverrideScope::Hierarchy
                             && target.method_classes.iter().any(|c| Some(c) == pkg.as_ref()))
                 };
                 match resolved_package {
                     Some(_) => pkg_matches(resolved_package),
-                    None => pkg_matches(&analysis.deferred_call_package(r, module_index)),
+                    None => {
+                        // Unqualified + unresolved: derive the caller's own
+                        // enclosing namespace positionally (pack) — a plain
+                        // `vformat_to(...)` inside `namespace fmt` looks up
+                        // fmt's, not detail's — before falling to the
+                        // no-package comparison.
+                        let derived = analysis.deferred_call_package(r, module_index).or_else(
+                            || {
+                                relative_ns
+                                    .then(|| analysis.enclosing_package_of(&r.span))
+                                    .flatten()
+                            },
+                        );
+                        pkg_matches(&derived)
+                    }
                 }
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
@@ -3377,17 +3664,19 @@ fn collect_from_analysis(
                 }
             }
             (TargetKind::Package, RefKind::PackageRef) => true,
-            // A pack-language enum constant / member read by BARE name
-            // (`x = OP_SCOPE`, `case OP_SCOPE:`) — a `Variable` ref the
-            // generic goto-def resolves to this def by name (the value-read
-            // half of the shared Variable/Field DEF). `name_matches` already
-            // pinned the name; an UNRESOLVED read is the cross-file case the
-            // by-name goto-def owns, and a resolved read counts only when it
-            // binds the target's own class content (a genuinely-local
+            // A pack-language enum constant read by BARE name (`x = OP_SCOPE`,
+            // `case OP_SCOPE:`) — a `Variable` ref the generic goto-def
+            // resolves to this def by name (the value-read half of the shared
+            // Variable/Field DEF). An UNRESOLVED read counts only when the
+            // member's name actually hoists into the enclosing scope
+            // (`bare_constant_member`) — receiver-reached members (fields,
+            // methods) never match bare tokens, or every stray `format` in
+            // the workspace joins the set. A resolved read counts only when
+            // it binds the target's own class content (a genuinely-local
             // variable — even one carrying the class as sticky package —
             // stays out via the structural gate).
             (TargetKind::Method { class }, RefKind::Variable) => match r.resolves_to {
-                None => true,
+                None => target.bare_constant || bare_constant_member,
                 Some(id) => {
                     let s = analysis.symbol(id);
                     analysis.symbol_is_class_content(s)
@@ -3407,7 +3696,8 @@ fn collect_from_analysis(
                 None => true,
                 Some(id) => {
                     let s = analysis.symbol(id);
-                    analysis.names_macro_def(&s.name, Some(s.selection_span))
+                    macro_visible_here
+                        || analysis.names_macro_def(&s.name, Some(s.selection_span))
                         || analysis.symbol_is_file_scope_value(s)
                 }
             },
