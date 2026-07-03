@@ -212,10 +212,12 @@ impl LanguageDriver for PackDriver {
                 }
                 // Expanded / blanked macro USES vanish from the parsed text,
                 // so no query capture can ref them — re-mint each as a
-                // variable read at its ORIGINAL span (the splice map + the
-                // member-block blank diff know every site), so find-references
-                // on a macro reaches uses the expansion erased (rule #7/#9).
-                mint_erased_macro_reads(&mut skel, source, &map, plan.as_ref());
+                // variable read at its ORIGINAL span (the splice map, the
+                // member-block blank diff, AND the between-splice text diff —
+                // which catches the length-preserving declarator-macro strip
+                // — know every site), so find-references on a macro reaches
+                // uses the expansion erased (rule #7/#9).
+                mint_erased_macro_reads(&mut skel, source, &src, &map, plan.as_ref());
                 // Macro identity lane: collect every `#define` off the ORIGINAL
                 // source (spans in user coordinates, no splice remap needed).
                 let macro_defs = self
@@ -700,6 +702,7 @@ fn remap_spans(
 fn mint_erased_macro_reads(
     skel: &mut crate::query_extract::SkeletonAnalysis,
     original: &str,
+    transformed: &str,
     map: &crate::cpp_reparse::SpliceMap,
     plan: Option<&crate::cpp_reparse::MemberBlockPlan>,
 ) {
@@ -724,9 +727,45 @@ fn mint_erased_macro_reads(
             }
         }
     }
+    // Between-splice diff: bytes the transform changed OUTSIDE any recorded
+    // edit are length-preserving blanks (the declarator-macro strip runs
+    // before expansion and records nothing in the map). Walk the pass-through
+    // segments original↔transformed in lockstep and mint a site at every
+    // differing run.
+    {
+        let tb = transformed.as_bytes();
+        let mut diff_segment = |o_from: usize, o_to: usize, t_from: usize, sites: &mut Vec<usize>| {
+            let len = o_to.saturating_sub(o_from);
+            if t_from + len > tb.len() {
+                return;
+            }
+            let mut i = 0;
+            while i < len {
+                if bytes[o_from + i] != tb[t_from + i] {
+                    let start = o_from + i;
+                    while i < len && bytes[o_from + i] != tb[t_from + i] {
+                        i += 1;
+                    }
+                    sites.push(start);
+                } else {
+                    i += 1;
+                }
+            }
+        };
+        let mut o_pos = 0usize;
+        let mut t_pos = 0usize;
+        for &(os, oe, nlen) in map.edits() {
+            diff_segment(o_pos, os, t_pos, &mut sites);
+            t_pos += (os - o_pos) + nlen;
+            o_pos = oe;
+        }
+        diff_segment(o_pos, bytes.len(), t_pos, &mut sites);
+    }
     if sites.is_empty() {
         return;
     }
+    sites.sort_unstable();
+    sites.dedup();
     let o = LineIndex::new(original);
     for os in sites {
         let mut e = os;

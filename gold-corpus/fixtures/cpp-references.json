@@ -336,6 +336,132 @@
         ],
         "none": []
       }
+    },
+    {
+      "id": "cpp-hitlist2-macro-gr-from-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-macro-identity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macrogr/anno.h",
+      "line": 2,
+      "col": 9,
+      "comment": "One canonical macro identity: gr from the #define reaches BOTH unexpanded decl-position uses (macro-as-sub artifacts) and expanded-and-erased re-minted reads.",
+      "expect": {
+        "all": [
+          "\"col\":\"9\",\"file\":\"anno.h\",\"line\":\"3\"",
+          "\"col\":\"15\",\"file\":\"use.c\",\"line\":\"4\"",
+          "\"col\":\"12\",\"file\":\"use.c\",\"line\":\"5\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-macro-gr-from-use-matches-def-origin",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-macro-identity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macrogr/use.c",
+      "line": 3,
+      "col": 15,
+      "comment": "gr from an unexpanded USE returns the SAME set as from the def \u2014 the Sub/Variable lane split is unified.",
+      "expect": {
+        "all": [
+          "\"col\":\"9\",\"file\":\"anno.h\",\"line\":\"3\"",
+          "\"col\":\"15\",\"file\":\"use.c\",\"line\":\"4\"",
+          "\"col\":\"12\",\"file\":\"use.c\",\"line\":\"5\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-macro-gr-adjacent-lines-agree",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-macro-identity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macrogr/use.c",
+      "line": 4,
+      "col": 12,
+      "comment": "Adjacent-line uses of one macro agree (the blocking_counter.h num_waiting_/done_ shape).",
+      "expect": {
+        "all": [
+          "\"col\":\"9\",\"file\":\"anno.h\",\"line\":\"3\"",
+          "\"col\":\"15\",\"file\":\"use.c\",\"line\":\"4\"",
+          "\"col\":\"12\",\"file\":\"use.c\",\"line\":\"5\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-member-gr-owner-keyed",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-identity-precision",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_owner.cpp",
+      "line": 1,
+      "col": 6,
+      "comment": "Member refs key on the owner class: alpha::go's set excludes beta::go's def and call site (the formatter<weekday>::format 1621-hit sweep, killed).",
+      "expect": {
+        "all": [
+          "\"col\":\"7\",\"file\":\"member_owner.cpp\",\"line\":\"2\"",
+          "\"col\":\"13\",\"file\":\"member_owner.cpp\",\"line\":\"8\""
+        ],
+        "none": [
+          "\"file\":\"member_owner.cpp\",\"line\":\"5\"",
+          "\"line\":\"9\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-call-gr-from-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsqual.cpp",
+      "line": 1,
+      "col": 4,
+      "comment": "Namespace participation: gr on alpha::run includes the QUALIFIED alpha::run(...) call site and excludes beta::run's def + call (the fmt format_to drop / detail-vs-fmt merge).",
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"nsqual.cpp\",\"line\":\"2\"",
+          "\"col\":\"32\",\"file\":\"nsqual.cpp\",\"line\":\"7\""
+        ],
+        "none": [
+          "\"file\":\"nsqual.cpp\",\"line\":\"5\"",
+          "\"col\":\"47\",\"file\":\"nsqual.cpp\",\"line\":\"7\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-call-gr-from-callsite",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsqual.cpp",
+      "line": 6,
+      "col": 32,
+      "comment": "gr from the qualified call site mints the same namespace-scoped target the def does.",
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"nsqual.cpp\",\"line\":\"2\"",
+          "\"col\":\"32\",\"file\":\"nsqual.cpp\",\"line\":\"7\""
+        ],
+        "none": [
+          "\"file\":\"nsqual.cpp\",\"line\":\"5\"",
+          "\"col\":\"47\",\"file\":\"nsqual.cpp\",\"line\":\"7\""
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

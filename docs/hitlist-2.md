@@ -140,10 +140,53 @@ catastrophic on collisions:
   confirmed) — one canonical target for a function-like macro's
   Sub-shaped AND re-minted-Variable occurrences; also give the Function
   lane real def_paths. Highest gr-correctness value.
+  **LANDED (wave-3)**: one `FileScopeValue` identity from every spelling
+  (def, unexpanded decl-position Sub/Method/Variable artifacts,
+  unexpanded calls, erased re-mints — which now survive the same-start
+  claim via name-keyed claims and cover the declarator-strip blanks via
+  the between-splice diff). `ABSL_GUARDED_BY` gr: 56/56/56 from
+  def/use/adjacent-use (grep 66 − 10 comment mentions — grep-exact, 0
+  false positives, 26 files). `ABSL_ATTRIBUTE_LIFETIME_BOUND`:
+  231 from any origin (was 21/14/6-style splits); the residual ~58 sites
+  are files whose PER-FILE expansion validation rejected the whole file
+  (#11) so the token is swallowed by the grammar — no ref to unify; they
+  join automatically when per-splice validation lands. The Function-lane
+  `def_paths` is deliberately still EMPTY: the gate keys on the decl
+  header being a def candidate, and #9 (pointer-returning prototypes
+  dropped) starves it (`zmalloc` 330 → 3 measured); activate together
+  with #9.
 - **B. Identity precision for one-symbol verbs** — member refs key on
   owner class (kills #1); type-ref gd consults the spec ladder (#2);
   namespace participation (#4, #5). Arity (#3) = additive depth,
   evaluate.
+  **LANDED (wave-3)** except #3: bare unresolved reads match a member
+  target only when the member is an enum-constant shape (name hoists to
+  the enclosing scope) — `formatter<weekday,Char>::format` gr 1621 → 17
+  (family decls + receiver-resolved sites; unresolvable-receiver member
+  accesses stay EXCLUDED — with owner-keyed identity the bare-name
+  bucket is unbounded noise, and gd/hover still serve those sites),
+  `basic_json::dump` 45 → 16. Type-ref gd walks the dispatch ladder
+  (chrono.h:1904 → 2101 first, primary base.h:633 kept). Qualified calls
+  mint `FunctionCall{resolved_package}` refs (span = bare tail);
+  matching is namespace-aware (`pkg_agrees`: innermost-segment tails,
+  None-tolerant only under partial attribution, pack files only) —
+  `format_to` gr 10 → 90/26 files (grep 93 incl. comments).
+  `detail::vformat_to` vs `fmt::vformat_to` separate BY QUALIFIER at
+  call sites everywhere; def-side separation needs namespace attribution
+  inside base.h (broken past line ~922 — #6/#7's desync), so both defs
+  currently mint `Sub{None}` and their gr sets merge on the real corpus;
+  the machinery separates wherever attribution exists (gold `nsqual.cpp`
+  locks it). `ns::Enum::kValue` gd resolves through the qualifier
+  (status.cc:223 → status.h enumerator), middle-segment gd via the
+  bare-word fallback.
+  **#3 arity — evaluated, NOT taken**: no cheap ranking falls out. The
+  UnionOnArgs machinery discriminates RETURN TYPES by a Perl
+  `cursor_context` arity hint against builder-recorded `ReturnInfo`
+  arms; pack call refs carry no argument count and pack Sub symbols no
+  parameter count, so an arity-aware gd ranking needs extraction to mint
+  both (plus default/variadic/template-param counting rules) before a
+  ranking tier in `definitions()` can consume them. That is extraction
+  work (the sibling's lane), not additive resolution depth — deferred.
 - **C. Extraction structural fixes** — #6 scope desync, #7 reopened
   namespaces, #9 pointer prototypes, #10 fn-ptr typedefs, #12 operators,
   #11 MACRO\nclass (macro lane), #8 using-re-exports (model as the
