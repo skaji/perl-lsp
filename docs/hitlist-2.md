@@ -42,13 +42,26 @@ catastrophic on collisions:
 ## gr counts: BOTH over- and under-collection, by lane
 
 - OVER: the bare-name sweeps above.
-- UNDER, whole files dropped: `ABSL_GUARDED_BY` 21/66 (10 of 27 files),
-  `ABSL_ATTRIBUTE_LIFETIME_BOUND` 160/294, `format_to` 10/93. Redis
-  (same-dir `"x.h"` includes) matches grep EXACTLY — abseil/fmt
-  (`<absl/…>`/`<fmt/…>` project-root includes) drop files. **Hypothesis
-  (wave-2 tested): `resolve_include` fails project-root-relative
-  includes → partial include closures → the visibility gate eats
-  legitimately-including files.**
+- UNDER, whole files dropped: `ABSL_GUARDED_BY` 21/66, `format_to`
+  10/93. **Wave-2 ROOT-CAUSED (include-closure hypothesis REFUTED —
+  resolve_include is fine; gd+completion prove closures resolve):**
+  - **Split macro identity** (the macro undercounts): a function-like
+    macro's occurrences split between left-unexpanded → Sub-classified
+    call refs and expanded-and-erased → re-minted Variable refs →
+    `FileScopeValue`; the two TargetKinds NEVER unify, so gr from any
+    origin sweeps only its own lane (adjacent lines in one file give
+    disjoint sets). Rule-#10 two-representations bug at the
+    expansion-policy seam (`resolve.rs:172-189` Function target also
+    mints empty def_paths → gate inactive on that lane;
+    `language_driver.rs:700-759` re-mint; matchers `resolve.rs:3298` vs
+    `:3406`). FIX: one canonical macro identity, both spellings match it.
+  - **`format_to` = finding #4** (namespace-blind): 9/10 "refs" are
+    sibling overload DEFS; every dropped site is a QUALIFIED
+    `fmt::format_to(...)` call failing the `Sub{package}` match. Same
+    fix bucket as #4/#5 (namespace participation), not a closure fix.
+  - Redis is grep-exact because C has no namespaces and its macros never
+    hit the lane split — structural immunity. One abseil "drop" was
+    grep over-counting a `//` comment; gr was CORRECT there.
 - Enum value as TEMPLATE ARGUMENT not a ref (`MakeError<StatusCode::
   kNotFound>`). [abseil]
 - Ref inside another macro's BODY missed (`OBJ_ENCODING_EMBSTR` in
@@ -118,9 +131,10 @@ catastrophic on collisions:
 
 ## Suggested fix-slice grouping (for the next queue)
 
-- **A. Include-closure resolution for project-root includes** (the
-  under-collection root, if wave-2 confirms) — highest gr-correctness
-  value.
+- **A. Macro identity unification** (the under-collection root, wave-2
+  confirmed) — one canonical target for a function-like macro's
+  Sub-shaped AND re-minted-Variable occurrences; also give the Function
+  lane real def_paths. Highest gr-correctness value.
 - **B. Identity precision for one-symbol verbs** — member refs key on
   owner class (kills #1); type-ref gd consults the spec ladder (#2);
   namespace participation (#4, #5). Arity (#3) = additive depth,
