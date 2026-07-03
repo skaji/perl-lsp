@@ -262,7 +262,10 @@ impl SkeletonAnalysis {
                     // "union": a named union TYPE (its members are its own).
                     "class" | "union" => SymKind::Class,
                     "sub" | "anon" | "constant" => SymKind::Sub,
-                    "method" => SymKind::Method,
+                    // "reexport": `using Base::m;` in a class body — a Method
+                    // in the class's API surface; the "reexport" attribute
+                    // (added below) makes resolution see through it.
+                    "method" | "reexport" => SymKind::Method,
                     // "unionfield" (an inline union member-field container)
                     // lands here too — a field, outline-nesting its body.
                     _ => SymKind::Variable,
@@ -281,6 +284,9 @@ impl SkeletonAnalysis {
                     // property, never a name test.
                     if matches!(s.kind.as_str(), "union" | "unionfield") {
                         a.push("union".to_string());
+                    }
+                    if s.kind == "reexport" {
+                        a.push("reexport".to_string());
                     }
                     a
                 },
@@ -1953,6 +1959,28 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             }
             "flow.rebind" => {
                 flow_rebinds.push(((pack.shape_name)("def.var", &e.text), cur_scope, e.start));
+            }
+            "anonagg.member" => {
+                // A field typed by an anonymous aggregate: its members are
+                // flattened onto the enclosing named container, so the field's
+                // own type IS that container (the anon hop is identity) —
+                // `u->data.ping` types `u->data` as U and finds `ping` there.
+                // TypeName (not ClassName) so a typedef'd container chases.
+                if let Some(owner) = &package {
+                    out.witnesses.push(crate::witnesses::Witness {
+                        attachment: crate::witnesses::WitnessAttachment::Variable {
+                            name: (pack.shape_name)("def.var", &e.text),
+                            scope: cur_scope,
+                        },
+                        source: crate::witnesses::WitnessSource::Builder(
+                            "skeleton-anon-agg".into(),
+                        ),
+                        payload: crate::witnesses::WitnessPayload::Edge(
+                            crate::witnesses::WitnessAttachment::TypeName(owner.clone()),
+                        ),
+                        span: Span { start: e.start, end: e.start },
+                    });
+                }
             }
             "flow.source" => {
                 flow_sources.insert(e.match_id, Span { start: e.start, end: e.end });

@@ -206,7 +206,7 @@
           "\"kind\":\"Variable\",\"line\":\"21\",\"name\":\"public\""
         ]
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "cpp-hitlist2-namespace-macro-reopen-orphans-package",
@@ -224,7 +224,7 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "cpp-hitlist2-using-reexport-invisible-in-outline",
@@ -242,7 +242,7 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "cpp-hitlist2-pointer-returning-prototype-dropped",
@@ -262,7 +262,7 @@
           "\"kind\":\"Variable\",\"line\":\"0\",\"name\":\"a\"}"
         ]
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "cpp-hitlist2-operator-overloads-blind-spot",
@@ -281,7 +281,7 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
     }
   ]
 }

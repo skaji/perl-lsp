@@ -424,7 +424,7 @@
           "struct Other"
         ]
       },
-      "status": "xfail"
+      "status": "gold"
     }
   ]
 }

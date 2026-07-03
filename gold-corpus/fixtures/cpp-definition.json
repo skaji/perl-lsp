@@ -515,7 +515,7 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "cpp-hitlist2-nested-union-cross-file-gd-dark",
@@ -533,7 +533,7 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
     }
   ]
 }
