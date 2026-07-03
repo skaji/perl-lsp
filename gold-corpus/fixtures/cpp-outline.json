@@ -186,6 +186,102 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-ctor-noexcept-scope-desync",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #6: a macro-attributed move ctor whose noexcept(... && ...) clause and member-initializer both span multiple lines (a nested brace-init inside a ternary) desyncs scope tracking for the rest of the class — a ref-qualified method right after it, and the access-specifier labels, leak.",
+      "file": "scope_desync.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Method\",\"line\":\"22\",\"name\":\"after\",\"package\":\"Widget\""
+        ],
+        "none": [
+          "\"kind\":\"Variable\",\"line\":\"18\",\"name\":\"private\"",
+          "\"kind\":\"Variable\",\"line\":\"21\",\"name\":\"public\""
+        ]
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist2-namespace-macro-reopen-orphans-package",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #7 reduction note: a PLAIN reopened namespace (no macro guard) already attributes both openings correctly today. json.hpp/fmt's real orphaning needs the SPDLOG/NLOHMANN-style macro-wrapped namespace-open idiom (NS_BEGIN/NS_END unresolved locally) — the same root cause as the macro-before-class gap (ns_macro.cpp), generalized to `namespace`: even the FIRST opening goes dark, not just later reopenings.",
+      "file": "reopen_ns.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Sub\",\"line\":\"16\",\"name\":\"f2\",\"package\":\"d\""
+        ],
+        "none": []
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist2-using-reexport-invisible-in-outline",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #8: `using Base::insert;` re-exports Base's member into Derived's public API but mints no outline entry for it — Derived's member list silently drops the re-exported name (gd from a call site is unaffected — verified separately it already reaches Base::insert, not the unrelated `Other::insert` plant).",
+      "file": "using_reexport.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"name\":\"insert\",\"package\":\"Derived\""
+        ],
+        "none": []
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist2-pointer-returning-prototype-dropped",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #9: `struct T *make_t(int a);` (pointer-returning prototype, no body) is dropped from the outline entirely — the declarator-ambiguity misparse leaks its param `a` as an orphan top-level Variable instead.",
+      "file": "ptr_proto.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Sub\",\"line\":\"0\",\"name\":\"make_t\""
+        ],
+        "none": [
+          "\"kind\":\"Variable\",\"line\":\"0\",\"name\":\"a\"}"
+        ]
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "cpp-hitlist2-operator-overloads-blind-spot",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #12: operator overloads (member `operator+`, free `operator<<`) are a total outline blind spot — neither appears at all. Expected name form (our choice): the member spells as `operator+` under package `Vec2`; the free operator spells as bare `operator<<` with no package.",
+      "file": "operators.cpp",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"name\":\"operator+\",\"package\":\"Vec2\"",
+          "\"name\":\"operator<<\""
+        ],
+        "none": []
+      },
+      "status": "xfail"
     }
   ]
 }
