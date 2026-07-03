@@ -43,6 +43,19 @@ import (`use`), field slot = one shared subject. Same machinery, C surface.
   promoted on landing; honest partials (use-after-move gated, Perl domain
   deferred) recorded, not forced.
 
+## STATE @ 2026-07-03 — templates DONE, CandidateSet everywhere
+
+The template arc landed end-to-end: (a) extraction hygiene ✅ (specs/
+explicit-inst/aliases/concepts/unions/ScopeKind), (b) instances join their
+class ✅ (`ParametricType::Instance`), (c) lazy projection + partial-spec
+selection + the unified projection engine ✅ (`src/projection.rs`). THE
+MIGRATION landed: the resolution CandidateSet (PR #107, merged to main)
+now runs the spike too — visibility/edges/ranking are construction facts,
+inherited by every projection, both languages. Heatmap #99 migrated onto
+`references()`. Full ledger + parked list:
+`docs/session-2026-07-03-summary.md`. Dogfood round 2 findings:
+`docs/hitlist-2.md`.
+
 ## READY QUEUE
 
 1–5 ✅ LANDED (see the arc record above). Remaining:
