@@ -53,8 +53,9 @@ MIGRATION landed: the resolution CandidateSet (PR #107, merged to main)
 now runs the spike too — visibility/edges/ranking are construction facts,
 inherited by every projection, both languages. Heatmap #99 migrated onto
 `references()`. Full ledger + parked list:
-`docs/session-2026-07-03-summary.md`. Dogfood round 2 findings:
-`docs/hitlist-2.md`.
+`docs/session-2026-07-03-summary.md`. Dogfood round 2 findings AND the
+landed fix run: `docs/hitlist-2.md` (all five slices A–E landed — see
+queue #9; residuals pinned in `gold-corpus/KNOWN-GAPS.md`).
 
 ## READY QUEUE
 
@@ -136,6 +137,20 @@ inherited by every projection, both languages. Heatmap #99 migrated onto
    share the worklist/seen-set/provenance spine). Parked residue: the
    deduction/dependent-type rungs, template-template params,
    `extern template` ERROR parse (see the brief's parked list).
+9. ✅ **hitlist-2 fix run** (`docs/hitlist-2.md`, dogfood round 2 → five
+   slices, all landed). A: one canonical `FileScopeValue` macro identity
+   from every spelling (gr grep-exact on the abseil guards). B: one-symbol
+   verbs keyed on owner class / namespace / spec ladder (member gr 1621 →
+   17 real; qualified calls participate; arity evaluated-not-taken). C:
+   extraction structurals — operators, pointer prototypes, fn-ptr
+   typedefs, anon-aggregate members, the structural macro strip +
+   per-splice salvage with the structure-count gate (basic_json /
+   raw_hash_set extract). D: hover joins the CandidateSet
+   (`hover_candidate()` — hover and gd answer ONE resolution) + decl→def
+   ranking + the Function-lane visibility gate re-activated. E: `.def`
+   content sniff, guard-label suppression, access-filtered completion,
+   kind labels, (name, span) class dedup. Residuals pinned in
+   `gold-corpus/KNOWN-GAPS.md`; open forks in `docs/open-forks.md`.
 
 **Deferred (recorded, not queued):** Perl domain typing (needs a synthetic
 constant-group / `Type::Tiny` enum-domain model — `docs/adr/field-projections.md`);

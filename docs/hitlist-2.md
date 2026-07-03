@@ -5,6 +5,10 @@ gr count grep-sanity-checked. Full tables in the agents' reports; this is
 the synthesized, deduplicated list. Wave-2 (minimal repros + the gr-count
 mechanics) findings appended at the bottom.
 
+**Status: all five fix slices (A–E) LANDED** — per-slice resolutions and
+honest residuals live inline in "Suggested fix-slice grouping" below; the
+residuals are also pinned in `gold-corpus/KNOWN-GAPS.md`.
+
 ## What held (the earned wins — regression-guard these)
 
 - gi family walk: `formatter` primary → 10 specs across 7 headers ✅
@@ -191,6 +195,27 @@ catastrophic on collisions:
   namespaces, #9 pointer prototypes, #10 fn-ptr typedefs, #12 operators,
   #11 MACRO\nclass (macro lane), #8 using-re-exports (model as the
   import-edge/role shape it is).
+  **LANDED (wave-3)**, 8 xfail rows promoted: #9 pointer-returning
+  prototype patterns (params shielded); #12 `operator_name` declarators
+  (in-class Method, free Sub, out-of-line, pointer/reference returns);
+  #10 fn-ptr typedef name inside `parenthesized_declarator`; #16
+  anonymous-aggregate members (`@anonagg.member` → identity edge to the
+  enclosing container, so `u->data.ping` resolves cross-file); #6+#7
+  `strip_unresolved_structural_macros` (blank unresolved macro tokens
+  before `namespace` / before a constructor / post-declarator ERROR
+  position, adopt/revert gated on damage AND bodied-structure count —
+  damage count alone is gameable, tree-sitter recovery trades small
+  ERRORs for one class-swallowing ERROR); #11 per-splice validation via
+  `salvage_splices` (bisect per-MACRO-NAME groups, O(names) reparses;
+  rejected groups degrade to length-preserving blanks). basic_json 0 → 1
+  Class / 36 members; raw_hash_set 0 → 1 Class / 68 members; #8
+  reexport Methods with see-through, class-scoped (not file-scoped)
+  cross-file member checks. **Honest residuals:** json.hpp namespace
+  attribution still stops at an `#if` inside a class body; one `private:`
+  leak remains after the scope repair; tokens the structural strip blanks
+  are NOT re-minted as refs (the A-slice diff re-mint covers only the
+  declarator-strip lane); salvage granularity is per-macro-name — a name
+  with mixed good/bad use sites degrades as a whole group.
 - **D. Hover joins the CandidateSet** (#14) + decl→def preference (#15).
   **LANDED (wave-3)**: pack hover = `CandidateSet::hover_candidate()` (the
   top-ranked `definitions()` candidate, presented — member drill-downs stay
@@ -214,3 +239,16 @@ catastrophic on collisions:
   decls, grep-consistent).
 - **E. Small: #13 .def language routing, #16 nested-union access, #17
   guard-label suppression, #18-21 polish.**
+  **LANDED (wave-3)** (#16 landed in C): #13 content sniff for
+  unknown-extension files (structural C-vs-Perl signature, not an
+  extension list — a Windows `.def` isn't C; wired into every open/CLI
+  parse entry; commands.def 0 → 906 symbols); #17 the header-guard idiom
+  recognized structurally and its term dropped from reachability labels;
+  #18 access-region scan stamps `non_public`, member completion filters
+  by it (two-state; friend/protected-via-inheritance noted, not
+  modeled); #19 `SymKind::Enumerator` + cpp `SymKind::Field` + the
+  `"macro"` attribute driving hover kind labels; #20 `--help` documents
+  the outline-JSON 0-indexed exception, banner names the served
+  languages; #21 class/union dedup keys on (name, span). **Honest
+  residual:** #19's `bool` → Numeric stays (typedef-resolution lane,
+  the golive-map's join→typing item).
