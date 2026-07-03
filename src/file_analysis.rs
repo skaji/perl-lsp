@@ -909,6 +909,12 @@ pub enum SymKind {
     Class,
     Module,
     Field,
+    /// A named enum value (C/C++ `enum Color { RED }`) — leaks into the
+    /// enclosing scope like C allows, but is neither an assignable
+    /// `Variable` nor a class `Field`: it's a compile-time constant scoped
+    /// to its enum. Distinct kind so hover/outline/completion can label it
+    /// `enumerator` instead of collapsing into the variable catch-all.
+    Enumerator,
     HashKeyDef,
     /// Named handler registered on a class via string-dispatch (e.g. Mojo
     /// events, Dancer routes, Catalyst actions). Not a Perl method — it
@@ -5427,8 +5433,12 @@ impl FileAnalysis {
             }
         }
 
-        // Collect methods from this class and all ancestors
-        self.collect_ancestor_methods(class_name, class_name, module_index, &mut candidates, &mut seen_names, 0);
+        // Collect methods from this class and all ancestors. Perl has no
+        // access-specifier concept, so no symbol here ever carries
+        // "non_public" — `requesting_class: None` is a no-op gate.
+        self.collect_ancestor_methods(
+            class_name, class_name, module_index, &mut candidates, &mut seen_names, 0, None,
+        );
 
         candidates
     }
@@ -5443,6 +5453,7 @@ impl FileAnalysis {
         cls: &str,
         candidates: &mut Vec<CompletionCandidate>,
         seen: &mut HashSet<String>,
+        requesting_class: Option<&str>,
     ) {
         let class_body = self
             .symbols
@@ -5466,6 +5477,11 @@ impl FileAnalysis {
                 // an anonymous container (`(union)`) is structure, not an
                 // addressable member
                 && !sym.attributes.iter().any(|a| a == "anonymous")
+                // access-specifier gate (hitlist-2 #18): a non-public member
+                // completes only from inside its OWN class's lexical body —
+                // two-state (friend/protected-via-inheritance not modeled).
+                && (requesting_class == Some(cls)
+                    || !sym.attributes.iter().any(|a| a == "non_public"))
                 && seen.insert(sym.name.clone())
             {
                 candidates.push(CompletionCandidate {
@@ -5488,15 +5504,22 @@ impl FileAnalysis {
     /// fields and mints no constructor — C++/Python member access lists
     /// the real members. Methods (and inherited ones) come from the shared
     /// ancestor walk; fields are this class's `Variable`/`Field` symbols.
+    /// `requesting_class` is the class the completion CURSOR is lexically
+    /// inside (`None` from free-standing code) — the access-specifier gate
+    /// (hitlist-2 #18): a non-public member offers only when the cursor is
+    /// inside that SAME class's own body. A caller with no cursor context
+    /// passes `None` and safely under-offers to "public only" — it never
+    /// leaks a private member.
     pub fn complete_members_for_class(
         &self,
         class_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
+        requesting_class: Option<&str>,
     ) -> Vec<CompletionCandidate> {
         let mut candidates = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         self.collect_ancestor_methods(
-            class_name, class_name, module_index, &mut candidates, &mut seen, 0,
+            class_name, class_name, module_index, &mut candidates, &mut seen, 0, requesting_class,
         );
         // Data members from this class AND its ancestors. A field lives in
         // its class body scope (or a nested container body — inline unions);
@@ -5504,15 +5527,15 @@ impl FileAnalysis {
         // where each class's methods are declared — that IS the body scope,
         // whichever node carries it.
         self.for_each_ancestor_class(class_name, module_index, |cls| {
-            self.collect_class_fields(cls, &mut candidates, &mut seen);
+            self.collect_class_fields(cls, &mut candidates, &mut seen, requesting_class);
             // a class defined in ANOTHER file — pull its fields from the
             // cached module so cross-file member completion is complete
             // (methods already cross via collect_ancestor_methods).
             if let Some(mi) = module_index {
                 if let Some(cached) = mi.get_cached(cls) {
-                    cached
-                        .analysis
-                        .collect_class_fields(cls, &mut candidates, &mut seen);
+                    cached.analysis.collect_class_fields(
+                        cls, &mut candidates, &mut seen, requesting_class,
+                    );
                 }
             }
             std::ops::ControlFlow::Continue(())
@@ -5688,7 +5711,7 @@ impl FileAnalysis {
                 .iter()
                 .find(|s| {
                     s.name == value
-                        && matches!(s.kind, SymKind::Variable | SymKind::Field)
+                        && matches!(s.kind, SymKind::Variable | SymKind::Field | SymKind::Enumerator)
                         && s.package.is_some()
                 })
                 .and_then(|s| s.package.clone())
@@ -5966,15 +5989,25 @@ impl FileAnalysis {
         candidates: &mut Vec<CompletionCandidate>,
         seen_names: &mut HashSet<String>,
         depth: usize,
+        requesting_class: Option<&str>,
     ) {
         if depth > 20 {
             return;
         }
+        // Access-specifier gate (hitlist-2 #18): visible from outside
+        // `class_name`'s own body only when NOT tagged non-public.
+        let visible = |sym: &Symbol| {
+            requesting_class == Some(class_name)
+                || !sym.attributes.iter().any(|a| a == "non_public")
+        };
 
         // Local methods in this class
         for sym in &self.symbols {
             if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
-                if self.symbol_in_class(sym.id, class_name) && !seen_names.contains(&sym.name) {
+                if self.symbol_in_class(sym.id, class_name)
+                    && !seen_names.contains(&sym.name)
+                    && visible(sym)
+                {
                     seen_names.insert(sym.name.clone());
                     let defining = if class_name != original_class { Some(class_name) } else { None };
                     let display_override = sub_display_override(&sym.detail);
@@ -6008,6 +6041,7 @@ impl FileAnalysis {
                 let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
                 if seen_names.contains(&sym.name) { continue; }
+                if !visible(sym) { continue; }
                 seen_names.insert(sym.name.clone());
                 let defining = if class_name != original_class { Some(class_name) } else { None };
                 let display_override = sub_display_override(&sym.detail);
@@ -6041,6 +6075,7 @@ impl FileAnalysis {
             let mut bridged: Vec<(String, SymKind, Option<SymbolDetail>, Option<InferredType>)> = Vec::new();
             idx.for_each_entity_bridged_to(class_name, &mut |_mod, _cached, sym| {
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                if !visible(sym) { return; }
                 bridged.push((
                     sym.name.clone(),
                     sym.kind,
@@ -6076,6 +6111,7 @@ impl FileAnalysis {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
                     if sym.package.as_deref() != Some(class_name) { continue; }
                     if seen_names.contains(&sym.name) { continue; }
+                    if !visible(sym) { continue; }
                     seen_names.insert(sym.name.clone());
                     let is_method = sym.kind == SymKind::Method
                         || matches!(sym.detail, SymbolDetail::Sub { is_method: true, .. });
@@ -6109,6 +6145,7 @@ impl FileAnalysis {
         ) {
             self.collect_ancestor_methods(
                 original_class, &parent, module_index, candidates, seen_names, depth + 1,
+                requesting_class,
             );
         }
     }
@@ -6260,7 +6297,11 @@ impl FileAnalysis {
     pub fn is_linkage_visible(&self, sym: &Symbol) -> bool {
         match sym.kind {
             SymKind::Class | SymKind::Sub => true,
-            SymKind::Variable => self
+            // An anonymous-enum constant leaks to file scope the same way an
+            // unqualified global does; a NAMED enum's constants leak to the
+            // enum's own enclosing scope (also File for a top-level enum) —
+            // either way the File-scope gate is the same test as Variable.
+            SymKind::Variable | SymKind::Enumerator => self
                 .scopes
                 .iter()
                 .find(|s| s.id == sym.scope)
@@ -8909,7 +8950,9 @@ impl FileAnalysis {
             let sym = self.symbol(sid);
             let member_kind = match sym.kind {
                 SymKind::Sub | SymKind::Method => true,
-                SymKind::Variable | SymKind::Field => self.symbol_is_class_content(sym),
+                SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
+                    self.symbol_is_class_content(sym)
+                }
                 _ => false,
             };
             // A re-export (`using Base::m;`) is API surface, not a def —
@@ -8945,8 +8988,10 @@ impl FileAnalysis {
                         && s.package.as_deref() == Some(cls)
                         && !s.is_reexport()
                         && (matches!(s.kind, SymKind::Sub | SymKind::Method)
-                            || (matches!(s.kind, SymKind::Variable | SymKind::Field)
-                                && cached.analysis.symbol_is_class_content(s)))
+                            || (matches!(
+                                s.kind,
+                                SymKind::Variable | SymKind::Field | SymKind::Enumerator
+                            ) && cached.analysis.symbol_is_class_content(s)))
                 });
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
@@ -9570,7 +9615,7 @@ impl FileAnalysis {
     /// bare-name cross-file lookup. Perl symbols never qualify (variables
     /// and Corinna fields carry sigils; callables aren't Variable/Field).
     pub(crate) fn symbol_is_class_content(&self, sym: &Symbol) -> bool {
-        if !matches!(sym.kind, SymKind::Variable | SymKind::Field) {
+        if !matches!(sym.kind, SymKind::Variable | SymKind::Field | SymKind::Enumerator) {
             return false;
         }
         if sym.name.starts_with(['$', '@', '%']) {
@@ -9689,7 +9734,9 @@ impl FileAnalysis {
     pub(crate) fn symbol_is_file_scope_value(&self, sym: &Symbol) -> bool {
         // `ScopeKind::File` is the SAME gate `register_symbols` keys the
         // by-name cross-file index on — forward and backward share the key.
-        matches!(sym.kind, SymKind::Variable)
+        // `Enumerator` covers an anonymous-enum constant (no enclosing
+        // named scope of its own; it leaks straight to file scope).
+        matches!(sym.kind, SymKind::Variable | SymKind::Enumerator)
             && sym.package.is_none()
             && !sym.name.starts_with(['$', '@', '%'])
             && matches!(self.scope(sym.scope).kind, ScopeKind::File)
@@ -9894,7 +9941,7 @@ impl FileAnalysis {
             // Sub/Method/Block/ForLoop; fields carry their class as `package`
             // and file/package-level vars live in the File/Package scope, so
             // both still surface.
-            if matches!(sym.kind, SymKind::Variable)
+            if matches!(sym.kind, SymKind::Variable | SymKind::Enumerator)
                 && sym.package.is_none()
                 && self.scopes.iter().find(|s| s.id == parent_scope).is_some_and(|s| {
                     matches!(
@@ -10028,6 +10075,9 @@ impl FileAnalysis {
                 }
                 SymKind::Field => {
                     (sym.name.clone(), Some("field".to_string()), Vec::new())
+                }
+                SymKind::Enumerator => {
+                    (sym.name.clone(), Some("enumerator".to_string()), Vec::new())
                 }
                 SymKind::HashKeyDef => continue, // Skip hash key defs from outline
                 SymKind::Handler => {

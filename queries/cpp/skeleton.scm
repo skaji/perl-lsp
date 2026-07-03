@@ -21,7 +21,11 @@
 ; the surface. Object-like (`#define MAX 1`) → a constant (Variable);
 ; function-like (`#define MIN(a,b) ...`) → a callable (Sub).
 (preproc_def name: (identifier) @def.var.name) @def.var
-(preproc_function_def name: (identifier) @def.sub.name) @def.sub
+; a distinct skel-kind (not the plain "sub" a real function uses) so the
+; Symbol can be tagged "macro" (hover/completion say "macro", not
+; "function" — hitlist-2 #19) while still resolving as a callable Sub
+; everywhere else.
+(preproc_function_def name: (identifier) @def.macro.name) @def.macro
 ; An object-like macro whose body is a bare type spelling is a TYPE ALIAS the
 ; same as a `typedef` — `#define PERL_BITFIELD16 U16` / `#define BITF16 unsigned`.
 ; The alias graph resolves it (incl. cross-file, since the #define is a
@@ -492,8 +496,12 @@
   name: (identifier) @def.class.name) @def.class
 (requires_expression) @scope.sub
 
+; a struct/class DATA MEMBER — structurally distinct from a plain variable
+; (the `field_declaration` node only appears inside a class/struct body),
+; so it gets its own kind (hover/outline "field", not "variable") without
+; any name-based guessing.
 (field_declaration
-  declarator: (field_identifier) @def.var.name) @def.var
+  declarator: (field_identifier) @def.field.name) @def.field
 ; a data member's TYPE — the type witness needs field_declaration (the
 ; `declaration` patterns below only see locals). Only plain-field
 ; declarators match (a function_declarator is a method, not a field), so

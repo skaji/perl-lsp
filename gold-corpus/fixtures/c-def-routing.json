@@ -1,0 +1,24 @@
+{
+  "capability": "outline",
+  "rows": [
+    {
+      "id": "c-def-extension-routes-to-cpp",
+      "difficulty": "moderate",
+      "semantic_area": "c-misra-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "commands_min.def",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "\"kind\":\"Sub\",\"line\":\"2\",\"name\":\"commandGroupStr\"",
+          "\"kind\":\"Variable\",\"line\":\"7\",\"name\":\"CMD_HISTORY_LEN\"",
+          "\"kind\":\"Class\",\"line\":\"10\",\"name\":\"redisCommand\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

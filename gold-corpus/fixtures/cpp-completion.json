@@ -2,6 +2,51 @@
   "capability": "completion",
   "rows": [
     {
+      "id": "cpp-completion-access-specifier-external-public-only",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "access_spec.cpp",
+      "line": 16,
+      "col": 9,
+      "expect": {
+        "all": [
+          "ok",
+          "Update"
+        ],
+        "none": [
+          "Ref",
+          "Unref",
+          "rep_"
+        ],
+        "exact_labels": [
+          "ok",
+          "Update"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-completion-access-specifier-self-access-sees-private",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "access_spec.cpp",
+      "line": 6,
+      "col": 10,
+      "expect": {
+        "all": [
+          "Ref",
+          "Unref",
+          "rep_"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-completion-member-access",
       "difficulty": "simple",
       "semantic_area": "cpp-multilang",

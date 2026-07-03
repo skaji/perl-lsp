@@ -175,22 +175,37 @@ impl SkeletonAnalysis {
             FileAnalysis, FileAnalysisParts, SymKind, Symbol, SymbolDetail, SymbolId,
         };
         // A NAMED typedef `typedef struct N {...} N;` matches both the
-        // struct_specifier and the type_definition → two `class N`. C
-        // can't have two types of one name, so keep one. "class" and
-        // "union" are one type-kind family (a bodied named union matches
-        // both the generic class pattern and the union-tagged one); the
-        // union-tagged row wins so the "union" attribute survives.
+        // struct_specifier and the type_definition → two `class N` AT THE
+        // SAME SPAN (one node, two capture patterns — e.g. the bodied
+        // pattern and the inheritance pattern both fire for `class Circle :
+        // public Shape {...}`). Key on (name, name span) rather than name
+        // alone (hitlist-2 #21): two class_specifiers that happen to share a
+        // bare name at DIFFERENT spans (forward decl + definition, same
+        // short name in different scopes) are genuinely distinct symbols and
+        // must both survive — only an exact same-span re-capture is the
+        // duplicate-emission bug. "class" and "union" are one type-kind
+        // family (a bodied named union matches both the generic class
+        // pattern and the union-tagged one); the union-tagged row wins at a
+        // shared span so the "union" attribute survives.
         {
-            let union_names: std::collections::HashSet<String> = self
+            type ClassKey = (String, (usize, usize), (usize, usize));
+            let key_of = |s: &SkelSymbol| -> ClassKey {
+                (
+                    s.name.clone(),
+                    (s.name_start.row, s.name_start.column),
+                    (s.name_end.row, s.name_end.column),
+                )
+            };
+            let union_keys: std::collections::HashSet<ClassKey> = self
                 .symbols
                 .iter()
                 .filter(|s| s.kind == "union")
-                .map(|s| s.name.clone())
+                .map(key_of)
                 .collect();
             let mut seen = std::collections::HashSet::new();
             self.symbols.retain(|s| match s.kind.as_str() {
-                "class" => !union_names.contains(&s.name) && seen.insert(s.name.clone()),
-                "union" => seen.insert(s.name.clone()),
+                "class" => !union_keys.contains(&key_of(s)) && seen.insert(key_of(s)),
+                "union" => seen.insert(key_of(s)),
                 _ => true,
             });
         }
@@ -261,13 +276,24 @@ impl SkeletonAnalysis {
                     "package" => SymKind::Package,
                     // "union": a named union TYPE (its members are its own).
                     "class" | "union" => SymKind::Class,
-                    "sub" | "anon" | "constant" => SymKind::Sub,
+                    // "macro": a function-like `#define` — a real callable
+                    // Sub everywhere (dispatch/completion/goto-def), tagged
+                    // "macro" below so hover/labels say so (hitlist-2 #19).
+                    "sub" | "anon" | "constant" | "macro" => SymKind::Sub,
                     // "reexport": `using Base::m;` in a class body — a Method
                     // in the class's API surface; the "reexport" attribute
                     // (added below) makes resolution see through it.
                     "method" | "reexport" => SymKind::Method,
+                    // a plain struct/class data member — distinct from a
+                    // local/global Variable (hitlist-2 #19: hover/outline
+                    // said "variable" for every field).
+                    "field" => SymKind::Field,
+                    // a named enum value — distinct from both Variable and
+                    // Field (hitlist-2 #19).
+                    "enumerator" => SymKind::Enumerator,
                     // "unionfield" (an inline union member-field container)
-                    // lands here too — a field, outline-nesting its body.
+                    // stays Variable — its "union" attribute drives the
+                    // outline-nesting branch keyed on SymKind::Variable below.
                     _ => SymKind::Variable,
                 },
                 span: Span { start: s.start, end: s.end },
@@ -287,6 +313,9 @@ impl SkeletonAnalysis {
                     }
                     if s.kind == "reexport" {
                         a.push("reexport".to_string());
+                    }
+                    if s.kind == "macro" {
+                        a.push("macro".to_string());
                     }
                     a
                 },
@@ -1178,7 +1207,11 @@ pub fn cpp_pack() -> LangPack {
                 ("reference_declarator", crate::file_analysis::DerefKind::Reference),
             ],
             annot_kinds: &["type_qualifier"],
-            leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.var")],
+            // `field_identifier` only ever names a struct/class member (the
+            // grammar's own distinction from a plain `identifier` local) —
+            // "def.field" here matches the plain (non-pointer) field pattern
+            // above (hitlist-2 #19).
+            leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.field")],
             record_stack: true,
         },
         // DerefKind placeholder — record_stack false, so it's never read.

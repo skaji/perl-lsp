@@ -59,9 +59,9 @@ pub fn pack_completion(
                     // (`p.` → `p->`) when the receiver's pointer depth wants
                     // a different operator than was typed. The diagnostic
                     // path (Mode B) is the universal fallback.
-                    if let Some(items) =
-                        symbols::member_completion_for_class(analysis, &class, xidx, ctx.op_fix)
-                    {
+                    if let Some(items) = symbols::member_completion_for_class(
+                        analysis, &class, xidx, ctx.op_fix, point,
+                    ) {
                         return (items, false);
                     }
                 }

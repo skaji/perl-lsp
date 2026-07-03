@@ -369,12 +369,12 @@ fn cli_languages() {
 fn cli_lang_analyze(file: &str) {
     let reg = crate::language_driver::LanguageRegistry::with_enabled();
     let path = std::path::Path::new(file);
-    let Some(driver) = reg.for_path(path) else {
-        eprintln!("no driver for {file} (this build serves: {})", reg.languages().join(", "));
-        std::process::exit(1);
-    };
     let Ok(src) = std::fs::read_to_string(path) else {
         eprintln!("cannot read {file}");
+        std::process::exit(1);
+    };
+    let Some(driver) = reg.for_path_sniffed(path, &src) else {
+        eprintln!("no driver for {file} (this build serves: {})", reg.languages().join(", "));
         std::process::exit(1);
     };
     // Persist the transitive macro table across invocations — keyed on the
@@ -423,6 +423,11 @@ fn print_usage() {
     eprintln!();
     eprintln!("  Positions: <line> <col> input is 0-based (col = byte offset);");
     eprintln!("             printed line:col output is 1-based (col = character).");
+    eprintln!("             EXCEPTION: --outline's \"line\"/\"col\" JSON fields are");
+    eprintln!("             0-based, matching input — unlike --definition/--references/");
+    eprintln!("             --rename/--workspace-symbol JSON, which follow the 1-based");
+    eprintln!("             output rule above. Existing fixtures pin both forms; this is");
+    eprintln!("             documented, not (yet) unified.");
     eprintln!();
     eprintln!("ANALYSIS:");
     eprintln!("  perl-lsp --check [<root>] [--severity error|warning]    Batch diagnostics (CI)");
@@ -478,10 +483,13 @@ fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnal
     });
     // Route a pack language (cpp, ...) through its driver so the CLI
     // capabilities (--outline, --hover, --batch/gold) match the LSP
-    // server. Perl + unknown extensions keep the existing path.
+    // server. Perl + truly-unrecognized files keep the existing path; an
+    // extension no driver claims falls back to a content sniff (hitlist-2
+    // #13 — `commands.def` is C, not Perl, despite its unowned extension).
     let reg = language_driver::LanguageRegistry::with_enabled();
-    if let Some(driver) =
-        reg.for_path(std::path::Path::new(path)).filter(|d| d.id() != "perl")
+    if let Some(driver) = reg
+        .for_path_sniffed(std::path::Path::new(path), &source)
+        .filter(|d| d.id() != "perl")
     {
         let mut parser = driver.make_parser();
         let tree = parser.parse(&source, None).unwrap_or_else(|| {
@@ -528,6 +536,21 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
     (path, uri)
 }
 
+/// Human-facing name for a pack language id, for the startup banner
+/// (hitlist-2 #20). Purely cosmetic — `LanguageRegistry::for_id` still
+/// speaks the short id everywhere else; this is the one spot that prints
+/// for a human. Falls back to the id itself for a language this mapping
+/// hasn't been told about yet (never a hard error over a display string).
+fn pack_language_display_name(id: &str) -> &'static str {
+    match id {
+        "cpp" => "C/C++",
+        "python" => "Python",
+        "r" => "R",
+        "cmake" => "CMake",
+        _ => "pack-language",
+    }
+}
+
 /// Full CLI workspace setup: index the workspace, open the SQLite cache,
 /// warm cached modules, resolve missing imports + ancestors via @INC,
 /// save fresh entries back to disk. Mirrors the LSP server's startup
@@ -560,7 +583,17 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     let pack_indexed =
         module_resolver::index_pack_languages(&root_path, Some(&root_uri), &module_index);
     if pack_indexed > 0 {
-        eprintln!("Indexed {} pack-language files", pack_indexed);
+        // Name the languages actually served (hitlist-2 #20) rather than the
+        // generic "pack-language" — a pure-C++ workspace should read "C/C++",
+        // not a term that only makes sense from inside this codebase.
+        let reg = language_driver::LanguageRegistry::with_enabled();
+        let langs: Vec<&'static str> = reg
+            .languages()
+            .into_iter()
+            .filter(|id| *id != "perl")
+            .map(pack_language_display_name)
+            .collect();
+        eprintln!("Indexed {} {} files", pack_indexed, langs.join("/"));
     }
 
     let mut inc_paths = module_resolver::discover_inc_paths();
@@ -819,7 +852,7 @@ fn cli_hover(root: Option<&str>, file: &str, line_str: &str, col_str: &str) {
             // in this form (use the root form for that). Perl keeps hover_info.
             let reg = language_driver::LanguageRegistry::with_enabled();
             let pack_lang = reg
-                .for_path(std::path::Path::new(file))
+                .for_path_sniffed(std::path::Path::new(file), &source)
                 .map(|d| d.id())
                 .filter(|id| *id != "perl");
             let markdown = match pack_lang {
@@ -951,9 +984,11 @@ fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::D
     });
     // Route a pack language (cpp, ...) through its driver so the CLI
     // cursor handlers (definition/references/highlight/…) match the LSP
-    // server. Perl + unknown extensions keep Document::new + enrichment.
+    // server. Perl + truly-unrecognized files keep Document::new + enrichment.
     let reg = language_driver::LanguageRegistry::with_enabled();
-    let pack = reg.for_path(std::path::Path::new(file)).filter(|d| d.id() != "perl");
+    let pack = reg
+        .for_path_sniffed(std::path::Path::new(file), &text)
+        .filter(|d| d.id() != "perl");
     if let Some(driver) = pack {
         return tphase!("Document::new_routed", document::Document::new_routed(text, driver, Some(std::path::PathBuf::from(file))).unwrap_or_else(|| {
             eprintln!("Parse failed: {}", file);
@@ -1075,7 +1110,7 @@ fn run_one(
             // the LSP server); Perl uses the hub. The CLI mirror MUST route here
             // or cross-file macro/function goto-def silently misses.
             let reg = language_driver::LanguageRegistry::with_enabled();
-            let lang_id = reg.for_path(std::path::Path::new(file))
+            let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &source)
                 .map(|d| d.id()).filter(|id| *id != "perl");
             let pack = lang_id.and_then(|lang| idx.pack_index(lang));
             let base_idx: &dyn crate::file_analysis::CrossFileLookup =
@@ -1126,7 +1161,7 @@ fn run_one(
             Err(format!("No definition found at {}:{}", req.line, req.col))
         }
         "references" => {
-            let (_s, _t, mut analysis) = parse_file(file);
+            let (s, _t, mut analysis) = parse_file(file);
             resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
@@ -1138,7 +1173,7 @@ fn run_one(
             // resolving/collecting against it silently misses every
             // cross-file cpp use. Perl keeps the hub (empty closure = no-op).
             let reg = language_driver::LanguageRegistry::with_enabled();
-            let lang_id = reg.for_path(std::path::Path::new(file))
+            let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
                 .map(|d| d.id()).filter(|id| *id != "perl");
             let pack = lang_id.and_then(|lang| idx.pack_index(lang));
             let base_idx: &dyn crate::file_analysis::CrossFileLookup =
@@ -1184,7 +1219,7 @@ fn run_one(
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
         "implementations" => {
-            let (_s, _t, mut analysis) = parse_file(file);
+            let (s, _t, mut analysis) = parse_file(file);
             resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
@@ -1196,7 +1231,7 @@ fn run_one(
             // field-slot sites) and the family/spec walks are one projection.
             let reg = language_driver::LanguageRegistry::with_enabled();
             let pack = reg
-                .for_path(std::path::Path::new(file))
+                .for_path_sniffed(std::path::Path::new(file), &s)
                 .map(|d| d.id())
                 .filter(|id| *id != "perl")
                 .and_then(|lang| idx.pack_index(lang));
@@ -1230,7 +1265,7 @@ fn run_one(
             // Pack languages get the language-agnostic declaration hover
             // (matches the LSP server); Perl keeps its rich renderer.
             let reg = language_driver::LanguageRegistry::with_enabled();
-            if let Some(lang) = reg.for_path(std::path::Path::new(file))
+            if let Some(lang) = reg.for_path_sniffed(std::path::Path::new(file), &source)
                 .map(|d| d.id()).filter(|id| *id != "perl")
             {
                 let pack = idx.pack_index(lang);
@@ -1404,7 +1439,8 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
         match sym.kind {
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
             | file_analysis::SymKind::Package | file_analysis::SymKind::Class
-            | file_analysis::SymKind::Variable | file_analysis::SymKind::Handler => {}
+            | file_analysis::SymKind::Variable | file_analysis::SymKind::Field
+            | file_analysis::SymKind::Enumerator | file_analysis::SymKind::Handler => {}
             _ => continue,
         }
         let hidden = match &sym.detail {
@@ -1413,7 +1449,9 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
             _ => false,
         };
         if hidden { continue; }
-        if sym.kind == file_analysis::SymKind::Variable && analysis.scope_within_sub_body(sym.scope) {
+        if matches!(sym.kind, file_analysis::SymKind::Variable | file_analysis::SymKind::Enumerator)
+            && analysis.scope_within_sub_body(sym.scope)
+        {
             continue;
         }
         let mut entry = serde_json::json!({
@@ -1501,14 +1539,14 @@ fn run_rename(
     }
     let file_path = std::path::Path::new(file).canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
-    let (_s, _t, mut analysis) = parse_file(file);
+    let (s, _t, mut analysis) = parse_file(file);
     analysis.enrich_imported_types_with_keys(Some(idx));
     // Same shape as the LSP handler: pack routing declared at construction,
     // stage the origin, construct the set once, project the rename — the
     // per-arm policy (cross-file vs group vs single-file, rewritability,
     // the pack full-or-refuse) lives on the set.
     let reg = language_driver::LanguageRegistry::with_enabled();
-    let lang_id = reg.for_path(std::path::Path::new(file))
+    let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
         .map(|d| d.id()).filter(|id| *id != "perl");
     let pack = lang_id.and_then(|lang| idx.pack_index(lang));
     let base_idx: &dyn crate::file_analysis::CrossFileLookup =
@@ -1986,9 +2024,10 @@ fn cli_parse(path: &str, lang: Option<&str>) {
         }
     };
     // Route to a grammar: an explicit `lang` id (stdin can't route by
-    // extension) wins, else the file's extension (cpp/python/r/cmake), so
+    // extension) wins, else the file's extension (cpp/python/r/cmake), else
+    // a content sniff for an extension no driver claims (hitlist-2 #13), so
     // --parse shows the SAME tree the pack extractor sees. Perl + stdin +
-    // unknown extensions/ids keep the Perl grammar.
+    // truly-unrecognized files keep the Perl grammar.
     let mut parser = if let Some(id) = lang {
         let reg = crate::language_driver::LanguageRegistry::with_enabled();
         match reg.for_id(id) {
@@ -2004,7 +2043,7 @@ fn cli_parse(path: &str, lang: Option<&str>) {
         }
     } else if path != "-" {
         let reg = crate::language_driver::LanguageRegistry::with_enabled();
-        reg.for_path(std::path::Path::new(path))
+        reg.for_path_sniffed(std::path::Path::new(path), &source)
             .filter(|d| d.id() != "perl")
             .map(|d| d.make_parser())
             .unwrap_or_else(builder::create_parser)
