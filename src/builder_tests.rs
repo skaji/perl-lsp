@@ -15210,7 +15210,7 @@ sub f {
 #[test]
 fn array_destructure_types_each_slot() {
     // `my @arr=(…); my ($x,$y)=@arr` — the array types as a Sequence and each
-    // destructured slot projects `element_at`. (Was None before slice D.)
+    // destructured slot projects `element_at`.
     use crate::file_analysis::InferredType::{Numeric, Sequence};
     let fa = build_fa("package T;
 sub f {

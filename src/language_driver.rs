@@ -162,7 +162,7 @@ pub struct PackDriver {
     /// `public:`/`private:`/`protected:` region scan (C preprocessor-free
     /// languages only; `None` when the language has no access-specifier
     /// concept). Stamps a `non_public` attribute on member symbols so
-    /// completion can filter by visibility (hitlist-2 #18).
+    /// completion can filter by visibility.
     access_regions: Option<fn(&mut tree_sitter::Parser, &str) -> Vec<crate::cpp_reparse::AccessRegion>>,
 }
 
@@ -255,7 +255,7 @@ impl LanguageDriver for PackDriver {
                 let mut fa = skel.into_file_analysis();
                 fa.macro_defs = macro_defs;
                 apply_attribute_macros(&mut fa, &recovered);
-                // Access-specifier regions (hitlist-2 #18): a fresh parse of
+                // Access-specifier regions: a fresh parse of
                 // the ORIGINAL source (spans already in original coords, no
                 // remap needed) tags each member symbol non-public when its
                 // declaration falls under `private:`/`protected:`.
@@ -543,7 +543,7 @@ fn inject_member_blocks(
 }
 
 /// Tag every member symbol whose declaration falls inside a non-public
-/// access region with a `"non_public"` attribute (hitlist-2 #18) — a
+/// access region with a `"non_public"` attribute — a
 /// value-borne fact on the symbol, so member completion filters by asking
 /// the symbol, never by re-deriving visibility from a name/kind guess.
 /// Span containment (not equality) because a region's span is the whole
@@ -808,7 +808,7 @@ fn mint_erased_macro_reads(
     // differing run.
     {
         let tb = transformed.as_bytes();
-        let mut diff_segment = |o_from: usize, o_to: usize, t_from: usize, sites: &mut Vec<usize>| {
+        let diff_segment = |o_from: usize, o_to: usize, t_from: usize, sites: &mut Vec<usize>| {
             let len = o_to.saturating_sub(o_from);
             if t_from + len > tb.len() {
                 return;
@@ -938,7 +938,7 @@ impl LanguageRegistry {
     }
 
     /// `for_path`, falling back to a content sniff when no driver claims the
-    /// extension (hitlist-2 #13). `source` is the file text the caller
+    /// extension. `source` is the file text the caller
     /// already has in hand — no extra I/O. Perl never sniffs (it's the
     /// default fallback the caller uses when this also returns `None`), so
     /// only pack drivers get a vote.

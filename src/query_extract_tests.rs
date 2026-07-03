@@ -1723,7 +1723,7 @@ fn cpp_fa(src: &str) -> crate::file_analysis::FileAnalysis {
         .into_file_analysis()
 }
 
-/// Class dedup keys on (name, span), not name alone (hitlist-2 #21): an
+/// Class dedup keys on (name, span), not name alone: an
 /// EXACT re-capture of the same node (a class with a base clause matches
 /// both the bodied pattern and the inheritance pattern in skeleton.scm)
 /// still collapses to one entry, but two GENUINELY DISTINCT classes that

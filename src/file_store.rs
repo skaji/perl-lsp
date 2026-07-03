@@ -81,7 +81,7 @@ impl FileStore {
     /// exists for the same path, it's replaced by the Open entry.
     pub fn open(&self, url: Url, text: String) -> bool {
         // Route by extension, falling back to a content sniff when no driver
-        // claims it (hitlist-2 #13): a PACK language (cpp, ...) goes through
+        // claims it: a PACK language (cpp, ...) goes through
         // its driver; Perl and truly-unrecognized files keep the exact
         // existing path (Document::new) so the reference behaviour is
         // byte-for-byte.

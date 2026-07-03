@@ -1015,7 +1015,7 @@ pub fn member_completion_for_class(
     op_fix: Option<(crate::file_analysis::Span, String)>,
     point: Point,
 ) -> Option<Vec<CompletionItem>> {
-    // The access-specifier gate (hitlist-2 #18) needs to know whether the
+    // The access-specifier gate needs to know whether the
     // CURSOR itself is lexically inside `class`'s own body — self-access
     // sees non-public members, an external receiver doesn't.
     let requesting_class = analysis
@@ -1237,8 +1237,7 @@ fn render_candidate_hover(
 /// `SymKind::Sub` everywhere else (dispatch/completion/goto-def), but its
 /// `"macro"` attribute (stamped at extraction) overrides the label here —
 /// the attribute is the value-borne "this Sub is macro-shaped" fact,
-/// checked before the kind match rather than re-deriving it from the name
-/// (hitlist-2 #19).
+/// checked before the kind match rather than re-deriving it from the name.
 fn hover_kind_label(sym: &crate::file_analysis::Symbol) -> &'static str {
     if sym.attributes.iter().any(|a| a == "macro") {
         return "macro";

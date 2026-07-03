@@ -284,7 +284,7 @@ struct s { M x:9; };
     assert_eq!(by_line[&6].body, "unsigned");
 }
 
-/// Content sniff (hitlist-2 #13): a `.def`-style C dispatch table (no
+/// Content sniff: a `.def`-style C dispatch table (no
 /// recognizable extension) reads as C-family on its preprocessor/brace
 /// shape; a Perl script with the same unowned extension must NOT.
 #[test]
@@ -318,7 +318,7 @@ sub greet {
 
 /// The header-guard idiom (`#ifndef X` / `#define X`) is NOT a real config
 /// knob: a macro nested under it must not inherit "!defined(X)" as a guard
-/// term (hitlist-2 #17 — gd on nearly every macro in a guarded header was
+/// term (gd on nearly every macro in a guarded header was
 /// printing a bogus `(if !defined(__REDIS_H))` label). A genuinely
 /// conditional macro nested in the SAME guarded region keeps its own guard.
 #[test]
