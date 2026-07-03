@@ -629,6 +629,63 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-static-forward-decl-offers-body",
+      "file": "fwddef/state.c",
+      "line": 1,
+      "col": 11,
+      "comment": "gd on a static forward decl offers the bodied definition (ranked first) with the decl kept \u2014 hitlist-2 #15.",
+      "expect": {
+        "all": [
+          "state.c:8:12",
+          "state.c:2:12"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-call-through-forward-decl-offers-body",
+      "file": "fwddef/state.c",
+      "line": 4,
+      "col": 21,
+      "comment": "gd from a call that resolves to the forward decl offers the body too.",
+      "expect": {
+        "all": [
+          "state.c:8:12",
+          "state.c:2:12"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-extern-decl-offers-defining-tu",
+      "file": "fwddef/state.h",
+      "line": 3,
+      "col": 24,
+      "comment": "gd on `extern struct GameState g_state;` offers the defining TU's instance (reverse closure: state.c includes state.h); the extern decl is kept, never pruned.",
+      "expect": {
+        "all": [
+          "state.c:3:18",
+          "state.h:4:25"
+        ],
+        "none": []
+      }
     }
   ]
 }

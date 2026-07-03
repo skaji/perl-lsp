@@ -425,6 +425,27 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-hover-presents-ranked-def",
+      "file": "fwddef/state.c",
+      "line": 4,
+      "col": 21,
+      "comment": "hover is the CandidateSet's hover projection: at a call whose gd ranks the bodied def first, hover presents THAT def's signature, not the forward decl.",
+      "expect": {
+        "all": [
+          "static int helper(int n) { return n * 2; }",
+          "*function*"
+        ],
+        "none": [
+          "static int helper(int n);"
+        ]
+      }
     }
   ]
 }

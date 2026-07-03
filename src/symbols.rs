@@ -1027,27 +1027,28 @@ pub fn member_completion_for_class(
     )
 }
 
+/// Hover for pack languages: a presentation of the CandidateSet's hover
+/// projection (`docs/adr/resolution-candidate-set.md` — hover presents the
+/// top-ranked candidate goto-def would jump to, so the two verbs answer one
+/// resolution and can't disagree). Presentation stays here: the member
+/// drill-downs (domain headline, storage leaf, template substitution) run
+/// first over the same invocant resolution the set's member goto-def lane
+/// uses; everything else renders the projection's candidate.
 pub fn pack_hover_markdown(
-    analysis: &FileAnalysis,
-    source: &str,
-    point: Point,
+    cs: &crate::resolve::CandidateSet,
     language: &str,
-    module_index: Option<&dyn crate::file_analysis::CrossFileLookup>,
 ) -> Option<String> {
-    // Cursor directly on a symbol DECL (its own type point + scope).
-    if let Some(sym) = analysis.symbol_at(point) {
-        return Some(render_symbol_hover(
-            sym, source, &sym.span.start, language, analysis, point, module_index,
-        ));
-    }
-    let r = analysis.ref_at(point)?;
+    let analysis = cs.origin_analysis();
+    let source = cs.origin_source()?;
+    let point = cs.cursor();
+    let module_index = cs.scoped_index();
     // Member access (`obj->field` / `obj->method()`): resolve the EXACT member
-    // via the invocant class + ancestor walk — the SAME resolution goto-def
-    // uses — BEFORE the by-name shortcut below, so a same-file field def (or a
-    // same-named symbol on another class) can't hijack it with the wrong scope.
+    // via the invocant class + ancestor walk — the SAME resolution the set's
+    // member goto-def lane uses — so a same-file field def (or a same-named
+    // symbol on another class) can't hijack it with the wrong scope.
     // A data field shows `field: type` (member_hover, keyed on the field's own
     // scope); a method shows its signature.
-    if matches!(r.kind, RefKind::MethodCall { .. }) {
+    if let Some(r) = analysis.ref_at(point).filter(|r| matches!(r.kind, RefKind::MethodCall { .. })) {
         if let Some(midx) = module_index {
             if let Some(cn) = analysis.method_call_invocant_class(r, Some(midx)) {
                 let field = r.unqualified_target_name();
@@ -1131,32 +1132,85 @@ pub fn pack_hover_markdown(
             }
         }
     }
-    // A call/ref naming a LOCAL def (function call, non-member).
-    if let Some(sym) = analysis.symbols.iter().find(|s| s.name == r.unqualified_target_name()) {
+    // The projection's answer: present the top-ranked definition candidate —
+    // what goto-def would jump to — wherever it lives (macro variants,
+    // template/spec ladders, locals, cross-file functions all arrive here).
+    if let Some(loc) = cs.hover_candidate() {
+        if let Some(text) = render_candidate_hover(cs, &loc, language) {
+            return Some(text);
+        }
+    }
+    // Cursor on a decl the forward walk didn't self-resolve: render the
+    // symbol under the cursor directly (its own type point + scope).
+    if let Some(sym) = analysis.symbol_at(point) {
         return Some(render_symbol_hover(
             sym, source, &sym.span.start, language, analysis, point, module_index,
         ));
     }
-    // Cross-file: a call whose target isn't local — look the function up in
-    // the cross-file index and render its signature from the defining file.
-    let midx = module_index?;
-    if !matches!(r.kind, RefKind::FunctionCall { .. }) {
-        return None;
+    None
+}
+
+/// Render the hover projection's candidate: the symbol declared at the
+/// location — in the origin (fresh text in hand) or a cached pack module
+/// (read from disk, suffixed with the defining file's name) — through the
+/// same renderer decl-site hovers use. A location no Symbol sits at (a
+/// macro def whose Symbol was claimed under another lane, a top-of-file
+/// landing) renders its source line, which for a `#define` IS the def.
+fn render_candidate_hover(
+    cs: &crate::resolve::CandidateSet,
+    loc: &crate::resolve::RefLocation,
+    language: &str,
+) -> Option<String> {
+    let module_index = cs.scoped_index();
+    let sym_at = |a: &FileAnalysis| -> Option<usize> {
+        a.symbols
+            .iter()
+            .position(|s| s.selection_span.start == loc.span.start)
+            .or_else(|| {
+                a.symbols
+                    .iter()
+                    .position(|s| s.selection_span.start.row == loc.span.start.row
+                        && crate::file_analysis::contains_point(&s.selection_span, loc.span.start))
+            })
+    };
+    if crate::resolve::file_key_eq(&loc.key, cs.origin_file_key()) {
+        let analysis = cs.origin_analysis();
+        let source = cs.origin_source()?;
+        if let Some(i) = sym_at(analysis) {
+            let sym = &analysis.symbols[i];
+            return Some(render_symbol_hover(
+                sym, source, &sym.span.start, language, analysis, cs.cursor(), module_index,
+            ));
+        }
+        let line = source.lines().nth(loc.span.start.row)?.trim();
+        return (!line.is_empty()).then(|| format!("```{}\n{}\n```", language, line));
     }
-    let name = r.unqualified_target_name();
-    let cached = midx.get_cached(name)?;
-    let sym = cached
-        .analysis
-        .symbols
-        .iter()
-        .find(|s| s.name == name && matches!(s.kind, FaSymKind::Sub))?;
-    let text = std::fs::read_to_string(&cached.path).ok()?;
-    let fname = cached.path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-    let mut out = render_symbol_hover(
-        sym, &text, &sym.span.start, language, &cached.analysis, sym.span.start, Some(midx),
-    );
-    out.push_str(&format!("\n\n— `{}`", fname));
-    Some(out)
+    let path = crate::resolve::key_for_sort(&loc.key);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    // The candidate's own analysis: the scoped index caches every pack file
+    // a projection can answer from.
+    let mut found: Option<std::sync::Arc<crate::file_analysis::CachedModule>> = None;
+    if let Some(midx) = module_index {
+        midx.for_each_cached_file(&mut |cached| {
+            if found.is_none() && cached.path == path {
+                found = Some(std::sync::Arc::clone(cached));
+            }
+        });
+    }
+    if let Some(cached) = &found {
+        if let Some(i) = sym_at(&cached.analysis) {
+            let sym = &cached.analysis.symbols[i];
+            let mut out = render_symbol_hover(
+                sym, &text, &sym.span.start, language, &cached.analysis, sym.span.start,
+                module_index,
+            );
+            out.push_str(&format!("\n\n— `{}`", fname));
+            return Some(out);
+        }
+    }
+    let line = text.lines().nth(loc.span.start.row)?.trim();
+    (!line.is_empty()).then(|| format!("```{}\n{}\n```\n\n— `{}`", language, line, fname))
 }
 
 /// Render a symbol's hover. Variables/fields show `name: type` (the inferred
@@ -1217,14 +1271,8 @@ fn render_symbol_hover(
     out
 }
 
-pub fn pack_hover(
-    analysis: &FileAnalysis,
-    source: &str,
-    point: Point,
-    language: &str,
-    module_index: Option<&dyn crate::file_analysis::CrossFileLookup>,
-) -> Option<Hover> {
-    let value = pack_hover_markdown(analysis, source, point, language, module_index)?;
+pub fn pack_hover(cs: &crate::resolve::CandidateSet, language: &str) -> Option<Hover> {
+    let value = pack_hover_markdown(cs, language)?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,

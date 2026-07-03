@@ -462,6 +462,26 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-extern-def-side-gr-includes-decl",
+      "file": "fwddef/state.c",
+      "line": 2,
+      "col": 17,
+      "comment": "def-side gr on the TU's `g_state` still lists the header's extern decl (decl and def are ONE identity).",
+      "expect": {
+        "all": [
+          "\"file\":\"state.h\",\"line\":\"4\"",
+          "\"file\":\"state.c\",\"line\":\"5\"",
+          "\"file\":\"state.c\",\"line\":\"6\""
+        ],
+        "none": []
+      }
     }
   ]
 }
