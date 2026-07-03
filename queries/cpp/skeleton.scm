@@ -23,8 +23,7 @@
 (preproc_def name: (identifier) @def.var.name) @def.var
 ; a distinct skel-kind (not the plain "sub" a real function uses) so the
 ; Symbol can be tagged "macro" (hover/completion say "macro", not
-; "function" — hitlist-2 #19) while still resolving as a callable Sub
-; everywhere else.
+; "function") while still resolving as a callable Sub everywhere else.
 (preproc_function_def name: (identifier) @def.macro.name) @def.macro
 ; An object-like macro whose body is a bare type spelling is a TYPE ALIAS the
 ; same as a `typedef` — `#define PERL_BITFIELD16 U16` / `#define BITF16 unsigned`.

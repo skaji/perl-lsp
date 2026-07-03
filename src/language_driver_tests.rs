@@ -186,7 +186,7 @@ fn class_content_gate_admits_members_not_locals() {
 #[cfg(feature = "cpp")]
 #[test]
 fn member_completion_filters_by_access_specifier() {
-    // Member completion filters by access specifier (hitlist-2 #18): from
+    // Member completion filters by access specifier: from
     // OUTSIDE the class only public members offer; from a method of the
     // SAME class (self-access) everything offers, including private ones.
     // Must go through `cpp_driver().analyze` (not the raw skeleton→FA path)

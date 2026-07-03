@@ -291,7 +291,7 @@ fn walk_macro_defs(
 }
 
 /// A cheap structural signature over a file's first ~1KB, for routing a file
-/// whose extension no driver claims (hitlist-2 #13: `commands.def`, a 12.7k
+/// whose extension no driver claims (`commands.def`, a 12.7k
 /// line C dispatch table with an unowned extension, went entirely dark under
 /// the Perl fallback). NOT an extension list — `.def` is ambiguous across
 /// ecosystems (a Windows module-definition file is `LIBRARY`/`EXPORTS`
@@ -535,8 +535,8 @@ fn guard_trail(node: tree_sitter::Node, src: &[u8]) -> Vec<String> {
                 // FIRST thing inside it) makes X true for the rest of the
                 // file from here on — it's not a real config knob, so a
                 // descendant nested in the primary branch must not inherit
-                // "!defined(X)" as a guard term (hitlist-2 #17: every macro
-                // in a guarded header was picking up its file's own include
+                // "!defined(X)" as a guard term (every macro
+                // in a guarded header would pick up its file's own include
                 // guard as a bogus UNKNOWN reachability label).
                 if ndef && !is_alt && is_self_defining_guard(p, &name, src) {
                     // term suppressed — always-true past this point.
@@ -2408,7 +2408,7 @@ impl MemberBlockPlan {
     }
 }
 
-/// One class/struct-body member's access region (hitlist-2 #18): its own
+/// One class/struct-body member's access region: its own
 /// declaration span, and whether it's reachable from OUTSIDE the class
 /// (`false` = public). Two-state — `private`/`protected` both fold to
 /// non-public; friend declarations and the protected-vs-private distinction

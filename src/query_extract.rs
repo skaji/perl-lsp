@@ -179,7 +179,7 @@ impl SkeletonAnalysis {
         // SAME SPAN (one node, two capture patterns — e.g. the bodied
         // pattern and the inheritance pattern both fire for `class Circle :
         // public Shape {...}`). Key on (name, name span) rather than name
-        // alone (hitlist-2 #21): two class_specifiers that happen to share a
+        // alone: two class_specifiers that happen to share a
         // bare name at DIFFERENT spans (forward decl + definition, same
         // short name in different scopes) are genuinely distinct symbols and
         // must both survive — only an exact same-span re-capture is the
@@ -278,18 +278,17 @@ impl SkeletonAnalysis {
                     "class" | "union" => SymKind::Class,
                     // "macro": a function-like `#define` — a real callable
                     // Sub everywhere (dispatch/completion/goto-def), tagged
-                    // "macro" below so hover/labels say so (hitlist-2 #19).
+                    // "macro" below so hover/labels say so.
                     "sub" | "anon" | "constant" | "macro" => SymKind::Sub,
                     // "reexport": `using Base::m;` in a class body — a Method
                     // in the class's API surface; the "reexport" attribute
                     // (added below) makes resolution see through it.
                     "method" | "reexport" => SymKind::Method,
                     // a plain struct/class data member — distinct from a
-                    // local/global Variable (hitlist-2 #19: hover/outline
-                    // said "variable" for every field).
+                    // local/global Variable so hover/outline say "field".
                     "field" => SymKind::Field,
                     // a named enum value — distinct from both Variable and
-                    // Field (hitlist-2 #19).
+                    // Field.
                     "enumerator" => SymKind::Enumerator,
                     // "unionfield" (an inline union member-field container)
                     // stays Variable — its "union" attribute drives the
@@ -1210,7 +1209,7 @@ pub fn cpp_pack() -> LangPack {
             // `field_identifier` only ever names a struct/class member (the
             // grammar's own distinction from a plain `identifier` local) —
             // "def.field" here matches the plain (non-pointer) field pattern
-            // above (hitlist-2 #19).
+            // above.
             leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.field")],
             record_stack: true,
         },

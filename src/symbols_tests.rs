@@ -4853,8 +4853,6 @@ fn test_helper_not_loaded_exempts_installed_plugins() {
 
 #[cfg(feature = "cpp")]
 mod pack_macro_goto {
-    use super::*;
-
     /// The macro variant lane via the CandidateSet: pack routing + source.
     fn macro_defs_at(src: &str, point: tree_sitter::Point) -> Vec<crate::resolve::RefLocation> {
         let fa = crate::language_driver::LanguageRegistry::with_enabled()

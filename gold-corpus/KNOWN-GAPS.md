@@ -4,14 +4,14 @@ The harness pins each gap as an `xfail` fixture row: the assertion is the
 **correct** expected behavior, marked as currently *not holding*. When a gap is
 fixed the row flips to **XPASS** and the harness fails until you promote it to
 `gold` — so a fix can't land silently and a gap can't rot. This file is the
-prose write-up of the 7 open xfails (the README's "Known failing" list is the
+prose write-up of the open xfails (the README's "Known failing" list is the
 one-line index). Verify any one with:
 
 ```sh
 gold-corpus/run.pl --emit <capability> <file> <line> <col>   # 0-based line/col
 ```
 
-All seven are in distinct subsystems — none are ref-graph (those are all closed).
+None are ref-graph (those are all closed).
 
 ---
 
@@ -203,21 +203,35 @@ all "the producer already has the signal, just consult it."
 
 ## C++ (multi-language tier)
 
-QA'd against spdlog (107 headers): **0 crashes**, 93/107 outline with
-symbols (3189 total). The dominant real-world gap is the
-**namespace-wrapping macro idiom** — `SPDLOG_NAMESPACE_BEGIN` /
-`FOOLIB_NAMESPACE_BEGIN`, where the open/close macros are `#define`d in a
-DIFFERENT header. Single-file analysis can't expand them (cpp_reparse only
-expands same-file `#define`s), so the parse corrupts: the wrapped `class`
-is lost and its methods leak as free functions.
+Cross-file macro resolution landed (include-closure gather + expansion +
+the structural strip/salvage lanes), so the original "namespace-wrapping
+macro from another header" class mostly resolves: a wrapping macro whose
+defining header is in the include closure expands, and macro-guarded
+namespace reopenings attribute. Three xfail rows remain open:
 
-| case | impact on spdlog |
+| row | residual shape |
 |---|---|
-| cross-file namespace macro | 14 headers empty + ≥4 with a `class` decl but 0 classes (e.g. `logger.h`: `class logger` lost, 62 methods → 62 free `Sub`s) |
+| `cpp-xfail-cross-file-namespace-macro` | the UNRESOLVABLE wrapping macro: no `#include` reaches a definition (generated/out-of-tree header) and the token sits in statement position before `class` — the structural strip covers the before-`namespace` and before-constructor positions, not this one, so `class Logger` is still lost and `info` leaks as a free Sub |
+| `cpp-hitlist-marker-macro-outline` | a bodyless marker `#define` (`FMT_HEADER_ONLY`) still appears as an outline Variable; the class after it extracts fine — pure outline noise |
+| `cpp-xfail-auto-deduced-return` | `auto`-deduced return types don't type the call's receiver (needs return-expression deduction) |
 
-Fixture: `cpp-xfail-cross-file-namespace-macro` (xfail → XPASS when fixed).
-Fix: cross-file macro resolution — resolve `#include`s, gather `#define`s,
-expand before extraction. The single biggest lever for real-world C++.
+### hitlist-2 fix-run residuals (dogfood round 2, slices A–E landed)
+
+The measured residue after the hitlist-2 fixes (`docs/hitlist-2.md` has the
+per-slice detail); none are pinned as rows yet — they were observed on real
+corpora (json.hpp/abseil), not minimal repros:
+
+- json.hpp namespace attribution still stops at an `#if` inside a class
+  body (extraction lane).
+- One `private:` leak survives the scope-desync repair.
+- Tokens blanked by `strip_unresolved_structural_macros` are not re-minted
+  as refs — the site vanishes from gr (the between-splice diff re-mint
+  covers only the declarator-strip lane).
+- Salvage granularity is per-MACRO-NAME: a name with mixed good/bad use
+  sites degrades as a whole group.
+- `bool` still reports Numeric (typedef-resolution / join→typing lane).
+- Overload arity ranking (finding #3): evaluated, not taken — needs
+  extraction-minted argument/parameter counts first.
 
 ## Refs symmetry (gd↔gr) — honest residuals
 

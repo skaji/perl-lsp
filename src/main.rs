@@ -484,8 +484,8 @@ fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnal
     // Route a pack language (cpp, ...) through its driver so the CLI
     // capabilities (--outline, --hover, --batch/gold) match the LSP
     // server. Perl + truly-unrecognized files keep the existing path; an
-    // extension no driver claims falls back to a content sniff (hitlist-2
-    // #13 — `commands.def` is C, not Perl, despite its unowned extension).
+    // extension no driver claims falls back to a content sniff
+    // (`commands.def` is C, not Perl, despite its unowned extension).
     let reg = language_driver::LanguageRegistry::with_enabled();
     if let Some(driver) = reg
         .for_path_sniffed(std::path::Path::new(path), &source)
@@ -536,8 +536,8 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
     (path, uri)
 }
 
-/// Human-facing name for a pack language id, for the startup banner
-/// (hitlist-2 #20). Purely cosmetic — `LanguageRegistry::for_id` still
+/// Human-facing name for a pack language id, for the startup banner.
+/// Purely cosmetic — `LanguageRegistry::for_id` still
 /// speaks the short id everywhere else; this is the one spot that prints
 /// for a human. Falls back to the id itself for a language this mapping
 /// hasn't been told about yet (never a hard error over a display string).
@@ -583,7 +583,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     let pack_indexed =
         module_resolver::index_pack_languages(&root_path, Some(&root_uri), &module_index);
     if pack_indexed > 0 {
-        // Name the languages actually served (hitlist-2 #20) rather than the
+        // Name the languages actually served rather than the
         // generic "pack-language" — a pure-C++ workspace should read "C/C++",
         // not a term that only makes sense from inside this codebase.
         let reg = language_driver::LanguageRegistry::with_enabled();
@@ -2048,7 +2048,7 @@ fn cli_parse(path: &str, lang: Option<&str>) {
     };
     // Route to a grammar: an explicit `lang` id (stdin can't route by
     // extension) wins, else the file's extension (cpp/python/r/cmake), else
-    // a content sniff for an extension no driver claims (hitlist-2 #13), so
+    // a content sniff for an extension no driver claims, so
     // --parse shows the SAME tree the pack extractor sees. Perl + stdin +
     // truly-unrecognized files keep the Perl grammar.
     let mut parser = if let Some(id) = lang {

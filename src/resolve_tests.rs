@@ -4258,7 +4258,7 @@ mod pack_symmetry {
             .analyze(source)
     }
 
-    /// decl→def ranking (hitlist-2 #15): goto-def on (or through) a bodiless
+    /// decl→def ranking: goto-def on (or through) a bodiless
     /// declaration ranks the bodied definition first, decl kept — the static
     /// forward-decl shape same-file, and the `extern` decl → defining-TU
     /// shape cross-file (reverse closure: the TU includes the header).
@@ -4376,7 +4376,7 @@ mod pack_symmetry {
         assert!(!has("noise.c"), "the disconnected file stays out: {refs:?}");
     }
 
-    /// The hover/gd agreement invariant (hitlist-2 #14): hover presents the
+    /// The hover/gd agreement invariant: hover presents the
     /// CandidateSet's top-ranked definition candidate, so a position answers
     /// BOTH verbs or NEITHER — hover-specific presentation aside, the two
     /// can't disagree on what the cursor means.

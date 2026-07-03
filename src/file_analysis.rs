@@ -75,16 +75,9 @@ impl CachedModule {
             .map(|s| s.span.start.row as u32)
     }
 
-    /// True if any sub/method with this name is declared in this module.
-    pub fn has_sub(&self, name: &str) -> bool {
-        self.analysis.symbols.iter().any(|s| {
-            s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method)
-        })
-    }
-
     /// True if a sub/method with this name is declared in this module
-    /// *attributed to `package`* — distinct from `has_sub`, which keys
-    /// on declaration only. Cross-package typeglob installs
+    /// *attributed to `package`* — not merely declared somewhere in the
+    /// file. Cross-package typeglob installs
     /// (`*{'DateTime::'.$sub} = …` inside `package DateTime::PP`)
     /// synthesize a symbol whose `package` (DateTime) differs from the
     /// file's own module name (DateTime::PP), so a class-keyed method
@@ -5477,7 +5470,7 @@ impl FileAnalysis {
                 // an anonymous container (`(union)`) is structure, not an
                 // addressable member
                 && !sym.attributes.iter().any(|a| a == "anonymous")
-                // access-specifier gate (hitlist-2 #18): a non-public member
+                // access-specifier gate: a non-public member
                 // completes only from inside its OWN class's lexical body —
                 // two-state (friend/protected-via-inheritance not modeled).
                 && (requesting_class == Some(cls)
@@ -5505,8 +5498,8 @@ impl FileAnalysis {
     /// the real members. Methods (and inherited ones) come from the shared
     /// ancestor walk; fields are this class's `Variable`/`Field` symbols.
     /// `requesting_class` is the class the completion CURSOR is lexically
-    /// inside (`None` from free-standing code) — the access-specifier gate
-    /// (hitlist-2 #18): a non-public member offers only when the cursor is
+    /// inside (`None` from free-standing code) — the access-specifier gate:
+    /// a non-public member offers only when the cursor is
     /// inside that SAME class's own body. A caller with no cursor context
     /// passes `None` and safely under-offers to "public only" — it never
     /// leaks a private member.
@@ -5994,7 +5987,7 @@ impl FileAnalysis {
         if depth > 20 {
             return;
         }
-        // Access-specifier gate (hitlist-2 #18): visible from outside
+        // Access-specifier gate: visible from outside
         // `class_name`'s own body only when NOT tagged non-public.
         let visible = |sym: &Symbol| {
             requesting_class == Some(class_name)
@@ -8980,7 +8973,7 @@ impl FileAnalysis {
             if let Some(cached) = idx.get_cached(cls) {
                 // Class-scoped, not file-scoped: a pack file holds MANY
                 // classes, so "some sub of this name exists in cls's file"
-                // (`has_sub`) would let an unrelated same-named member hijack
+                // would let an unrelated same-named member hijack
                 // the walk at `cls` and stop it before the true ancestor.
                 // Re-exports fall through, same as the local arm.
                 let has_member = cached.analysis.symbols.iter().any(|s| {
@@ -9346,9 +9339,8 @@ impl FileAnalysis {
     }
 
     /// Any non-contract Sub/Method named `name` in this file,
-    /// regardless of package attribution — the cross-file flavor of
-    /// `class_provides_method`, matching `CachedModule::has_sub`'s
-    /// name-only looseness while excluding `requires` markers. The
+    /// regardless of package attribution — the name-only flavor of
+    /// `class_provides_method`, excluding `requires` markers. The
     /// distinction is load-bearing for the default-implementation
     /// pattern: a role that both requires AND defines a name must
     /// count as providing it.

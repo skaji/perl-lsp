@@ -1055,8 +1055,8 @@ impl<'a> CandidateSet<'a> {
     /// Hover projection: the top-ranked candidate of the forward walk — the
     /// SAME identity, visibility, and ranking `definitions()` computes, so
     /// hover and goto-def answer one resolution and can't disagree on what
-    /// the cursor means (hitlist-2 #14: hover dark where gd worked, and a
-    /// bare-name hijack where gd was right). Presentation — markdown, kind
+    /// the cursor means (no hover dark where gd works, no
+    /// bare-name hijack where gd is right). Presentation — markdown, kind
     /// labels, member drill-downs — is the adapter's
     /// (`symbols::pack_hover_markdown`); this returns WHAT to present.
     pub fn hover_candidate(&self) -> Option<RefLocation> {
@@ -1176,7 +1176,7 @@ impl<'a> CandidateSet<'a> {
                 }
         };
         let mut defs: Vec<RefLocation> = Vec::new();
-        let mut push = |defs: &mut Vec<RefLocation>, key: &FileKey, span: Span| {
+        let push = |defs: &mut Vec<RefLocation>, key: &FileKey, span: Span| {
             if span.start == decl.span.start && file_key_eq(key, &decl.key) {
                 return;
             }
