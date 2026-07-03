@@ -1458,6 +1458,10 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // `@def` event fires before these inner captures.
     let mut qualifier_by_match: HashMap<usize, String> = HashMap::new();
     let mut rettype_by_match: HashMap<usize, String> = HashMap::new();
+    // `@sym.attr` — a token whose TEXT rides onto the match's def symbol as
+    // an attribute (cpp: a declaration's storage class, so "extern" is a
+    // symbol-borne fact goto-def's decl→def ranking can ask the value for).
+    let mut attrs_by_match: HashMap<usize, Vec<String>> = HashMap::new();
     // `@member.recv` → the receiver span of a `recv.field` access, joined to
     // its `@ref.member` by match_id so the minted MethodCall ref carries it.
     let mut member_recv: HashMap<usize, (crate::file_analysis::Span, String)> = HashMap::new();
@@ -1475,6 +1479,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         }
         if e.cap == "rettype" {
             rettype_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "sym.attr" {
+            attrs_by_match.entry(e.match_id).or_default().push(e.text.clone());
         }
     }
     // (var name, declaring scope) → its declared-type text, joined per
@@ -1845,12 +1852,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         .get(&e.match_id)
                         .and_then(|t| (pack.annot_type)(t)),
                     deref_stack: nested_stacks.get(&e.match_id).cloned().unwrap_or_default(),
-                    // a default-named symbol is structure, not an
-                    // addressable name — completion skips it.
-                    attributes: if defaulted {
-                        vec!["anonymous".to_string()]
-                    } else {
-                        Vec::new()
+                    attributes: {
+                        let mut a =
+                            attrs_by_match.get(&e.match_id).cloned().unwrap_or_default();
+                        // a default-named symbol is structure, not an
+                        // addressable name — completion skips it.
+                        if defaulted {
+                            a.push("anonymous".to_string());
+                        }
+                        a
                     },
                 });
             }

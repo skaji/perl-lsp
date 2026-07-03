@@ -4258,6 +4258,188 @@ mod pack_symmetry {
             .analyze(source)
     }
 
+    /// decl→def ranking (hitlist-2 #15): goto-def on (or through) a bodiless
+    /// declaration ranks the bodied definition first, decl kept — the static
+    /// forward-decl shape same-file, and the `extern` decl → defining-TU
+    /// shape cross-file (reverse closure: the TU includes the header).
+    #[test]
+    fn goto_def_ranks_bodied_definition_above_decl() {
+        use std::sync::Arc;
+        // Same-file: static forward decl at row 0, bodied def at row 2.
+        let src = "static int helper(int n);\nint use_it(int n) { return helper(n); }\nstatic int helper(int n) { return n * 2; }\n";
+        let fa = cpp(src);
+        let store = FileStore::new();
+        let cs = resolve(
+            &store,
+            &fa,
+            FileKey::Path(PathBuf::from("/fake/dd/one.c")),
+            tree_sitter::Point { row: 0, column: 11 }, // on the decl's name
+            None,
+            OverrideScope::default(),
+        )
+        .with_source(src)
+        .pack_routed();
+        let defs = cs.definitions();
+        assert_eq!(defs.len(), 2, "def ranked + decl kept: {defs:?}");
+        assert_eq!(defs[0].span.start.row, 2, "the bodied def ranks first: {defs:?}");
+        assert_eq!(defs[1].span.start.row, 0, "the decl is kept, never pruned: {defs:?}");
+
+        // Cross-file: `extern` decl in the header, instance in the TU whose
+        // closure includes the header (the reverse-connectivity edge).
+        let header_src = "extern struct GS g_state;\n";
+        let header = cpp(header_src);
+        let mut tu = cpp("struct GS g_state;\n");
+        tu.include_closure = vec!["/fake/dd/state.h".to_string()];
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        idx.register_symbols(PathBuf::from("/fake/dd/state.h"), Arc::new(header));
+        idx.register_symbols(PathBuf::from("/fake/dd/state.c"), Arc::new(tu));
+        let origin = idx
+            .get_cached_scoped("g_state", &["/fake/dd/state.h".to_string()].iter().cloned().collect())
+            .expect("header registered");
+        assert!(origin.path.ends_with("state.h"));
+        let cs = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/dd/state.h")),
+            tree_sitter::Point { row: 0, column: 18 }, // on `g_state`
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(header_src)
+        .pack_routed();
+        let defs = cs.definitions();
+        assert!(
+            matches!(&defs[0].key, FileKey::Path(p) if p.ends_with("state.c")),
+            "the defining TU's instance ranks first: {defs:?}"
+        );
+        assert!(
+            defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("state.h"))),
+            "the extern decl is kept: {defs:?}"
+        );
+    }
+
+    /// The visibility gate's textual-inclusion extension: a file whose own
+    /// closure reaches no def path still joins the references image when a
+    /// DIRECT seer includes it (`ae.c: #include "ae_epoll.c"`); a genuinely
+    /// disconnected file's same-named token stays out.
+    #[test]
+    fn function_gate_admits_files_included_by_a_seer() {
+        use std::sync::Arc;
+        let def_src = "int compute_thing(int n) { return n; }\n";
+        let mut def_tu = cpp(def_src);
+        def_tu.include_closure = vec!["/fake/inc/lib.h".to_string()];
+        let header = cpp("int compute_thing(int n);\n");
+        let mut host = cpp("int a(void) { return compute_thing(1); }\n");
+        host.include_closure =
+            vec!["/fake/inc/lib.h".to_string(), "/fake/inc/frag.c".to_string()];
+        // The fragment: same call, EMPTY closure (compiled only by textual
+        // inclusion into host.c).
+        let frag = cpp("int b(void) { return compute_thing(2); }\n");
+        // Disconnected same-named noise.
+        let noise = cpp("int c(void) { return compute_thing(3); }\n");
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        idx.register_symbols(PathBuf::from("/fake/inc/lib.c"), Arc::new(def_tu));
+        idx.register_symbols(PathBuf::from("/fake/inc/lib.h"), Arc::new(header));
+        idx.register_symbols(PathBuf::from("/fake/inc/host.c"), Arc::new(host));
+        idx.register_symbols(PathBuf::from("/fake/inc/frag.c"), Arc::new(frag));
+        idx.register_symbols(PathBuf::from("/fake/inc/noise.c"), Arc::new(noise));
+
+        let store = FileStore::new();
+        let origin = idx
+            .get_cached_scoped("compute_thing", &["/fake/inc/lib.c".to_string()].iter().cloned().collect())
+            .expect("def TU registered");
+        assert!(origin.path.ends_with("lib.c"));
+        let cs = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/inc/lib.c")),
+            tree_sitter::Point { row: 0, column: 4 }, // on the def's name
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(def_src)
+        .pack_routed();
+        // The Sub target carries closure-keyed def_paths (the D3 gate).
+        match cs.resolution() {
+            Some(ResolvedTarget::Target(t)) => {
+                assert!(!t.def_paths.is_empty(), "pack Sub target is gated: {t:?}")
+            }
+            other => panic!("Sub target expected: {other:?}"),
+        }
+        let refs = cs.references();
+        let has = |suffix: &str| {
+            refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p.ends_with(suffix)))
+        };
+        assert!(has("host.c"), "a direct seer's call is in: {refs:?}");
+        assert!(has("frag.c"), "the seer-included fragment's call is in: {refs:?}");
+        assert!(!has("noise.c"), "the disconnected file stays out: {refs:?}");
+    }
+
+    /// The hover/gd agreement invariant (hitlist-2 #14): hover presents the
+    /// CandidateSet's top-ranked definition candidate, so a position answers
+    /// BOTH verbs or NEITHER — hover-specific presentation aside, the two
+    /// can't disagree on what the cursor means.
+    #[test]
+    fn hover_projection_agrees_with_goto_def() {
+        use std::sync::Arc;
+        let header_src = "enum opcode { OP_HOV_A, OP_HOV_B };\n";
+        let use_src = "int f(int t) {\n    return t == OP_HOV_A;\n}\n";
+
+        // Hover renders the cross-file candidate from its file on disk.
+        let dir = std::env::temp_dir().join("perl_lsp_hover_gd_invariant");
+        std::fs::create_dir_all(&dir).unwrap();
+        let header_path = dir.join("def.h");
+        std::fs::write(&header_path, header_src).unwrap();
+
+        let header = cpp(header_src);
+        let mut user = cpp(use_src);
+        user.include_closure = vec![header_path.to_string_lossy().into_owned()];
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        idx.register_symbols(header_path.clone(), Arc::new(header));
+        idx.register_symbols(dir.join("use.c"), Arc::new(user));
+
+        let store = FileStore::new();
+        let origin = idx.get_cached("f").expect("use.c registered by its fn name");
+        let cs = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(dir.join("use.c")),
+            tree_sitter::Point { row: 1, column: 16 }, // on OP_HOV_A
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(use_src)
+        .pack_routed();
+
+        let defs = cs.definitions();
+        let hover = crate::symbols::pack_hover_markdown(&cs, "c");
+        assert!(!defs.is_empty(), "gd answers at the enum-constant use");
+        let hover = hover.expect("hover answers wherever gd answers");
+        assert!(
+            hover.contains("OP_HOV_A"),
+            "hover presents the candidate gd ranks first: {hover}"
+        );
+
+        // NEITHER: a token-less position answers no verb.
+        let cs_blank = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(dir.join("use.c")),
+            tree_sitter::Point { row: 2, column: 0 }, // the closing `}` line
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(use_src)
+        .pack_routed();
+        assert!(cs_blank.definitions().is_empty(), "gd silent on a token-less position");
+        assert!(
+            crate::symbols::pack_hover_markdown(&cs_blank, "c").is_none(),
+            "hover silent exactly where gd is"
+        );
+    }
+
     #[test]
     fn enum_constant_def_reaches_bare_reads_across_files() {
         let store = FileStore::new();

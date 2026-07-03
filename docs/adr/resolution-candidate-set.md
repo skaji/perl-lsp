@@ -74,7 +74,7 @@ Every feature is a **projection** of the same CandidateSet:
 | implementations | `implementations()` — the family/descendants walk |
 | goto-def | `definitions()` — forward-best projection |
 | completion gathering | `complete(prefix, import_slot)` — prefix-enumeration of the visible identifier universe (Perl: in-scope + explicit imports on OPEN, export surfaces + auto-import firehose on DEPENDENCY; pack: the origin's include-closure universe); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `import_slot` is the slot's import affordance: `false` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code); candidates carry `ImportFact`, the adapter composes the edit |
-| hover | (future) the top candidate's presentation |
+| hover | `hover_candidate()` — the top-ranked `definitions()` candidate, presented (pack languages; the adapter renders, the set resolves — hover and goto-def cannot disagree at a position). Perl keeps its language-specific renderer over the same origin |
 
 Symmetry becomes **by construction**: an axis added to CandidateSet
 construction is inherited by every projection — the test
@@ -173,6 +173,22 @@ The spike's axes live in CandidateSet construction:
   order, per candidate); `RefLocation.label` carries the per-candidate
   fact (reachability verdict / see-through note) — the LSP adapter drops
   it, the CLI renders it.
+- **decl→def ranking** — a pack `definitions()` answer landing on a
+  bodiless declaration (a prototype, an `extern` variable decl) ranks the
+  bodied definition(s) of the same identity first, decl kept (never
+  pruned). Definition-ness is a symbol-borne fact (a callable's body mints
+  a scope spanning it; a variable carries its `extern` storage class as an
+  attribute), and cross-file identity rides the def-candidates table +
+  closure connectivity — forward (origin reaches the defining file) and
+  reverse (the defining TU includes the origin header). Hover inherits it:
+  `hover_candidate()` presents the ranked winner.
+- **Function-lane visibility gate** — a plain Sub target minted from a
+  pack-routed set carries closure-keyed `def_paths` (minted in
+  `resolution()`, on the routing fact — a Perl Sub cursor is the same
+  `RenameKind` shape but is package-keyed, so it stays ungated). The
+  backward gate has a textual-inclusion extension: a scanned file whose
+  own closure misses every def path still passes when a direct seer
+  includes it (redis's `ae.c → #include "ae_epoll.c"` fragments).
 - **completion** — the pack instance of `complete(prefix)`: the origin's
   include closure is the identifier universe
   (`CrossFileLookup::visible_defs_with_prefix`, no global fallback).

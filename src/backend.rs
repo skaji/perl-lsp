@@ -1301,31 +1301,36 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        // Perl's hover renderer is Perl-specific; pack languages get a
-        // language-agnostic declaration-line hover.
+        // Perl's hover renderer is Perl-specific; pack languages present the
+        // CandidateSet's hover projection (the top-ranked candidate goto-def
+        // would jump to) — constructed exactly like the goto-def handler's
+        // set, so the two verbs can't disagree at a position.
         if doc.language != "perl" {
-            // Route cross-file (function hover) to the per-language sub-index,
-            // scoped to this file's include closure.
             let pack = self.module_index.pack_index(doc.language);
             let base_idx: &dyn crate::file_analysis::CrossFileLookup =
                 pack.as_deref().map_or(&*self.module_index, |i| i);
+            let mut cs = crate::resolve::resolve(
+                &self.files,
+                &doc.analysis,
+                FileKey::Url(uri.clone()),
+                symbols::position_to_point(pos),
+                Some(base_idx),
+                crate::resolve::OverrideScope::default(),
+            )
+            .with_source(&doc.text);
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            if let Some(h) = symbols::pack_hover(&cs, doc.language) {
+                return Ok(Some(h));
+            }
+            // The raw-word fallback outside the set (mirrors goto-def's): a
+            // macro / enum-constant / global whose token no ref captures —
+            // show its definition line.
             let self_path = uri.to_file_path().ok();
             let scoped = crate::file_analysis::ScopedLookup::new(
                 base_idx, &doc.analysis.include_closure, self_path.as_deref());
             let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-            if let Some(h) = symbols::pack_hover(
-                &doc.analysis,
-                &doc.text,
-                symbols::position_to_point(pos),
-                doc.language,
-                Some(xidx),
-            ) {
-                return Ok(Some(h));
-            }
-            // Member access (`obj->field`) is handled inside `pack_hover`
-            // above — it resolves the MethodCall ref like goto-def does.
-            // A macro / enum-constant / global (`OP_NULL`, `BASEOP`) — show
-            // its cross-file definition line.
             if let Some((_, _, line)) = self.pack_xfile_word_at(&doc, pos, xidx) {
                 if !line.is_empty() {
                     return Ok(Some(Hover {

@@ -565,7 +565,15 @@
   declarator: (init_declarator
     declarator: (identifier) @flow.target @def.local
     value: (_) @flow.source))
+; The bare (initializer-less) form also captures the storage class as a
+; symbol attribute: `extern struct redisServer server;` DECLARES, the
+; initializer-less `struct redisServer server;` DEFINES — goto-def's
+; decl→def ranking asks the symbol (`attributes` carries "extern"), never
+; a header-vs-TU shape branch. An initialized `extern int x = 5;` is a
+; definition regardless, so the init form above deliberately skips the
+; capture.
 (declaration
+  (storage_class_specifier)? @sym.attr
   type: (_) @type.annot
   declarator: (identifier) @flow.target @def.local)
 
@@ -574,6 +582,7 @@
 ; @nested.target chain is unravelled by core (see params). The init form also
 ; carries @flow.source so the initializer's type flows to the leaf.
 (declaration
+  (storage_class_specifier)? @sym.attr
   type: (_) @type.annot
   declarator: [(pointer_declarator) (reference_declarator)] @nested.target)
 (declaration

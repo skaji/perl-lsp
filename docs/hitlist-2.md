@@ -192,5 +192,25 @@ catastrophic on collisions:
   #11 MACRO\nclass (macro lane), #8 using-re-exports (model as the
   import-edge/role shape it is).
 - **D. Hover joins the CandidateSet** (#14) + decl→def preference (#15).
+  **LANDED (wave-3)**: pack hover = `CandidateSet::hover_candidate()` (the
+  top-ranked `definitions()` candidate, presented — member drill-downs stay
+  adapter-side over the same invocant resolution). Measured: the
+  `flat_hash_map<…>` instantiation (reflection.cc), the fmt spec
+  base-clause (chrono.h:1904 → the spec, primary kept), and the
+  `ABSL_GUARDED_BY` token all hover where gd answers — the last one had
+  been a bare-name HIJACK (a mis-extracted decl artifact); the projection
+  kills the class, not the instance. decl→def: bodied defs rank above
+  bodiless decls of the same identity, decl kept — t_string.c forward decl
+  → :244 (from decl AND call), `extern … server;` → server.c:85 (reverse
+  closure), FMT_API vformat → FMT_FUNC format-inl.h:1457 (overload
+  siblings rank too; arity is still #3-deferred). `extern` rides
+  `Symbol.attributes` (EXTRACT_VERSION 139). The A-slice's deferred
+  Function-lane def_paths gate is ACTIVE (minted set-level under pack
+  routing); its starving case was the textual-inclusion fragments —
+  `ae.c → #include "ae_epoll.c"` — fixed by extending the backward gate
+  with the direct seers' closures. gr: `zmalloc` 330 (exact),
+  `ABSL_GUARDED_BY` 56 (exact), `format_to` 90, `Perl_croak_nocontext`
+  199 (was 194 pre-slice-C; the extras are newly-extracted prototype
+  decls, grep-consistent).
 - **E. Small: #13 .def language routing, #16 nested-union access, #17
   guard-label suppression, #18-21 polish.**

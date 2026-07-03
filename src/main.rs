@@ -823,7 +823,20 @@ fn cli_hover(root: Option<&str>, file: &str, line_str: &str, col_str: &str) {
                 .map(|d| d.id())
                 .filter(|id| *id != "perl");
             let markdown = match pack_lang {
-                Some(lang) => symbols::pack_hover_markdown(&analysis, &source, point, lang, None),
+                Some(lang) => {
+                    let files = file_store::FileStore::new();
+                    let cs = resolve::resolve(
+                        &files,
+                        &analysis,
+                        file_store::FileKey::Path(std::path::PathBuf::from(file)),
+                        point,
+                        None,
+                        resolve::OverrideScope::default(),
+                    )
+                    .with_source(&source)
+                    .pack_routed();
+                    symbols::pack_hover_markdown(&cs, lang)
+                }
                 None => analysis.hover_info(point, &source, None),
             };
             if let Some(markdown) = markdown {
@@ -1227,8 +1240,9 @@ fn run_one(
         }
         "hover" => {
             let (source, _t, mut analysis) = parse_file(file);
-            // Pack languages get the language-agnostic declaration hover
-            // (matches the LSP server); Perl keeps its rich renderer.
+            // Pack languages present the CandidateSet's hover projection
+            // (matches the LSP server — the same construction goto-def uses);
+            // Perl keeps its rich renderer.
             let reg = language_driver::LanguageRegistry::with_enabled();
             if let Some(lang) = reg.for_path(std::path::Path::new(file))
                 .map(|d| d.id()).filter(|id| *id != "perl")
@@ -1236,11 +1250,20 @@ fn run_one(
                 let pack = idx.pack_index(lang);
                 let base_idx: &dyn crate::file_analysis::CrossFileLookup =
                     pack.as_deref().map_or(idx, |i| i);
-                let self_path = std::fs::canonicalize(file).ok();
-                let scoped = crate::file_analysis::ScopedLookup::new(
-                    base_idx, &analysis.include_closure, self_path.as_deref());
-                let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-                return symbols::pack_hover_markdown(&analysis, &source, point, lang, Some(xidx))
+                let abs = std::fs::canonicalize(file)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(file));
+                let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
+                let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
+                    .expect("origin staged above");
+                let mut cs = resolve::resolve(
+                    ws, &origin, file_store::FileKey::Path(abs), point,
+                    Some(base_idx), resolve::OverrideScope::default(),
+                )
+                .with_source(&source);
+                if pack.is_some() {
+                    cs = cs.pack_routed();
+                }
+                return symbols::pack_hover_markdown(&cs, lang)
                     .ok_or_else(|| format!("No hover info at {}:{}", req.line, req.col));
             }
             resolve_imports_blocking(idx, &analysis);

@@ -190,15 +190,14 @@ impl TargetRef {
                     Some(class) => method_classes_for(origin, class, &name, module_index, scope),
                     None => Vec::new(),
                 };
-                // Function targets keep EMPTY def_paths (gate inactive) for
-                // now — deliberately, not as an oversight: the closure gate
-                // keys on the decl header being a def CANDIDATE, and pointer-
-                // returning prototypes (`void *zmalloc(size_t);`) are still
-                // dropped by extraction (hitlist-2 #9), so gating here starves
-                // real reference sets (zmalloc 330 → 3). Activate by minting
-                // `pack_def_paths` here once prototype extraction lands.
-                // Macro-named cursors never reach this arm (the canonical
-                // FileScopeValue lanes claim them first, WITH def_paths).
+                // Function targets keep empty def_paths HERE: a Sub cursor
+                // is language-neutral (Perl subs mint the same RenameKind)
+                // and Perl visibility is package-keyed, never closure-gated.
+                // The pack instance of the gate is minted at the set level
+                // (`CandidateSet::resolution`), on the caller-declared pack
+                // routing fact. Macro-named cursors never reach this arm
+                // (the canonical FileScopeValue lanes claim them first,
+                // WITH def_paths).
                 TargetRef {
                     name,
                     kind: TargetKind::Sub { package },
@@ -837,7 +836,26 @@ impl<'a> CandidateSet<'a> {
     pub fn resolution(&self) -> Option<&ResolvedTarget> {
         self.resolution
             .get_or_init(|| {
-                resolve_symbol_scoped(self.origin, self.point, self.idx(), self.scope)
+                let mut r =
+                    resolve_symbol_scoped(self.origin, self.point, self.idx(), self.scope);
+                // Pack routing: a plain function (Sub) target's visibility
+                // identity is closure-keyed like every other pack target —
+                // its def_paths are minted HERE, on the routing fact the
+                // caller declared, because the Sub cursor shape itself is
+                // language-neutral (a Perl `sub` mints the same RenameKind)
+                // and Perl visibility is package-keyed, never closure-gated.
+                if self.pack {
+                    if let Some(ResolvedTarget::Target(t)) = &mut r {
+                        if matches!(t.kind, TargetKind::Sub { .. }) && t.def_paths.is_empty() {
+                            let origin_defines = self.origin.symbols.iter().any(|s| {
+                                s.name == t.name
+                                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                            });
+                            t.def_paths = pack_def_paths(&t.name, origin_defines, self.idx());
+                        }
+                    }
+                }
+                r
             })
             .as_ref()
     }
@@ -1034,6 +1052,39 @@ impl<'a> CandidateSet<'a> {
         out
     }
 
+    /// Hover projection: the top-ranked candidate of the forward walk — the
+    /// SAME identity, visibility, and ranking `definitions()` computes, so
+    /// hover and goto-def answer one resolution and can't disagree on what
+    /// the cursor means (hitlist-2 #14: hover dark where gd worked, and a
+    /// bare-name hijack where gd was right). Presentation — markdown, kind
+    /// labels, member drill-downs — is the adapter's
+    /// (`symbols::pack_hover_markdown`); this returns WHAT to present.
+    pub fn hover_candidate(&self) -> Option<RefLocation> {
+        self.definitions().into_iter().next()
+    }
+
+    /// Read access for adapters presenting a projection (the hover renderer
+    /// works from the same origin/point/scoped-index the set resolved with,
+    /// so presentation lookups can't drift from resolution).
+    pub fn origin_analysis(&self) -> &'a FileAnalysis {
+        self.origin
+    }
+    pub fn origin_file_key(&self) -> &FileKey {
+        &self.origin_key
+    }
+    pub fn cursor(&self) -> tree_sitter::Point {
+        self.point
+    }
+    pub fn origin_source(&self) -> Option<&'a str> {
+        self.source
+    }
+    /// The origin-scoped index — the closure-scoped view every forward
+    /// resolution reads (`idx`), exposed so adapters query member types /
+    /// config-variant leaves through the same visibility the set used.
+    pub fn scoped_index(&self) -> Option<&dyn CrossFileLookup> {
+        self.idx()
+    }
+
     /// The def site of `member` on `class` — origin symbols first, then the
     /// class's own cached file. Serves the template-family ranked goto-def
     /// (one location per ladder class that actually defines the member).
@@ -1068,6 +1119,115 @@ impl<'a> CandidateSet<'a> {
             rewritable: true,
             label: None,
         })
+    }
+
+    /// Decl→def preference (pack routing): when a resolved location is a
+    /// bodiless DECLARATION — a function prototype, an `extern` variable
+    /// decl — rank the bodied definition(s) of the same identity first,
+    /// declaration kept (never pruned). Identity spans files on the same
+    /// facts the backward walk's visibility gate uses: the def-candidates
+    /// table plus closure connectivity (forward: the origin reaches the
+    /// defining file; reverse: the defining TU includes the origin header —
+    /// `server.c` defines the `server` its own `server.h` declares extern).
+    /// "Definition-ness" is asked of the symbol, not a header-vs-TU shape
+    /// branch: a callable's body mints a scope spanning it; a variable
+    /// carries its `extern` storage class as an attribute. Anything that
+    /// isn't a bodiless decl of those shapes passes through untouched.
+    fn preferred_definitions(&self, decl: RefLocation, decl_fa: &FileAnalysis) -> Vec<RefLocation> {
+        if !self.pack {
+            return vec![decl];
+        }
+        let Some(sym) = decl_fa
+            .symbols
+            .iter()
+            .find(|s| s.selection_span.start == decl.span.start)
+        else {
+            return vec![decl];
+        };
+        let hunt = match sym.kind {
+            SymKind::Sub | SymKind::Method => {
+                !decl_fa.scopes.iter().any(|sc| sc.span == sym.span)
+            }
+            SymKind::Variable => {
+                decl_fa.symbol_is_file_scope_value(sym)
+                    && sym.attributes.iter().any(|a| a == "extern")
+            }
+            _ => false,
+        };
+        if !hunt {
+            return vec![decl];
+        }
+        let cand_is_def = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
+            s.name == sym.name
+                && pkg_agrees(true, sym.package.as_deref(), s.package.as_deref())
+                && match sym.kind {
+                    SymKind::Sub | SymKind::Method => {
+                        matches!(s.kind, SymKind::Sub | SymKind::Method)
+                            && a.scopes.iter().any(|sc| sc.span == s.span)
+                    }
+                    _ => {
+                        matches!(s.kind, SymKind::Variable)
+                            && a.symbol_is_file_scope_value(s)
+                            && !s.attributes.iter().any(|at| at == "extern")
+                    }
+                }
+        };
+        let mut defs: Vec<RefLocation> = Vec::new();
+        let mut push = |defs: &mut Vec<RefLocation>, key: &FileKey, span: Span| {
+            if span.start == decl.span.start && file_key_eq(key, &decl.key) {
+                return;
+            }
+            if defs.iter().any(|l| file_key_eq(&l.key, key) && l.span == span) {
+                return;
+            }
+            defs.push(RefLocation {
+                key: key.clone(),
+                span,
+                access: AccessKind::Declaration,
+                rewritable: true,
+                label: None,
+            });
+        };
+        // The decl's own file first (a static's forward decl and body).
+        for s in decl_fa.symbols.iter().filter(|s| cand_is_def(decl_fa, s)) {
+            push(&mut defs, &decl.key, s.selection_span);
+        }
+        // Cross-file: the full def-candidates table, closure-connected to the
+        // origin, path-sorted so the ranking is deterministic across the
+        // cache's randomized iteration order.
+        if let Some(idx) = self.idx() {
+            if let Some((self_path, visible)) = idx.visibility_scope() {
+                let self_str = self_path.to_string_lossy().into_owned();
+                let decl_path = key_for_sort(&decl.key);
+                let mut cands = idx.def_candidates(&sym.name);
+                cands.sort_by(|a, b| a.path.cmp(&b.path));
+                for cached in cands {
+                    if cached.path == decl_path {
+                        continue;
+                    }
+                    let p = cached.path.to_string_lossy().into_owned();
+                    let connected = visible.contains(&p)
+                        || cached.analysis.include_closure.iter().any(|c| *c == self_str);
+                    if !connected {
+                        continue;
+                    }
+                    let key = FileKey::Path(cached.path.clone());
+                    for s in cached
+                        .analysis
+                        .symbols
+                        .iter()
+                        .filter(|s| cand_is_def(&cached.analysis, s))
+                    {
+                        push(&mut defs, &key, s.selection_span);
+                    }
+                }
+            }
+        }
+        if defs.is_empty() {
+            return vec![decl];
+        }
+        defs.push(decl);
+        defs
     }
 
     /// A declaration site in the origin file.
@@ -1256,9 +1416,11 @@ impl<'a> CandidateSet<'a> {
             }
         }
 
-        // Local definition first.
+        // Local definition first — through the decl→def ranking, so a cursor
+        // on (or a call resolving to) a bodiless prototype / extern decl
+        // offers the bodied definition first, decl kept.
         if let Some(span) = analysis.find_definition(point, self.idx()) {
-            return vec![self.origin_decl(span)];
+            return self.preferred_definitions(self.origin_decl(span), analysis);
         }
 
         let Some(idx) = self.idx() else {
@@ -1532,13 +1694,18 @@ impl<'a> CandidateSet<'a> {
                         s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Variable)
                     }) {
                         if Url::from_file_path(&cached.path).is_ok() {
-                            return vec![RefLocation {
-                                key: FileKey::Path(cached.path.clone()),
-                                span: sym.selection_span,
-                                access: AccessKind::Declaration,
-                                rewritable: true,
-                                label: None
-                            }];
+                            // A call resolving to a header PROTOTYPE offers
+                            // the bodied definition first (decl→def ranking).
+                            return self.preferred_definitions(
+                                RefLocation {
+                                    key: FileKey::Path(cached.path.clone()),
+                                    span: sym.selection_span,
+                                    access: AccessKind::Declaration,
+                                    rewritable: true,
+                                    label: None,
+                                },
+                                &cached.analysis,
+                            );
                         }
                     }
                 }
@@ -2405,6 +2572,29 @@ pub fn refs_to(
     // `Perl_Inc`). Computed once per query; empty for Perl.
     let aliases = delegation_aliases(files, module_index, target, mask);
 
+    // Textual-inclusion extension of the closure gate: a file whose own
+    // closure reaches no def path still sees the target when a DIRECT seer
+    // includes it (`ae.c: #include "ae_epoll.c"` — the fragment compiles
+    // inside the includer's TU with the includer's preamble, so its
+    // `zmalloc(...)` calls are real references). One sweep collects the
+    // union of the direct seers' closures; membership is the reverse edge.
+    // Empty def_paths (no gate — every Perl target) skips the sweep.
+    let mut seen_by_inclusion: std::collections::HashSet<String> = Default::default();
+    if !target.def_paths.is_empty() {
+        if let Some(idx) = module_index {
+            idx.for_each_cached_file(&mut |cached| {
+                let own = cached.path.to_string_lossy();
+                if file_sees_target(target, &cached.analysis, &own) {
+                    seen_by_inclusion.extend(cached.analysis.include_closure.iter().cloned());
+                }
+            });
+        }
+    }
+    let gate = |analysis: &FileAnalysis, file_str: &str| {
+        file_sees_target(target, analysis, file_str)
+            || seen_by_inclusion.contains(file_str)
+    };
+
     // Open files (canonical — workspace entries for open paths are skipped).
     let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if mask.contains(RoleMask::OPEN) {
@@ -2418,7 +2608,7 @@ pub fn refs_to(
             // matcher below only matches.
             let key = FileKey::Url(url);
             let file_str = canonical_file_str(&key);
-            if !file_sees_target(target, &doc.analysis, &file_str) {
+            if !gate(&doc.analysis, &file_str) {
                 return;
             }
             collect_from_analysis(&key, &doc.analysis, target, &aliases, module_index, &file_str, &mut out);
@@ -2442,7 +2632,7 @@ pub fn refs_to(
             covered_paths.insert(entry.key().clone());
             let key = FileKey::Path(entry.key().clone());
             let file_str = canonical_file_str(&key);
-            if !file_sees_target(target, entry.value(), &file_str) {
+            if !gate(entry.value(), &file_str) {
                 continue;
             }
             collect_from_analysis(&key, entry.value(), target, &aliases, module_index, &file_str, &mut out);
@@ -2461,7 +2651,7 @@ pub fn refs_to(
                 }
                 let key = FileKey::Path(cached.path.clone());
                 let file_str = canonical_file_str(&key);
-                if !file_sees_target(target, &cached.analysis, &file_str) {
+                if !gate(&cached.analysis, &file_str) {
                     return;
                 }
                 collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &file_str, &mut out);
@@ -2964,14 +3154,14 @@ fn pack_symbol_def_location(
     candidates.into_iter().next().map(|c| c.5)
 }
 
-fn key_for_sort(k: &FileKey) -> PathBuf {
+pub(crate) fn key_for_sort(k: &FileKey) -> PathBuf {
     match k {
         FileKey::Path(p) => p.clone(),
         FileKey::Url(u) => u.to_file_path().unwrap_or_else(|_| PathBuf::from(u.as_str())),
     }
 }
 
-fn file_key_eq(a: &FileKey, b: &FileKey) -> bool {
+pub(crate) fn file_key_eq(a: &FileKey, b: &FileKey) -> bool {
     key_for_sort(a) == key_for_sort(b)
 }
 
