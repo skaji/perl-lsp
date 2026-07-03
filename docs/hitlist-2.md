@@ -73,25 +73,30 @@ catastrophic on collisions:
    `&&`-ref-qualified members desync scope tracking; everything after
    reparents wrong (~800 lines in raw_hash_set.h), `private:` leaks as a
    Variable. 3 files independently. [abseil]
-7. **Reopened namespaces lose attribution** — only the FIRST `namespace
-   detail {` becomes a Package; later reopenings orphan their symbols
-   (json.hpp: 1 of 36 → parser/lexer/serializer all orphaned; also fmt
-   base.h/format.h). Cascades into scope-blind completion. [fmt, json]
-8. **`using Base::insert;` member re-exports** — abseil containers' whole
-   public API: invisible in outline, gd resolves to an UNRELATED
-   container's `insert` (confidently wrong), gr/hover empty. [abseil]
+7. **Reopened namespaces lose attribution** — WAVE-2 CORRECTION: plain
+   reopenings work; the killer is MACRO-GUARDED namespace opens
+   (`FMT_BEGIN_NAMESPACE`/`NLOHMANN_JSON_NAMESPACE_BEGIN`) — stripping
+   those macros from json.hpp makes all 36 reopenings attribute. The
+   macro-before-declaration gap, generalized to `namespace`. xfail:
+   `reopen_ns.cpp`. [fmt, json]
+8. **`using Base::insert;` member re-exports** — WAVE-2 CORRECTION: gd
+   from a use is CORRECT (reaches Base::insert); broken = outline (the
+   re-export invisible under Derived) and HOVER (wrong bare-name match,
+   disagreeing with gd at the same position). xfail rows: outline +
+   hover on `using_reexport.cpp`. [abseil]
 9. **Pointer-returning prototypes dropped** — `robj *createObject(...)`
    decls: 8 of 16 sampled dropped from outline, params leak as orphan
    Variables (pointer-decl ambiguity). [redis]
-10. **Function-pointer typedefs invisible** — `typedef void *(*Name)(…)`:
-    gr empty even on self. The other idiom (`typedef int Name(Args)`)
-    has gr working but gd/hover dark — verbs disagree on one symbol.
-    [redis]
-11. **`MACRO\nclass X : …` kills the class** — NLOHMANN_BASIC_JSON_TPL_
-    DECLARATION (macro standing in for `template<…>`): basic_json has NO
-    Class entry, 292/316 members orphaned, `j.` completion returns zero
-    real members. (strip_declarator_macros covers `class MACRO X`, not
-    `MACRO\nclass X`.) [json]
+10. **Function-pointer typedefs** — WAVE-2 CORRECTION: gr on the typedef
+    works; gd FROM a use is dark. xfail: `fnptr_typedef.cpp`. [redis]
+11. **basic_json invisible — root-caused DEEPER (wave-2, no minimal
+    repro possible)**: the literal `MACRO\nclass X` shape WORKS via the
+    expansion reparse. The real mechanism: expansion validation is
+    PER-FILE — one bad macro elsewhere in json.hpp
+    (`NLOHMANN_JSON_NAMESPACE_BEGIN`, object-like body embedding an
+    unexpanded `##` call) expands to invalid syntax, and the whole
+    file's GOOD expansions are discarded with it. Architectural:
+    per-splice (not per-file) expansion validation. [json]
 12. **Operator overloads: total blind spot** — 0/43 in format.h outline;
     gd/gr/hover all dead on `operator+`. [fmt]
 13. **`.def` parsed as PERL** — commands.def (12.7k lines, the command
