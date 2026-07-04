@@ -166,6 +166,15 @@ pub struct PackDriver {
     access_regions: Option<fn(&mut tree_sitter::Parser, &str) -> Vec<crate::cpp_reparse::AccessRegion>>,
 }
 
+/// Pre-parse external state gathered in phase 1 (`gather_pack_context`) and
+/// threaded through phases 2 and 5 (`transform_and_parse`, `enrich_skeleton`)
+/// — see the phase list on `analyze_with_path`.
+#[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
+struct PackContext {
+    external: std::sync::Arc<crate::cpp_reparse::PreExpandedExternal>,
+    plan: Option<crate::cpp_reparse::MemberBlockPlan>,
+}
+
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
 impl LanguageDriver for PackDriver {
     fn id(&self) -> &'static str {
@@ -183,31 +192,48 @@ impl LanguageDriver for PackDriver {
     fn analyze(&self, source: &str) -> FileAnalysis {
         self.analyze_with_path(source, None)
     }
+    /// Source + path → `FileAnalysis` for a pack-driven language (C++/Python/
+    /// R/CMake). Fixed pipeline, each phase consuming state the previous
+    /// produced — the phase fns live in the `impl PackDriver` block below,
+    /// in the same order:
+    ///
+    /// 1. `gather_pack_context` — pre-parse external inputs read from the
+    ///    ORIGINAL source: the cross-file macro table (`gather_macros`) and
+    ///    the member-block plan (blanks standalone macro-in-struct-body uses
+    ///    so the base parses clean). Produces `PackContext`.
+    /// 2. `transform_and_parse` — the macro-expansion reparse (`transform`)
+    ///    over the plan's blanked source (or the original, when there's no
+    ///    plan), then the real tree-sitter parse of the transformed text.
+    ///    MUST run after (1): consumes `ctx.external` + `ctx.plan`. `None`
+    ///    means the transformed text failed to parse — caller serves a
+    ///    degraded empty analysis without reaching extraction at all.
+    /// 3. `query_extract::extract` — the query-driven skeleton extraction
+    ///    over the transformed tree (unchanged; lives in `query_extract.rs`).
+    /// 4. `remap_spans` — transformed → original coordinate remap over EVERY
+    ///    span-bearing skeleton field (see its own doc for the exhaustive-
+    ///    destructure enforcement). MUST run before (5): every later phase
+    ///    that reads or writes skeleton spans assumes original coordinates.
+    /// 5. `enrich_skeleton` — post-remap, pre-assembly skeleton enrichment:
+    ///    external type-alias witnesses, member-block injection (synthetic
+    ///    bases + parent edges), erased-macro-read minting, and the macro
+    ///    identity/typing lane (`collect_macro_defs` + `macro_return_hints`).
+    ///    MUST run after (4) (injected spans are original-coordinate) and
+    ///    before (6) (`into_file_analysis` builds indices over everything).
+    /// 6. `skel.into_file_analysis()` — the skeleton → FileAnalysis assembly
+    ///    (unchanged; a method on `SkeletonAnalysis`, not a phase fn here).
+    /// 7. `register_post_build` — post-assembly hooks that stamp fields only
+    ///    queryable once the FileAnalysis exists: macro defs, attribute-macro
+    ///    signals, access-region visibility, include closure, degraded flag.
+    ///
+    /// Add a phase by inserting a numbered call here plus a fn beside the
+    /// others below, in order — don't inline new logic into an existing
+    /// phase's body (a later emission phase for the type-fuel work is
+    /// expected to land here this way).
     fn analyze_with_path(&self, source: &str, path: Option<&Path>) -> FileAnalysis {
         let mut parser = (self.make_parser)();
-        // Cross-file macros from #included headers (C++), so a macro
-        // #defined elsewhere (SPDLOG_NAMESPACE_BEGIN) expands here.
-        let external = match (self.gather_macros, path) {
-            (Some(g), Some(p)) => {
-                crate::timings::phase("cpp.gather", || g(p, source, &mut parser))
-            }
-            _ => std::sync::Arc::new(crate::cpp_reparse::PreExpandedExternal::empty()),
-        };
-        // Member-block macros as roles: BLANK the standalone-in-struct-body uses
-        // so `struct op { BASEOP };` parses clean, and mint the synthetic base +
-        // parent edges (injected below, into the extracted skeleton). The blank
-        // is length-preserving, so the transform + remap stay in original
-        // coordinates; the ORIGINAL source keeps the token (goto-def-on-`BASEOP`
-        // untouched). `docs/adr/macro-handling.md`.
-        let plan = self
-            .member_blocks
-            .map(|f| crate::timings::phase("cpp.member_blocks", || f(&mut parser, source)));
-        let parse_input: &str = plan.as_ref().map(|p| p.blanked_source.as_str()).unwrap_or(source);
-        let (src, map, recovered) = match self.transform {
-            Some(t) => crate::timings::phase("cpp.transform", || t(&mut parser, parse_input, &external)),
-            None => (parse_input.to_string(), crate::cpp_reparse::SpliceMap::default(), Vec::new()),
-        };
-        let Some(tree) = parser.parse(&src, None) else {
+        let ctx = self.gather_pack_context(&mut parser, source, path);
+        let Some((tree, src, map, recovered)) = self.transform_and_parse(&mut parser, source, &ctx)
+        else {
             let mut fa = FileAnalysis::new(Default::default());
             fa.degraded = true;
             return fa;
@@ -217,63 +243,9 @@ impl LanguageDriver for PackDriver {
                 // remap extracted spans from transformed → original coords
                 // (no-op for identity / pass-through languages).
                 remap_spans(&mut skel, &src, source, &map);
-                // Type-alias `#define`s gathered from the include closure ride
-                // into this file's bag as `TypeName` witnesses (span-less, so
-                // post-remap is fine): the cross-file chase can't index a
-                // gitignored generated header (`config.h`'s `U16TYPE`), but the
-                // gather reached it — so carry the alias here.
-                emit_external_type_aliases(&mut skel.witnesses, &external, (self.pack)().annot_type);
-                // Member-block roles: inject the synthetic bases + parent edges
-                // (original coords) into the skeleton, so the ONE ancestor walk
-                // resolves `o->op_type` / hover / the references splat. Must run
-                // AFTER remap (the injected spans are already original) and BEFORE
-                // `into_file_analysis` (it builds indices over everything).
-                if let Some(plan) = &plan {
-                    inject_member_blocks(&mut skel, plan, (self.pack)().annot_type);
-                }
-                // Expanded / blanked macro USES vanish from the parsed text,
-                // so no query capture can ref them — re-mint each as a
-                // variable read at its ORIGINAL span (the splice map, the
-                // member-block blank diff, AND the between-splice text diff —
-                // which catches the length-preserving declarator-macro strip
-                // — know every site), so find-references on a macro reaches
-                // uses the expansion erased (rule #7/#9).
-                mint_erased_macro_reads(&mut skel, source, &src, &map, plan.as_ref());
-                // Macro identity lane: collect every `#define` off the ORIGINAL
-                // source (spans in user coordinates, no splice remap needed).
-                let macro_defs = self
-                    .collect_macro_defs
-                    .map(|collect| collect(&mut parser, source))
-                    .unwrap_or_default();
-                // Function-like macro typing (the expansion flip's payoff): a
-                // left-unexpanded macro call parses as `call_expression`, so the
-                // macro is a package-global sub. Type it from its body — delegation
-                // reuses the see-through target, else a param-independent body type
-                // — and hand `into_file_analysis` the hints to lower onto the
-                // final `SymbolId`s. `docs/adr/macro-handling.md`.
-                skel.macro_returns = macro_return_hints(&macro_defs, &mut parser);
+                let macro_defs = self.enrich_skeleton(&mut skel, &mut parser, source, &src, &map, &ctx);
                 let mut fa = skel.into_file_analysis();
-                fa.macro_defs = macro_defs;
-                apply_attribute_macros(&mut fa, &recovered);
-                // Access-specifier regions: a fresh parse of
-                // the ORIGINAL source (spans already in original coords, no
-                // remap needed) tags each member symbol non-public when its
-                // declaration falls under `private:`/`protected:`.
-                if let Some(f) = self.access_regions {
-                    let regions = crate::timings::phase("cpp.access_regions", || {
-                        f(&mut parser, source)
-                    });
-                    stamp_access_regions(&mut fa, &regions);
-                }
-                // The file's include closure is the cross-file visibility key
-                // (`ScopedLookup`). Computed here — the driver holds the path the
-                // resolver needs; empty on-open until the header cache warms.
-                if let (Some(f), Some(p)) = (self.include_closure, path) {
-                    fa.include_closure = crate::timings::phase("cpp.include_closure", || f(p, source));
-                }
-                // A skipped gather (on-open cached-only miss) analyzed with a
-                // placeholder external table — servable, never cacheable.
-                fa.degraded = external.degraded;
+                self.register_post_build(&mut fa, &mut parser, source, path, &ctx, &recovered, macro_defs);
                 fa
             }
             Err(e) => {
@@ -301,6 +273,130 @@ impl LanguageDriver for PackDriver {
     }
     fn sniff(&self, prefix: &str) -> bool {
         self.sniff.is_some_and(|f| f(prefix))
+    }
+}
+
+/// The pack analyze pipeline's phases (1/2/5/7 in `analyze_with_path`'s doc;
+/// 3/4/6 are the free fns / `SkeletonAnalysis` method called between them).
+/// Order is fixed and load-bearing — see that doc for the full contract.
+#[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
+impl PackDriver {
+    /// Phase 1: pre-parse external context — the cross-file macro table and
+    /// the member-block plan. Both read the ORIGINAL source only.
+    fn gather_pack_context(&self, parser: &mut tree_sitter::Parser, source: &str, path: Option<&Path>) -> PackContext {
+        // Cross-file macros from #included headers (C++), so a macro
+        // #defined elsewhere (SPDLOG_NAMESPACE_BEGIN) expands here.
+        let external = match (self.gather_macros, path) {
+            (Some(g), Some(p)) => crate::timings::phase("cpp.gather", || g(p, source, parser)),
+            _ => std::sync::Arc::new(crate::cpp_reparse::PreExpandedExternal::empty()),
+        };
+        // Member-block macros as roles: BLANK the standalone-in-struct-body uses
+        // so `struct op { BASEOP };` parses clean, and mint the synthetic base +
+        // parent edges (injected in phase 5, into the extracted skeleton). The
+        // blank is length-preserving, so the transform + remap stay in original
+        // coordinates; the ORIGINAL source keeps the token (goto-def-on-`BASEOP`
+        // untouched). `docs/adr/macro-handling.md`.
+        let plan = self.member_blocks.map(|f| crate::timings::phase("cpp.member_blocks", || f(parser, source)));
+        PackContext { external, plan }
+    }
+
+    /// Phase 2: the macro-expansion reparse over `ctx`'s blanked/original
+    /// source, then the real tree-sitter parse of the transformed text.
+    /// `None` means the transformed text failed to parse.
+    #[allow(clippy::type_complexity)]
+    fn transform_and_parse(
+        &self,
+        parser: &mut tree_sitter::Parser,
+        source: &str,
+        ctx: &PackContext,
+    ) -> Option<(tree_sitter::Tree, String, crate::cpp_reparse::SpliceMap, Vec<(String, String)>)> {
+        let parse_input: &str = ctx.plan.as_ref().map(|p| p.blanked_source.as_str()).unwrap_or(source);
+        let (src, map, recovered) = match self.transform {
+            Some(t) => crate::timings::phase("cpp.transform", || t(parser, parse_input, &ctx.external)),
+            None => (parse_input.to_string(), crate::cpp_reparse::SpliceMap::default(), Vec::new()),
+        };
+        let tree = parser.parse(&src, None)?;
+        Some((tree, src, map, recovered))
+    }
+
+    /// Phase 5: post-remap, pre-assembly skeleton enrichment. Returns the
+    /// macro-identity lane (`MacroDef`s) for phase 7 to stamp onto the built
+    /// `FileAnalysis` — the skeleton itself has no field for it.
+    fn enrich_skeleton(
+        &self,
+        skel: &mut crate::query_extract::SkeletonAnalysis,
+        parser: &mut tree_sitter::Parser,
+        source: &str,
+        src: &str,
+        map: &crate::cpp_reparse::SpliceMap,
+        ctx: &PackContext,
+    ) -> Vec<crate::file_analysis::MacroDef> {
+        // Type-alias `#define`s gathered from the include closure ride into
+        // this file's bag as `TypeName` witnesses (span-less, so post-remap is
+        // fine): the cross-file chase can't index a gitignored generated
+        // header (`config.h`'s `U16TYPE`), but the gather reached it — so
+        // carry the alias here.
+        emit_external_type_aliases(&mut skel.witnesses, &ctx.external, (self.pack)().annot_type);
+        // Member-block roles: inject the synthetic bases + parent edges
+        // (original coords) into the skeleton, so the ONE ancestor walk
+        // resolves `o->op_type` / hover / the references splat. Must run
+        // AFTER remap (the injected spans are already original) and BEFORE
+        // `into_file_analysis` (it builds indices over everything).
+        if let Some(plan) = &ctx.plan {
+            inject_member_blocks(skel, plan, (self.pack)().annot_type);
+        }
+        // Expanded / blanked macro USES vanish from the parsed text, so no
+        // query capture can ref them — re-mint each as a variable read at its
+        // ORIGINAL span (the splice map, the member-block blank diff, AND the
+        // between-splice text diff — which catches the length-preserving
+        // declarator-macro strip — know every site), so find-references on a
+        // macro reaches uses the expansion erased (rule #7/#9).
+        mint_erased_macro_reads(skel, source, src, map, ctx.plan.as_ref());
+        // Macro identity lane: collect every `#define` off the ORIGINAL
+        // source (spans in user coordinates, no splice remap needed).
+        let macro_defs = self.collect_macro_defs.map(|collect| collect(parser, source)).unwrap_or_default();
+        // Function-like macro typing (the expansion flip's payoff): a
+        // left-unexpanded macro call parses as `call_expression`, so the
+        // macro is a package-global sub. Type it from its body — delegation
+        // reuses the see-through target, else a param-independent body type
+        // — and hand `into_file_analysis` the hints to lower onto the final
+        // `SymbolId`s. `docs/adr/macro-handling.md`.
+        skel.macro_returns = macro_return_hints(&macro_defs, parser);
+        macro_defs
+    }
+
+    /// Phase 7: post-assembly hooks — fields only fillable once the
+    /// `FileAnalysis` exists (indices are built, symbols are final).
+    #[allow(clippy::too_many_arguments)]
+    fn register_post_build(
+        &self,
+        fa: &mut FileAnalysis,
+        parser: &mut tree_sitter::Parser,
+        source: &str,
+        path: Option<&Path>,
+        ctx: &PackContext,
+        recovered: &[(String, String)],
+        macro_defs: Vec<crate::file_analysis::MacroDef>,
+    ) {
+        fa.macro_defs = macro_defs;
+        apply_attribute_macros(fa, recovered);
+        // Access-specifier regions: a fresh parse of the ORIGINAL source
+        // (spans already in original coords, no remap needed) tags each
+        // member symbol non-public when its declaration falls under
+        // `private:`/`protected:`.
+        if let Some(f) = self.access_regions {
+            let regions = crate::timings::phase("cpp.access_regions", || f(parser, source));
+            stamp_access_regions(fa, &regions);
+        }
+        // The file's include closure is the cross-file visibility key
+        // (`ScopedLookup`). Computed here — the driver holds the path the
+        // resolver needs; empty on-open until the header cache warms.
+        if let (Some(f), Some(p)) = (self.include_closure, path) {
+            fa.include_closure = crate::timings::phase("cpp.include_closure", || f(p, source));
+        }
+        // A skipped gather (on-open cached-only miss) analyzed with a
+        // placeholder external table — servable, never cacheable.
+        fa.degraded = ctx.external.degraded;
     }
 }
 
