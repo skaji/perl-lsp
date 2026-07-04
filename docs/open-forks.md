@@ -89,3 +89,35 @@ Format per entry:
 - **Discussion needed:** none urgent; the field is documented at its
   definition (`src/cursor_slot.rs`) and locked by
   `cursor_slot_tests.rs::detect_slot_perl_use_module_name_is_module_path`.
+  (The two renders now live set-side as
+  `CandidateSet::complete_module_candidates` / `complete_qualified_path`.)
+
+## Ref-type deref snippets — candidate data vs projection policy — 2026-07-05 — OPEN
+- **Context:** the entity-content candidate-level migration (PARKED
+  "Entity-content completion sources"). Every entity-content source now
+  yields `CompletionCandidate` through one adapter projection
+  (`candidate_to_completion_item`). Two Member-slot extras don't fit the
+  candidate mould: the pack `.`→`->` operator-swap edit (`op_fix`) and the
+  Perl ref-type deref snippets (`[index]` / `{key}` / `(args)` offered when
+  the `->` receiver is an ArrayRef/HashRef/CodeRef).
+- **Options:** A — keep them as they are: `op_fix` rides the existing
+  `CompletionCandidate.additional_edits` (candidate DATA — the receiver's
+  pointer depth is a fact about the member candidate), and the ref snippets
+  stay adapter-appended `CompletionItem`s (projection POLICY — they are
+  syntactic templates for a ref receiver, not members of any entity, and
+  need `InsertTextFormat::SNIPPET` which the candidate vocabulary doesn't
+  model). B — add a snippet-format field to `CompletionCandidate` so the
+  ref snippets become candidates too, folding the last Member extra into
+  the vocabulary.
+- **Picked:** A. `op_fix` was already candidate data and stays there. The
+  ref snippets are a fixed 1-item-per-ref-kind template with no gathering
+  to unify — making them candidates would add a SNIPPET-only field to the
+  struct that every other candidate carries as `None`, bloat for zero
+  dedup/provenance benefit. They're the same shape as the import-list
+  "still indexing" placeholder: a slot affordance, not a resolved entity,
+  so the adapter builds them directly.
+- **Undo cost:** trivial — add the snippet field + move
+  `ref_type_snippet_completions` into a gatherer if a second snippet source
+  ever appears; today there's exactly one.
+- **Discussion needed:** none urgent; revisit only if type-constrained
+  completion wants snippet candidates from a shared source.

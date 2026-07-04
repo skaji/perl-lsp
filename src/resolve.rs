@@ -1932,6 +1932,96 @@ impl<'a> CandidateSet<'a> {
         }
         out
     }
+
+    /// `complete_modules` shaped into candidates: indexed modules rank
+    /// above merely-available ones. Presentation (the MODULE kind, the
+    /// availability detail) rides the candidate so the one adapter
+    /// projection reproduces the `use`-line / path-drill module half.
+    pub fn complete_module_candidates(&self, prefix: &str) -> Vec<CompletionCandidate> {
+        self.complete_modules(prefix)
+            .into_iter()
+            .map(|(name, is_resolved)| {
+                let (detail, sort_priority) = if is_resolved {
+                    (Some("indexed".to_string()), 10u8)
+                } else {
+                    (Some("available".to_string()), 50u8)
+                };
+                CompletionCandidate {
+                    label: name,
+                    kind: SymKind::Module,
+                    detail,
+                    insert_text: None,
+                    sort_priority,
+                    additional_edits: vec![],
+                    import_fact: None,
+                    display_override: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Candidates for a `Package::<cursor>` drill: the subs declared in (or
+    /// inherited by) `package` — bare-name inserts so the typed prefix stays
+    /// put (tier 10) — plus the sub-packages nested under it, both the
+    /// loadable modules the set's module universe knows and the in-file
+    /// `package Package::Other` names its OPEN tier holds (tier 20, labelled
+    /// by the suffix so the client's `Package::<typed>` filter matches).
+    pub fn complete_qualified_path(
+        &self,
+        module_index: &dyn CrossFileLookup,
+        package: &str,
+    ) -> Vec<CompletionCandidate> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<CompletionCandidate> = Vec::new();
+
+        for c in self.origin.complete_methods_for_class(package, Some(module_index)) {
+            if !seen.insert(c.label.clone()) {
+                continue;
+            }
+            out.push(CompletionCandidate {
+                label: c.label.clone(),
+                kind: SymKind::Sub,
+                detail: c.detail.or_else(|| Some(format!("from {}", package))),
+                insert_text: Some(c.label),
+                sort_priority: 10,
+                additional_edits: vec![],
+                import_fact: None,
+                display_override: None,
+            });
+        }
+
+        let prefix = format!("{}::", package);
+        let mut subpaths: Vec<(String, &'static str)> = Vec::new();
+        for (name, is_resolved) in self.complete_modules(&prefix) {
+            subpaths.push((name, if is_resolved { "indexed" } else { "available" }));
+        }
+        for c in self.complete(&prefix, false) {
+            if !matches!(c.kind, SymKind::Package | SymKind::Class) {
+                continue;
+            }
+            subpaths.push((c.label, "in-file"));
+        }
+        for (name, hint) in subpaths {
+            let suffix = match name.strip_prefix(&prefix) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            if !seen.insert(suffix.clone()) {
+                continue;
+            }
+            out.push(CompletionCandidate {
+                label: suffix.clone(),
+                kind: SymKind::Module,
+                detail: Some(hint.to_string()),
+                insert_text: Some(suffix),
+                sort_priority: 20,
+                additional_edits: vec![],
+                import_fact: None,
+                display_override: None,
+            });
+        }
+        out
+    }
 }
 
 /// Candidates for names a `use` statement makes (or could make) available:

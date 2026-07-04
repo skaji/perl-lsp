@@ -75,6 +75,54 @@ impl CachedModule {
             .map(|s| s.span.start.row as u32)
     }
 
+    /// Completion candidates for `use Module qw(|)` — this module's export
+    /// surface, `@EXPORT` first (sort tier 10) then `@EXPORT_OK` (tier 20),
+    /// deduped. Detail carries the resolved return type when known. The
+    /// adapter projects these; the "still indexing" affordance for a
+    /// not-yet-cached module is the adapter's (there's no entity to gather).
+    pub fn import_list_candidates(&self) -> Vec<CompletionCandidate> {
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        for name in &self.analysis.export {
+            if seen.insert(name.clone()) {
+                let detail = self
+                    .sub_info(name)
+                    .and_then(|s| s.return_type(None))
+                    .map(|rt| format!("@EXPORT → {}", format_inferred_type(&rt)))
+                    .or_else(|| Some("@EXPORT".to_string()));
+                items.push(CompletionCandidate {
+                    label: name.clone(),
+                    kind: SymKind::Sub,
+                    detail,
+                    insert_text: None,
+                    sort_priority: 10,
+                    additional_edits: vec![],
+                    import_fact: None,
+                    display_override: None,
+                });
+            }
+        }
+        for name in &self.analysis.export_ok {
+            if seen.insert(name.clone()) {
+                let detail = self
+                    .sub_info(name)
+                    .and_then(|s| s.return_type(None))
+                    .map(|rt| format!("→ {}", format_inferred_type(&rt)));
+                items.push(CompletionCandidate {
+                    label: name.clone(),
+                    kind: SymKind::Sub,
+                    detail,
+                    insert_text: None,
+                    sort_priority: 20,
+                    additional_edits: vec![],
+                    import_fact: None,
+                    display_override: None,
+                });
+            }
+        }
+        items
+    }
+
     /// True if a sub/method with this name is declared in this module
     /// *attributed to `package`* — not merely declared somewhere in the
     /// file. Cross-package typeglob installs
