@@ -246,7 +246,8 @@ impl LanguageDriver for PackDriver {
             fa.degraded = true;
             return fa;
         };
-        match crate::query_extract::extract(&tree, src.as_bytes(), &(self.pack)()) {
+        let pack = (self.pack)();
+        match crate::query_extract::extract(&tree, src.as_bytes(), &pack) {
             Ok(mut skel) => {
                 // remap extracted spans from transformed → original coords
                 // (no-op for identity / pass-through languages).
@@ -257,7 +258,7 @@ impl LanguageDriver for PackDriver {
                 // the FINAL FileAnalysis.
                 let return_sites = std::mem::take(&mut skel.return_sites);
                 let mut fa = skel.into_file_analysis();
-                emit_return_fuel(&mut fa, &return_sites);
+                emit_return_fuel(&mut fa, &return_sites, pack.implicit_field_reads);
                 self.register_post_build(&mut fa, &mut parser, source, path, &ctx, &recovered, macro_defs);
                 fa
             }
@@ -737,11 +738,15 @@ fn emit_external_type_aliases(
 /// Edge(Variable{field, field's own scope})` edge the field's own
 /// declared-type witness already resolves through, so the read chases the
 /// general Variable path instead of dead-ending. General-purpose (any bare
-/// field read, not gated on return position — rule #10).
+/// field read, not gated on return position — rule #10). Whether a bare name
+/// CAN mean `this->field` is a language fact the pack declares
+/// (`implicit_field_reads`): true for C/C++, false for Python/R where the
+/// receiver is mandatory.
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
 fn emit_return_fuel(
     fa: &mut FileAnalysis,
     return_sites: &[(crate::file_analysis::ScopeId, crate::file_analysis::Span)],
+    implicit_field_reads: bool,
 ) {
     use crate::file_analysis::{RefKind, ScopeId, ScopeKind, SymKind, SymbolId};
     use crate::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
@@ -786,6 +791,9 @@ fn emit_return_fuel(
         });
     }
 
+    if !implicit_field_reads {
+        return;
+    }
     let scope_package: HashMap<ScopeId, Option<String>> =
         fa.scopes.iter().map(|s| (s.id, s.package.clone())).collect();
     let field_scope: HashMap<(String, String), ScopeId> = fa

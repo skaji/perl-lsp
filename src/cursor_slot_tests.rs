@@ -53,8 +53,8 @@ fn expected_type_is_none_off_arg_position() {
 
 /// `Slot::sigil` decodes the bare-sigil-trigger fact back out of an
 /// `Identifier` slot — the reconstruction `detect_slot`'s Perl fold
-/// relies on to stay byte-identical with the old `CursorContext::Variable`
-/// branch.
+/// relies on to stay byte-identical with the `CursorContext::Variable`
+/// branch it folds from.
 #[test]
 fn sigil_decodes_bare_trigger_only() {
     assert_eq!(Slot::Identifier { prefix: "$".into() }.sigil(), Some('$'));

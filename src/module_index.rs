@@ -1380,15 +1380,11 @@ pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
 }
 
 pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {
-    if let Some(parents) = analysis.package_parents.get(module_name) {
-        return parents.clone();
-    }
-    if analysis.package_parents.len() == 1 {
-        if let Some((_pkg, parents)) = analysis.package_parents.iter().next() {
-            return parents.clone();
-        }
-    }
-    Vec::new()
+    analysis
+        .package_parents
+        .get(module_name)
+        .cloned()
+        .unwrap_or_default()
 }
 
 

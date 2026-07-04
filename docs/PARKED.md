@@ -18,7 +18,8 @@ why parked, what unblocks it. Prune on landing.
 - **Perl domain typing** — needs a constant-group / Type::Tiny enum-domain
   model (`docs/adr/field-projections.md`).
 - **Type-constrained completion** at domain slots (`op_type == |` → `OP_*`)
-  — needs cursor-context work (couples to the slot-taxonomy item above).
+  — needs cursor-context work; extends the landed cursor `Slot` taxonomy
+  (`docs/adr/cursor-slots.md`) with a type-constrained domain slot.
 - **Overload arity ranking** (hitlist-2 #3) — needs extraction-minted
   arg/param counts first; evaluated in slice A, not taken.
 - **Template rungs**: dependent types (`T::value_type`), value-arg
@@ -38,25 +39,12 @@ why parked, what unblocks it. Prune on landing.
 
 ## Residual-bug tier (pinned, xfail'd where reducible)
 
-- **Implicit-`this->field` reads apply to ALL pack languages**
-  (`language_driver.rs::emit_return_fuel`'s second pass): "bare unresolved
-  identifier naming an enclosing class's field = member read" is cpp
-  semantics — false for Python (bare name never means `self.field`).
-  Wants a LangPack capability flag (NOT a language-name branch — rule #10);
-  directed at the next round-close sweep. Trigger conditions are narrow
-  (unresolved Variable ref + class-scoped + name-matching Field), so
-  exposure is low today.
 - **Ctor-convention heuristic misfires on uppercase macro/function-style
   calls** (`RCPVx(pv)` mints `ClassName("RCPVx")` as a flow witness —
   root seed of the hitlist-3 #1 bug). The annotation-priority fix shields
   ANNOTATED receivers; an `auto`/annotation-less local initialized from
   an uppercase call still mistypes. Wants the heuristic gated on "callee
   resolves to a known type/ctor", not name case alone.
-- **`primary_package_parents` `len()==1` single-entry fallback** resolves
-  by luck (proven fragile in the hitlist-3 #1 bisection — stops firing
-  when a file holds a second parents-bearing decl). Wants examination:
-  either justify with a recorded verdict or replace with exact-name
-  resolution.
 - **Call-root chain arm hardcodes `arity_hint = Some(0)`**
   (`file_analysis.rs::expr_type_at_span`): wrong hint for a multi-arg call
   root on an arity-discriminated callee. Harmless while cpp overloads are

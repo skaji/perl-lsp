@@ -136,13 +136,11 @@ impl Slot {
 }
 
 /// The one identity-question entry (`docs/adr/cursor-slots.md`): Perl
-/// wraps `cursor_context`'s tree-then-text detector chain unchanged; pack
-/// languages wrap `cursor_sentinel`'s member-access sentinel reparse
-/// (looking up the language's driver/parser/`LangPack` itself — the same
-/// lookup `backend::pack_completion` used to do inline). Falls back to a
-/// bare `Identifier` slot when a pack language isn't registered or has no
-/// `LangPack` (mirrors the prior fallthrough to bare-identifier
-/// completion exactly).
+/// wraps `cursor_context`'s tree-then-text detector chain; pack languages
+/// wrap `cursor_sentinel`'s member-access sentinel reparse (looking up the
+/// language's driver/parser/`LangPack` itself). Falls back to a bare
+/// `Identifier` slot when a pack language isn't registered or has no
+/// `LangPack`.
 pub fn detect_slot(
     analysis: &FileAnalysis,
     tree: &Tree,

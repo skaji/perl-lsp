@@ -849,6 +849,13 @@ pub struct LangPack {
     /// it is clean. Pack-owned language vocab (like `op_map` / `ctor_class`):
     /// core asks the value, never enumerates names itself.
     pub rebind_method: fn(method: &str) -> bool,
+    /// Does a bare, receiver-less identifier that names an enclosing class's
+    /// field mean an implicit member read (`return inner_;` = `this->inner_`)?
+    /// True for C/C++ (implicit `this->`); false for Python/R (a bare name is
+    /// never `self.field` — the receiver is mandatory). Gates
+    /// `language_driver::emit_return_fuel`'s implicit-field-read pass — a
+    /// language fact the driver asks the pack, not a language-name branch.
+    pub implicit_field_reads: bool,
     /// Completion trigger characters for the LSP
     /// `completionProvider.triggerCharacters` slot — the client auto-fires
     /// completion (and reports the char in `CompletionContext`) when one is
@@ -963,6 +970,7 @@ pub fn perl_pack() -> LangPack {
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
+        implicit_field_reads: false,
         trigger_chars: &["$", "@", "%", ">", ":", "{"],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1008,6 +1016,7 @@ pub fn python_pack() -> LangPack {
         // `isinstance(x, Foo)` narrows x to Foo inside the guard.
         narrow_guard: |guard, ty| (guard == Some("isinstance")).then(|| InferredType::ClassName(ty.to_string())),
         rebind_method: |_| false,
+        implicit_field_reads: false,
         trigger_chars: &["."],
         receiver_names: &["self", "cls"],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1048,6 +1057,7 @@ pub fn r_pack() -> LangPack {
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
+        implicit_field_reads: false,
         trigger_chars: &["$", "@", ":"],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1095,6 +1105,7 @@ pub fn cmake_pack() -> LangPack {
         },
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
+        implicit_field_reads: false,
         trigger_chars: &["{", "("],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1205,6 +1216,8 @@ pub fn cpp_pack() -> LangPack {
         rebind_method: |m| {
             matches!(m, "clear" | "reset" | "assign" | "emplace" | "swap")
         },
+        // C/C++ methods read members with an implicit `this->`.
+        implicit_field_reads: true,
         trigger_chars: &[".", ">", ":"],
         receiver_names: &["this"],
         nested_peel: PeelSpec {
@@ -2025,8 +2038,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 // The returned expression's own general-rule witness (literal
                 // / var-read / member / call — whichever matched this same
                 // node) already carries its type; this just records the site
-                // (scope + span) so `into_file_analysis` can chain the
-                // enclosing function's `Symbol` onto it when undeclared.
+                // (scope + span) so `emit_return_fuel` (language_driver.rs,
+                // phase 7) can chain the enclosing function's `Symbol` onto it
+                // when undeclared.
                 out.return_sites
                     .push((cur_scope, Span { start: e.start, end: e.end }));
             }

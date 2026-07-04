@@ -475,3 +475,44 @@ fn cpp_splice_remaps_domain_sites() {
         "domain-site span back in ORIGINAL coords: {got:?}"
     );
 }
+
+// The implicit-`this->field` read pass is a C/C++ semantic (a bare name can
+// mean `this->field`); the pack declares whether it applies. Only cpp mints
+// the `SymKind::Field` + unresolved-bare-ref shape the pass keys on, so we
+// drive it through cpp extraction and run `emit_return_fuel` with the flag
+// both ways on fresh copies — the flag is the ONLY difference.
+#[cfg(feature = "cpp")]
+#[test]
+fn implicit_field_read_pass_gated_by_pack_capability() {
+    use crate::witnesses::WitnessSource;
+    let src = "struct C { int inner_; int get() { return inner_; } };\n";
+    let build = || {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let pack = crate::query_extract::cpp_pack();
+        let mut skel = crate::query_extract::extract(&tree, src.as_bytes(), &pack).unwrap();
+        let sites = std::mem::take(&mut skel.return_sites);
+        (skel.into_file_analysis(), sites)
+    };
+    let count = |fa: &FileAnalysis| {
+        fa.witnesses
+            .all()
+            .iter()
+            .filter(|w| matches!(&w.source, WitnessSource::Builder(s) if s == "cpp_implicit_field_read"))
+            .count()
+    };
+
+    let (mut fa_on, sites) = build();
+    emit_return_fuel(&mut fa_on, &sites, true);
+    assert_eq!(count(&fa_on), 1, "capability on → bare-member read minted");
+
+    let (mut fa_off, sites) = build();
+    emit_return_fuel(&mut fa_off, &sites, false);
+    assert_eq!(count(&fa_off), 0, "capability off → pass gated, nothing minted");
+
+    assert!(!crate::query_extract::python_pack().implicit_field_reads,
+        "python: a bare name is never self.field");
+    assert!(crate::query_extract::cpp_pack().implicit_field_reads,
+        "cpp: methods read members with implicit this->");
+}
