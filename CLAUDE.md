@@ -89,6 +89,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 - `file_store.rs` — unified store for open + workspace FileAnalyses, role-tagged, dedup'd by path.
 - `file_analysis.rs` — data model; serde-derived.
 - `builder.rs` — CST→FileAnalysis. ONLY tree-sitter consumer.
+- `language_driver.rs` — `LanguageDriver`/`PackDriver`/`LanguageRegistry`, the multi-language serving seam (`docs/prompt-multi-language.md`). `PackDriver::analyze_with_path`'s pipeline is 7 named phases (doc comment on that fn): gather context → transform+parse → extract → remap spans → enrich skeleton → `into_file_analysis` → register post-build hooks; remap must precede injection, injection must precede `into_file_analysis`.
 - `cst.rs` — typed view over the CST (typed wrappers, `NodeExt`, pair walking, call args, varname canonicalization). The vocabulary every tree consumer uses.
 - `conventions.rs` — Perl name semantics, parsed once: `MethodToken` (FQ/SUPER/main method-token qualifier), `InvocantText` (variable/bareword/`__PACKAGE__`/positional-receiver invocant shape), plus name predicates (constructor, conventional invocant, `__PACKAGE__`). Pure `&str`; no tree-sitter. Never re-derive these shapes with `rsplit_once("::")` / `starts_with('$')` string ops in a consumer.
 - `pod.rs` — POD→markdown via tree-sitter-pod.
