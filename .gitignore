@@ -4,7 +4,8 @@ editors/vscode/node_modules/
 editors/vscode/out/
 .node-version
 
-.claude/
+.claude/*
+!.claude/skills/
 qa-workspace/
 gold-corpus/local/
 gold-corpus/.carton/
