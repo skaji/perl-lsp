@@ -26,6 +26,27 @@ return function(opts)
   vim.keymap.set("n", "<C-k>", "<C-w>k")
   vim.keymap.set("n", "<C-l>", "<C-w>l")
 
+  -- aerial.nvim outline, OPTIMISTIC + interactive-only: never loads headless
+  -- (e2e stays plugin-free), never errors if the clone is absent/broken, and
+  -- lives outside the global nvim config (~/.local/share/nvim-dev-plugins).
+  if #vim.api.nvim_list_uis() > 0 then
+    local aerial_path = vim.fn.expand("~/.local/share/nvim-dev-plugins/aerial.nvim")
+    if vim.fn.isdirectory(aerial_path) == 1 then
+      vim.opt.runtimepath:prepend(aerial_path)
+      local ok, aerial = pcall(require, "aerial")
+      if ok then
+        pcall(aerial.setup, {
+          backends = { "lsp" },
+          layout = { default_direction = "prefer_right", min_width = 32 },
+          show_guides = true,
+        })
+        vim.keymap.set("n", "<leader>a", "<cmd>AerialToggle!<CR>")
+        vim.keymap.set("n", "{", "<cmd>AerialPrev<CR>")
+        vim.keymap.set("n", "}", "<cmd>AerialNext<CR>")
+      end
+    end
+  end
+
   -- Built binary. Override with PERL_LSP_BIN for comparison runs.
   local lsp_bin = vim.env.PERL_LSP_BIN
     and vim.fn.fnamemodify(vim.env.PERL_LSP_BIN, ":p")
