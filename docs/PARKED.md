@@ -55,6 +55,19 @@ why parked, what unblocks it. Prune on landing.
 
 ## Residual-bug tier (pinned, xfail'd where reducible)
 
+- **Implicit-`this->field` reads apply to ALL pack languages**
+  (`language_driver.rs::emit_return_fuel`'s second pass): "bare unresolved
+  identifier naming an enclosing class's field = member read" is cpp
+  semantics — false for Python (bare name never means `self.field`).
+  Wants a LangPack capability flag (NOT a language-name branch — rule #10);
+  directed at the next round-close sweep. Trigger conditions are narrow
+  (unresolved Variable ref + class-scoped + name-matching Field), so
+  exposure is low today.
+- **Call-root chain arm hardcodes `arity_hint = Some(0)`**
+  (`file_analysis.rs::expr_type_at_span`): wrong hint for a multi-arg call
+  root on an arity-discriminated callee. Harmless while cpp overloads are
+  parked; the depth round's overload-arity slice mints real arg counts —
+  fix it there with the same fuel.
 - **json.hpp attribution stops mid-class** at a `#if`-conditional
   ctor-initializer — the config-superposition tier (a `#if` inside a
   class body forks the member list; wants the superposition model applied
