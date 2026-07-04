@@ -132,6 +132,13 @@ pub enum WitnessAttachment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RefIdx(pub u32);
 
+/// `WitnessSource::Builder` tag marking a variable's type as written
+/// EXPLICITLY (a declared static-type annotation) rather than inferred.
+/// Recognized by `WitnessSource::priority` (an explicit annotation
+/// outranks a flow guess) and by the inlay-hint suppression (an annotated
+/// declaration needs no synthetic `: T`).
+pub const ANNOT_SOURCE: &str = "skeleton-annot";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WitnessSource {
     /// Named builder pass — "signature_extraction", "narrowing", …
@@ -148,10 +155,17 @@ impl WitnessSource {
     /// Priority for "highest-priority source wins" tie-breaking in
     /// reducers. Plugin overrides dominate everything else (the whole
     /// point of an override is "inference reaches the wrong answer
-    /// here"); the weights only need `Plugin > everything else`.
+    /// here"). An EXPLICIT type annotation (`ANNOT_SOURCE`) outranks a
+    /// same-attachment inferred/flow class assertion: in a statically-
+    /// typed pack language the declared type governs member dispatch, so a
+    /// declared `RCPV *rcpv = FOO(...)` must resolve members on `RCPV`,
+    /// never on a flow guess for the initializer (e.g. the uppercase-call
+    /// ctor-convention heuristic that mis-types the macro call). The
+    /// remaining weights only need `Plugin > annotation > everything else`.
     pub fn priority(&self) -> u8 {
         match self {
             WitnessSource::Plugin(_) => 100,
+            WitnessSource::Builder(tag) if tag == ANNOT_SOURCE => 20,
             WitnessSource::Builder(_)
             | WitnessSource::Enrichment(_)
             | WitnessSource::DerivedFrom(_) => 10,

@@ -709,15 +709,15 @@
    "semantic_area": "cpp-ctxparam-macro",
    "lang": "cpp",
    "root": "gold-corpus/cpp-fixture",
-   "status": "xfail",
+   "status": "gold",
    "file": "ctxparam/ctxparam.c",
-   "id": "cpp-xfail-ctxparam-member-gd-control",
+   "id": "cpp-ctxparam-member-gd-control",
    "line": 6,
    "col": 11,
-   "comment": "gd on rcpv->refcount inside a fn whose param list uses a single-level config-superposed context macro (pCTX_). Fails only when the header ALSO defines the nested pTHX-style chain \u2014 the nested defs degrade member resolution TU-wide (real-world: every Perl_* fn in perl5 op.c).",
+   "comment": "gd on rcpv->refcount where rcpv is `RCPV *rcpv = RCPVx(pv)`. The uppercase macro-call `RCPVx(pv)` mis-fires a ctor-convention ClassName(RCPVx) that shadowed the declared type RCPV; member resolution then leaned on a single-entry package_parents fallback that broke once the header held a second decl. Fix: an explicit type annotation outranks an inferred flow class assertion (WitnessSource::priority ANNOT_SOURCE), so the receiver types RCPV and resolves the field robustly. Real-world: perl5 op.c:16170.",
    "expect": {
     "all": [
-     "ctxparam/ctx.h:29:"
+     "ctx.h:30:"
     ],
     "none": []
    }
@@ -727,15 +727,15 @@
    "semantic_area": "cpp-ctxparam-macro",
    "lang": "cpp",
    "root": "gold-corpus/cpp-fixture",
-   "status": "xfail",
+   "status": "gold",
    "file": "ctxparam/ctxparam.c",
-   "id": "cpp-xfail-ctxparam-member-gd-nested",
+   "id": "cpp-ctxparam-member-gd-nested",
    "line": 14,
    "col": 11,
-   "comment": "gd on rcpv->refcount inside Perl_rcpv_copy(pTHX_ char *pv) \u2014 the perl5 shape: 3-deep nested param macro chain ending in an attribute macro. refcount lives on struct rcpv via typedef RCPV.",
+   "comment": "gd on rcpv->refcount inside Perl_rcpv_copy(pTHX_ char *pv). The pTHX_ param-macro chain is incidental \u2014 the break was the ctor-convention misfire on the RCPVx(pv) initializer shadowing the declared RCPV type (same root cause as -control). refcount lives on struct rcpv via typedef RCPV.",
    "expect": {
     "all": [
-     "ctxparam/ctx.h:29:"
+     "ctx.h:30:"
     ],
     "none": []
    }

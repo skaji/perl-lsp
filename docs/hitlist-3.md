@@ -4,6 +4,33 @@ Live findings queue for round 3. Same discipline as hitlist-2: every
 reducible finding gets a RED xfail row before its fix; root causes get
 CONFIRMED by experiment, not guessed.
 
+## 1. Context-param macro chains break member resolution (perl5 pTHX_) — RESOLVED
+
+**Resolution (2026-07-05):** the pTHX_ chain was a RED HERRING. Bisection
+showed the trigger is a SECOND top-level declaration in the header combined
+with a receiver typed through a macro call: `RCPV *rcpv = RCPVx(pv)`. The
+uppercase macro-call `RCPVx(pv)` mis-fires the ctor-convention
+`ClassName("RCPVx")` witness (query_extract), which — as a `flow`-sourced
+class assertion — *shadowed* the explicit `skeleton-annot` declared type
+`RCPV` in the Variable reducer (equal source priority → latest-wins → flow
+wins). Member resolution then dispatched on the bogus class `RCPVx`, whose
+"parents" only resolved by luck through `primary_package_parents`'s
+`len()==1` single-entry fallback — which stops firing the moment the header
+holds a second `package_parents`-bearing decl (hence the "2 typedefs" /
+"extra struct" / "extra global" triggers, all equivalent).
+
+Fix: an EXPLICIT type annotation is a higher-confidence class assertion than
+an inferred flow type — `WitnessSource::priority` returns 20 for the
+`ANNOT_SOURCE` (`skeleton-annot`) tag vs 10 for flow. The declared `RCPV`
+now wins, the receiver types `RCPV`, and `parents_cached("RCPV")` resolves
+robustly via the exact-name branch regardless of header decl count. General
+(rule #10): keyed on the annotation SOURCE, no macro names, no perl5
+specifics. Rows `cpp-ctxparam-member-gd-{control,nested}` promoted to gold;
+`cpp-ctxparam-member-hover-nested` added. Real-world verified on perl5
+op.c:16170 (`rcpv->refcount` → cop.h:574) and a second pTHX_ function
+(`o->op_type` in Perl_op_free). NOTE: the op.c CLI queries need one warm-up
+query first — the cold-start flake (finding #2) still poisons the first hit.
+
 ## 1. Context-param macro chains break member resolution (perl5 pTHX_)
 
 **Report (veesh):** op.c:16170 `rcpv->refcount++` has no gd — expected the
