@@ -54,6 +54,24 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-chain-root-free-function-completion",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "chainroot.cpp",
+      "line": 10,
+      "col": 18,
+      "expect": {
+        "all": [
+          "next",
+          "leaf"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }
