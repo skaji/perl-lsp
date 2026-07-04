@@ -4452,6 +4452,44 @@ impl FileAnalysis {
                 }
             }
         }
+        // Call-expression chain root (`make_widget().next()`, and a ctor call
+        // on a temporary `Box().getInner()` falls out the same way — both are
+        // plain `call_expression`s, not member accesses, so the pack
+        // member-chain arm above never sees them as a receiver). The queried
+        // span here is the INVOCANT'S full extent (callee + parens/args,
+        // handed in by the member-chain arm's own recursion); the call's ref
+        // only spans the callee token — same start, narrower end. Feeds the
+        // call's own return into the chain exactly like a variable's type
+        // does.
+        if let Some((recv_idx, kind)) = self.refs.iter().enumerate().find_map(|(i, r)| {
+            if r.span.start == span.start
+                && (r.span.end.row, r.span.end.column) <= (span.end.row, span.end.column)
+                && matches!(r.kind, RefKind::MethodCall { .. } | RefKind::FunctionCall { .. })
+            {
+                Some((i, &r.kind))
+            } else {
+                None
+            }
+        }) {
+            match kind {
+                RefKind::MethodCall { .. } => {
+                    if let Some(t) =
+                        self.method_call_return_type_via_bag(recv_idx, module_index)
+                    {
+                        return Some(t);
+                    }
+                }
+                RefKind::FunctionCall { .. } => {
+                    if let Some(t) = self.sub_return_type_at_arity(
+                        &self.refs[recv_idx].target_name,
+                        Some(0),
+                    ) {
+                        return Some(t);
+                    }
+                }
+                _ => {}
+            }
+        }
         self.bag_query_expr_span(span, module_index)
     }
 

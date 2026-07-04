@@ -153,6 +153,13 @@ pub struct SkeletonAnalysis {
     /// return witness, and each call site an `Expr → Edge(Symbol)` so the call
     /// reflects the body's type. `docs/adr/macro-handling.md`.
     pub macro_returns: Vec<(String, MacroReturnHint)>,
+    /// `return EXPR;` sites (`@expr.return.value`): (enclosing scope, the
+    /// returned expression's span). Purely structural — this tier doesn't
+    /// know what a `return` MEANS for any given language; the interpretation
+    /// (join to an owning function, decide whether it needs implicit-return
+    /// fuel) is cpp-specific and lives in `language_driver.rs`'s post-
+    /// extraction pipeline (`emit_return_fuel`).
+    pub return_sites: Vec<(crate::file_analysis::ScopeId, Span)>,
 }
 
 /// What a function-like macro's return resolves to (`SkeletonAnalysis::
@@ -2013,6 +2020,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     ),
                     span,
                 });
+            }
+            "expr.return.value" => {
+                // The returned expression's own general-rule witness (literal
+                // / var-read / member / call — whichever matched this same
+                // node) already carries its type; this just records the site
+                // (scope + span) so `into_file_analysis` can chain the
+                // enclosing function's `Symbol` onto it when undeclared.
+                out.return_sites
+                    .push((cur_scope, Span { start: e.start, end: e.end }));
             }
             "flow.target" => {
                 flow_targets.insert(

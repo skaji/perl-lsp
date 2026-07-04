@@ -628,6 +628,14 @@
 (string_literal) @expr.lit.string
 (identifier) @expr.read.var
 
+; `return EXPR;` — the returned expression's OWN span already carries
+; whatever witness the general rules above minted for its shape (a literal,
+; a variable read, a member access, a call); this capture just marks the
+; site so `into_file_analysis` can chain the enclosing function's `Symbol`
+; onto it when the function has no declared return (`auto`) — cpp's side of
+; Perl's implicit-return machinery, one arm per `return` statement.
+(return_statement (_) @expr.return.value)
+
 ; ---- bind shapes + guard narrowing (the value-flow tier, cpp side) ----
 
 ; `for (auto x : items)` — the range-for var rebinds per element (a Rebind, no

@@ -221,14 +221,22 @@ impl LanguageDriver for PackDriver {
     ///    before (6) (`into_file_analysis` builds indices over everything).
     /// 6. `skel.into_file_analysis()` — the skeleton → FileAnalysis assembly
     ///    (unchanged; a method on `SkeletonAnalysis`, not a phase fn here).
-    /// 7. `register_post_build` — post-assembly hooks that stamp fields only
+    /// 7. `emit_return_fuel` — post-assembly implicit-return / implicit-
+    ///    field-read interpretation over the FINAL FileAnalysis (stable
+    ///    SymbolIds, resolved refs): an `auto`-returning function with no
+    ///    declared type chains its Symbol onto its `return`-statement sites
+    ///    (structural-only in the skeleton — `SkeletonAnalysis::return_sites`
+    ///    — so `query_extract.rs` stays language-generic; the "this needs
+    ///    implicit-return fuel" READING of that data is cpp semantics, so it
+    ///    lives here). MUST run after (6): needs final SymbolIds + resolved
+    ///    `fa.refs`.
+    /// 8. `register_post_build` — post-assembly hooks that stamp fields only
     ///    queryable once the FileAnalysis exists: macro defs, attribute-macro
     ///    signals, access-region visibility, include closure, degraded flag.
     ///
     /// Add a phase by inserting a numbered call here plus a fn beside the
     /// others below, in order — don't inline new logic into an existing
-    /// phase's body (a later emission phase for the type-fuel work is
-    /// expected to land here this way).
+    /// phase's body.
     fn analyze_with_path(&self, source: &str, path: Option<&Path>) -> FileAnalysis {
         let mut parser = (self.make_parser)();
         let ctx = self.gather_pack_context(&mut parser, source, path);
@@ -244,7 +252,12 @@ impl LanguageDriver for PackDriver {
                 // (no-op for identity / pass-through languages).
                 remap_spans(&mut skel, &src, source, &map);
                 let macro_defs = self.enrich_skeleton(&mut skel, &mut parser, source, &src, &map, &ctx);
+                // `return_sites` is structural skeleton output; taken before
+                // assembly consumes `skel` so phase 7 can interpret it against
+                // the FINAL FileAnalysis.
+                let return_sites = std::mem::take(&mut skel.return_sites);
                 let mut fa = skel.into_file_analysis();
+                emit_return_fuel(&mut fa, &return_sites);
                 self.register_post_build(&mut fa, &mut parser, source, path, &ctx, &recovered, macro_defs);
                 fa
             }
@@ -700,6 +713,107 @@ fn emit_external_type_aliases(
     }
 }
 
+/// Phase 7: the two CHAIN-FUEL gaps (`docs/PARKED.md`) — cpp's
+/// implicit-return inference and the implicit `this->field` read that
+/// feeds it. Reads the FINAL `FileAnalysis` (stable SymbolIds, resolved
+/// refs) plus `return_sites` (the skeleton's purely structural "a `return`
+/// happened here" record — `query_extract.rs` doesn't know what a return
+/// MEANS for any language; this function is the cpp-semantic reading of it).
+///
+/// An `auto`-returning function/method has no declared-return witness (the
+/// writeback inside `into_file_analysis` only fires when the syntax carries
+/// a type), so `fa.witnesses.for_attachment(Symbol(sid))` being empty IS
+/// the "undeclared" signal — reading the bag's own state rather than a
+/// private skeleton field. For each qualifying site: one
+/// `SymbolReturnArm(sid) → Edge(Expr(return_span))` witness plus one
+/// `Symbol(sid) → Edge(SymbolReturnArm(sid))` chain witness, mirroring
+/// Perl's `Builder::publish_return_arm_witnesses` — `SymbolReturnArmFold`
+/// (`witnesses.rs`) already folds multi-arm agreement generically.
+///
+/// A bare identifier that resolves to no local var (an unresolved
+/// `RefKind::Variable`) but names a field of its enclosing class
+/// (`Scope::package`) is an implicit `this->field` read (`return inner_;`
+/// with no explicit receiver) — mints the same `Expr(span) →
+/// Edge(Variable{field, field's own scope})` edge the field's own
+/// declared-type witness already resolves through, so the read chases the
+/// general Variable path instead of dead-ending. General-purpose (any bare
+/// field read, not gated on return position — rule #10).
+#[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
+fn emit_return_fuel(
+    fa: &mut FileAnalysis,
+    return_sites: &[(crate::file_analysis::ScopeId, crate::file_analysis::Span)],
+) {
+    use crate::file_analysis::{RefKind, ScopeId, ScopeKind, SymKind, SymbolId};
+    use crate::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
+    use std::collections::HashMap;
+
+    let scope_parent: HashMap<ScopeId, Option<ScopeId>> =
+        fa.scopes.iter().map(|s| (s.id, s.parent)).collect();
+    // A Sub/Method's body scope (`@scope.sub`) is minted on the SAME
+    // `function_definition` node as its `@def.sub`/`@def.method` — same
+    // span, different query pattern — so span equality joins scope → Symbol.
+    let scope_to_symbol: HashMap<ScopeId, SymbolId> = fa
+        .scopes
+        .iter()
+        .filter(|s| matches!(s.kind, ScopeKind::Sub { .. }))
+        .filter_map(|s| {
+            fa.symbols
+                .iter()
+                .find(|sym| matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.span == s.span)
+                .map(|sym| (s.id, sym.id))
+        })
+        .collect();
+    for (ret_scope, ret_span) in return_sites {
+        let owner = std::iter::successors(Some(*ret_scope), |sc| {
+            scope_parent.get(sc).copied().flatten()
+        })
+        .find_map(|sc| scope_to_symbol.get(&sc).copied());
+        let Some(sid) = owner else { continue };
+        if !fa.witnesses.for_attachment(&WA::Symbol(sid)).is_empty() {
+            continue; // a declared return already carries its own witness
+        }
+        fa.witnesses.push(Witness {
+            attachment: WA::SymbolReturnArm(sid),
+            source: WitnessSource::Builder("cpp_return_arm".into()),
+            payload: WP::Edge(WA::Expr(*ret_span)),
+            span: *ret_span,
+        });
+        fa.witnesses.push(Witness {
+            attachment: WA::Symbol(sid),
+            source: WitnessSource::Builder("cpp_return_arm_chain".into()),
+            payload: WP::Edge(WA::SymbolReturnArm(sid)),
+            span: *ret_span,
+        });
+    }
+
+    let scope_package: HashMap<ScopeId, Option<String>> =
+        fa.scopes.iter().map(|s| (s.id, s.package.clone())).collect();
+    let field_scope: HashMap<(String, String), ScopeId> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, SymKind::Field))
+        .filter_map(|s| s.package.clone().map(|p| ((p, s.name.clone()), s.scope)))
+        .collect();
+    let implicit_field_edges: Vec<(crate::file_analysis::Span, String, ScopeId)> = fa
+        .refs
+        .iter()
+        .filter(|r| matches!(r.kind, RefKind::Variable) && r.resolves_to.is_none())
+        .filter_map(|r| {
+            let class = scope_package.get(&r.scope)?.as_ref()?;
+            let fscope = *field_scope.get(&(class.clone(), r.target_name.clone()))?;
+            Some((r.span, r.target_name.clone(), fscope))
+        })
+        .collect();
+    for (span, name, fscope) in implicit_field_edges {
+        fa.witnesses.push(Witness {
+            attachment: WA::Expr(span),
+            source: WitnessSource::Builder("cpp_implicit_field_read".into()),
+            payload: WP::Edge(WA::Variable { name, scope: fscope }),
+            span,
+        });
+    }
+}
+
 /// Remap extracted skeleton spans from transformed coords back to
 /// original source coords via the anchor map. A no-op for an identity
 /// map (clean/pass-through files round-trip byte→point→byte unchanged),
@@ -760,6 +874,7 @@ fn remap_spans(
         specializations: _,
         // name-keyed, ordered by byte position pre-remap — no spans to fix.
         template_params: _,
+        return_sites,
     } = skel;
 
     for s in symbols.iter_mut() {
@@ -803,6 +918,9 @@ fn remap_spans(
         }
     }
     for (_, _, span) in var_reads.iter_mut() {
+        *span = rspan(*span);
+    }
+    for (_, span) in return_sites.iter_mut() {
         *span = rspan(*span);
     }
     for sc in scopes.iter_mut() {
