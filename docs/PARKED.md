@@ -15,11 +15,6 @@ why parked, what unblocks it. Prune on landing.
   key / import / type-position / …), per-language detectors behind it —
   the LanguagePack pattern applied to cursor context. Slice-E's access
   filter already had to thread through cursor_sentinel awkwardly.
-- **Entity-content completion sources** still adapter-side (methods-on-
-  class, hash keys, dispatch handlers, `use Foo qw(|)`) — deliberately
-  outside the set (they ride MethodOnClass/ReceiverGated), but the pack
-  in-scope/member sources note from THE MIGRATION says candidate-level
-  pack gathering is the mechanical next step.
 - **language_driver post-extraction pipeline** grew organically (remap →
   member-block injection → domain sites → …): wants the builder.rs
   treatment — named phases, ordering documented.

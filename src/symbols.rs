@@ -9,9 +9,8 @@ use crate::file_analysis::{
     HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
     SymKind as FaSymKind, SymbolDetail,
 };
-use crate::module_index::{CachedModule, ModuleIndex, SubInfo};
+use crate::module_index::{ModuleIndex, SubInfo};
 use crate::resolve::{resolve_imported_function, ImportResolution};
-use std::sync::Arc;
 
 // ---- Coordinate conversion ----
 
@@ -404,12 +403,17 @@ fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
     // message, wire) which makes handlers look like they're mixed
     // into noise. Prefixing with a space character ensures the
     // handler group sorts first as a block — space (0x20) < digit
-    // (0x30) lexicographically. Non-handlers keep the existing
-    // priority-based ordering.
+    // (0x30) lexicographically.
+    //
+    // The label is the intra-priority tie-break in every case (module /
+    // import-list / qualified-path candidates carry it explicitly, and
+    // it's what a client falls back to for equal sortText anyway — so
+    // spelling it here is ranking-neutral for the identifier/member/key
+    // arms and lets this one projection reproduce those arms byte-for-byte).
     let sort_text = if matches!(c.kind, FaSymKind::Handler) {
         Some(format!(" {:03}{}", c.sort_priority, c.label))
     } else {
-        Some(format!("{:03}", c.sort_priority))
+        Some(format!("{:03}{}", c.sort_priority, c.label))
     };
     let kind = if let Some(ref d) = c.display_override {
         handler_display_to_completion_kind(d)
@@ -725,20 +729,31 @@ fn completion_items_native(
         }
         Slot::Import { ref module } => {
             if let Some(ref name) = module {
-                return complete_import_list(name, module_index);
+                // The export surface is entity content on `CachedModule`;
+                // the "still indexing" placeholder is a slot affordance
+                // (no entity to gather yet), so it stays adapter-side.
+                return match module_index.get_cached(name) {
+                    Some(cached) => cached
+                        .import_list_candidates()
+                        .into_iter()
+                        .map(candidate_to_completion_item)
+                        .collect(),
+                    None => vec![import_list_loading_placeholder(name)],
+                };
             }
             Vec::new()
         }
         Slot::ModulePath { ref prefix, in_use } => {
-            if in_use {
-                return complete_module_names(&cs, prefix);
-            }
-            // `Foo::Bar::<cursor>` — return subs declared in (or
-            // inherited by) that package, qualified with the package
-            // prefix so the client filter matches against what the
-            // user typed. Suppress the global firehose; this branch
-            // is the answer.
-            return qualified_path_completions(&cs, analysis, module_index, prefix);
+            // `use Foo::<cursor>` → the loadable-module half; `Foo::<cursor>`
+            // mid-expression → the qualified-path drill (subs + sub-packages).
+            // Both are candidate-level on the set; this branch is the answer,
+            // so it returns directly (the global firehose is suppressed).
+            let candidates = if in_use {
+                cs.complete_module_candidates(prefix)
+            } else {
+                cs.complete_qualified_path(module_index, prefix)
+            };
+            return candidates.into_iter().map(candidate_to_completion_item).collect();
         }
         Slot::Identifier { .. } if sigil_trigger.is_some() => {
             analysis.complete_variables(point, sigil_trigger.expect("checked by guard"))
@@ -826,147 +841,18 @@ fn completion_items_native(
     items
 }
 
-/// Complete module names on `use` lines — the CandidateSet's loadable-module
-/// universe, formatted.
-fn complete_module_names(
-    cs: &crate::resolve::CandidateSet,
-    prefix: &str,
-) -> Vec<CompletionItem> {
-    let modules = cs.complete_modules(prefix);
-    modules.into_iter().map(|(name, is_resolved)| {
-        let (detail, priority) = if is_resolved {
-            (Some("indexed".to_string()), 10u8)
-        } else {
-            (Some("available".to_string()), 50u8)
-        };
-        CompletionItem {
-            label: name.clone(),
-            kind: Some(CompletionItemKind::MODULE),
-            detail,
-            sort_text: Some(format!("{:03}{}", priority, name)),
-            ..Default::default()
-        }
-    }).collect()
-}
-
-/// Complete import list items for `use Module qw(|)`.
-fn complete_import_list(module_name: &str, module_index: &ModuleIndex) -> Vec<CompletionItem> {
-    let cached: Arc<CachedModule> = match module_index.get_cached(module_name) {
-        Some(c) => c,
-        None => return vec![CompletionItem {
-            label: format!("loading {}...", module_name),
-            kind: Some(CompletionItemKind::TEXT),
-            detail: Some("Module is being indexed".to_string()),
-            insert_text: Some(String::new()),
-            sort_text: Some("999".to_string()),
-            ..Default::default()
-        }],
-    };
-
-    let mut items = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for name in &cached.analysis.export {
-        if seen.insert(name.clone()) {
-            let detail = cached.sub_info(name)
-                .and_then(|s| s.return_type(None))
-                .map(|rt| format!("@EXPORT → {}", format_inferred_type(&rt)))
-                .or(Some("@EXPORT".to_string()));
-            items.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail,
-                sort_text: Some(format!("010{}", name)),
-                ..Default::default()
-            });
-        }
+/// The `use Module qw(|)` "still indexing" affordance — shown while the
+/// named module's export surface (the entity) isn't cached yet. Not an
+/// entity candidate, so it's built here rather than via the projection.
+fn import_list_loading_placeholder(module_name: &str) -> CompletionItem {
+    CompletionItem {
+        label: format!("loading {}...", module_name),
+        kind: Some(CompletionItemKind::TEXT),
+        detail: Some("Module is being indexed".to_string()),
+        insert_text: Some(String::new()),
+        sort_text: Some("999".to_string()),
+        ..Default::default()
     }
-
-    for name in &cached.analysis.export_ok {
-        if seen.insert(name.clone()) {
-            let detail = cached.sub_info(name)
-                .and_then(|s| s.return_type(None))
-                .map(|rt| format!("→ {}", format_inferred_type(&rt)));
-            items.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail,
-                sort_text: Some(format!("020{}", name)),
-                ..Default::default()
-            });
-        }
-    }
-
-    items
-}
-
-/// Completion items for `Package::<cursor>` — subs declared in that
-/// package (cross-file + local + inherited) PLUS sub-packages nested
-/// underneath. Typing `Mojo::` shows both the methods on Mojo itself
-/// and the available namespaces (`Util`, `Base`, `IOLoop`, …) so the
-/// user can drill in without leaving completion. Subs sort first
-/// (priority 010), sub-packages second (020).
-fn qualified_path_completions(
-    cs: &crate::resolve::CandidateSet,
-    analysis: &FileAnalysis,
-    module_index: &ModuleIndex,
-    package: &str,
-) -> Vec<CompletionItem> {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut items: Vec<CompletionItem> = Vec::new();
-
-    // Subs declared in this package (cross-file + local + inherited).
-    // Insert the bare name — the typed `Package::` prefix stays put.
-    for c in analysis.complete_methods_for_class(package, Some(module_index)) {
-        if !seen.insert(c.label.clone()) {
-            continue;
-        }
-        items.push(CompletionItem {
-            label: c.label.clone(),
-            kind: Some(CompletionItemKind::FUNCTION),
-            detail: c.detail.clone().or_else(|| Some(format!("from {}", package))),
-            sort_text: Some(format!("010{}", c.label)),
-            insert_text: Some(c.label),
-            ..Default::default()
-        });
-    }
-
-    // Sub-packages — both loadable modules whose name starts with
-    // `Package::` (the set's module universe) AND in-file
-    // `package Package::Other` declarations (the set's OPEN-tier
-    // identifier universe, kind-projected to packages).
-    // Label is the suffix (what follows the typed prefix), so the
-    // client's `Package::<typed>` filter matches naturally.
-    let prefix = format!("{}::", package);
-    let mut subpaths: Vec<(String, &'static str)> = Vec::new();
-    for (name, is_resolved) in cs.complete_modules(&prefix) {
-        let hint = if is_resolved { "indexed" } else { "available" };
-        subpaths.push((name, hint));
-    }
-    for c in cs.complete(&prefix, false) {
-        if !matches!(c.kind, FaSymKind::Package | FaSymKind::Class) {
-            continue;
-        }
-        subpaths.push((c.label, "in-file"));
-    }
-    for (name, hint) in subpaths {
-        let suffix = match name.strip_prefix(&prefix) {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => continue,
-        };
-        if !seen.insert(suffix.clone()) {
-            continue;
-        }
-        items.push(CompletionItem {
-            label: suffix.clone(),
-            kind: Some(CompletionItemKind::MODULE),
-            detail: Some(hint.to_string()),
-            sort_text: Some(format!("020{}", suffix)),
-            insert_text: Some(suffix),
-            ..Default::default()
-        });
-    }
-    items
 }
 
 /// Returns snippet completions for ref-type dereference after `->`.
