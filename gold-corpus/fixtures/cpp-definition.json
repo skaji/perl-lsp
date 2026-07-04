@@ -1,708 +1,744 @@
 {
-  "capability": "definition",
-  "rows": [
-    {
-      "id": "cpp-definition-call-to-free-function",
-      "difficulty": "simple",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "sample.cpp",
-      "line": 16,
-      "col": 12,
-      "expect": {
-        "all": [
-          "sample.cpp:13:5"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-chain-root-free-function-call",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "chainroot.cpp",
-      "line": 7,
-      "col": 19,
-      "expect": {
-        "all": [
-          "chainroot.cpp:3:10"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist-include-nav",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "inc_nav.cpp",
-      "line": 0,
-      "col": 10,
-      "expect": {
-        "all": [
-          "incdep.h"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-member-block-field-goto-def",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "member_block.cpp",
-      "line": 8,
-      "col": 22,
-      "expect": {
-        "all": [
-          "member_block.cpp:3:32"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-member-block-base-goto-def",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "member_block.cpp",
-      "line": 4,
-      "col": 14,
-      "expect": {
-        "all": [
-          "member_block.cpp:3:9"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-definition-cross-file-enum-variant",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-multilang-crossfile",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture/xenum",
-      "file": "use.c",
-      "line": 2,
-      "col": 16,
-      "expect": {
-        "all": [
-          "opcodes.h:3:5"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-definition-domain-typing-op-type-offers-enum",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_enum.c",
-      "line": 6,
-      "col": 14,
-      "expect": {
-        "all": [
-          "domain_enum.c:5:29",
-          "domain_enum.c:4:6"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-definition-domain-mixed-slot-real-decl-no-enum",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_mixed.c",
-      "line": 3,
-      "col": 11,
-      "expect": {
-        "all": [
-          "domain_mixed.c:2:19"
-        ],
-        "none": [
-          "domain_mixed.c:1:"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-definition-domain-owner-separation-enum-side",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_owner.c",
-      "line": 3,
-      "col": 38,
-      "expect": {
-        "all": [
-          "domain_owner.c:2:21",
-          "domain_owner.c:1:6"
-        ],
-        "none": [
-          "domain_owner.c:3:20"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-definition-domain-owner-separation-int-side",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_owner.c",
-      "line": 6,
-      "col": 37,
-      "expect": {
-        "all": [
-          "domain_owner.c:3:20"
-        ],
-        "none": [
-          "domain_owner.c:1:6",
-          "domain_owner.c:2:21"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-sym-typedef-use-to-def",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-symmetry",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "sympair/typedefpair.c",
-      "line": 1,
-      "col": 0,
-      "expect": {
-        "all": [
-          "typedefpair.c:1:24"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-sym-global-use-to-def",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-symmetry",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "sympair/globalpair.c",
-      "line": 1,
-      "col": 20,
-      "expect": {
-        "all": [
-          "globalpair.c:1:5"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-sym-type-use-to-def",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-symmetry",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "struct_refs.cpp",
-      "line": 1,
-      "col": 0,
-      "expect": {
-        "all": [
-          "struct_refs.cpp:1:8"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-sym-enum-variant-use-to-def",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-symmetry",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "xenum/use.c",
-      "line": 2,
-      "col": 16,
-      "expect": {
-        "all": [
-          "opcodes.h:3:5"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-definition-brace-init-member-through-declared-var",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-parse-repair",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "file": "brace_init.cpp",
-      "line": 3,
-      "col": 11,
-      "expect": {
-        "all": [
-          "brace_init.cpp:1:20"
-        ],
-        "none": []
-      }
-    },
-    {
-      "id": "cpp-definition-member-after-same-line-macro-splice",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-parse-repair",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "file": "splice_member.c",
-      "line": 5,
-      "col": 9,
-      "expect": {
-        "all": [
-          "splice_member.c:3:21"
-        ],
-        "none": []
-      }
-    },
-    {
-      "id": "cpp-template-struct-gd-from-trailing-return-cross-file",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_sep.cpp",
-      "line": 2,
-      "col": 28,
-      "expect": {
-        "all": [
-          "tmpl_sep.h:3:33"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_instance.cpp",
-      "status": "gold",
-      "id": "cpp-template-instance-member-goto-def",
-      "line": 29,
-      "col": 6,
-      "expect": {
-        "all": [
-          "tmpl_instance.cpp:15:9"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_instance.cpp",
-      "status": "gold",
-      "id": "cpp-template-instance-param-typed-member-goto-def",
-      "line": 30,
-      "col": 6,
-      "expect": {
-        "all": [
-          "tmpl_instance.cpp:14:7"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_instance.cpp",
-      "status": "gold",
-      "id": "cpp-typedef-chase-to-instance-member-goto-def",
-      "line": 32,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_instance.cpp:15:9"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_instance.cpp",
-      "status": "gold",
-      "id": "cpp-instance-spec-exact-spelling-wins-goto-def",
-      "line": 35,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_instance.cpp:25:10"
-        ],
-        "none": [
-          "tmpl_instance.cpp:22"
-        ]
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_instance.cpp",
-      "status": "gold",
-      "id": "cpp-instance-no-spec-falls-to-primary-goto-def",
-      "line": 36,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_instance.cpp:22:10"
-        ],
-        "none": [
-          "tmpl_instance.cpp:25"
-        ]
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-typing-chain-gd-through-substituted-return",
-      "line": 32,
-      "col": 13,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:7:10"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-typing-chain-gd-through-param-field",
-      "line": 33,
-      "col": 14,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:7:10"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-partial-spec-member-gd",
-      "line": 36,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:22:7"
-        ],
-        "none": [
-          "tmpl_typing.cpp:19"
-        ]
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-chain-gd-through-partial-spec-binding",
-      "line": 36,
-      "col": 15,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:7:10"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-family-gd-ranked-spec-first-primary-kept",
-      "line": 37,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:23:9",
-          "tmpl_typing.cpp:19:9"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-exact-spec-beats-partial-gd",
-      "line": 39,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:26:9"
-        ],
-        "none": [
-          "tmpl_typing.cpp:23",
-          "tmpl_typing.cpp:19"
-        ]
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-no-spec-match-falls-to-primary-gd",
-      "line": 41,
-      "col": 7,
-      "expect": {
-        "all": [
-          "tmpl_typing.cpp:19:9"
-        ],
-        "none": [
-          "tmpl_typing.cpp:23",
-          "tmpl_typing.cpp:26"
-        ]
-      }
-    },
-    {
-      "id": "cpp-hitlist2-fnptr-typedef-gd-dark",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` \u2014 a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use \u2014 verbs disagree on one symbol).",
-      "file": "fnptr_typedef.cpp",
-      "line": 1,
-      "col": 0,
-      "expect": {
-        "all": [
-          "fnptr_typedef.cpp:1:17"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist2-nested-union-cross-file-gd-dark",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist2",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture/nestunion",
-      "comment": "hitlist-2 #16: `union U { struct { int ping; } data; }` in a header, accessed cross-file as `u->data.ping`. gd on `ping` at the use site can't reach the field decl (the anonymous-struct-in-union DX covers the defining file's own outline/completion, per union_nest.c, but not cross-file access).",
-      "file": "use.c",
-      "line": 2,
-      "col": 12,
-      "expect": {
-        "all": [
-          "msg.h:3:13"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist2-spec-ladder-type-gd",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist2-identity-precision",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typegd.cpp",
-      "line": 6,
-      "col": 14,
-      "comment": "Type-REFERENCE gd consults the specificity ladder: the base-clause fmtr<int> offers the exact spec (ranked first) AND the primary (kept, never pruned) \u2014 the chrono.h:1904 -> 2101 shape.",
-      "expect": {
-        "all": [
-          "tmpl_typegd.cpp:4:20",
-          "tmpl_typegd.cpp:1:30"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist2-qualified-enum-constant-gd",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist2-namespace",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "nsenum/use.cc",
-      "line": 2,
-      "col": 24,
-      "comment": "ns::EnumClass::kValue gd: the constant resolves through its owning class (the qualifier segment), not the file-scope by-name tail \u2014 the abseil status.cc:223 shape.",
-      "expect": {
-        "all": [
-          "codes.h:5:3"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist2-namespace-middle-segment-gd",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist2-namespace",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "nsenum/use.cc",
-      "line": 2,
-      "col": 18,
-      "comment": "gd on the MIDDLE segment (the enum-class name inside ns::Code::kBad) resolves to the enum def via the bare-word fallback.",
-      "expect": {
-        "all": [
-          "codes.h:4:12"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist2-qualified-call-gd-alpha",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2-namespace",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "nsqual.cpp",
-      "line": 6,
-      "col": 32,
-      "comment": "gd from a qualified call lands on the SAME-namespace overload, not the sibling namespace's.",
-      "expect": {
-        "all": [
-          "nsqual.cpp:2:5"
-        ],
-        "none": [
-          "nsqual.cpp:5:5"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist2-qualified-call-gd-beta",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2-namespace",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "nsqual.cpp",
-      "line": 6,
-      "col": 47,
-      "comment": "\u2026and the sibling namespace's call lands on ITS def \u2014 the pair proves qualifier-keyed selection.",
-      "expect": {
-        "all": [
-          "nsqual.cpp:5:5"
-        ],
-        "none": [
-          "nsqual.cpp:2:5"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2-decl-def",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "id": "cpp-hitlist2-static-forward-decl-offers-body",
-      "file": "fwddef/state.c",
-      "line": 1,
-      "col": 11,
-      "comment": "gd on a static forward decl offers the bodied definition (ranked first) with the decl kept \u2014 hitlist-2 #15.",
-      "expect": {
-        "all": [
-          "state.c:8:12",
-          "state.c:2:12"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2-decl-def",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "id": "cpp-hitlist2-call-through-forward-decl-offers-body",
-      "file": "fwddef/state.c",
-      "line": 4,
-      "col": 21,
-      "comment": "gd from a call that resolves to the forward decl offers the body too.",
-      "expect": {
-        "all": [
-          "state.c:8:12",
-          "state.c:2:12"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2-decl-def",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "id": "cpp-hitlist2-extern-decl-offers-defining-tu",
-      "file": "fwddef/state.h",
-      "line": 3,
-      "col": 24,
-      "comment": "gd on `extern struct GameState g_state;` offers the defining TU's instance (reverse closure: state.c includes state.h); the extern decl is kept, never pruned.",
-      "expect": {
-        "all": [
-          "state.c:3:18",
-          "state.h:4:25"
-        ],
-        "none": []
-      }
-    }
-  ]
+ "capability": "definition",
+ "rows": [
+  {
+   "id": "cpp-definition-call-to-free-function",
+   "difficulty": "simple",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "sample.cpp",
+   "line": 16,
+   "col": 12,
+   "expect": {
+    "all": [
+     "sample.cpp:13:5"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-chain-root-free-function-call",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "chainroot.cpp",
+   "line": 7,
+   "col": 19,
+   "expect": {
+    "all": [
+     "chainroot.cpp:3:10"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist-include-nav",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "inc_nav.cpp",
+   "line": 0,
+   "col": 10,
+   "expect": {
+    "all": [
+     "incdep.h"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-member-block-field-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "member_block.cpp",
+   "line": 8,
+   "col": 22,
+   "expect": {
+    "all": [
+     "member_block.cpp:3:32"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-member-block-base-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "member_block.cpp",
+   "line": 4,
+   "col": 14,
+   "expect": {
+    "all": [
+     "member_block.cpp:3:9"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-definition-cross-file-enum-variant",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-multilang-crossfile",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture/xenum",
+   "file": "use.c",
+   "line": 2,
+   "col": 16,
+   "expect": {
+    "all": [
+     "opcodes.h:3:5"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-definition-domain-typing-op-type-offers-enum",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_enum.c",
+   "line": 6,
+   "col": 14,
+   "expect": {
+    "all": [
+     "domain_enum.c:5:29",
+     "domain_enum.c:4:6"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-definition-domain-mixed-slot-real-decl-no-enum",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_mixed.c",
+   "line": 3,
+   "col": 11,
+   "expect": {
+    "all": [
+     "domain_mixed.c:2:19"
+    ],
+    "none": [
+     "domain_mixed.c:1:"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-definition-domain-owner-separation-enum-side",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_owner.c",
+   "line": 3,
+   "col": 38,
+   "expect": {
+    "all": [
+     "domain_owner.c:2:21",
+     "domain_owner.c:1:6"
+    ],
+    "none": [
+     "domain_owner.c:3:20"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-definition-domain-owner-separation-int-side",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_owner.c",
+   "line": 6,
+   "col": 37,
+   "expect": {
+    "all": [
+     "domain_owner.c:3:20"
+    ],
+    "none": [
+     "domain_owner.c:1:6",
+     "domain_owner.c:2:21"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-sym-typedef-use-to-def",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-symmetry",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "sympair/typedefpair.c",
+   "line": 1,
+   "col": 0,
+   "expect": {
+    "all": [
+     "typedefpair.c:1:24"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-sym-global-use-to-def",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-symmetry",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "sympair/globalpair.c",
+   "line": 1,
+   "col": 20,
+   "expect": {
+    "all": [
+     "globalpair.c:1:5"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-sym-type-use-to-def",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-symmetry",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "struct_refs.cpp",
+   "line": 1,
+   "col": 0,
+   "expect": {
+    "all": [
+     "struct_refs.cpp:1:8"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-sym-enum-variant-use-to-def",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-symmetry",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "xenum/use.c",
+   "line": 2,
+   "col": 16,
+   "expect": {
+    "all": [
+     "opcodes.h:3:5"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-definition-brace-init-member-through-declared-var",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-parse-repair",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "brace_init.cpp",
+   "line": 3,
+   "col": 11,
+   "expect": {
+    "all": [
+     "brace_init.cpp:1:20"
+    ],
+    "none": []
+   }
+  },
+  {
+   "id": "cpp-definition-member-after-same-line-macro-splice",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-parse-repair",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "splice_member.c",
+   "line": 5,
+   "col": 9,
+   "expect": {
+    "all": [
+     "splice_member.c:3:21"
+    ],
+    "none": []
+   }
+  },
+  {
+   "id": "cpp-template-struct-gd-from-trailing-return-cross-file",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_sep.cpp",
+   "line": 2,
+   "col": 28,
+   "expect": {
+    "all": [
+     "tmpl_sep.h:3:33"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_instance.cpp",
+   "status": "gold",
+   "id": "cpp-template-instance-member-goto-def",
+   "line": 29,
+   "col": 6,
+   "expect": {
+    "all": [
+     "tmpl_instance.cpp:15:9"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_instance.cpp",
+   "status": "gold",
+   "id": "cpp-template-instance-param-typed-member-goto-def",
+   "line": 30,
+   "col": 6,
+   "expect": {
+    "all": [
+     "tmpl_instance.cpp:14:7"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_instance.cpp",
+   "status": "gold",
+   "id": "cpp-typedef-chase-to-instance-member-goto-def",
+   "line": 32,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_instance.cpp:15:9"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_instance.cpp",
+   "status": "gold",
+   "id": "cpp-instance-spec-exact-spelling-wins-goto-def",
+   "line": 35,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_instance.cpp:25:10"
+    ],
+    "none": [
+     "tmpl_instance.cpp:22"
+    ]
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_instance.cpp",
+   "status": "gold",
+   "id": "cpp-instance-no-spec-falls-to-primary-goto-def",
+   "line": 36,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_instance.cpp:22:10"
+    ],
+    "none": [
+     "tmpl_instance.cpp:25"
+    ]
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-typing-chain-gd-through-substituted-return",
+   "line": 32,
+   "col": 13,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:7:10"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-typing-chain-gd-through-param-field",
+   "line": 33,
+   "col": 14,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:7:10"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-partial-spec-member-gd",
+   "line": 36,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:22:7"
+    ],
+    "none": [
+     "tmpl_typing.cpp:19"
+    ]
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-chain-gd-through-partial-spec-binding",
+   "line": 36,
+   "col": 15,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:7:10"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-family-gd-ranked-spec-first-primary-kept",
+   "line": 37,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:23:9",
+     "tmpl_typing.cpp:19:9"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-exact-spec-beats-partial-gd",
+   "line": 39,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:26:9"
+    ],
+    "none": [
+     "tmpl_typing.cpp:23",
+     "tmpl_typing.cpp:19"
+    ]
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-no-spec-match-falls-to-primary-gd",
+   "line": 41,
+   "col": 7,
+   "expect": {
+    "all": [
+     "tmpl_typing.cpp:19:9"
+    ],
+    "none": [
+     "tmpl_typing.cpp:23",
+     "tmpl_typing.cpp:26"
+    ]
+   }
+  },
+  {
+   "id": "cpp-hitlist2-fnptr-typedef-gd-dark",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` \u2014 a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use \u2014 verbs disagree on one symbol).",
+   "file": "fnptr_typedef.cpp",
+   "line": 1,
+   "col": 0,
+   "expect": {
+    "all": [
+     "fnptr_typedef.cpp:1:17"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist2-nested-union-cross-file-gd-dark",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist2",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture/nestunion",
+   "comment": "hitlist-2 #16: `union U { struct { int ping; } data; }` in a header, accessed cross-file as `u->data.ping`. gd on `ping` at the use site can't reach the field decl (the anonymous-struct-in-union DX covers the defining file's own outline/completion, per union_nest.c, but not cross-file access).",
+   "file": "use.c",
+   "line": 2,
+   "col": 12,
+   "expect": {
+    "all": [
+     "msg.h:3:13"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist2-spec-ladder-type-gd",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist2-identity-precision",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typegd.cpp",
+   "line": 6,
+   "col": 14,
+   "comment": "Type-REFERENCE gd consults the specificity ladder: the base-clause fmtr<int> offers the exact spec (ranked first) AND the primary (kept, never pruned) \u2014 the chrono.h:1904 -> 2101 shape.",
+   "expect": {
+    "all": [
+     "tmpl_typegd.cpp:4:20",
+     "tmpl_typegd.cpp:1:30"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist2-qualified-enum-constant-gd",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist2-namespace",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "nsenum/use.cc",
+   "line": 2,
+   "col": 24,
+   "comment": "ns::EnumClass::kValue gd: the constant resolves through its owning class (the qualifier segment), not the file-scope by-name tail \u2014 the abseil status.cc:223 shape.",
+   "expect": {
+    "all": [
+     "codes.h:5:3"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist2-namespace-middle-segment-gd",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist2-namespace",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "nsenum/use.cc",
+   "line": 2,
+   "col": 18,
+   "comment": "gd on the MIDDLE segment (the enum-class name inside ns::Code::kBad) resolves to the enum def via the bare-word fallback.",
+   "expect": {
+    "all": [
+     "codes.h:4:12"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist2-qualified-call-gd-alpha",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2-namespace",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "nsqual.cpp",
+   "line": 6,
+   "col": 32,
+   "comment": "gd from a qualified call lands on the SAME-namespace overload, not the sibling namespace's.",
+   "expect": {
+    "all": [
+     "nsqual.cpp:2:5"
+    ],
+    "none": [
+     "nsqual.cpp:5:5"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist2-qualified-call-gd-beta",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2-namespace",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "nsqual.cpp",
+   "line": 6,
+   "col": 47,
+   "comment": "\u2026and the sibling namespace's call lands on ITS def \u2014 the pair proves qualifier-keyed selection.",
+   "expect": {
+    "all": [
+     "nsqual.cpp:5:5"
+    ],
+    "none": [
+     "nsqual.cpp:2:5"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2-decl-def",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "id": "cpp-hitlist2-static-forward-decl-offers-body",
+   "file": "fwddef/state.c",
+   "line": 1,
+   "col": 11,
+   "comment": "gd on a static forward decl offers the bodied definition (ranked first) with the decl kept \u2014 hitlist-2 #15.",
+   "expect": {
+    "all": [
+     "state.c:8:12",
+     "state.c:2:12"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2-decl-def",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "id": "cpp-hitlist2-call-through-forward-decl-offers-body",
+   "file": "fwddef/state.c",
+   "line": 4,
+   "col": 21,
+   "comment": "gd from a call that resolves to the forward decl offers the body too.",
+   "expect": {
+    "all": [
+     "state.c:8:12",
+     "state.c:2:12"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2-decl-def",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "id": "cpp-hitlist2-extern-decl-offers-defining-tu",
+   "file": "fwddef/state.h",
+   "line": 3,
+   "col": 24,
+   "comment": "gd on `extern struct GameState g_state;` offers the defining TU's instance (reverse closure: state.c includes state.h); the extern decl is kept, never pruned.",
+   "expect": {
+    "all": [
+     "state.c:3:18",
+     "state.h:4:25"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-ctxparam-macro",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "xfail",
+   "file": "ctxparam/ctxparam.c",
+   "id": "cpp-xfail-ctxparam-member-gd-control",
+   "line": 6,
+   "col": 11,
+   "comment": "gd on rcpv->refcount inside a fn whose param list uses a single-level config-superposed context macro (pCTX_). Fails only when the header ALSO defines the nested pTHX-style chain \u2014 the nested defs degrade member resolution TU-wide (real-world: every Perl_* fn in perl5 op.c).",
+   "expect": {
+    "all": [
+     "ctxparam/ctx.h:29:"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-ctxparam-macro",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "xfail",
+   "file": "ctxparam/ctxparam.c",
+   "id": "cpp-xfail-ctxparam-member-gd-nested",
+   "line": 14,
+   "col": 11,
+   "comment": "gd on rcpv->refcount inside Perl_rcpv_copy(pTHX_ char *pv) \u2014 the perl5 shape: 3-deep nested param macro chain ending in an attribute macro. refcount lives on struct rcpv via typedef RCPV.",
+   "expect": {
+    "all": [
+     "ctxparam/ctx.h:29:"
+    ],
+    "none": []
+   }
+  }
+ ]
 }
