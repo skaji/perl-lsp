@@ -46,6 +46,17 @@ why parked, what unblocks it. Prune on landing.
   directed at the next round-close sweep. Trigger conditions are narrow
   (unresolved Variable ref + class-scoped + name-matching Field), so
   exposure is low today.
+- **Ctor-convention heuristic misfires on uppercase macro/function-style
+  calls** (`RCPVx(pv)` mints `ClassName("RCPVx")` as a flow witness —
+  root seed of the hitlist-3 #1 bug). The annotation-priority fix shields
+  ANNOTATED receivers; an `auto`/annotation-less local initialized from
+  an uppercase call still mistypes. Wants the heuristic gated on "callee
+  resolves to a known type/ctor", not name case alone.
+- **`primary_package_parents` `len()==1` single-entry fallback** resolves
+  by luck (proven fragile in the hitlist-3 #1 bisection — stops firing
+  when a file holds a second parents-bearing decl). Wants examination:
+  either justify with a recorded verdict or replace with exact-name
+  resolution.
 - **Call-root chain arm hardcodes `arity_hint = Some(0)`**
   (`file_analysis.rs::expr_type_at_span`): wrong hint for a multi-arg call
   root on an arity-discriminated callee. Harmless while cpp overloads are

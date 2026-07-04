@@ -31,7 +31,7 @@ op.c:16170 (`rcpv->refcount` → cop.h:574) and a second pTHX_ function
 (`o->op_type` in Perl_op_free). NOTE: the op.c CLI queries need one warm-up
 query first — the cold-start flake (finding #2) still poisons the first hit.
 
-## 1. Context-param macro chains break member resolution (perl5 pTHX_)
+### Original dossier (pre-resolution, kept for the probe trail)
 
 **Report (veesh):** op.c:16170 `rcpv->refcount++` has no gd — expected the
 field on `struct rcpv` (cop.h:574, via `typedef struct rcpv RCPV`,
