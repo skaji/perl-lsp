@@ -352,7 +352,10 @@ fn resolve_node_type(
             let method_name = method.utf8_text(src.as_bytes()).ok()?;
             return analysis.member_value_type(&recv_ty, method_name, module_index, None);
         }
-        return None;
+        // A plain call (`make_widget()`, a ctor-on-temporary `Box()`) —
+        // `function` isn't member-shaped, so there's no receiver to recurse
+        // onto. Falls through to the exact-span lookup below, which chases
+        // the call's own return through the bag's call-root arm.
     }
     // Transparent wrappers — `(expr)`, `*p`, `&obj` — denote the same class
     // as their operand (pointer-/reference-ness dropped). Peel and recurse so

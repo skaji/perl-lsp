@@ -153,6 +153,14 @@ pub struct SkeletonAnalysis {
     /// return witness, and each call site an `Expr → Edge(Symbol)` so the call
     /// reflects the body's type. `docs/adr/macro-handling.md`.
     pub macro_returns: Vec<(String, MacroReturnHint)>,
+    /// `return EXPR;` sites (`@expr.return.value`): (enclosing scope, the
+    /// returned expression's span). Joined in `into_file_analysis` to the
+    /// nearest enclosing Sub/Method symbol (by walking the scope-parent
+    /// chain to the owning body scope); a function with no declared return
+    /// gets one `Symbol(sid) → Edge(SymbolReturnArm(sid))` chain per site,
+    /// mirroring `Builder::publish_return_arm_witnesses` — cpp's implicit-
+    /// return fuel for `auto`-deduced returns.
+    pub return_sites: Vec<(crate::file_analysis::ScopeId, Span)>,
 }
 
 /// What a function-like macro's return resolves to (`SkeletonAnalysis::
@@ -547,6 +555,61 @@ impl SkeletonAnalysis {
             crate::file_analysis::ScopeId,
             Option<crate::file_analysis::ScopeId>,
         > = self.scopes.iter().map(|s| (s.id, s.parent)).collect();
+        // `auto`-return inference: cpp's implicit-return fuel, mirroring
+        // Perl's `Symbol(sid) → Edge(SymbolReturnArm(sid))` return-arm chain
+        // (`Builder::publish_return_arm_witnesses`). A declared return needs
+        // no fixpoint (the writeback above already typed it from the
+        // syntax); this covers the `auto`/undeducible case, where the ONLY
+        // fuel is the body's `return` statements. `scope_to_symbol` joins a
+        // Sub/Method's body scope (`@scope.sub`, minted on the SAME
+        // `function_definition` node as `@def.sub`/`@def.method` — same
+        // span, different query pattern, so span equality is the join key)
+        // back to the owning Symbol.
+        {
+            use crate::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
+            let scope_to_symbol: std::collections::HashMap<
+                crate::file_analysis::ScopeId,
+                SymbolId,
+            > = self
+                .scopes
+                .iter()
+                .filter(|s| matches!(s.kind, crate::file_analysis::ScopeKind::Sub { .. }))
+                .filter_map(|s| {
+                    symbols
+                        .iter()
+                        .find(|sym| {
+                            matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                                && sym.span == s.span
+                        })
+                        .map(|sym| (s.id, sym.id))
+                })
+                .collect();
+            for (ret_scope, ret_span) in &self.return_sites {
+                let owner = std::iter::successors(Some(*ret_scope), |sc| {
+                    scope_parent.get(sc).copied().flatten()
+                })
+                .find_map(|sc| scope_to_symbol.get(&sc).copied());
+                let Some(sid) = owner else { continue };
+                // Only the undeclared-return case: a declared return (incl.
+                // trailing `auto f() -> T`) already carries its own writeback
+                // witness above — this chain must not compete with it.
+                if self.symbols[sid.0 as usize].return_type.is_some() {
+                    continue;
+                }
+                bag.push(Witness {
+                    attachment: WA::SymbolReturnArm(sid),
+                    source: WitnessSource::Builder("cpp_return_arm".into()),
+                    payload: WP::Edge(WA::Expr(*ret_span)),
+                    span: *ret_span,
+                });
+                bag.push(Witness {
+                    attachment: WA::Symbol(sid),
+                    source: WitnessSource::Builder("cpp_return_arm_chain".into()),
+                    payload: WP::Edge(WA::SymbolReturnArm(sid)),
+                    span: *ret_span,
+                });
+            }
+        }
         let mut local_refs: Vec<crate::file_analysis::Ref> = Vec::new();
         // Reads that found no LOCAL decl — a Variable ref is still minted for
         // each (below, once call/member spans are known) so query-time
@@ -588,6 +651,43 @@ impl SkeletonAnalysis {
                     folded_from: None,
                 }),
                 None => unresolved_reads.push((name.clone(), *read_scope, *read_span)),
+            }
+        }
+        // A bare identifier that resolves to no local var, inside a method
+        // whose enclosing scope carries the owning class (`Scope.package`,
+        // baked at scope-creation and inherited through nested blocks), and
+        // that names one of THAT class's own fields, is an implicit
+        // `this->field` read (`return inner_;` with no explicit receiver).
+        // Mint the same `Expr(span) → Edge(Variable{field, field's own
+        // scope})` edge the field's declared-type witness already resolves
+        // through, so the read types through the general chase — the fix is
+        // general-purpose (any bare field read), not gated on return
+        // position (rule #10).
+        {
+            use crate::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
+            let scope_package: std::collections::HashMap<
+                crate::file_analysis::ScopeId,
+                Option<String>,
+            > = self.scopes.iter().map(|s| (s.id, s.package.clone())).collect();
+            let field_scope: std::collections::HashMap<
+                (String, String),
+                crate::file_analysis::ScopeId,
+            > = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, SymKind::Field))
+                .filter_map(|s| s.package.clone().map(|p| ((p, s.name.clone()), s.scope)))
+                .collect();
+            for (name, read_scope, read_span) in &unresolved_reads {
+                let Some(Some(class)) = scope_package.get(read_scope) else { continue };
+                let Some(&fscope) = field_scope.get(&(class.clone(), name.clone())) else {
+                    continue;
+                };
+                bag.push(Witness {
+                    attachment: WA::Expr(*read_span),
+                    source: WitnessSource::Builder("cpp_implicit_field_read".into()),
+                    payload: WP::Edge(WA::Variable { name: name.clone(), scope: fscope }),
+                    span: *read_span,
+                });
             }
         }
         // `goto LABEL` → the `LABEL:` def, function-wide: first matching
@@ -2013,6 +2113,15 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     ),
                     span,
                 });
+            }
+            "expr.return.value" => {
+                // The returned expression's own general-rule witness (literal
+                // / var-read / member / call — whichever matched this same
+                // node) already carries its type; this just records the site
+                // (scope + span) so `into_file_analysis` can chain the
+                // enclosing function's `Symbol` onto it when undeclared.
+                out.return_sites
+                    .push((cur_scope, Span { start: e.start, end: e.end }));
             }
             "flow.target" => {
                 flow_targets.insert(

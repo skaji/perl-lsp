@@ -760,6 +760,7 @@ fn remap_spans(
         specializations: _,
         // name-keyed, ordered by byte position pre-remap — no spans to fix.
         template_params: _,
+        return_sites,
     } = skel;
 
     for s in symbols.iter_mut() {
@@ -803,6 +804,9 @@ fn remap_spans(
         }
     }
     for (_, _, span) in var_reads.iter_mut() {
+        *span = rspan(*span);
+    }
+    for (_, span) in return_sites.iter_mut() {
         *span = rspan(*span);
     }
     for sc in scopes.iter_mut() {

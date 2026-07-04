@@ -207,13 +207,12 @@ Cross-file macro resolution landed (include-closure gather + expansion +
 the structural strip/salvage lanes), so the original "namespace-wrapping
 macro from another header" class mostly resolves: a wrapping macro whose
 defining header is in the include closure expands, and macro-guarded
-namespace reopenings attribute. Three xfail rows remain open:
+namespace reopenings attribute. Two xfail rows remain open:
 
 | row | residual shape |
 |---|---|
 | `cpp-xfail-cross-file-namespace-macro` | the UNRESOLVABLE wrapping macro: no `#include` reaches a definition (generated/out-of-tree header) and the token sits in statement position before `class` — the structural strip covers the before-`namespace` and before-constructor positions, not this one, so `class Logger` is still lost and `info` leaks as a free Sub |
 | `cpp-hitlist-marker-macro-outline` | a bodyless marker `#define` (`FMT_HEADER_ONLY`) still appears as an outline Variable; the class after it extracts fine — pure outline noise |
-| `cpp-xfail-auto-deduced-return` | `auto`-deduced return types don't type the call's receiver (needs return-expression deduction) |
 
 ### hitlist-2 fix-run residuals (dogfood round 2, slices A–E landed)
 
