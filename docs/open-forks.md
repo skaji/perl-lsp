@@ -58,3 +58,34 @@ Format per entry:
   ever lands for other reasons.
 - **Discussion needed:** none urgent; fold into B if/when a language tag
   exists.
+
+## `Slot::ModulePath`'s `in_use` field — 2026-07-05 — OPEN
+- **Context:** cursor Slot taxonomy (`docs/adr/cursor-slots.md`), migrating
+  completion's context match onto `Slot`. The ADR sketches `ModulePath {
+  prefix: String }` covering BOTH `use |` (typing the module name —
+  `complete_module_names`, loadable-module labels) and `Foo::|` (an
+  in-file qualified-path drill — `qualified_path_completions`, sub +
+  sub-package labels). The two behaviors are genuinely different renders
+  over the same CandidateSet (full module name vs. bare suffix), and
+  `prefix`'s text alone can't distinguish them — `Mojo::Ut` is a valid
+  partial spelling under either. Folding them into one slot with only
+  `prefix` and picking ONE render would silently change completion output
+  for whichever case lost, breaking the migration's byte-identical
+  requirement.
+- **Options:** A — add `in_use: bool` to `ModulePath`, set at detection
+  time from which `CursorContext` arm fired (`UseStatement` vs
+  `QualifiedPath`); the consumer's `if in_use {..} else {..}` exactly
+  reconstructs today's two code paths. B — split into two Slot variants
+  (`ModulePath` for the drill, a new `UseModule` for the bare `use` case),
+  matching the ADR's 7-variant count more loosely.
+- **Picked:** A. Keeps the ADR's closed 7-variant vocabulary intact (the
+  field is additive, not a new variant), stays a straight decode of which
+  detector fired — no shape re-derivation from tree/text — and the two
+  render functions (`complete_module_names` / `qualified_path_completions`)
+  are untouched, called exactly as before.
+- **Undo cost:** trivial — drop the field and hardcode one render, or
+  promote to option B (split variant) if a future consumer wants to
+  match on it structurally instead of a bool.
+- **Discussion needed:** none urgent; the field is documented at its
+  definition (`src/cursor_slot.rs`) and locked by
+  `cursor_slot_tests.rs::detect_slot_perl_use_module_name_is_module_path`.

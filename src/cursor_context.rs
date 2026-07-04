@@ -45,7 +45,9 @@ pub enum CursorContext {
 
 /// Context about a function/method call enclosing the cursor.
 /// Everything computed from the tree so callers need zero tree access.
-#[derive(Debug)]
+/// `Clone` so it rides `Slot::ArgPosition` (`cursor_slot.rs`) as `CalleeCtx`
+/// without forcing every consumer to hold the original borrow.
+#[derive(Debug, Clone)]
 pub struct CallContext {
     /// Name of the function or method being called.
     pub name: String,
