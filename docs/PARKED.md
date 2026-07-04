@@ -36,6 +36,17 @@ why parked, what unblocks it. Prune on landing.
   model (`docs/adr/field-projections.md`).
 - **Type-constrained completion** at domain slots (`op_type == |` → `OP_*`)
   — needs cursor-context work (couples to the slot-taxonomy item above).
+- **cpp `auto`-return inference** — cpp function bodies don't push
+  implicit-return witnesses, so `auto` returns type as nothing and kill
+  chains/completion mid-hop (the `autoret` xfail). Fix shape: wire cpp
+  bodies into the same `Symbol → Edge(Expr(last_return))` machinery Perl
+  uses (the expansion-flip already did this for macro bodies). Probed
+  2026-07-03: declared-return chains are Perl-level; this is the
+  inference-fuel gap.
+- **Free-function chain roots** — `make_widget().next()` is dark: the
+  pack member-chain lane only recognizes variable receivers, not a
+  call-expression root. Small fix (a call-root arm reading the call-ref's
+  declared return). Probed 2026-07-03.
 - **Overload arity ranking** (hitlist-2 #3) — needs extraction-minted
   arg/param counts first; evaluated in slice A, not taken.
 - **Template rungs**: dependent types (`T::value_type`), value-arg
