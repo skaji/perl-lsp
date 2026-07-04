@@ -18,7 +18,7 @@ Format per entry:
 
 ---
 
-## Hover presentation payload — 2026-07-03 — OPEN
+## Hover presentation payload — 2026-07-03 — RATIFIED (veesh, 2026-07-03)
 - **Context:** hitlist-2 slice D (#14): hover became a CandidateSet
   projection (`hover_candidate()` = the top-ranked `definitions()`
   candidate; `symbols::pack_hover_markdown` presents it).
@@ -39,7 +39,7 @@ Format per entry:
 - **Discussion needed:** if a second presentation consumer appears (e.g.
   CLI gd wanting signatures beside locations), promote to B then.
 
-## Function-lane def_paths minted at the set, not identity minting — 2026-07-03 — OPEN
+## Function-lane def_paths minted at the set, not identity minting — 2026-07-03 — RATIFIED (veesh, 2026-07-03)
 - **Context:** slice D3 re-activated the def-candidates visibility gate for
   plain function (Sub) targets. Every other def_paths mint sits in
   `resolve_symbol_scoped` behind a structural pack-only fact (macro_defs,
