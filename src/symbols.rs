@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use tower_lsp::lsp_types::*;
 use tree_sitter::{Point, Tree};
 
-use crate::cursor_context::{self, CursorContext};
+use crate::cursor_context;
+use crate::cursor_slot::Slot;
 use crate::file_analysis::{
     format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
     HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
@@ -566,11 +567,13 @@ fn completion_items_native(
         crate::resolve::OverrideScope::default(),
     );
 
-    // Try tree-based detection first for expression-based contexts
-    let ctx = cursor_context::detect_cursor_context_tree_with_index(
-        tree, source.as_bytes(), point, analysis, Some(module_index),
-    )
-        .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point, Some(analysis)));
+    // The slot verdict (`docs/adr/cursor-slots.md`) — Perl's detector
+    // wraps `cursor_context`'s tree-then-text chain unchanged.
+    let slot = crate::cursor_slot::detect_slot(
+        analysis, tree, source, point, "perl", Some(module_index));
+    // Bare-sigil trigger (`$|`/`@|`/`%|`) decoded once so the match below
+    // doesn't need a second borrow of `slot` inside its own arm.
+    let sigil_trigger = slot.sigil();
 
     // Mid-string completion for plugin-emitted MethodCallRefs. When the
     // cursor sits inside the span of a MethodCallRef emitted by a plugin
@@ -657,7 +660,7 @@ fn completion_items_native(
                 }
                 suppress_firehose = true;
             } else if call_ctx.active_param > 0 && has_any_handlers
-                && !matches!(ctx, CursorContext::HashKey { .. })
+                && !matches!(slot, Slot::Key { .. })
             {
                 // Past arg-0 in a known dispatcher: the only sensible
                 // completion is variables-in-scope (candidates for
@@ -680,10 +683,9 @@ fn completion_items_native(
         }
     }
 
-    candidates.extend::<Vec<CompletionCandidate>>(match ctx {
-        CursorContext::Variable { sigil } => analysis.complete_variables(point, sigil),
-        CursorContext::Method { ref invocant_type, ref invocant_text } => {
-            if let Some(ref ty) = invocant_type {
+    candidates.extend::<Vec<CompletionCandidate>>(match slot {
+        Slot::Member { ref receiver, .. } => {
+            if let Some(ref ty) = receiver.receiver_type {
                 // `class_name_lenient` peels `Optional<Foo>` to `Foo` so an
                 // unguarded optional receiver still offers its methods — the
                 // same lenient receiver projection goto/hover/refs now use.
@@ -694,20 +696,21 @@ fn completion_items_native(
                     Vec::new()
                 }
             } else {
+                let invocant_text = receiver.receiver_text.as_deref().unwrap_or("");
                 analysis.complete_methods(invocant_text, point, Some(module_index))
             }
         }
-        CursorContext::HashKey { ref owner_type, ref var_text, ref source_sub } => {
+        Slot::Key { ref owner } => {
             // Keys already written in the enclosing hash literal —
             // they shouldn't re-appear in the suggestions. Scoped to
             // the hash_expression directly so unrelated nearby calls
             // don't interfere. Works for both class-typed hashes and
             // sub-owned ones.
             let used = cursor_context::used_keys_in_enclosing_hash(tree, source.as_bytes(), point);
-            let class_name = owner_type.as_ref().and_then(|t| t.class_name());
+            let class_name = owner.owner_type.as_ref().and_then(|t| t.class_name());
             let candidates = if let Some(cn) = class_name {
                 analysis.complete_hash_keys_for_class(cn, point, Some(module_index))
-            } else if let Some(ref sub_name) = source_sub {
+            } else if let Some(ref sub_name) = owner.source_sub {
                 // Routes to HashKeyOwner::Sub { name } — catches both
                 // plugin-emitted HashKeyDefs (minion enqueue options)
                 // AND body-derived keys from `$opts->{...}` accesses
@@ -716,34 +719,36 @@ fn completion_items_native(
                 // literals at a call-arg position returned nothing.
                 analysis.complete_hash_keys_for_sub(sub_name, point, Some(module_index))
             } else {
-                analysis.complete_hash_keys(var_text, point, Some(module_index))
+                analysis.complete_hash_keys(&owner.var_text, point, Some(module_index))
             };
             candidates.into_iter().filter(|c| !used.contains(&c.label)).collect()
         }
-        CursorContext::UseStatement { ref module_prefix, in_import_list, ref module_name } => {
-            if in_import_list {
-                if let Some(ref name) = module_name {
-                    return complete_import_list(name, module_index);
-                }
-            } else {
-                return complete_module_names(&cs, module_prefix);
+        Slot::Import { ref module } => {
+            if let Some(ref name) = module {
+                return complete_import_list(name, module_index);
             }
             Vec::new()
         }
-        CursorContext::QualifiedPath { ref package } => {
+        Slot::ModulePath { ref prefix, in_use } => {
+            if in_use {
+                return complete_module_names(&cs, prefix);
+            }
             // `Foo::Bar::<cursor>` — return subs declared in (or
             // inherited by) that package, qualified with the package
             // prefix so the client filter matches against what the
             // user typed. Suppress the global firehose; this branch
             // is the answer.
-            return qualified_path_completions(&cs, analysis, module_index, package);
+            return qualified_path_completions(&cs, analysis, module_index, prefix);
         }
-        CursorContext::General => {
+        Slot::Identifier { .. } if sigil_trigger.is_some() => {
+            analysis.complete_variables(point, sigil_trigger.expect("checked by guard"))
+        }
+        Slot::Identifier { .. } => {
             let mut items = Vec::new();
             // Keyval arg completions if inside a call at key position.
             // (Dispatch-target completions are handled above the match
-            // regardless of context, so they apply whether tree detection
-            // decides we're in Method, General, or anything else.)
+            // regardless of context, so they apply whether the slot
+            // resolves to Member, Identifier, or anything else.)
             if let Some(call_ctx) =
                 cursor_context::find_call_context(tree, source.as_bytes(), point)
             {
@@ -789,6 +794,10 @@ fn completion_items_native(
 
             items
         }
+        // Perl's slot detector never produces these — ArgPosition is
+        // `detect_call_slot`'s question (sig-help's), TypePosition has no
+        // Perl detector at all.
+        Slot::TypePosition { .. } | Slot::ArgPosition { .. } => Vec::new(),
     });
 
     let mut items: Vec<CompletionItem> = candidates
@@ -806,8 +815,8 @@ fn completion_items_native(
     }
 
     // Ref-type deref snippets when completing after ->
-    if let CursorContext::Method { ref invocant_type, .. } = ctx {
-        if let Some(ref ty) = invocant_type {
+    if let Slot::Member { ref receiver, .. } = slot {
+        if let Some(ref ty) = receiver.receiver_type {
             if !ty.is_object() {
                 items.extend(ref_type_snippet_completions(ty));
             }
@@ -2086,8 +2095,14 @@ pub fn signature_help(
         }
     }
 
-    // Step 1: cursor_context finds the enclosing call
-    let call_ctx = cursor_context::find_call_context(tree, text.as_bytes(), point)?;
+    // Step 1: the enclosing call's ArgPosition slot (`docs/adr/cursor-slots.md`)
+    // — only the VERDICT routes through `detect_slot`'s call-slot entry;
+    // sig-help's own machinery (below) is unchanged.
+    let Slot::ArgPosition { callee: Some(call_ctx), .. } =
+        crate::cursor_slot::detect_call_slot(tree, text.as_bytes(), point)?
+    else {
+        return None;
+    };
 
     // Step 1a: string-dispatch specialization. `$x->emit('ready', CURSOR)`
     // is a method call whose string arg routes to a registered handler;

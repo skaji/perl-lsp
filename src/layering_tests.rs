@@ -83,6 +83,9 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("backend", Lsp),
         ("symbols", Lsp),
         ("cursor_context", Lsp),
+        // one Slot vocabulary over cursor_context (Perl) + cursor_sentinel
+        // (pack); consumers switch on Slot, never on language
+        ("cursor_slot", Lsp),
         ("plugin_cli", Lsp),
         ("main", Lsp),
         ("layering_tests", Lsp),

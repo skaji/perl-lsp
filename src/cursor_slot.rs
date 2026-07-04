@@ -1,0 +1,249 @@
+//! The cursor Slot taxonomy — one vocabulary for "what kind of hole is the
+//! cursor in", per `docs/adr/cursor-slots.md`. Two detectors answer into
+//! it: Perl's wraps `cursor_context`'s tree/text detectors; the pack
+//! languages' wraps `cursor_sentinel`'s sentinel-reparse member access.
+//! Neither detector's internals change here — this module only
+//! re-expresses their existing outputs as `Slot` verdicts, so consumers
+//! (completion, sig-help) switch on `Slot`, never on language.
+//!
+//! `detect_slot` answers the identity question (Member / Key / Identifier
+//! / Import / ModulePath). It does NOT answer the arg-position question —
+//! `detect_call_slot` does, orthogonally: a receiver's Member slot and an
+//! enclosing call's ArgPosition can both hold at once (`foo($x->|)`), so
+//! folding them into one mutually-exclusive detector would change which
+//! candidates a nested-call cursor gets. Two questions, two entries, one
+//! `Slot` vocabulary.
+
+use tree_sitter::{Point, Tree};
+
+use crate::cursor_context::{self, CursorContext};
+use crate::file_analysis::{CrossFileLookup, FileAnalysis, InferredType, MemberOp, Span};
+
+/// A call/method context enclosing the cursor — Perl only; pack languages
+/// have no call/arg-position slot today (no sig-help for them). Alias of
+/// `cursor_context::CallContext`: already tree-free, so `Slot::ArgPosition`
+/// carries it directly rather than re-shaping the same fields twice.
+pub type CalleeCtx = cursor_context::CallContext;
+
+/// The receiver of a `Slot::Member` — its resolved type, source text when
+/// the detector captured one (Perl always does; the pack sentinel
+/// resolves a span, not text, so this is `None` there), and — pack
+/// languages only — the single-token `.`/`->` operator-swap fix a
+/// mismatched pointer depth wants. Perl's `->` is always correct, so
+/// `op_fix` is always `None` there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReceiverCtx {
+    pub receiver_type: Option<InferredType>,
+    pub receiver_text: Option<String>,
+    pub op_fix: Option<(Span, String)>,
+}
+
+/// The owner of a `Slot::Key` — `$h->{|`'s hash, resolved by type when
+/// known, else by the owning sub when the hash is a bare literal passed
+/// as a call argument (`foo($x, { | })`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnerCtx {
+    pub owner_type: Option<InferredType>,
+    pub var_text: String,
+    pub source_sub: Option<String>,
+}
+
+/// What kind of hole the cursor sits in (`docs/adr/cursor-slots.md`). Each
+/// variant declares its candidate question; the slot never enumerates
+/// names itself.
+#[derive(Debug)]
+pub enum Slot {
+    /// `obj.|` / `obj->|` / `$x->|` — members of the receiver. `op` is
+    /// metadata (which operator was written) — no migrated consumer
+    /// branches on it yet, same "seam, not yet consumed" status as
+    /// `expected_type`.
+    Member {
+        receiver: ReceiverCtx,
+        #[allow(dead_code)]
+        op: MemberOp,
+    },
+    /// `$h->{|` — keys of the owner.
+    Key { owner: OwnerCtx },
+    /// A bare identifier, including a bare sigil trigger (`$|`/`@|`/`%|`)
+    /// — the visible-universe projection (`CandidateSet::complete`).
+    /// `prefix` is exactly what's been typed since the last non-identifier
+    /// boundary; a lone sigil in `prefix` is Perl's variable-sigil trigger
+    /// (`Slot::sigil` decodes it — the fact is data on the slot, not a
+    /// shape a consumer re-derives from the tree).
+    Identifier { prefix: String },
+    /// `use Foo qw(|` — the named module's import surface.
+    Import { module: Option<String> },
+    /// `use |` (typing the module name) or `Foo::|` (a qualified-path
+    /// drill) — loadable modules and/or sub-packages. `in_use`
+    /// distinguishes the two behaviors this prefix-shaped slot folds
+    /// together (see `docs/open-forks.md`'s "ModulePath in_use" entry).
+    ModulePath { prefix: String, in_use: bool },
+    /// A type is expected here. No current detector populates this —
+    /// reserved for pack languages' declaration positions.
+    #[allow(dead_code)]
+    TypePosition { prefix: String },
+    /// `f(a, |)` and `x == |` — sig-help today; the type-constrained-
+    /// completion seam (`expected_type`) tomorrow.
+    ArgPosition { callee: Option<CalleeCtx>, index: usize },
+}
+
+impl Slot {
+    /// Decode a bare sigil trigger (`$|`/`@|`/`%|`, nothing else typed)
+    /// out of an `Identifier` slot. `None` for every other slot, and for
+    /// an `Identifier` whose prefix is empty, a real word, or longer than
+    /// one char — i.e. `None` means "run the general identifier path",
+    /// matching `cursor_context::CursorContext::General`'s old fallthrough.
+    pub fn sigil(&self) -> Option<char> {
+        let Slot::Identifier { prefix } = self else { return None };
+        let mut chars = prefix.chars();
+        let c = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        matches!(c, '$' | '@' | '%').then_some(c)
+    }
+
+    /// The type expected at this slot, when derivable — the seam for
+    /// type-constrained completion (`docs/adr/cursor-slots.md`). Consumed
+    /// by nothing yet: `ArgPosition` resolves a LOCAL callee's param type
+    /// at `index` via the same witness-bag path signature-help's own
+    /// param-type rendering uses (`inferred_type_via_bag` at the sub
+    /// body's end); a cross-file callee (whose param types are display
+    /// tags, not `InferredType`s) and every other slot answer `None`.
+    /// Consumed by nothing today (the parked type-constrained-completion
+    /// slice plugs in here); locked by `cursor_slot_tests.rs`, not a call
+    /// site.
+    #[allow(dead_code)]
+    pub fn expected_type(
+        &self,
+        analysis: &FileAnalysis,
+        point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
+        let Slot::ArgPosition { callee: Some(c), index } = self else { return None };
+        let sig = analysis.signature_for_call(
+            &c.name, c.is_method, c.invocant.as_deref(), point, module_index,
+        )?;
+        if sig.param_types.is_some() {
+            return None; // cross-file: pre-resolved as display tags, not InferredType
+        }
+        let param = sig.params.get(*index)?;
+        if param.is_invocant || crate::conventions::is_conventional_invocant_name(&param.name) {
+            return None;
+        }
+        analysis.inferred_type_via_bag(&param.name, sig.body_end)
+    }
+}
+
+/// The one identity-question entry (`docs/adr/cursor-slots.md`): Perl
+/// wraps `cursor_context`'s tree-then-text detector chain unchanged; pack
+/// languages wrap `cursor_sentinel`'s member-access sentinel reparse
+/// (looking up the language's driver/parser/`LangPack` itself — the same
+/// lookup `backend::pack_completion` used to do inline). Falls back to a
+/// bare `Identifier` slot when a pack language isn't registered or has no
+/// `LangPack` (mirrors the prior fallthrough to bare-identifier
+/// completion exactly).
+pub fn detect_slot(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    point: Point,
+    language: &str,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Slot {
+    if language == "perl" {
+        return detect_slot_perl(analysis, tree, source, point, module_index);
+    }
+    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
+    let Some(driver) = reg.for_id(language) else {
+        return Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() };
+    };
+    let Some(lang_pack) = driver.lang_pack() else {
+        return Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() };
+    };
+    let mut parser = driver.make_parser();
+    if let Some(ctx) = crate::cursor_sentinel::member_completion_ctx_incremental(
+        &mut parser, &lang_pack, source, tree, cursor, analysis, module_index,
+    ) {
+        return Slot::Member {
+            receiver: ReceiverCtx {
+                receiver_type: ctx.receiver_type,
+                receiver_text: None,
+                op_fix: ctx.op_fix,
+            },
+            op: ctx.op,
+        };
+    }
+    Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() }
+}
+
+fn detect_slot_perl(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    point: Point,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Slot {
+    let ctx = cursor_context::detect_cursor_context_tree_with_index(
+        tree, source.as_bytes(), point, analysis, module_index,
+    )
+    .unwrap_or_else(|| cursor_context::detect_cursor_context(source, point, Some(analysis)));
+    slot_from_cursor_context(ctx)
+}
+
+fn slot_from_cursor_context(ctx: CursorContext) -> Slot {
+    match ctx {
+        CursorContext::Variable { sigil } => Slot::Identifier { prefix: sigil.to_string() },
+        CursorContext::Method { invocant_type, invocant_text } => Slot::Member {
+            receiver: ReceiverCtx {
+                receiver_type: invocant_type,
+                receiver_text: Some(invocant_text),
+                op_fix: None,
+            },
+            op: MemberOp::Arrow, // Perl method dispatch is always `->`
+        },
+        CursorContext::HashKey { owner_type, var_text, source_sub } => {
+            Slot::Key { owner: OwnerCtx { owner_type, var_text, source_sub } }
+        }
+        CursorContext::UseStatement { module_prefix, in_import_list, module_name } => {
+            if in_import_list {
+                Slot::Import { module: module_name }
+            } else {
+                Slot::ModulePath { prefix: module_prefix, in_use: true }
+            }
+        }
+        CursorContext::QualifiedPath { package } => {
+            Slot::ModulePath { prefix: package, in_use: false }
+        }
+        CursorContext::General => Slot::Identifier { prefix: String::new() },
+    }
+}
+
+/// The enclosing call's arg-position slot, when the cursor sits inside
+/// one. Orthogonal to `detect_slot` (see the module doc) — sig-help's
+/// entire question is this slot; wraps `cursor_context::find_call_context`
+/// unchanged.
+pub fn detect_call_slot(tree: &Tree, source: &[u8], point: Point) -> Option<Slot> {
+    let call_ctx = cursor_context::find_call_context(tree, source, point)?;
+    let index = call_ctx.active_param;
+    Some(Slot::ArgPosition { callee: Some(call_ctx), index })
+}
+
+/// The identifier chars immediately before the byte cursor — the typed
+/// prefix bare-identifier / cross-file gathering filters on server-side.
+/// Moved here from `backend.rs` so both `detect_slot`'s pack fallback and
+/// the macro/closure completion sources share one implementation.
+pub(crate) fn identifier_prefix(source: &str, cursor: usize) -> &str {
+    let bytes = source.as_bytes();
+    let cursor = cursor.min(bytes.len());
+    let mut start = cursor;
+    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        start -= 1;
+    }
+    &source[start..cursor]
+}
+
+#[cfg(test)]
+#[path = "cursor_slot_tests.rs"]
+mod tests;

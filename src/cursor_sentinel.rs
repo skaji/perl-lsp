@@ -251,6 +251,10 @@ pub fn receiver_at_incremental(
 pub struct MemberCompletionCtx {
     pub receiver_type: Option<InferredType>,
     pub op_fix: Option<(Span, String)>,
+    /// The operator actually typed (`.` vs `->`), regardless of whether
+    /// `op_fix` corrects it. `Slot::Member.op`'s pack-side answer
+    /// (`docs/adr/cursor-slots.md`).
+    pub op: crate::file_analysis::MemberOp,
 }
 
 pub fn member_completion_ctx_incremental(
@@ -286,7 +290,17 @@ pub fn member_completion_ctx_incremental(
     let receiver_type = resolve_node_type(receiver, cfg, &patched, analysis, module_index)
         .map(|t| analysis.refine_instance_dispatch(t, module_index));
     let op_fix = operator_fix(member, receiver, &patched, analysis, cfg);
-    Some(MemberCompletionCtx { receiver_type, op_fix })
+    let op = typed_member_op(member, &patched);
+    Some(MemberCompletionCtx { receiver_type, op_fix, op })
+}
+
+/// The operator token actually written at a member access — `.` unless
+/// the anonymous child between the two named children spells `->`.
+fn typed_member_op(member: Node, patched: &str) -> crate::file_analysis::MemberOp {
+    match operator_token(member, patched).and_then(|t| t.utf8_text(patched.as_bytes()).ok()) {
+        Some("->") => crate::file_analysis::MemberOp::Arrow,
+        _ => crate::file_analysis::MemberOp::Dot,
+    }
 }
 
 /// The operator correction for a member access whose receiver is a simple

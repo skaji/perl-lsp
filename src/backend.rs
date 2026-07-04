@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::lsp_types::{notification, request};
 use tower_lsp::{Client, LanguageServer};
 
+use crate::cursor_slot::identifier_prefix;
 use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
 use crate::symbols;
@@ -31,40 +32,34 @@ pub fn pack_completion(
     path: Option<&std::path::Path>,
     module_index: &ModuleIndex,
 ) -> (Vec<CompletionItem>, bool) {
-    if let Some(driver) =
-        crate::language_driver::LanguageRegistry::with_enabled().for_id(language)
-    {
-        // ONE lookup: the driver carries the LangPack (the cursor path's
-        // config), `None` for native Perl. No parallel `lang_cfg` registry.
-        if let Some(lang_pack) = driver.lang_pack() {
-            // Cross-file resolves against THIS language's sub-index (its
-            // own cache — no cross-language overlap), falling back to the
-            // hub when none is attached.
-            let pack = module_index.pack_index(language);
-            let base_idx: &dyn crate::file_analysis::CrossFileLookup =
-                pack.as_deref().map_or(module_index, |i| i);
-            // Scope member/type resolution to the file's include closure.
-            let scoped = crate::file_analysis::ScopedLookup::new(
-                base_idx, &analysis.include_closure, path);
-            let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-            let cursor = crate::cursor_sentinel::point_to_byte(source, point);
-            let mut parser = driver.make_parser();
-            if let Some(ctx) = crate::cursor_sentinel::member_completion_ctx_incremental(
-                &mut parser, &lang_pack, source, tree, cursor, analysis, Some(xidx),
+    // Cross-file resolves against THIS language's sub-index (its own
+    // cache — no cross-language overlap), falling back to the hub when
+    // none is attached.
+    let pack = module_index.pack_index(language);
+    let base_idx: &dyn crate::file_analysis::CrossFileLookup =
+        pack.as_deref().map_or(module_index, |i| i);
+    // Scope member/type resolution to the file's include closure.
+    let scoped = crate::file_analysis::ScopedLookup::new(
+        base_idx, &analysis.include_closure, path);
+    let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
+    // The slot verdict — Member (sentinel reparse → receiver span →
+    // type) or the bare-identifier fallback (no registered driver / no
+    // LangPack / no dangling member access) — comes from the one
+    // cursor-tier entry (`docs/adr/cursor-slots.md`); this adapter only
+    // projects it onto LSP items.
+    let slot = crate::cursor_slot::detect_slot(analysis, tree, source, point, language, Some(xidx));
+    if let crate::cursor_slot::Slot::Member { receiver, .. } = slot {
+        if let Some(class) =
+            receiver.receiver_type.and_then(|ty| ty.class_name().map(|s| s.to_string()))
+        {
+            // Mode A: the member items carry the operator-swap edit
+            // (`p.` → `p->`) when the receiver's pointer depth wants
+            // a different operator than was typed. The diagnostic
+            // path (Mode B) is the universal fallback.
+            if let Some(items) = symbols::member_completion_for_class(
+                analysis, &class, xidx, receiver.op_fix, point,
             ) {
-                if let Some(class) =
-                    ctx.receiver_type.and_then(|ty| ty.class_name().map(|s| s.to_string()))
-                {
-                    // Mode A: the member items carry the operator-swap edit
-                    // (`p.` → `p->`) when the receiver's pointer depth wants
-                    // a different operator than was typed. The diagnostic
-                    // path (Mode B) is the universal fallback.
-                    if let Some(items) = symbols::member_completion_for_class(
-                        analysis, &class, xidx, ctx.op_fix, point,
-                    ) {
-                        return (items, false);
-                    }
-                }
+                return (items, false);
             }
         }
     }
@@ -73,18 +68,6 @@ pub fn pack_completion(
     let closure_live = closure_symbol_completion(
         files, analysis, source, point, language, path, module_index, &mut items);
     (items, macros_live || closure_live)
-}
-
-/// The identifier chars immediately before the byte cursor — the typed
-/// prefix that cross-file gathering filters on server-side.
-fn identifier_prefix(source: &str, cursor: usize) -> &str {
-    let bytes = source.as_bytes();
-    let cursor = cursor.min(bytes.len());
-    let mut start = cursor;
-    while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
-        start -= 1;
-    }
-    &source[start..cursor]
 }
 
 /// Bare-identifier cross-file completion: the file-scope symbols of every

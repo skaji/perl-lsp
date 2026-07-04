@@ -5,6 +5,7 @@ mod conventions;
 mod cpanfile;
 mod cst;
 mod cursor_context;
+mod cursor_slot;
 mod document;
 mod file_analysis;
 mod file_store;
