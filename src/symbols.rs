@@ -2293,7 +2293,7 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
                         name: sym.name.clone(),
                         scope: sym.scope,
                     },
-                    "skeleton-annot",
+                    crate::witnesses::ANNOT_SOURCE,
                 ) {
                     continue;
                 }

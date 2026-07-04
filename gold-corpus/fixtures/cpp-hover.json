@@ -446,6 +446,27 @@
           "static int helper(int n);"
         ]
       }
+    },
+    {
+      "id": "cpp-ctxparam-member-hover-nested",
+      "difficulty": "hard",
+      "semantic_area": "cpp-ctxparam-macro",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "ctxparam/ctxparam.c",
+      "line": 14,
+      "col": 11,
+      "comment": "member hover on rcpv->refcount in Perl_rcpv_copy(pTHX_ ...) — the declared-type-wins fix (WitnessSource ANNOT_SOURCE priority) types the receiver RCPV so the field resolves; regressed to no-hover when the header held a second decl.",
+      "expect": {
+        "all": [
+          "refcount: Numeric",
+          "*field*"
+        ],
+        "none": [
+          "```perl"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }
