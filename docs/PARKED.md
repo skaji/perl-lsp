@@ -6,24 +6,12 @@ why parked, what unblocks it. Prune on landing.
 
 ## Design-debt tier (candidates for a tightening round)
 
-- **Cursor-context split**: Perl has `cursor_context.rs`, pack languages
-  have `cursor_sentinel.rs` — two slot-detection systems with no shared
-  vocabulary. The CandidateSet ADR's honest boundary leaves slot detection
-  outside the seam (correctly), but the two implementations answer the
-  same question ("what kind of hole is the cursor in") per-language with
-  no common shape. Wants: one slot taxonomy (method-position / member /
-  key / import / type-position / …), per-language detectors behind it —
-  the LanguagePack pattern applied to cursor context. Slice-E's access
-  filter already had to thread through cursor_sentinel awkwardly.
-- **language_driver post-extraction pipeline** grew organically (remap →
-  member-block injection → domain sites → …): wants the builder.rs
-  treatment — named phases, ordering documented.
 - **Two include-BFS walkers + two `file_stamp` fns** (cpp_reparse vs
   module_cache): twice examined, twice left (different contracts/layers);
   verdicts recorded so sweeps don't re-litigate. Merge only with a reason.
-- **Open forks awaiting ratification** (`docs/open-forks.md`): hover
-  presentation payload (bare RefLocation vs candidate payload);
-  Function-lane def_paths minting location. Both cheap to undo.
+- **Open forks awaiting ratification** (`docs/open-forks.md`):
+  `Slot::ModulePath.in_use` field; ref-type deref snippets as projection
+  policy vs candidate data. Both cheap to undo.
 
 ## Feature tier (each is a fireable slice)
 
