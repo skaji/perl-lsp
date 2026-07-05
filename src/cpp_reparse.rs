@@ -1440,12 +1440,25 @@ fn salvage_splices(
     base: (usize, usize),
     budget: &mut u32,
 ) -> Vec<Splice> {
+    // Context-free-safe splices (empty-body byte-deletions — see
+    // `is_context_free_safe`) are KEPT without a probe: their expansion can't
+    // raise damage in any position, so the budget must not be spent bisecting
+    // them (`docs/prompt-macro-salvage-scaling.md`, fix #1 — `pTHX_`/`aTHX_` used
+    // across the whole file no longer cost anything). They double as the
+    // always-applied BASELINE the ambiguous bisection validates against: since a
+    // deletion only lowers damage, keeping them out can never raise a surviving
+    // subset's damage, so the remaining groups keep at least as much as before.
+    let (safe, ambiguous): (Vec<Splice>, Vec<Splice>) = splices
+        .iter()
+        .cloned()
+        .partition(|s| s.replacement.chars().all(char::is_whitespace));
     let mut by_name: BTreeMap<&str, Vec<Splice>> = BTreeMap::new();
-    for s in splices {
+    for s in &ambiguous {
         by_name.entry(&s.name).or_default().push(s.clone());
     }
     let groups: Vec<Vec<Splice>> = by_name.into_values().collect();
-    let mut kept = salvage_groups(parser, src, &groups, base, budget);
+    let mut kept = salvage_groups(parser, src, &groups, &safe, base, budget);
+    kept.extend(safe);
     kept.sort_by_key(|s| s.start);
     kept
 }
@@ -1453,6 +1466,7 @@ fn salvage_splices(
 fn salvage_validates(
     parser: &mut tree_sitter::Parser,
     src: &str,
+    keep_always: &[Splice],
     set: &[Splice],
     base: (usize, usize),
     budget: &mut u32,
@@ -1461,7 +1475,9 @@ fn salvage_validates(
         return false;
     }
     *budget -= 1;
-    let mut v = set.to_vec();
+    // `keep_always` (the context-free-safe deletions) is applied on every probe
+    // so the ambiguous groups are judged in the same context they'll ship in.
+    let mut v: Vec<Splice> = keep_always.iter().chain(set).cloned().collect();
     let (rw, _) = apply(src, &mut v);
     parser.parse(&rw, None).is_some_and(|t| {
         parse_damage(t.root_node()) <= base.0 && structure_count(t.root_node()) >= base.1
@@ -1472,6 +1488,7 @@ fn salvage_groups(
     parser: &mut tree_sitter::Parser,
     src: &str,
     groups: &[Vec<Splice>],
+    keep_always: &[Splice],
     base: (usize, usize),
     budget: &mut u32,
 ) -> Vec<Splice> {
@@ -1479,7 +1496,7 @@ fn salvage_groups(
         return Vec::new();
     }
     let all: Vec<Splice> = groups.iter().flatten().cloned().collect();
-    if salvage_validates(parser, src, &all, base, budget) {
+    if salvage_validates(parser, src, keep_always, &all, base, budget) {
         return all;
     }
     if groups.len() == 1 {
@@ -1493,14 +1510,14 @@ fn salvage_groups(
                 name: s.name.clone(),
             })
             .collect();
-        if salvage_validates(parser, src, &blanks, base, budget) {
+        if salvage_validates(parser, src, keep_always, &blanks, base, budget) {
             return blanks;
         }
         return Vec::new();
     }
     let (l, r) = groups.split_at(groups.len() / 2);
-    let lk = salvage_groups(parser, src, l, base, budget);
-    let rk = salvage_groups(parser, src, r, base, budget);
+    let lk = salvage_groups(parser, src, l, keep_always, base, budget);
+    let rk = salvage_groups(parser, src, r, keep_always, base, budget);
     if lk.is_empty() {
         return rk;
     }
@@ -1509,7 +1526,7 @@ fn salvage_groups(
     }
     let mut keep = lk.clone();
     keep.extend(rk.iter().cloned());
-    if salvage_validates(parser, src, &keep, base, budget) {
+    if salvage_validates(parser, src, keep_always, &keep, base, budget) {
         return keep;
     }
     // The halves validated separately but interact when combined — keep the
@@ -2741,6 +2758,33 @@ fn compute_splices(
     compute_splices_inner(tree, src, external, alias_only, force_slow_path(), expand_region_bodies)
 }
 
+/// The per-name expansion-safety verdict, computed ONCE from the macro's body
+/// (a property, never the name — rule #10). `true` means the expansion is
+/// **context-independently safe**: it can be spliced in *any* position without
+/// raising parse damage, so it need never be stranded in a dropped
+/// conditional-region batch or a salvage-budget tail.
+///
+/// The provable class is an object-like macro with an empty/whitespace body: its
+/// expansion is pure byte-DELETION (`pTHX_`/`aTHX_` under a non-multiplicity
+/// config), which can only ever REMOVE a token, never introduce a malformed one.
+/// A non-empty fragment (`pTHX_ → PerlInterpreter *my_perl,`) is position-
+/// dependent (the trailing comma is safe only in a param list), so it stays
+/// under the normal exclusion/validation path — the whole-file gate is the
+/// backstop either way. See `docs/prompt-macro-salvage-scaling.md`.
+fn is_context_free_safe(m: &Macro) -> bool {
+    m.params.is_none() && m.body.trim().is_empty()
+}
+
+/// Forward-cursor membership: is `pos` inside one of the sorted, disjoint
+/// `spans`? `cursor` only advances, so successive calls with non-decreasing
+/// `pos` stay O(1) amortized (the same discipline the `excludes` walk uses).
+fn span_contains(spans: &[(usize, usize)], cursor: &mut usize, pos: usize) -> bool {
+    while *cursor < spans.len() && spans[*cursor].1 <= pos {
+        *cursor += 1;
+    }
+    *cursor < spans.len() && spans[*cursor].0 <= pos
+}
+
 fn compute_splices_inner(
     tree: &Tree,
     src: &str,
@@ -2756,6 +2800,12 @@ fn compute_splices_inner(
         return Vec::new();
     }
     let excludes = exclusion_spans(tree, expand_region_bodies);
+    // The HARD exclusions (strings/comments/directives) a context-free-safe
+    // macro is *never* exempt from — only computed for the wide fallback, where
+    // `excludes` additionally holds the conditional-region bodies such a macro
+    // MAY expand into. In the default scope the two sets coincide (see the
+    // exemption at the exclusion cursor below).
+    let narrow = (!expand_region_bodies).then(|| exclusion_spans(tree, true));
     // The expansion-policy flip: leave a use unexpanded when it already parses
     // clean, expand only where leaving it raises `parse_damage` (parse-repair).
     // `error_spans` is that per-use oracle. The alias-salvage mode is exempt —
@@ -2780,6 +2830,7 @@ fn compute_splices_inner(
     // intervals that end at/before the current word, then the frontier
     // interval is the only one that can contain it.
     let mut ex = 0usize;
+    let mut nex = 0usize;
     let mut lc = 0usize;
     let mut i = 0;
     while i < bytes.len() {
@@ -2792,8 +2843,24 @@ fn compute_splices_inner(
             while ex < excludes.len() && excludes[ex].1 <= start {
                 ex += 1;
             }
-            if ex < excludes.len() && excludes[ex].0 <= start {
-                continue; // start ∈ [s, e) of the frontier exclude → skip
+            let in_exclude = ex < excludes.len() && excludes[ex].0 <= start;
+            if in_exclude {
+                // A context-independently-safe expansion (empty body → pure byte
+                // deletion; see `is_context_free_safe`) stays expandable even
+                // inside a conditional-region BODY the wide fallback re-excludes:
+                // otherwise a clean `pTHX_` threaded through a `#ifdef` function
+                // dies as collateral when a *sibling* macro forced that fallback
+                // (`docs/prompt-macro-salvage-scaling.md`). It is still barred
+                // from the HARD spans (strings/comments/directives, `narrow`),
+                // where no expansion may ever touch bytes. `narrow` is only built
+                // for the wide fallback — in the default scope it equals
+                // `excludes`, so the exemption is a no-op there.
+                let hard = narrow.as_deref().map_or(&excludes[..], |n| n);
+                let exempt = eff.get(word).is_some_and(is_context_free_safe)
+                    && !span_contains(hard, &mut nex, start);
+                if !exempt {
+                    continue; // start ∈ [s, e) of the frontier exclude → skip
+                }
             }
             // `leave_calls` (sorted, from the same left-to-right tree walk) is
             // consulted with a forward cursor like `excludes`.
