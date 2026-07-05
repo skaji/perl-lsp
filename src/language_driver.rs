@@ -372,6 +372,20 @@ impl PackDriver {
         // Macro identity lane: collect every `#define` off the ORIGINAL
         // source (spans in user coordinates, no splice remap needed).
         let macro_defs = self.collect_macro_defs.map(|collect| collect(parser, source)).unwrap_or_default();
+        // Nested-macro-body references: a use of macro `A` inside `B`'s
+        // `#define` body is preproc-excluded from the code parse (one opaque
+        // `preproc_arg` token), so no query capture reaches it and gr on `A`
+        // goes dark. Scan each body for identifier tokens naming a KNOWN macro
+        // (this file's `#define`s ∪ the include closure's) and mint a read at
+        // the ORIGINAL span (rule #7). Only for drivers with the macro lane.
+        if self.collect_macro_defs.is_some() {
+            let mut known: std::collections::HashSet<String> =
+                macro_defs.iter().map(|m| m.name.clone()).collect();
+            known.extend(ctx.external.macro_names().map(str::to_string));
+            for (name, span) in crate::cpp_reparse::macro_body_name_refs(parser, source, &known) {
+                skel.var_reads.push((name, crate::file_analysis::ScopeId(0), span));
+            }
+        }
         // Function-like macro typing (the expansion flip's payoff): a
         // left-unexpanded macro call parses as `call_expression`, so the
         // macro is a package-global sub. Type it from its body — delegation

@@ -532,6 +532,166 @@ pub fn macro_call_arg_spans(
     out
 }
 
+/// Identifier tokens inside a `#define` body that name a KNOWN macro — the
+/// nested-macro uses the preprocessor hides from the code parser (`#define
+/// IS_OK(x) (FLAGS(x) & 1)` references FLAGS; perl5 `SvFLAGS` inside
+/// `SvOK`/`SvTRUE`). tree-sitter models a macro body as one opaque `preproc_arg`
+/// token, so these never surface as query captures and find-references on the
+/// inner macro goes dark. We lexically scan each body in ORIGINAL coordinates
+/// (def bodies are never spliced) and mint a use per token that (a) names a
+/// known macro and (b) is not the macro's own parameter. Comments, string/char
+/// literals, and `#`/`##` stringify/paste operands are skipped — a pasted or
+/// stringified token is textual, not a real reference (rule: prefer silence
+/// over a wrong ref). Body end is the LOGICAL line end (`logical_body_end`),
+/// not the CST node's, so continuation-past-comment tokens are still seen.
+pub fn macro_body_name_refs(
+    parser: &mut tree_sitter::Parser,
+    source: &str,
+    known: &std::collections::HashSet<String>,
+) -> Vec<(String, crate::file_analysis::Span)> {
+    let Some(tree) = parser.parse(source, None) else { return Vec::new() };
+    let src = source.as_bytes();
+    let query = cached_query(&MACRO_DEF_Q, &tree.language(), MACRO_DEF_QUERY);
+    let names: Vec<&str> = query.capture_names().to_vec();
+    let mut out = Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut it = cursor.matches(query, tree.root_node(), src);
+    while let Some(m) = it.next() {
+        let mut body: Option<tree_sitter::Node> = None;
+        let mut params: Vec<String> = Vec::new();
+        for c in m.captures {
+            match names[c.index as usize] {
+                "obody" | "fbody" => body = Some(c.node),
+                "fparams" => {
+                    let txt = c.node.utf8_text(src).unwrap_or("");
+                    params = txt
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        let Some(body) = body else { continue };
+        scan_body_name_refs(src, body, known, &params, &mut out);
+    }
+    out
+}
+
+/// Lexically scan `body`'s logical extent (comment/literal-aware) and push a
+/// `(name, span)` per known-macro identifier token. Point coordinates are
+/// tracked from the node's start position; identifiers never cross a newline.
+fn scan_body_name_refs(
+    src: &[u8],
+    body: tree_sitter::Node,
+    known: &std::collections::HashSet<String>,
+    params: &[String],
+    out: &mut Vec<(String, crate::file_analysis::Span)>,
+) {
+    use crate::file_analysis::Span;
+    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    let start = body.start_byte();
+    let end = logical_body_end(src, start).min(src.len());
+    let mut i = start;
+    let start_pt = body.start_position();
+    let (mut row, mut col) = (start_pt.row, start_pt.column);
+    // The most recent non-whitespace byte — for the stringify/paste-right
+    // operand check (`#X`, or `X` after the second `#` of `Y ## X`).
+    let mut prev_nonspace = 0u8;
+    let bump = |b: u8, row: &mut usize, col: &mut usize| {
+        if b == b'\n' {
+            *row += 1;
+            *col = 0;
+        } else {
+            *col += 1;
+        }
+    };
+    while i < end {
+        let b = src[i];
+        match (b, src.get(i + 1).copied()) {
+            (b'/', Some(b'*')) => {
+                while i < end && !(src[i] == b'*' && src.get(i + 1) == Some(&b'/')) {
+                    bump(src[i], &mut row, &mut col);
+                    i += 1;
+                }
+                // consume the closing `*/`
+                for _ in 0..2 {
+                    if i < end {
+                        bump(src[i], &mut row, &mut col);
+                        i += 1;
+                    }
+                }
+                prev_nonspace = b'/';
+            }
+            (b'/', Some(b'/')) => {
+                while i < end && src[i] != b'\n' {
+                    bump(src[i], &mut row, &mut col);
+                    i += 1;
+                }
+            }
+            (q @ (b'"' | b'\''), _) => {
+                bump(b, &mut row, &mut col);
+                i += 1;
+                while i < end {
+                    let c = src[i];
+                    bump(c, &mut row, &mut col);
+                    i += 1;
+                    if c == b'\\' {
+                        if i < end {
+                            bump(src[i], &mut row, &mut col);
+                            i += 1;
+                        }
+                    } else if c == q {
+                        break;
+                    }
+                }
+                prev_nonspace = q;
+            }
+            _ if is_id(b) => {
+                let (srow, scol) = (row, col);
+                let tok_start = i;
+                while i < end && is_id(src[i]) {
+                    bump(src[i], &mut row, &mut col);
+                    i += 1;
+                }
+                let name = &src[tok_start..i];
+                // Stringify/paste-right operand: `#TOKEN` or `Y ## TOKEN`.
+                let stringified = prev_nonspace == b'#';
+                // Paste-left operand: `TOKEN ## Y` — peek past spaces for `##`.
+                let mut j = i;
+                while j < end && matches!(src[j], b' ' | b'\t') {
+                    j += 1;
+                }
+                let pasted = src.get(j) == Some(&b'#') && src.get(j + 1) == Some(&b'#');
+                if !stringified && !pasted {
+                    if let Ok(s) = std::str::from_utf8(name) {
+                        if known.contains(s) && !params.iter().any(|p| p == s) {
+                            out.push((
+                                s.to_string(),
+                                Span {
+                                    start: tree_sitter::Point { row: srow, column: scol },
+                                    end: tree_sitter::Point { row, column: col },
+                                },
+                            ));
+                        }
+                    }
+                }
+                prev_nonspace = *name.last().unwrap_or(&0);
+            }
+            _ => {
+                if !matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                    prev_nonspace = b;
+                }
+                bump(b, &mut row, &mut col);
+                i += 1;
+            }
+        }
+    }
+}
+
 fn classify_expr_node(node: tree_sitter::Node) -> Option<crate::file_analysis::InferredType> {
     use crate::file_analysis::InferredType;
     match node.kind() {
@@ -1715,6 +1875,14 @@ impl PreExpandedExternal {
             .iter()
             .filter(|(_, m)| m.params.is_none())
             .map(|(k, m)| (k.as_str(), m.body.as_str()))
+    }
+
+    /// Every gathered macro NAME (object- and function-like) — the include
+    /// closure's macro universe. The nested-macro-body ref lane unions this
+    /// with the file's own `#define`s so a body token naming a header-defined
+    /// macro (`SvFLAGS` used inside an `hv.h` macro) still mints a reference.
+    pub fn macro_names(&self) -> impl Iterator<Item = &str> {
+        self.raw.keys().map(|k| k.as_str())
     }
 }
 

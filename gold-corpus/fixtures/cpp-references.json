@@ -7,18 +7,38 @@
       "semantic_area": "cpp-multilang-macros",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "Family M #3 (PARKED): references on a macro should include uses inside OTHER macros' `#define` bodies (`FLAGS` used inside `IS_OK`, line 7). Macro definition bodies are preproc-excluded from ref minting, so the nested use is unindexed — perl5 `SvFLAGS` finds 190/347 real. goto-def through the same nested sites WORKS; this is index-population only. XPASS when the macro-body ref lane is added.",
+      "comment": "Family M #3: references on a macro include uses inside OTHER macros' `#define` bodies (`FLAGS` used inside `IS_OK`, line 7). Macro bodies are one opaque preproc_arg token, so the nested use has no query capture — the macro-body ref lane (`macro_body_name_refs`) lexically scans each body for known-macro tokens and mints a read at its original span.",
       "file": "macro_nested_ref.c",
       "line": 5,
       "col": 8,
       "expect": {
         "all": [
-          "\"file\":\"macro_nested_ref.c\",\"line\":\"7\"",
+          "\"col\":\"20\",\"file\":\"macro_nested_ref.c\",\"line\":\"7\"",
           "\"file\":\"macro_nested_ref.c\",\"line\":\"12\""
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
+    },
+    {
+      "id": "cpp-macro-nested-ref-in-macro-body-from-use",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Reverse direction: gr FROM the nested use site (the `FLAGS` token inside `IS_OK`'s body) returns the same identity set as from the def — the macro-body read carries the same FileScopeValue identity the #define and code-position uses do.",
+      "file": "macro_nested_ref.c",
+      "line": 6,
+      "col": 20,
+      "expect": {
+        "all": [
+          "\"col\":\"9\",\"file\":\"macro_nested_ref.c\",\"line\":\"6\"",
+          "\"col\":\"20\",\"file\":\"macro_nested_ref.c\",\"line\":\"7\"",
+          "\"file\":\"macro_nested_ref.c\",\"line\":\"12\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     },
     {
       "id": "cpp-references-free-function-def-and-call",
