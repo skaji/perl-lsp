@@ -348,6 +348,7 @@ impl Backend {
         let client = self.client.clone();
         let module_index = Arc::clone(&self.module_index);
         let root = self.module_index.workspace_root();
+        let options = self.diagnostic_options();
         // Server-initiated progress requires the client capability; a client
         // that never advertised it may also never ANSWER the create request —
         // and indexing must proceed regardless (LSP spec).
@@ -408,7 +409,76 @@ impl Backend {
                     )),
                 }));
             }
+            // Heal the cold-open degraded window: the index this file's family
+            // needs has now ATTACHED (the latch marked KICKOFF; this is the
+            // completion signal). Re-analyze + re-publish every open doc in the
+            // family so pull-verb answers baked in the cached-only open window
+            // (truncated cross-file closure, `None` gd/hover) self-heal without
+            // the user re-triggering.
+            Self::heal_open_docs(&files, &module_index, &client, options, want_perl);
         });
+    }
+
+    /// Re-derive + re-publish every OPEN document in a language family after its
+    /// workspace index / macro gather lands — the pull-verb heal for the
+    /// cold-open degraded window. Pack docs get a full OFF-lock re-analysis
+    /// (their `did_open` gather was cached-only + the cross-file index is now
+    /// warm); perl docs get an enrich + diagnostics re-publish.
+    ///
+    /// FileStore guard discipline: pack URIs are collected under a read guard
+    /// that is DROPPED before any re-analysis, and each re-analysis snapshots
+    /// text off the lock (`spawn_pack_doc_refresh`). The perl branch enriches
+    /// under the write guard but touches only `module_index` (never re-locks the
+    /// store) and publishes after the guard drops — the same shape the resolver
+    /// `on_refresh` callback already uses safely.
+    fn heal_open_docs(
+        files: &Arc<FileStore>,
+        module_index: &Arc<ModuleIndex>,
+        client: &Client,
+        options: symbols::DiagnosticOptions,
+        want_perl: bool,
+    ) {
+        log::debug!(
+            "cold-window heal: index landed for {} family",
+            if want_perl { "perl" } else { "pack" }
+        );
+        if want_perl {
+            let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+            files.for_each_open_mut(|uri, doc| {
+                if doc.language != "perl" {
+                    return;
+                }
+                std::sync::Arc::make_mut(&mut doc.analysis)
+                    .enrich_imported_types_with_keys(Some(module_index.as_ref()));
+                let diags = symbols::collect_diagnostics(&doc.analysis, module_index, options);
+                pending.push((uri.clone(), diags));
+            });
+            if pending.is_empty() {
+                return;
+            }
+            let client = client.clone();
+            tokio::spawn(async move {
+                for (uri, diags) in pending {
+                    client.publish_diagnostics(uri, diags, None).await;
+                }
+            });
+        } else {
+            let mut uris: Vec<Url> = Vec::new();
+            files.for_each_open(|uri, doc| {
+                if doc.language != "perl" {
+                    uris.push(uri.clone());
+                }
+            });
+            for uri in uris {
+                Self::spawn_pack_doc_refresh(
+                    Arc::clone(files),
+                    Arc::clone(module_index),
+                    client.clone(),
+                    uri,
+                    options,
+                );
+            }
+        }
     }
 }
 
@@ -431,20 +501,41 @@ impl Backend {
             Arc::new(std::sync::OnceLock::new());
         let holder_clone = Arc::clone(&module_index_holder);
 
+        // Coalesce generation for the per-module refresh storm: each resolved
+        // module fires `on_refresh` (~33 in ~400ms opening a Perl file with a
+        // dozen `use`s), each otherwise a full `for_each_open_mut` + publish —
+        // CPU + stdout pressure that WIDENS the cold-open degraded window. Every
+        // fire bumps this generation and debounces; only the latest surviving
+        // fire republishes, so the burst collapses to ~one refresh. Lives only
+        // in the closure — nothing outside bumps it.
+        let refresh_gen_cb = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         // Capture the tokio handle so the callback can spawn async work
         // from the resolver thread (which has no tokio context).
         let tokio_handle = tokio::runtime::Handle::current();
         let on_refresh = move || {
+            use std::sync::atomic::Ordering;
             let client = refresh_client.clone();
             let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
             let unresolved_dispatch = Arc::clone(&refresh_unresolved_dispatch);
             let use_after_move = Arc::clone(&refresh_use_after_move);
+            let refresh_gen = Arc::clone(&refresh_gen_cb);
+            // Debounce: bump the generation, then only the LATEST fire that
+            // survives the settle window does the work. A tight resolver burst
+            // (~45 modules in ~400ms) thus republishes once, not 45×.
+            let my_gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            log::debug!("diag-refresh fired (gen {})", my_gen);
             tokio_handle.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                if refresh_gen.load(Ordering::Relaxed) != my_gen {
+                    return; // a newer fire superseded this one
+                }
                 let module_index = match holder.get() {
                     Some(idx) => idx,
                     None => return,
                 };
+                log::debug!("diag-refresh executing (gen {})", my_gen);
                 // Collect (uri, diagnostics) first without holding the store lock
                 // across the await — publishing is async and could deadlock.
                 let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
