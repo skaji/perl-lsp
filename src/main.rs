@@ -1013,7 +1013,7 @@ fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::D
         eprintln!("Parse failed: {}", file);
         std::process::exit(1);
     }));
-    tphase!("enrich_imported_types", doc.analysis.enrich_imported_types_with_keys(Some(idx)));
+    tphase!("enrich_imported_types", std::sync::Arc::make_mut(&mut doc.analysis).enrich_imported_types_with_keys(Some(idx)));
     doc
 }
 

@@ -3121,7 +3121,10 @@ fn sigil_modifier(sigil: char) -> u32 {
 
 // ---- FileAnalysis ----
 
-#[derive(Debug, Serialize, Deserialize)]
+// `Clone` supports `Arc::make_mut` copy-on-write on `Document::analysis`:
+// diagnostics enrichment mutates through the Arc, cloning only when a request
+// handler is concurrently reading a snapshot (the deadlock-avoidance path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileAnalysis {
     // Core tables
     pub scopes: Vec<Scope>,

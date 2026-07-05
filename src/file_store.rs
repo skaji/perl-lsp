@@ -119,7 +119,7 @@ impl FileStore {
         if let Some((_, path)) = self.url_to_path.remove(url) {
             // Snapshot analysis into workspace. Tree + text are dropped —
             // workspace entries don't carry them.
-            self.workspace.insert(path, Arc::new(doc.analysis));
+            self.workspace.insert(path, doc.analysis);
         }
     }
 
@@ -171,7 +171,8 @@ impl FileStore {
     // ---- Iteration ----
 
     /// Call `f` for every open Document with mutable access to the analysis.
-    /// Used by the module-resolver callback to re-enrich open docs.
+    /// Used by the module-resolver callback to re-enrich open docs. Takes a
+    /// shard write lock per entry — see the deadlock note on `for_each_open`.
     pub fn for_each_open_mut<F: FnMut(&Url, &mut Document)>(&self, mut f: F) {
         for mut entry in self.open.iter_mut() {
             let url = entry.key().clone();
@@ -180,9 +181,15 @@ impl FileStore {
     }
 
     /// Read-only iteration over open Documents. Query paths (`refs_to`,
-    /// `references_mask_for`) use this so a caller may hold a `get_open` read
-    /// guard while the walk runs — the mutable variant takes shard write locks
-    /// and would deadlock against that guard.
+    /// `references_mask_for`, CandidateSet projections) use this.
+    ///
+    /// DEADLOCK HAZARD: a caller must NOT hold a `get_open` read guard while
+    /// this runs. `iter()` re-locks every shard, so it reentrantly read-locks
+    /// the shard the guard already holds — and if a `for_each_open_mut` writer
+    /// has queued on that shard in between, parking_lot's writer preference
+    /// blocks the reentrant read behind the writer, which waits on the first
+    /// read. Handlers snapshot (`Arc::clone(&doc.analysis)`) and drop the guard
+    /// before calling `resolve()`. See `Document::analysis`.
     pub fn for_each_open<F: FnMut(&Url, &Document)>(&self, mut f: F) {
         for entry in self.open.iter() {
             f(entry.key(), entry.value());
