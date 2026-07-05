@@ -1,0 +1,88 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "cpp-qualified-completion-prefix-filter",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-namespaces",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Completion after `fmtx::f` is qualifier-filtered: the namespace's `format_to` appears, the similarly-named global `formatter_global` and the in-scope local `caller` do NOT — the qualifier is a hard filter by meaning.",
+      "file": "nsqualcomp/use.cpp",
+      "line": 7,
+      "col": 11,
+      "expect": {
+        "all": [
+          "format_to"
+        ],
+        "none": [
+          "formatter_global",
+          "caller"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-qualified-completion-bare-qualifier-members",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-namespaces",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Completion right after `fmtx::` (nothing typed yet) offers the namespace's members — functions AND the nested namespace `detail` — never the global pool.",
+      "file": "nsqualcomp/use.cpp",
+      "line": 3,
+      "col": 10,
+      "expect": {
+        "all": [
+          "format_to",
+          "print",
+          "detail"
+        ],
+        "none": [
+          "formatter_global",
+          "caller"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-qualified-completion-nested-namespace-drill",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-namespaces",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Completion after `fmtx::detail::` drills into the nested namespace: its members only, not the parent's or the globals.",
+      "file": "nsqualcomp/use.cpp",
+      "line": 11,
+      "col": 18,
+      "expect": {
+        "all": [
+          "detail_helper"
+        ],
+        "none": [
+          "formatter_global",
+          "format_to"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-qualified-completion-inline-namespace-lift",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-namespaces",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "An inline namespace (`inline namespace v11`) is transparent: its members surface when completing the ENCLOSING namespace's qualifier (`fmtx::` offers `inline_fn`).",
+      "file": "nsqualcomp/use.cpp",
+      "line": 3,
+      "col": 10,
+      "expect": {
+        "all": [
+          "inline_fn"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

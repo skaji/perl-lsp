@@ -1690,6 +1690,16 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             attrs_by_match.entry(e.match_id).or_default().push(e.text.clone());
         }
     }
+    // `@ns.inline` — an inline namespace's NAME token, fired by a name-only
+    // sibling pattern (its def/scope/context come from the base namespace
+    // pattern, a different match). Joined to the Package symbol by name span
+    // in a post-pass below, tagging it "inline" so the qualified-completion
+    // gather can lift its members into the enclosing namespace.
+    let inline_ns_spans: Vec<(Point, Point)> = events
+        .iter()
+        .filter(|e| e.cap == "ns.inline")
+        .map(|e| (e.start, e.end))
+        .collect();
     // (var name, declaring scope) → its declared-type text, joined per
     // declaration match. Feeds the token-less optional-engagement narrowing
     // (`if (opt)`): the guard names no type, so the refinement reads the
@@ -2356,6 +2366,20 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 }
             }
             _ => {}
+        }
+    }
+
+    // ---- inline namespaces: tag the Package symbol by name span ----
+    if !inline_ns_spans.is_empty() {
+        let same = |a: Point, b: Point| a.row == b.row && a.column == b.column;
+        for s in out.symbols.iter_mut() {
+            if s.kind == "package"
+                && inline_ns_spans
+                    .iter()
+                    .any(|&(st, en)| same(st, s.name_start) && same(en, s.name_end))
+            {
+                s.attributes.push("inline".to_string());
+            }
         }
     }
 

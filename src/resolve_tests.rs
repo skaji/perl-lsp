@@ -4818,3 +4818,53 @@ fn candidate_set_definitions_local() {
     assert_eq!(defs[0].access, AccessKind::Declaration);
 }
 
+
+/// Qualified-path completion (pack lane): `fmtx::` gathers the OWNER's
+/// members — functions, the nested namespace, the inline namespace's
+/// lifted members — and NEVER the global pool (the similarly-named
+/// free function, the in-scope caller). The completion half of
+/// namespace participation; gd's owner-anchored half shares the
+/// membership predicate.
+#[cfg(feature = "cpp")]
+#[test]
+fn complete_qualified_path_pack_gathers_owner_members_only() {
+    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let driver = reg.for_id("cpp").expect("cpp driver");
+    let src = "namespace fmtx {\n\
+               void format_to(int v);\n\
+               void print(int v);\n\
+               namespace detail { void detail_helper(); }\n\
+               inline namespace v11 { void inline_fn(); }\n\
+               }\n\
+               void formatter_global(int v);\n\
+               void caller() {\n\
+                   fmtx::f\n\
+               }\n";
+    let fa = driver.analyze_with_path(src, Some(std::path::Path::new("/fake/use.cpp")));
+    let store = FileStore::new();
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let cs = resolve(
+        &store,
+        &fa,
+        FileKey::Path(PathBuf::from("/fake/use.cpp")),
+        tree_sitter::Point { row: 8, column: 11 },
+        None,
+        OverrideScope::default(),
+    )
+    .pack_routed();
+
+    let labels: Vec<String> =
+        cs.complete_qualified_path(&idx, "fmtx").into_iter().map(|c| c.label).collect();
+    for want in ["format_to", "print", "detail", "inline_fn"] {
+        assert!(labels.iter().any(|l| l == want), "missing {want}: {labels:?}");
+    }
+    for reject in ["formatter_global", "caller"] {
+        assert!(!labels.iter().any(|l| l == reject), "leaked {reject}: {labels:?}");
+    }
+
+    // Nested drill: `fmtx::detail::` is the inner namespace's members only.
+    let labels: Vec<String> =
+        cs.complete_qualified_path(&idx, "detail").into_iter().map(|c| c.label).collect();
+    assert!(labels.iter().any(|l| l == "detail_helper"), "missing detail_helper: {labels:?}");
+    assert!(!labels.iter().any(|l| l == "format_to"), "parent member leaked: {labels:?}");
+}

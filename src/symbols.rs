@@ -413,7 +413,7 @@ fn inferred_type_matches(expected: &InferredType, actual: &InferredType) -> bool
         )
 }
 
-fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
+pub(crate) fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
     let additional_text_edits = if c.additional_edits.is_empty() {
         None
     } else {

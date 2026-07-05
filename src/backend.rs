@@ -63,6 +63,34 @@ pub fn pack_completion(
             }
         }
     }
+    // `fmtx::|` — a qualified path completes to the OWNER's members
+    // (workspace + dependency roles), never the global pool: the qualifier
+    // is a hard filter by meaning. The gather is the CandidateSet's
+    // qualified-path projection (pack lane), anchored on the same qualifier
+    // detection goto-def uses. Falls through to the bare-identifier universe
+    // when the owner resolves nothing (e.g. a macro-guarded namespace open
+    // left members unattributed), mirroring gd's owner-anchored
+    // fall-through.
+    if let crate::cursor_slot::Slot::ModulePath { ref prefix, .. } = slot {
+        let cs = crate::resolve::resolve(
+            files,
+            analysis,
+            crate::file_store::FileKey::Path(
+                path.map(|p| p.to_path_buf()).unwrap_or_default(),
+            ),
+            point,
+            Some(base_idx),
+            crate::resolve::OverrideScope::default(),
+        )
+        .pack_routed();
+        let candidates = cs.complete_qualified_path(xidx, prefix);
+        if !candidates.is_empty() {
+            return (
+                candidates.into_iter().map(symbols::candidate_to_completion_item).collect(),
+                false,
+            );
+        }
+    }
     // `o->op_type == |` — the equality's field operand types the slot to
     // an enum DOMAIN. Rank that enum's members first (never prune the
     // bare-identifier universe): the type-constrained-completion payoff of

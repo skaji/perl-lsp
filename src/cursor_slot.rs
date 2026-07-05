@@ -74,9 +74,10 @@ pub enum Slot {
     /// `use Foo qw(|` — the named module's import surface.
     Import { module: Option<String> },
     /// `use |` (typing the module name) or `Foo::|` (a qualified-path
-    /// drill) — loadable modules and/or sub-packages. `in_use`
-    /// distinguishes the two behaviors this prefix-shaped slot folds
-    /// together (see `docs/open-forks.md`'s "ModulePath in_use" entry).
+    /// drill; pack languages' `ns::|` detects here too) — loadable modules
+    /// and/or the qualifier's members/sub-packages. `in_use` distinguishes
+    /// the two behaviors this prefix-shaped slot folds together (see
+    /// `docs/open-forks.md`'s "ModulePath in_use" entry).
     ModulePath { prefix: String, in_use: bool },
     /// A type is expected here. No current detector populates this —
     /// reserved for pack languages' declaration positions.
@@ -191,6 +192,15 @@ pub fn detect_slot(
             },
             op: ctx.op,
         };
+    }
+    // `fmtx::|` / `fmtx::f|` — a `::`-qualified path names its OWNER
+    // explicitly. Same qualifier detection owner-anchored goto-def resolves
+    // through (`resolve::qualifier_at_point`), so the completion filter and
+    // gd anchor on the identical owner. The qualifier is a hard filter by
+    // meaning; ahead of the domain-compare slot, which only re-ranks the
+    // global pool.
+    if let Some(owner) = crate::resolve::qualifier_at_point(source, point) {
+        return Slot::ModulePath { prefix: owner.to_string(), in_use: false };
     }
     // `field == |` — the equality's field operand carries an enum DOMAIN.
     // The slot hands that expected type to completion so the domain's

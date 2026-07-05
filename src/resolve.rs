@@ -1091,45 +1091,7 @@ impl<'a> CandidateSet<'a> {
     fn member_def_location(&self, class: &str, member: &str) -> Option<RefLocation> {
         let is_member = |fa: &crate::file_analysis::FileAnalysis,
                          s: &crate::file_analysis::Symbol| {
-            if s.name != member {
-                return false;
-            }
-            match s.kind {
-                SymKind::Method | SymKind::Sub => s.package.as_deref() == Some(class),
-                // A data member (or enum constant) must be the class's OWN
-                // content, not a sub-body local carrying the class as sticky
-                // package.
-                SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
-                    if !fa.symbol_is_class_content(s) {
-                        return false;
-                    }
-                    if s.package.as_deref() == Some(class) {
-                        return true;
-                    }
-                    // Unscoped-enum leak: `dynamic::STRING` / `level::info`
-                    // where the enumerator's enum is nested in a class OR
-                    // namespace `class`. C++ makes an unscoped enum's
-                    // enumerators members of EVERY enclosing named scope,
-                    // addressable by that scope's name — but extraction files
-                    // the enumerator under its tightest container (the enum),
-                    // so the direct package match above misses the outer
-                    // scope. Bridge it structurally: the enumerator's span
-                    // lives inside a container symbol named `class`
-                    // (span-contained, and not the enumerator itself). Works
-                    // whether the scope is a struct (`dynamic`) or a namespace
-                    // (`level`), without depending on how either tags package.
-                    matches!(s.kind, SymKind::Enumerator)
-                        && fa.symbols.iter().any(|c| {
-                            c.name == class
-                                && c.span != s.span
-                                && (c.span.start.row, c.span.start.column)
-                                    <= (s.span.start.row, s.span.start.column)
-                                && (s.span.end.row, s.span.end.column)
-                                    <= (c.span.end.row, c.span.end.column)
-                        })
-                }
-                _ => false,
-            }
+            s.name == member && pack_member_of(fa, s, class)
         };
         if let Some(sym) = self.origin.symbols.iter().find(|s| is_member(self.origin, s)) {
             return Some(self.origin_decl(sym.selection_span));
@@ -2244,6 +2206,13 @@ impl<'a> CandidateSet<'a> {
         module_index: &dyn CrossFileLookup,
         package: &str,
     ) -> Vec<CompletionCandidate> {
+        // Pack routing: the qualifier names a namespace/class owner; the
+        // candidates are its members, gathered through the SAME
+        // owner-membership predicate owner-anchored goto-def resolves with.
+        // Same projection, per-routing sources — like `complete()`.
+        if self.pack {
+            return self.complete_pack_qualified(module_index, package);
+        }
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out: Vec<CompletionCandidate> = Vec::new();
 
@@ -2292,6 +2261,83 @@ impl<'a> CandidateSet<'a> {
                 import_fact: None,
                 display_override: None,
             });
+        }
+        out
+    }
+
+    /// Pack half of the qualified-path drill (`fmtx::<cursor>`): the members
+    /// of the owner the qualifier names — never the global pool. Per file,
+    /// membership is `pack_member_of` over the inline-expanded owner set
+    /// (inline namespaces are transparent), plus the nested containers
+    /// (sub-namespaces, types) filed directly under the owner. Sources by
+    /// tier: OPEN = the origin's own symbols; DEPENDENCY = every cached file
+    /// closure-connected to the origin — the same connectivity the
+    /// owner-anchored goto-def scan walks, so completion offers exactly what
+    /// gd can resolve. Empty when the qualifier resolves nothing (e.g. a
+    /// macro-guarded namespace open left members unattributed) — the caller
+    /// falls through to the bare-identifier universe, mirroring gd.
+    fn complete_pack_qualified(
+        &self,
+        module_index: &dyn CrossFileLookup,
+        owner: &str,
+    ) -> Vec<CompletionCandidate> {
+        let mask = self.completion_visibility();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<CompletionCandidate> = Vec::new();
+        let gather = |fa: &FileAnalysis,
+                      header: Option<&str>,
+                      seen: &mut std::collections::HashSet<String>,
+                      out: &mut Vec<CompletionCandidate>| {
+            let owners = pack_inline_owner_set(fa, owner);
+            for s in &fa.symbols {
+                let nested_container = matches!(s.kind, SymKind::Package | SymKind::Class)
+                    && s.package.as_deref().is_some_and(|p| owners.iter().any(|o| o == p));
+                if !nested_container && !owners.iter().any(|o| pack_member_of(fa, s, o)) {
+                    continue;
+                }
+                // a default-named symbol is structure, not an addressable name
+                if s.attributes.iter().any(|a| a == "anonymous") {
+                    continue;
+                }
+                if !seen.insert(s.name.clone()) {
+                    continue;
+                }
+                let detail = match (s.package.as_deref(), header) {
+                    (Some(p), Some(h)) if !p.is_empty() => Some(format!("{} — {}", p, h)),
+                    (_, Some(h)) => Some(h.to_string()),
+                    (Some(p), None) if !p.is_empty() => Some(p.to_string()),
+                    _ => None,
+                };
+                out.push(CompletionCandidate {
+                    label: s.name.clone(),
+                    kind: s.kind.clone(),
+                    detail,
+                    insert_text: None,
+                    sort_priority: if nested_container { 20 } else { 10 },
+                    additional_edits: vec![],
+                    import_fact: None,
+                    display_override: None,
+                });
+            }
+        };
+        if mask.contains(RoleMask::OPEN) {
+            gather(self.origin, None, &mut seen, &mut out);
+        }
+        if mask.contains(RoleMask::DEPENDENCY) {
+            if let Some((self_path, visible)) = module_index.visibility_scope() {
+                let self_str = self_path.to_string_lossy().into_owned();
+                module_index.for_each_cached_file(&mut |cached| {
+                    let p = cached.path.to_string_lossy();
+                    let connected = visible.contains(p.as_ref())
+                        || cached.analysis.include_closure.iter().any(|c| *c == self_str);
+                    if !connected {
+                        return;
+                    }
+                    let header =
+                        cached.path.file_name().map(|f| f.to_string_lossy().into_owned());
+                    gather(&cached.analysis, header.as_deref(), &mut seen, &mut out);
+                });
+            }
         }
         out
     }
@@ -3343,11 +3389,84 @@ fn template_instance_spelling(source: &str, span: Span) -> Option<String> {
     None
 }
 
+/// Is `s` addressable as `owner::<its name>` — the owner-membership predicate
+/// shared by owner-anchored goto-def (`member_def_location`) and the
+/// qualified-completion gather (`complete_pack_qualified`), so "resolvable"
+/// and "offered" never drift apart. Methods/subs key by package; a data
+/// member (or enum constant) must be the owner's OWN content, not a sub-body
+/// local carrying the owner as sticky package.
+fn pack_member_of(
+    fa: &crate::file_analysis::FileAnalysis,
+    s: &crate::file_analysis::Symbol,
+    owner: &str,
+) -> bool {
+    match s.kind {
+        SymKind::Method | SymKind::Sub => s.package.as_deref() == Some(owner),
+        SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
+            if !fa.symbol_is_class_content(s) {
+                return false;
+            }
+            if s.package.as_deref() == Some(owner) {
+                return true;
+            }
+            // Unscoped-enum leak: `dynamic::STRING` / `level::info`
+            // where the enumerator's enum is nested in a class OR
+            // namespace `owner`. C++ makes an unscoped enum's
+            // enumerators members of EVERY enclosing named scope,
+            // addressable by that scope's name — but extraction files
+            // the enumerator under its tightest container (the enum),
+            // so the direct package match above misses the outer
+            // scope. Bridge it structurally: the enumerator's span
+            // lives inside a container symbol named `owner`
+            // (span-contained, and not the enumerator itself). Works
+            // whether the scope is a struct (`dynamic`) or a namespace
+            // (`level`), without depending on how either tags package.
+            matches!(s.kind, SymKind::Enumerator)
+                && fa.symbols.iter().any(|c| {
+                    c.name == owner
+                        && c.span != s.span
+                        && (c.span.start.row, c.span.start.column)
+                            <= (s.span.start.row, s.span.start.column)
+                        && (s.span.end.row, s.span.end.column)
+                            <= (c.span.end.row, c.span.end.column)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// `owner` plus every inline namespace nested under it (transitively), per
+/// C++'s inline-namespace transparency: `namespace fmt { inline namespace
+/// v11 { ... } }` makes `v11`'s members addressable as `fmt::` members.
+/// Extraction tags inline namespaces with the "inline" attribute; a plain
+/// nested namespace never joins the set (its members need their own
+/// qualifier).
+fn pack_inline_owner_set(fa: &crate::file_analysis::FileAnalysis, owner: &str) -> Vec<String> {
+    let mut owners = vec![owner.to_string()];
+    loop {
+        let mut grew = false;
+        for s in &fa.symbols {
+            if s.kind == SymKind::Package
+                && s.attributes.iter().any(|a| a == "inline")
+                && s.package.as_deref().is_some_and(|p| owners.iter().any(|o| o == p))
+                && !owners.contains(&s.name)
+            {
+                owners.push(s.name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    owners
+}
+
 /// The `::`-qualifier owning the identifier under `point` — `dynamic` for the
 /// cursor anywhere in `STRING` of `dynamic::STRING`. Walks back to the token
 /// start (like `word_at_point`), then scans a leading `::` scope.
 /// `None` when the token has no leading `::` scope.
-fn qualifier_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
+pub(crate) fn qualifier_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
     let cursor = crate::cursor_sentinel::point_to_byte(source, point);
     let b = source.as_bytes();
     let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
