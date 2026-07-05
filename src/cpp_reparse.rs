@@ -2524,6 +2524,61 @@ pub fn evict_analysis_caches(files: &std::collections::HashSet<std::path::PathBu
     }
 }
 
+/// Measurement aid (gated by callers behind `PERL_LSP_MEM_REPORT`): a rough
+/// resident-byte estimate of the four process-global gather caches. Counts the
+/// heap payload of each `String`/`Vec` (capacity), not `size_of` overhead, so
+/// the numbers track the actual macro-table blow-up. NOT wired into any query
+/// path — a diagnostic only.
+pub fn cache_size_report() -> String {
+    fn macro_bytes(m: &Macro) -> usize {
+        m.body.capacity()
+            + m.params.as_ref().map_or(0, |p| p.iter().map(|s| s.capacity() + 24).sum())
+            + m.guards.iter().map(|s| s.capacity() + 24).sum::<usize>()
+            + 48
+    }
+    fn table_bytes(t: &MacroTable) -> usize {
+        t.iter().map(|(k, v)| k.capacity() + macro_bytes(v) + 32).sum()
+    }
+    let (mut mt_n, mut mt_b) = (0usize, 0usize);
+    if let Ok(c) = macro_table_cache().lock() {
+        mt_n = c.len();
+        mt_b = c.values().map(|(_, t)| table_bytes(t)).sum();
+    }
+    let (mut hc_n, mut hc_b) = (0usize, 0usize);
+    if let Ok(c) = header_cache().lock() {
+        hc_n = c.len();
+        hc_b = c
+            .values()
+            .map(|(_, h)| table_bytes(&h.macros) + h.includes.iter().map(|s| s.capacity() + 24).sum::<usize>())
+            .sum();
+    }
+    // pre_expanded's `raw` Arc is SHARED with macro_table_cache (same
+    // allocation) — count only the ADDED full+alias expanded-variant tables.
+    let (mut pe_n, mut pe_b) = (0usize, 0usize);
+    if let Ok(c) = pre_expanded_cache().lock() {
+        pe_n = c.len();
+        pe_b = c
+            .values()
+            .map(|(_, pe)| {
+                table_bytes(&pe.full.table)
+                    + pe.full.body_idents.iter().map(|s| s.capacity() + 24).sum::<usize>()
+                    + table_bytes(&pe.alias.table)
+                    + pe.alias.body_idents.iter().map(|s| s.capacity() + 24).sum::<usize>()
+            })
+            .sum();
+    }
+    let (mut ic_n, mut ic_b) = (0usize, 0usize);
+    if let Ok(c) = include_closure_cache().lock() {
+        ic_n = c.len();
+        ic_b = c.values().map(|(_, v)| v.iter().map(|s| s.capacity() + 24).sum::<usize>()).sum();
+    }
+    let mb = |b: usize| b as f64 / 1_048_576.0;
+    format!(
+        "cpp gather caches (heap payload est.):\n  header_cache:       {hc_n:>6} headers, {:>8.1} MB (shared across files)\n  macro_table_cache:  {mt_n:>6} files,   {:>8.1} MB (raw merged table, Arc-shared w/ pre_expanded)\n  pre_expanded_cache: {pe_n:>6} files,   {:>8.1} MB (full+alias expanded variants, ON TOP of raw)\n  include_closure:    {ic_n:>6} files,   {:>8.1} MB\n  TOTAL: {:>8.1} MB",
+        mb(hc_b), mb(mt_b), mb(pe_b), mb(ic_b), mb(hc_b + mt_b + pe_b + ic_b)
+    )
+}
+
 fn include_paths(src: &str, parser: &mut tree_sitter::Parser) -> Vec<String> {
     match parser.parse(src, None) {
         Some(tree) => include_paths_tree(&tree, src),

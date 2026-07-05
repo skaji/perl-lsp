@@ -863,6 +863,9 @@ pub fn index_pack_languages(
         }
         hub.attach_pack_index(lang, pack_index);
     }
+    if std::env::var_os("PERL_LSP_MEM_REPORT").is_some() {
+        eprintln!("[mem-report] {}", crate::cpp_reparse::cache_size_report());
+    }
     total.load(Ordering::Relaxed)
 }
 
