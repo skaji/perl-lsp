@@ -1651,13 +1651,11 @@ fn enriched_tree_diagnostics(
     // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
     // diagnostics` / `--check` / gold see the same Mode-B answers the LSP
     // publishes. No enrichment (pack files aren't cross-file-enriched).
-    idx.for_each_pack_index(|_lang, pack| {
-        pack.for_each_registered_file(&mut |cm| {
-            let file = cm.path.display().to_string();
-            for d in symbols::pack_diagnostics(&cm.analysis, options) {
-                all.push((file.clone(), d));
-            }
-        });
+    idx.for_each_pack_registered_file(&mut |path, analysis| {
+        let file = path.display().to_string();
+        for d in symbols::pack_diagnostics(analysis, options) {
+            all.push((file.clone(), d));
+        }
     });
     all
 }
