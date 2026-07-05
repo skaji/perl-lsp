@@ -10,6 +10,25 @@ export PERL5LIB="${PERL5LIB:-$PWD/test_files/lib}"
 
 bin="${PERL_LSP_BIN:-./target/release/perl-lsp}"
 
+# Reap our own servers. nvim spawns perl-lsp and cleanly shuts it down when nvim
+# exits normally — but a hung suite that CI `timeout`-kills orphans the server
+# (it reparents to init but keeps our process group). The parent-liveness
+# monitor self-exits it within ~10s regardless; this trap is the immediate
+# belt-and-suspenders. Only touches perl-lsp started DURING this run and sharing
+# our process group, so an unrelated editor's server (different pgid) is safe.
+our_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+declare -A _preexisting_lsp=()
+for _p in $(pgrep -x perl-lsp 2>/dev/null || true); do _preexisting_lsp[$_p]=1; done
+reap_servers() {
+  local pid pgid
+  for pid in $(pgrep -x perl-lsp 2>/dev/null || true); do
+    [[ -n "${_preexisting_lsp[$pid]:-}" ]] && continue
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [[ "$pgid" == "$our_pgid" ]] && kill -TERM "$pid" 2>/dev/null || true
+  done
+}
+trap reap_servers EXIT
+
 # Warm the fixture cache synchronously before the suite loop. The cross-file
 # suites poll a fixed 10s for the workspace index; with a cold cache the async
 # resolver loses that race in isolation, and the full run only passes because

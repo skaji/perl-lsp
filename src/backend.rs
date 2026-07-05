@@ -1000,6 +1000,49 @@ fn refs_to_locations(results: Vec<crate::resolve::RefLocation>) -> Option<Vec<Lo
     Some(locations)
 }
 
+/// How often the parent-liveness monitor polls the client `processId`. ~10s is
+/// the cadence vscode-languageserver-node / lsp4j / jdt.ls use — cheap enough to
+/// run unconditionally, tight enough that a leaked server dies within a poll.
+const PARENT_LIVENESS_POLL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Spawn a detached timer that self-exits when the LSP client (parent) process
+/// dies. This is INDEPENDENT of the stdin read loop by design: the leak cases
+/// are exactly when the read loop isn't running (server wedged mid-analysis, or
+/// a hard SIGKILL of the editor that delivered no clean EOF). `None` disables
+/// the check — per spec, a null `processId` means the client didn't fork us.
+fn spawn_parent_liveness_monitor(process_id: Option<u32>) {
+    let Some(pid) = process_id else { return };
+    if pid == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(PARENT_LIVENESS_POLL).await;
+            if !parent_process_alive(pid) {
+                // Client gone; nothing to flush after the connection drops.
+                // Exit hard so background `spawn_blocking` indexing (which parks
+                // on `send_request` once the client vanishes) can't keep the
+                // runtime — and a multi-GB workspace index — alive.
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// Linux liveness probe: `/proc/<pid>` vanishes once the process is reaped. No
+/// new dependency, no signal side effects (unlike `kill(pid, 0)`).
+#[cfg(target_os = "linux")]
+fn parent_process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Off Linux there's no cheap dependency-free probe, so assume alive — never
+/// false-positive into an exit. The stdin-EOF path still covers clean shutdown.
+#[cfg(not(target_os = "linux"))]
+fn parent_process_alive(_pid: u32) -> bool {
+    true
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
@@ -1019,6 +1062,14 @@ impl LanguageServer for Backend {
         // Same root drives repo-local `.perl-lsp/` plugin discovery, so the
         // plugin set and the per-project cache key can't disagree.
         crate::plugin::rhai_host::set_workspace_root(root);
+
+        // LSP spec: `initialize` carries the client `processId`; "if the parent
+        // process is not alive then the server should exit." Poll it on an
+        // independent timer — the ROBUST backstop the stdin-EOF path can't be
+        // (that's coupled to the read loop, which isn't running precisely when
+        // the leak happens: a server wedged mid-analysis isn't reading stdin,
+        // and a hard SIGKILL of the editor need not deliver a clean EOF).
+        spawn_parent_liveness_monitor(params.process_id);
 
         // Server-initiated progress is capability-gated (M7): only send
         // `window/workDoneProgress/create` to clients that opted in.
