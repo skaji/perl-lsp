@@ -39,6 +39,16 @@
   name: (namespace_identifier) @def.package.name @context.namespace
   body: (declaration_list) @scope) @def.package
 
+; `inline namespace v11` — a name-only sibling (the def/scope/context still
+; come from the base pattern above; an optional "inline"? capture there would
+; kill the pattern's other captures). The extractor joins by name span and
+; tags the Package symbol "inline", so the qualified-completion gather lifts
+; its members into the enclosing namespace (C++ inline-namespace
+; transparency).
+(namespace_definition
+  "inline"
+  name: (namespace_identifier) @ns.inline)
+
 ; ---- type defs: class / struct / union / enum ----
 ; @context.class tags the body's members with the class name (package),
 ; so member completion (`obj.`) and symbol_in_class resolve them.

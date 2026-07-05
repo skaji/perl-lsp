@@ -116,3 +116,42 @@ fn detect_slot_perl_use_module_name_is_module_path() {
         other => panic!("expected ModulePath slot, got {:?}", other),
     }
 }
+
+/// A pack-language `::`-qualified cursor (`fmtx::f|`) is a `ModulePath`
+/// slot naming the qualifier as owner — the completion consumer gathers
+/// that owner's members instead of the global pool. Detection is
+/// `resolve::qualifier_at_point`, the same anchor goto-def resolves
+/// through.
+#[cfg(feature = "cpp")]
+#[test]
+fn detect_slot_cpp_qualified_path_is_module_path() {
+    let src = "namespace fmtx { void format_to(int); }\nvoid caller() {\n    fmtx::f\n}\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let analysis = reg.for_id("cpp").unwrap().analyze_with_path(src, None);
+
+    // Mid-token: `fmtx::f|`.
+    let slot = detect_slot(&analysis, &tree, src, Point::new(2, 11), "cpp", None);
+    match slot {
+        Slot::ModulePath { prefix, in_use } => {
+            assert_eq!(prefix, "fmtx");
+            assert!(!in_use);
+        }
+        other => panic!("expected ModulePath slot, got {:?}", other),
+    }
+
+    // Bare qualifier: `fmtx::|` (nothing typed after the colons yet).
+    let src2 = "namespace fmtx { void format_to(int); }\nvoid caller() {\n    fmtx::\n}\n";
+    let tree2 = parser.parse(src2, None).unwrap();
+    let analysis2 = reg.for_id("cpp").unwrap().analyze_with_path(src2, None);
+    let slot = detect_slot(&analysis2, &tree2, src2, Point::new(2, 10), "cpp", None);
+    match slot {
+        Slot::ModulePath { prefix, in_use } => {
+            assert_eq!(prefix, "fmtx");
+            assert!(!in_use);
+        }
+        other => panic!("expected ModulePath slot, got {:?}", other),
+    }
+}

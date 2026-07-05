@@ -147,9 +147,17 @@ why parked, what unblocks it. Prune on landing.
   gd THROUGH the same nested sites works, so this is index-population only.
   Pinned `cpp-macro-nested-ref-in-macro-body` (xfail); unassigned.
   - let's close this guy too
-- **`fmt::` qualified-path completion** unfiltered (the completion half
-  of namespace participation — gd/gr half landed in slice B).
-  - this should be closed
+- **`fmt::` qualified-path completion** — CLOSED. A pack `ns::`/`Class::`
+  cursor detects as `Slot::ModulePath` via the same `qualifier_at_point`
+  goto-def anchors on; `CandidateSet::complete_qualified_path`'s pack lane
+  gathers the owner's members (shared `pack_member_of` predicate with
+  `member_def_location`, so "offered" = "resolvable"), nested containers,
+  and inline-namespace-lifted members ("inline" attribute minted by the
+  `@ns.inline` skeleton capture; EXTRACT_VERSION 154). Empty gather falls
+  through to the bare-identifier universe — so real fmt's OWN `fmt::` drill
+  (members unattributed behind `FMT_BEGIN_NAMESPACE`) keeps prior behavior
+  until the macro-guarded-namespace-open gap closes; `fmt::detail::` filters
+  correctly there today. Gold: `cpp-qualified-completion.json` (4 rows).
 
 ## Cross-references
 - Gap shapes behind open xfails: `gold-corpus/KNOWN-GAPS.md`
