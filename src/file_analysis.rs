@@ -2382,6 +2382,16 @@ pub struct FileAnalysis {
     /// here so query-time owner resolution can mint the column owner cross-file.
     #[serde(default)]
     pub column_keyed_verbs: HashSet<String>,
+    /// Number of dynamic method-dispatch sites (`$obj->$method(...)`) in
+    /// this file — calls whose method name is a scalar, not a bareword.
+    /// They produce no nameable `MethodCall` ref (unless const-folding
+    /// resolves the name), so they are invisible to the static reference
+    /// graph. The `--heatmap` dead-code pass reads this as a per-workspace
+    /// soundness gate: when any file dispatches dynamically, a zero-fan-in
+    /// method can't be proven dead (Perl may reach it through this
+    /// invisible edge), so it is NOT flagged.
+    #[serde(default)]
+    pub dynamic_dispatch_sites: u32,
 
     /// Caller-side loader facts: this file loads plugin `name` and
     /// passes the value at `config_span`. Joined at enrichment with
@@ -2458,6 +2468,7 @@ pub struct FileAnalysisParts {
     pub dynamic_parent_packages: HashSet<String>,
     pub role_packages: HashSet<String>,
     pub column_keyed_verbs: HashSet<String>,
+    pub dynamic_dispatch_sites: u32,
     pub plugin_loads: Vec<PluginLoadFact>,
     pub loader_config_params: Vec<LoaderConfigParam>,
 }
@@ -2616,6 +2627,7 @@ impl FileAnalysis {
             dynamic_parent_packages,
             role_packages,
             column_keyed_verbs,
+            dynamic_dispatch_sites,
             plugin_loads,
             loader_config_params,
         } = parts;
@@ -2654,6 +2666,7 @@ impl FileAnalysis {
             dynamic_parent_packages,
             role_packages,
             column_keyed_verbs,
+            dynamic_dispatch_sites,
             plugin_loads,
             loader_config_params,
             scope_starts: Vec::new(),
