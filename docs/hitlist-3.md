@@ -4,6 +4,94 @@ Live findings queue for round 3. Same discipline as hitlist-2: every
 reducible finding gets a RED xfail row before its fix; root causes get
 CONFIRMED by experiment, not guessed.
 
+## Round-3 dogfood synthesis (folly/spdlog/abseil/json/perl5/redis, 2026-07-05)
+
+Raw reports: three probes, ~30 findings, deduped into FOUR families +
+small fry. gr/reverse-index was correct in every family-Q case — the rot
+is all in forward gd/hover.
+
+### Family Q — qualifier/owner-blind forward resolution (5 symptoms, likely 1 root)
+
+gd/hover fall through to a bare-name global search that ignores both the
+`X::` qualifier and the receiver's class; gr at the same coordinates is
+correct every time.
+- folly `case dynamic::STRING:` (dynamic-inl.h:1408) → gd lands on an
+  UNRELATED `#define STRING` in FBStringBenchmark.cpp (wrong-answer).
+- folly `dynamic::OBJECT` (dynamic.cpp:98) → dark (same gap, no collider).
+- spdlog `level::info` (3 sites) → `dragonbox::float_info<Float>::info`
+  type alias in bundled fmt (wrong-answer).
+- spdlog member calls `logger.log/.info/.trace` → same-named FREE
+  functions in spdlog.h win over the class members; receiver typing is
+  fine (set_level resolves; completion correctly scoped) — the collision
+  priority is the bug.
+- fmt hover on `native_formatter::format` decl → color.h's free
+  `format` (hover-only; gr at same span correct → hover shares the
+  qualifier-blind path).
+FIX SLICE Q (owner-anchored forward resolution). Assigned.
+
+### Family M — macro-body extraction fidelity (perl5 core types dark)
+
+- **`_SV_HEAD` comment-truncation, ROOT-CAUSED**: tree-sitter-cpp's
+  `preproc_arg` truncates a backslash-continued macro body at the first
+  trailing `/* comment */`; `Macro.body` keeps only the first field, so
+  SV — THE central Perl type — has zero member intelligence
+  (`sv->sv_flags` dark everywhere; `sv->` completion junk). Fix scoped by
+  the probe's sub-agent: re-derive the body from raw source bytes across
+  continuations (strip comments) instead of trusting the CST span
+  (cpp_reparse.rs: MACRO_DEF_QUERY / clean_body / plan_member_blocks).
+- **BASEOP per-field synthesis drops 4/14 fields** (op_targ, op_opt,
+  op_slabbed, op_flags dark; 9 siblings + completion fine) — DISTINCT
+  bug (body parses in full, no comments involved) in the per-field
+  span-splitting (`synth_base`). Field position doesn't predict failure.
+- **gr misses macro-nested refs at scale**: SvFLAGS 190 vs 347 grep-real,
+  SvANY 111 vs 200 — refs inside OTHER macros' bodies aren't indexed
+  (generalizes the known redis `OBJ_ENCODING_EMBSTR` gap from
+  one-site-curio to 45% undercount on core symbols). gd through the same
+  nested sites WORKS — index-population-only.
+FIX SLICE M. Assigned.
+
+### Family A+I — cpp local-intelligence gaps
+
+- **Braced-init flow misinference beats the declared type** (abseil):
+  `flat_hash_map<int,int> m = {{1,7},{2,9}};` hovers `m: Numeric`,
+  completion falls to junk; the no-init control is perfect. The C++ twin
+  of the landed annotation-priority fix, on an axis it didn't cover
+  (either the annot witness isn't minted for this decl shape, or the
+  braced-init flow witness outruns it).
+- **Implicit-`this` sibling method CALLS dark** (folly, template AND
+  plain classes): bare `reserveSmall(...)` inside an out-of-line member
+  body, `isNull()` inside `dynamic::empty()` — gd nothing. Qualified
+  `Class::method` resolution works; the sibling-call link back is
+  missing. The sibling-FIELD reads landed (emit_return_fuel); calls are
+  the unfinished half.
+FIX SLICE AI. Assigned.
+
+### Ledgered small fry (not sliced this round)
+
+- json single-header attribution break: SHARPENED — trigger is the `#if`
+  in ctor-initializer position at json.hpp:21396; attribution never
+  recovers for ~4400 lines (~80% of basic_json: completion empty, hover
+  cross-file corrupted). Plus spurious Method re-emission of two call
+  statements at the break point. Still the config-superposition-on-
+  declarations tier (PARKED); now with exact blast radius.
+- Dual-vs-single gd targets on typed fields inconsistent (`op_type` →
+  field + enum def; `op_next` → field only) — normalize deliberately.
+- redis `extern struct redisCommand redisCommandTable[]` → defining decl
+  behind `#include "commands.def"` not linked (single site).
+- `struct interpreter`/PERLVAR token-pasting invisible — fundamental
+  no-preprocessing limitation, recorded as expected behavior (PL_curcop
+  resolves one hop, `Icurcop` doesn't exist as text anywhere).
+
+### Verified green in round 3 (the re-probe column)
+
+Substitute arity (all 4 arities, independently), join() arity both ways,
+GUARDED_BY 56/56 grep-exact, format_to ~90 grep-consistent, domain
+completion ranking OP_* at two real op.c sites in declaration order,
+pTHX_ hover/locals/members across 5 functions, embed.h alias dual-target
+gd (macro def + real fn), memory_buffer completion, OBJ_ENCODING_EMBSTR
+20/22 with both misses accounted for, commands.def navigation, robj*
+member gd, OP_PADSV gr 100% comment-exact.
+
 ## 1. Context-param macro chains break member resolution (perl5 pTHX_) — RESOLVED
 
 **Resolution (2026-07-05):** the pTHX_ chain was a RED HERRING. Bisection
