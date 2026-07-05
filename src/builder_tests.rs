@@ -39,6 +39,142 @@ fn debug_moo_name_refs() {
     }
 }
 
+/// A Mojo plugin that mints helpers with dynamically-built names — an
+/// interpolated loop name (`"get_$name"`), the bare loop var (`$name`),
+/// a `.`-concat (`'find_' . $name`), and a lexical-literal name (both
+/// bare and interpolated) — must synthesize each concrete helper as a
+/// real Method on the app surface. The name enumeration is structural
+/// (loop var over a literal `qw` list, lexical assigned a literal);
+/// nothing is executed. Each synthesized helper's selection span is the
+/// registration `$app->helper(...)` name argument, so goto-def lands on
+/// the call site (provenance, rule #9).
+#[test]
+fn plugin_mojo_helpers_dynamic_loop_names_synthesize() {
+    let src = r#"
+package MyApp::Plugin::Dyn;
+use Mojo::Base 'Mojolicious::Plugin';
+sub register {
+    my ($self, $app) = @_;
+    for my $name (qw(user order invoice)) {
+        $app->helper("get_$name" => sub { my ($c) = @_; return 1; });
+        $app->helper($name => sub { my ($c) = @_; return 2; });
+        $app->helper('find_' . $name => sub { my ($c) = @_; return 3; });
+    }
+    my $one = 'single';
+    $app->helper($one => sub { my ($c) = @_; return 4; });
+    $app->helper("mk_$one" => sub { my ($c) = @_; return 5; });
+    $app->helper("${one}_x" => sub { my ($c) = @_; return 6; });
+}
+1;
+"#;
+    let fa = build_fa(src);
+    let mut names: Vec<&str> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+        .map(|s| s.name.as_str())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "find_invoice", "find_order", "find_user", "get_invoice", "get_order", "get_user",
+            "invoice", "mk_single", "order", "single", "single_x", "user",
+        ],
+        "every statically enumerable helper name (loop-var interpolation bare \
+         and braced, bare loop var, concat, lexical literal) minted as a Method",
+    );
+
+    // Each helper is a real Method on the app surface, resolvable from any
+    // controller/app via the synthetic-parent edge — same as a literal helper.
+    for consumer in ["Mojolicious::Controller", "Mojolicious"] {
+        for helper in ["get_order", "find_user", "mk_single"] {
+            match fa.resolve_method_in_ancestors(consumer, helper, None) {
+                Some(crate::file_analysis::MethodResolution::Local { class, .. }) => {
+                    assert_eq!(class, crate::file_analysis::APP_SURFACE_CLASS);
+                }
+                other => panic!("{consumer}->{helper} should resolve to the app surface, got {other:?}"),
+            }
+        }
+    }
+
+    // Provenance: the interpolated helper's selection span is the name
+    // argument at its own registration site (row 6 = the `"get_$name"`
+    // line), NOT some other loop iteration's line — so goto-def lands on
+    // the exact `$app->helper("get_$name" => …)` call.
+    let get_order = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == "get_order")
+        .expect("get_order synthesized");
+    assert_eq!(get_order.selection_span.start.row, 6, "selection span at the registration name");
+    assert_eq!(get_order.span.start.row, 6, "extent span at the registration call");
+}
+
+/// Nested loops over two literal lists: the cross-product falls out of the
+/// same interpolation fold (both loop vars are live in the constant table
+/// when the inner body is walked), so `"${verb}_$obj"` mints every
+/// verb×obj combination. No dedicated nested-loop machinery.
+#[test]
+fn plugin_mojo_helpers_nested_loop_cross_product() {
+    let src = r#"
+package P;
+use Mojo::Base 'Mojolicious::Plugin';
+sub register {
+    my ($self, $app) = @_;
+    for my $verb (qw(get set)) {
+        for my $obj (qw(user post)) {
+            $app->helper("${verb}_$obj" => sub { my ($c) = @_; return 1; });
+        }
+    }
+}
+1;
+"#;
+    let fa = build_fa(src);
+    let mut names: Vec<&str> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+        .map(|s| s.name.as_str())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["get_post", "get_user", "set_post", "set_user"],
+        "nested loops mint the full verb×obj cross-product",
+    );
+}
+
+/// The honest boundary: a helper name that is NOT statically decidable —
+/// a function call (`compute()`), or an interpolation over an unknown
+/// variable (`"x_$unknown"`) — synthesizes NOTHING. No guess, no
+/// fabricated symbol named `compute` / `x_$unknown`.
+#[test]
+fn plugin_mojo_helpers_undecidable_name_synthesizes_nothing() {
+    let src = r#"
+package MyApp::Plugin::Dyn;
+use Mojo::Base 'Mojolicious::Plugin';
+sub register {
+    my ($self, $app) = @_;
+    $app->helper(compute() => sub { my ($c) = @_; return 1; });
+    $app->helper("x_$unknown" => sub { my ($c) = @_; return 2; });
+    $app->helper($runtime => sub { my ($c) = @_; return 3; });
+}
+1;
+"#;
+    let fa = build_fa(src);
+    let names: Vec<&str> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        names.is_empty(),
+        "undecidable helper names must synthesize nothing, got {names:?}",
+    );
+}
+
 // ---- varname-based extraction ----
 
 /// Adversarial: every flavor of `foo` access (plain, element, slice,

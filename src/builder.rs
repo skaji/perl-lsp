@@ -2165,7 +2165,6 @@ impl<'a> Builder<'a> {
     fn arg_info_for(&mut self, arg: Node<'a>) -> plugin::ArgInfo {
         let text = arg.utf8_text(self.source).unwrap_or("").to_string();
         let mut content_span: Option<Span> = None;
-        let mut string_values: Vec<String> = Vec::new();
         let string_value = match arg.kind() {
             "string_literal" | "interpolated_string_literal" => {
                 // Read the string_content child — quote-flavor-agnostic
@@ -2192,21 +2191,22 @@ impl<'a> Builder<'a> {
             // through the constant table (`$app->plugin(EXTRA)` where
             // `use constant EXTRA => 'Gizmos'`). Falls back to the raw
             // token when it names no constant.
-            "bareword" => {
-                if let Some(folded) = self.resolve_constant_strings(&text, 0) {
-                    string_values = folded.clone();
-                    folded.into_iter().next()
-                } else {
-                    Some(text.clone())
-                }
-            }
+            "bareword" => self
+                .resolve_constant_strings(&text, 0)
+                .and_then(|f| f.into_iter().next())
+                .or_else(|| Some(text.clone())),
             "scalar" | "array" | "hash" => {
-                let folded = self.resolve_constant_strings(&text, 0).unwrap_or_default();
-                string_values = folded.clone();
-                folded.into_iter().next()
+                self.resolve_constant_strings(&text, 0).and_then(|f| f.into_iter().next())
             }
             _ => None,
         };
+        // `string_values` is the multi-value channel: a loop registration
+        // (`$app->helper("get_$name" => …) for my $name (qw(a b))`) folds to
+        // every candidate. The general enumeration owns literal / interpolated
+        // / constant-ref / concat folding; an undecidable arg yields empty and
+        // falls back to the single `string_value` (a fat-comma bareword key,
+        // an unfolded interpolation the plugin then skips).
+        let mut string_values = self.enumerate_string_values(arg);
         if string_values.is_empty() {
             string_values.extend(string_value.clone());
         }
@@ -6137,12 +6137,15 @@ impl<'a> Builder<'a> {
                         segments.push(vec![literal.to_string()]);
                     }
                 }
-                // Resolve the variable
-                let var_text = match var_node.utf8_text(self.source) {
-                    Ok(t) => t,
-                    Err(_) => return vec![],
+                // Resolve the variable — canonicalize via the `varname`
+                // child so the braced form (`${verb}`) keys the same
+                // `$verb` as the bare `$verb`; the raw scalar text carries
+                // the braces and would miss the loop/lexical binding.
+                let key = match var_node.named_child(0).and_then(|v| v.utf8_text(self.source).ok()) {
+                    Some(bare) if !bare.is_empty() => format!("${bare}"),
+                    _ => return vec![],
                 };
-                match self.resolve_constant_strings(var_text, 0) {
+                match self.resolve_constant_strings(&key, 0) {
                     Some(values) if !values.is_empty() => segments.push(values),
                     _ => return vec![],
                 }
@@ -9128,20 +9131,37 @@ impl<'a> Builder<'a> {
     }
 
     /// `*{ EXPR }` — derive name(s) from the block's single expression.
-    /// Handles a bare string literal and a constant-foldable interpolated
-    /// string / concat; bails (empty) on anything runtime-dynamic.
     fn glob_name_from_block(&self, block: Node<'a>, _assign_node: Node<'a>) -> Vec<String> {
         let inner = (|| {
             let stmt = block.named_child(0)?;
             stmt.named_child(0)
         })();
         let Some(expr) = inner else { return vec![] };
+        self.enumerate_string_values(expr)
+    }
+
+    /// The statically enumerable string values an expression can take, or
+    /// empty when not decidable (a call, an unknown variable, a non-`.`
+    /// operator). The general "what strings is this expression" query —
+    /// folds string literals, interpolations over known loop/lexical vars
+    /// (`"get_$name"`), constant/loop-var refs (`$name`, a `use constant`),
+    /// and `.`-concatenation of the same (`'find_' . $name`). An
+    /// undecidable operand collapses the whole result to empty (honest: no
+    /// partial guess). Consumers structurally project these into symbols:
+    /// glob-install name derivation (`*{"…"} = sub`) and dynamic helper /
+    /// plugin registration names (`$app->helper("get_$name" => …)`).
+    fn enumerate_string_values(&self, expr: Node<'a>) -> Vec<String> {
         match expr.kind() {
             "string_literal" => self.extract_string_content(expr).into_iter().collect(),
             "interpolated_string_literal" => self.try_fold_interpolated_string(expr),
-            // `'is_' . $type` — fold both operands; if any operand is dynamic
-            // and unresolvable, the fold yields empty and we skip (don't guess).
             "binary_expression" => self.try_fold_string_concat(expr),
+            "scalar" | "array" | "hash" | "bareword" => self
+                .resolve_constant_strings(expr.utf8_text(self.source).unwrap_or(""), 0)
+                .unwrap_or_default(),
+            "parenthesized_expression" | "list_expression" => expr
+                .named_child(0)
+                .map(|c| self.enumerate_string_values(c))
+                .unwrap_or_default(),
             _ => vec![],
         }
     }
