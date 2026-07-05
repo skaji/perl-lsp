@@ -27,7 +27,13 @@ correct every time.
 - fmt hover on `native_formatter::format` decl → color.h's free
   `format` (hover-only; gr at same span correct → hover shares the
   qualifier-blind path).
-FIX SLICE Q (owner-anchored forward resolution). Assigned.
+FIX SLICE Q (owner-anchored forward resolution). **LANDED** — `resolve.rs`
+gd/hover resolve a `::`-qualified read on its owner (the qualifier segment
+touching the token) BEFORE any bare-name fallback (`qualifier_at_point` +
+`member_def_location`), and `overload_arity_definitions` ranks by owner match
+so a sibling member outranks a package-less free function
+(`cpp-sibling-call-shadows-free`, `ownerqual/` rows gold). The owner match is
+the single key across `dynamic::STRING` / `logger.info` / `level::info`.
 
 ### Family M — macro-body extraction fidelity (perl5 core types dark)
 
@@ -48,7 +54,18 @@ FIX SLICE Q (owner-anchored forward resolution). Assigned.
   (generalizes the known redis `OBJ_ENCODING_EMBSTR` gap from
   one-site-curio to 45% undercount on core symbols). gd through the same
   nested sites WORKS — index-population-only.
-FIX SLICE M. Assigned.
+FIX SLICE M. **PARTIALLY LANDED.** `_SV_HEAD` comment-truncation FIXED —
+`clean_body`/`raw_macro_body` re-derive the body from raw source across
+continuations (C phase-2 splice then phase-3 comment removal), and
+`plan_member_blocks` handles function-like member-block pastes
+(`_SV_HEAD(void*)`) with comment-neutralized blanking; SV member
+intelligence restored (`memfree/` rows gold). **BASEOP was a
+MISATTRIBUTION**: the "4/14 fields dropped" were not a `synth_base` bug —
+those fields go dark only in config-INACTIVE `#ifdef` twins (`op_slabbed`
+works at op.c:394, dark at op.c:633 in the same function), the known
+config-superposition-on-declarations tier (PARKED). The nested-ref gr
+undercount is still open, now pinned `cpp-macro-nested-ref-in-macro-body`
+(xfail).
 
 ### Family A+I — cpp local-intelligence gaps
 
@@ -64,7 +81,15 @@ FIX SLICE M. Assigned.
   `Class::method` resolution works; the sibling-call link back is
   missing. The sibling-FIELD reads landed (emit_return_fuel); calls are
   the unfinished half.
-FIX SLICE AI. Assigned.
+FIX SLICE AI. **LANDED.** Braced-init: `FrameworkAwareTypeFold` now breaks
+ties by source priority for every `InferredType` flavor (not just
+`ClassName`), so a declared container type (`ANNOT_SOURCE`, priority 20)
+dominates the initializer's inferred flow witness (`braced_type.cpp` /
+`type-at` rows). Sibling calls: `emit_return_fuel` pins a bare `foo(...)`
+inside a method body to the enclosing method symbol's package (walked off
+the peeled symbol, so out-of-line bodies work too), routing it through
+`package_scoped_callable` — gd/gr/rename land on the member
+(`sibling_call.cpp` rows).
 
 ### Ledgered small fry (not sliced this round)
 

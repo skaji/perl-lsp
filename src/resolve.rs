@@ -1961,21 +1961,10 @@ impl<'a> CandidateSet<'a> {
         // already returned for resolved ones), so this is the cross-file
         // tail: `OP_SCOPE` used in op.c resolving to its enumerator def in
         // opnames.h. (Perl's cache is keyed by MODULE name, so a bare-name
-        // lookup no-ops.)
-        // A `::`-qualified value read (`absl::StatusCode::kNotFound`): the
-        // owning class is the qualifier segment touching the token — resolve
-        // the member on it. Enum-class constants are class content, invisible
-        // to the by-name file-scope tail below (they aren't file-scope names).
-        if let (Some(source), Some(r)) = (self.source, analysis.ref_at(point)) {
-            if matches!(r.kind, RefKind::Variable) && r.resolves_to.is_none() {
-                if let Some(owner) = qualifier_before(source, r.span) {
-                    if let Some(loc) = self.member_def_location(owner, &r.target_name) {
-                        return vec![loc];
-                    }
-                }
-            }
-        }
-
+        // lookup no-ops.) A `::`-qualified value read
+        // (`absl::StatusCode::kNotFound`) is already handled at the top by the
+        // owner-anchored step (`qualifier_at_point` + `member_def_location`),
+        // which fires unconditionally for pack routing before this tail.
         if let Some(r) = analysis.ref_at(point) {
             if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
                 let name = r.unqualified_target_name();
@@ -3354,27 +3343,9 @@ fn template_instance_spelling(source: &str, span: Span) -> Option<String> {
     None
 }
 
-/// The qualifier segment immediately before `span` — `StatusCode` for the
-/// `kNotFound` span in `absl::StatusCode::kNotFound`. `None` when the token
-/// isn't preceded by `::`.
-fn qualifier_before(source: &str, span: Span) -> Option<&str> {
-    let start = crate::cursor_sentinel::point_to_byte(source, span.start);
-    if start < 2 || !source.is_char_boundary(start) || &source[start - 2..start] != "::" {
-        return None;
-    }
-    let b = source.as_bytes();
-    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
-    let e = start - 2;
-    let mut s = e;
-    while s > 0 && is_id(b[s - 1]) {
-        s -= 1;
-    }
-    (s < e).then(|| &source[s..e])
-}
-
 /// The `::`-qualifier owning the identifier under `point` — `dynamic` for the
 /// cursor anywhere in `STRING` of `dynamic::STRING`. Walks back to the token
-/// start (like `word_at_point`), then reuses `qualifier_before`'s `::`-scan.
+/// start (like `word_at_point`), then scans a leading `::` scope.
 /// `None` when the token has no leading `::` scope.
 fn qualifier_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
     let cursor = crate::cursor_sentinel::point_to_byte(source, point);

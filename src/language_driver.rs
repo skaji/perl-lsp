@@ -222,14 +222,17 @@ impl LanguageDriver for PackDriver {
     /// 6. `skel.into_file_analysis()` — the skeleton → FileAnalysis assembly
     ///    (unchanged; a method on `SkeletonAnalysis`, not a phase fn here).
     /// 7. `emit_return_fuel` — post-assembly implicit-return / implicit-
-    ///    field-read interpretation over the FINAL FileAnalysis (stable
+    ///    `this` interpretation over the FINAL FileAnalysis (stable
     ///    SymbolIds, resolved refs): an `auto`-returning function with no
     ///    declared type chains its Symbol onto its `return`-statement sites
     ///    (structural-only in the skeleton — `SkeletonAnalysis::return_sites`
     ///    — so `query_extract.rs` stays language-generic; the "this needs
     ///    implicit-return fuel" READING of that data is cpp semantics, so it
-    ///    lives here). MUST run after (6): needs final SymbolIds + resolved
-    ///    `fa.refs`.
+    ///    lives here). The `implicit_field_reads`-gated half also mints
+    ///    implicit-`this` FIELD-read edges AND pins bare sibling method
+    ///    CALLs to the enclosing class (`resolved_package`), so both halves
+    ///    of C++'s receiver elision resolve. MUST run after (6): needs final
+    ///    SymbolIds + resolved `fa.refs`.
     /// 8. `register_post_build` — post-assembly hooks that stamp fields only
     ///    queryable once the FileAnalysis exists: macro defs, attribute-macro
     ///    signals, access-region visibility, include closure, degraded flag.

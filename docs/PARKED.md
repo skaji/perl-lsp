@@ -9,6 +9,22 @@ why parked, what unblocks it. Prune on landing.
 - **Two include-BFS walkers + two `file_stamp` fns** (cpp_reparse vs
   module_cache): twice examined, twice left (different contracts/layers);
   verdicts recorded so sweeps don't re-litigate. Merge only with a reason.
+- **Two C-comment strippers in cpp_reparse** (`strip_c_comments` vs
+  `blank_comments_in_range`): distinct contracts — the former COLLAPSES
+  whitespace to produce clean body text, the latter is length-preserving
+  (spaces over comment bytes, newlines kept) so byte offsets stay in
+  original coordinates for member positioning. Not a merge target.
+- **Two "enclosing class" notions in `emit_return_fuel`**: the implicit-
+  field half reads the ref's own `scope.package`; the sibling-CALL half
+  walks up to the enclosing method SYMBOL's package (so out-of-line bodies,
+  whose body scope carries no package, still resolve). Deliberately
+  different robustness; unifying is a behavior change, not a cleanup.
+- **Two domain/type completion rankers** (`backend::rank_domain_members`
+  for pack enum members vs `symbols::rank_candidates_by_expected_type` for
+  Perl scope vars): different item types (`CompletionItem` vs
+  `CompletionCandidate`) and semantics (enum members verbatim, front-loaded
+  vs. type-matching locals kept at `PRIORITY_LOCAL`). No shared gatherer to
+  factor.
 - **Open forks awaiting ratification** (`docs/open-forks.md`):
   `Slot::ModulePath.in_use` field; ref-type deref snippets as projection
   policy vs candidate data. Both cheap to undo.
@@ -42,7 +58,11 @@ why parked, what unblocks it. Prune on landing.
   root seed of the hitlist-3 #1 bug). The annotation-priority fix shields
   ANNOTATED receivers; an `auto`/annotation-less local initialized from
   an uppercase call still mistypes. Wants the heuristic gated on "callee
-  resolves to a known type/ctor", not name case alone.
+  resolves to a known type/ctor", not name case alone. (The round-3
+  braced-init fix generalized the annotation-dominates axis to every
+  `InferredType` flavor, not just `ClassName` — but `ClassName` was already
+  shielded, so this residual's exposure is UNCHANGED: the auto-less case has
+  no annotation witness to dominate the bogus flow class.)
 - **C struct-field member resolution through a call-expression receiver**
   (`mkStruct()->field` where the callee's declared return is a struct
   pointer) — dark; distinct from the landed cpp method chain roots
@@ -70,8 +90,12 @@ why parked, what unblocks it. Prune on landing.
   staleness) — KNOWN-GAPS "LSP session determinism".
 - **Enum value as template argument** not a ref (`MakeError<StatusCode::
   kNotFound>`) — hitlist-2 residual, unassigned.
-- **Ref inside another macro's body** (`OBJ_ENCODING_EMBSTR` in
-  `sdsEncodedObject`) — hitlist-2 residual, unassigned.
+- **Refs inside another macro's `#define` body aren't indexed** — a use of
+  `FLAGS` inside `IS_OK`'s body, redis `OBJ_ENCODING_EMBSTR` in
+  `sdsEncodedObject`, perl5 `SvFLAGS` (190/347 grep-real) / `SvANY`
+  (111/200). Macro definition bodies are preproc-excluded from ref minting;
+  gd THROUGH the same nested sites works, so this is index-population only.
+  Pinned `cpp-macro-nested-ref-in-macro-body` (xfail); unassigned.
 - **`fmt::` qualified-path completion** unfiltered (the completion half
   of namespace participation — gd/gr half landed in slice B).
 
