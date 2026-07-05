@@ -20,8 +20,6 @@ why parked, what unblocks it. Prune on landing.
 - **Type-constrained completion** at domain slots (`op_type == |` → `OP_*`)
   — needs cursor-context work; extends the landed cursor `Slot` taxonomy
   (`docs/adr/cursor-slots.md`) with a type-constrained domain slot.
-- **Overload arity ranking** (hitlist-2 #3) — needs extraction-minted
-  arg/param counts first; evaluated in slice A, not taken.
 - **Template rungs**: dependent types (`T::value_type`), value-arg
   deduction, template-template params.
 - **Flag-set domains** (`op_flags`/`OPf_*` — subset-of vs one-of).
@@ -43,11 +41,6 @@ why parked, what unblocks it. Prune on landing.
   ANNOTATED receivers; an `auto`/annotation-less local initialized from
   an uppercase call still mistypes. Wants the heuristic gated on "callee
   resolves to a known type/ctor", not name case alone.
-- **Call-root chain arm hardcodes `arity_hint = Some(0)`**
-  (`file_analysis.rs::expr_type_at_span`): wrong hint for a multi-arg call
-  root on an arity-discriminated callee. Harmless while cpp overloads are
-  parked; the depth round's overload-arity slice mints real arg counts —
-  fix it there with the same fuel.
 - **json.hpp attribution stops mid-class** at a `#if`-conditional
   ctor-initializer — the config-superposition tier (a `#if` inside a
   class body forks the member list; wants the superposition model applied

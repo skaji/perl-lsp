@@ -530,6 +530,13 @@
 ; `resolved_package` — the namespace-participation half of gr identity.
 (call_expression function: (qualified_identifier) @ref.qcall) @expr.call
 
+; ---- overload arity ranking fuel (structural counts only; "which overload
+; fits" is downstream interpretation, `ParamArity::fit`). An arg list is
+; joined to its callee ref by adjacency (`ref.end == arglist.start`); a
+; def's parameter list is joined to the def by span containment. ----
+(argument_list) @arity.args
+(function_declarator parameters: (parameter_list) @arity.sig)
+
 ; ---- member access (`recv.field` / `recv->field`, AND `recv.method(...)`):
 ; the field is the "method", the receiver subtree the invocant. Mints the same
 ; MethodCall ref core resolves for Perl `$obj->m` — goto-def / hover /

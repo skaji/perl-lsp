@@ -1233,6 +1233,131 @@ impl<'a> CandidateSet<'a> {
         defs
     }
 
+    /// Overload arity ranking (pack): a call to a name with MULTIPLE callable
+    /// definitions ranks the family by how each signature's declared arity
+    /// fits the call's written arg count — an exact `params == args` overload
+    /// first, then defaults/variadic-compatible ones, then mismatches. Ranked,
+    /// NEVER pruned (the whole overload set stays visible, like macro
+    /// variants); ties break bodied-then-local-then-position so the pick is
+    /// deterministic. `None` (fall through to single-def resolution) unless the
+    /// call carries an arg count AND ≥2 same-name callables are in scope — so
+    /// non-overloaded resolution is untouched. The arity FUEL is structural
+    /// (`Symbol::param_arity` / `Ref::arg_count`); the fit rule lives on
+    /// `ParamArity::fit`.
+    fn overload_arity_definitions(&self) -> Option<Vec<RefLocation>> {
+        if !self.pack {
+            return None;
+        }
+        let analysis = self.origin;
+        let idx = self.idx()?;
+        let r = analysis.ref_at(self.point)?;
+        let argc = r.arg_count?;
+        let name = r.unqualified_target_name().to_string();
+        // Anchor the family's scope on the primary resolution so overload
+        // siblings gather in the right class/namespace without re-deriving C++
+        // name lookup here.
+        let pkg: Option<String> = match &r.kind {
+            RefKind::MethodCall { .. } => Some(analysis.method_call_invocant_class(r, Some(idx))?),
+            RefKind::FunctionCall { resolved_package } => resolved_package.clone().or_else(|| {
+                analysis.find_definition(self.point, Some(idx)).and_then(|sp| {
+                    analysis
+                        .symbols
+                        .iter()
+                        .find(|s| {
+                            s.selection_span.start == sp.start
+                                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                        })
+                        .and_then(|s| s.package.clone())
+                })
+            }),
+            _ => return None,
+        };
+        let pkg_ok = |sp: Option<&str>| match &pkg {
+            None => sp.is_none(),
+            Some(p) => pkg_agrees(true, Some(p), sp),
+        };
+        let has_body =
+            |a: &FileAnalysis, s: &crate::file_analysis::Symbol| a.scopes.iter().any(|sc| sc.span == s.span);
+        // Sort key, best-first: arity fit, then bodied, then local, then a
+        // total (path, row, col) order for determinism across cache iteration.
+        let mut cands: Vec<(u8, bool, bool, PathBuf, usize, usize, RefLocation)> = Vec::new();
+        let push = |fit: u8,
+                    bodied: bool,
+                    local: bool,
+                        key: &FileKey,
+                        span: Span,
+                        cands: &mut Vec<(u8, bool, bool, PathBuf, usize, usize, RefLocation)>| {
+            if cands
+                .iter()
+                .any(|c| file_key_eq(&c.6.key, key) && c.6.span == span)
+            {
+                return;
+            }
+            cands.push((
+                fit,
+                bodied,
+                local,
+                key_for_sort(key),
+                span.start.row,
+                span.start.column,
+                RefLocation {
+                    key: key.clone(),
+                    span,
+                    access: AccessKind::Declaration,
+                    rewritable: true,
+                    label: None,
+                },
+            ));
+        };
+        for s in analysis.symbols.iter().filter(|s| {
+            s.name == name
+                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                && pkg_ok(s.package.as_deref())
+        }) {
+            let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
+            push(fit, has_body(analysis, s), true, &self.origin_key, s.selection_span, &mut cands);
+        }
+        // Cross-file: the full def-candidates table, closure-connected to the
+        // origin (same connectivity gate as the decl→def ranking).
+        if let Some((self_path, visible)) = idx.visibility_scope() {
+            let self_str = self_path.to_string_lossy().into_owned();
+            let origin_path = key_for_sort(&self.origin_key);
+            let mut cached_files = idx.def_candidates(&name);
+            cached_files.sort_by(|a, b| a.path.cmp(&b.path));
+            for cached in cached_files {
+                if cached.path == origin_path {
+                    continue;
+                }
+                let p = cached.path.to_string_lossy().into_owned();
+                let connected = visible.contains(&p)
+                    || cached.analysis.include_closure.iter().any(|c| *c == self_str);
+                if !connected {
+                    continue;
+                }
+                let key = FileKey::Path(cached.path.clone());
+                for s in cached.analysis.symbols.iter().filter(|s| {
+                    s.name == name
+                        && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                        && pkg_ok(s.package.as_deref())
+                }) {
+                    let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
+                    push(fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                }
+            }
+        }
+        if cands.len() < 2 {
+            return None;
+        }
+        cands.sort_by(|a, b| {
+            b.0.cmp(&a.0) // arity fit, best first
+                .then_with(|| b.1.cmp(&a.1)) // bodied first
+                .then_with(|| b.2.cmp(&a.2)) // local first
+                .then_with(|| a.3.cmp(&b.3)) // path
+                .then_with(|| (a.4, a.5).cmp(&(b.4, b.5))) // row, col
+        });
+        Some(cands.into_iter().map(|c| c.6).collect())
+    }
+
     /// A declaration site in the origin file.
     fn origin_decl(&self, span: Span) -> RefLocation {
         RefLocation {
@@ -1417,6 +1542,15 @@ impl<'a> CandidateSet<'a> {
                     }
                 }
             }
+        }
+
+        // Overload arity ranking: a call to an overloaded name ranks the
+        // family by how each signature fits the call's arg count (never
+        // pruned). Supersedes the single-winner `find_definition` below, which
+        // is arity-blind. `None` for non-overloaded calls, leaving the path
+        // below untouched.
+        if let Some(ranked) = self.overload_arity_definitions() {
+            return ranked;
         }
 
         // Local definition first — through the decl→def ranking, so a cursor

@@ -629,6 +629,7 @@ fn inject_member_blocks(
                 return_type: None,
                 deref_stack: Vec::new(),
                 attributes: Vec::new(),
+                arity: None,
             });
             // The role member emits the SAME `TypeName` edge an expanded field
             // does — the edge is canonical (the hover leaf + the type chase
@@ -883,6 +884,7 @@ fn remap_spans(
         // name-keyed, ordered by byte position pre-remap — no spans to fix.
         template_params: _,
         return_sites,
+        param_sigs,
     } = skel;
 
     for s in symbols.iter_mut() {
@@ -898,11 +900,18 @@ fn remap_spans(
             return_type: _,
             deref_stack: _,
             attributes: _,
+            arity: _,
         } = s;
         *start = r(*start);
         *end = r(*end);
         *name_start = r(*name_start);
         *name_end = r(*name_end);
+    }
+    // Parameter-list spans feed the def-arity association (`into_file_analysis`,
+    // which runs after this remap) — they must speak original coords like the
+    // symbol spans they're matched against.
+    for (span, _) in param_sigs.iter_mut() {
+        *span = rspan(*span);
     }
     for rf in refs.iter_mut() {
         let crate::query_extract::SkelRef {
@@ -913,6 +922,7 @@ fn remap_spans(
             scope: _,
             invocant,
             member_op,
+            arg_count: _,
         } = rf;
         (*start, *end) = remap_span(*start, *end);
         // The invocant span is consumed via `expr_type_at_span` (member
