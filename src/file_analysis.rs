@@ -10445,11 +10445,19 @@ impl FileAnalysis {
             (o.start.row, o.start.column) <= (i.start.row, i.start.column)
                 && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
         };
+        // The owner container is a Class (struct/union/enum) OR a namespace
+        // (`SymKind::Package`): a namespace-scope global (`ns::kBits`) is its
+        // namespace's content the same way a field is its class's — the Sub-
+        // scope walk below still excludes a sub-body local that merely carries
+        // the enclosing namespace as sticky package.
         let Some(class_span) = self
             .symbols_named(pkg)
             .iter()
             .map(|&sid| self.symbol(sid))
-            .filter(|c| matches!(c.kind, SymKind::Class) && contains(&c.span, &sym.span))
+            .filter(|c| {
+                matches!(c.kind, SymKind::Class | SymKind::Package)
+                    && contains(&c.span, &sym.span)
+            })
             .map(|c| c.span)
             .next()
         else {

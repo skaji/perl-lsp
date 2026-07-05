@@ -449,11 +449,43 @@
 (function_definition
   declarator: (function_declarator
     declarator: (operator_name) @def.sub.name)) @def.sub
+; reference- / pointer-returning inline operator DEFINITIONS
+; (`T& operator[](...) { ... }`, `T* operator->() { ... }`): the return
+; wrapper nests the function_declarator, exactly like the field-decl operator
+; forms above. Without these the inline body's method symbol is never minted,
+; so the implicit-`this` sibling-pin's enclosing-class lookup (which joins a
+; body scope to its owning method SYMBOL) dead-ends and a bare sibling call
+; inside the operator body resolves nowhere.
+(function_definition
+  type: (_) @rettype
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (operator_name) @def.sub.name))) @def.sub
+(function_definition
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (operator_name) @def.sub.name))) @def.sub
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier
       scope: (_) @qualifier
       name: (operator_name) @def.method.name))) @def.method
+; out-of-line ref-/pointer-returning operator defs (`T& Vec2::operator[](...)`)
+(function_definition
+  type: (_) @rettype
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @qualifier
+        name: (operator_name) @def.method.name)))) @def.method
+(function_definition
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @qualifier
+        name: (operator_name) @def.method.name)))) @def.method
 ; pointer-/reference-returning operator decls (`Vec2& operator+=(...)`)
 (field_declaration
   type: (_) @rettype
@@ -646,6 +678,27 @@
   (storage_class_specifier)? @sym.attr
   type: (_) @type.annot
   declarator: (identifier) @flow.target @def.local)
+
+; array declarations (`extern const unsigned char kPropertyBits[256];`,
+; `int table[8] = {...};`): the declarator is an array_declarator wrapping the
+; leaf identifier, which the plain-identifier forms above never see — so a
+; NAMESPACE/file-scope array global was minted as NO symbol at all (dead
+; goto-def, absent from outline). Capture the leaf as @def.local: the sticky
+; namespace context tags it with its owning namespace (package) and a
+; file/namespace-scope decl outlines, while a function-body array stays a
+; scope-hidden local — the same scope-driven local-vs-global distinction the
+; scalar forms already ride. (Bare + extern first, then the braced-init form.)
+(declaration
+  (storage_class_specifier)? @sym.attr
+  type: (_) @type.annot
+  declarator: (array_declarator
+    declarator: (identifier) @flow.target @def.local))
+(declaration
+  type: (_) @type.annot
+  declarator: (init_declarator
+    declarator: (array_declarator
+      declarator: (identifier) @flow.target @def.local)
+    value: (_) @flow.source))
 
 ; pointer / reference locals of ANY depth, bare and initialized — `T* p;`,
 ; `T** pp;`, `T& r = x;`, `if (Derived* d = dynamic_cast<...>(b))`. The

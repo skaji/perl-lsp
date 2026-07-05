@@ -995,6 +995,62 @@
       }
     },
     {
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-ref-operator-def",
+      "line": 33,
+      "col": 36,
+      "comment": "bare enroll(k) inside a REFERENCE-returning operator[] DEFINITION (`int& operator[](...) { ... }`) is an implicit this->enroll — pins to the ENCLOSING class Slots, NOT the same-named Registry::enroll in a sibling class. Regression lock for hitlist-5 Family D: the inline ref-/ptr-returning operator def must mint its method symbol, or the sibling-pin's scope→symbol→enclosing-class join dead-ends and the bare call resolves nowhere (or, pre-json-reanchor, to a foreign same-named method).",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:33:10"
+        ],
+        "none": [
+          "sibling_call.cpp:30:10"
+        ]
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "ns_extern_global.cpp",
+      "id": "cpp-ns-extern-global-array-goto-def",
+      "line": 6,
+      "col": 19,
+      "comment": "goto-def on a qualified read of a namespace-scope extern ARRAY global (`detail::kTable[c]`) lands on the decl. hitlist-5 Finding E: array-declarator namespace globals were minted as no symbol at all; now they mint (owning namespace as package) and resolve owner-anchored through member_def_location once symbol_is_class_content admits a namespace (Package) container.",
+      "expect": {
+        "all": [
+          "ns_extern_global.cpp:3:28"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "ns_extern_global.cpp",
+      "id": "cpp-ns-extern-global-scalar-goto-def",
+      "line": 6,
+      "col": 39,
+      "comment": "goto-def on a qualified read of a namespace-scope extern SCALAR global (`detail::kCounter`) lands on the decl — the scalar mint already existed, but the namespace-owner resolution gate did not admit it; hitlist-5 Finding E completes both.",
+      "expect": {
+        "all": [
+          "ns_extern_global.cpp:4:12"
+        ],
+        "none": []
+      }
+    },
+    {
       "id": "cpp-family-q-qualified-enum-case-label",
       "difficulty": "hard",
       "semantic_area": "cpp-family-q-owner-anchor",

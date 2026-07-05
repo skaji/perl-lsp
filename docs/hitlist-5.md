@@ -11,6 +11,18 @@
 > `cpp-inline-ns-transparency-*` (definition + references),
 > `cpp-inline-ns-absent-member-goto-def-fail-safe`.
 >
+> **Refs-symmetry follow-up (A1) — LANDED.** The Family A gate expanded only
+> the *named-owner* side of the inline-owner set, so `references` was **anchor-
+> asymmetric**: from the DEF (filed under parent `mylib` — the inline child
+> `v1` is macro-formed via `NS_BEGIN` and never entered the sticky context) it
+> dropped the unqualified in-namespace use (whose enclosing owner is the
+> positional inline child `v1`), while from a USE it found everything. Fix:
+> the `resolve.rs` unqualified-call gate now expands **both** sides through
+> `pack_inline_owner_set` and tests for a shared owner (a parent's set contains
+> its inline children, so parent↔child agrees whichever side names the parent).
+> Gold `cpp-inline-ns-transparency-references-all-calls` (def-anchored) now
+> passes deterministically; `-references-from-use` locks the symmetry.
+>
 > **PARKED residuals** (same family, different seam — not this resolution-gate
 > slice):
 > - **A1 function-designator emission.** `absl::ascii_isspace` passed by name to
@@ -155,36 +167,61 @@ over-count direction. `find-references` on any common member name (`key_type`,
 
 ---
 
-## Family D — bare sibling-method call resolves to a foreign same-named method (HIGH pain)
+## Family D — bare sibling-method call resolves to a foreign same-named method (HIGH pain) — **LANDED**
 
 `definition` on the unqualified sibling call `emplace(key, T{})` inside
-`ordered_map::operator[]` (ordered_map.hpp L103:15) → `json.hpp:3303:31`, and
-`hover` there → `std::pair<iterator,bool> emplace(Args&&...)` labeled
-*function* — that is **`basic_json::emplace`, the wrong class**. The correct
-target is `ordered_map`'s own `emplace(const key_type&, T&&)` at
-ordered_map.hpp:73.
+`ordered_map::operator[]` (ordered_map.hpp L103:15) → now
+`ordered_map.hpp:73:31` + `88:31` (both `ordered_map::emplace` overloads), the
+enclosing class — NOT `basic_json::emplace`.
 
-**Owning seam.** `language_driver.rs::emit_return_fuel`'s bare
-sibling-method-call pinning (`resolved_package` → enclosing class) plus the
-method-call resolution in `resolve.rs`: the pin to enclosing `ordered_map`
-either wasn't applied or lost to a workspace-wide same-name method winner
-(`basic_json::emplace`). Because the wrong target is `basic_json`, this is
-**adjacent to the assigned "json.hpp basic_json re-anchor" work** — see overlap
-list; the sibling-pinning failure may share that root.
+**Root cause (not what the seam note guessed).** The sibling-pin machinery was
+fine; the enclosing method `operator[]` was **never minted as a symbol**. The
+skeleton had no `function_definition` operator-def pattern for a
+reference-/pointer-RETURNING operator (`T& operator[](...) { ... }` — the return
+wrapper nests the `function_declarator`, so the bare `operator_name` patterns
+missed it). With no `operator[]` Method symbol, `emit_return_fuel`'s
+scope→symbol→enclosing-class join dead-ended, the pin never fired, and (post
+json-reanchor) the bare call resolved to nothing (pre-reanchor: to
+`basic_json::emplace`).
+
+**Fix.** `queries/cpp/skeleton.scm`: add the ref-/ptr-returning operator
+DEFINITION patterns (in-class + out-of-line), mirroring the field-decl operator
+prototypes that already existed. The enclosing operator now mints its Method
+symbol; the existing pin resolves the bare sibling call to the enclosing class.
+A bare call to a method that lives ONLY on a foreign class still resolves
+nowhere (verified negative control) — no mis-pin. Gold:
+`cpp-sibling-call-ref-operator-def` (positive + `none` foreign-class guard).
 
 ---
 
-## Finding E — namespace-scope `extern` variable decls are not symbols (MEDIUM-LOW pain)
+## Finding E — namespace-scope `extern` variable decls are not symbols (MEDIUM-LOW pain) — **LANDED**
 
-`definition` on `ascii_internal::kPropertyBits` (ascii.h L90:26) → "No
-definition found"; same for `ascii_internal::kToLower` (L183:25). The decls
-(`ABSL_DLL extern const unsigned char kPropertyBits[256];`, ascii.h L71/74/77)
-are never emitted as symbols — absent from `--outline`. Goto-def on a
-namespaced global variable is dead.
+`definition` on `ascii_internal::kPropertyBits` (ascii.h use L90:26) → now
+`ascii.h:71:37` (the real decl); the decls also appear in `--outline` as
+`Variable … ascii_internal`.
 
-**Owning seam.** `queries/cpp/skeleton.scm` has no capture for `extern`
-variable declarations at namespace scope (only class fields / locals). Add a
-namespaced-variable-decl capture + `query_extract.rs` emission.
+**Two gaps, both closed.** (1) The array declarators (`extern const unsigned
+char kPropertyBits[256];`) matched NO skeleton pattern — the scalar/pointer
+forms only handle `(identifier)`/`(pointer_declarator)` leaves, so an
+`array_declarator` global minted nothing (dead gd, absent from outline). Added
+the array-declarator variants (bare/extern + braced-init) to
+`queries/cpp/skeleton.scm`; the leaf is captured as `@def.local`, so the sticky
+namespace context tags it with its owning namespace (package) and a
+namespace-scope decl outlines while a function-body array stays a scope-hidden
+local — the same scope-driven local-vs-global split the scalar forms ride.
+(2) Even minted, qualified reads didn't resolve: `symbol_is_class_content`
+(the owner-membership gate behind `pack_member_of` → `member_def_location` /
+`complete_pack_qualified`) recognized only `SymKind::Class` containers, so a
+namespace-scope global (owner = `SymKind::Package`) failed the gate. Extended
+the container filter to accept namespaces; the Sub-scope walk still excludes a
+sub-body local carrying the namespace as sticky package. Gold:
+`cpp-ns-extern-global-array-goto-def` / `-scalar-goto-def` (definition),
+`cpp-outline-ns-extern-globals` (outline).
+
+**PARKED residual.** Multi-dimensional array globals (`T m[3][4]` at namespace
+scope) — the single array-declarator pattern matches one level; a nested
+`array_declarator > array_declarator > identifier` isn't captured. Rare;
+kPropertyBits/kToLower/kToUpper are all single-dim.
 
 ---
 
@@ -215,8 +252,8 @@ namespaced-variable-decl capture + `query_extract.rs` emission.
 | Inline-namespace owner set expanded for completion only | `resolve.rs`: `pack_member_of` / `member_def_location` / `pkg_agrees` don't call `pack_inline_owner_set` | A1, A2 (resolvable half), A3, root of B |
 | `Scope::member` miss → module→file `1:1` fallback | goto-def PackageRef/type tail in `resolve.rs` | A2 (garbage half), B |
 | Reference identity matched by bare name, not owner-scoped | `refs_to` member/typedef arm | C |
-| Bare sibling-method not pinned to enclosing type | `emit_return_fuel` pinning + method-call resolution | D |
-| No symbol for namespace-scope `extern` var | `queries/cpp/skeleton.scm` + `query_extract.rs` | E |
+| ~~Bare sibling-method not pinned to enclosing type~~ **LANDED** — real cause: ref-/ptr-returning operator DEF never minted, so the pin's enclosing-class join dead-ended | `queries/cpp/skeleton.scm` operator-def patterns | D |
+| ~~No symbol for namespace-scope `extern` var~~ **LANDED** — array-declarator mint + namespace-owner resolution gate | `queries/cpp/skeleton.scm` + `symbol_is_class_content` | E |
 
 ---
 

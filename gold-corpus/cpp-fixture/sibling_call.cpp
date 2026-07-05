@@ -25,3 +25,11 @@ struct Board {
     void freefunc();
     void tick() { freefunc(); }
 };
+
+struct Registry {
+    int& enroll(int k);
+};
+struct Slots {
+    int& enroll(int k);
+    int& operator[](int k) { return enroll(k); }
+};
