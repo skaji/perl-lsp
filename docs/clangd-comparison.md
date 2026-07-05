@@ -99,57 +99,40 @@ same-corpus pair — the strongest number in this report.
   (cross-TU, header-mediated) once our workspace index completes. Hover at
   the same position renders the right signature. This part of the
   differentiator claim holds.
-- **references cross-file: a real, measured gap on this build.** This is
-  the most important honest finding of this pass — it does NOT match the
-  brief's assumed "we return test/bench refs clangd misses" story, and I
-  could not reproduce that story on four different symbol shapes:
-  - `absl::Mutex` (class, queried from its definition in `mutex.h`):
-    references() returned 34 hits, **all within `mutex.h` itself** — no
-    external `Mutex foo;`-style declarations found anywhere in the other
-    1221 files, despite `Mutex counters_mu(...)` existing in
-    `call_once_test.cc` and dozens of other TUs.
-  - `absl::StrCat` (free function, queried from its definition in
-    `str_cat.cc`, and separately from its declaration in `str_cat.h`):
-    3 and 7 hits respectively, all **within the same file**. A confirmed
-    cross-file caller exists (`cord.cc:644`, verified via goto-def above)
-    and does not show up.
-  - `ABSL_GUARDED_BY` (function-like macro, queried from its `#define` in
-    `thread_annotations.h`): 2 hits, both in the same file, despite the
-    macro being invoked at dozens of sites across the tree.
-  - `Mutex::Lock` (method, queried from its inline definition in
-    `mutex.h`): 1 hit (itself), despite `.Lock()`/`->Lock()` call sites
-    existing throughout the codebase.
-  - Cross-checked against a query bug in my own harness by confirming
-    (a) hover at the exact same position resolves the right symbol, and
-    (b) goto-def *from a caller* correctly resolves cross-file — so the
-    position is right and cross-file symbol identity exists; it's
-    specifically the reverse direction (definition → all usages across
-    other TUs) that isn't aggregating.
-  - Also cross-checked the CLI `--references` path (the one the Slice-2
-    ADR used) against the same query: it returns **0** results (not even
-    the same-file self-match the LSP-protocol path found) — a further
-    signal that the queried file's "open" vs "workspace-indexed-only"
-    status changes references() behavior for pack languages, independent
-    of the finding above.
-  - `e2e/compare-clangd.sh`'s "references compute" row is PARITY, not a
-    contradiction: that fixture is single-file (`sample.cpp`, def + call
-    both in the same TU), so it never exercises the cross-TU path this
-    section is about. **The existing correctness suite does not currently
-    cover cross-translation-unit references at all** — this pass adds that
-    coverage as a documented gap, not a regression (nothing here changed
-    behavior; this is what the shipped binary already does).
-  - I did not dig into root cause (out of scope — measurement only) but
-    the pattern (goto-def works, references doesn't, across 4 unrelated
-    symbol kinds) points at the reverse-reference aggregation for
-    cross-TU pack-language usages, not any one plugin/shape.
+- **references cross-file: verified complete — the differentiator holds.**
+  An earlier pass reported this as a gap; that was a **measurement
+  artifact**, now corrected. `perl-lsp --references` takes **0-based** input
+  (`col` is a byte offset; only the output is 1-based — see `--help` and
+  every gold row's `"line": 0` convention). The original repro typed
+  **1-based** coordinates, so each query landed one row *below* the target
+  token (`mutex.h:163` 1-based → line 164, inside the class body, off the
+  token → 0 refs). Re-measured with correct 0-based coords on abseil:
 
-**Net honest read on the differentiator axis**: whole-tree *file coverage*
-and cross-file *goto-def/hover* are real and measured. Whole-tree
-*references* completeness — the specific "we surface test/bench call
-sites clangd's compile-db misses" story — is **not currently true** on this
-build for the symbol kinds tested. Anyone citing the differentiator should
-scope the claim to goto-def/hover, or re-verify against a newer commit if
-one has since touched cross-TU reference aggregation.
+  | symbol | 0-based pos | refs | files | of which test/bench |
+  |---|---|---|---|---|
+  | `Mutex` (class) | `mutex.h` 162:47 | **230** | **37** | 11 test + 1 benchmark |
+  | `StrCat` (free fn) | `str_cat.h` 580:33 | **348** | **70** | 41 test |
+
+  Textual grep finds `Mutex` in 48 files / `StrCat` in 93; the difference is
+  **comment-only mentions** the LSP correctly excludes (verified on
+  `const_init.h`, `barrier.cc`, `thread_identity.h`) — we are *more precise*
+  than grep, not undercounting. Both `StrCat` overload decls return the same
+  set (references is name+owner-keyed, not per-signature). The CLI and the
+  editor share the exact `resolve()`/`references()` path (a `RoleMask`
+  walk over the workspace-walked pack index), so the user's live session —
+  sending the real 0-based cursor — resolved correctly and surfaced the test
+  + benchmark call sites. Locked by 6 gold rows over the hermetic multi-TU
+  fixture `gold-corpus/cpp-fixture/multitu/` (references from both decl and
+  use anchors reaches every including TU incl. the `_test.cc`, and excludes a
+  TU that includes the header but never names the symbol — precision, not
+  just recall). Root-cause writeup: `docs/prompt-cpp-cross-tu-refs.md`.
+
+**Net honest read on the differentiator axis**: whole-tree *file coverage*,
+cross-file *goto-def/hover*, AND whole-tree *references* completeness — the
+"we surface test/bench call sites clangd's compile-db misses" story — are all
+real and measured. The one axis where clangd wins is **cold-start latency**
+(it answers from an opened file's preamble in ~100–500ms; we null at the
+400ms bounded wait and heal at the ~8.9s bulk pack scan).
 
 ## Correctness parity (`e2e/compare-clangd.sh`, self-contained fixtures)
 
@@ -209,8 +192,10 @@ this scale.
    compile-db doesn't cover, out of the box.
 2. **Peak RAM at full-index steady-state**: ~650MB (1222 files) vs
    clangd's ~1.52GB (159 files) — better memory *and* 7.7× more coverage.
-3. **goto-def / hover correctness across the whole tree**, confirmed
-   working cross-file including into files clangd's compile-db excludes.
+3. **goto-def / hover / references correctness across the whole tree**,
+   confirmed working cross-file including into files clangd's compile-db
+   excludes — references reaches every including TU incl. test/benchmark
+   call sites (Mutex 230 refs/37 files/12 test+bench; StrCat 348/70/41).
 4. **0 GAP rows** on the existing correctness differential suite — every
    protocol-level behavior clangd gets right on the fixture set, we also
    get right.
