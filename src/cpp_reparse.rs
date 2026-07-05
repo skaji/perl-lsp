@@ -2503,6 +2503,24 @@ pub fn include_closure(file_path: &std::path::Path, src: &str) -> (Vec<String>, 
 /// frozen table (cache keys are whatever path `analyze_with_path` got, so
 /// membership is checked on the canonicalized key).
 pub fn evict_analysis_caches(files: &std::collections::HashSet<std::path::PathBuf>) {
+    evict_gather_caches(files, true);
+}
+
+/// Residency-only eviction for the bulk workspace index: drop the per-file
+/// merged/expanded macro tables (`macro_table_cache`, `pre_expanded_cache`) +
+/// the closure memo for files whose `FileAnalysis` is already built and
+/// persisted, but keep `header_cache` warm. The per-file tables are a private
+/// memo of each source file's include-closure merge — never read by any other
+/// file's gather (that only consults `header_cache`), disk-backed, and cheaply
+/// re-derived from the warm shared header table on a later on-edit re-gather.
+/// See `docs/prompt-bounded-memory.md` (Slice 1). Content-edit invalidation
+/// must NOT use this — a changed header's own `header_cache` entry has to go,
+/// so that path calls `evict_analysis_caches` (drops headers too).
+pub fn evict_gather_caches_keep_headers(files: &std::collections::HashSet<std::path::PathBuf>) {
+    evict_gather_caches(files, false);
+}
+
+fn evict_gather_caches(files: &std::collections::HashSet<std::path::PathBuf>, drop_headers: bool) {
     let hit = |key: &std::path::PathBuf| {
         files.contains(key)
             || key
@@ -2519,8 +2537,10 @@ pub fn evict_analysis_caches(files: &std::collections::HashSet<std::path::PathBu
     if let Ok(mut c) = include_closure_cache().lock() {
         c.retain(|k, _| !hit(k));
     }
-    if let Ok(mut c) = header_cache().lock() {
-        c.retain(|k, _| !hit(k));
+    if drop_headers {
+        if let Ok(mut c) = header_cache().lock() {
+            c.retain(|k, _| !hit(k));
+        }
     }
 }
 

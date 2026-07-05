@@ -844,8 +844,19 @@ pub fn index_pack_languages(
             if let Ok(Some(analysis)) = res {
                 let arc = Arc::new(analysis);
                 pack_index.register_symbols(path.clone(), arc.clone());
-                fresh.lock().unwrap().push((canon, arc));
+                fresh.lock().unwrap().push((canon.clone(), arc));
                 total.fetch_add(1, Ordering::Relaxed);
+                // Residency: this file's merged/expanded macro tables are a
+                // one-shot build input, now dead weight for the rest of the
+                // bulk index (they'd otherwise accumulate to ~1.6 GB of
+                // per-file duplicates on abseil). Drop them the moment the
+                // analysis is built; the shared `header_cache` stays warm so
+                // an on-edit re-gather is a header-BFS, not a cold gather.
+                // Keyed by the same path analyze got, plus its canonical form.
+                let mut drop_set = std::collections::HashSet::with_capacity(2);
+                drop_set.insert(path.clone());
+                drop_set.insert(canon);
+                crate::cpp_reparse::evict_gather_caches_keep_headers(&drop_set);
             }
         });
 

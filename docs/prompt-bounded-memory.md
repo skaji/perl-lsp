@@ -130,14 +130,37 @@ re-derivable from the resident 2.1 MB `header_cache`. So dropping them is nearly
 free to reverse.
 
 **Slice 1 (smallest, highest impact): evict the per-file gather-cache entry for
-a file the moment its analysis is built during bulk index.** In
+a file the moment its analysis is built during bulk index.** — **LANDED.** In
 `index_pack_languages`' `par_iter` body, after `analyze_with_path` returns and
 the `Arc<FileAnalysis>` is registered + queued for persist, call
-`cpp_reparse::evict_analysis_caches(&{this file})` (the function already exists —
-it retains-out `macro_table_cache`, `pre_expanded_cache`, `include_closure_cache`,
-and leaves `header_cache` intact). The file's raw+expanded tables die with the
+`cpp_reparse::evict_gather_caches_keep_headers(&{this file})`. This retains-out
+`macro_table_cache`, `pre_expanded_cache`, `include_closure_cache` and **leaves
+`header_cache` intact** — the pre-existing `evict_analysis_caches` (the on-change
+seam) drops the header entry too, which is right for a content edit but wrong for
+a residency evict, so slice 1 got its own keep-headers variant (both share the
+`evict_gather_caches` core). The file's raw+expanded tables die with the
 iteration; `header_cache` (the shared truth) stays warm so a later on-edit
 re-gather of any single file is a 2.1 MB-scale BFS, not a cold gather.
+
+**Measured (abseil, `--references`, cold):**
+
+| | before | after |
+|---|---|---|
+| Peak RSS | 4.02 GB (4221364 KB) | **1.22 GB (1274300 KB)** |
+| `macro_table_cache` | 596.6 MB / 877 files | **0.0 MB / 0 files** |
+| `pre_expanded_cache` | 961.9 MB / 877 files | **0.0 MB / 0 files** |
+| `include_closure` | 20.8 MB / 877 files | **0.0 MB / 0 files** |
+| `header_cache` | 2.1 MB / 1092 headers | 2.1 MB / 1092 headers (kept warm) |
+| gather-cache TOTAL | 1581.4 MB | **2.1 MB** |
+| Cold index wall | 11.52 s | 11.19 s (no cliff) |
+
+Peak beat the ~2.0–2.5 GB estimate — the 1.58 GB of per-file duplicates never
+accumulate, so the remaining resident is the ~0.89 GB FileAnalysis floor plus
+glibc arena. Completeness verified warm-to-warm: the same cross-file references
+query (`ascii.cc` → `AsciiStrToLower`) returns **13 refs across 6 files
+(incl. `ascii_test.cc`, `charset_test.cc` — the tests clangd misses)** identical
+before and after. No `EXTRACT_VERSION` bump (eviction timing, no serialized-shape
+change; stays 162).
 
 - **Expected peak after slice 1:** the ~1.58 GB measured payload (and its
   larger RSS shadow) collapses to at most one file's tables per live worker
@@ -242,7 +265,7 @@ Cheaper wins that shrink both the resident floor and the disk blob:
 
 | Slice | Change | Expected abseil peak | Risk |
 |---|---|---|---|
-| **1** | Evict per-file gather caches after each file's analysis in `index_pack_languages` (reuse `evict_analysis_caches`). | **4.24 → ~2.0–2.5 GB** | Very low — transparent, tiny diff, function exists |
+| **1** ✅ | Evict per-file gather caches after each file's analysis in `index_pack_languages` (`evict_gather_caches_keep_headers`). | **4.02 → 1.22 GB** (measured) | Very low — transparent, tiny diff |
 | 2 | Split lightweight name index (complete, pinned) from heavy `FileAnalysis`; LRU-bound the heavy map + rehydrate from SQLite; pin open docs. | ~2.0 → **~0.4–0.6 GB** | Medium — new residency layer; guard discipline |
 | 3 | Intern `include_closure`/path strings; drop witness bag for workspace role post-fold. | shaves 0.1–0.3 GB off floor + disk | Low–medium |
 
