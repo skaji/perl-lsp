@@ -38,7 +38,10 @@ goes to stderr, so `--heatmap … 2>/dev/null | jq` is clean.
 ## Metrics
 
 Per symbol (subs, methods, packages/classes/modules — anonymous and
-non-identifier-named symbols are skipped, they have no nameable graph):
+non-identifier-named symbols are skipped, they have no nameable graph;
+`SymKind::Handler` — routes / Minion tasks / events — is *also* elided today,
+but that is a listing gap, not a graph gap: their fan-in is well-defined and
+already built. See "What's next" #1):
 
 - **`fan_in`** — number of reference *sites* across the searched roles, with the
   symbol's own declaration(s) excluded. A "reference site" is **any** mention
@@ -181,6 +184,77 @@ Treat the dead list as a **review queue**, not a delete list.
   Rides the bincode cache blob (`#[serde(default)]`); `EXTRACT_VERSION` bumped.
 
 ## What's next
+
+The two highest-value residuals lead. Both are the **same** generalization:
+the framework plugin already knows an edge the static call graph can't see, and
+the reference machinery already computes the count — the heatmap just isn't
+consuming it. Both must stay generic and plugin-owned (rule #10); neither is a
+per-verb or per-name allowlist in core.
+
+### 1. Unblock Handlers — plugin-owned "definition site"
+
+`heatmap_symbol_eligible` admits only `Sub|Method|Package|Class|Module`, eliding
+`SymKind::Handler`. The elision was rationalized as "handlers have no meaningful
+cross-file usage count" — **that is false**, and verified so on a live fixture.
+`references()` on a Handler already returns every wire-up *and* every dispatch
+site:
+
+- `$r->get('/users')->to('Users#list')` → the controller `sub list` already
+  reports `fan_in = 1` from the route today (this half works, because the callee
+  resolves to a real `Sub`; the `->to('Class#method')` linkage is what supplies
+  the ref).
+- `$app->minion->add_task(cleanup => …)` + `->enqueue('cleanup')` → `references`
+  on the `cleanup` Handler returns **two** sites (the `add_task` definition and
+  the `enqueue` call). A never-enqueued `vacuum` task returns **only** its
+  definition. So an orphaned Minion task / route / event is already visible in
+  the graph — it just never reaches the heatmap because Handlers are elided.
+
+The work:
+
+- **Make Handlers heatmap-eligible** — they then get fan-in / dead-candidate
+  treatment like any callable.
+- **Give a Handler a generic "definition site."** The blocker for a *correct*
+  fan-in is that a Handler's registration (`add_task(cleanup => …)`,
+  `->to('X#y')`, `->on(evt => …)`) is itself one of its refs — so the current
+  "subtract `AccessKind::Declaration` + the decl name-token span" logic won't
+  exclude it, and every wired Handler would read `fan_in ≥ 1` off its own
+  wire-up. *Which* arg/span is the definition is **plugin knowledge** (the
+  string key in `add_task`, the `Controller#action` string in `->to`, the event
+  name in `->on`). So the plugin that mints the Handler must also stamp its
+  definition span — a generic tag on the emitted Handler (the Handler-shaped
+  equivalent of `AccessKind::Declaration`) — and the heatmap subtracts *that*.
+  Never a per-verb definition rule in core.
+
+Outcome: orphan-route / never-enqueued-task / never-emitted-event detection
+falls out of the existing dead-code lens — no new analysis, just correct
+definition-site accounting.
+
+### 2. Plugin-declared "framework-consumed" reachability
+
+The `dynamic-dispatch` shield is workspace-global and coarse — it shields *every*
+non-`main` method when *any* `$obj->$method` exists, yet misses the sharp common
+case: a framework **lifecycle hook** with zero static callers and no dynamic
+dispatch anywhere. Verified false-positive: a Mojolicious `sub startup ($self)`
+(the app entry point, invoked by Mojo core out-of-workspace) is flagged
+**dead** — a direct violation of the "never falsely flags a live symbol"
+promise.
+
+The framework plugin already knows which method names/roles that framework
+invokes through its own machinery (`startup`, `run`, `BUILD`/`DEMOLISH`, Moose
+triggers, DBIC `sqlt_deploy_hook`, …). Let a plugin **mark a symbol as
+framework-consumed** — a witness/attribute on the symbol asserting "an invisible
+framework edge reaches this." Consumers then:
+
+- treat it as reachable → a new, precise `reachable_guard = "framework-consumed"`
+  (narrower and more honest than the blanket dynamic-dispatch shield);
+- **and likely skip it for fan-out** — its callees are framework-driven, not
+  authored call intent, so counting them dilutes the hotspot signal.
+
+This is the dead-code-reachability projection of the same edge the graph-walking
+`APP_SURFACE_CLASS` seam already models for the Mojo app surface — core stays a
+generic dispatcher, the plugin owns the rule.
+
+### Also deferred (unchanged priority)
 
 - **SARIF 2.1.0** output (`--format sarif`) — the gold interchange format for
   the automotive/static-analysis tool ecosystem; deferred from v1.
