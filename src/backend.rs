@@ -272,6 +272,48 @@ fn macro_completion(
     true
 }
 
+/// Default bounded-wait cap for the cold-open pull-verb heal (ms). A gd/hover/
+/// references issued while the family index is in-flight blocks up to this long
+/// awaiting completion, then resolves warm; 0 opts out. Overridable via
+/// `initializationOptions.coldWaitMs`.
+const DEFAULT_COLD_WAIT_MS: u64 = 400;
+
+/// Per-language-family completion signal for the cold-open bounded wait. The
+/// KICKOFF latch (`perl_indexed`/`pack_indexed`) flips synchronously on the
+/// first `did_open`; these fire on COMPLETION — the workspace/pack index has
+/// attached and `heal_open_docs` ran. A pull verb arriving in the in-flight
+/// window (latch set, `done` clear) registers on the matching `Notify` and
+/// waits bounded. Touched only via atomics + `Notify::notify_waiters` — never
+/// behind a FileStore guard — so the wait is deadlock-safe by construction.
+#[derive(Default)]
+struct IndexReady {
+    perl_done: std::sync::atomic::AtomicBool,
+    pack_done: std::sync::atomic::AtomicBool,
+    perl_notify: tokio::sync::Notify,
+    pack_notify: tokio::sync::Notify,
+}
+
+/// Fires the family's completion signal on EVERY exit path of the indexing
+/// task (including the no-root early-out and a panic), so a bounded waiter is
+/// never left blocking for an index that will never announce.
+struct IndexDoneGuard {
+    ready: Arc<IndexReady>,
+    want_perl: bool,
+}
+
+impl Drop for IndexDoneGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.want_perl {
+            self.ready.perl_done.store(true, Ordering::Relaxed);
+            self.ready.perl_notify.notify_waiters();
+        } else {
+            self.ready.pack_done.store(true, Ordering::Relaxed);
+            self.ready.pack_notify.notify_waiters();
+        }
+    }
+}
+
 pub struct Backend {
     client: Client,
     files: Arc<FileStore>,
@@ -307,6 +349,11 @@ pub struct Backend {
     /// same pattern as `diag_options`). `overrideScope = "dispatch"` picks the
     /// precise method-override scope; default is the whole-hierarchy family.
     rename_options: Arc<std::sync::Mutex<crate::resolve::RenameOptions>>,
+    /// Cold-open bounded-wait completion signals per language family.
+    index_ready: Arc<IndexReady>,
+    /// Bounded-wait cap (ms) for the cold-open pull-verb heal; 0 disables it.
+    /// Set from `initializationOptions.coldWaitMs`, default `DEFAULT_COLD_WAIT_MS`.
+    cold_wait_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Backend {
@@ -341,7 +388,11 @@ impl Backend {
         let progress = self
             .work_done_progress
             .load(std::sync::atomic::Ordering::Relaxed);
+        let index_ready = Arc::clone(&self.index_ready);
         tokio::task::spawn_blocking(move || {
+            // Announces completion (or the no-root early-out) to bounded waiters
+            // on Drop — every exit path of this closure, panic included.
+            let _done = IndexDoneGuard { ready: index_ready, want_perl };
             let Some(root_uri) = root else { return };
             let Some(root_path) = root_uri.strip_prefix("file://") else { return };
             let root_path = PathBuf::from(root_path);
@@ -466,6 +517,53 @@ impl Backend {
             }
         }
     }
+
+    /// Bounded wait for the opened file's language-family workspace/pack index
+    /// to finish, when — and ONLY when — it is actually in-flight: KICKED OFF
+    /// (`ensure_workspace_indexed` flipped the latch at `did_open`) but not yet
+    /// DONE. This closes the residual cold-open window for PULL verbs
+    /// (goto-def / hover / references): unlike completion (`isIncomplete`) and
+    /// diagnostics (server re-push), a one-shot gd/hover the user fired in the
+    /// window got its degraded answer and is gone. Blocking the handler briefly
+    /// for the imminent index lets it resolve against the warm cross-file index
+    /// instead (e.g. references `op_free` 1 → 118).
+    ///
+    /// Zero added latency in the common cases: the warm session (index already
+    /// `done` → returns before awaiting) and the no-index case (latch never set).
+    /// Bounded by `cold_wait_ms` (0 opts out) so it can never wedge, and on
+    /// timeout the handler resolves degraded exactly as before.
+    ///
+    /// GUARD DISCIPLINE: holds NO FileStore guard across the await — it touches
+    /// only the family's `done` atomic + `Notify`. Callers peek `language` under
+    /// a `get_open` guard that DROPS before this await, and snapshot `analysis`
+    /// fresh AFTER it, picking up any heal (see the hazard note on
+    /// `FileStore::for_each_open`).
+    async fn await_index_ready(&self, language: &str) {
+        use std::sync::atomic::Ordering;
+        let want_perl = language == "perl";
+        let latch = if want_perl { &self.perl_indexed } else { &self.pack_indexed };
+        let (done, notify) = if want_perl {
+            (&self.index_ready.perl_done, &self.index_ready.perl_notify)
+        } else {
+            (&self.index_ready.pack_done, &self.index_ready.pack_notify)
+        };
+        // Only wait when an index is actually coming: kicked off but not done.
+        if !latch.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
+            return;
+        }
+        let cap = self.cold_wait_ms.load(Ordering::Relaxed);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the final `done` re-check to close the
+        // notify lost-wakeup race (a completion between the first check and the
+        // await would otherwise be missed), then wait bounded.
+        let waited = notify.notified();
+        if done.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
+    }
 }
 
 impl Backend {
@@ -553,6 +651,8 @@ impl Backend {
             pack_change_lock: Arc::new(std::sync::Mutex::new(())),
             diag_options,
             rename_options: Arc::new(std::sync::Mutex::new(crate::resolve::RenameOptions::default())),
+            index_ready: Arc::new(IndexReady::default()),
+            cold_wait_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_COLD_WAIT_MS)),
         }
     }
 
@@ -924,6 +1024,17 @@ impl LanguageServer for Backend {
                 *self.rename_options.lock().unwrap() = parsed;
             }
         }
+        // `coldWaitMs` caps the cold-open pull-verb bounded wait; 0 opts out.
+        // Absent / non-integer leaves the default.
+        if let Some(ms) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("coldWaitMs"))
+            .and_then(|v| v.as_u64())
+        {
+            self.cold_wait_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -1183,6 +1294,13 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        // Cold-open bounded wait: if this file's family index is in-flight, block
+        // briefly for it so the query resolves warm instead of returning the one
+        // degraded answer the user never re-triggers. Guard dropped before the
+        // await; analysis snapshotted AFTER so any heal is picked up.
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language).await;
+        }
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, text, language) = match self.files.get_open(uri) {
@@ -1265,6 +1383,11 @@ impl LanguageServer for Backend {
     ) -> Result<Option<request::GotoImplementationResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        // Cold-open bounded wait (see `await_index_ready`): block briefly for an
+        // in-flight family index so implementations resolves warm.
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language).await;
+        }
         // Snapshot the open doc (cheap `Arc` clone) and DROP the store guard
         // before `resolve()` — it re-locks the open shards via `for_each_open`,
         // and holding the guard across that reentrant read deadlocks against a
@@ -1301,6 +1424,12 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
+        // Cold-open bounded wait (see `await_index_ready`): block briefly for an
+        // in-flight family index so cross-file references resolve warm (the
+        // in-window `op_free` 1 → 118 heal) instead of returning def-only.
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language).await;
+        }
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
@@ -1459,6 +1588,11 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        // Cold-open bounded wait (see `await_index_ready` + goto_definition):
+        // block briefly for an in-flight family index so hover resolves warm.
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language).await;
+        }
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, text, language) = match self.files.get_open(uri) {
