@@ -1,0 +1,135 @@
+{
+  "capability": "references",
+  "rows": [
+    {
+      "id": "cpp-cross-tu-free-fn-decl-reaches-every-tu-incl-test",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "The whole-tree differentiator vs clangd: references on a header free-function declaration (pkg::Combine in strjoin.h) reaches EVERY translation unit that #includes the header — the impl (strjoin.cc), two consumers (app.cc/other.cc), AND the test TU (strjoin_test.cc). clangd's compile_commands.json-scoped index routinely misses test/benchmark TUs; the include-closure visibility gate over the workspace-walked pack index does not.",
+      "file": "multitu/strjoin.h",
+      "line": 3,
+      "col": 4,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"strjoin.cc\",\"line\":\"3\"}",
+          "{\"col\":\"15\",\"file\":\"app.cc\",\"line\":\"5\"}",
+          "{\"col\":\"15\",\"file\":\"other.cc\",\"line\":\"3\"}",
+          "{\"col\":\"15\",\"file\":\"strjoin_test.cc\",\"line\":\"5\"}"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cross-tu-free-fn-use-matches-decl-anchor",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Symmetry: references anchored on a USE site (pkg::Combine in app.cc) returns the SAME whole-tree set as the decl-anchored row — gr is anchor-independent across the cross-TU include-closure gate.",
+      "file": "multitu/app.cc",
+      "line": 4,
+      "col": 14,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"strjoin.h\",\"line\":\"4\"}",
+          "{\"col\":\"5\",\"file\":\"strjoin.cc\",\"line\":\"3\"}",
+          "{\"col\":\"15\",\"file\":\"other.cc\",\"line\":\"3\"}",
+          "{\"col\":\"15\",\"file\":\"strjoin_test.cc\",\"line\":\"5\"}"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cross-tu-class-decl-reaches-users-not-non-users",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "A class/type (pkg::Mutex) with no overloading: gr from its header decl reaches every TU that names it — impl, app.cc, and the test TU — while EXCLUDING other.cc, which includes the header but never uses Mutex (visibility gate admits the closure, the matcher keys on the name).",
+      "file": "multitu/strjoin.h",
+      "line": 4,
+      "col": 6,
+      "expect": {
+        "all": [
+          "{\"col\":\"3\",\"file\":\"strjoin.cc\",\"line\":\"4\"}",
+          "{\"col\":\"8\",\"file\":\"app.cc\",\"line\":\"3\"}",
+          "{\"col\":\"8\",\"file\":\"strjoin_test.cc\",\"line\":\"3\"}"
+        ],
+        "none": [
+          "\"file\":\"other.cc\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cross-tu-class-use-matches-decl-anchor",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Symmetry for the type: references anchored on a Mutex type-use (app.cc pkg::Mutex mu) returns the same cross-TU set as the decl anchor, still excluding the non-using TU.",
+      "file": "multitu/app.cc",
+      "line": 2,
+      "col": 8,
+      "expect": {
+        "all": [
+          "{\"col\":\"7\",\"file\":\"strjoin.h\",\"line\":\"5\"}",
+          "{\"col\":\"3\",\"file\":\"strjoin.cc\",\"line\":\"4\"}",
+          "{\"col\":\"8\",\"file\":\"strjoin_test.cc\",\"line\":\"3\"}"
+        ],
+        "none": [
+          "\"file\":\"other.cc\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cross-tu-method-decl-reaches-call-sites-incl-test",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "A member function (pkg::Mutex::Lock) declared in the header: gr from the decl reaches every cross-TU call site incl the test TU, and the out-of-line definition in strjoin.cc.",
+      "file": "multitu/strjoin.h",
+      "line": 6,
+      "col": 7,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"strjoin.cc\",\"line\":\"5\"}",
+          "{\"col\":\"6\",\"file\":\"app.cc\",\"line\":\"4\"}",
+          "{\"col\":\"5\",\"file\":\"strjoin_test.cc\",\"line\":\"4\"}"
+        ],
+        "none": [
+          "\"file\":\"other.cc\""
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cross-tu-method-use-matches-decl-anchor",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Symmetry for the method: gr from a cross-TU call site (app.cc mu.Lock) matches the decl-anchored set.",
+      "file": "multitu/app.cc",
+      "line": 3,
+      "col": 5,
+      "expect": {
+        "all": [
+          "{\"col\":\"8\",\"file\":\"strjoin.h\",\"line\":\"7\"}",
+          "{\"col\":\"5\",\"file\":\"strjoin.cc\",\"line\":\"5\"}",
+          "{\"col\":\"5\",\"file\":\"strjoin_test.cc\",\"line\":\"4\"}"
+        ],
+        "none": [
+          "\"file\":\"other.cc\""
+        ]
+      },
+      "status": "gold"
+    }
+  ]
+}
