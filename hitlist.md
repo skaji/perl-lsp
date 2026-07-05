@@ -12,23 +12,32 @@
     ther's a random var named `h`
   - includes should be treated like perl imports in their UX
 
+
 ### op.c
 
-- line 180 - no references found, even tho it has callers thru its blessed macro
-- op_type from *op_p shows NO type info, just that it's a field
-  - gd on it takes you to the def of OP, which is just a container for another macro;
-    you'd probably want to model that cleaner and show where it's composed and also
-    defined
-  - `op_p->` by itself on a line gives no smart completion (falls back to global); it's possible that it's a syntax
-    error the sentinel doesn't fix?
+- `op_p->` by itself on a line gives no smart completion (falls back to global); it's
+  possible that it's a syntax error the sentinel doesn't fix?
     - `*op_p->` DOES give completion
     - so does `op_p. == 5` w/ your cursor on the dot
   - the "you need to peel" diagnostic is not firing
 - on line 185, no element of the OP enum is offered as a completion
-- on line 2817, gd on fix_optchain takes you to the intermediate macro, and you have to
-  then navigate to its inner def
-  - makes it seem like function like wrapper macros should be more transparent, similar to
-    the references issue from above
+
+- gd on OP (the type), after the deterministic fix, it now goes to a random macro; reachability has to get fixeded
+  - there might be some element where you can catch the undef to see which macros don't
+    get "exported"
+
+- op_p->op_next - the op_next hovers as OP, when it's really OP*
+- enum variants hover as their value definition (good) but show nothing about their type (bad)
+  - in opnames.h there's spurious inlay hints again - of course every value is an opcode
+  - also asymmetry; the enum variants show no references other than their own def
+
+
+### op.h
+
+- now, op_type on line 55 has issues (even tho we indeed gd to it properly from a usage site)
+  - it has a unecessary inline hint (it's LITERALLY typed right there)
+  - it does not show any references
+    asymmetric)
 
 ## fmt
 

@@ -47,8 +47,14 @@ why parked, what unblocks it. Prune on landing.
 - **Flag-set domains** (`op_flags`/`OPf_*` — subset-of vs one-of).
 - **Use-after-move re-wire** — needs path-sensitivity (function + test
   kept, unwired).
+  - let's see how far we can go at this now that we're smarter
 - **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
+  - i think this will just be closed; anyways it didn't look like it did the intended PPP,
+    which is to have mojo helpers which mint dynamic helpers show their definitions;
+    literally no reason to punt on a conrete impl. this branch is leaning towards prod, so
+    no reason to duplicate there
 - **PR #105** heatmap-viz refresh (pre-rebased on local `tmp-viz-trial`).
+  - yalla, let's clean that up; the core of the PR is just the html
 - **Per-toolchain global system-header cache**; the cross-language
   "system root" generalization (perl=@INC, python=probe).
 - **Instance brands** (per-object dispatch scoping) — downstream of the
@@ -66,16 +72,19 @@ why parked, what unblocks it. Prune on landing.
   `InferredType` flavor, not just `ClassName` — but `ClassName` was already
   shielded, so this residual's exposure is UNCHANGED: the auto-less case has
   no annotation witness to dominate the bogus flow class.)
+  - great; yes, let's not stam guess blindly, we have the knowledges
 - **C struct-field member resolution through a call-expression receiver**
   (`mkStruct()->field` where the callee's declared return is a struct
   pointer) — dark; distinct from the landed cpp method chain roots
   (methodchain works, C Field refs don't). Noted by the depth-B agent as
   pre-existing; lives in the `expr_type_at_span` path. Unassigned.
+  - this sounds like it should be easy enough that we'll just do it!
 - **json.hpp attribution stops mid-class** at a `#if`-conditional
   ctor-initializer — DECIDED arc: see
   `docs/adr/config-superposition-declarations.md` (re-anchor invariant +
   declaration-scoped variants; spike gate first). Blast radius detail in
   hitlist-3. BASEOP config-twin darkness (op.c) is the same tier.
+  - the design is settled to solve this guy
 - **Strip-blanked tokens aren't re-minted as refs** (gr misses blanked
   `NS_BEGIN`-style occurrences; splice-blanked ones ARE re-minted).
 - **Per-macro-name salvage granularity** — a macro with both good and bad
@@ -114,14 +123,17 @@ why parked, what unblocks it. Prune on landing.
   determinism".
 - **Enum value as template argument** not a ref (`MakeError<StatusCode::
   kNotFound>`) — hitlist-2 residual, unassigned.
+  - looks easy enough to close
 - **Refs inside another macro's `#define` body aren't indexed** — a use of
   `FLAGS` inside `IS_OK`'s body, redis `OBJ_ENCODING_EMBSTR` in
   `sdsEncodedObject`, perl5 `SvFLAGS` (190/347 grep-real) / `SvANY`
   (111/200). Macro definition bodies are preproc-excluded from ref minting;
   gd THROUGH the same nested sites works, so this is index-population only.
   Pinned `cpp-macro-nested-ref-in-macro-body` (xfail); unassigned.
+  - let's close this guy too
 - **`fmt::` qualified-path completion** unfiltered (the completion half
   of namespace participation — gd/gr half landed in slice B).
+  - this should be closed
 
 ## Cross-references
 - Gap shapes behind open xfails: `gold-corpus/KNOWN-GAPS.md`
