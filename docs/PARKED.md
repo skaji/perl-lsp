@@ -40,6 +40,11 @@ why parked, what unblocks it. Prune on landing.
   ANNOTATED receivers; an `auto`/annotation-less local initialized from
   an uppercase call still mistypes. Wants the heuristic gated on "callee
   resolves to a known type/ctor", not name case alone.
+- **C struct-field member resolution through a call-expression receiver**
+  (`mkStruct()->field` where the callee's declared return is a struct
+  pointer) — dark; distinct from the landed cpp method chain roots
+  (methodchain works, C Field refs don't). Noted by the depth-B agent as
+  pre-existing; lives in the `expr_type_at_span` path. Unassigned.
 - **json.hpp attribution stops mid-class** at a `#if`-conditional
   ctor-initializer — the config-superposition tier (a `#if` inside a
   class body forks the member list; wants the superposition model applied
