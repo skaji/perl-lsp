@@ -909,6 +909,14 @@ pub fn index_pack_languages(
     if std::env::var_os("PERL_LSP_MEM_REPORT").is_some() {
         eprintln!("[mem-report] {}", crate::cpp_reparse::cache_size_report());
     }
+    // Heap-composition of the resident pack `FileAnalysis` set — the Slice-2
+    // eviction target (`docs/adr/memory-slice-2-lru.md`). Env-gated, inert by
+    // default, no query-path cost.
+    if std::env::var_os("PERL_LSP_HEAP_DUMP").is_some() {
+        let mut agg = crate::file_analysis::HeapBreakdown::default();
+        hub.for_each_pack_registered_file(&mut |_path, fa| agg.add(&fa.heap_estimate()));
+        eprintln!("[heap-dump] {agg}");
+    }
     total.load(Ordering::Relaxed)
 }
 
