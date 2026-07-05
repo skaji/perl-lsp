@@ -154,21 +154,47 @@ why parked, what unblocks it. Prune on landing.
 - **Nested-hash-key completion level leak** (Perl, pre-existing — xfail
   `completion-exact-hash-key-slot-no-nested-leak`).
 - **Moo rwp writer at decl-token group answer** (prompt-heatmap.md).
-- **M6/L3 session determinism — cold-open degraded window** (residual; the
-  DEADLOCK half is FIXED — see below). The on-open analyze is cached-only and
-  the pack index attaches after the lazy background walk, so a query in that
-  window can see a degraded answer (pack completion falls back to the Perl hub
-  → `@INC` flood; cross-file gd/hover `None`) with no client re-request signal
-  for the pull verbs (completion self-heals via `isIncomplete`). Normally the
-  window closes in <500ms; under heavy load (a cold cache + the Perl cpanfile
-  resolver storm competing for CPU) it stretches past the e2e's 500ms settle
-  and a fast burst of queries can race it. Wants a completion signal on BOTH
-  `spawn_pack_gather_refresh` AND `ensure_workspace_indexed` (its latch marks
-  KICKOFF, not completion) plus a bounded wait in the pull handlers — deliberate
-  design gap. A cheap partial unblock: coalesce the `on_refresh`
-  diagnostics-refresh callback (it fires once PER resolved module — ~45× in a
-  400ms burst on a mixed repo, each a full `for_each_open_mut` + publish),
-  shrinking both the CPU pressure and the stdout flood that widen the window.
+- **M6/L3 session determinism — cold-open degraded window** (the DEADLOCK,
+  POISONED-PERSIST, and now the HEAL-REPUSH + COALESCE halves are FIXED; only a
+  bounded-wait in the pull handlers is LEDGERED — see below). The on-open
+  analyze is cached-only and the pack index attaches after the lazy background
+  walk, so a query in that window can see a degraded answer (pack completion
+  falls back to the Perl hub → `@INC` flood; cross-file gd/hover `None`; refs
+  from an open def-site return the def only, e.g. `op_free` count=1 in-window vs
+  118 warm). Completion self-heals via `isIncomplete`.
+  **The HEAL-REPUSH + COALESCE halves are FIXED** (`fix/degraded-window-heal`).
+  Two changes in `backend.rs`:
+  - **Completion-signal heal.** `ensure_workspace_indexed`'s latch marked
+    KICKOFF, not completion; nothing re-derived an open doc after the index
+    landed. Now the end of that background walk calls `Backend::heal_open_docs`,
+    which re-analyzes every OPEN doc in the family (pack: full off-lock
+    re-analysis via `spawn_pack_doc_refresh`, since the `did_open` gather was
+    cached-only and the cross-file index is now warm; perl: enrich + diagnostics
+    re-publish) — so the doc-baked degradation self-heals on a server-driven
+    event, not on a user re-trigger. `spawn_pack_gather_refresh` already heals
+    its own doc on gather completion, so BOTH completion signals now fire a
+    heal. Guard discipline held: pack URIs are snapshotted under a read guard
+    that drops before any re-analyze; the perl branch enriches under the write
+    guard touching only `module_index` and publishes after the guard drops
+    (same shape as the resolver `on_refresh`). Verified: `heal_open_docs` logs
+    `cold-window heal: index landed for pack family` on op.c open, refs heal
+    1→118 (`e2e/cold-window-heal-repro.sh` phase 1).
+  - **Coalesced `on_refresh`.** The callback fired once PER resolved module (33
+    fires opening a Perl file with 14 `use`s), each a full `for_each_open_mut` +
+    publish — CPU + stdout pressure that widens the window. It now bumps a
+    `refresh_gen` and debounces 120ms; only the latest fire runs, collapsing the
+    burst to ONE execution (measured 33→1, `e2e/cold-window-heal-repro.sh` phase
+    2). The final fire always survives the settle, so the fully-resolved state
+    is still published.
+  **LEDGERED (still open): the bounded wait.** A pull verb (gd/hover/references)
+  issued in-window and NOT re-requested still returns the one degraded answer —
+  the server has no push channel for pull verbs (only diagnostics + completion
+  `isIncomplete` push). A bounded wait in the pull handlers (block a gd/hover
+  briefly for an imminent index) would close this, but it risks re-introducing
+  the guard-held-across-`resolve()` deadlock family, so it is deliberately NOT
+  taken here. The heal-repush shrinks the STICKY surface (doc-baked answers +
+  diagnostics now self-heal server-side) and the coalesce narrows the window
+  itself; a single in-window pull query under load remains the residual.
   **The deadlock that used to MASK this window is fixed** (`Document::analysis`
   is now `Arc`; handlers snapshot + drop the `get_open` read guard before
   `resolve()` re-locks the open shards — the reentrant-read-behind-a-queued-
@@ -192,10 +218,10 @@ why parked, what unblocks it. Prune on landing.
   transient window WITHOUT `--clear-cache` (a genuine poison would fail every
   warm run). Locks: `include_closure_reports_incomplete_on_unreadable_header`
   (unit), `e2e/persist-poison-repro.sh` (cold-load poison → warm heals, no
-  clear-cache). What REMAINS is only the TRANSIENT window above (the
-  completion-signal + bounded-wait design gap) — a fast burst under load still
-  races the background gather/index for one session, but nothing sticky
-  survives it.
+  clear-cache). What REMAINS of the TRANSIENT window is only the ledgered
+  bounded-wait above — a single un-re-requested in-window pull query under load
+  still sees the degraded answer for one session; the doc-baked state and
+  diagnostics now self-heal server-side, and nothing sticky survives it.
 - **Enum value as template argument** — FIXED. The token always had a ref
   (the `@ref.type` catch-all fires in template args; the grammar guesses
   TYPE for value args), so the fix is resolution-side: gd's PackageRef arms
