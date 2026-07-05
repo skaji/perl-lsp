@@ -61,10 +61,17 @@ continuations (C phase-2 splice then phase-3 comment removal), and
 (`_SV_HEAD(void*)`) with comment-neutralized blanking; SV member
 intelligence restored (`memfree/` rows gold). **BASEOP was a
 MISATTRIBUTION**: the "4/14 fields dropped" were not a `synth_base` bug —
-those fields go dark only in config-INACTIVE `#ifdef` twins (`op_slabbed`
-works at op.c:394, dark at op.c:633 in the same function), the known
-config-superposition-on-declarations tier (PARKED). The nested-ref gr
-undercount is still open, now pinned `cpp-macro-nested-ref-in-macro-body`
+`op_slabbed` worked at op.c:394 and was dark at op.c:633. **The original
+"config-INACTIVE `#ifdef` twin" gloss here was wrong on both counts**
+(corrected by the 2026-07-05 spike,
+`docs/adr/config-superposition-declarations.md`): the darkness was NOT a
+config superposition and NOT twin-specific. It was the macro-expansion
+EXCLUDE_QUERY over-reaching conditional-region BODIES, so `pTHX_` stayed
+a literal token inside any `#ifdef`-wrapped function, mistyping the
+receiver `o` as `pTHX_`; condition-blind (config-ACTIVE `#ifndef` arms
+and single-arm `#ifdef`s reproduce it too, no twin required). Fixed by
+slice 1's exclusion narrowing (region bodies expandable). The nested-ref
+gr undercount is still open, now pinned `cpp-macro-nested-ref-in-macro-body`
 (xfail).
 
 ### Family A+I — cpp local-intelligence gaps

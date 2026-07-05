@@ -1,7 +1,12 @@
 # ADR: Config superposition over declarations
 
-Status: **decided** (veesh, 2026-07-05); implementation not started.
-Spike gate below runs before the main slices.
+Status: **decided** (veesh, 2026-07-05). **Slice 1 landed**: the
+macro-expansion exclusion narrowing (Case B, opportunistic widening with
+a wide-scope fallback) and the declaration-position directive repair
+(`strip_declaration_position_directives`, Case A's isolated ctor-`#if`).
+Case A's json.hpp blast radius (deep-error-propagation class corruption)
+and slice 2 (variant tags) remain open — see `docs/PARKED.md`.
+Spike gate below ran before the main slices.
 
 ## Context
 
