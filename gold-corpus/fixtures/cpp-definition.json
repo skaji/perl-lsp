@@ -909,18 +909,99 @@
    "semantic_area": "cpp-hitlist",
    "lang": "cpp",
    "root": "gold-corpus/cpp-fixture",
-   "status": "provisional",
+   "status": "gold",
    "file": "sibling_call.cpp",
    "id": "cpp-sibling-call-shadows-free",
    "line": 25,
    "col": 18,
-   "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the sibling LINK is minted (Board::freefunc offered), but the overload-arity ranking in resolve.rs (pkg_agrees admits the package-less free fn) still surfaces the free decl first — a resolve.rs-owned interaction, logged in docs/open-forks.md. Provisional: never fails.",
+   "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the implicit-this sibling member Board::freefunc ranks FIRST (owner-matched), the free decl kept below (family never pruned). Resolved by owner-anchored overload ranking (Family Q) — the free fn no longer shadows the sibling.",
    "expect": {
     "all": [
      "sibling_call.cpp:25:10"
     ],
-    "none": []
+    "none": [
+     "\nsibling_call.cpp:25:10"
+    ]
    }
+  },
+  {
+   "id": "cpp-family-q-qualified-enum-case-label",
+   "difficulty": "hard",
+   "semantic_area": "cpp-family-q-owner-anchor",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "ownerqual/use.cpp",
+   "line": 3,
+   "col": 18,
+   "comment": "gd on `case dynamic::STRING:` anchors on the `dynamic::` qualifier and lands on the nested-enum enumerator in kind.h - a same-named `#define STRING` in an unrelated file must NOT hijack it (macro lane preempted by owner-anchored resolution).",
+   "expect": {
+    "all": [
+     "kind.h:4:20"
+    ],
+    "none": [
+     "collide.cpp"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-family-q-qualified-enum-expr",
+   "difficulty": "hard",
+   "semantic_area": "cpp-family-q-owner-anchor",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "ownerqual/use.cpp",
+   "line": 8,
+   "col": 23,
+   "comment": "gd on `k == dynamic::STRING` (expression position) - same owner-anchored resolution as the case label; the `#define STRING` collider stays out.",
+   "expect": {
+    "all": [
+     "kind.h:4:20"
+    ],
+    "none": [
+     "collide.cpp"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-family-q-member-call-ranked-over-free",
+   "difficulty": "hard",
+   "semantic_area": "cpp-family-q-owner-anchor",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "memfree/use.cpp",
+   "line": 2,
+   "col": 17,
+   "comment": "gd on `logger.info(5)` where a same-named FREE `info` exists - the receiver-class member ranks FIRST (owner-matched), the free function stays in the set below (family never pruned).",
+   "expect": {
+    "all": [
+     "log.h:4:7",
+     "log.h:6:5"
+    ],
+    "none": [
+     "\nlog.h:4:7"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-family-q-namespace-scoped-enum-leak",
+   "difficulty": "hard",
+   "semantic_area": "cpp-family-q-owner-anchor",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "nsleak/use.cpp",
+   "line": 2,
+   "col": 16,
+   "comment": "gd on `level::info` where `info` is an unscoped enumerator of `enum level_enum` nested in `namespace level` - the qualifier is the NAMESPACE (not a cache key, and the enumerator is not linkage-visible), so resolution walks the origin include closure and bridges the namespace->enum->enumerator leak by span containment. The spdlog level::info shape.",
+   "expect": {
+    "all": [
+     "common.h:4:39"
+    ],
+    "none": []
+   },
+   "status": "gold"
   }
  ]
 }

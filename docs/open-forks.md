@@ -38,7 +38,7 @@ Format per entry:
   through `emit_return_fuel`; the sibling-call pass already stands alone as
   its own block, so it just reads a different flag.
 
-## Sibling-call vs. same-named free function ranking — 2026-07-05 — OPEN
+## Sibling-call vs. same-named free function ranking — 2026-07-05 — RESOLVED (Family Q, 2026-07-05)
 - **Context:** same slice. When a method body calls `foo()` and BOTH a
   sibling method `Class::foo` and a free `foo()` exist, C++ name lookup says
   the member hides the free function. The model tier correctly MINTS the
@@ -52,14 +52,19 @@ Format per entry:
   residual is a resolve.rs overload-family concern. B — teach
   `overload_arity` that a member call (pinned `resolved_package`, class
   origin) excludes package-less free functions from the family.
-- **Picked:** A for this slice — `resolve.rs` is explicitly owned by a
-  sibling worktree this slice must not touch. Logged for that owner. The
-  reduced-fixture row `cpp-sibling-call-shadows-free` is PROVISIONAL
-  (asserts the sibling link is offered; does not gate on the free being
-  absent) so the residual is tracked without a false-green.
-- **Undo cost:** small and localized to `resolve.rs::overload_arity_definitions`
-  — gate the family gather on `pkg_agrees(relative=false, …)` (exact
-  package) when the call carries a member-pinned `resolved_package`.
+- **Picked:** B, landed by the Family Q slice that owns `resolve.rs`. This
+  ranking residual is the exact symptom-2 of Family Q (owner/qualifier-blind
+  forward resolution): `overload_arity_definitions` now ranks candidates by
+  **owner match** first — a candidate whose package genuinely agrees with the
+  call's anchored owner (both sides carry a package, tails agree) sorts above
+  one admitted only by `pkg_agrees`' recall bias (a package-`None` free
+  function). The family is never pruned: the free decl stays in the set,
+  ranked below the sibling member. The pinned `resolved_package` = the class
+  origin makes the sibling member owner-matched, so it wins. General rule (no
+  member-vs-free branch): the owner match IS the key, shared with the
+  `dynamic::STRING` / `logger.info` / `level::info` cases.
+- **Outcome:** `cpp-sibling-call-shadows-free` promoted PROVISIONAL → gold,
+  now asserting the sibling member ranks FIRST (`none: ["\nsibling_call.cpp:25:10"]`).
 
 ## Hover presentation payload — 2026-07-03 — RATIFIED (veesh, 2026-07-03)
 - **Context:** hitlist-2 slice D (#14): hover became a CandidateSet

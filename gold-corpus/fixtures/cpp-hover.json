@@ -507,6 +507,26 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-family-q-member-decl-hover-not-free",
+      "difficulty": "hard",
+      "semantic_area": "cpp-family-q-owner-anchor",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "memfree/log.h",
+      "line": 3,
+      "col": 8,
+      "comment": "hover on the member declaration `info` in `struct Logger` presents the MEMBER, not a color.h-style free `info` - the decl->def hunt no longer treats a package-`None` free function as the body of a package-`Logger` member.",
+      "expect": {
+        "all": [
+          "*method*"
+        ],
+        "none": [
+          "return x + 1"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

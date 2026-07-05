@@ -1091,33 +1091,112 @@ impl<'a> CandidateSet<'a> {
     fn member_def_location(&self, class: &str, member: &str) -> Option<RefLocation> {
         let is_member = |fa: &crate::file_analysis::FileAnalysis,
                          s: &crate::file_analysis::Symbol| {
-            s.name == member
-                && s.package.as_deref() == Some(class)
-                && match s.kind {
-                    SymKind::Method | SymKind::Sub => true,
-                    // A data member (or enum constant) must be the class's
-                    // OWN content, not a sub-body local carrying the class
-                    // as sticky package.
-                    SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
-                        fa.symbol_is_class_content(s)
+            if s.name != member {
+                return false;
+            }
+            match s.kind {
+                SymKind::Method | SymKind::Sub => s.package.as_deref() == Some(class),
+                // A data member (or enum constant) must be the class's OWN
+                // content, not a sub-body local carrying the class as sticky
+                // package.
+                SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
+                    if !fa.symbol_is_class_content(s) {
+                        return false;
                     }
-                    _ => false,
+                    if s.package.as_deref() == Some(class) {
+                        return true;
+                    }
+                    // Unscoped-enum leak: `dynamic::STRING` / `level::info`
+                    // where the enumerator's enum is nested in a class OR
+                    // namespace `class`. C++ makes an unscoped enum's
+                    // enumerators members of EVERY enclosing named scope,
+                    // addressable by that scope's name — but extraction files
+                    // the enumerator under its tightest container (the enum),
+                    // so the direct package match above misses the outer
+                    // scope. Bridge it structurally: the enumerator's span
+                    // lives inside a container symbol named `class`
+                    // (span-contained, and not the enumerator itself). Works
+                    // whether the scope is a struct (`dynamic`) or a namespace
+                    // (`level`), without depending on how either tags package.
+                    matches!(s.kind, SymKind::Enumerator)
+                        && fa.symbols.iter().any(|c| {
+                            c.name == class
+                                && c.span != s.span
+                                && (c.span.start.row, c.span.start.column)
+                                    <= (s.span.start.row, s.span.start.column)
+                                && (s.span.end.row, s.span.end.column)
+                                    <= (c.span.end.row, c.span.end.column)
+                        })
                 }
+                _ => false,
+            }
         };
         if let Some(sym) = self.origin.symbols.iter().find(|s| is_member(self.origin, s)) {
             return Some(self.origin_decl(sym.selection_span));
         }
         let idx = self.idx()?;
-        let cached = idx.get_cached(class)?;
-        let sym = cached
-            .analysis
-            .symbols
-            .iter()
-            .find(|s| is_member(&cached.analysis, s))?;
-        Url::from_file_path(&cached.path).ok()?;
-        Some(RefLocation {
-            key: FileKey::Path(cached.path.clone()),
-            span: sym.selection_span,
+        let loc_of = |cached: &crate::file_analysis::CachedModule, sym: &crate::file_analysis::Symbol| {
+            Url::from_file_path(&cached.path).ok()?;
+            Some(RefLocation {
+                key: FileKey::Path(cached.path.clone()),
+                span: sym.selection_span,
+                access: AccessKind::Declaration,
+                rewritable: true,
+                label: None,
+            })
+        };
+        // Class-keyed cached module — the fast path when `class` names a
+        // struct/class/enum that is itself a cache key.
+        if let Some(cached) = idx.get_cached(class) {
+            if let Some(sym) = cached.analysis.symbols.iter().find(|s| is_member(&cached.analysis, s)) {
+                return loc_of(&cached, sym);
+            }
+        }
+        let Some((self_path, visible)) = idx.visibility_scope() else {
+            return None;
+        };
+        let self_str = self_path.to_string_lossy().into_owned();
+        let connected = |cached: &crate::file_analysis::CachedModule| {
+            let p = cached.path.to_string_lossy();
+            visible.contains(p.as_ref())
+                || cached.analysis.include_closure.iter().any(|c| *c == self_str)
+        };
+        // Name-indexed def candidates first (a File-scope member the index
+        // registered) — the cheap subset, path-sorted for determinism.
+        {
+            let mut cands = idx.def_candidates(member);
+            cands.sort_by(|a, b| a.path.cmp(&b.path));
+            for cached in cands {
+                if !connected(&cached) {
+                    continue;
+                }
+                if let Some(sym) = cached.analysis.symbols.iter().find(|s| is_member(&cached.analysis, s)) {
+                    return loc_of(&cached, sym);
+                }
+            }
+        }
+        // Include-closure scan: a namespace-scoped unscoped-enum enumerator
+        // (`spdlog::level::info`) is NOT linkage-visible, so the name index
+        // never registered it and the class key (`level`, a namespace) is no
+        // cache winner. The origin's own include closure still carries the
+        // defining header — walk it directly, applying the same owner test.
+        // Only reached when both keyed lookups miss (a namespace-qualified
+        // member), so the broad scan stays off the hot path.
+        let mut hit: Option<(String, Span)> = None;
+        idx.for_each_cached_file(&mut |cached| {
+            if !connected(cached) || Url::from_file_path(&cached.path).is_err() {
+                return;
+            }
+            if let Some(sym) = cached.analysis.symbols.iter().find(|s| is_member(&cached.analysis, s)) {
+                let p = cached.path.to_string_lossy().into_owned();
+                if hit.as_ref().is_none_or(|(hp, _)| p < *hp) {
+                    hit = Some((p, sym.selection_span));
+                }
+            }
+        });
+        hit.map(|(p, span)| RefLocation {
+            key: FileKey::Path(PathBuf::from(p)),
+            span,
             access: AccessKind::Declaration,
             rewritable: true,
             label: None,
@@ -1160,9 +1239,23 @@ impl<'a> CandidateSet<'a> {
         if !hunt {
             return vec![decl];
         }
+        // Identity is owner-exact here, NOT recall-biased: the decl→def hunt
+        // decides "is this the SAME symbol's body," and a same-named FREE
+        // function (package `None`) is a different identity than a class member
+        // (package `Some`) — the `pkg_agrees` recall bias that admits an
+        // unattributed side would let color.h's free `format` masquerade as the
+        // body of `native_formatter::format`. Keep `None == None` (a free-fn
+        // prototype and its TU body, an `extern` and its definition) and
+        // tail-equal `Some`/`Some` (a member declared in-class, defined
+        // out-of-line); reject the vacuous `Some`/`None` cross.
+        let owner_agrees_forward = |a: Option<&str>, b: Option<&str>| match (a, b) {
+            (None, None) => true,
+            (Some(x), Some(y)) => pkg_agrees(true, Some(x), Some(y)),
+            _ => false,
+        };
         let cand_is_def = |a: &FileAnalysis, s: &crate::file_analysis::Symbol| {
             s.name == sym.name
-                && pkg_agrees(true, sym.package.as_deref(), s.package.as_deref())
+                && owner_agrees_forward(sym.package.as_deref(), s.package.as_deref())
                 && match sym.kind {
                     SymKind::Sub | SymKind::Method => {
                         matches!(s.kind, SymKind::Sub | SymKind::Method)
@@ -1278,22 +1371,35 @@ impl<'a> CandidateSet<'a> {
         };
         let has_body =
             |a: &FileAnalysis, s: &crate::file_analysis::Symbol| a.scopes.iter().any(|sc| sc.span == s.span);
-        // Sort key, best-first: arity fit, then bodied, then local, then a
-        // total (path, row, col) order for determinism across cache iteration.
-        let mut cands: Vec<(u8, bool, bool, PathBuf, usize, usize, RefLocation)> = Vec::new();
-        let push = |fit: u8,
+        // Owner match: the candidate GENUINELY belongs to the anchored owner
+        // (both sides carry a package and the tails agree) — NOT via the
+        // `pkg_ok` recall bias that admits an unattributed side. A member call
+        // (`logger.info(x)`) anchors on the receiver class, so a real member
+        // ranks above a same-named FREE function (package `None`); the free
+        // function stays in the set, just below. `None` anchor (a free-fn call)
+        // leaves the axis flat, so non-member overloading is untouched.
+        let owner_matched = |sp: Option<&str>| match (pkg.as_deref(), sp) {
+            (Some(p), Some(q)) => pkg_agrees(true, Some(p), Some(q)),
+            _ => false,
+        };
+        // Sort key, best-first: owner match, then arity fit, then bodied, then
+        // local, then a total (path, row, col) order for cache determinism.
+        let mut cands: Vec<(bool, u8, bool, bool, PathBuf, usize, usize, RefLocation)> = Vec::new();
+        let push = |owner: bool,
+                    fit: u8,
                     bodied: bool,
                     local: bool,
                         key: &FileKey,
                         span: Span,
-                        cands: &mut Vec<(u8, bool, bool, PathBuf, usize, usize, RefLocation)>| {
+                        cands: &mut Vec<(bool, u8, bool, bool, PathBuf, usize, usize, RefLocation)>| {
             if cands
                 .iter()
-                .any(|c| file_key_eq(&c.6.key, key) && c.6.span == span)
+                .any(|c| file_key_eq(&c.7.key, key) && c.7.span == span)
             {
                 return;
             }
             cands.push((
+                owner,
                 fit,
                 bodied,
                 local,
@@ -1315,7 +1421,27 @@ impl<'a> CandidateSet<'a> {
                 && pkg_ok(s.package.as_deref())
         }) {
             let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
-            push(fit, has_body(analysis, s), true, &self.origin_key, s.selection_span, &mut cands);
+            push(owner_matched(s.package.as_deref()), fit, has_body(analysis, s), true, &self.origin_key, s.selection_span, &mut cands);
+        }
+        // The receiver class's OWN cached file. A member method is not
+        // linkage-visible, so the def-candidates table below (keyed on the
+        // bare name) never pulls the member's header in when the same-named
+        // FREE function that collides lives in a DIFFERENT file (spdlog's
+        // `logger::info` in logger.h vs `spdlog::info` in spdlog.h). Seed the
+        // owner-matched member directly from `get_cached(class)` so the
+        // ranking can float it above the frees.
+        if let Some(p) = &pkg {
+            if let Some(cached) = idx.get_cached(p) {
+                let key = FileKey::Path(cached.path.clone());
+                for s in cached.analysis.symbols.iter().filter(|s| {
+                    s.name == name
+                        && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                        && pkg_ok(s.package.as_deref())
+                }) {
+                    let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
+                    push(owner_matched(s.package.as_deref()), fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                }
+            }
         }
         // Cross-file: the full def-candidates table, closure-connected to the
         // origin (same connectivity gate as the decl→def ranking).
@@ -1341,7 +1467,7 @@ impl<'a> CandidateSet<'a> {
                         && pkg_ok(s.package.as_deref())
                 }) {
                     let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
-                    push(fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                    push(owner_matched(s.package.as_deref()), fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
                 }
             }
         }
@@ -1349,13 +1475,14 @@ impl<'a> CandidateSet<'a> {
             return None;
         }
         cands.sort_by(|a, b| {
-            b.0.cmp(&a.0) // arity fit, best first
-                .then_with(|| b.1.cmp(&a.1)) // bodied first
-                .then_with(|| b.2.cmp(&a.2)) // local first
-                .then_with(|| a.3.cmp(&b.3)) // path
-                .then_with(|| (a.4, a.5).cmp(&(b.4, b.5))) // row, col
+            b.0.cmp(&a.0) // owner-matched first
+                .then_with(|| b.1.cmp(&a.1)) // arity fit, best first
+                .then_with(|| b.2.cmp(&a.2)) // bodied first
+                .then_with(|| b.3.cmp(&a.3)) // local first
+                .then_with(|| a.4.cmp(&b.4)) // path
+                .then_with(|| (a.5, a.6).cmp(&(b.5, b.6))) // row, col
         });
-        Some(cands.into_iter().map(|c| c.6).collect())
+        Some(cands.into_iter().map(|c| c.7).collect())
     }
 
     /// A declaration site in the origin file.
@@ -1376,6 +1503,29 @@ impl<'a> CandidateSet<'a> {
     pub fn definitions(&self) -> Vec<RefLocation> {
         let analysis = self.origin;
         let point = self.point;
+
+        // Owner-anchored forward resolution: a `::`-qualified value read
+        // (`dynamic::STRING`, `absl::StatusCode::kNotFound`) names its OWNER
+        // explicitly — the qualifier segment touching the token. Resolve the
+        // member on that owner BEFORE any bare-name fallback (the macro lane
+        // below, the by-name file-scope tail), which would otherwise hijack the
+        // name via a same-named `#define` or free symbol in an unrelated file.
+        // A macro has no namespace, so a qualified word is never a macro use;
+        // anchoring on the qualifier the cursor already wrote is unconditional.
+        // Falls through untouched when the qualifier resolves nothing (a
+        // namespace middle-segment `ns::Code` handled by the type/last-resort
+        // paths).
+        if self.pack {
+            if let Some(source) = self.source {
+                if let Some(owner) = qualifier_at_point(source, point) {
+                    if let Some(name) = word_at_point(source, point) {
+                        if let Some(loc) = self.member_def_location(owner, name) {
+                            return vec![loc];
+                        }
+                    }
+                }
+            }
+        }
 
         // Macro-aware goto-def OWNS a macro-named word (pack routing): the
         // `#define` wins over a use's self-span, EVERY def site comes back
@@ -3214,6 +3364,32 @@ fn qualifier_before(source: &str, span: Span) -> Option<&str> {
     }
     let b = source.as_bytes();
     let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    let e = start - 2;
+    let mut s = e;
+    while s > 0 && is_id(b[s - 1]) {
+        s -= 1;
+    }
+    (s < e).then(|| &source[s..e])
+}
+
+/// The `::`-qualifier owning the identifier under `point` — `dynamic` for the
+/// cursor anywhere in `STRING` of `dynamic::STRING`. Walks back to the token
+/// start (like `word_at_point`), then reuses `qualifier_before`'s `::`-scan.
+/// `None` when the token has no leading `::` scope.
+fn qualifier_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
+    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
+    let b = source.as_bytes();
+    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    if cursor > b.len() {
+        return None;
+    }
+    let mut start = cursor;
+    while start > 0 && is_id(b[start - 1]) {
+        start -= 1;
+    }
+    if start < 2 || !source.is_char_boundary(start) || &source[start - 2..start] != "::" {
+        return None;
+    }
     let e = start - 2;
     let mut s = e;
     while s > 0 && is_id(b[s - 1]) {
