@@ -18,28 +18,27 @@ Format per entry:
 
 ---
 
-## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — RATIFIED (veesh, 2026-07-05)
-- **Context:** hitlist-3 Family A+I slice. The implicit-field-read pass is
-  gated by the pack's `implicit_field_reads` capability. The sibling-CALL
+## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — RATIFIED + RENAME LANDED (veesh, 2026-07-05)
+- **Context:** hitlist-3 Family A+I slice. The implicit-member pass is
+  gated by the pack's `implicit_this_members` capability. The sibling-CALL
   half (a bare `foo()` inside a method body meaning `this->foo()`) needed a
   gate too — same fork the task flagged: reuse the flag, or add a sibling
   one.
-- **Options:** A — reuse `implicit_field_reads` for both halves. B — add a
+- **Options:** A — reuse the one capability for both halves. B — add a
   parallel `implicit_method_calls` capability.
 - **Picked:** A. "Can a bare name resolve through an implicit `this->`" is a
   SINGLE language fact — C/C++ elide the receiver for both members and
   methods; Python/R make it mandatory for both. There is no language where
   fields elide but methods don't (or vice-versa), so a second flag would be
   a distinction with no possible producer. The flag's NAME is now
-  field-specific and slightly under-describes its scope; a future rename to
-  `implicit_this_members` is the loose cleanup, deferred to avoid churn
-  across the pack definitions.
+  field-specific and slightly under-describes its scope; the rename to
+  `implicit_this_members` (member-scoped, covers fields AND sibling calls)
+  landed in the round-close sweep.
 - **Undo cost:** trivial — split into two bools and thread the second
   through `emit_return_fuel`; the sibling-call pass already stands alone as
   its own block, so it just reads a different flag.
-- **Ratification (veesh):** one flag for both, confirmed; the rename
-  (`implicit_field_reads` → something member-scoped) happens at a later
-  decrufting. Queued in PARKED design-debt.
+- **Ratification (veesh):** one flag for both, confirmed; the rename to a
+  member-scoped name landed (`implicit_this_members`).
 
 ## Sibling-call vs. same-named free function ranking — 2026-07-05 — RESOLVED (Family Q, 2026-07-05)
 - **Context:** same slice. When a method body calls `foo()` and BOTH a
@@ -110,7 +109,7 @@ Format per entry:
 - **Discussion needed:** none urgent; fold into B if/when a language tag
   exists.
 
-## `Slot::ModulePath`'s `in_use` field — 2026-07-05 — RATIFIED with direction (veesh, 2026-07-05)
+## `Slot::ModulePath`'s `in_use` field — 2026-07-05 — RATIFIED + GENERALIZED (veesh, 2026-07-05)
 - **Context:** cursor Slot taxonomy (`docs/adr/cursor-slots.md`), migrating
   completion's context match onto `Slot`. The ADR sketches `ModulePath {
   prefix: String }` covering BOTH `use |` (typing the module name —
@@ -142,10 +141,13 @@ Format per entry:
   `cursor_slot_tests.rs::detect_slot_perl_use_module_name_is_module_path`.
   (The two renders now live set-side as
   `CandidateSet::complete_module_candidates` / `complete_qualified_path`.)
-- **Ratification (veesh):** keep, but GENERALIZE at a future decruft —
-  `in_use` should become a generic "which detector arm fired" fact the
-  Slot always carries, not a ModulePath-only special case. Queued in
-  PARKED design-debt.
+- **Ratification (veesh):** keep, but GENERALIZE — done in the round-close
+  sweep. `in_use` is gone; every detected slot now carries a
+  `DetectorArm` (`cursor_slot.rs`) — the generic "which detector fired"
+  fact. `detect_slot`/`detect_call_slot` return `DetectedSlot { slot, arm }`;
+  the `ModulePath` consumer asks `arm == UseModule` (module-name render) vs
+  `QualifiedPath` (drill), no per-variant bool. Any future folded-slot
+  consumer reads the same arm.
 
 ## Ref-type deref snippets — candidate data vs projection policy — 2026-07-05 — RATIFIED (veesh, 2026-07-05)
 - **Context:** the entity-content candidate-level migration (PARKED

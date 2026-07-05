@@ -951,13 +951,15 @@ pub struct LangPack {
     /// it is clean. Pack-owned language vocab (like `op_map`): core asks the
     /// value, never enumerates names itself.
     pub rebind_method: fn(method: &str) -> bool,
-    /// Does a bare, receiver-less identifier that names an enclosing class's
-    /// field mean an implicit member read (`return inner_;` = `this->inner_`)?
-    /// True for C/C++ (implicit `this->`); false for Python/R (a bare name is
-    /// never `self.field` — the receiver is mandatory). Gates
-    /// `language_driver::emit_return_fuel`'s implicit-field-read pass — a
-    /// language fact the driver asks the pack, not a language-name branch.
-    pub implicit_field_reads: bool,
+    /// Can a bare, receiver-less identifier resolve through an implicit
+    /// `this->` — both a field read (`return inner_;` = `this->inner_`) AND a
+    /// sibling method call (`foo()` = `this->foo()`)? True for C/C++ (the
+    /// receiver is elided for both members and methods); false for Python/R
+    /// (the receiver is mandatory for both). One language fact, not two: no
+    /// language elides fields but not methods. Gates the member-access half of
+    /// `language_driver::emit_return_fuel` — asked of the pack, never a
+    /// language-name branch.
+    pub implicit_this_members: bool,
     /// Completion trigger characters for the LSP
     /// `completionProvider.triggerCharacters` slot — the client auto-fires
     /// completion (and reports the char in `CompletionContext`) when one is
@@ -1099,7 +1101,7 @@ pub fn perl_pack() -> LangPack {
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
-        implicit_field_reads: false,
+        implicit_this_members: false,
         trigger_chars: &["$", "@", "%", ">", ":", "{"],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1140,7 +1142,7 @@ pub fn python_pack() -> LangPack {
         // `isinstance(x, Foo)` narrows x to Foo inside the guard.
         narrow_guard: |guard, ty| (guard == Some("isinstance")).then(|| InferredType::ClassName(ty.to_string())),
         rebind_method: |_| false,
-        implicit_field_reads: false,
+        implicit_this_members: false,
         trigger_chars: &["."],
         receiver_names: &["self", "cls"],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1182,7 +1184,7 @@ pub fn r_pack() -> LangPack {
         cmd_effects: |_| vec![],
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
-        implicit_field_reads: false,
+        implicit_this_members: false,
         trigger_chars: &["$", "@", ":"],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1231,7 +1233,7 @@ pub fn cmake_pack() -> LangPack {
         },
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
-        implicit_field_reads: false,
+        implicit_this_members: false,
         trigger_chars: &["{", "("],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1336,7 +1338,7 @@ pub fn cpp_pack() -> LangPack {
             matches!(m, "clear" | "reset" | "assign" | "emplace" | "swap")
         },
         // C/C++ methods read members with an implicit `this->`.
-        implicit_field_reads: true,
+        implicit_this_members: true,
         trigger_chars: &[".", ">", ":"],
         receiver_names: &["this"],
         // `field_identifier` only ever names a struct/class member (the

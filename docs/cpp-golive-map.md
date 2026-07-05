@@ -57,6 +57,29 @@ inherited by every projection, both languages. Heatmap #99 migrated onto
 landed fix run: `docs/hitlist-2.md` (all five slices A–E landed — see
 queue #9; residuals pinned in `gold-corpus/KNOWN-GAPS.md`).
 
+## STATE @ 2026-07-05 — hitlist-4 families + heatmap-cpp + refs reach
+
+Dogfood round on op.c/op.h (`docs/hitlist-4.md`) root-caused six findings
+into four families, all landed. Durable structure:
+
+- **Family A/C/D** are the KNOWN-LIVE-BUGS flips below (`OP` gd fn-like-macro
+  arbitration; macro-body member field payload; DEEP-receiver peel hint +
+  Mode-B CLI parity). **Family B** = the first-open degraded window, healed
+  server-side (heal-repush + coalesced refresh; `docs/PARKED.md` retains the
+  ledgered bounded-wait residual).
+- **heatmap-into-cpp** — `--heatmap` lights up for pack languages: per-symbol
+  fan-in/fan-out over the pack sub-indexes (fan-in routes through each pack's
+  own cache, not the Perl hub), a pack-language usage/dead-code view.
+  `docs/prompt-heatmap.md`.
+- **macro-body ref indexing** — a macro name used inside another macro's
+  `#define` body mints a read at its span (`macro_body_name_refs`), so gr on
+  `SvFLAGS`/`SvANY` reaches nested-macro uses. Cross-file-closure reach is the
+  residual (`docs/PARKED.md`).
+- **call-receiver field** — single-file `mkStruct()->field` resolves: the
+  free-function return type carries through `expr_type_at_span`'s member-chain
+  arm. Cross-file (prototype in an included header) is the pinned residual
+  (xfail `cpp-call-receiver-field-crossfile-call`).
+
 ## READY QUEUE
 
 1–5 ✅ LANDED (see the arc record above). Remaining:
@@ -240,11 +263,14 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              needs spdlog/fmt/onednn calibration, same bar UAM cleared.
              Pack-CAPABILITY gated, not `lang == cpp`.
              `docs/adr/narrowing-diagnostics.md`, `docs/PARKED.md`.
-         · TYPE-CONSTRAINED completion .................... ⬜ (sick)
-             at a typed slot (`x.` where x:T, a `T`-typed arg position, a
-             return slot), offer only members/values whose type matches the
-             EXPECTED type — rank/filter completions by the type tier we
-             already have. Flow-aware, additive; clangd does a weak version.
+         · TYPE-CONSTRAINED completion .................... ✅ (domain slots)
+             at a typed slot, rank the expected type's members first. The
+             `Slot::expected_type` seam drives both the cpp domain-compare
+             (`op_type == |` → `OP_*` ranked, `detail: "opcode"`) and the
+             Perl ArgPosition consumer (`docs/adr/cursor-slots.md`). Never
+             prunes the global pool. Residual: the switch-`case |:` position
+             (needs the switch-condition climb) + the Perl enum-domain source
+             (`Type::Tiny` model — `docs/PARKED.md`).
 
        KNOWN LIVE BUGS (op.c stress):
          · config-variant macro goto-def ✅ — every `#define` carries its
@@ -256,8 +282,21 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
                - join→typing ⬜ (`op_type` still untyped: `PERL_BITFIELD16 →
                  U16` is the TYPEDEF case; needs typedef resolution `U16 →
                  unsigned short → Numeric` + a join override seam).
-         · `op_p` member completion peel `(*op_p)->` not firing. ⬜
-         · `op_type` hover shows a spurious/random line. ⬜
+         · `op_p` member completion peel `(*op_p)->` ✅ (hitlist-4 D)
+             — DEEP-receiver peel hint ("wrap, not swap") now has a producer;
+             Mode-B diagnostics reach the CLI (`--batch`/`--check`) too, so
+             gold sees the same answers the LSP publishes.
+         · `op_type`/`op_next` macro-body member payload ✅ (hitlist-4 C)
+             — a field declared inside a `#define BASEOP` body now mints as a
+             `Field` of `op` with its full payload: the deref_stack survives
+             (`op_next: OP*`, not `OP`), owner is the class not the macro
+             package, and def-site and use-site hover agree.
+         · gd on `OP` (the type) hijacked by a fn-like macro ✅ (hitlist-4 A)
+             — a parenless type-position `OP` no longer resolves to a
+             function-like `#define OP(p)`: fn-like macros are shape-gated
+             (C's own rule — a fn-like macro expands ONLY before `(`), so the
+             `typedef struct op OP` wins the candidate lane. rule #10 clean
+             (the macro's own arity gates it, no name allowlist).
 
        TABLE STAKES — the ship gate (dogfooding, hitlist.md). The honest
          read: the DIFFERENTIATORS (narrowing, use-after-move, function-scope)

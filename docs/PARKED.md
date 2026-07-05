@@ -25,13 +25,6 @@ why parked, what unblocks it. Prune on landing.
   `CompletionCandidate`) and semantics (enum members verbatim, front-loaded
   vs. type-matching locals kept at `PRIORITY_LOCAL`). No shared gatherer to
   factor.
-- **Fork-ratification decruft items (veesh, 2026-07-05)** — all forks in
-  `docs/open-forks.md` are now ratified/resolved; two carry queued
-  cleanups: (a) rename `implicit_field_reads` to a member-scoped name (it
-  gates sibling CALLS too); (b) generalize `Slot::ModulePath.in_use` into
-  a generic "which detector arm fired" fact carried by every Slot, not a
-  ModulePath-only bool. Both are pure renames/reshapes, next sweep.
-
 ## Feature tier (each is a fireable slice)
 
 - **Perl domain typing** — needs a constant-group / Type::Tiny enum-domain
@@ -88,7 +81,7 @@ why parked, what unblocks it. Prune on landing.
   headers that surface as bare identifiers) must be **calibrated against the
   macro-heavy real substrate** (spdlog/fmt/onednn), the same bar
   use-after-move cleared. Default-off + opt-in + pack-capability gate
-  (declared like `implicit_field_reads`, never `lang == cpp`) is understood;
+  (declared like `implicit_this_members`, never `lang == cpp`) is understood;
   only the valve + its calibration remain. `docs/adr/narrowing-diagnostics.md`.
 - **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
   - i think this will just be closed; anyways it didn't look like it did the intended PPP,
@@ -174,7 +167,12 @@ why parked, what unblocks it. Prune on landing.
 - **Strip-blanked tokens aren't re-minted as refs** (gr misses blanked
   `NS_BEGIN`-style occurrences; splice-blanked ones ARE re-minted).
 - **Per-macro-name salvage granularity** — a macro with both good and bad
-  uses is kept/blanked wholesale.
+  uses is kept/blanked wholesale. SIBLING defect: a budget-exhaustion
+  scaling wall — blind bisection over op.c's dense macro-name set burns the
+  48-probe cap and drops clean macros (`pTHX_`/`aTHX_`) in the dropped tail.
+  Full analysis + ranked fixes (per-name expansion-verdict cache is the
+  recommended first slice: classify `pTHX_` blankable once, cache, never
+  re-bisect) in `docs/prompt-macro-salvage-scaling.md`.
 - **One `private:` leak shape** (raw_hash_set.h:3783 — post-declarator
   attribute in a compound misparse the conservative gate doesn't reach).
 - **fmt macro-prefixed members** (`FMT_CONSTEXPR auto data()`) don't

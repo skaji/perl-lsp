@@ -613,7 +613,7 @@ fn completion_items_native(
 
     // The slot verdict (`docs/adr/cursor-slots.md`) — Perl's detector
     // wraps `cursor_context`'s tree-then-text chain unchanged.
-    let slot = crate::cursor_slot::detect_slot(
+    let crate::cursor_slot::DetectedSlot { slot, arm: slot_arm } = crate::cursor_slot::detect_slot(
         analysis, tree, source, point, "perl", Some(module_index));
     // Bare-sigil trigger (`$|`/`@|`/`%|`) decoded once so the match below
     // doesn't need a second borrow of `slot` inside its own arm.
@@ -783,12 +783,13 @@ fn completion_items_native(
             }
             Vec::new()
         }
-        Slot::ModulePath { ref prefix, in_use } => {
+        Slot::ModulePath { ref prefix } => {
             // `use Foo::<cursor>` → the loadable-module half; `Foo::<cursor>`
             // mid-expression → the qualified-path drill (subs + sub-packages).
             // Both are candidate-level on the set; this branch is the answer,
-            // so it returns directly (the global firehose is suppressed).
-            let candidates = if in_use {
+            // so it returns directly (the global firehose is suppressed). The
+            // arm (not a local field) tells the two renders apart.
+            let candidates = if slot_arm == crate::cursor_slot::DetectorArm::UseModule {
                 cs.complete_module_candidates(prefix)
             } else {
                 cs.complete_qualified_path(module_index, prefix)
@@ -861,7 +862,7 @@ fn completion_items_native(
     // a reorder + priority boost on the gathered candidates; nothing is
     // pruned (a mid-refactor mismatch stays visible).
     if let Some(expected) = crate::cursor_slot::detect_call_slot(tree, source.as_bytes(), point)
-        .and_then(|s| s.expected_type(analysis, point, Some(module_index)))
+        .and_then(|s| s.slot.expected_type(analysis, point, Some(module_index)))
     {
         rank_candidates_by_expected_type(&mut candidates, &expected, analysis, point);
     }
@@ -2036,7 +2037,7 @@ pub fn signature_help(
     // — only the VERDICT routes through `detect_slot`'s call-slot entry;
     // sig-help's own machinery (below) is unchanged.
     let Slot::ArgPosition { callee: Some(call_ctx), .. } =
-        crate::cursor_slot::detect_call_slot(tree, text.as_bytes(), point)?
+        crate::cursor_slot::detect_call_slot(tree, text.as_bytes(), point)?.slot
     else {
         return None;
     };
