@@ -69,9 +69,10 @@ why parked, what unblocks it. Prune on landing.
   (methodchain works, C Field refs don't). Noted by the depth-B agent as
   pre-existing; lives in the `expr_type_at_span` path. Unassigned.
 - **json.hpp attribution stops mid-class** at a `#if`-conditional
-  ctor-initializer — the config-superposition tier (a `#if` inside a
-  class body forks the member list; wants the superposition model applied
-  to declarations).
+  ctor-initializer — DECIDED arc: see
+  `docs/adr/config-superposition-declarations.md` (re-anchor invariant +
+  declaration-scoped variants; spike gate first). Blast radius detail in
+  hitlist-3. BASEOP config-twin darkness (op.c) is the same tier.
 - **Strip-blanked tokens aren't re-minted as refs** (gr misses blanked
   `NS_BEGIN`-style occurrences; splice-blanked ones ARE re-minted).
 - **Per-macro-name salvage granularity** — a macro with both good and bad
