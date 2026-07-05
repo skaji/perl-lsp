@@ -156,6 +156,35 @@ fn delegation_macro_types_as_the_wrapped_functions_return() {
     assert_eq!(fa.symbols.iter().filter(|s| s.name == "real").count(), 1);
 }
 
+/// An annotation-less local initialized from an UNRESOLVABLE uppercase call
+/// (`auto rcpv = RCPVx(pv)` — no local class/struct/typedef, no known return)
+/// must NOT type as `ClassName("RCPVx")`. The retired ctor-convention heuristic
+/// minted a phantom class from name case alone; deferred resolution yields no
+/// witness when the callee resolves to nothing, so the receiver stays honestly
+/// untyped rather than wrongly typed. Real coordinates: perl5 op.c `RCPVx(pv)`.
+#[cfg(feature = "cpp")]
+#[test]
+fn ctor_convention_unresolvable_uppercase_call_no_phantom_class() {
+    use crate::file_analysis::{InferredType, RefKind};
+    let src = "void g(char *pv) {\n  auto rcpv = RCPVx(pv);\n  rcpv->refcount++;\n}\n";
+    let fa = cpp_driver().analyze(src);
+    let inv = fa
+        .refs
+        .iter()
+        .find_map(|r| match &r.kind {
+            RefKind::MethodCall { invocant_span: Some(sp), .. } if r.target_name == "refcount" => {
+                Some(*sp)
+            }
+            _ => None,
+        })
+        .expect("rcpv->refcount minted a member ref with an invocant span");
+    let ty = fa.expr_type_at_span(inv, None);
+    assert!(
+        !matches!(&ty, Some(InferredType::ClassName(n)) if n == "RCPVx"),
+        "unresolvable uppercase call must not mint a phantom ClassName: {ty:?}"
+    );
+}
+
 #[cfg(feature = "cpp")]
 #[test]
 fn class_content_gate_admits_members_not_locals() {

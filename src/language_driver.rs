@@ -967,6 +967,7 @@ fn remap_spans(
         macro_returns: _,
         // Populated in enrich_skeleton (post-remap) already in original coords.
         macro_call_arg_spans: _,
+        call_sites,
         specializations: _,
         // name-keyed, ordered by byte position pre-remap — no spans to fix.
         template_params: _,
@@ -1023,6 +1024,12 @@ fn remap_spans(
         }
     }
     for (_, _, span) in var_reads.iter_mut() {
+        *span = rspan(*span);
+    }
+    // Call-site spans feed the call-value edge (`into_file_analysis`, after
+    // this remap) and must speak original coords like the flow-edge source
+    // (the same call span) they land beside.
+    for (span, _) in call_sites.iter_mut() {
         *span = rspan(*span);
     }
     for (_, span) in return_sites.iter_mut() {
