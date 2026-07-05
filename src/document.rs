@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tree_sitter::{InputEdit, Point, Tree};
 
 use crate::builder;
@@ -16,7 +18,13 @@ pub struct StableOutline {
 pub struct Document {
     pub text: String,
     pub tree: Tree,
-    pub analysis: FileAnalysis,
+    /// `Arc` so a request handler can clone a cheap owned handle and DROP the
+    /// `FileStore` read guard before running `resolve()` — which re-locks the
+    /// open shards via `for_each_open`. Holding the guard across that reentrant
+    /// read deadlocks against a concurrent `for_each_open_mut` writer (the
+    /// diagnostics-refresh storm): parking_lot's writer-preference blocks the
+    /// second read behind the queued writer, which waits on the first read.
+    pub analysis: Arc<FileAnalysis>,
     pub stable_outline: StableOutline,
     /// Driver id: "perl" (the reference path) or a pack language ("cpp").
     /// The FileAnalysis-based handlers are language-agnostic; the
@@ -41,7 +49,7 @@ impl Document {
         let tree = parser.parse(&text, None)?;
         let analysis = driver.analyze_with_path(&text, path.as_deref());
         let stable_outline = StableOutline::from_analysis(&analysis);
-        Some(Document { text, tree, analysis, stable_outline, language: driver.id(), path })
+        Some(Document { text, tree, analysis: Arc::new(analysis), stable_outline, language: driver.id(), path })
     }
 
     pub fn new(text: String) -> Option<Self> {
@@ -63,7 +71,7 @@ impl Document {
         let analysis = crate::timings::phase("build()", || builder::build(&tree, text.as_bytes()));
         let stable_outline =
             crate::timings::phase("stable_outline", || StableOutline::from_analysis(&analysis));
-        Some(Document { text, tree, analysis, stable_outline, language: "perl", path: None })
+        Some(Document { text, tree, analysis: Arc::new(analysis), stable_outline, language: "perl", path: None })
     }
 
     /// Pack-language FAST path for a keystroke: reparse the tree + swap text,
@@ -89,7 +97,7 @@ impl Document {
     /// Write back an analysis built off-lock (from a text snapshot) +
     /// refresh the outline. Pairs with a `spawn_blocking` rebuild.
     pub fn apply_rebuilt(&mut self, analysis: crate::file_analysis::FileAnalysis) {
-        self.analysis = analysis;
+        self.analysis = Arc::new(analysis);
         self.stable_outline.update(&self.analysis, &self.text);
     }
 
@@ -101,7 +109,7 @@ impl Document {
             self.update_text_only(new_text);
             let reg = crate::language_driver::LanguageRegistry::with_enabled();
             if let Some(driver) = reg.for_id(self.language) {
-                self.analysis = driver.analyze_with_path(&self.text, self.path.as_deref());
+                self.analysis = Arc::new(driver.analyze_with_path(&self.text, self.path.as_deref()));
                 self.stable_outline.update(&self.analysis, &self.text);
             }
             return;
@@ -157,7 +165,7 @@ impl Document {
             log::warn!("Slow parse (update): {:?} for {} bytes", elapsed, new_text.len());
         }
         self.text = new_text;
-        self.analysis = builder::build(&self.tree, self.text.as_bytes());
+        self.analysis = Arc::new(builder::build(&self.tree, self.text.as_bytes()));
         self.stable_outline.update(&self.analysis, &self.text);
     }
 }

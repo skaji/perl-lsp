@@ -415,7 +415,8 @@ impl Backend {
                 };
                 files.for_each_open_mut(|uri, doc| {
                     let diagnostics = if doc.language == "perl" {
-                        doc.analysis.enrich_imported_types_with_keys(Some(module_index.as_ref()));
+                        std::sync::Arc::make_mut(&mut doc.analysis)
+                            .enrich_imported_types_with_keys(Some(module_index.as_ref()));
                         symbols::collect_diagnostics(&doc.analysis, module_index, options)
                     } else {
                         symbols::pack_diagnostics(&doc.analysis)
@@ -636,11 +637,12 @@ impl Backend {
     /// Returns (target uri, def span, the def's source line for hover).
     fn pack_xfile_word_at(
         &self,
-        doc: &crate::document::Document,
+        text: &str,
+        doc_analysis: &crate::file_analysis::FileAnalysis,
         pos: Position,
         idx: &dyn crate::file_analysis::CrossFileLookup,
     ) -> Option<(Option<Url>, crate::file_analysis::Span, String)> {
-        let word = symbols::word_at_point(&doc.text, symbols::position_to_point(pos))?;
+        let word = symbols::word_at_point(text, symbols::position_to_point(pos))?;
         // Pick the best DEFINITION among same-named symbols (a `#define X` plus
         // its raw usages): prefer the `#define` line, else the earliest.
         let pick = |analysis: &crate::file_analysis::FileAnalysis, src: &str| {
@@ -659,7 +661,7 @@ impl Backend {
         // A macro defined in THIS file (`BASEOP` in op.h) — the usage isn't a
         // captured ref, so find_definition missed it, but the def symbol is
         // local. Fall back to the cross-file index for usages from elsewhere.
-        if let Some((span, line)) = pick(&doc.analysis, &doc.text) {
+        if let Some((span, line)) = pick(doc_analysis, text) {
             return Some((None, span, line));
         }
         let cached = idx.get_cached(word)?;
@@ -673,7 +675,8 @@ impl Backend {
             // enrichment is Perl-flavored (imported-type/hash-key keys);
             // pack languages skip it.
             if doc.language == "perl" {
-                doc.analysis.enrich_imported_types_with_keys(Some(&*self.module_index));
+                std::sync::Arc::make_mut(&mut doc.analysis)
+                    .enrich_imported_types_with_keys(Some(&*self.module_index));
             }
         }
     }
@@ -1060,14 +1063,16 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, text, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
             None => return Ok(None),
         };
         // cpp/pack functions live in the per-language sub-index; route there
         // so cross-file function goto-def resolves (Perl uses the hub).
-        let pack = (doc.language != "perl")
-            .then(|| self.module_index.pack_index(doc.language))
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
             .flatten();
         let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
@@ -1078,14 +1083,14 @@ impl LanguageServer for Backend {
         // scope; the set scopes itself at construction.
         let self_path = uri.to_file_path().ok();
         let scoped = crate::file_analysis::ScopedLookup::new(
-            base_idx, &doc.analysis.include_closure, self_path.as_deref());
+            base_idx, &analysis.include_closure, self_path.as_deref());
         let idx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
         // `#include "x.h"` path → the resolved header (`#include` = `use`).
         // A path token, not a name — slot-shaped, so it stays ahead of the
         // set (the ADR's honest boundary).
-        if doc.language == "cpp" {
+        if language == "cpp" {
             if let Some(loc) = symbols::pack_include_definition(
-                &doc.analysis, symbols::position_to_point(pos), self_path.as_deref())
+                &analysis, symbols::position_to_point(pos), self_path.as_deref())
             {
                 return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
             }
@@ -1096,13 +1101,13 @@ impl LanguageServer for Backend {
         // them (ordering conveys rank).
         let mut cs = crate::resolve::resolve(
             &self.files,
-            &doc.analysis,
+            &analysis,
             FileKey::Url(uri.clone()),
             symbols::position_to_point(pos),
             Some(base_idx),
             crate::resolve::OverrideScope::default(),
         )
-        .with_source(&doc.text);
+        .with_source(&text);
         if pack.is_some() {
             cs = cs.pack_routed();
         }
@@ -1121,10 +1126,10 @@ impl LanguageServer for Backend {
         }
         // Member access (`obj->field`) now flows through `find_definition`
         // above: cpp mints a `MethodCall` ref core resolves like any other.
-        if doc.language != "perl" {
+        if language != "perl" {
             // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`) —
             // the raw word names a local-or-cross-file symbol.
-            if let Some((target, span, _)) = self.pack_xfile_word_at(&doc, pos, idx) {
+            if let Some((target, span, _)) = self.pack_xfile_word_at(&text, &analysis, pos, idx) {
                 return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                     uri: target.unwrap_or_else(|| uri.clone()),
                     range: symbols::span_to_range(span),
@@ -1140,16 +1145,20 @@ impl LanguageServer for Backend {
     ) -> Result<Option<request::GotoImplementationResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot the open doc (cheap `Arc` clone) and DROP the store guard
+        // before `resolve()` — it re-locks the open shards via `for_each_open`,
+        // and holding the guard across that reentrant read deadlocks against a
+        // concurrent `for_each_open_mut` writer. See `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),
         };
 
         // The family/descendants/domain projection of the same set references
         // and rename resolve from — pack routing declared at construction so
         // the resolved target can't diverge across the three verbs.
-        let pack = (doc.language != "perl")
-            .then(|| self.module_index.pack_index(doc.language))
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
             .flatten();
         let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
@@ -1157,7 +1166,7 @@ impl LanguageServer for Backend {
         };
         let mut cs = crate::resolve::resolve(
             &self.files,
-            &doc.analysis,
+            &analysis,
             FileKey::Url(uri.clone()),
             symbols::position_to_point(pos),
             Some(base_idx),
@@ -1172,8 +1181,10 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),
         };
 
@@ -1181,8 +1192,8 @@ impl LanguageServer for Backend {
         // Pack languages resolve + collect through their sub-index (mirrors
         // goto-def and the CLI) — the hub only knows Perl modules, so a cpp
         // query against it silently misses every cross-file use.
-        let pack = (doc.language != "perl")
-            .then(|| self.module_index.pack_index(doc.language))
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
             .flatten();
         let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
@@ -1191,9 +1202,9 @@ impl LanguageServer for Backend {
         let self_path = uri.to_file_path().ok();
         // `#include` reverse — "who includes this header" — owns the path
         // token exclusively (the backward mirror of include goto-def).
-        if doc.language == "cpp" {
+        if language == "cpp" {
             if let Some(incs) = symbols::pack_include_references(
-                &doc.analysis, point, self_path.as_deref(), base_idx)
+                &analysis, point, self_path.as_deref(), base_idx)
             {
                 let locs: Vec<Location> = incs
                     .into_iter()
@@ -1214,7 +1225,7 @@ impl LanguageServer for Backend {
         // VISIBLE widening), and the cross-file walk all live inside the set.
         let mut cs = crate::resolve::resolve(
             &self.files,
-            &doc.analysis,
+            &analysis,
             FileKey::Url(uri.clone()),
             point,
             Some(base_idx),
@@ -1230,26 +1241,27 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        let doc = match self.files.get_open(&params.text_document.uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(&params.text_document.uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),
         };
         let point = symbols::position_to_point(params.position);
         // Same pack routing as the rename handler, so this gate probes the
         // target rename would actually act on.
-        let pack = (doc.language != "perl")
-            .then(|| self.module_index.pack_index(doc.language))
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
             .flatten();
         let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
             None => &*self.module_index,
         };
         // The rename box's range + placeholder.
-        let box_at = doc
-            .analysis
+        let box_at = analysis
             .symbol_at(point)
             .map(|sym| (sym.selection_span, sym.name.clone()))
-            .or_else(|| doc.analysis.ref_at(point).map(|r| (r.span, r.target_name.clone())));
+            .or_else(|| analysis.ref_at(point).map(|r| (r.span, r.target_name.clone())));
         // Only offer a rename box where `rename` would actually produce edits.
         // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
         // `@_` or an ownerless constructor key resolve to nothing renameable, so
@@ -1259,7 +1271,7 @@ impl LanguageServer for Backend {
         // new renameable kinds automatically, with no change here.
         let mut cs = crate::resolve::resolve(
             &self.files,
-            &doc.analysis,
+            &analysis,
             FileKey::Url(params.text_document.uri.clone()),
             point,
             Some(base_idx),
@@ -1287,8 +1299,10 @@ impl LanguageServer for Backend {
                 "rename: the new name must not be empty or whitespace",
             ));
         }
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),
         };
 
@@ -1299,8 +1313,8 @@ impl LanguageServer for Backend {
         // pack routing fact is declared at construction; the set widens the
         // walk to the per-language cache and REFUSES on alias-spelled sites
         // instead of emitting a partial edit.
-        let pack = (doc.language != "perl")
-            .then(|| self.module_index.pack_index(doc.language))
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
             .flatten();
         let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
@@ -1308,7 +1322,7 @@ impl LanguageServer for Backend {
         };
         let mut cs = crate::resolve::resolve(
             &self.files,
-            &doc.analysis,
+            &analysis,
             FileKey::Url(uri.clone()),
             point,
             Some(base_idx),
@@ -1325,31 +1339,33 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, text, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
             None => return Ok(None),
         };
         // Perl's hover renderer is Perl-specific; pack languages present the
         // CandidateSet's hover projection (the top-ranked candidate goto-def
         // would jump to) — constructed exactly like the goto-def handler's
         // set, so the two verbs can't disagree at a position.
-        if doc.language != "perl" {
-            let pack = self.module_index.pack_index(doc.language);
+        if language != "perl" {
+            let pack = self.module_index.pack_index(language);
             let base_idx: &dyn crate::file_analysis::CrossFileLookup =
                 pack.as_deref().map_or(&*self.module_index, |i| i);
             let mut cs = crate::resolve::resolve(
                 &self.files,
-                &doc.analysis,
+                &analysis,
                 FileKey::Url(uri.clone()),
                 symbols::position_to_point(pos),
                 Some(base_idx),
                 crate::resolve::OverrideScope::default(),
             )
-            .with_source(&doc.text);
+            .with_source(&text);
             if pack.is_some() {
                 cs = cs.pack_routed();
             }
-            if let Some(h) = symbols::pack_hover(&cs, doc.language) {
+            if let Some(h) = symbols::pack_hover(&cs, language) {
                 return Ok(Some(h));
             }
             // The raw-word fallback outside the set (mirrors goto-def's): a
@@ -1357,14 +1373,14 @@ impl LanguageServer for Backend {
             // show its definition line.
             let self_path = uri.to_file_path().ok();
             let scoped = crate::file_analysis::ScopedLookup::new(
-                base_idx, &doc.analysis.include_closure, self_path.as_deref());
+                base_idx, &analysis.include_closure, self_path.as_deref());
             let xidx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
-            if let Some((_, _, line)) = self.pack_xfile_word_at(&doc, pos, xidx) {
+            if let Some((_, _, line)) = self.pack_xfile_word_at(&text, &analysis, pos, xidx) {
                 if !line.is_empty() {
                     return Ok(Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: format!("```{}\n{}\n```", doc.language, line),
+                            value: format!("```{}\n{}\n```", language, line),
                         }),
                         range: None,
                     }));
@@ -1373,8 +1389,8 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(symbols::hover_info(
-            &doc.analysis,
-            &doc.text,
+            &analysis,
+            &text,
             pos,
             &self.module_index,
         ))
@@ -1386,19 +1402,31 @@ impl LanguageServer for Backend {
     ) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
-            None => return Ok(None),
-        };
-        if doc.language != "perl" {
+        // Snapshot + drop the store guard before completion resolves (both the
+        // pack and Perl paths gather cross-file candidates through `resolve()`,
+        // which re-locks the open shards via `for_each_open`); see
+        // `Document::analysis`. `tree` clones O(1) (tree-sitter refcount).
+        let (analysis, text, tree, language, path, package_lines) =
+            match self.files.get_open(uri) {
+                Some(doc) => (
+                    Arc::clone(&doc.analysis),
+                    doc.text.clone(),
+                    doc.tree.clone(),
+                    doc.language,
+                    doc.path.clone(),
+                    doc.stable_outline.package_lines().to_vec(),
+                ),
+                None => return Ok(None),
+            };
+        if language != "perl" {
             let (items, is_incomplete) = pack_completion(
                 &self.files,
-                &doc.analysis,
-                &doc.text,
-                &doc.tree,
+                &analysis,
+                &text,
+                &tree,
                 symbols::position_to_point(pos),
-                doc.language,
-                doc.path.as_deref(),
+                language,
+                path.as_deref(),
                 &self.module_index,
             );
             if items.is_empty() && !is_incomplete {
@@ -1416,12 +1444,12 @@ impl LanguageServer for Backend {
         let items = symbols::completion_items(
             &self.files,
             &FileKey::Url(uri.clone()),
-            &doc.analysis,
-            &doc.tree,
-            &doc.text,
+            &analysis,
+            &tree,
+            &text,
             pos,
             &self.module_index,
-            Some(doc.stable_outline.package_lines()),
+            Some(&package_lines),
         );
         if items.is_empty() {
             Ok(None)

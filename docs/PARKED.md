@@ -86,8 +86,28 @@ why parked, what unblocks it. Prune on landing.
 - **Nested-hash-key completion level leak** (Perl, pre-existing — xfail
   `completion-exact-hash-key-slot-no-nested-leak`).
 - **Moo rwp writer at decl-token group answer** (prompt-heatmap.md).
-- **M6/L3 session determinism** (cold-open None→warm flip; debounce
-  staleness) — KNOWN-GAPS "LSP session determinism".
+- **M6/L3 session determinism — cold-open degraded window** (residual; the
+  DEADLOCK half is FIXED — see below). The on-open analyze is cached-only and
+  the pack index attaches after the lazy background walk, so a query in that
+  window can see a degraded answer (pack completion falls back to the Perl hub
+  → `@INC` flood; cross-file gd/hover `None`) with no client re-request signal
+  for the pull verbs (completion self-heals via `isIncomplete`). Normally the
+  window closes in <500ms; under heavy load (a cold cache + the Perl cpanfile
+  resolver storm competing for CPU) it stretches past the e2e's 500ms settle
+  and a fast burst of queries can race it. Wants a completion signal on BOTH
+  `spawn_pack_gather_refresh` AND `ensure_workspace_indexed` (its latch marks
+  KICKOFF, not completion) plus a bounded wait in the pull handlers — deliberate
+  design gap. A cheap partial unblock: coalesce the `on_refresh`
+  diagnostics-refresh callback (it fires once PER resolved module — ~45× in a
+  400ms burst on a mixed repo, each a full `for_each_open_mut` + publish),
+  shrinking both the CPU pressure and the stdout flood that widen the window.
+  **The deadlock that used to MASK this window is fixed** (`Document::analysis`
+  is now `Arc`; handlers snapshot + drop the `get_open` read guard before
+  `resolve()` re-locks the open shards — the reentrant-read-behind-a-queued-
+  `for_each_open_mut`-writer deadlock). Repro lock: `e2e/cold-start-repro.sh`
+  (pre-fix ~7.5% cold-run failure, post-fix 0). Also: debounce-window staleness
+  (mid-typing `doc.analysis` describes prior text). KNOWN-GAPS "LSP session
+  determinism".
 - **Enum value as template argument** not a ref (`MakeError<StatusCode::
   kNotFound>`) — hitlist-2 residual, unassigned.
 - **Refs inside another macro's `#define` body aren't indexed** — a use of

@@ -469,7 +469,7 @@ impl FrameworkFact {
 /// consumer that loads a `FileAnalysis` from bincode (SQLite cache,
 /// dump-package, cross-file enrichment) would have reducers claim empty
 /// witness slices and the bag would silently return `None`.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct WitnessBag {
     witnesses: Vec<Witness>,
     #[serde(skip)]
