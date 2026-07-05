@@ -167,7 +167,12 @@ why parked, what unblocks it. Prune on landing.
 - **Strip-blanked tokens aren't re-minted as refs** (gr misses blanked
   `NS_BEGIN`-style occurrences; splice-blanked ones ARE re-minted).
 - **Per-macro-name salvage granularity** — a macro with both good and bad
-  uses is kept/blanked wholesale.
+  uses is kept/blanked wholesale. SIBLING defect: a budget-exhaustion
+  scaling wall — blind bisection over op.c's dense macro-name set burns the
+  48-probe cap and drops clean macros (`pTHX_`/`aTHX_`) in the dropped tail.
+  Full analysis + ranked fixes (per-name expansion-verdict cache is the
+  recommended first slice: classify `pTHX_` blankable once, cache, never
+  re-bisect) in `docs/prompt-macro-salvage-scaling.md`.
 - **One `private:` leak shape** (raw_hash_set.h:3783 — post-declarator
   attribute in a compound misparse the conservative gate doesn't reach).
 - **fmt macro-prefixed members** (`FMT_CONSTEXPR auto data()`) don't
