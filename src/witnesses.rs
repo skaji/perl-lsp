@@ -741,6 +741,7 @@ impl WitnessReducer for FrameworkAwareTypeFold {
         let mut str_ = false;
         let mut re = false;
         let mut plain_type: Option<InferredType> = None;
+        let mut plain_type_priority: u8 = 0;
 
         for w in ws {
             // Temporal ordering: only consider witnesses emitted at or
@@ -772,16 +773,26 @@ impl WitnessReducer for FrameworkAwareTypeFold {
                         first_param_class = Some(package.clone())
                     }
                     b @ InferredType::BrandedRoute { .. } => branded = Some(b.clone()),
-                    // Latest wins UNLESS the standing answer subsumes the
-                    // newcomer — structure dominates rep (`HashWithKeys` is
-                    // not downgraded by a deref's re-derived `HashRef`),
-                    // mirroring the class-dominates-rep rule below.
+                    // Source priority breaks ties first (an EXPLICIT
+                    // annotation — `ANNOT_SOURCE`, priority 20 — governs over
+                    // an inferred flow type, priority 10, whatever the order
+                    // they land in): the C++ `T x = {…}` braced-init case,
+                    // where the initializer's `Numeric` flow witness would
+                    // otherwise clobber the declared container type. This is
+                    // the same annotation-dominates rule the `ClassName`/
+                    // `ClassAssertion` axis above already applies, extended to
+                    // every `InferredType` flavor (`Parametric`, `HashRef`,
+                    // …). Within equal priority: latest wins UNLESS the
+                    // standing answer subsumes the newcomer — structure
+                    // dominates rep (`HashWithKeys` is not downgraded by a
+                    // deref's re-derived `HashRef`), mirroring class-over-rep.
                     other => {
-                        if !plain_type
+                        let subsumed = plain_type
                             .as_ref()
-                            .is_some_and(|have| have.subsumes_narrowing(other))
-                        {
+                            .is_some_and(|have| have.subsumes_narrowing(other));
+                        if prio > plain_type_priority || (prio == plain_type_priority && !subsumed) {
                             plain_type = Some(other.clone());
+                            plain_type_priority = prio;
                         }
                     }
                 },

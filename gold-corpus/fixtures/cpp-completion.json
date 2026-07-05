@@ -206,6 +206,31 @@
           "weight"
         ]
       }
+    },
+    {
+      "id": "cpp-braced-init-container-api",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "braced_type.cpp",
+      "line": 9,
+      "col": 13,
+      "comment": "completion on `m.` where `FlatMap<int,int> m = {...}` — the declared-type-governs fix types `m` as the container, so members (at/insert) complete instead of the junk top-level fallback the Numeric misinference produced.",
+      "expect": {
+        "all": [
+          "at",
+          "insert"
+        ],
+        "none": [
+          "main",
+          "FlatMap\tFlatMap"
+        ],
+        "exact_labels": [
+          "at",
+          "insert"
+        ]
+      }
     }
   ]
 }

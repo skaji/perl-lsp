@@ -18,6 +18,49 @@ Format per entry:
 
 ---
 
+## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — OPEN
+- **Context:** hitlist-3 Family A+I slice. The implicit-field-read pass is
+  gated by the pack's `implicit_field_reads` capability. The sibling-CALL
+  half (a bare `foo()` inside a method body meaning `this->foo()`) needed a
+  gate too — same fork the task flagged: reuse the flag, or add a sibling
+  one.
+- **Options:** A — reuse `implicit_field_reads` for both halves. B — add a
+  parallel `implicit_method_calls` capability.
+- **Picked:** A. "Can a bare name resolve through an implicit `this->`" is a
+  SINGLE language fact — C/C++ elide the receiver for both members and
+  methods; Python/R make it mandatory for both. There is no language where
+  fields elide but methods don't (or vice-versa), so a second flag would be
+  a distinction with no possible producer. The flag's NAME is now
+  field-specific and slightly under-describes its scope; a future rename to
+  `implicit_this_members` is the loose cleanup, deferred to avoid churn
+  across the pack definitions.
+- **Undo cost:** trivial — split into two bools and thread the second
+  through `emit_return_fuel`; the sibling-call pass already stands alone as
+  its own block, so it just reads a different flag.
+
+## Sibling-call vs. same-named free function ranking — 2026-07-05 — OPEN
+- **Context:** same slice. When a method body calls `foo()` and BOTH a
+  sibling method `Class::foo` and a free `foo()` exist, C++ name lookup says
+  the member hides the free function. The model tier correctly MINTS the
+  sibling link (pins the call's `resolved_package` to the class, so
+  `find_definition` lands on the member). But goto-def's set projection runs
+  through `overload_arity_definitions` in `resolve.rs`, whose `pkg_agrees`
+  admits a package-less (free) function into a class-scoped overload family
+  (`_ => true`), so the free decl still surfaces — and its earlier source
+  row sorts it FIRST.
+- **Options:** A — leave it: the sibling link is present, the ranking
+  residual is a resolve.rs overload-family concern. B — teach
+  `overload_arity` that a member call (pinned `resolved_package`, class
+  origin) excludes package-less free functions from the family.
+- **Picked:** A for this slice — `resolve.rs` is explicitly owned by a
+  sibling worktree this slice must not touch. Logged for that owner. The
+  reduced-fixture row `cpp-sibling-call-shadows-free` is PROVISIONAL
+  (asserts the sibling link is offered; does not gate on the free being
+  absent) so the residual is tracked without a false-green.
+- **Undo cost:** small and localized to `resolve.rs::overload_arity_definitions`
+  — gate the family gather on `pkg_agrees(relative=false, …)` (exact
+  package) when the call carries a member-pinned `resolved_package`.
+
 ## Hover presentation payload — 2026-07-03 — RATIFIED (veesh, 2026-07-03)
 - **Context:** hitlist-2 slice D (#14): hover became a CandidateSet
   projection (`hover_candidate()` = the top-ranked `definitions()`

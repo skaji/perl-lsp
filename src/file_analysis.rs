@@ -6496,6 +6496,32 @@ impl FileAnalysis {
         self.symbols_by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// The local callable a package-scoped `FunctionCall` targets: the
+    /// Sub/Method whose `package` equals `resolved_package`, keyed by the
+    /// call's unqualified tail (symbols are stored under the bare name).
+    /// A free function (`Sub`) is preferred; a class `Method` is the
+    /// fallback so an implicit-`this` sibling call — a bare `foo()` inside a
+    /// method body whose `resolved_package` the model pinned to the enclosing
+    /// class — lands on the member. This is C++ name lookup: the member wins
+    /// over a same-named free function INSIDE the class body (the pin only
+    /// happens there), but a name with no member in that package leaves the
+    /// `Sub` path untouched, so a free-function-only call still resolves free.
+    fn package_scoped_callable(&self, name: &str, resolved_package: &Option<String>) -> Option<SymbolId> {
+        let mut method_fallback = None;
+        for &sid in self.symbols_named(name) {
+            let sym = self.symbol(sid);
+            if sym.package != *resolved_package {
+                continue;
+            }
+            match sym.kind {
+                SymKind::Sub => return Some(sid),
+                SymKind::Method if method_fallback.is_none() => method_fallback = Some(sid),
+                _ => {}
+            }
+        }
+        method_fallback
+    }
+
     /// The C-linkage "everything exported" test: is `sym` part of this
     /// file's cross-file surface? Types (class/struct/typedef), functions,
     /// and FILE-SCOPE values (globals, object-like macros, enum constants).
@@ -6625,12 +6651,8 @@ impl FileAnalysis {
                     // carry the full path in `target_name` but symbols are
                     // keyed by bare name — match on the unqualified tail and
                     // pin via `resolved_package` (the qualifier).
-                    for &sid in self.symbols_named(r.unqualified_target_name()) {
-                        let sym = self.symbol(sid);
-                        if sym.kind != SymKind::Sub { continue; }
-                        if sym.package == *resolved_package {
-                            return Some(sym.selection_span);
-                        }
+                    if let Some(sid) = self.package_scoped_callable(r.unqualified_target_name(), resolved_package) {
+                        return Some(self.symbol(sid).selection_span);
                     }
                     // Nothing local; leave cross-file resolution to
                     // the LSP adapter (symbols::find_definition).
@@ -7030,12 +7052,8 @@ impl FileAnalysis {
                     // package matches what the ref resolved to. Qualified
                     // calls match on the bare tail (symbols are keyed by
                     // bare name); `resolved_package` pins the package.
-                    for &sid in self.symbols_named(r.unqualified_target_name()) {
-                        let sym = self.symbol(sid);
-                        if sym.kind != SymKind::Sub { continue; }
-                        if sym.package == *resolved_package {
-                            return Some(self.format_symbol_hover(sym, source, module_index));
-                        }
+                    if let Some(sid) = self.package_scoped_callable(r.unqualified_target_name(), resolved_package) {
+                        return Some(self.format_symbol_hover(self.symbol(sid), source, module_index));
                     }
                     // Fall-through: the name might be a function imported
                     // from another module (either hand-written `use` or a
@@ -8155,12 +8173,8 @@ impl FileAnalysis {
                 RefKind::FunctionCall { resolved_package } => {
                     // Qualified calls carry the full path in `target_name`;
                     // symbols are keyed by bare name + `resolved_package`.
-                    for &sid in self.symbols_named(r.unqualified_target_name()) {
-                        let sym = self.symbol(sid);
-                        if sym.kind != SymKind::Sub { continue; }
-                        if sym.package == *resolved_package {
-                            return Some((sid, true));
-                        }
+                    if let Some(sid) = self.package_scoped_callable(r.unqualified_target_name(), resolved_package) {
+                        return Some((sid, true));
                     }
                 }
                 RefKind::MethodCall { .. } => {

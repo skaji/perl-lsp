@@ -831,6 +831,96 @@
      "\noverload_arity.cpp:8:5"
     ]
    }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "sibling_call.cpp",
+   "id": "cpp-sibling-call-template-outofline",
+   "line": 8,
+   "col": 30,
+   "comment": "bare grow(n) inside the OUT-OF-LINE TEMPLATE body Buf<T>::reserve is an implicit this->grow — links to the sibling method decl (the enclosing class comes off the peeled method symbol, not the package-less out-of-line body scope).",
+   "expect": {
+    "all": [
+     "sibling_call.cpp:5:10"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "sibling_call.cpp",
+   "id": "cpp-sibling-call-inclass",
+   "line": 13,
+   "col": 20,
+   "comment": "bare paint() inside the IN-CLASS body Widget::render is an implicit this->paint — links to the sibling method decl.",
+   "expect": {
+    "all": [
+     "sibling_call.cpp:12:10"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "sibling_call.cpp",
+   "id": "cpp-sibling-call-plain-outofline",
+   "line": 16,
+   "col": 24,
+   "comment": "bare width() inside the plain (non-template) OUT-OF-LINE body Widget::resize links to the sibling method decl.",
+   "expect": {
+    "all": [
+     "sibling_call.cpp:13:9"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "sibling_call.cpp",
+   "id": "cpp-sibling-call-free-function-only",
+   "line": 20,
+   "col": 17,
+   "comment": "bare helper() inside Gadget::run has NO sibling method of that name — the sibling-call pass leaves it untouched, so it still resolves to the FREE function (no false link, no over-claim).",
+   "expect": {
+    "all": [
+     "sibling_call.cpp:19:5"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "provisional",
+   "file": "sibling_call.cpp",
+   "id": "cpp-sibling-call-shadows-free",
+   "line": 25,
+   "col": 18,
+   "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the sibling LINK is minted (Board::freefunc offered), but the overload-arity ranking in resolve.rs (pkg_agrees admits the package-less free fn) still surfaces the free decl first — a resolve.rs-owned interaction, logged in docs/open-forks.md. Provisional: never fails.",
+   "expect": {
+    "all": [
+     "sibling_call.cpp:25:10"
+    ],
+    "none": []
+   }
   }
  ]
 }

@@ -844,6 +844,65 @@ fn emit_return_fuel(
             span,
         });
     }
+
+    // Sibling method CALLs — the call half of the same implicit-`this`
+    // fact the field pass covers. A bare `foo(...)` inside a method body is
+    // `this->foo(...)` when the enclosing class declares a `foo` method; C++
+    // name lookup finds the member before any free function of that name.
+    // Pinning the call's `resolved_package` to the enclosing class routes it
+    // through the SAME package-scoped callable resolution a qualified
+    // `Class::foo()` uses (`package_scoped_callable`), so goto-def /
+    // references / rename all land on the sibling. A name with no matching
+    // member is left untouched — a free-function-only call still resolves
+    // free.
+    //
+    // The enclosing class is the enclosing method SYMBOL's `package`, NOT the
+    // ref's scope package: an out-of-line body (`void Buf<T>::reserve(…)`) is
+    // lexically at file scope, so its body scope carries no package, but the
+    // peeled method symbol does (`Buf`). Reading it off the symbol covers
+    // in-class AND out-of-line, template or not, with one rule.
+    let class_methods: std::collections::HashSet<(String, String)> = fa
+        .symbols
+        .iter()
+        .filter(|s| matches!(s.kind, SymKind::Method))
+        .filter_map(|s| s.package.clone().map(|p| (p, s.name.clone())))
+        .collect();
+    // Each Sub/Method body scope → its owning class (the peeled symbol
+    // package). Precomputed so the enclosing-class walk reads no `fa` borrow,
+    // leaving `fa.refs` free to mutate below.
+    let scope_class: HashMap<ScopeId, String> = scope_to_symbol
+        .iter()
+        .filter_map(|(&sc, &sid)| {
+            fa.symbols
+                .iter()
+                .find(|s| s.id == sid)
+                .and_then(|s| s.package.clone())
+                .map(|p| (sc, p))
+        })
+        .collect();
+    let class_of = |sc: ScopeId| -> Option<String> {
+        std::iter::successors(Some(sc), |s| scope_parent.get(s).copied().flatten())
+            .find_map(|s| scope_class.get(&s).cloned())
+    };
+    let sibling_pins: Vec<(usize, String)> = fa
+        .refs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            if !matches!(r.kind, RefKind::FunctionCall { resolved_package: None }) {
+                return None;
+            }
+            let class = class_of(r.scope)?;
+            class_methods
+                .contains(&(class.clone(), r.target_name.clone()))
+                .then_some((i, class))
+        })
+        .collect();
+    for (i, class) in sibling_pins {
+        if let RefKind::FunctionCall { resolved_package } = &mut fa.refs[i].kind {
+            *resolved_package = Some(class);
+        }
+    }
 }
 
 /// Remap extracted skeleton spans from transformed coords back to

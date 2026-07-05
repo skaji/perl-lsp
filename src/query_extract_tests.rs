@@ -1723,6 +1723,40 @@ fn cpp_fa(src: &str) -> crate::file_analysis::FileAnalysis {
         .into_file_analysis()
 }
 
+/// An EXPLICIT declared type governs member dispatch for EVERY C++
+/// initializer shape — `T x = {…}`, `T x{…}`, `T x;` — the braced-init
+/// twin of the annotation-priority fix. The initializer's literals mint a
+/// `Numeric` flow witness (priority 10); the declared container mints an
+/// `ANNOT_SOURCE` witness (priority 20). Before the plain-`InferredType`
+/// axis learned to break ties on source priority, the later flow witness
+/// clobbered the annot (latest-wins) and the variable hovered `Numeric`.
+#[test]
+fn cpp_braced_init_declared_type_governs_over_flow() {
+    use crate::file_analysis::InferredType;
+    let fa = cpp_fa(
+        "template <class K, class V> struct FlatMap { V at(K k); };\n\
+         int main() {\n\
+         FlatMap<int, int> m = {{1, 7}, {2, 9}};\n\
+         FlatMap<int, int> d{{3, 4}};\n\
+         FlatMap<int, int> n;\n\
+         return 0;\n\
+         }\n",
+    );
+    let pt = tree_sitter::Point { row: 6, column: 0 };
+    for var in ["m", "d", "n"] {
+        let t = fa.inferred_type_via_bag(var, pt);
+        assert!(
+            matches!(t, Some(InferredType::Parametric(_))),
+            "{var}: the declared container must govern every initializer shape, got {t:?}"
+        );
+        assert_ne!(
+            t,
+            Some(InferredType::Numeric),
+            "{var}: braced-init flow must not clobber the declared type"
+        );
+    }
+}
+
 /// Class dedup keys on (name, span), not name alone: an
 /// EXACT re-capture of the same node (a class with a base clause matches
 /// both the bodied pattern and the inheritance pattern in skeleton.scm)

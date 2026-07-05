@@ -467,6 +467,46 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-braced-init-hover-eq",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "braced_type.cpp",
+      "line": 6,
+      "col": 22,
+      "comment": "hover on `m` in `FlatMap<int,int> m = {{1,7},{2,9}}` — the EXPLICIT declared type governs the `= {...}` shape; the braced-init literals' Numeric flow witness must not clobber the annot (WitnessSource ANNOT_SOURCE priority extended to the plain-InferredType axis).",
+      "expect": {
+        "all": [
+          "m: FlatMap<int, int>"
+        ],
+        "none": [
+          "Numeric"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-braced-init-hover-direct",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "braced_type.cpp",
+      "line": 8,
+      "col": 22,
+      "comment": "hover on `d` in `FlatMap<int,int> d{{3,4}}` — the declared type governs the direct brace-init `{...}` shape too.",
+      "expect": {
+        "all": [
+          "d: FlatMap<int, int>"
+        ],
+        "none": [
+          "Numeric"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

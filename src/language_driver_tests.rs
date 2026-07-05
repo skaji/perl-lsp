@@ -516,3 +516,73 @@ fn implicit_field_read_pass_gated_by_pack_capability() {
     assert!(crate::query_extract::cpp_pack().implicit_field_reads,
         "cpp: methods read members with implicit this->");
 }
+
+// Implicit-`this` sibling method CALLs — the call half of the same
+// capability. A bare `foo(...)` inside a method body pins its enclosing
+// class onto the `FunctionCall`'s `resolved_package` (in-class AND
+// out-of-line/template bodies — the class comes off the peeled method
+// symbol, not the body scope which is package-less out of line), so
+// goto-def lands on the sibling. A free-function-only name stays unpinned;
+// the capability gate governs the whole pass.
+#[cfg(feature = "cpp")]
+#[test]
+fn sibling_method_call_pins_enclosing_class() {
+    use crate::file_analysis::{RefKind, SymKind};
+    let src = "\
+struct Widget {\n\
+    void paint();\n\
+    void render() { paint(); }\n\
+};\n\
+template <class T> struct Buf { void grow(int n); void reserve(int n); };\n\
+template <class T> void Buf<T>::reserve(int n) { grow(n); }\n\
+int helper();\n\
+struct Gadget { void run() { helper(); } };\n";
+    let build = || {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let pack = crate::query_extract::cpp_pack();
+        let mut skel = crate::query_extract::extract(&tree, src.as_bytes(), &pack).unwrap();
+        let sites = std::mem::take(&mut skel.return_sites);
+        (skel.into_file_analysis(), sites)
+    };
+    let pin_of = |fa: &FileAnalysis, name: &str| -> Option<Option<String>> {
+        fa.refs
+            .iter()
+            .find(|r| r.target_name == name && matches!(r.kind, RefKind::FunctionCall { .. }))
+            .map(|r| match &r.kind {
+                RefKind::FunctionCall { resolved_package } => resolved_package.clone(),
+                _ => None,
+            })
+    };
+
+    let (mut fa, sites) = build();
+    emit_return_fuel(&mut fa, &sites, true);
+    assert_eq!(pin_of(&fa, "paint"), Some(Some("Widget".into())), "in-class sibling call pins its class");
+    assert_eq!(pin_of(&fa, "grow"), Some(Some("Buf".into())), "out-of-line template sibling call pins the peeled class");
+    assert_eq!(pin_of(&fa, "helper"), Some(None), "free-function-only call stays unpinned");
+
+    // The pin makes goto-def (via the model's `find_definition`) land on the
+    // sibling method decl, in-class and out-of-line alike.
+    for (call, kind_pkg) in [("paint", "Widget"), ("grow", "Buf")] {
+        let cref = fa
+            .refs
+            .iter()
+            .find(|r| r.target_name == call && matches!(r.kind, RefKind::FunctionCall { .. }))
+            .unwrap();
+        let decl = fa
+            .symbols
+            .iter()
+            .find(|s| s.name == call && matches!(s.kind, SymKind::Method) && s.package.as_deref() == Some(kind_pkg))
+            .unwrap();
+        assert_eq!(
+            fa.find_definition(cref.span.start, None),
+            Some(decl.selection_span),
+            "{call}: sibling call resolves to the class method"
+        );
+    }
+
+    let (mut fa_off, sites2) = build();
+    emit_return_fuel(&mut fa_off, &sites2, false);
+    assert_eq!(pin_of(&fa_off, "paint"), Some(None), "capability off → no sibling-call pin");
+}
