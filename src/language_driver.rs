@@ -255,6 +255,12 @@ impl LanguageDriver for PackDriver {
                 // remap extracted spans from transformed → original coords
                 // (no-op for identity / pass-through languages).
                 remap_spans(&mut skel, &src, source, &map);
+                // Re-anchor members orphaned by a truncated container node, on
+                // the now-original coordinates (the transform's macro expansion
+                // unbalances braces; only the original source is trustworthy).
+                if pack.brace_scoped_members {
+                    skel.reanchor_truncated_containers(source);
+                }
                 let macro_defs = self.enrich_skeleton(&mut skel, &mut parser, source, &src, &map, &ctx);
                 // `return_sites` is structural skeleton output; taken before
                 // assembly consumes `skel` so phase 7 can interpret it against

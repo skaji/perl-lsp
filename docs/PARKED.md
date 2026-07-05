@@ -116,29 +116,26 @@ why parked, what unblocks it. Prune on landing.
   `python_cross_file_method_dispatch_through_mro_walk` now asserts `g` is
   honestly `None` locally (its real subject — cross-file MRO dispatch keyed
   on the class name — is unaffected).
-- **json.hpp `basic_json` attribution blast radius** (~4400 lines lose
-  membership) — **re-anchor invariant, still open.** Slice 1's
-  declaration-position directive repair landed
-  (`strip_declaration_position_directives`) and fixes the ISOLATED
-  ctor-initializer `#if` (no phantom `start_position`/`end_position`
-  members; late members still attribute — gold rows `cpp-ctorif-decl-
-  directive-*`). But that is NOT what corrupts json.hpp: **the ctor `#if`
-  in isolation causes only LOCAL damage** — a reduced class with the same
-  shape still parses and attributes correctly. The real blast radius is
-  **deep-error-propagation**: a failure ~4400 lines into `basic_json`
-  poisons the whole class node (the class never becomes a
-  `class_specifier` — it degrades to ERROR + `function_definition` +
-  `compound_statement` soup, so there is no class scope to attribute
-  to). The 80-line header parses fine standalone; the trigger is deep and
-  unbisected. Two remaining paths, either would bound it:
-  (a) an attribution-layer **re-anchor fallback** — positional/textual
-  class tracking so members attribute even when the `class_specifier`
-  node is corrupted (bounds blast radius for ANY misparse cause, the
-  general fix); (b) a deep-construct repair that keeps `basic_json`
-  parsing as a class. json.hpp `basic_json` is before == after
-  unattributed; commit 2 did not move it. If slice 2 variant tags land,
-  they still would NOT help here — the failure is a parse corruption, not
-  a config superposition.
+- **json.hpp `basic_json` attribution blast radius — FIXED** (the
+  re-anchor invariant landed; `docs/prompt-json-reanchor.md`). Trigger
+  named: `#if JSON_DIAGNOSTIC_POSITIONS` in ctor-initializer / declaration
+  position (6 sites in `basic_json`) truncates the `class_specifier` node
+  at the first ctor's body brace (row 21450 vs the true 25771) — every
+  member after falls through to the enclosing `nlohmann` namespace. The
+  fix is `SkeletonAnalysis::reanchor_truncated_containers` (gated by
+  `LangPack::brace_scoped_members`, run post-`remap_spans`): it
+  brace-matches the ORIGINAL source (balanced — the macro-expansion
+  transform is what unbalances braces, 682/710 vs 646/646) to recover each
+  container's true extent, then re-attributes members to the innermost
+  container that textually encloses them (upgrade-only; a `::`-qualifier
+  attribution and a macro-defined-namespace scope are the two guarded
+  cases). `basic_json` member attribution: **92 → 763** (both amalgamated
+  and split forms); nested `json_value`/`data`/`patch_operations` members
+  preserved. Bounds the blast radius for ANY future misparse that truncates
+  a container, not just this construct. Residual (small): specialization
+  containers whose shaped name ≠ source text are skipped (conservative);
+  the `strip_declaration_position_directives` gate still misses the
+  in-context `#if` (a point-repair complement, no longer load-bearing).
 - **Slice 2 (config-superposition variant tags) re-scoped** — the spike
   (`docs/adr/config-superposition-declarations.md`, findings 2026-07-05)
   proved slice 2 is NOT needed for Case B (slice-1 exclusion narrowing

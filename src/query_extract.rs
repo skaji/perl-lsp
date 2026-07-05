@@ -210,7 +210,190 @@ pub enum MacroReturnHint {
     Param(u32),
 }
 
+/// Locate a brace-delimited body: from byte `from`, the matching close of the
+/// first top-level `{`, skipping line/block comments and string/char/raw-string
+/// literals so their braces never miscount. Returns `(open, close)` byte
+/// offsets, or `None` when a `;` or EOF is reached before any `{` (a forward
+/// declaration — no body). The single trustworthy container-extent primitive
+/// for the re-anchor pass, run on ORIGINAL source (balanced braces).
+fn brace_body_extent(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let n = bytes.len();
+    let mut i = from;
+    let mut depth = 0i32;
+    let mut open: Option<usize> = None;
+    while i < n {
+        match bytes[i] {
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // Raw string `R"delim( ... )delim"` — a `R` immediately before the
+            // quote, not part of a longer identifier. Its body is verbatim, so
+            // braces inside must not count.
+            b'"' if i > from
+                && bytes[i - 1] == b'R'
+                && !bytes.get(i.wrapping_sub(2)).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
+            {
+                let dstart = i + 1;
+                let mut j = dstart;
+                while j < n && bytes[j] != b'(' && bytes[j] != b'"' {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'(' {
+                    let delim = &bytes[dstart..j];
+                    let mut k = j + 1;
+                    i = n;
+                    while k < n {
+                        if bytes[k] == b')'
+                            && bytes[k + 1..].starts_with(delim)
+                            && bytes.get(k + 1 + delim.len()) == Some(&b'"')
+                        {
+                            i = k + 2 + delim.len();
+                            break;
+                        }
+                        k += 1;
+                    }
+                } else {
+                    i = j; // malformed; resume scan
+                }
+            }
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => {
+                if open.is_none() {
+                    open = Some(i);
+                }
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open.map(|o| (o, i));
+                }
+                i += 1;
+            }
+            b';' if open.is_none() => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 impl SkeletonAnalysis {
+    /// Re-anchor members that lost their enclosing container to a tree-sitter
+    /// misparse — the re-anchor invariant (`docs/prompt-json-reanchor.md`).
+    /// When a deep misparse truncates a `class_specifier`/`namespace` node
+    /// (json.hpp's `basic_json`: a `#if` in ctor-initializer position closes
+    /// the class ~4400 lines early), every member after the truncation becomes
+    /// a sibling in the enclosing scope and loses its `package`. This recovers
+    /// them positionally.
+    ///
+    /// MUST run on ORIGINAL-coordinate symbols (post-`remap_spans`): the C++
+    /// macro-expansion transform unbalances braces (measured on json.hpp's
+    /// `basic_json`: transformed 682/710 vs original 646/646), so only the
+    /// ORIGINAL source's braces locate a container's true extent.
+    ///
+    /// Anti-fabrication: a container is only "computable" when its name span in
+    /// the source spells its own name (macro-synthesized namespaces like
+    /// `nlohmann`, whose span covers `NLOHMANN_JSON_NAMESPACE_BEGIN`, are
+    /// excluded) and it has a real brace body. Re-anchoring is UPGRADE-ONLY —
+    /// a symbol moves to the innermost container that textually encloses it
+    /// only when its current package is None, an ancestor of that container, or
+    /// a non-computable (macro/external) scope. A `::`-qualifier attribution
+    /// (out-of-line def) names a container that does NOT enclose the symbol, so
+    /// it is left untouched. No membership is invented: every target is a real
+    /// declared container whose braces enclose the member.
+    pub fn reanchor_truncated_containers(&mut self, source: &str) {
+        let bytes = source.as_bytes();
+        // Point → byte: tree-sitter columns ARE byte offsets within the line.
+        let mut line_start = Vec::with_capacity(bytes.len() / 32 + 1);
+        line_start.push(0usize);
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                line_start.push(i + 1);
+            }
+        }
+        let pt = |p: Point| -> usize {
+            line_start.get(p.row).copied().unwrap_or(bytes.len()) + p.column
+        };
+
+        // Computable containers: a declared class/union/namespace whose name
+        // span in the source spells its name AND that opens a brace body.
+        struct Container {
+            name: String,
+            open: usize,
+            close: usize,
+        }
+        let mut containers: Vec<Container> = Vec::new();
+        for s in &self.symbols {
+            if !matches!(s.kind.as_str(), "class" | "union" | "package") {
+                continue;
+            }
+            let (ns, ne) = (pt(s.name_start), pt(s.name_end));
+            if source.get(ns..ne) != Some(s.name.as_str()) {
+                continue; // macro-synthesized or shaped name: not textually locatable
+            }
+            if let Some((open, close)) = brace_body_extent(bytes, ne) {
+                containers.push(Container { name: s.name.clone(), open, close });
+            }
+        }
+        if containers.is_empty() {
+            return;
+        }
+
+        for s in self.symbols.iter_mut() {
+            let sb = pt(s.start);
+            // innermost = the smallest container range strictly enclosing sb.
+            let Some(t0) = containers
+                .iter()
+                .filter(|c| c.open < sb && sb < c.close)
+                .min_by_key(|c| c.close - c.open)
+            else {
+                continue;
+            };
+            let upgrade = match &s.package {
+                None => true,
+                Some(p) if *p == t0.name => false,
+                Some(p) => {
+                    // A `::`-qualifier names a computable container that does
+                    // NOT enclose this symbol (out-of-line def) — leave it. A
+                    // non-computable scope (macro namespace) or an enclosing
+                    // ancestor container is a truncation fall-through — upgrade.
+                    let p_computable_here =
+                        containers.iter().any(|c| c.name == *p && c.open < sb && sb < c.close);
+                    let p_is_container = containers.iter().any(|c| c.name == *p);
+                    !p_is_container || p_computable_here
+                }
+            };
+            if upgrade {
+                s.package = Some(t0.name.clone());
+            }
+        }
+    }
+
     /// Assemble a REAL `FileAnalysis` — production model, production
     /// indices, production reducer registry behind every query — from
     /// nothing but capture events. The existence proof that the engine
@@ -960,6 +1143,14 @@ pub struct LangPack {
     /// `language_driver::emit_return_fuel` — asked of the pack, never a
     /// language-name branch.
     pub implicit_this_members: bool,
+    /// Container membership (class/struct/union/namespace) is delimited by
+    /// literal `{`/`}` in the source, so a member that lost its enclosing
+    /// container to a tree-sitter misparse can be re-anchored by matching the
+    /// container's body braces on the ORIGINAL source
+    /// (`reanchor_truncated_containers`). True for C/C++; false for
+    /// indentation-scoped (Python) or non-nesting packs.
+    /// `docs/prompt-json-reanchor.md`.
+    pub brace_scoped_members: bool,
     /// Completion trigger characters for the LSP
     /// `completionProvider.triggerCharacters` slot — the client auto-fires
     /// completion (and reports the char in `CompletionContext`) when one is
@@ -1102,6 +1293,7 @@ pub fn perl_pack() -> LangPack {
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
         implicit_this_members: false,
+        brace_scoped_members: false,
         trigger_chars: &["$", "@", "%", ">", ":", "{"],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1143,6 +1335,7 @@ pub fn python_pack() -> LangPack {
         narrow_guard: |guard, ty| (guard == Some("isinstance")).then(|| InferredType::ClassName(ty.to_string())),
         rebind_method: |_| false,
         implicit_this_members: false,
+        brace_scoped_members: false,
         trigger_chars: &["."],
         receiver_names: &["self", "cls"],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1185,6 +1378,7 @@ pub fn r_pack() -> LangPack {
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
         implicit_this_members: false,
+        brace_scoped_members: false,
         trigger_chars: &["$", "@", ":"],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1234,6 +1428,7 @@ pub fn cmake_pack() -> LangPack {
         narrow_guard: |_, _| None,
         rebind_method: |_| false,
         implicit_this_members: false,
+        brace_scoped_members: false,
         trigger_chars: &["{", "("],
         receiver_names: &[],
         nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
@@ -1339,6 +1534,7 @@ pub fn cpp_pack() -> LangPack {
         },
         // C/C++ methods read members with an implicit `this->`.
         implicit_this_members: true,
+        brace_scoped_members: true,
         trigger_chars: &[".", ">", ":"],
         receiver_names: &["this"],
         // `field_identifier` only ever names a struct/class member (the
