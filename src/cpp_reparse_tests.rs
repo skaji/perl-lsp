@@ -847,3 +847,100 @@ fn predefined_macros_seed_reachability_config() {
 
 
 
+
+
+// --- Context-free-safe expansion verdict (docs/prompt-macro-salvage-scaling.md)
+//
+// A macro whose expansion is context-INDEPENDENTLY safe — an empty/whitespace
+// body, i.e. a pure byte-DELETION like perl5's `pTHX_`/`aTHX_` under a
+// non-multiplicity config — must never be stranded when a *sibling* macro in
+// the same conditional region forces the wide→re-excluded fallback (which
+// otherwise drops every conditional-region-body expansion wholesale). This is
+// the exact op.c:633 dark-receiver: `Perl_op_refcnt_inc(pTHX_ OP *o)` sits in
+// `#ifdef PERL_DEBUG_READONLY_OPS`, and a broken sibling macro forced the
+// fallback → `pTHX_` stayed literal → `o` typed `pTHX_`, not `OP`.
+
+fn macro_table(defs: &[(&str, Option<&[&str]>, &str)]) -> PreExpandedExternal {
+    let mut ext = std::collections::BTreeMap::new();
+    for (n, params, body) in defs {
+        ext.insert(
+            n.to_string(),
+            Macro {
+                params: params.map(|ps| ps.iter().map(|s| s.to_string()).collect()),
+                body: body.to_string(),
+                guards: Vec::new(),
+                def_line: 0,
+            },
+        );
+    }
+    PreExpandedExternal::from_raw(std::sync::Arc::new(ext))
+}
+
+#[test]
+fn context_free_safe_macro_survives_conditional_region_drop() {
+    let mut p = cpp_parser();
+    // `pTHX_` empty (safe deletion); `EVIL` breaks the parse when expanded, so
+    // the wide expansion raises damage and the fallback re-excludes the region.
+    let external = macro_table(&[("pTHX_", None, ""), ("EVIL", None, ")}} garbage {{(")]);
+    let src = "struct OP { int x; };\n#ifdef FEATURE\nvoid refcnt(pTHX_ struct OP *o) { o->x = 1; }\nint z = EVIL;\n#endif\nvoid other(int y) { y++; }\n";
+
+    let tree = parse(&mut p, src);
+    let before = crate::cpp_reparse::parse_damage(tree.root_node());
+    let (wide, _) = preprocess_with(&tree, src, &external);
+    let wide_dmg = crate::cpp_reparse::parse_damage(parse(&mut p, &wide).root_node());
+    assert!(wide_dmg > before, "the sibling `EVIL` must force the fallback (wide raises damage)");
+
+    let (rw, _map, _rec) = preprocess_validated_with(&mut p, src, &external);
+    // `pTHX_` is deleted even though it lives in the dropped conditional region…
+    assert!(!rw.contains("pTHX_"), "context-free-safe `pTHX_` expanded despite the region drop:\n{rw}");
+    assert!(
+        rw.contains("refcnt( struct OP *o)") || rw.contains("refcnt(struct OP *o)"),
+        "the signature parses `o` as `struct OP *`:\n{rw}"
+    );
+    // …while the position-DEPENDENT `EVIL` stays excluded (left literal), so the
+    // exemption did not over-broaden past the provably-safe class.
+    assert!(rw.contains("EVIL"), "non-safe `EVIL` must stay excluded in the fallback:\n{rw}");
+    // The damage-never-rises invariant: the shipped rewrite validates.
+    assert!(
+        crate::cpp_reparse::parse_damage(parse(&mut p, &rw).root_node()) <= before,
+        "salvage/exemption never ships a rewrite above baseline damage"
+    );
+}
+
+#[test]
+fn context_free_safe_macro_still_barred_from_hard_spans() {
+    let mut p = cpp_parser();
+    // The exemption relaxes only the conditional-region-body exclusion — a
+    // safe-macro token inside a string/comment must still never be touched.
+    let external = macro_table(&[("pTHX_", None, ""), ("EVIL", None, ")}} garbage {{(")]);
+    let src = "struct OP { int x; };\n#ifdef FEATURE\nconst char *s = \"pTHX_ in a string\"; // pTHX_ in a comment\nint z = EVIL;\n#endif\n";
+    let (rw, _m, _r) = preprocess_validated_with(&mut p, src, &external);
+    assert!(rw.contains("\"pTHX_ in a string\""), "string literal bytes untouched:\n{rw}");
+    assert!(rw.contains("// pTHX_ in a comment"), "comment bytes untouched:\n{rw}");
+}
+
+#[test]
+fn salvage_keeps_context_free_safe_groups_without_a_probe() {
+    // Direct salvage: a context-free-safe deletion (empty replacement) is kept
+    // unconditionally and never enters the budgeted bisection (doc fix #1), so
+    // the whole budget flows to the genuinely-ambiguous name.
+    let mut p = cpp_parser();
+    let src = "int a; int b; int c;\n";
+    let base_tree = parse(&mut p, src);
+    let base = (
+        crate::cpp_reparse::parse_damage(base_tree.root_node()),
+        structure_count(base_tree.root_node()),
+    );
+    // `a` (4..5) → deleted (safe); `b` (11..12) → broken expansion (ambiguous).
+    let splices = vec![
+        Splice { start: 4, end: 5, replacement: String::new(), name: "SAFE".into() },
+        Splice { start: 11, end: 12, replacement: ")}}(".into(), name: "BAD".into() },
+    ];
+    let mut budget = SALVAGE_PARSE_BUDGET;
+    let start_budget = budget;
+    let kept = salvage_splices(&mut p, src, &splices, base, &mut budget);
+    assert!(kept.iter().any(|s| s.name == "SAFE"), "safe deletion kept: {kept:?}");
+    // The safe group cost zero probes: only the single ambiguous group could
+    // have been probed (≤ 2 probes: its expansion + its blank retry).
+    assert!(start_budget - budget <= 2, "safe group must not consume budget (used {})", start_budget - budget);
+}

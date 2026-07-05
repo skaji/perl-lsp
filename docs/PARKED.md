@@ -150,12 +150,15 @@ why parked, what unblocks it. Prune on landing.
 - **Strip-blanked tokens aren't re-minted as refs** (gr misses blanked
   `NS_BEGIN`-style occurrences; splice-blanked ones ARE re-minted).
 - **Per-macro-name salvage granularity** — a macro with both good and bad
-  uses is kept/blanked wholesale. SIBLING defect: a budget-exhaustion
-  scaling wall — blind bisection over op.c's dense macro-name set burns the
-  48-probe cap and drops clean macros (`pTHX_`/`aTHX_`) in the dropped tail.
-  Full analysis + ranked fixes (per-name expansion-verdict cache is the
-  recommended first slice: classify `pTHX_` blankable once, cache, never
-  re-bisect) in `docs/prompt-macro-salvage-scaling.md`.
+  uses is kept/blanked wholesale. SIBLING (budget-exhaustion scaling wall)
+  and the op.c:633 dark-receiver are now FIXED via the context-free-safe
+  expansion verdict (`is_context_free_safe` in `cpp_reparse.rs`): an
+  empty-body deletion like `pTHX_`/`aTHX_` is classified context-independently
+  safe and is never stranded in a dropped conditional-region body OR bisected
+  in salvage (it's kept as the always-applied baseline). Residual: the general
+  per-name granularity for a NON-empty, position-DEPENDENT macro with mixed
+  good/bad uses — the localization slice (fix #1) — still wants doing.
+  `docs/prompt-macro-salvage-scaling.md`.
 - **One `private:` leak shape** (raw_hash_set.h:3783 — post-declarator
   attribute in a compound misparse the conservative gate doesn't reach).
 - **fmt macro-prefixed members** (`FMT_CONSTEXPR auto data()`) don't

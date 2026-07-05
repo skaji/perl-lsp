@@ -4,6 +4,50 @@ Forward-design note. The problem is a **residual on the densest, most
 macro-abusive translation units** (perl5 `op.c` is the canonical case);
 the machinery is otherwise correct. Two sibling defects share one fix.
 
+## LANDED: context-free-safe verdict (fixes op.c:633)
+
+The **verdict-cache slice landed**, but the on-the-ground mechanism for
+op.c:633 turned out to be a *sibling* of the budget wall this note
+predicted, not the budget wall itself. Verified reality on the current
+checkout: `pTHX_` resolves to an **empty** body (non-multiplicity config),
+salvage **never runs** on op.c, and `Perl_op_refcnt_inc(pTHX_ OP *o)` at
+line 630 lives inside `#ifdef PERL_DEBUG_READONLY_OPS` (628–663). The WIDE
+expansion raises whole-file damage (a *sibling* macro in the file), so
+`preprocess_validated_with` drops to the **re-excluded fallback**
+(`expand_region_bodies=false`) — which excludes every conditional-region
+body wholesale and strands the clean `pTHX_` there, exactly the "clean
+macro dropped with the damaging batch" defect this note describes, but at
+the region-exclusion seam rather than the salvage-budget seam.
+
+The fix is the verdict's essence, delivered where it actually bites:
+`is_context_free_safe(macro)` classifies an object-like macro with an
+empty/whitespace body as **context-independently safe** (its expansion is
+pure byte DELETION — it can only remove a token, never introduce a bad
+one, in ANY position). Such a macro is:
+
+- **exempt from the conditional-region-body exclusion** (never the hard
+  string/comment/directive spans) in `compute_splices_inner`, so `pTHX_`
+  survives the re-excluded fallback → `o` types as `OP` → `o->op_slabbed`
+  resolves; and
+- **pulled out of the salvage bisection** as the always-applied baseline
+  (`salvage_splices`), so it costs zero probes and can't lower the recall
+  of the ambiguous groups (a deletion only lowers damage).
+
+The damage-never-rises invariant is preserved throughout by the existing
+whole-file validation gate. Classification is a pure syntactic property
+(fix #4 below), free and stable, so cross-open reuse is automatic via the
+already-cached `PreExpandedExternal` — no SQLite blob field, no
+`EXTRACT_VERSION`-persisted verdict (the bump to 161 is only because cpp
+analysis OUTPUT changed, invalidating stale blobs).
+
+**Still open (localization, fix #1):** a NON-empty, position-DEPENDENT
+macro with genuinely mixed good/bad uses. `pTHX_ → PerlInterpreter
+*my_perl,` (a multiplicity config) is NOT context-free (the trailing comma
+is safe only in a param list), so it stays on the normal
+exclusion/salvage path. Mapping the first-parse ERROR range back through
+the splice map to the covering group would keep clean uses of such a
+macro without probing the whole name set.
+
 ## The machinery (as it stands)
 
 Macro expansion turns every macro *use* into a **splice** (a byte-range
@@ -86,7 +130,9 @@ set).
    per-probe cost collapses and the budget could rise 10–100× for nearly
    free. Attacks cost-per-probe rather than probe-count.
 
-4. **Syntactic pre-filter** (cheap partial). A single-token declarator
+4. **Syntactic pre-filter** (cheap partial) — **LANDED** as
+   `is_context_free_safe` (narrowed to the provably context-independent
+   class: empty/whitespace-body deletions). A single-token declarator
    macro (`pTHX_`) is structurally safe; the dangerous shapes contain
    `##` or produce unbalanced braces. A one-pass filter exempts the
    obviously-safe majority from salvage, shrinking the bisection input.
