@@ -47,6 +47,63 @@ return function(opts)
     end
   end
 
+  -- Indexing progress spinner, interactive-only (never headless — e2e stays
+  -- quiet + plugin-free). The server emits window/workDoneProgress for the
+  -- workspace index (perl + pack tokens); this shows a top-right spinner so you
+  -- KNOW smarts are still warming during the cold-open window and WHEN they
+  -- land, instead of waiting blind. Dependency-free: nvim's built-in
+  -- `LspProgress` autocmd + a small float. Tracks BOTH tokens; clears when both
+  -- End.
+  if #vim.api.nvim_list_uis() > 0 then
+    local uv = vim.uv or vim.loop
+    local frames = { "⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏" }
+    local st = { win = nil, buf = nil, timer = nil, fi = 1, active = {}, msg = "" }
+    local function close()
+      if st.timer then pcall(function() st.timer:stop(); st.timer:close() end); st.timer = nil end
+      if st.win and vim.api.nvim_win_is_valid(st.win) then pcall(vim.api.nvim_win_close, st.win, true) end
+      st.win, st.buf = nil, nil
+    end
+    local function render(spin)
+      if not (st.win and vim.api.nvim_win_is_valid(st.win)) then
+        st.buf = vim.api.nvim_create_buf(false, true)
+        st.win = vim.api.nvim_open_win(st.buf, false, {
+          relative = "editor", anchor = "NE", row = 1, col = vim.o.columns - 1,
+          width = 44, height = 1, style = "minimal", border = "rounded",
+          focusable = false, noautocmd = true, zindex = 200,
+        })
+      end
+      local line = (spin and (frames[st.fi] .. " ") or "") .. "perl-lsp: " .. st.msg
+      pcall(vim.api.nvim_buf_set_lines, st.buf, 0, -1, false, { line:sub(1, 44) })
+    end
+    vim.api.nvim_create_autocmd("LspProgress", {
+      callback = function(ev)
+        local p = ev.data and ev.data.params
+        local v = p and p.value
+        if not v then return end
+        local tok = tostring(p.token or "")
+        if not tok:match("workspace%-index") then return end
+        if v.kind == "begin" or v.kind == "report" then
+          st.active[tok] = true
+          st.msg = (v.title or "Indexing") .. (v.message and (": " .. v.message) or "")
+          if not st.timer then
+            st.timer = uv.new_timer()
+            st.timer:start(0, 90, vim.schedule_wrap(function()
+              st.fi = st.fi % #frames + 1
+              if next(st.active) then render(true) else close() end
+            end))
+          end
+        elseif v.kind == "end" then
+          st.active[tok] = nil
+          if not next(st.active) then
+            st.msg = "✓ " .. (v.message or "indexed") .. " — full smarts ready"
+            render(false)
+            vim.defer_fn(close, 2500)
+          end
+        end
+      end,
+    })
+  end
+
   -- Built binary. Override with PERL_LSP_BIN for comparison runs.
   local lsp_bin = vim.env.PERL_LSP_BIN
     and vim.fn.fnamemodify(vim.env.PERL_LSP_BIN, ":p")
