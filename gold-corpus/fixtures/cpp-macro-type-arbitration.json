@@ -1,0 +1,38 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "cpp-macro-arb-parenless-type-token-prefers-typedef",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macroarb/use.c",
+      "line": 3, "col": 11,
+      "expect": { "all": ["optype.h:5:19"], "none": ["regmacro.h"] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-macro-arb-typedef-site-prefers-typedef",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macroarb/optype.h",
+      "line": 4, "col": 18,
+      "expect": { "all": ["optype.h:5:19"], "none": ["regmacro.h"] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-macro-arb-call-shaped-use-prefers-macro",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macroarb/use.c",
+      "line": 5, "col": 8,
+      "expect": { "all": ["regmacro.h:5:9"], "none": ["optype.h:5:19"] },
+      "status": "gold"
+    }
+  ]
+}

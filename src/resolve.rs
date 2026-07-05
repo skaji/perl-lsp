@@ -1498,7 +1498,16 @@ impl<'a> CandidateSet<'a> {
         if self.pack {
             if let (Some(source), Some(idx)) = (self.source, self.idx()) {
                 if let Some(word) = word_at_point(source, point) {
-                    let ranked = ranked_macro_variants(analysis, word, &self.origin_key, idx);
+                    // Shape gate: a function-like `#define F(x)` expands only at
+                    // call shape `F(`. At a parenless site it can't claim the
+                    // token — drop those variants so a parenless type token
+                    // (`OP** p`) falls through to the typedef/class lane instead
+                    // of landing on a same-named regex-internal `#define OP(p)`.
+                    let call_shaped = token_is_call_shaped(source, point);
+                    let ranked: Vec<_> = ranked_macro_variants(analysis, word, &self.origin_key, idx)
+                        .into_iter()
+                        .filter(|(m, _, _)| call_shaped || m.params.is_none())
+                        .collect();
                     if !ranked.is_empty() {
                         let mut out: Vec<RefLocation> = ranked
                             .iter()
@@ -3368,6 +3377,30 @@ pub fn word_at_point(source: &str, point: tree_sitter::Point) -> Option<&str> {
         end += 1;
     }
     (start < end).then(|| &source[start..end])
+}
+
+/// Is the identifier at `point` CALL-SHAPED — its token immediately followed
+/// (skipping whitespace) by `(`? The C preprocessor expands a function-like
+/// macro ONLY at this shape, so a PARENLESS token (`OP** p`, the `OP` in a
+/// `typedef`) is never a function-like macro's use and a `#define OP(p)` must
+/// not claim it. Object-like macros claim regardless (they expand at any
+/// occurrence). This is the SITE half of the shape gate; the def's
+/// `params.is_some()` is the candidate half.
+pub(crate) fn token_is_call_shaped(source: &str, point: tree_sitter::Point) -> bool {
+    let cursor = crate::cursor_sentinel::point_to_byte(source, point);
+    let b = source.as_bytes();
+    let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    if cursor > b.len() {
+        return false;
+    }
+    let mut end = cursor;
+    while end < b.len() && is_id(b[end]) {
+        end += 1;
+    }
+    while end < b.len() && b[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    end < b.len() && b[end] == b'('
 }
 
 /// The full `Base<...>` spelling at a type ref: `span` covers the base token;

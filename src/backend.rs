@@ -1741,6 +1741,22 @@ impl LanguageServer for Backend {
             }
         });
 
+        // Pack-language (C/C++/…) symbols live in per-language sub-indexes, not
+        // the FileStore — sweep them so a C typedef/class/free function shows in
+        // workspace search alongside Perl packages.
+        self.module_index.for_each_pack_registered_file(&mut |path, analysis| {
+            let uri = Url::from_file_path(path).unwrap_or_else(|_| {
+                Url::parse(&format!("file://{}", path.display())).unwrap()
+            });
+            for sym in &analysis.symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+        });
+
         if results.is_empty() {
             Ok(None)
         } else {

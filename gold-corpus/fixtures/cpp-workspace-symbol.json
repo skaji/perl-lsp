@@ -1,0 +1,18 @@
+{
+  "capability": "workspace-symbol",
+  "rows": [
+    {
+      "id": "cpp-ws-typedef-short-name",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "query": "OP",
+      "expect": {
+        "all": ["{\"col\":\"18\",\"file\":\"optype.h\",\"kind\":\"Class\",\"line\":\"4\",\"name\":\"OP\"}"],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}
