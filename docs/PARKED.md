@@ -215,15 +215,28 @@ why parked, what unblocks it. Prune on landing.
     burst to ONE execution (measured 33→1, `e2e/cold-window-heal-repro.sh` phase
     2). The final fire always survives the settle, so the fully-resolved state
     is still published.
-  **LEDGERED (still open): the bounded wait.** A pull verb (gd/hover/references)
-  issued in-window and NOT re-requested still returns the one degraded answer —
-  the server has no push channel for pull verbs (only diagnostics + completion
-  `isIncomplete` push). A bounded wait in the pull handlers (block a gd/hover
-  briefly for an imminent index) would close this, but it risks re-introducing
-  the guard-held-across-`resolve()` deadlock family, so it is deliberately NOT
-  taken here. The heal-repush shrinks the STICKY surface (doc-baked answers +
-  diagnostics now self-heal server-side) and the coalesce narrows the window
-  itself; a single in-window pull query under load remains the residual.
+  **The bounded wait is now FIXED** (`fix/cold-window-wait`). A pull verb
+  (gd/hover/references/implementations) arriving while its language family's
+  workspace/pack index is IN-FLIGHT — kicked off at `did_open` but not yet
+  complete — now blocks briefly (`await_index_ready`) for the completion signal,
+  then resolves against the warm cross-file index instead of returning the one
+  degraded answer the user never re-triggers. The signal is a per-family
+  `AtomicBool` + `tokio::sync::Notify` fired by an `IndexDoneGuard` on EVERY exit
+  of the indexing task (no-root / panic included), so a waiter is never stranded.
+  **Guard discipline held:** the wait touches ONLY the family's atomic + Notify
+  — NO FileStore guard is held across the await (the handler peeks `language`
+  under a `get_open` that drops before the await, and snapshots `analysis` fresh
+  after). Cap is `initializationOptions.coldWaitMs` (default 400ms, 0 opts out) —
+  bounded, so it can never wedge; on timeout the handler degrades exactly as
+  before. The warm case pays ZERO added latency (index already `done` → returns
+  before awaiting; measured warm re-fire 61ms vs a 2084ms in-window wait). Repro:
+  `e2e/cold-window-wait-repro.sh` (self-contained synthetic C workspace; OFF
+  coldWaitMs=0 → in-window refs 4 degraded, ON → 16001 healed by the wait, same
+  single query un-re-requested). Deadlock lock `e2e/cold-start-repro.sh` stays
+  0/20. On a perl5-scale tree whose index alone takes ~22s the default 400ms cap
+  times out and degrades safely — the wait targets normal-sized projects whose
+  index lands within the cap. The heal-repush (doc-baked answers + diagnostics)
+  and coalesce still cover the rest.
   **The deadlock that used to MASK this window is fixed** (`Document::analysis`
   is now `Arc`; handlers snapshot + drop the `get_open` read guard before
   `resolve()` re-locks the open shards — the reentrant-read-behind-a-queued-
