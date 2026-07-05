@@ -1,0 +1,38 @@
+{
+  "capability": "diagnostics",
+  "rows": [
+    {
+      "id": "cpp-member-op-swap-cli-parity",
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-diag-fixture",
+      "comment": "Family D iii: Mode-B (member-op) diagnostics now route through the CLI diagnostics path (pack_diagnostics wired into enriched_tree_diagnostics), so --batch/gold see the same swap WARNING the LSP publishes. `o.op_type` on an OP* wants `->`.",
+      "expect": {
+        "all": [
+          "\"code\":\"member-access-operator\"",
+          "\"file\":\"memberop.cc\",\"line\":\"5\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-member-op-deep-peel",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-diag-fixture",
+      "comment": "Family D i: a DEEP receiver (OP** op_p) can't be reached by any single `.`/`->` — `op_p->op_type` needs `(*op_p)->`. Show-only peel hint (no auto-fix), property-driven off deref depth.",
+      "expect": {
+        "all": [
+          "\"code\":\"member-access-peel\"",
+          "(*op_p)->",
+          "\"file\":\"memberop.cc\",\"line\":\"9\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

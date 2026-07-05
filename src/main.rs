@@ -1631,6 +1631,19 @@ fn enriched_tree_diagnostics(
             all.push((file.clone(), d));
         }
     }
+    // Pack-language files (C++/…) live in the per-language sub-indexes, not the
+    // Perl-only `FileStore` above. Mirror the backend's language dispatch: they
+    // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
+    // diagnostics` / `--check` / gold see the same Mode-B answers the LSP
+    // publishes. No enrichment (pack files aren't cross-file-enriched).
+    idx.for_each_pack_index(|_lang, pack| {
+        pack.for_each_registered_file(&mut |cm| {
+            let file = cm.path.display().to_string();
+            for d in symbols::pack_diagnostics(&cm.analysis, options) {
+                all.push((file.clone(), d));
+            }
+        });
+    });
     all
 }
 

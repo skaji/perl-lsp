@@ -92,4 +92,37 @@ t.test("Mode B: diagnostic on p.width with a working `->` quick-fix", function()
   if t.ok(N, fixed, "p.width rewritten to p->width") then t.pass(N) end
 end)
 
+-- Poll until the DEEP-receiver peel diagnostic publishes.
+local function peel_diag(buf)
+  for _ = 1, 40 do
+    for _, d in ipairs(vim.diagnostic.get(buf)) do
+      local lsp_d = d.user_data and d.user_data.lsp
+      if lsp_d and lsp_d.code == "member-access-peel" then return d, lsp_d end
+    end
+    vim.wait(250)
+  end
+  return nil
+end
+
+t.test("Mode B: DEEP receiver peel hint on pp->width, show-only (no fix)", function()
+  local N = "deep-peel-diag"
+  local d, lsp_d = peel_diag(buf)
+  if not t.ok(N, d, "peel diagnostic present") then return end
+  local diag_line = b.find_line(buf, "pp%->width")
+  if not t.eq(N, diag_line, d.lnum, "peel diagnostic on the pp->width line") then return end
+  -- The message names the peeled receiver spelling.
+  if not t.ok(N, d.message:find("%(%*pp%)", 1), "message suggests `(*pp)`") then return end
+  -- Show-only: no quick-fix over its range.
+  local actions = lsp.request(buf, "textDocument/codeAction", {
+    textDocument = { uri = vim.uri_from_bufnr(buf) },
+    range = lsp_d.range,
+    context = { diagnostics = { lsp_d } },
+  }) or {}
+  local has_fix = false
+  for _, a in ipairs(actions) do
+    if a.edit then has_fix = true; break end
+  end
+  if t.eq(N, false, has_fix, "no auto-fix offered for the peel") then t.pass(N) end
+end)
+
 t.finish()

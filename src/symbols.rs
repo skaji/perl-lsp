@@ -3080,6 +3080,34 @@ pub fn pack_member_op_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
         .collect()
 }
 
+/// Diagnostic code for a member-access whose receiver is too deeply indirected
+/// for a single `.`/`->` — the fix is an expression wrap (`(*pp)->m`), not a
+/// swap, so this carries NO `data.operator` and offers no quick-fix (show-only,
+/// mirroring Mode A's stance for the ambiguous case).
+const MEMBER_OP_PEEL_CODE: &str = "member-access-peel";
+
+/// Mode B (peel half): the DEEP-receiver hints. One WARNING per
+/// `member_op_deep_accesses()` entry — the case a token swap can't express
+/// (`OP** op_p; op_p->m` needs `(*op_p)->m`). Range = the written operator; the
+/// message names the peeled receiver spelling. No auto-fix.
+pub fn pack_member_op_peel_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    analysis
+        .member_op_deep_accesses()
+        .into_iter()
+        .map(|p| Diagnostic {
+            range: span_to_range(p.op_span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(MEMBER_OP_PEEL_CODE.into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "receiver is {}-level indirect — a single `.`/`->` can't reach its members; dereference first: `{}->`",
+                p.depth, p.wrap,
+            ),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Mode C: use-after-move. One WARNING per `use_after_move_reads()` read —
 /// a variable read after a `std::move` of it, before any reassignment. The
 /// region + cutoff + honesty gates live on `FileAnalysis` (the edge-driven
@@ -3104,6 +3132,7 @@ pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnosti
 /// One seam so a backend dispatch never enumerates the individual checks.
 pub fn pack_diagnostics(analysis: &FileAnalysis, options: DiagnosticOptions) -> Vec<Diagnostic> {
     let mut diags = pack_member_op_diagnostics(analysis);
+    diags.extend(pack_member_op_peel_diagnostics(analysis));
     // use-after-move is OPT-IN (`DiagnosticOptions.use_after_move`): the wired
     // check is the decidable subset only — gates B/C/E on `use_after_move_reads`
     // keep it to straight-line, in-function, local moves, verified to emit ZERO

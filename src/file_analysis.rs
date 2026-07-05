@@ -830,6 +830,46 @@ pub struct MemberOpMismatch {
     pub expected: MemberOp,
 }
 
+/// A member-access whose receiver is too deeply indirected for ANY single
+/// `.`/`->` token — the fix is an expression WRAP (`(*pp)->m`), not a swap,
+/// so there is no auto-fix. Complements `MemberOpMismatch`: the two partition
+/// the flagged accesses by whether `expected_member_op` can name one operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberOpPeel {
+    /// The written operator token (`.`/`->`) — where the hint is anchored.
+    pub op_span: Span,
+    /// The receiver rewritten to reach a single-indirection value, e.g.
+    /// `(*op_p)`. The caller composes `<wrap>-><member>`.
+    pub wrap: String,
+    /// Pointer indirection levels on the receiver (≥2).
+    pub depth: usize,
+}
+
+/// The peeled receiver spelling for a DEEP stack — one whose pointer depth
+/// exceeds what a single `.`/`->` can reach (`expected_member_op` is `None`).
+/// Returns `(wrap, depth)`: a plain pointer chain of depth N peels to
+/// `(` + `*`×(N-1) + name + `)`, accessed with `->`. `None` when a single
+/// token already suffices, or the stack isn't a plain pointer chain we can
+/// spell (reference-mixed shapes stay silent — rule #10: the stack
+/// composition, not a name, decides). The pointer count, not `stack.len()`,
+/// drives the star count so an interleaved reference (which auto-derefs)
+/// neither adds a `*` nor blocks the hint.
+pub fn deref_peel(stack: &[DerefStep], receiver: &str) -> Option<(String, usize)> {
+    // A single token already reaches the members — not a peel case.
+    if expected_member_op(stack).is_some() {
+        return None;
+    }
+    let pointers = stack
+        .iter()
+        .filter(|s| s.kind == DerefKind::Pointer)
+        .count();
+    if pointers < 2 {
+        return None;
+    }
+    let stars = "*".repeat(pointers - 1);
+    Some((format!("({stars}{receiver})"), pointers))
+}
+
 /// How a value is taken out of its source when it flows to a target — the
 /// shape of the assignment. `Whole` is `$x = RHS`; the rest model list /
 /// destructuring / element / key binding. An OPEN ontology: Rust makes adding
@@ -4305,14 +4345,43 @@ impl FileAnalysis {
     }
 
     /// Member accesses whose typed operator disagrees with their
-    /// receiver's pointer depth — the single-level `.`↔`->` mismatches.
-    /// Pure read over the MEMBER REFS — each `MethodCall` ref carrying a
-    /// `member_op` (a simple-variable receiver) joined with that receiver's
-    /// `deref_stack`. DEEP receivers (`Box**`) yield no `MemberOp` and are
-    /// skipped (show-only, no token-swap fix). The op-DX is the ref now, not a
-    /// separate `member_access_sites` walk.
+    /// receiver's pointer depth — the single-level `.`↔`->` mismatches with a
+    /// token-swap fix. DEEP receivers (`Box**`) fall to the peel partition
+    /// (`member_op_deep_accesses`), not here.
     pub fn member_op_mismatches(&self) -> Vec<MemberOpMismatch> {
         let mut out = Vec::new();
+        self.for_each_member_access(|_recv, typed, op_span, stack| {
+            let Some(expected) = expected_member_op(stack) else {
+                return; // DEEP — a wrap, not a swap; `member_op_deep_accesses` owns it
+            };
+            if typed != expected {
+                out.push(MemberOpMismatch { op_span, typed, expected });
+            }
+        });
+        out
+    }
+
+    /// Member accesses whose receiver is too deeply indirected for any single
+    /// `.`/`->` token — the DEEP partition `member_op_mismatches` skips. Each
+    /// carries the peeled receiver spelling (`(*pp)`) for a show-only hint (no
+    /// auto-fix: the rewrite is an expression wrap, not a token swap).
+    pub fn member_op_deep_accesses(&self) -> Vec<MemberOpPeel> {
+        let mut out = Vec::new();
+        self.for_each_member_access(|recv, _typed, op_span, stack| {
+            if let Some((wrap, depth)) = deref_peel(stack, recv) {
+                out.push(MemberOpPeel { op_span, wrap, depth });
+            }
+        });
+        out
+    }
+
+    /// Shared walk over member-access refs carrying a `member_op` (a
+    /// simple-variable receiver) joined with that receiver's `deref_stack`.
+    /// Both op-DX queries project this — one ref scan, one join site.
+    fn for_each_member_access(
+        &self,
+        mut f: impl FnMut(&str, MemberOp, Span, &[DerefStep]),
+    ) {
         for r in &self.refs {
             let RefKind::MethodCall {
                 invocant,
@@ -4323,17 +4392,12 @@ impl FileAnalysis {
             else {
                 continue;
             };
-            let Some(stack) = self.var_deref_stack_at(invocant.text(), span.start) else {
+            let recv = invocant.text();
+            let Some(stack) = self.var_deref_stack_at(recv, span.start) else {
                 continue;
             };
-            let Some(expected) = expected_member_op(stack) else {
-                continue; // DEEP — needs a wrap, not a swap
-            };
-            if *typed != expected {
-                out.push(MemberOpMismatch { op_span: *op_span, typed: *typed, expected });
-            }
+            f(recv, *typed, *op_span, stack);
         }
-        out
     }
 
     /// Raw Variable+InferredType lookup — returns the latest in-scope

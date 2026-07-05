@@ -283,6 +283,38 @@ A's show-only stance; wire `pack_diagnostics` into the CLI diagnostics path
 (parity + makes it gold-testable); keep the mid-edit erasure as a known
 degradation unless cheap.
 
+**LANDED** (`fix/member-op-dx2`):
+- (i) **peel hint** — `deref_peel(stack, receiver)` (sibling of
+  `expected_member_op`, `file_analysis.rs`) computes the wrapped spelling for a
+  DEEP pointer chain (`(` + `*`×(pointers-1) + name + `)`), driven off the
+  pointer count in the deref stack (rule #10 — the composition, not a name,
+  decides; reference-mixed shapes stay silent). `FileAnalysis::member_op_deep_accesses`
+  projects it; `member_op_mismatches` + the new query share one
+  `for_each_member_access` walk (swap vs peel = disjoint partitions of the flagged
+  accesses). `symbols::pack_member_op_peel_diagnostics` emits a show-only WARNING
+  (code `member-access-peel`, no `data.operator` → no quick-fix). E2E:
+  `deep-peel-diag` in `cpp_member_op.lua`.
+- (iii) **CLI parity** — `pack_diagnostics` now runs on every pack-language file
+  in the CLI whole-tree pass (`main.rs::enriched_tree_diagnostics` sweeps
+  `ModuleIndex::for_each_pack_index` → `for_each_registered_file`), mirroring the
+  backend's per-language dispatch. `--batch diagnostics` / `--check` / gold now
+  see Mode B (swap + peel). Gold: `fixtures/cpp-member-op-dx.json` (2 rows over
+  `gold-corpus/cpp-diag-fixture/memberop.cc`).
+
+**PARKED** (residual):
+- (ii) **mid-edit erasure** — the provable subset already survives: a mismatch on
+  a prior line in the same function, or in any later scope anchored by an
+  intervening `}`, is kept (locked by `cpp_dangling_arrow_keeps_provable_mismatches`).
+  The only loss is a mismatch whose receiver **declaration** the dangling
+  expression greedily consumes (`q->` eats the following `Box* p;`, so `p` has no
+  type in the recovered tree) — its type is genuinely gone, so it is left out
+  rather than guessed (per "don't publish wrong diagnostics to keep count"). No
+  cheap diagnostics-layer fix: it's tree-sitter-cpp recovery, not a wholesale
+  bail. Left as a known degradation.
+
+**EXTRACT_VERSION:** unchanged at 157 — no serialized `FileAnalysis` field added
+(`MemberOpPeel` is a transient query result, not cached).
+
 ### Polish (fold into A/C or a fifth micro-slice)
 
 - Enumerator hover: show value AND type (`OP_NULL = 0: opcode`). (5a)
@@ -323,5 +355,5 @@ extraction-payload, and DX issues respectively. No double-scheduling.
   owner-gated vote needs real usage mass) — and prefix-filtered closure
   completion cosplays as domain ranking. Distinguish by `detail`: slot ranking
   = bare enum name; closure completion = `enum — file.h`.
-- CLI diagnostics omit Mode B (family D iii) — don't use `--batch diagnostics`
-  to probe member-op DX until slice D lands.
+- CLI diagnostics now include Mode B (slice D iii landed) — `--batch
+  diagnostics` / `--check` surface member-op swap + peel for pack files.
