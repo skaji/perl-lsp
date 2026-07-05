@@ -277,6 +277,21 @@ pub trait CrossFileLookup {
     fn def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
         self.get_cached(name).into_iter().collect()
     }
+    /// A cached module's analysis with its witness bag GUARANTEED present.
+    /// Slice 2 evicts the bag from resident pack-index copies; every TYPE
+    /// query that reads a foreign file's bag (the `MethodOnClass` / `SlotType`
+    /// / `TypeName` cross-file chases, `def_candidates` return-type folds,
+    /// cross-file field types) routes through here so the exact persisted bag
+    /// rehydrates on demand. Default (Perl hub, tests, non-pack impls): a cheap
+    /// `Arc` bump — those copies are never evicted. The pack `ModuleIndex`
+    /// overrides it to rehydrate from its `PackBagCache` when the bag is
+    /// evicted. See `docs/adr/memory-slice-2-lru.md`.
+    fn bag_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        cached.analysis.clone()
+    }
     fn parents_cached(&self, module_name: &str) -> Vec<String>;
     fn modules_with_symbol(&self, name: &str) -> Vec<String>;
     fn find_exporters(&self, func_name: &str) -> Vec<String>;
@@ -413,6 +428,16 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // definition-ness themselves, and a definition legitimately lives
         // OUTSIDE the querying file's closure (a `.c` body nobody includes).
         self.inner.def_candidates(name)
+    }
+    fn bag_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // MUST delegate: the inner pack index owns the `PackBagCache`. Without
+        // this, cpp cross-file type queries (which thread a `ScopedLookup`)
+        // hit the trait default and read the evicted bag — silent Slice-2
+        // type regressions while goto/refs stay green.
+        self.inner.bag_present(cached)
     }
     fn parents_cached(&self, module_name: &str) -> Vec<String> {
         self.inner.parents_cached(module_name)
@@ -3456,6 +3481,17 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub witnesses: crate::witnesses::WitnessBag,
 
+    /// Slice-2 residency flag: the resident pack-index copy of a workspace
+    /// file has its witness bag evicted after the fold bakes its conclusions
+    /// into pinned fields (`docs/adr/memory-slice-2-lru.md`). Set by
+    /// `evict_witness_bag`, `#[serde(skip)]` so the on-disk blob (which keeps
+    /// the FULL bag) always deserializes with the flag `false` — a rehydrated
+    /// analysis is bag-present and indistinguishable from a never-evicted one.
+    /// Consumers reading a foreign bag rehydrate through `CrossFileLookup::
+    /// bag_present` when this is set; the empty bag is "evicted", not "no facts".
+    #[serde(skip, default)]
+    bag_evicted: bool,
+
     /// Witness-bag baseline — `enrich_imported_types_with_keys`
     /// truncates back to this length before re-deriving so repeat
     /// calls stay idempotent.
@@ -3932,6 +3968,7 @@ impl FileAnalysis {
             plugin_namespaces,
             type_provenance,
             witnesses,
+            bag_evicted: false,
             package_framework,
             base_symbol_count: 0,
             base_witness_count: 0,
@@ -3985,6 +4022,24 @@ impl FileAnalysis {
     /// end of the worklist (single emission point for "this sub's
     /// return type is known"). Cross-file imports do not get a local
     /// mirror; they resolve lazily through `query_sub_return_type`.
+    /// Drop the witness bag (the build-time type-inference scaffold) from
+    /// this resident analysis after the fold baked its conclusions into pinned
+    /// fields. The full bag rides the on-disk blob, so this is lossless — a
+    /// type query needing it rehydrates the exact persisted bag on demand
+    /// (`docs/adr/memory-slice-2-lru.md`). Clears both the `Vec<Witness>` and
+    /// its rebuilt index; touches no pinned field (refs, symbols, return_types,
+    /// resolved_method_target all survive). Idempotent.
+    pub fn evict_witness_bag(&mut self) {
+        self.witnesses = crate::witnesses::WitnessBag::default();
+        self.bag_evicted = true;
+    }
+
+    /// True when `evict_witness_bag` stripped this copy's bag: an empty bag
+    /// here means "on disk, not resident", not "no type facts".
+    pub fn bag_is_evicted(&self) -> bool {
+        self.bag_evicted
+    }
+
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
         // Fill HashKeyAccess owners that are resolvable in-file
@@ -6321,14 +6376,18 @@ impl FileAnalysis {
         match self.resolve_method_in_ancestors(class, field, module_index)? {
             MethodResolution::Local { sym_id, .. } => Some(render(self, self.symbol(sym_id))),
             MethodResolution::CrossFile { class, .. } => {
-                let cached = module_index?.get_cached(&class)?;
-                let sym = cached.analysis.symbols.iter().find(|s| {
+                let idx = module_index?;
+                let cached = idx.get_cached(&class)?;
+                // `render` reads the field's flow type from its OWNING bag —
+                // rehydrate if the resident pack copy was Slice-2-evicted.
+                let full = idx.bag_present(&cached);
+                let sym = full.symbols.iter().find(|s| {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
                         && s.package.as_deref() == Some(class.as_str())
-                        && cached.analysis.symbol_is_class_content(s)
+                        && full.symbol_is_class_content(s)
                 })?;
-                Some(render(&cached.analysis, sym))
+                Some(render(&full, sym))
             }
         }
     }
@@ -6392,14 +6451,18 @@ impl FileAnalysis {
                 self.inferred_type_via_bag(field, self.symbol(sym_id).span.end)
             }
             MethodResolution::CrossFile { class, .. } => {
-                let cached = module_index?.get_cached(&class)?;
-                let sym = cached.analysis.symbols.iter().find(|s| {
+                let idx = module_index?;
+                let cached = idx.get_cached(&class)?;
+                // The field's type lives in the OWNING file's bag; rehydrate
+                // it if the resident pack copy was bag-evicted (Slice 2).
+                let full = idx.bag_present(&cached);
+                let sym = full.symbols.iter().find(|s| {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
                         && s.package.as_deref() == Some(class.as_str())
-                        && cached.analysis.symbol_is_class_content(s)
+                        && full.symbol_is_class_content(s)
                 })?;
-                cached.analysis.inferred_type_via_bag(field, sym.span.end)
+                full.inferred_type_via_bag(field, sym.span.end)
             }
         }
     }
@@ -6423,13 +6486,17 @@ impl FileAnalysis {
                 self.type_name_edge_of(&self.symbol(sym_id).name, self.symbol(sym_id).scope)
             }
             MethodResolution::CrossFile { class, .. } => {
-                let cached = module_index?.get_cached(&class)?;
-                let sym = cached.analysis.symbols.iter().find(|s| {
+                let idx = module_index?;
+                let cached = idx.get_cached(&class)?;
+                // `type_name_edge_of` reads the field's `Edge(TypeName(_))`
+                // witness — rehydrate the owning file's bag if evicted.
+                let full = idx.bag_present(&cached);
+                let sym = full.symbols.iter().find(|s| {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
                         && s.package.as_deref() == Some(class.as_str())
                 })?;
-                cached.analysis.type_name_edge_of(&sym.name, sym.scope)
+                full.type_name_edge_of(&sym.name, sym.scope)
             }
         }
     }

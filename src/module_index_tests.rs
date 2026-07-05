@@ -14,6 +14,51 @@ fn parse_source_to_cached(source: &str, module_name: &str) -> Arc<CachedModule> 
     ))
 }
 
+/// Slice-2 crux (R1): a bag-EVICTED cached analysis, queried through
+/// `bag_present`, rehydrates to a bag-PRESENT analysis via the pack index's
+/// `PackBagCache` — byte-identical bag whether the LRU retains (cap>0) or
+/// re-decodes every time (cap==0). This is the seam every cross-file TYPE
+/// query routes through; if it regressed, references/goto stay green while
+/// type inference silently returns None into evicted files.
+#[test]
+fn bag_present_rehydrates_evicted_at_both_caps() {
+    use crate::pack_bag_cache::PackBagCache;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\nsub name { my $s = shift; return 'w'; }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let full_bag_len = full.analysis.witnesses.len();
+    assert!(full_bag_len > 0, "fixture must have a populated bag");
+    let path = full.path.clone();
+
+    // The resident copy the index would register: bag stripped.
+    let mut stripped = (*full.analysis).clone();
+    stripped.evict_witness_bag();
+    assert!(stripped.bag_is_evicted() && stripped.witnesses.is_empty());
+    let stripped_cached = Arc::new(CachedModule::new(path.clone(), Arc::new(stripped)));
+
+    for cap in [8 * 1024 * 1024usize, 0] {
+        // Loader hands back the FULL analysis (as SQLite would after decode).
+        let full_for_loader = full.analysis.clone();
+        let cache = Arc::new(PackBagCache::new(cap, move |_p| {
+            Some((*full_for_loader).clone())
+        }));
+        let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
+        let got = idx.bag_present(&stripped_cached);
+        assert!(!got.bag_is_evicted(), "cap={cap}: rehydrated must be bag-present");
+        assert_eq!(
+            got.witnesses.len(),
+            full_bag_len,
+            "cap={cap}: rehydrated bag must be byte-identical in length"
+        );
+    }
+
+    // A non-evicted cached analysis (open doc / Perl hub) is a cheap pass-
+    // through — no cache, no rehydration, same bag.
+    let hub = ModuleIndex::new_for_cli(); // no bag_cache
+    let got = hub.bag_present(&full);
+    assert_eq!(got.witnesses.len(), full_bag_len);
+    assert!(!got.bag_is_evicted());
+}
+
 #[test]
 fn test_resolve_module_list_util() {
     let idx = ModuleIndex::new_for_test();

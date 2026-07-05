@@ -1813,13 +1813,17 @@ impl ReducerRegistry {
                 // (1) Cross-file primary lookup.
                 if let Some(idx) = ctx.module_index {
                     if let Some(cached) = idx.get_cached(class) {
-                        if !std::ptr::eq(bag, &cached.analysis.witnesses) {
+                        // Rehydrate the target file's bag if its resident copy
+                        // was Slice-2-evicted; the cross-file chase reads its
+                        // witnesses (`docs/adr/memory-slice-2-lru.md`).
+                        let full = idx.bag_present(&cached);
+                        if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {
-                                scopes: &cached.analysis.scopes,
-                                package_framework: &cached.analysis.package_framework,
+                                scopes: &full.scopes,
+                                package_framework: &full.package_framework,
                                 module_index: Some(idx),
-                                package_parents: &cached.analysis.package_parents,
-                                app_surface_consumers: &cached.analysis.app_surface_consumers,
+                                package_parents: &full.package_parents,
+                                app_surface_consumers: &full.app_surface_consumers,
                             };
                             let sub_q = ReducerQuery {
                                 attachment: q.attachment,
@@ -1831,7 +1835,7 @@ impl ReducerRegistry {
                                 context: Some(&cached_ctx),
                             };
                             let v = self.query_rec(
-                                &cached.analysis.witnesses,
+                                &full.witnesses,
                                 &sub_q,
                                 state,
                             );
@@ -1893,10 +1897,10 @@ impl ReducerRegistry {
                         if &sym.name != name {
                             return;
                         }
-                        if let Some(t) = cached
-                            .analysis
-                            .symbol_return_type_via_bag(sym.id, None)
-                        {
+                        // Bridged Method's return lives in the bridging file's
+                        // bag — rehydrate it if evicted before querying.
+                        let full = idx.bag_present(cached);
+                        if let Some(t) = full.symbol_return_type_via_bag(sym.id, None) {
                             found = Some(t);
                         }
                     });
@@ -1917,13 +1921,14 @@ impl ReducerRegistry {
             if let Some(ctx) = q.context {
                 if let Some(idx) = ctx.module_index {
                     if let Some(cached) = idx.get_cached(class) {
-                        if !std::ptr::eq(bag, &cached.analysis.witnesses) {
+                        let full = idx.bag_present(&cached);
+                        if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {
-                                scopes: &cached.analysis.scopes,
-                                package_framework: &cached.analysis.package_framework,
+                                scopes: &full.scopes,
+                                package_framework: &full.package_framework,
                                 module_index: Some(idx),
-                                package_parents: &cached.analysis.package_parents,
-                                app_surface_consumers: &cached.analysis.app_surface_consumers,
+                                package_parents: &full.package_parents,
+                                app_surface_consumers: &full.app_surface_consumers,
                             };
                             let sub_q = ReducerQuery {
                                 attachment: q.attachment,
@@ -1934,7 +1939,7 @@ impl ReducerRegistry {
                                 args: q.args.clone(),
                                 context: Some(&cached_ctx),
                             };
-                            let v = self.query_rec(&cached.analysis.witnesses, &sub_q, state);
+                            let v = self.query_rec(&full.witnesses, &sub_q, state);
                             if *v != ReducedValue::None {
                                 return (*v).clone();
                             }
@@ -1980,13 +1985,14 @@ impl ReducerRegistry {
             if let Some(ctx) = q.context {
                 if let Some(idx) = ctx.module_index {
                     if let Some(cached) = idx.get_cached(name) {
-                        if !std::ptr::eq(bag, &cached.analysis.witnesses) {
+                        let full = idx.bag_present(&cached);
+                        if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {
-                                scopes: &cached.analysis.scopes,
-                                package_framework: &cached.analysis.package_framework,
+                                scopes: &full.scopes,
+                                package_framework: &full.package_framework,
                                 module_index: Some(idx),
-                                package_parents: &cached.analysis.package_parents,
-                                app_surface_consumers: &cached.analysis.app_surface_consumers,
+                                package_parents: &full.package_parents,
+                                app_surface_consumers: &full.app_surface_consumers,
                             };
                             let sub_q = ReducerQuery {
                                 attachment: q.attachment,
@@ -1997,7 +2003,7 @@ impl ReducerRegistry {
                                 args: q.args.clone(),
                                 context: Some(&cached_ctx),
                             };
-                            let v = self.query_rec(&cached.analysis.witnesses, &sub_q, state);
+                            let v = self.query_rec(&full.witnesses, &sub_q, state);
                             if *v != ReducedValue::None {
                                 return (*v).clone();
                             }
@@ -2380,7 +2386,8 @@ pub fn query_sub_return_type(
         if let Some(idx) = ctx.module_index {
             for module_name in idx.find_exporters(sub_name) {
                 let Some(cached) = idx.get_cached(&module_name) else { continue };
-                let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                let full = idx.bag_present(&cached);
+                let Some(sym) = full.symbols.iter().find(|s| {
                     s.name == sub_name
                         && matches!(
                             s.kind,
@@ -2391,11 +2398,11 @@ pub fn query_sub_return_type(
                     continue;
                 };
                 let cached_ctx = BagContext {
-                    scopes: &cached.analysis.scopes,
-                    package_framework: &cached.analysis.package_framework,
+                    scopes: &full.scopes,
+                    package_framework: &full.package_framework,
                     module_index: Some(idx),
-                    package_parents: &cached.analysis.package_parents,
-                    app_surface_consumers: &cached.analysis.app_surface_consumers,
+                    package_parents: &full.package_parents,
+                    app_surface_consumers: &full.app_surface_consumers,
                 };
                 let att = WitnessAttachment::Symbol(sym.id);
                 let q = ReducerQuery {
@@ -2407,7 +2414,7 @@ pub fn query_sub_return_type(
                     args: Vec::new(),
                     context: Some(&cached_ctx),
                 };
-                if let ReducedValue::Type(t) = reg.query(&cached.analysis.witnesses, &q) {
+                if let ReducedValue::Type(t) = reg.query(&full.witnesses, &q) {
                     return Some(t);
                 }
             }
@@ -2428,6 +2435,9 @@ pub fn query_sub_return_type(
                 let mut ambiguous = false;
                 for cached in idx.def_candidates(sub_name) {
                     let p = cached.path.to_string_lossy();
+                    // Reachability reads pinned fields (path + include_closure),
+                    // so gate BEFORE rehydrating — an unreachable candidate
+                    // never pays a bag decode.
                     let reachable = visible.contains(p.as_ref())
                         || cached
                             .analysis
@@ -2437,23 +2447,24 @@ pub fn query_sub_return_type(
                     if !reachable {
                         continue;
                     }
-                    let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                    let full = idx.bag_present(&cached);
+                    let Some(sym) = full.symbols.iter().find(|s| {
                         s.name == sub_name
                             && matches!(
                                 s.kind,
                                 crate::file_analysis::SymKind::Sub
                                     | crate::file_analysis::SymKind::Method
                             )
-                            && cached.analysis.is_linkage_visible(s)
+                            && full.is_linkage_visible(s)
                     }) else {
                         continue;
                     };
                     let cached_ctx = BagContext {
-                        scopes: &cached.analysis.scopes,
-                        package_framework: &cached.analysis.package_framework,
+                        scopes: &full.scopes,
+                        package_framework: &full.package_framework,
                         module_index: Some(idx),
-                        package_parents: &cached.analysis.package_parents,
-                        app_surface_consumers: &cached.analysis.app_surface_consumers,
+                        package_parents: &full.package_parents,
+                        app_surface_consumers: &full.app_surface_consumers,
                     };
                     let att = WitnessAttachment::Symbol(sym.id);
                     let q = ReducerQuery {
@@ -2465,7 +2476,7 @@ pub fn query_sub_return_type(
                         args: Vec::new(),
                         context: Some(&cached_ctx),
                     };
-                    if let ReducedValue::Type(t) = reg.query(&cached.analysis.witnesses, &q) {
+                    if let ReducedValue::Type(t) = reg.query(&full.witnesses, &q) {
                         match &answer {
                             Some(existing) if *existing != t => ambiguous = true,
                             None => answer = Some(t),

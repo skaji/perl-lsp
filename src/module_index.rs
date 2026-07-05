@@ -298,6 +298,12 @@ pub struct ModuleIndex {
     /// name-keyed views can't reach those, but whole-project sweeps
     /// (`for_each_cached_file`) must.
     all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
+    /// Slice-2 rehydration store — SET ONLY on pack sub-indexes, `None` on the
+    /// Perl hub (Perl copies are never bag-evicted). After indexing, each
+    /// resident pack `FileAnalysis` has its witness bag evicted; a type query
+    /// reaching into an evicted file rehydrates the exact persisted bag through
+    /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
+    bag_cache: Option<Arc<crate::pack_bag_cache::PackBagCache>>,
 }
 
 impl ModuleIndex {
@@ -344,6 +350,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
+            bag_cache: None,
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -689,6 +696,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
+            bag_cache: None,
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -741,6 +749,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
+            bag_cache: None,
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -854,6 +863,25 @@ impl ModuleIndex {
     /// Attach a per-language sub-index (`"cpp"`, `"python"`, …).
     pub fn attach_pack_index(&self, lang: &str, idx: Arc<ModuleIndex>) {
         self.pack_indexes.insert(lang.to_string(), idx);
+    }
+
+    /// Install this pack sub-index's Slice-2 bag-rehydration LRU before it is
+    /// `Arc`-wrapped and registered. Consuming builder so the field is set once
+    /// on the owned value (the index is shared immutably thereafter).
+    pub fn with_bag_cache(
+        mut self,
+        cache: Arc<crate::pack_bag_cache::PackBagCache>,
+    ) -> Self {
+        self.bag_cache = Some(cache);
+        self
+    }
+
+    /// Drop `path`'s rehydrated bag from this pack index's LRU (a changed/saved
+    /// file's bag is stale). No-op on the Perl hub (no bag cache).
+    pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
+        if let Some(bc) = &self.bag_cache {
+            bc.invalidate(path);
+        }
     }
 
     /// The sub-index for `lang`, if this distribution indexes it.
@@ -1252,6 +1280,26 @@ impl CrossFileLookup for ModuleIndex {
         visible: &std::collections::HashSet<String>,
     ) -> Option<Arc<CachedModule>> {
         self.get_cached_scoped(module_name, visible)
+    }
+
+    fn bag_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        // Never-evicted copy (open docs, Perl hub, degraded pack files kept
+        // whole): a cheap Arc bump, no I/O.
+        if !cached.analysis.bag_is_evicted() {
+            return cached.analysis.clone();
+        }
+        // A pack cross-file type query threads the PACK sub-index as its
+        // `module_index` (it owns `visibility_scope`), so `self.bag_cache` is
+        // the right one. Rehydrate the exact persisted bag; on a miss (no row /
+        // decode failure) degrade to the bag-less resident copy rather than
+        // fabricate — the type query then returns None, as it would pre-Slice-2
+        // for a genuinely bag-less file.
+        if let Some(bc) = &self.bag_cache {
+            if let Some(full) = bc.bag_for(&cached.path) {
+                return full;
+            }
+        }
+        cached.analysis.clone()
     }
 
     fn parents_cached(&self, module_name: &str) -> Vec<String> {

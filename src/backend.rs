@@ -278,6 +278,22 @@ fn macro_completion(
 /// `initializationOptions.coldWaitMs`.
 const DEFAULT_COLD_WAIT_MS: u64 = 400;
 
+/// Slice-2 bag-rehydration LRU cap in MiB, from `initializationOptions.
+/// maxCacheMb`. ~180 abseil bags at ~700 KB each; `0` disables retention
+/// (rehydrate-and-drop). See `docs/adr/memory-slice-2-lru.md`.
+pub const DEFAULT_MAX_CACHE_MB: u64 = 128;
+
+/// Startup default for the rehydration cap: `PERL_LSP_MAX_CACHE_MB` overrides
+/// `DEFAULT_MAX_CACHE_MB` when set (a QA/measurement knob — `0` forces every
+/// cross-file type query to re-decode, the completeness-under-forced-rehydration
+/// mode). `initializationOptions.maxCacheMb` still wins over this at `initialize`.
+pub fn max_cache_mb_default() -> u64 {
+    std::env::var("PERL_LSP_MAX_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX_CACHE_MB)
+}
+
 /// Per-language-family completion signal for the cold-open bounded wait. The
 /// KICKOFF latch (`perl_indexed`/`pack_indexed`) flips synchronously on the
 /// first `did_open`; these fire on COMPLETION — the workspace/pack index has
@@ -354,6 +370,9 @@ pub struct Backend {
     /// Bounded-wait cap (ms) for the cold-open pull-verb heal; 0 disables it.
     /// Set from `initializationOptions.coldWaitMs`, default `DEFAULT_COLD_WAIT_MS`.
     cold_wait_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Slice-2 rehydration LRU cap in MiB, from `initializationOptions.
+    /// maxCacheMb` (default `DEFAULT_MAX_CACHE_MB`, `0` disables retention).
+    max_cache_mb: Arc<std::sync::atomic::AtomicU64>,
     /// URIs whose initial `did_open` build is in flight (running off the message
     /// loop). A read verb that finds the doc still absent bounded-waits on the
     /// per-URI `Notify` instead of racing an empty store — the same heal shape
@@ -395,6 +414,8 @@ impl Backend {
             .work_done_progress
             .load(std::sync::atomic::Ordering::Relaxed);
         let index_ready = Arc::clone(&self.index_ready);
+        let bag_cache_bytes =
+            self.max_cache_mb.load(std::sync::atomic::Ordering::Relaxed) as usize * 1024 * 1024;
         tokio::task::spawn_blocking(move || {
             // Announces completion (or the no-root early-out) to bounded waiters
             // on Drop — every exit path of this closure, panic included.
@@ -487,6 +508,7 @@ impl Backend {
                     Some(root_uri.as_str()),
                     &module_index,
                     cb_ref,
+                    bag_cache_bytes,
                 )
             };
             // Drop the sender(s) so the emitter's channel closes, then drain it
@@ -743,6 +765,7 @@ impl Backend {
             rename_options: Arc::new(std::sync::Mutex::new(crate::resolve::RenameOptions::default())),
             index_ready: Arc::new(IndexReady::default()),
             cold_wait_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_COLD_WAIT_MS)),
+            max_cache_mb: Arc::new(std::sync::atomic::AtomicU64::new(max_cache_mb_default())),
             opening: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -1176,6 +1199,17 @@ impl LanguageServer for Backend {
         {
             self.cold_wait_ms
                 .store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        // `maxCacheMb` sizes the Slice-2 bag-rehydration LRU (0 = rehydrate and
+        // drop). Absent / non-integer leaves the default.
+        if let Some(mb) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("maxCacheMb"))
+            .and_then(|v| v.as_u64())
+        {
+            self.max_cache_mb
+                .store(mb, std::sync::atomic::Ordering::Relaxed);
         }
 
         Ok(InitializeResult {
