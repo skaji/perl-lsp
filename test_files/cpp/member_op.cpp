@@ -24,3 +24,8 @@ void diag_case() {
     Box* p;
     p.width;
 }
+
+void deep_diag() {
+    Box** pp;
+    pp->width;
+}

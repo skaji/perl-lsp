@@ -1767,6 +1767,86 @@ void f() {
 }
 
 #[test]
+fn cpp_dangling_arrow_keeps_provable_mismatches() {
+    // A mid-edit dangling `q->` (nothing after) mints no member ref of its own.
+    // The still-PROVABLE mismatches must survive — a prior line in the same
+    // function AND a later, separate function whose recovery is anchored by the
+    // intervening `}`. (A mismatch whose receiver DECLARATION the dangling
+    // expression greedily consumes is genuinely unprovable in the recovered
+    // tree — its type is gone — and is left out rather than guessed: that
+    // narrow loss is documented in docs/hitlist-4.md Family D.)
+    let src = "\
+struct Box { int w; };
+void f() {
+    Box* p;
+    p.w;
+    Box* q;
+    q->
+}
+void g() {
+    Box* r;
+    r.w;
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let mm = fa.member_op_mismatches();
+    assert!(
+        mm.iter().any(|m| m.op_span.start.row == 3),
+        "prior-line p.w mismatch survives the dangling `q->`: {mm:?}",
+    );
+    assert!(
+        mm.iter().any(|m| m.op_span.start.row == 9),
+        "next-function r.w mismatch survives (recovery anchored by `}}`): {mm:?}",
+    );
+}
+
+#[test]
+fn cpp_deep_receiver_gets_peel_hint() {
+    // `OP** op_p; op_p->m` (and `op_p.m`) can't be fixed by a token swap —
+    // `op_p->` dereferences one level to an `OP*`, still not a struct. The
+    // hint suggests the peeled receiver `(*op_p)`. Show-only, no mismatch entry.
+    let src = "\
+struct Box { int w; };
+void f() {
+    Box** pp;
+    Box*** ppp;
+    Box* p;
+    pp->w;
+    ppp.w;
+    p->w;
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+
+    let peels = fa.member_op_deep_accesses();
+    // pp (depth 2) and ppp (depth 3) each get a peel; p (depth 1) does not.
+    assert_eq!(peels.len(), 2, "pp + ppp peel; p is single-level: {peels:?}");
+
+    let pp = peels.iter().find(|p| p.op_span.start.row == 5).expect("pp->w peel");
+    assert_eq!(pp.wrap, "(*pp)");
+    assert_eq!(pp.depth, 2);
+
+    let ppp = peels.iter().find(|p| p.op_span.start.row == 6).expect("ppp.w peel");
+    assert_eq!(ppp.wrap, "(**ppp)");
+    assert_eq!(ppp.depth, 3);
+
+    // The peel partition is disjoint from the swap partition: neither pp nor
+    // ppp appears as a mismatch, and p (a real single-level swap needing `->`,
+    // written `->` correctly here) yields neither.
+    let mm = fa.member_op_mismatches();
+    assert!(mm.is_empty(), "no single-level mismatch in this fixture: {mm:?}");
+
+    // The LSP projection carries the peel code + no quick-fix data.
+    let diags = crate::symbols::pack_member_op_peel_diagnostics(&fa);
+    assert_eq!(diags.len(), 2);
+    assert!(diags.iter().all(|d| matches!(
+        &d.code,
+        Some(tower_lsp::lsp_types::NumberOrString::String(s)) if s == "member-access-peel"
+    )));
+    assert!(diags.iter().all(|d| d.data.is_none()), "show-only: no auto-fix data");
+}
+
+#[test]
 fn cpp_move_in_scopeless_operator_body_does_not_leak_to_sibling() {
     // GOAL-1 regression: the `operator[]` body mints its OWN @scope now (the
     // universal `(function_definition) @scope`). Before, operator/cast/dtor

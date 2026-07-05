@@ -861,6 +861,16 @@ impl ModuleIndex {
         self.pack_indexes.get(lang).map(|e| e.value().clone())
     }
 
+    /// Every attached pack-language sub-index, by language id. The CLI
+    /// diagnostics path sweeps these for Mode-B (member-op) diagnostics —
+    /// pack files live here, not in the Perl-only `FileStore` the whole-tree
+    /// pass iterates.
+    pub fn for_each_pack_index(&self, mut f: impl FnMut(&str, &Arc<ModuleIndex>)) {
+        for entry in self.pack_indexes.iter() {
+            f(entry.key(), entry.value());
+        }
+    }
+
     /// Register a pack-language file's named top-level entities — classes
     /// AND free functions — by name, so cross-file member completion (`obj.`
     /// → the class's file) and function goto-def (`compute()` → the file that
