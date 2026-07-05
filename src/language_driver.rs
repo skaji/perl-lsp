@@ -963,6 +963,8 @@ fn remap_spans(
         receiver_names: _,
         flow_edges,
         moved_from,
+        control_regions,
+        param_regions,
         domain_sites,
         macro_returns: _,
         // Populated in enrich_skeleton (post-remap) already in original coords.
@@ -1076,6 +1078,12 @@ fn remap_spans(
         *span = rspan(*span);
     }
     for (_, span, _) in moved_from.iter_mut() {
+        *span = rspan(*span);
+    }
+    for span in control_regions.iter_mut() {
+        *span = rspan(*span);
+    }
+    for span in param_regions.iter_mut() {
         *span = rspan(*span);
     }
     for ds in domain_sites.iter_mut() {

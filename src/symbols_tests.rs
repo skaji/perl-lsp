@@ -103,7 +103,7 @@ fn unresolved_dispatch_fires_only_when_enabled_and_only_on_untyped_receiver() {
     );
 
     // Enabled: exactly one unresolved-dispatch on the untyped receiver.
-    let on = DiagnosticOptions { unresolved_dispatch: true };
+    let on = DiagnosticOptions { unresolved_dispatch: true, ..Default::default() };
     let diags = collect_diagnostics(&analysis, &module_index, on);
     let dispatch_diags: Vec<_> = diags.iter().filter(|d|
         matches!(&d.code, Some(NumberOrString::String(c)) if c == "unresolved-dispatch")).collect();
@@ -122,7 +122,7 @@ fn unresolved_dispatch_silent_on_does_not_apply() {
     let source = "package W;\nsub fire {\n  my $x = Some::Other->new;\n  $x->enqueue('send_email');\n}\npackage Some::Other;\nsub new { bless {}, shift }\nsub enqueue { 1 }\n1;\n";
     let analysis = parse_analysis(source);
     let module_index = crate::module_index::ModuleIndex::new_for_test();
-    let on = DiagnosticOptions { unresolved_dispatch: true };
+    let on = DiagnosticOptions { unresolved_dispatch: true, ..Default::default() };
     let diags = collect_diagnostics(&analysis, &module_index, on);
     assert!(
         !diags.iter().any(|d|
@@ -4456,7 +4456,7 @@ my $maybe = $open->{whatever};
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions { unresolved_dispatch: false, ..Default::default() },
     );
     let keys: Vec<&str> = diags
         .iter()
@@ -4503,7 +4503,7 @@ my $silent = $taken{anything};
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions { unresolved_dispatch: false, ..Default::default() },
     );
     let keys: Vec<&str> = diags
         .iter()
@@ -4532,7 +4532,7 @@ cfg()->{hsot2};
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions { unresolved_dispatch: false, ..Default::default() },
     );
     let keys: Vec<&str> = diags
         .iter()
@@ -4584,7 +4584,7 @@ sub run {
     let diags = collect_diagnostics(
         &analysis,
         &idx,
-        DiagnosticOptions { unresolved_dispatch: false },
+        DiagnosticOptions { unresolved_dispatch: false, ..Default::default() },
     );
     let unresolved: Vec<&str> = diags
         .iter()

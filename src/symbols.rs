@@ -2448,6 +2448,11 @@ pub struct DiagnosticOptions {
     /// be typed (`GateResult::ReceiverUntyped`) — never on a settled
     /// `DoesNotApply`. Off by default.
     pub unresolved_dispatch: bool,
+    /// Fire `use-after-move` on the decidable subset (straight-line, in-function,
+    /// local-only moved-then-used). Pack-language (C++) channel, off by default —
+    /// it is a heuristic-adjacent lane whose honest subset is narrow. See
+    /// `use_after_move_reads` / `docs/adr/use-after-move.md`.
+    pub use_after_move: bool,
 }
 
 pub fn collect_diagnostics(
@@ -3077,11 +3082,9 @@ pub fn pack_member_op_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
 
 /// Mode C: use-after-move. One WARNING per `use_after_move_reads()` read —
 /// a variable read after a `std::move` of it, before any reassignment. The
-/// region + cutoff logic lives on `FileAnalysis` (the edge-driven moved-from
-/// window); this is the thin LSP projection. Parked: not wired into
-/// `pack_diagnostics` (see the gate comment there); kept dark with its tests
-/// until the residual FP classes close.
-#[allow(dead_code)]
+/// region + cutoff + honesty gates live on `FileAnalysis` (the edge-driven
+/// moved-from window, gates B/C/E); this is the thin LSP projection. Opt-in
+/// via `DiagnosticOptions.use_after_move`.
 pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
     analysis
         .use_after_move_reads()
@@ -3099,16 +3102,17 @@ pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnosti
 
 /// Every pack-language (non-Perl) diagnostic for an analysis, concatenated.
 /// One seam so a backend dispatch never enumerates the individual checks.
-pub fn pack_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
-    let diags = pack_member_op_diagnostics(analysis);
-    // use-after-move stays GATED: on real library headers (json/fmt/spdlog) it
-    // still emits ~17 false positives — the residual classes need analysis this
-    // tier can't do: partial/member move (move a base subobject, then use other
-    // members), braceless/ternary conditional move on a returning path,
-    // switch-case conditional move, and pass-by-mutable-ref reset
-    // (interprocedural). Bad signal on common headers, so keep it dark.
-    // `pack_use_after_move_diagnostics` + its tests stay; re-wire here once the
-    // residual classes close.
+pub fn pack_diagnostics(analysis: &FileAnalysis, options: DiagnosticOptions) -> Vec<Diagnostic> {
+    let mut diags = pack_member_op_diagnostics(analysis);
+    // use-after-move is OPT-IN (`DiagnosticOptions.use_after_move`): the wired
+    // check is the decidable subset only — gates B/C/E on `use_after_move_reads`
+    // keep it to straight-line, in-function, local moves, verified to emit ZERO
+    // false positives over the spdlog/fmt/onednn headers. The path-sensitive
+    // residuals (cross-branch use, loop-carried move, by-ref reset, subobject
+    // move) stay OUT by design, not flagged. `docs/adr/use-after-move.md`.
+    if options.use_after_move {
+        diags.extend(pack_use_after_move_diagnostics(analysis));
+    }
     diags
 }
 
