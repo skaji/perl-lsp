@@ -150,10 +150,56 @@ graph cannot see:
 
 Treat the dead list as a **review queue**, not a delete list.
 
+### C/C++ (pack languages)
+
+Pack-language files (C/C++/…) light up the heatmap on the SAME machinery:
+symbols are gathered from the per-language sub-indexes (not the Perl
+`FileStore`) via `ModuleIndex::for_each_pack_index` →
+`for_each_registered_file`, and fan-in is the identical `references()`
+projection — routed through the pack sub-index (`pack_routed()`, VISIBLE-wide
+because pack workspace files ride the DEPENDENCY role). Free functions group
+by file (like Perl's `main`); class / namespace members group by their class
+(`sym.package`). No language branch: a cpp `FileAnalysis` exposes symbols and
+refs the same way Perl's does.
+
+**C/C++ dead-code is more over-approximate than Perl's**, because a
+zero-fan-in symbol has more invisible reachability vectors. Two are cheaply
+shielded and never flagged:
+
+- **`main`** — the runtime enters through it over the ABI, never a source call
+  site (guard `entry-point`).
+- **Address-taken / used-as-value functions** — `&fn` or a bare
+  function-pointer decay is a *reference* (not a call), so it lands in
+  `fan_in` and the symbol is never a candidate. No special guard: the
+  reference graph already carries it.
+
+The remaining vectors are **not** cheaply decidable, so a zero-fan-in symbol
+that hits one is still listed — honestly, as a review-queue entry:
+
+- **Exported / `extern "C"` ABI surface** — a library's public functions are
+  called by consumers outside the indexed tree. (We do *not* blanket-shield
+  external-linkage functions: that would silently drop every genuinely-unused
+  internal helper — the actual C dead-code use case.)
+- **Function-pointer callbacks** — a callback registered into a table/struct
+  the graph doesn't follow reads as unreferenced unless its name (or `&name`)
+  appears at the registration site.
+- **Templates instantiated in an unscanned translation unit** — a template
+  used only from a TU outside the workspace reads as dead.
+- **Prototype vs definition** — a function declared in a header and defined in
+  a `.c`/`.cpp` lists as two rows (one per file), exactly as a Perl package
+  reopened across files does; fan-in is identical on both.
+
 ## Implementation notes
 
 - CLI entry: `cli_heatmap` in `src/main.rs`, dispatched from the `--heatmap`
   arm, mirroring `--workspace-symbol`.
+- Symbol gathering: Perl files from `ws.workspace_raw()`, pack-language files
+  from `idx.for_each_pack_index(|_lang, pack| pack.for_each_registered_file(…))`
+  — the same seam `workspace/symbol` and Mode-B diagnostics use. Both loops
+  call the one `heatmap_symbol_row` helper (fan-in/fan-out/guard/row), so their
+  counts are the same `references()` projection by construction; the only
+  branch is the `is_pack` routing fact (which sub-index + `pack_routed()`
+  VISIBLE walk + the `entry-point` guard). `files_indexed` sums both.
 - Identity + counting: `resolve::resolve(...)` at the symbol's declared name
   token, then `references()` — the heatmap never maps a `Symbol` to a target
   itself, so its counts cannot diverge from the references verb (the N-path

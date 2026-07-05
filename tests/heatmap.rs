@@ -196,6 +196,91 @@ fn html_view_is_self_contained_and_embeds_the_report() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// C/C++ symbols live in a per-language sub-index, not the Perl FileStore.
+/// The heatmap must gather them the same way (`for_each_pack_registered_file`)
+/// and project fan-in through the SAME `references()` set the cpp
+/// references/rename verbs use. `main` is the ABI entry point (shielded), an
+/// unreferenced free function IS a dead candidate, and a called function's
+/// fan-in equals its call-site count.
+#[cfg(feature = "cpp")]
+#[test]
+fn cpp_fan_in_entry_point_and_dead_code() {
+    let dir = std::env::temp_dir().join(format!("perl-lsp-heatmap-cpp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    std::fs::write(
+        dir.join("math.h"),
+        "int add(int a, int b);\nint helper_unused(int x);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("math.cpp"),
+        "#include \"math.h\"\n\
+         int add(int a, int b) { return a + b; }\n\
+         int helper_unused(int x) { return x * 2; }\n",
+    )
+    .unwrap();
+    // `main` calls `add` twice; nobody calls `helper_unused`.
+    std::fs::write(
+        dir.join("main.cpp"),
+        "#include \"math.h\"\n\
+         int main() {\n\
+         \x20   int r = add(1, 2);\n\
+         \x20   int s = add(r, 3);\n\
+         \x20   return r + s;\n\
+         }\n",
+    )
+    .unwrap();
+
+    let report = run_heatmap(&dir);
+    assert_eq!(
+        report["files_indexed"].as_u64(),
+        Some(3),
+        "all three cpp files gathered: {}",
+        report["files_indexed"]
+    );
+
+    // Fan-in IS the references() image: `add`'s two call sites, declaration
+    // (header proto) and definition excluded.
+    let add = sym(&report, "add");
+    assert_eq!(
+        add["fan_in"].as_u64(),
+        Some(2),
+        "add is called twice from main: {add}"
+    );
+    assert_eq!(add["dead_code_candidate"].as_bool(), Some(false));
+
+    // `main` has no static caller (the runtime enters over the ABI), so it is
+    // shielded, never flagged dead.
+    let main = sym(&report, "main");
+    assert_eq!(main["fan_in"].as_u64(), Some(0));
+    assert_eq!(main["reachable_guard"].as_str(), Some("entry-point"));
+    assert_eq!(main["dead_code_candidate"].as_bool(), Some(false));
+
+    // `main` calls `add` — fan-out is intra-body distinct callees.
+    assert!(main["fan_out"].as_u64().unwrap() >= 1, "main calls add: {main}");
+
+    // The unreferenced free function surfaces as a dead candidate; `main`
+    // never does.
+    let dead: Vec<&str> = report["dead_code_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        dead.contains(&"helper_unused"),
+        "unreferenced cpp function is a dead candidate: {dead:?}"
+    );
+    assert!(
+        !dead.contains(&"main"),
+        "the C entry point must never be flagged dead: {dead:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn dynamic_dispatch_shields_unreferenced_methods() {
     let dir = std::env::temp_dir().join(format!("perl-lsp-heatmap-dyn-{}", std::process::id()));

@@ -2033,6 +2033,143 @@ fn heatmap_symbol_eligible(sym: &file_analysis::Symbol) -> bool {
         )
 }
 
+/// One heatmap row for one symbol — the shared body both the Perl and the
+/// pack-language (C/C++/…) gather loops call, so their fan-in counts come
+/// from the SAME `references()` projection by construction (no second ref
+/// walk). `is_pack` routes identity + the backward reference walk through the
+/// caller's per-language sub-index: pack workspace files ride the DEPENDENCY
+/// role (a storage artifact of the per-language cache), so the set widens to
+/// VISIBLE via `pack_routed()` instead of the Perl `mask`, and the pack-only
+/// entry-point guard (C's `main` is reached through the ABI, not a call site)
+/// unlocks. Returns `(row, is_callable, dead)`.
+#[allow(clippy::too_many_arguments)]
+fn heatmap_symbol_row(
+    ws: &file_store::FileStore,
+    routing_idx: &dyn file_analysis::CrossFileLookup,
+    path: &std::path::Path,
+    analysis: &file_analysis::FileAnalysis,
+    sym: &file_analysis::Symbol,
+    is_pack: bool,
+    mask: resolve::RoleMask,
+    scope: resolve::OverrideScope,
+    has_dynamic_dispatch: bool,
+    sources: &mut SourceCache,
+) -> (serde_json::Value, bool, bool) {
+    use file_analysis::{AccessKind, Namespace, RefKind, SymKind};
+    use std::collections::HashSet;
+
+    let within = |outer: &file_analysis::Span, inner: &file_analysis::Span| {
+        let s = |p: &tree_sitter::Point| (p.row, p.column);
+        s(&inner.start) >= s(&outer.start) && s(&inner.end) <= s(&outer.end)
+    };
+    let path_str = path.display().to_string();
+
+    // The declared name token is a cursor position, so the set minted there
+    // is the one references/rename project from — identity is never re-derived
+    // heatmap-side. Pack routing is a construction fact (which sub-index,
+    // VISIBLE-wide walk), declared here exactly as the references/goto-def CLI
+    // mirrors declare it.
+    let mut cs = resolve::resolve(
+        ws,
+        analysis,
+        file_store::FileKey::Path(path.to_path_buf()),
+        sym.selection_span.start,
+        Some(routing_idx),
+        scope,
+    );
+    if is_pack {
+        cs = cs.pack_routed();
+    } else {
+        cs = cs.with_visibility(mask);
+    }
+
+    // fan_in = the references image minus the symbol's declaration site(s).
+    let locs = cs.references();
+    let fan_in = locs
+        .iter()
+        .filter(|l| l.access != AccessKind::Declaration)
+        .filter(|l| {
+            !(l.span == sym.selection_span
+                && matches!(&l.key, file_store::FileKey::Path(p) if p == path))
+        })
+        .count();
+
+    // fan_out = distinct callee names referenced inside this body (subs /
+    // methods only). Packages have no body to scan.
+    let is_callable = matches!(sym.kind, SymKind::Sub | SymKind::Method);
+    let fan_out: Option<usize> = if is_callable {
+        let mut callees: HashSet<&str> = HashSet::new();
+        for r in &analysis.refs {
+            if matches!(
+                r.kind,
+                RefKind::FunctionCall { .. }
+                    | RefKind::MethodCall { .. }
+                    | RefKind::DispatchCall { .. }
+            ) && within(&sym.span, &r.span)
+            {
+                callees.insert(r.unqualified_target_name());
+            }
+        }
+        callees.remove(sym.name.as_str());
+        Some(callees.len())
+    } else {
+        None
+    };
+
+    let exported = analysis.exports_name(&sym.name);
+    let native = matches!(sym.namespace, Namespace::Language);
+
+    // Reachability guard — why a zero-fan-in symbol is NOT flagged dead.
+    // Ordered most-specific-first. Address-taken / used-as-value functions
+    // need no guard: a non-call reference (`&fn`, function-pointer decay) is
+    // still a reference, so it lands in `fan_in` and never reaches here.
+    let guard: Option<&'static str> = if fan_in > 0 {
+        None
+    } else if exported {
+        Some("exported")
+    } else if conventions::is_constructor_name(&sym.name) {
+        Some("constructor")
+    } else if !native {
+        Some("framework-synthesized")
+    } else if is_pack && is_callable && sym.name == "main" {
+        // C/C++ entry point: the runtime enters through `main` over the ABI,
+        // never a source call site the static graph can see.
+        Some("entry-point")
+    } else if matches!(sym.kind, SymKind::Package | SymKind::Class | SymKind::Module) {
+        Some("package-implicit-use")
+    } else if has_dynamic_dispatch
+        && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+        && sym.package.as_deref().is_some_and(|p| p != "main")
+    {
+        Some("dynamic-dispatch")
+    } else {
+        None
+    };
+
+    let dead = fan_in == 0 && guard.is_none();
+    let (line, col) = sources.display(
+        &path_str,
+        sym.selection_span.start.row,
+        sym.selection_span.start.column,
+    );
+    let kind = format!("{:?}", sym.kind);
+
+    let row = serde_json::json!({
+        "name": sym.name,
+        "kind": kind,
+        "package": sym.package,
+        "file": path_str,
+        "line": line,
+        "col": col,
+        "fan_in": fan_in,
+        "fan_out": fan_out,
+        "exported": exported,
+        "dead_code_candidate": dead,
+        "reachable_guard": guard,
+    });
+    (row, is_callable, dead)
+}
+
 /// --heatmap <root> [--csv|--html] [--include-deps] [--all] — Code-usage heatmap.
 ///
 /// Emits per-symbol USAGE metrics as a projection of the resolution
@@ -2060,9 +2197,6 @@ fn heatmap_symbol_eligible(sym: &file_analysis::Symbol) -> bool {
 /// `can`/`->$method` with an unresolved name, `AUTOLOAD`, and string `eval` are
 /// invisible; function candidates assume none of these reach them.
 fn cli_heatmap(root: &str, opts: &[String]) {
-    use file_analysis::{AccessKind, Namespace, SymKind};
-    use std::collections::HashSet;
-
     let csv = opts.iter().any(|a| a == "--csv");
     let html = opts.iter().any(|a| a == "--html");
     let include_deps = opts.iter().any(|a| a == "--include-deps");
@@ -2072,12 +2206,38 @@ fn cli_heatmap(root: &str, opts: &[String]) {
 
     let (ws, idx) = cli_full_startup(root);
 
+    // Pack-language (C/C++/…) files live in per-language sub-indexes, not the
+    // Perl `FileStore` — `workspace/symbol` and Mode-B diagnostics sweep these
+    // separately, and the heatmap gathers them the same way. Each entry keeps
+    // its sub-index so fan-in routes through it (identity minting + the
+    // backward reference walk both need the pack cache, not the Perl hub).
+    // Snapshot to a Vec for a stable order and to sum dynamic dispatch below.
+    let mut pack_entries: Vec<(
+        std::path::PathBuf,
+        std::sync::Arc<file_analysis::FileAnalysis>,
+        std::sync::Arc<module_index::ModuleIndex>,
+    )> = Vec::new();
+    idx.for_each_pack_index(|_lang, pack| {
+        pack.for_each_registered_file(&mut |cached| {
+            pack_entries.push((
+                cached.path.clone(),
+                std::sync::Arc::clone(&cached.analysis),
+                std::sync::Arc::clone(pack),
+            ));
+        });
+    });
+    pack_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
     // Workspace-level soundness gate. Any dynamic method dispatch makes the
     // static call graph an under-approximation of method reachability, so a
-    // zero-fan-in METHOD can't be proven dead.
+    // zero-fan-in METHOD can't be proven dead. Pack files contribute too
+    // (virtual / function-pointer dispatch counts the same).
     let mut dynamic_dispatch_sites: u64 = 0;
     for entry in ws.workspace_raw().iter() {
         dynamic_dispatch_sites += entry.value().dynamic_dispatch_sites as u64;
+    }
+    for (_p, analysis, _pack) in &pack_entries {
+        dynamic_dispatch_sites += analysis.dynamic_dispatch_sites as u64;
     }
     let has_dynamic_dispatch = dynamic_dispatch_sites > 0;
 
@@ -2095,11 +2255,6 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     };
     let scope = override_scope_from_env();
 
-    let within = |outer: &file_analysis::Span, inner: &file_analysis::Span| {
-        let s = |p: &tree_sitter::Point| (p.row, p.column);
-        s(&inner.start) >= s(&outer.start) && s(&inner.end) <= s(&outer.end)
-    };
-
     let mut sources = SourceCache::new();
     let mut symbol_rows: Vec<serde_json::Value> = Vec::new();
     let mut dead_rows: Vec<serde_json::Value> = Vec::new();
@@ -2112,120 +2267,37 @@ fn cli_heatmap(root: &str, opts: &[String]) {
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (path, analysis) in &entries {
-        let path_str = path.display().to_string();
+    // Gather rows for one file's symbols through `heatmap_symbol_row` — the
+    // one place fan-in/fan-out/dead are computed, so Perl and pack share the
+    // exact `references()` projection. `hidden_in_outline` folds arity-variant
+    // accessor twins / DSL-import infrastructure into their listed primary
+    // (same contract the outline honors); `heatmap_symbol_eligible` keeps it
+    // to nameable callables/packages.
+    let gather = |ws: &file_store::FileStore,
+                  routing: &dyn file_analysis::CrossFileLookup,
+                  path: &std::path::Path,
+                  analysis: &file_analysis::FileAnalysis,
+                  is_pack: bool,
+                  row_mask: resolve::RoleMask,
+                  symbol_rows: &mut Vec<serde_json::Value>,
+                  dead_rows: &mut Vec<serde_json::Value>,
+                  sources: &mut SourceCache| {
         for sym in &analysis.symbols {
-            // Fold arity-variant accessor twins / DSL-import infrastructure
-            // into their listed primary — same contract the outline honors.
-            // A fluent `rw` writer shares its getter's name/span/fan-in, so
-            // listing it would double-count one logical method.
             if sym.hidden_in_outline() || !heatmap_symbol_eligible(sym) {
                 continue;
             }
-
-            // The declared name token is a cursor position, so the set minted
-            // there is the one references/rename project from — identity is
-            // never re-derived heatmap-side.
-            let cs = resolve::resolve(
-                &ws,
+            let (row, is_callable, dead) = heatmap_symbol_row(
+                ws,
+                routing,
+                path,
                 analysis,
-                file_store::FileKey::Path(path.clone()),
-                sym.selection_span.start,
-                Some(&idx),
+                sym,
+                is_pack,
+                row_mask,
                 scope,
-            )
-            .with_visibility(mask);
-
-            // fan_in = the references image minus the symbol's declaration
-            // site(s). Group answers (attr field splats) mark their local
-            // decl spelling as a plain Read, so the symbol's own name token
-            // is excluded by span as well as by access kind.
-            let locs = cs.references();
-            let fan_in = locs
-                .iter()
-                .filter(|l| l.access != AccessKind::Declaration)
-                .filter(|l| {
-                    !(l.span == sym.selection_span
-                        && matches!(&l.key, file_store::FileKey::Path(p) if p == path))
-                })
-                .count();
-
-            // fan_out = distinct callee names referenced inside this body
-            // (subs/methods only). Packages have no body to scan.
-            let is_callable = matches!(sym.kind, SymKind::Sub | SymKind::Method);
-            let fan_out: Option<usize> = if is_callable {
-                let mut callees: HashSet<&str> = HashSet::new();
-                for r in &analysis.refs {
-                    if matches!(
-                        r.kind,
-                        file_analysis::RefKind::FunctionCall { .. }
-                            | file_analysis::RefKind::MethodCall { .. }
-                            | file_analysis::RefKind::DispatchCall { .. }
-                    ) && within(&sym.span, &r.span)
-                    {
-                        callees.insert(r.unqualified_target_name());
-                    }
-                }
-                // Don't count self-recursion as fan-out to itself.
-                callees.remove(sym.name.as_str());
-                Some(callees.len())
-            } else {
-                None
-            };
-
-            let exported = analysis.exports_name(&sym.name);
-            let native = matches!(sym.namespace, Namespace::Language);
-
-            // Reachability guard — why a zero-fan-in symbol is NOT flagged dead.
-            // Ordered most-specific-first.
-            let guard: Option<&'static str> = if fan_in > 0 {
-                None
-            } else if exported {
-                Some("exported")
-            } else if conventions::is_constructor_name(&sym.name) {
-                Some("constructor")
-            } else if !native {
-                // Framework-synthesized accessors/handlers — the user didn't
-                // write them, and the framework calls them through machinery
-                // the static graph doesn't model.
-                Some("framework-synthesized")
-            } else if matches!(sym.kind, SymKind::Package | SymKind::Class | SymKind::Module) {
-                // Packages are reachable through too many invisible vectors
-                // (`require`, app entrypoints, dynamic class strings) to flag.
-                Some("package-implicit-use")
-            } else if has_dynamic_dispatch
-                && matches!(sym.kind, SymKind::Sub | SymKind::Method)
-                && sym.package.as_deref().is_some_and(|p| p != "main")
-            {
-                // A sub declared in a class can be invoked as `$obj->name`;
-                // an unresolved dynamic dispatch ANYWHERE in the workspace
-                // could target it, so the static graph can't prove it dead.
-                // `main`-script free functions are excluded — they're not
-                // class methods, so their FunctionCall graph is authoritative.
-                Some("dynamic-dispatch")
-            } else {
-                None
-            };
-
-            let dead = fan_in == 0 && guard.is_none();
-            let (line, col) =
-                sources.display(&path_str, sym.selection_span.start.row, sym.selection_span.start.column);
-            let kind = format!("{:?}", sym.kind);
-
-            let row = serde_json::json!({
-                "name": sym.name,
-                "kind": kind,
-                "package": sym.package,
-                "file": path_str,
-                "line": line,
-                "col": col,
-                "fan_in": fan_in,
-                "fan_out": fan_out,
-                "exported": exported,
-                "dead_code_candidate": dead,
-                "reachable_guard": guard,
-            });
-
+                has_dynamic_dispatch,
+                sources,
+            );
             if dead {
                 dead_rows.push(row.clone());
             }
@@ -2233,6 +2305,38 @@ fn cli_heatmap(root: &str, opts: &[String]) {
                 symbol_rows.push(row);
             }
         }
+    };
+
+    for (path, analysis) in &entries {
+        gather(
+            &ws,
+            &idx,
+            path,
+            analysis,
+            false,
+            mask,
+            &mut symbol_rows,
+            &mut dead_rows,
+            &mut sources,
+        );
+    }
+
+    // Pack languages route through their own sub-index (VISIBLE-wide — pack
+    // workspace files ride the DEPENDENCY role); `pack_routed()` inside the
+    // helper applies that, so `mask` here is only the Perl knob.
+    for (path, analysis, pack) in &pack_entries {
+        let routing: &dyn file_analysis::CrossFileLookup = pack.as_ref();
+        gather(
+            &ws,
+            routing,
+            path,
+            analysis,
+            true,
+            resolve::RoleMask::VISIBLE,
+            &mut symbol_rows,
+            &mut dead_rows,
+            &mut sources,
+        );
     }
 
     // Heaviest fan-in first — the hotspots a reader wants up top.
@@ -2265,10 +2369,10 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     let out = serde_json::json!({
         "schema": "perl-lsp.heatmap.v1",
         "kind": "usage-heatmap",
-        "label": "dead_code_candidate: a symbol with no references found. Confirm it's unused before removing.",
-        "soundness": "Flagging errs toward reachable, so it never flags exported symbols, constructors, framework-synthesized members, packages, or (when the workspace uses dynamic dispatch) any method.",
+        "label": "dead_code_candidate: a symbol with no references found — a review queue, not a delete list. Confirm it's unused before removing.",
+        "soundness": "Flagging errs toward reachable, so it never flags exported symbols, constructors, framework-synthesized members, packages, or (when the workspace uses dynamic dispatch) any method. C/C++ dead-code is more over-approximate: `main` and address-taken functions are shielded, but a zero-fan-in symbol may still be exported/`extern \"C\"` ABI surface, a callback wired through a function pointer the graph can't follow, or a template instantiated in an unscanned translation unit — treat the list as a review queue.",
         "root": root,
-        "files_indexed": entries.len(),
+        "files_indexed": entries.len() + pack_entries.len(),
         "dynamic_dispatch_sites": dynamic_dispatch_sites,
         "include_deps": include_deps,
         "summary": {
