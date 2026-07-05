@@ -593,9 +593,9 @@ fn implicit_field_read_pass_gated_by_pack_capability() {
     emit_return_fuel(&mut fa_off, &sites, false);
     assert_eq!(count(&fa_off), 0, "capability off → pass gated, nothing minted");
 
-    assert!(!crate::query_extract::python_pack().implicit_field_reads,
+    assert!(!crate::query_extract::python_pack().implicit_this_members,
         "python: a bare name is never self.field");
-    assert!(crate::query_extract::cpp_pack().implicit_field_reads,
+    assert!(crate::query_extract::cpp_pack().implicit_this_members,
         "cpp: methods read members with implicit this->");
 }
 

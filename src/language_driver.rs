@@ -228,7 +228,7 @@ impl LanguageDriver for PackDriver {
     ///    (structural-only in the skeleton — `SkeletonAnalysis::return_sites`
     ///    — so `query_extract.rs` stays language-generic; the "this needs
     ///    implicit-return fuel" READING of that data is cpp semantics, so it
-    ///    lives here). The `implicit_field_reads`-gated half also mints
+    ///    lives here). The `implicit_this_members`-gated half also mints
     ///    implicit-`this` FIELD-read edges AND pins bare sibling method
     ///    CALLs to the enclosing class (`resolved_package`), so both halves
     ///    of C++'s receiver elision resolve. MUST run after (6): needs final
@@ -261,7 +261,7 @@ impl LanguageDriver for PackDriver {
                 // the FINAL FileAnalysis.
                 let return_sites = std::mem::take(&mut skel.return_sites);
                 let mut fa = skel.into_file_analysis();
-                emit_return_fuel(&mut fa, &return_sites, pack.implicit_field_reads);
+                emit_return_fuel(&mut fa, &return_sites, pack.implicit_this_members);
                 self.register_post_build(&mut fa, &mut parser, source, path, &ctx, &recovered, macro_defs);
                 fa
             }
@@ -793,15 +793,16 @@ fn emit_external_type_aliases(
 /// Edge(Variable{field, field's own scope})` edge the field's own
 /// declared-type witness already resolves through, so the read chases the
 /// general Variable path instead of dead-ending. General-purpose (any bare
-/// field read, not gated on return position — rule #10). Whether a bare name
-/// CAN mean `this->field` is a language fact the pack declares
-/// (`implicit_field_reads`): true for C/C++, false for Python/R where the
-/// receiver is mandatory.
+/// field read, not gated on return position — rule #10). The same gate also
+/// pins a bare sibling-method CALL (`foo()` = `this->foo()`) to the enclosing
+/// class. Whether a bare name CAN elide `this->` — for members OR methods — is
+/// a language fact the pack declares (`implicit_this_members`): true for C/C++,
+/// false for Python/R where the receiver is mandatory.
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
 fn emit_return_fuel(
     fa: &mut FileAnalysis,
     return_sites: &[(crate::file_analysis::ScopeId, crate::file_analysis::Span)],
-    implicit_field_reads: bool,
+    implicit_this_members: bool,
 ) {
     use crate::file_analysis::{RefKind, ScopeId, ScopeKind, SymKind, SymbolId};
     use crate::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
@@ -846,7 +847,7 @@ fn emit_return_fuel(
         });
     }
 
-    if !implicit_field_reads {
+    if !implicit_this_members {
         return;
     }
     let scope_package: HashMap<ScopeId, Option<String>> =

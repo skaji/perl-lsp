@@ -89,7 +89,7 @@ fn detect_slot_perl_method_position() {
     let src = "package Foo;\nsub greet { 1 }\npackage main;\nmy $f = bless {}, 'Foo';\n$f->\n";
     let (tree, analysis) = build(src);
     let point = Point::new(4, 4); // right after `$f->`
-    let slot = detect_slot(&analysis, &tree, src, point, "perl", None);
+    let slot = detect_slot(&analysis, &tree, src, point, "perl", None).slot;
     match slot {
         Slot::Member { receiver, op } => {
             assert_eq!(op, MemberOp::Arrow);
@@ -99,20 +99,19 @@ fn detect_slot_perl_method_position() {
     }
 }
 
-/// `use |` (typing the module name) is `ModulePath` with `in_use: true` —
-/// the fork this migration needed beyond the ADR's minimal sketch
-/// (`docs/open-forks.md`).
+/// `use |` (typing the module name) is a `ModulePath` slot on the
+/// `UseModule` detector arm — the arm, not a local bool, distinguishes it
+/// from the qualified-path drill (`docs/open-forks.md`).
 #[test]
 fn detect_slot_perl_use_module_name_is_module_path() {
+    use crate::cursor_slot::DetectorArm;
     let src = "use Sc\n";
     let (tree, analysis) = build(src);
     let point = Point::new(0, 6);
-    let slot = detect_slot(&analysis, &tree, src, point, "perl", None);
-    match slot {
-        Slot::ModulePath { prefix, in_use } => {
-            assert_eq!(prefix, "Sc");
-            assert!(in_use);
-        }
+    let detected = detect_slot(&analysis, &tree, src, point, "perl", None);
+    assert_eq!(detected.arm, DetectorArm::UseModule);
+    match detected.slot {
+        Slot::ModulePath { prefix } => assert_eq!(prefix, "Sc"),
         other => panic!("expected ModulePath slot, got {:?}", other),
     }
 }
@@ -132,13 +131,12 @@ fn detect_slot_cpp_qualified_path_is_module_path() {
     let reg = crate::language_driver::LanguageRegistry::with_enabled();
     let analysis = reg.for_id("cpp").unwrap().analyze_with_path(src, None);
 
+    use crate::cursor_slot::DetectorArm;
     // Mid-token: `fmtx::f|`.
-    let slot = detect_slot(&analysis, &tree, src, Point::new(2, 11), "cpp", None);
-    match slot {
-        Slot::ModulePath { prefix, in_use } => {
-            assert_eq!(prefix, "fmtx");
-            assert!(!in_use);
-        }
+    let detected = detect_slot(&analysis, &tree, src, Point::new(2, 11), "cpp", None);
+    assert_eq!(detected.arm, DetectorArm::QualifiedPath);
+    match detected.slot {
+        Slot::ModulePath { prefix } => assert_eq!(prefix, "fmtx"),
         other => panic!("expected ModulePath slot, got {:?}", other),
     }
 
@@ -146,12 +144,10 @@ fn detect_slot_cpp_qualified_path_is_module_path() {
     let src2 = "namespace fmtx { void format_to(int); }\nvoid caller() {\n    fmtx::\n}\n";
     let tree2 = parser.parse(src2, None).unwrap();
     let analysis2 = reg.for_id("cpp").unwrap().analyze_with_path(src2, None);
-    let slot = detect_slot(&analysis2, &tree2, src2, Point::new(2, 10), "cpp", None);
-    match slot {
-        Slot::ModulePath { prefix, in_use } => {
-            assert_eq!(prefix, "fmtx");
-            assert!(!in_use);
-        }
+    let detected = detect_slot(&analysis2, &tree2, src2, Point::new(2, 10), "cpp", None);
+    assert_eq!(detected.arm, DetectorArm::QualifiedPath);
+    match detected.slot {
+        Slot::ModulePath { prefix } => assert_eq!(prefix, "fmtx"),
         other => panic!("expected ModulePath slot, got {:?}", other),
     }
 }

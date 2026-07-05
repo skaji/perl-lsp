@@ -75,10 +75,11 @@ pub enum Slot {
     Import { module: Option<String> },
     /// `use |` (typing the module name) or `Foo::|` (a qualified-path
     /// drill; pack languages' `ns::|` detects here too) — loadable modules
-    /// and/or the qualifier's members/sub-packages. `in_use` distinguishes
-    /// the two behaviors this prefix-shaped slot folds together (see
-    /// `docs/open-forks.md`'s "ModulePath in_use" entry).
-    ModulePath { prefix: String, in_use: bool },
+    /// and/or the qualifier's members/sub-packages. The two behaviors this
+    /// prefix-shaped slot folds together are told apart by the slot's
+    /// `DetectorArm` (`UseModule` vs `QualifiedPath`), not a local field —
+    /// the arm is the generic "which detector fired" fact every slot carries.
+    ModulePath { prefix: String },
     /// A type is expected here. No current detector populates this —
     /// reserved for pack languages' declaration positions.
     #[allow(dead_code)]
@@ -100,6 +101,38 @@ pub enum Slot {
         index: usize,
         expected: Option<InferredType>,
     },
+}
+
+/// Which detector arm produced a `Slot` — the generic "which detector
+/// fired" fact every detected slot carries. A slot shape that folds two
+/// behaviors (today `ModulePath`: the `use`-module render vs the
+/// qualified-path drill) is disambiguated by asking the arm, never a
+/// per-variant bool. The arms mirror the detector's own cases: Perl's
+/// `CursorContext` discriminants plus the pack sentinel's member /
+/// qualifier / domain arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorArm {
+    Variable,
+    Member,
+    HashKey,
+    ImportList,
+    /// `use Foo::|` — typing a loadable module name.
+    UseModule,
+    /// `Foo::|` / pack `ns::|` — a qualified-path drill into an owner.
+    QualifiedPath,
+    DomainCompare,
+    CallArg,
+    General,
+}
+
+/// A detected `Slot` paired with the `DetectorArm` that produced it. The
+/// pairing is how the arm stays generic — carried by every slot the
+/// detectors emit — rather than living as a bool on the one variant that
+/// needed it first.
+#[derive(Debug)]
+pub struct DetectedSlot {
+    pub slot: Slot,
+    pub arm: DetectorArm,
 }
 
 impl Slot {
@@ -168,29 +201,36 @@ pub fn detect_slot(
     point: Point,
     language: &str,
     module_index: Option<&dyn CrossFileLookup>,
-) -> Slot {
+) -> DetectedSlot {
     if language == "perl" {
         return detect_slot_perl(analysis, tree, source, point, module_index);
     }
     let reg = crate::language_driver::LanguageRegistry::with_enabled();
     let cursor = crate::cursor_sentinel::point_to_byte(source, point);
+    let bare_identifier = || DetectedSlot {
+        slot: Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() },
+        arm: DetectorArm::General,
+    };
     let Some(driver) = reg.for_id(language) else {
-        return Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() };
+        return bare_identifier();
     };
     let Some(lang_pack) = driver.lang_pack() else {
-        return Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() };
+        return bare_identifier();
     };
     let mut parser = driver.make_parser();
     if let Some(ctx) = crate::cursor_sentinel::member_completion_ctx_incremental(
         &mut parser, &lang_pack, source, tree, cursor, analysis, module_index,
     ) {
-        return Slot::Member {
-            receiver: ReceiverCtx {
-                receiver_type: ctx.receiver_type,
-                receiver_text: None,
-                op_fix: ctx.op_fix,
+        return DetectedSlot {
+            slot: Slot::Member {
+                receiver: ReceiverCtx {
+                    receiver_type: ctx.receiver_type,
+                    receiver_text: None,
+                    op_fix: ctx.op_fix,
+                },
+                op: ctx.op,
             },
-            op: ctx.op,
+            arm: DetectorArm::Member,
         };
     }
     // `fmtx::|` / `fmtx::f|` — a `::`-qualified path names its OWNER
@@ -200,7 +240,10 @@ pub fn detect_slot(
     // meaning; ahead of the domain-compare slot, which only re-ranks the
     // global pool.
     if let Some(owner) = crate::resolve::qualifier_at_point(source, point) {
-        return Slot::ModulePath { prefix: owner.to_string(), in_use: false };
+        return DetectedSlot {
+            slot: Slot::ModulePath { prefix: owner.to_string() },
+            arm: DetectorArm::QualifiedPath,
+        };
     }
     // `field == |` — the equality's field operand carries an enum DOMAIN.
     // The slot hands that expected type to completion so the domain's
@@ -209,9 +252,12 @@ pub fn detect_slot(
     if let Some(expected) = crate::cursor_sentinel::domain_compare_ctx_incremental(
         &mut parser, &lang_pack, source, tree, cursor, analysis, module_index,
     ) {
-        return Slot::ArgPosition { callee: None, index: 0, expected: Some(expected) };
+        return DetectedSlot {
+            slot: Slot::ArgPosition { callee: None, index: 0, expected: Some(expected) },
+            arm: DetectorArm::DomainCompare,
+        };
     }
-    Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() }
+    bare_identifier()
 }
 
 fn detect_slot_perl(
@@ -220,7 +266,7 @@ fn detect_slot_perl(
     source: &str,
     point: Point,
     module_index: Option<&dyn CrossFileLookup>,
-) -> Slot {
+) -> DetectedSlot {
     let ctx = cursor_context::detect_cursor_context_tree_with_index(
         tree, source.as_bytes(), point, analysis, module_index,
     )
@@ -228,42 +274,52 @@ fn detect_slot_perl(
     slot_from_cursor_context(ctx)
 }
 
-fn slot_from_cursor_context(ctx: CursorContext) -> Slot {
-    match ctx {
-        CursorContext::Variable { sigil } => Slot::Identifier { prefix: sigil.to_string() },
-        CursorContext::Method { invocant_type, invocant_text } => Slot::Member {
-            receiver: ReceiverCtx {
-                receiver_type: invocant_type,
-                receiver_text: Some(invocant_text),
-                op_fix: None,
-            },
-            op: MemberOp::Arrow, // Perl method dispatch is always `->`
-        },
-        CursorContext::HashKey { owner_type, var_text, source_sub } => {
-            Slot::Key { owner: OwnerCtx { owner_type, var_text, source_sub } }
+fn slot_from_cursor_context(ctx: CursorContext) -> DetectedSlot {
+    let (slot, arm) = match ctx {
+        CursorContext::Variable { sigil } => {
+            (Slot::Identifier { prefix: sigil.to_string() }, DetectorArm::Variable)
         }
+        CursorContext::Method { invocant_type, invocant_text } => (
+            Slot::Member {
+                receiver: ReceiverCtx {
+                    receiver_type: invocant_type,
+                    receiver_text: Some(invocant_text),
+                    op_fix: None,
+                },
+                op: MemberOp::Arrow, // Perl method dispatch is always `->`
+            },
+            DetectorArm::Member,
+        ),
+        CursorContext::HashKey { owner_type, var_text, source_sub } => (
+            Slot::Key { owner: OwnerCtx { owner_type, var_text, source_sub } },
+            DetectorArm::HashKey,
+        ),
         CursorContext::UseStatement { module_prefix, in_import_list, module_name } => {
             if in_import_list {
-                Slot::Import { module: module_name }
+                (Slot::Import { module: module_name }, DetectorArm::ImportList)
             } else {
-                Slot::ModulePath { prefix: module_prefix, in_use: true }
+                (Slot::ModulePath { prefix: module_prefix }, DetectorArm::UseModule)
             }
         }
         CursorContext::QualifiedPath { package } => {
-            Slot::ModulePath { prefix: package, in_use: false }
+            (Slot::ModulePath { prefix: package }, DetectorArm::QualifiedPath)
         }
-        CursorContext::General => Slot::Identifier { prefix: String::new() },
-    }
+        CursorContext::General => (Slot::Identifier { prefix: String::new() }, DetectorArm::General),
+    };
+    DetectedSlot { slot, arm }
 }
 
 /// The enclosing call's arg-position slot, when the cursor sits inside
 /// one. Orthogonal to `detect_slot` (see the module doc) — sig-help's
 /// entire question is this slot; wraps `cursor_context::find_call_context`
 /// unchanged.
-pub fn detect_call_slot(tree: &Tree, source: &[u8], point: Point) -> Option<Slot> {
+pub fn detect_call_slot(tree: &Tree, source: &[u8], point: Point) -> Option<DetectedSlot> {
     let call_ctx = cursor_context::find_call_context(tree, source, point)?;
     let index = call_ctx.active_param;
-    Some(Slot::ArgPosition { callee: Some(call_ctx), index, expected: None })
+    Some(DetectedSlot {
+        slot: Slot::ArgPosition { callee: Some(call_ctx), index, expected: None },
+        arm: DetectorArm::CallArg,
+    })
 }
 
 /// The identifier chars immediately before the byte cursor — the typed
