@@ -820,7 +820,7 @@ fn test_method_call_ref() {
         .collect();
     assert_eq!(method_refs.len(), 1);
     if let RefKind::MethodCall { ref invocant, .. } = method_refs[0].kind {
-        assert_eq!(invocant, "$obj");
+        assert_eq!(invocant.text(), "$obj");
     }
 }
 
@@ -1695,7 +1695,7 @@ $h{it}->kid();
     // Spot-check the concrete answers so a mutual `None` regression
     // can't pass the agreement assert vacuously.
     let kid_on_scalar = fa.refs.iter().find(|r| {
-        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "$f")
+        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "$f")
             && r.target_name == "kid"
     });
     assert_eq!(
@@ -1704,7 +1704,7 @@ $h{it}->kid();
         "scalar invocant `$f->kid` should type as Foo, tree-free",
     );
     let kid_on_array = fa.refs.iter().find(|r| {
-        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.starts_with("$arr"))
+        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text().starts_with("$arr"))
             && r.target_name == "kid"
     });
     assert_eq!(
@@ -2651,7 +2651,7 @@ fn test_dunder_package_method_invocant() {
     match &method_ref.kind {
         RefKind::MethodCall { invocant, .. } => {
             assert_eq!(
-                invocant, "Foo",
+                invocant.text(), "Foo",
                 "invocant should be resolved from __PACKAGE__"
             );
         }
@@ -3695,6 +3695,37 @@ has [qw(foo bar)] => (is => 'ro');
         .collect();
     assert_eq!(foo.len(), 1, "should synthesize foo accessor");
     assert_eq!(bar.len(), 1, "should synthesize bar accessor");
+}
+
+#[test]
+fn test_moo_has_constant_array_ref() {
+    // `has \@names` (a ref to a constant array) folds the array's elements
+    // through the same accessor synthesis as the literal-arrayref form. A
+    // bare `has @names` SPLATS the array into the call (`has 'a','b', is=>…`)
+    // — a different declaration — so it is NOT folded; nor is a non-constant
+    // array.
+    let fa = build_fa(
+        "
+package Foo;
+use Moo;
+my @attrs = qw(client_id client_secret);
+my @more  = ('refresh_token', 'profile_id');
+has \\@attrs, is => 'ro';
+has @more,    is => 'ro';
+has @runtime, is => 'ro';
+",
+    );
+    let accessor = |name: &str| {
+        fa.symbols
+            .iter()
+            .filter(|s| s.name == name && s.kind == SymKind::Method)
+            .count()
+    };
+    assert_eq!(accessor("client_id"), 1, "fold \\@attrs → client_id");
+    assert_eq!(accessor("client_secret"), 1, "fold \\@attrs → client_secret");
+    assert_eq!(accessor("refresh_token"), 0, "bare `has @more` splats — not a multi-attr decl, not folded");
+    assert_eq!(accessor("profile_id"), 0, "bare `has @more` splats — not a multi-attr decl, not folded");
+    assert_eq!(accessor("runtime"), 0, "non-constant array stays unclaimed");
 }
 
 #[test]
@@ -6042,7 +6073,7 @@ $r->get('/users')->to('Users#list');
     );
     let r = route_refs
         .iter()
-        .find(|r| matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users"))
+        .find(|r| matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users"))
         .expect("MethodCall with invocant=Users");
 
     // Sanity: ref span covers the string literal so cursor anywhere
@@ -6068,7 +6099,7 @@ $r->get('/users')->to(controller => 'Users', action => 'list');
     let fa = build_fa(src);
 
     let has_ref = fa.refs.iter().any(|r| {
-        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+        matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
             && r.target_name == "list"
     });
     assert!(
@@ -6548,7 +6579,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
         .refs
         .iter()
         .find(|r| {
-            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant == "Users")
+            matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
                 && r.target_name == "create"
         })
         .expect("route should emit MethodCall create@Users");
@@ -6849,7 +6880,7 @@ sub list {
         line: 5,
         character: 25,
     };
-    let items = crate::symbols::completion_items(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
     let labels: Vec<String> = items.iter().map(|it| it.label.clone()).collect();
 
     for expected in &["users_list", "Users#list", "/hello"] {
@@ -6927,7 +6958,7 @@ sub list {
         .set_language(&ts_parser_perl::LANGUAGE.into())
         .unwrap();
     let tree = parser.parse(empty_src, None).unwrap();
-    let items = crate::symbols::completion_items(
+    let items = crate::symbols::completion_items_for_test(
         &empty_fa,
         &tree,
         empty_src,
@@ -6969,7 +7000,7 @@ sub list {
         std::sync::Arc::new(build_fa(typed_src)),
     );
     let tree = parser.parse(typed_src, None).unwrap();
-    let items = crate::symbols::completion_items(
+    let items = crate::symbols::completion_items_for_test(
         &typed_fa,
         &tree,
         typed_src,
@@ -7498,7 +7529,7 @@ sub session { my ($self, $key) = @_; }
         items.iter().map(|it| it.label.clone()).collect()
     };
 
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(7, 8), &idx, None);
     let labels = call_label_set(&items);
     for expected in &["list", "render", "stash", "current_user", "users", "admin"] {
         assert!(
@@ -7514,7 +7545,7 @@ sub session { my ($self, $key) = @_; }
     // fix: cursor_context couldn't resolve the chain without a
     // module_index, so completion fell through to Users's own
     // methods (`list`).
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(8, 15), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(8, 15), &idx, None);
     let labels = call_label_set(&items);
     assert_eq!(
         labels.iter().collect::<std::collections::HashSet<_>>(),
@@ -7535,7 +7566,7 @@ sub session { my ($self, $key) = @_; }
 
     // Part 3: `$c->admin->` resolves through the first-level proxy
     // to the innermost `users` step.
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(9, 15), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(9, 15), &idx, None);
     let labels = call_label_set(&items);
     assert_eq!(
         labels,
@@ -7547,7 +7578,7 @@ sub session { my ($self, $key) = @_; }
     // Part 4: the proxy's detail is suppressed (opaque_return).
     // No `_Helper::...` string should leak into the user-facing
     // detail of a helper-root completion entry, even cross-file.
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos(7, 8), &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos(7, 8), &idx, None);
     let users_item = items.iter().find(|it| it.label == "users").unwrap();
     let admin_item = items.iter().find(|it| it.label == "admin").unwrap();
     for (name, item) in [("users", users_item), ("admin", admin_item)] {
@@ -8644,7 +8675,7 @@ $minion->enqueue(task_x => ['a'], {  });
     };
 
     let idx = crate::module_index::ModuleIndex::new_for_test();
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     for expected in &["priority", "queue", "delay", "attempts"] {
@@ -8693,7 +8724,7 @@ $minion->enqueue(task_x => ['a'], { priority => 10,  });
     };
 
     let idx = crate::module_index::ModuleIndex::new_for_test();
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     assert!(
@@ -9174,7 +9205,7 @@ sub foreground  { my ($self, $id) = @_; }
         character: col as u32,
     };
 
-    let items = crate::symbols::completion_items(&fa, &tree, src, pos, &idx, None);
+    let items = crate::symbols::completion_items_for_test(&fa, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     assert!(
@@ -14401,7 +14432,7 @@ ${$ref}->other;
     let RefKind::MethodCall { ref invocant, .. } = thing.kind else {
         panic!("expected MethodCall, got {:?}", thing.kind);
     };
-    assert_eq!(invocant, "$sner");
+    assert_eq!(invocant.text(), "$sner");
     assert_eq!(
         fa.method_call_invocant_class(thing, None).as_deref(),
         Some("Foo"),
@@ -14416,7 +14447,7 @@ ${$ref}->other;
     let RefKind::MethodCall { ref invocant, .. } = other.kind else {
         panic!("expected MethodCall, got {:?}", other.kind);
     };
-    assert_eq!(invocant, "${$ref}", "deref block keeps raw text");
+    assert_eq!(invocant.text(), "${$ref}", "deref block keeps raw text");
 }
 
 /// `my $c = 'Counter'; $c->bump` — a scalar invocant holding a const-folded
@@ -14947,20 +14978,20 @@ get('/y')->to('#after_group');
             .unwrap_or_else(|| panic!("no MethodCall ref for {action}"))
     };
     assert!(
-        invocant_of("missing_fnsku").contains("notifications"),
-        "in-group partial inherits the group's under",
+        invocant_of("missing_fnsku").contains("Notifications"),
+        "in-group partial inherits the group's under (camelized)",
     );
     assert!(
-        invocant_of("after_group").contains("login"),
+        invocant_of("after_group").contains("Login"),
         "post-group partial inherits the OUTER under — the group frame popped",
     );
 }
 
-/// `plugin 'Thing'` emits a register-anchored MethodCall ref with the
-/// DECAMELIZED token ("WasLoaded" → "was_loaded"), so goto-def rides
-/// the same camelize+tail+ownership search as go-to-controller —
-/// namespace-agnostic (Mojolicious::Plugin::* and app-specific
-/// namespaces both land).
+/// `plugin 'Thing'` emits a register-anchored MethodCall ref whose
+/// bridged token is the plugin name camelized to a class key (already
+/// CamelCase here, so it passes through), resolved by `::`-tail +
+/// ownership of `register` — namespace-agnostic (Mojolicious::Plugin::*
+/// and app-specific namespaces both land).
 #[test]
 fn lite_plugin_name_emits_register_ref() {
     let src = "\
@@ -14983,8 +15014,8 @@ plugin 'Foo::BarBaz';
         })
         .collect();
     assert_eq!(invocants.len(), 2, "{:?}", invocants);
-    assert!(invocants[0].contains("was_loaded"), "{:?}", invocants);
-    assert!(invocants[1].contains("foo-bar_baz"), "{:?}", invocants);
+    assert!(invocants[0].contains("WasLoaded"), "{:?}", invocants);
+    assert!(invocants[1].contains("Foo::BarBaz"), "{:?}", invocants);
 }
 
 /// Framework-assigned Mojo attrs (`has [qw(app tx)]` with no default —

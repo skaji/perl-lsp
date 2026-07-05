@@ -1139,7 +1139,7 @@ fn parse_instance_of(isa: &str) -> Option<String> {
         return None;
     }
     let args = call.child_by_field_name("arguments")?;
-    if args.kind() != "anonymous_array_expression" && args.kind() != "array_ref_expression" {
+    if args.kind() != "anonymous_array_expression" {
         return None;
     }
     for i in 0..args.named_child_count() {
@@ -3155,15 +3155,22 @@ impl<'a> Builder<'a> {
                     config_span,
                 });
             }
-            plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span } => {
+            plugin::EmitAction::MethodCallRef { method_name, invocant, span, invocant_span, bridged } => {
                 // Standard MethodCall ref — gd/gr/hover/rename route to
                 // the usual resolution path (inheritance walk + module
                 // index + type inference). The plugin's job is just
                 // "there's a call to method X on invocant Y here".
-                // Plugins declare `invocant` as the intended receiver
-                // class (e.g. route plugin uses "Users" for `->to('Users#list')`);
-                // treat that as the resolved class unless it's a sigil-shape.
-                let invocant_class = if invocant.is_empty()
+                //
+                // `bridged`: when Some(mode), the invocant is a class key the
+                // emitting plugin already transformed (a camelized Mojo
+                // controller name), not a Perl receiver. It becomes
+                // `Invocant::Bridged` so the freeze pass never pins it and
+                // core resolves it generically by the declared match mode.
+                // A non-bridged invocant is the intended receiver class /
+                // canonical variable, treated as the resolved class unless
+                // it's a sigil-shape.
+                let invocant_class = if bridged.is_some()
+                    || invocant.is_empty()
                     || invocant.starts_with('$')
                     || invocant.starts_with('@')
                     || invocant.starts_with('%')
@@ -3179,12 +3186,16 @@ impl<'a> Builder<'a> {
                 )) {
                     return;
                 }
+                let invocant = match bridged {
+                    Some(match_mode) => {
+                        crate::conventions::Invocant::bridged(plugin_id.clone(), invocant, match_mode)
+                    }
+                    None => crate::conventions::Invocant::assume_canonical(invocant),
+                };
                 let ref_idx = self.refs.len();
                 self.refs.push(Ref {
                     kind: RefKind::MethodCall {
-                        // The plugin asserts its receiver text (a literal
-                        // class like "Users", or a canonical `$self`).
-                        invocant: crate::conventions::InvocantName::assume_canonical(invocant),
+                        invocant,
                         invocant_span,
                         method_name_span: span,
                     },
@@ -8406,7 +8417,7 @@ impl<'a> Builder<'a> {
                             if name.chars().next().map_or(false, |c| c == '_' || c.is_alphabetic()) {
                                 self.refs.push(Ref {
                                     kind: RefKind::MethodCall {
-                                        invocant: crate::conventions::InvocantName::assume_canonical(
+                                        invocant: crate::conventions::Invocant::assume_canonical(
                                             invocant
                                                 .and_then(|i| {
                                                     crate::cst::canonical_var_name(i, &bytes)
@@ -9275,7 +9286,7 @@ impl<'a> Builder<'a> {
         // CST: ambiguous_function_call_expression
         //   function: "has"
         //   arguments: list_expression
-        //     [0] string_literal 'name' | array_ref_expression [qw(a b)]
+        //     [0] string_literal 'name' | anonymous_array_expression [qw(a b)]
         //     [1] list_expression (is => 'ro', isa => 'Str')   -- options (Moo/Moose)
         //          OR absent (Mojo::Base: has 'name' or has 'name' => 'default')
         let mut attr_names: Vec<(String, Span)> = Vec::new();
@@ -9319,7 +9330,15 @@ impl<'a> Builder<'a> {
                         attr_names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "array_ref_expression" | "anonymous_array_expression" => {
+                // Literal arrayref (`has ['a','b']`) or a ref to a constant
+                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
+                // through the constant-fold seam: `extract_array_attr_names`
+                // → `string_list` resolves `\@attrs` against the constant table.
+                // NOT a bare `has @attrs` — that SPLATS the array into the call
+                // (`has 'a', 'b', is => …`), a different declaration entirely,
+                // so the `array` node is intentionally excluded. A non-constant
+                // arrayref folds to nothing and stays unclaimed.
+                "anonymous_array_expression" | "refgen_expression" => {
                     self.extract_array_attr_names(*child, &mut attr_names);
                 }
                 _ => {}
@@ -9738,7 +9757,15 @@ impl<'a> Builder<'a> {
                         attr_names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "array_ref_expression" | "anonymous_array_expression" => {
+                // Literal arrayref (`has ['a','b']`) or a ref to a constant
+                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
+                // through the constant-fold seam: `extract_array_attr_names`
+                // → `string_list` resolves `\@attrs` against the constant table.
+                // NOT a bare `has @attrs` — that SPLATS the array into the call
+                // (`has 'a', 'b', is => …`), a different declaration entirely,
+                // so the `array` node is intentionally excluded. A non-constant
+                // arrayref folds to nothing and stays unclaimed.
+                "anonymous_array_expression" | "refgen_expression" => {
                     self.extract_array_attr_names(*child, &mut attr_names);
                 }
                 _ => {}
@@ -9822,7 +9849,7 @@ impl<'a> Builder<'a> {
                 }
                 plugin::ValueShape::HashPairs(pairs)
             }
-            "array_ref_expression" | "anonymous_array_expression" => {
+            "anonymous_array_expression" => {
                 plugin::ValueShape::ArrayItems(
                     self.extract_string_list(node).into_iter().map(|(s, _)| s).collect(),
                 )
@@ -9963,7 +9990,7 @@ impl<'a> Builder<'a> {
         for i in 0..args.named_child_count() {
             let Some(child) = args.named_child(i) else { continue };
             match child.kind() {
-                "anonymous_array_expression" | "array_ref_expression" => {
+                "anonymous_array_expression" => {
                     for j in 0..child.named_child_count() {
                         if let Some(el) = child.named_child(j) {
                             params.push(self.constraint_param_for(el));
@@ -10445,11 +10472,11 @@ impl<'a> Builder<'a> {
             // canonical producer for ref invocants — varname spelling
             // normalized above, package token resolved here.
             if crate::conventions::is_current_package_token(s) {
-                crate::conventions::InvocantName::assume_canonical(
+                crate::conventions::Invocant::assume_canonical(
                     self.current_package.clone().unwrap_or_else(|| s.to_string()),
                 )
             } else {
-                crate::conventions::InvocantName::assume_canonical(s)
+                crate::conventions::Invocant::assume_canonical(s)
             }
         });
         // Stored even when walk-time can't resolve the class — PostFold's
@@ -10785,7 +10812,7 @@ impl<'a> Builder<'a> {
                         names.push((text.to_string(), node_to_span(*child)));
                     }
                 }
-                "quoted_word_list" | "array_ref_expression" | "anonymous_array_expression" => {
+                "quoted_word_list" | "anonymous_array_expression" => {
                     self.extract_array_attr_names(*child, &mut names);
                 }
                 _ => {}

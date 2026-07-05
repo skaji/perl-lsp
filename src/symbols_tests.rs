@@ -1070,7 +1070,7 @@ fn test_unimported_completion_with_auto_import() {
     let tree = crate::document::Document::new(source.to_string())
         .unwrap()
         .tree;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -1135,7 +1135,7 @@ fn test_unimported_completion_skips_imported_modules() {
     let tree = crate::document::Document::new(source.to_string())
         .unwrap()
         .tree;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -1223,7 +1223,7 @@ my $sq   = Math::Util::s
     // Line: `my $sq   = Math::Util::s` — cursor sits past the `s`.
     let line_text = source.lines().nth(10).unwrap();
     let cursor_col = line_text.len() as u32;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -1310,7 +1310,7 @@ my $x = Math::
     // Cursor at end of `Math::` on the last source line.
     let last_line_idx = source.lines().count() as u32 - 1;
     let line_text = source.lines().last().unwrap();
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -1383,7 +1383,7 @@ $pkg->squ
     // Cursor sits past the `q` in `$pkg->squ`.
     let line_text = source.lines().nth(5).unwrap();
     let cursor_col = line_text.len() as u32;
-    let items = completion_items(
+    let items = completion_items_for_test(
         &analysis,
         &tree,
         source,
@@ -1861,7 +1861,7 @@ sub fire {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
 
     // Every registered handler shows up as a top-priority suggestion.
     let connect = items
@@ -1948,7 +1948,7 @@ sub use_it {
     let col = line.find("$r->").unwrap() + "$r->".len();
     let pos = Position { line: line_idx as u32, character: col as u32 };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     assert!(
         items.iter().any(|i| i.label == "go"),
         "Optional<Foo> receiver should offer Foo's methods (peeled): {:?}",
@@ -1991,7 +1991,7 @@ sub fire { my $self = shift; $self->emit(); }
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let connect = items
         .iter()
         .find(|i| i.label == "connect")
@@ -2051,7 +2051,7 @@ sub fire {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let connect = items
         .iter()
         .find(|i| i.label == "connect")
@@ -2162,7 +2162,7 @@ sub list {
         character: pr_col,
     };
 
-    let items = completion_items(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
+    let items = completion_items_for_test(&ctrl_fa, &tree, ctrl_src, pos, &idx, None);
 
     let path_item = items
         .iter()
@@ -2223,7 +2223,7 @@ sub list {
         line: 5,
         character: past_hash_col,
     };
-    let items = completion_items(&ctrl_fa_hash, &tree_hash, ctrl_src_hash, pos, &idx, None);
+    let items = completion_items_for_test(&ctrl_fa_hash, &tree_hash, ctrl_src_hash, pos, &idx, None);
     let hash_item = items
         .iter()
         .find(|i| i.label == "Users#list")
@@ -2319,7 +2319,7 @@ sub list {
     ];
 
     for (label, col) in cursor_variants {
-        let items = completion_items(
+        let items = completion_items_for_test(
             &ctrl_fa,
             &tree,
             ctrl_src,
@@ -2412,7 +2412,7 @@ sub fire {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     assert!(
@@ -2470,7 +2470,7 @@ $r->get('/users')->to('Users#lis');
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
 
     // Prefix-filtered: only `list` starts with `lis`; `login`,
@@ -2544,7 +2544,7 @@ $r->get('/users')->to('Us');
     // Doesn't assert what IS offered — just that it doesn't panic
     // and doesn't return complete nonsense. This is the honest
     // edge-case: without a `#` yet, no plugin-emitted ref exists.
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let _ = items;
 }
 
@@ -2585,7 +2585,7 @@ sub other {
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     assert!(
         !items.iter().any(|i| i.label == "connect"),
         "non-dispatcher method must not surface handler completions"
@@ -2754,7 +2754,7 @@ fn data_printer_use_line_options_completion() {
         line: 0,
         character: 10,
     };
-    let items = completion_items(&analysis, &tree, source, pos, &module_index, None);
+    let items = completion_items_for_test(&analysis, &tree, source, pos, &module_index, None);
 
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     // Sample of keys from Data::Printer's actual options. If the
@@ -2974,7 +2974,7 @@ fn data_printer_use_line_options_completion_for_data_printer_module() {
         line: 0,
         character: 20,
     };
-    let items = completion_items(&analysis, &tree, source, pos, &module_index, None);
+    let items = completion_items_for_test(&analysis, &tree, source, pos, &module_index, None);
 
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     assert!(
@@ -3463,7 +3463,7 @@ $r->get('/users')->
         character: col as u32,
     };
 
-    let items = completion_items(&analysis, &tree, src, pos, &idx, None);
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
     let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
     for expected in &["to", "name", "get"] {
         assert!(
@@ -3532,7 +3532,7 @@ sub action ($c) {\n\
     };
 
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &consumer, pos, &uri, &idx);
 
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
@@ -3595,7 +3595,7 @@ sub day_of_week {\n\
     };
 
     let uri = Url::parse("file:///datetime.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &consumer, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
@@ -3645,7 +3645,7 @@ my @s = @My::Vars::servers;\n\
     };
 
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &consumer, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected goto-def for FQ var, got {other:?}"),
@@ -3677,7 +3677,7 @@ fn fq_variable_read_unknown_package_is_honest_miss() {
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &consumer, pos, &uri, &idx);
     assert!(resp.is_none(), "unknown package must be an honest miss, got {resp:?}");
 }
 
@@ -3989,12 +3989,12 @@ sub get { my $self = shift; return $self; }
 sub under { my $self = shift; return $self; }
 sub to { my $self = shift; return $self; }
 
-package alerts;
+package Alerts;
 sub list { my $c = shift; }
 sub get_alert { my $c = shift; }
 sub read_settings { my $c = shift; }
 
-package other;
+package Other;
 sub thing { my $c = shift; }
 
 package MyApp;
@@ -4014,31 +4014,38 @@ sub startup {
     let fa = parse_analysis(src);
     let idx = crate::module_index::ModuleIndex::new_for_test();
 
-    // Helper: the plugin-emitted MethodCallRef for a partial target —
-    // its invocant class IS the inherited controller, its target the
-    // action.
+    let _ = &idx;
+    // Helper: the plugin-emitted MethodCallRef for a partial target
+    // carries the inherited controller as its bridged TOKEN (not a frozen
+    // class — resolution to a class is the plugin's query-time job, which
+    // needs a populated index; brand inheritance is what's under test).
     let inherited = |action: &str| -> Option<String> {
         fa.refs.iter().find_map(|r| {
-            if let crate::file_analysis::RefKind::MethodCall { .. } = &r.kind {
+            if let crate::file_analysis::RefKind::MethodCall {
+                invocant: crate::conventions::Invocant::Bridged { token, .. },
+                ..
+            } = &r.kind
+            {
                 if r.target_name == action {
-                    return fa.method_call_invocant_class(r, Some(&idx));
+                    return Some(token.clone());
                 }
             }
             None
         })
     };
 
-    // Direct child: `$alerts_r->get('/')->to('#list')` inherits 'alerts'.
-    assert_eq!(inherited("list").as_deref(), Some("alerts"),
+    // Direct child: `$alerts_r->get('/')->to('#list')` inherits 'alerts',
+    // emitted camelized (`Alerts`) — the plugin applies the convention.
+    assert_eq!(inherited("list").as_deref(), Some("Alerts"),
         "partial '#list' must inherit the parent's 'alerts' controller");
     // Nested via `under`: `$crud` inherits 'alerts' from `$alerts_r`.
-    assert_eq!(inherited("get_alert").as_deref(), Some("alerts"),
+    assert_eq!(inherited("get_alert").as_deref(), Some("Alerts"),
         "partial '#get_alert' on $crud (under $alerts_r) inherits 'alerts'");
     // Two hops deep: `$crud->get('/settings')->to('#read_settings')`.
-    assert_eq!(inherited("read_settings").as_deref(), Some("alerts"),
+    assert_eq!(inherited("read_settings").as_deref(), Some("Alerts"),
         "nested partial '#read_settings' still inherits 'alerts'");
     // Sibling group re-brands; no leak from 'alerts'.
-    assert_eq!(inherited("thing").as_deref(), Some("other"),
+    assert_eq!(inherited("thing").as_deref(), Some("Other"),
         "sibling group's '#thing' inherits 'other', not 'alerts'");
 
     // The brand rides assignment + nesting: $alerts_r and $crud both
@@ -4088,7 +4095,7 @@ sub startup {
         line: pre.matches('\n').count() as u32,
         character: (list_at - pre.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
-    let resp = find_definition(&fa, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &fa, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
@@ -4606,7 +4613,7 @@ my $v = helper_fn(21);\n";
     };
 
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let resp = find_definition(&consumer, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &consumer, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected a single-hop Scalar to the module sub, got {other:?}"),
@@ -4648,7 +4655,7 @@ Foo->bar();\n";
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32 + 1,
     };
     let uri = Url::parse("file:///test.pl").unwrap();
-    let resp = find_definition(&analysis, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &analysis, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected goto-def on class invocant, got {other:?}"),
@@ -4682,7 +4689,7 @@ Foo->bar();\n";
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///test.pl").unwrap();
-    let resp = find_definition(&analysis, pos, &uri, &idx);
+    let resp = find_definition(&crate::file_store::FileStore::new(), &analysis, pos, &uri, &idx);
     let loc = match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => loc,
         other => panic!("expected goto-def on method token, got {other:?}"),
@@ -4740,7 +4747,7 @@ fn gd_resolves(source: &str, name: &str, idx: &crate::module_index::ModuleIndex)
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let loc = match find_definition(&analysis, pos, &uri, idx) {
+    let loc = match find_definition(&crate::file_store::FileStore::new(), &analysis, pos, &uri, idx) {
         Some(GotoDefinitionResponse::Scalar(loc)) => Some(loc),
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => Some(v.remove(0)),
         _ => None,
@@ -4915,7 +4922,7 @@ fn gd_resolves_to(
         character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
     };
     let uri = Url::parse("file:///consumer.pl").unwrap();
-    let loc = match find_definition(&analysis, pos, &uri, idx) {
+    let loc = match find_definition(&crate::file_store::FileStore::new(), &analysis, pos, &uri, idx) {
         Some(GotoDefinitionResponse::Scalar(loc)) => Some(loc),
         Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => Some(v.remove(0)),
         _ => None,
@@ -5115,6 +5122,7 @@ class Point {
     let uri = Url::parse("file:///tmp/sym_defer_consumer.pl").unwrap();
     // Cursor on `x` (row 1, col 19).
     let resp = find_definition(
+        &crate::file_store::FileStore::new(),
         &analysis,
         Position { line: 1, character: 19 },
         &uri,
