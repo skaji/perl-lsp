@@ -148,7 +148,7 @@ pub struct PackDriver {
     /// canonical header paths this file reaches — the cross-file VISIBILITY key
     /// (`ScopedLookup` ranks `get_cached` candidates by it). `None` for packs
     /// with no include model.
-    include_closure: Option<fn(&Path, &str) -> Vec<String>>,
+    include_closure: Option<fn(&Path, &str) -> (Vec<String>, bool)>,
     /// External analysis-input fingerprint (see
     /// `LanguageDriver::analysis_input_fingerprint`). `None` = no external
     /// inputs (fingerprint 0).
@@ -436,12 +436,20 @@ impl PackDriver {
         // The file's include closure is the cross-file visibility key
         // (`ScopedLookup`). Computed here — the driver holds the path the
         // resolver needs; empty on-open until the header cache warms.
+        let mut closure_incomplete = false;
         if let (Some(f), Some(p)) = (self.include_closure, path) {
-            fa.include_closure = crate::timings::phase("cpp.include_closure", || f(p, source));
+            let (closure, complete) =
+                crate::timings::phase("cpp.include_closure", || f(p, source));
+            fa.include_closure = closure;
+            closure_incomplete = !complete;
         }
-        // A skipped gather (on-open cached-only miss) analyzed with a
-        // placeholder external table — servable, never cacheable.
-        fa.degraded = ctx.external.degraded;
+        // Never persist an analysis built from a partial dependency view: a
+        // skipped gather (on-open cached-only miss, placeholder external table)
+        // OR a truncated include closure (a header that resolved but failed to
+        // read). Both would freeze a weaker-than-truth analysis behind a
+        // deps_stamp that self-validates. `save_to_db` refuses `degraded`;
+        // a complete gather next session re-derives the row.
+        fa.degraded = ctx.external.degraded || closure_incomplete;
     }
 }
 

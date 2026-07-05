@@ -148,6 +148,26 @@ why parked, what unblocks it. Prune on landing.
   (pre-fix ~7.5% cold-run failure, post-fix 0). Also: debounce-window staleness
   (mid-typing `doc.analysis` describes prior text). KNOWN-GAPS "LSP session
   determinism".
+  **The POISONED-PERSIST half is FIXED — the window's damage is non-sticky.**
+  The worry was that a degraded cold-run analysis gets frozen into the SQLite
+  pack cache behind a `deps_stamp` that self-validates (the stamp is recomputed
+  over the STORED closure at load time, so a truncated/empty closure matches
+  itself and never re-derives), re-served on every WARM run until `--clear-cache`.
+  Two guards close it: `save_to_db` refuses any `degraded` analysis (H8), and
+  `PackDriver::register_post_build` now folds closure-INCOMPLETENESS into
+  `degraded` — a skipped cached-only gather OR a truncated include closure (a
+  header that RESOLVED and exists yet failed to read: non-UTF-8, transient I/O)
+  marks the analysis non-persistable, so a complete gather next session
+  re-derives it. `cpp_reparse::include_closure` returns `(closure, complete)`
+  and only memoizes a complete walk. Verified under heavy CPU load: every
+  persisted blob is the correct full-closure analysis, and a warm run heals the
+  transient window WITHOUT `--clear-cache` (a genuine poison would fail every
+  warm run). Locks: `include_closure_reports_incomplete_on_unreadable_header`
+  (unit), `e2e/persist-poison-repro.sh` (cold-load poison → warm heals, no
+  clear-cache). What REMAINS is only the TRANSIENT window above (the
+  completion-signal + bounded-wait design gap) — a fast burst under load still
+  races the background gather/index for one session, but nothing sticky
+  survives it.
 - **Enum value as template argument** not a ref (`MakeError<StatusCode::
   kNotFound>`) — hitlist-2 residual, unassigned.
   - looks easy enough to close
