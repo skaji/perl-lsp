@@ -11,6 +11,18 @@
 > `cpp-inline-ns-transparency-*` (definition + references),
 > `cpp-inline-ns-absent-member-goto-def-fail-safe`.
 >
+> **Refs-symmetry follow-up (A1) — LANDED.** The Family A gate expanded only
+> the *named-owner* side of the inline-owner set, so `references` was **anchor-
+> asymmetric**: from the DEF (filed under parent `mylib` — the inline child
+> `v1` is macro-formed via `NS_BEGIN` and never entered the sticky context) it
+> dropped the unqualified in-namespace use (whose enclosing owner is the
+> positional inline child `v1`), while from a USE it found everything. Fix:
+> the `resolve.rs` unqualified-call gate now expands **both** sides through
+> `pack_inline_owner_set` and tests for a shared owner (a parent's set contains
+> its inline children, so parent↔child agrees whichever side names the parent).
+> Gold `cpp-inline-ns-transparency-references-all-calls` (def-anchored) now
+> passes deterministically; `-references-from-use` locks the symmetry.
+>
 > **PARKED residuals** (same family, different seam — not this resolution-gate
 > slice):
 > - **A1 function-designator emission.** `absl::ascii_isspace` passed by name to

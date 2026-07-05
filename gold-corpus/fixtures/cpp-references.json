@@ -566,11 +566,31 @@
       "difficulty": "hard",
       "semantic_area": "cpp-multilang",
       "lang": "cpp",
-      "comment": "hitlist-5 Family A1: references on an inline-namespaced free-function def must find BOTH call sites \u2014 the unqualified same-namespace call AND the qualified `mylib::is_thing` call whose resolved_package is the transparent parent. The refs_to package gate expands the named owner through pack_inline_owner_set before comparing.",
+      "comment": "hitlist-5 Family A1 + refs-symmetry: references ANCHORED ON THE DEF of an inline-namespaced free function must find BOTH call sites \u2014 the unqualified same-namespace call (line 24) AND the qualified `mylib::is_thing` call (line 25). The def is attributed to the parent `mylib` (the inline child `v1` is macro-formed and never entered the sticky context), while the unqualified use's enclosing owner is positionally the inline CHILD `v1`; the refs_to package gate must expand BOTH sides through pack_inline_owner_set (parent\u2194child), not just the named-owner side, or the def-anchored gr drops the unqualified use while use-anchored gr (below) keeps it.",
       "root": "gold-corpus/cpp-fixture",
       "file": "inline_ns_transparency.cpp",
       "line": 20,
       "col": 12,
+      "expect": {
+        "all": [
+          "\"col\":\"13\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"21\"",
+          "\"col\":\"12\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"24\"",
+          "\"col\":\"19\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"25\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-inline-ns-transparency-references-from-use",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "comment": "Symmetry companion: references ANCHORED ON THE UNQUALIFIED USE (line 24) must return the SAME set as the def-anchored row above \u2014 def + unqualified use + qualified use. Locks that gr is anchor-independent across the inline-namespace owner gate.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inline_ns_transparency.cpp",
+      "line": 23,
+      "col": 11,
       "expect": {
         "all": [
           "\"col\":\"13\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"21\"",

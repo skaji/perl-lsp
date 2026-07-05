@@ -4353,18 +4353,25 @@ fn collect_from_analysis(
                 let ns_relative = relative_ns && matches!(target.kind, TargetKind::Sub { .. });
                 let pkg_matches = |pkg: &Option<String>| {
                     pkg_agrees(ns_relative, pkg.as_deref(), scope.as_deref())
-                        // Inline-namespace transparency: a call keyed on the
-                        // transparent parent (`mylib::is_thing`, `absl::X`)
-                        // reaches a def filed under an `inline namespace`
-                        // child (`v1`, `head`). The named owner expands
-                        // DOWNWARD through inline children exactly as
-                        // completion / goto-def's owner lookup do; only
-                        // name-matching refs reach here, so the per-ref set
-                        // build stays cheap.
+                        // Inline-namespace transparency, BOTH directions. A
+                        // qualified `mylib::is_thing` / `absl::X` keys on the
+                        // transparent parent while the def sits under an inline
+                        // child (`v1`, `head`); an UNQUALIFIED in-namespace use
+                        // is the mirror — its enclosing owner is the inline
+                        // CHILD (`v1`) while the def is attributed to the parent
+                        // (`mylib`) whenever the child namespace was opened by a
+                        // macro the sticky context never recorded. Expanding
+                        // only one side matches the first but drops the second
+                        // (the def-anchored gr asymmetry). Expand BOTH and test
+                        // for a shared owner: a parent's set contains its inline
+                        // children, so parent↔child agrees whichever side names
+                        // the parent. Unrelated namespaces share nothing.
                         || match (pkg.as_deref(), scope.as_deref()) {
-                            (Some(named), Some(actual)) => pack_inline_owner_set(analysis, named)
-                                .iter()
-                                .any(|o| o == actual),
+                            (Some(named), Some(actual)) => {
+                                let a = pack_inline_owner_set(analysis, named);
+                                let b = pack_inline_owner_set(analysis, actual);
+                                a.iter().any(|o| b.contains(o))
+                            }
                             _ => false,
                         }
                         || (target.scope == OverrideScope::Hierarchy
