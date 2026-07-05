@@ -1,1313 +1,1367 @@
 {
- "capability": "definition",
- "rows": [
-  {
-   "id": "cpp-definition-call-to-free-function",
-   "difficulty": "simple",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "sample.cpp",
-   "line": 16,
-   "col": 12,
-   "expect": {
-    "all": [
-     "sample.cpp:13:5"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-chain-root-free-function-call",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "chainroot.cpp",
-   "line": 7,
-   "col": 19,
-   "expect": {
-    "all": [
-     "chainroot.cpp:3:10"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist-include-nav",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "inc_nav.cpp",
-   "line": 0,
-   "col": 10,
-   "expect": {
-    "all": [
-     "incdep.h"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-svhead-comment-blocked-field-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Family M #1: `_SV_HEAD(ptrtype)` is a function-like member-block macro whose `\\`-continued body carries a trailing block comment on each field line. tree-sitter-cpp ends `preproc_arg` at the first comment, so the CST-span body kept only `sv_any` (perl5 sv.h `_SV_HEAD` shape \u2192 SV member intelligence dark). Fix: derive the body from raw source across continuations (strip comments) + handle function-like member-block macros as roles. `sv_flags` is the last, comment-blocked field with no `;` of its own.",
-   "file": "svhead.c",
-   "line": 14,
-   "col": 20,
-   "expect": {
-    "all": [
-     "svhead.c:10:14"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-svhead-continued-field-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "svhead.c",
-   "line": 15,
-   "col": 20,
-   "expect": {
-    "all": [
-     "svhead.c:9:14"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-svhead-first-field-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "svhead.c",
-   "line": 16,
-   "col": 20,
-   "expect": {
-    "all": [
-     "svhead.c:8:14"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-svhead-funclike-base-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "goto-def on the function-like member-block paste `_SV_HEAD(void*)` resolves to the macro #define, not itself.",
-   "file": "svhead.c",
-   "line": 11,
-   "col": 15,
-   "expect": {
-    "all": [
-     "svhead.c:7:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-member-block-field-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "member_block.cpp",
-   "line": 8,
-   "col": 22,
-   "expect": {
-    "all": [
-     "member_block.cpp:3:32"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-member-block-base-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "member_block.cpp",
-   "line": 4,
-   "col": 14,
-   "expect": {
-    "all": [
-     "member_block.cpp:3:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-definition-cross-file-enum-variant",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-multilang-crossfile",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture/xenum",
-   "file": "use.c",
-   "line": 2,
-   "col": 16,
-   "expect": {
-    "all": [
-     "opcodes.h:3:5"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-definition-domain-typing-op-type-offers-enum",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-domain",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "domain_enum.c",
-   "line": 6,
-   "col": 14,
-   "expect": {
-    "all": [
-     "domain_enum.c:5:29",
-     "domain_enum.c:4:6"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-definition-domain-mixed-slot-real-decl-no-enum",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-domain",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "domain_mixed.c",
-   "line": 3,
-   "col": 11,
-   "expect": {
-    "all": [
-     "domain_mixed.c:2:19"
-    ],
-    "none": [
-     "domain_mixed.c:1:"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-definition-domain-owner-separation-enum-side",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-domain",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "domain_owner.c",
-   "line": 3,
-   "col": 38,
-   "expect": {
-    "all": [
-     "domain_owner.c:2:21",
-     "domain_owner.c:1:6"
-    ],
-    "none": [
-     "domain_owner.c:3:20"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-definition-domain-owner-separation-int-side",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-domain",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "domain_owner.c",
-   "line": 6,
-   "col": 37,
-   "expect": {
-    "all": [
-     "domain_owner.c:3:20"
-    ],
-    "none": [
-     "domain_owner.c:1:6",
-     "domain_owner.c:2:21"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-sym-typedef-use-to-def",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-symmetry",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "sympair/typedefpair.c",
-   "line": 1,
-   "col": 0,
-   "expect": {
-    "all": [
-     "typedefpair.c:1:24"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-sym-global-use-to-def",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-symmetry",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "sympair/globalpair.c",
-   "line": 1,
-   "col": 20,
-   "expect": {
-    "all": [
-     "globalpair.c:1:5"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-sym-type-use-to-def",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-symmetry",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "struct_refs.cpp",
-   "line": 1,
-   "col": 0,
-   "expect": {
-    "all": [
-     "struct_refs.cpp:1:8"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-sym-enum-variant-use-to-def",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-symmetry",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "xenum/use.c",
-   "line": 2,
-   "col": 16,
-   "expect": {
-    "all": [
-     "opcodes.h:3:5"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-definition-brace-init-member-through-declared-var",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-parse-repair",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "brace_init.cpp",
-   "line": 3,
-   "col": 11,
-   "expect": {
-    "all": [
-     "brace_init.cpp:1:20"
-    ],
-    "none": []
-   }
-  },
-  {
-   "id": "cpp-definition-member-after-same-line-macro-splice",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-parse-repair",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "splice_member.c",
-   "line": 5,
-   "col": 9,
-   "expect": {
-    "all": [
-     "splice_member.c:3:21"
-    ],
-    "none": []
-   }
-  },
-  {
-   "id": "cpp-template-struct-gd-from-trailing-return-cross-file",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_sep.cpp",
-   "line": 2,
-   "col": 28,
-   "expect": {
-    "all": [
-     "tmpl_sep.h:3:33"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_instance.cpp",
-   "status": "gold",
-   "id": "cpp-template-instance-member-goto-def",
-   "line": 29,
-   "col": 6,
-   "expect": {
-    "all": [
-     "tmpl_instance.cpp:15:9"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_instance.cpp",
-   "status": "gold",
-   "id": "cpp-template-instance-param-typed-member-goto-def",
-   "line": 30,
-   "col": 6,
-   "expect": {
-    "all": [
-     "tmpl_instance.cpp:14:7"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_instance.cpp",
-   "status": "gold",
-   "id": "cpp-typedef-chase-to-instance-member-goto-def",
-   "line": 32,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_instance.cpp:15:9"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_instance.cpp",
-   "status": "gold",
-   "id": "cpp-instance-spec-exact-spelling-wins-goto-def",
-   "line": 35,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_instance.cpp:25:10"
-    ],
-    "none": [
-     "tmpl_instance.cpp:22"
-    ]
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_instance.cpp",
-   "status": "gold",
-   "id": "cpp-instance-no-spec-falls-to-primary-goto-def",
-   "line": 36,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_instance.cpp:22:10"
-    ],
-    "none": [
-     "tmpl_instance.cpp:25"
-    ]
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-typing-chain-gd-through-substituted-return",
-   "line": 32,
-   "col": 13,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:7:10"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-typing-chain-gd-through-param-field",
-   "line": 33,
-   "col": 14,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:7:10"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-partial-spec-member-gd",
-   "line": 36,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:22:7"
-    ],
-    "none": [
-     "tmpl_typing.cpp:19"
-    ]
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-chain-gd-through-partial-spec-binding",
-   "line": 36,
-   "col": 15,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:7:10"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-family-gd-ranked-spec-first-primary-kept",
-   "line": 37,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:23:9",
-     "tmpl_typing.cpp:19:9"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-exact-spec-beats-partial-gd",
-   "line": 39,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:26:9"
-    ],
-    "none": [
-     "tmpl_typing.cpp:23",
-     "tmpl_typing.cpp:19"
-    ]
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typing.cpp",
-   "status": "gold",
-   "id": "cpp-tmpl-no-spec-match-falls-to-primary-gd",
-   "line": 41,
-   "col": 7,
-   "expect": {
-    "all": [
-     "tmpl_typing.cpp:19:9"
-    ],
-    "none": [
-     "tmpl_typing.cpp:23",
-     "tmpl_typing.cpp:26"
-    ]
-   }
-  },
-  {
-   "id": "cpp-hitlist2-fnptr-typedef-gd-dark",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist2",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` \u2014 a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use \u2014 verbs disagree on one symbol).",
-   "file": "fnptr_typedef.cpp",
-   "line": 1,
-   "col": 0,
-   "expect": {
-    "all": [
-     "fnptr_typedef.cpp:1:17"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist2-nested-union-cross-file-gd-dark",
-   "difficulty": "hard",
-   "semantic_area": "cpp-hitlist2",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture/nestunion",
-   "comment": "hitlist-2 #16: `union U { struct { int ping; } data; }` in a header, accessed cross-file as `u->data.ping`. gd on `ping` at the use site can't reach the field decl (the anonymous-struct-in-union DX covers the defining file's own outline/completion, per union_nest.c, but not cross-file access).",
-   "file": "use.c",
-   "line": 2,
-   "col": 12,
-   "expect": {
-    "all": [
-     "msg.h:3:13"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist2-spec-ladder-type-gd",
-   "difficulty": "hard",
-   "semantic_area": "cpp-hitlist2-identity-precision",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_typegd.cpp",
-   "line": 6,
-   "col": 14,
-   "comment": "Type-REFERENCE gd consults the specificity ladder: the base-clause fmtr<int> offers the exact spec (ranked first) AND the primary (kept, never pruned) \u2014 the chrono.h:1904 -> 2101 shape.",
-   "expect": {
-    "all": [
-     "tmpl_typegd.cpp:4:20",
-     "tmpl_typegd.cpp:1:30"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist2-qualified-enum-constant-gd",
-   "difficulty": "hard",
-   "semantic_area": "cpp-hitlist2-namespace",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "nsenum/use.cc",
-   "line": 2,
-   "col": 24,
-   "comment": "ns::EnumClass::kValue gd: the constant resolves through its owning class (the qualifier segment), not the file-scope by-name tail \u2014 the abseil status.cc:223 shape.",
-   "expect": {
-    "all": [
-     "codes.h:5:3"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist2-namespace-middle-segment-gd",
-   "difficulty": "hard",
-   "semantic_area": "cpp-hitlist2-namespace",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "nsenum/use.cc",
-   "line": 2,
-   "col": 18,
-   "comment": "gd on the MIDDLE segment (the enum-class name inside ns::Code::kBad) resolves to the enum def via the bare-word fallback.",
-   "expect": {
-    "all": [
-     "codes.h:4:12"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist2-qualified-call-gd-alpha",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist2-namespace",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "nsqual.cpp",
-   "line": 6,
-   "col": 32,
-   "comment": "gd from a qualified call lands on the SAME-namespace overload, not the sibling namespace's.",
-   "expect": {
-    "all": [
-     "nsqual.cpp:2:5"
-    ],
-    "none": [
-     "nsqual.cpp:5:5"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-hitlist2-qualified-call-gd-beta",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist2-namespace",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "nsqual.cpp",
-   "line": 6,
-   "col": 47,
-   "comment": "\u2026and the sibling namespace's call lands on ITS def \u2014 the pair proves qualifier-keyed selection.",
-   "expect": {
-    "all": [
-     "nsqual.cpp:5:5"
-    ],
-    "none": [
-     "nsqual.cpp:2:5"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist2-decl-def",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "id": "cpp-hitlist2-static-forward-decl-offers-body",
-   "file": "fwddef/state.c",
-   "line": 1,
-   "col": 11,
-   "comment": "gd on a static forward decl offers the bodied definition (ranked first) with the decl kept \u2014 hitlist-2 #15.",
-   "expect": {
-    "all": [
-     "state.c:8:12",
-     "state.c:2:12"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist2-decl-def",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "id": "cpp-hitlist2-call-through-forward-decl-offers-body",
-   "file": "fwddef/state.c",
-   "line": 4,
-   "col": 21,
-   "comment": "gd from a call that resolves to the forward decl offers the body too.",
-   "expect": {
-    "all": [
-     "state.c:8:12",
-     "state.c:2:12"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist2-decl-def",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "id": "cpp-hitlist2-extern-decl-offers-defining-tu",
-   "file": "fwddef/state.h",
-   "line": 3,
-   "col": 24,
-   "comment": "gd on `extern struct GameState g_state;` offers the defining TU's instance (reverse closure: state.c includes state.h); the extern decl is kept, never pruned.",
-   "expect": {
-    "all": [
-     "state.c:3:18",
-     "state.h:4:25"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-ctxparam-macro",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "ctxparam/ctxparam.c",
-   "id": "cpp-ctxparam-member-gd-control",
-   "line": 6,
-   "col": 11,
-   "comment": "gd on rcpv->refcount where rcpv is `RCPV *rcpv = RCPVx(pv)`. The uppercase macro-call `RCPVx(pv)` mis-fires a ctor-convention ClassName(RCPVx) that shadowed the declared type RCPV; member resolution then leaned on a single-entry package_parents fallback that broke once the header held a second decl. Fix: an explicit type annotation outranks an inferred flow class assertion (WitnessSource::priority ANNOT_SOURCE), so the receiver types RCPV and resolves the field robustly. Real-world: perl5 op.c:16170.",
-   "expect": {
-    "all": [
-     "ctx.h:30:"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-ctxparam-macro",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "ctxparam/ctxparam.c",
-   "id": "cpp-ctxparam-member-gd-nested",
-   "line": 14,
-   "col": 11,
-   "comment": "gd on rcpv->refcount inside Perl_rcpv_copy(pTHX_ char *pv). The pTHX_ param-macro chain is incidental \u2014 the break was the ctor-convention misfire on the RCPVx(pv) initializer shadowing the declared RCPV type (same root cause as -control). refcount lives on struct rcpv via typedef RCPV.",
-   "expect": {
-    "all": [
-     "ctx.h:30:"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-overload-arity",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "overload_arity.cpp",
-   "id": "cpp-overload-arity-zero-arg",
-   "line": 9,
-   "col": 20,
-   "comment": "gd on a 0-arg call pick() ranks the 0-param overload FIRST; the whole family stays visible (never pruned). The `none` anchor asserts the winner is not preceded by a newline, i.e. it is the first result.",
-   "expect": {
-    "all": [
-     "overload_arity.cpp:5:5",
-     "overload_arity.cpp:6:5",
-     "overload_arity.cpp:7:5",
-     "overload_arity.cpp:8:5"
-    ],
-    "none": [
-     "\noverload_arity.cpp:5:5"
-    ]
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-overload-arity",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "overload_arity.cpp",
-   "id": "cpp-overload-arity-one-arg",
-   "line": 10,
-   "col": 20,
-   "comment": "gd on a 1-arg call pick(1) ranks the 1-param overload FIRST; family never pruned.",
-   "expect": {
-    "all": [
-     "overload_arity.cpp:5:5",
-     "overload_arity.cpp:6:5",
-     "overload_arity.cpp:7:5",
-     "overload_arity.cpp:8:5"
-    ],
-    "none": [
-     "\noverload_arity.cpp:6:5"
-    ]
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-overload-arity",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "overload_arity.cpp",
-   "id": "cpp-overload-arity-two-arg",
-   "line": 11,
-   "col": 20,
-   "comment": "gd on a 2-arg call pick(1, 2) ranks the exact 2-param overload FIRST, ahead of the defaulted 3/4-param overload; family never pruned.",
-   "expect": {
-    "all": [
-     "overload_arity.cpp:5:5",
-     "overload_arity.cpp:6:5",
-     "overload_arity.cpp:7:5",
-     "overload_arity.cpp:8:5"
-    ],
-    "none": [
-     "\noverload_arity.cpp:7:5"
-    ]
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-overload-arity",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "overload_arity.cpp",
-   "id": "cpp-overload-arity-defaulted",
-   "line": 12,
-   "col": 20,
-   "comment": "gd on a 3-arg call pick(1, 2, 3) ranks the defaulted overload (3 required, 4 total) FIRST \u2014 the only signature the arg count fits; family never pruned.",
-   "expect": {
-    "all": [
-     "overload_arity.cpp:5:5",
-     "overload_arity.cpp:6:5",
-     "overload_arity.cpp:7:5",
-     "overload_arity.cpp:8:5"
-    ],
-    "none": [
-     "\noverload_arity.cpp:8:5"
-    ]
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "sibling_call.cpp",
-   "id": "cpp-sibling-call-template-outofline",
-   "line": 8,
-   "col": 30,
-   "comment": "bare grow(n) inside the OUT-OF-LINE TEMPLATE body Buf<T>::reserve is an implicit this->grow \u2014 links to the sibling method decl (the enclosing class comes off the peeled method symbol, not the package-less out-of-line body scope).",
-   "expect": {
-    "all": [
-     "sibling_call.cpp:5:10"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "sibling_call.cpp",
-   "id": "cpp-sibling-call-inclass",
-   "line": 13,
-   "col": 20,
-   "comment": "bare paint() inside the IN-CLASS body Widget::render is an implicit this->paint \u2014 links to the sibling method decl.",
-   "expect": {
-    "all": [
-     "sibling_call.cpp:12:10"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "sibling_call.cpp",
-   "id": "cpp-sibling-call-plain-outofline",
-   "line": 16,
-   "col": 24,
-   "comment": "bare width() inside the plain (non-template) OUT-OF-LINE body Widget::resize links to the sibling method decl.",
-   "expect": {
-    "all": [
-     "sibling_call.cpp:13:9"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "moderate",
-   "semantic_area": "cpp-hitlist",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "sibling_call.cpp",
-   "id": "cpp-sibling-call-free-function-only",
-   "line": 20,
-   "col": 17,
-   "comment": "bare helper() inside Gadget::run has NO sibling method of that name \u2014 the sibling-call pass leaves it untouched, so it still resolves to the FREE function (no false link, no over-claim).",
-   "expect": {
-    "all": [
-     "sibling_call.cpp:19:5"
-    ],
-    "none": []
-   }
-  },
-  {
-   "difficulty": "hard",
-   "semantic_area": "cpp-hitlist",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "status": "gold",
-   "file": "sibling_call.cpp",
-   "id": "cpp-sibling-call-shadows-free",
-   "line": 25,
-   "col": 18,
-   "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the implicit-this sibling member Board::freefunc ranks FIRST (owner-matched), the free decl kept below (family never pruned). Resolved by owner-anchored overload ranking (Family Q) \u2014 the free fn no longer shadows the sibling.",
-   "expect": {
-    "all": [
-     "sibling_call.cpp:25:10"
-    ],
-    "none": [
-     "\nsibling_call.cpp:25:10"
-    ]
-   }
-  },
-  {
-   "id": "cpp-family-q-qualified-enum-case-label",
-   "difficulty": "hard",
-   "semantic_area": "cpp-family-q-owner-anchor",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "ownerqual/use.cpp",
-   "line": 3,
-   "col": 18,
-   "comment": "gd on `case dynamic::STRING:` anchors on the `dynamic::` qualifier and lands on the nested-enum enumerator in kind.h - a same-named `#define STRING` in an unrelated file must NOT hijack it (macro lane preempted by owner-anchored resolution).",
-   "expect": {
-    "all": [
-     "kind.h:4:20"
-    ],
-    "none": [
-     "collide.cpp"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-family-q-qualified-enum-expr",
-   "difficulty": "hard",
-   "semantic_area": "cpp-family-q-owner-anchor",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "ownerqual/use.cpp",
-   "line": 8,
-   "col": 23,
-   "comment": "gd on `k == dynamic::STRING` (expression position) - same owner-anchored resolution as the case label; the `#define STRING` collider stays out.",
-   "expect": {
-    "all": [
-     "kind.h:4:20"
-    ],
-    "none": [
-     "collide.cpp"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-family-q-member-call-ranked-over-free",
-   "difficulty": "hard",
-   "semantic_area": "cpp-family-q-owner-anchor",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "memfree/use.cpp",
-   "line": 2,
-   "col": 17,
-   "comment": "gd on `logger.info(5)` where a same-named FREE `info` exists - the receiver-class member ranks FIRST (owner-matched), the free function stays in the set below (family never pruned).",
-   "expect": {
-    "all": [
-     "log.h:4:7",
-     "log.h:6:5"
-    ],
-    "none": [
-     "\nlog.h:4:7"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-family-q-namespace-scoped-enum-leak",
-   "difficulty": "hard",
-   "semantic_area": "cpp-family-q-owner-anchor",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "nsleak/use.cpp",
-   "line": 2,
-   "col": 16,
-   "comment": "gd on `level::info` where `info` is an unscoped enumerator of `enum level_enum` nested in `namespace level` - the qualifier is the NAMESPACE (not a cache key, and the enumerator is not linkage-visible), so resolution walks the origin include closure and bridges the namespace->enum->enumerator leak by span containment. The spdlog level::info shape.",
-   "expect": {
-    "all": [
-     "common.h:4:39"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-call-receiver-field-goto-def",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Field member access through a call-expression receiver: `cfMkStruct()->slot` where `cfMkStruct` is a pointer-returning prototype (`CallW *cfMkStruct(void);`). The callee's declared return type is the sole source for the receiver class, so the prototype/pointer skeleton patterns must carry @rettype; the existing expr_type_at_span member-chain path then resolves the field.",
-   "file": "callfield.c",
-   "line": 11,
-   "col": 26,
-   "expect": {
-    "all": [
-     "callfield.c:2:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-call-receiver-field-crossfile-var",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Cross-file field access through a VARIABLE receiver whose type is declared at the use site (`CfGadget *g = cfMakeGadget(); g->weight`). The struct lives in the included header; the variable's declared type resolves the field cross-file without needing the callee's return type.",
-   "file": "callfield_use.c",
-   "line": 4,
-   "col": 15,
-   "expect": {
-    "all": [
-     "callfield.h:2:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-call-receiver-field-crossfile-call",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Field access through a call-expression receiver whose callee prototype lives in an INCLUDED header (`cfMakeGadget()->height`, `CfGadget *cfMakeGadget(void);` in callfield.h). The callee return type crosses the boundary through query_sub_return_type's include-closure arm (resolved-target-keyed, not the Perl export model); expr_type_at_span's member-chain then types the receiver. See negctrl_use for the over-linking negative control.",
-   "file": "callfield_use.c",
-   "line": 5,
-   "col": 28,
-   "expect": {
-    "all": [
-     "callfield.h:3:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-call-receiver-field-crossfile-negctrl-positive",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Non-vacuity companion to the negative control: negctrl_pos.c DOES #include negctrl_other.h, so `ncMakeThing()->secret` resolves cross-file to the header's field. Same code as negctrl_use.c minus the include — the pair isolates the include-closure gate as the sole difference.",
-   "file": "negctrl_pos.c",
-   "line": 2,
-   "col": 27,
-   "expect": {
-    "all": [
-     "negctrl_other.h:2:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-call-receiver-field-crossfile-negctrl-silent",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Over-linking negative control: negctrl_use.c does NOT #include negctrl_other.h, where an unrelated same-named `ncMakeThing` (with a `secret` field) is declared. The include closure never reaches it, so the callee return type must not cross the boundary — gd on `secret` stays silent, never landing on the unrelated function's struct. Guards query_sub_return_type's include-closure gate against bare-name cross-contamination.",
-   "file": "negctrl_use.c",
-   "line": 8,
-   "col": 27,
-   "expect": {
-    "all": [],
-    "none": [
-     "negctrl_other.h"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-tmpl-valarg-enum-value-gd",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "comment": "Enum value as template ARGUMENT (`MakeError<StatusCode::kNotFound>`): gd on the value token lands on the enumerator def. Works via the owner-anchored qualified-read path; pinned so the template-arg slice can't regress it.",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_valarg.cpp",
-   "line": 18,
-   "col": 35,
-   "expect": {
-    "all": [
-     "tmpl_valarg.cpp:3:3"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-tmpl-valarg-enum-qualifier-gd",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "comment": "The `StatusCode::` qualifier inside the template arg gds to the enum type def.",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_valarg.cpp",
-   "line": 18,
-   "col": 24,
-   "expect": {
-    "all": [
-     "tmpl_valarg.cpp:1:12"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-tmpl-valarg-plain-const-gd",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "comment": "Plain constant as template arg (`Buffer<BUF_LIMIT>`): the grammar guesses TYPE, so the token is a PackageRef; gd must fall through type space to the value decl (`const int BUF_LIMIT`), not land at file top (1:1) via the module-file fallback.",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_valarg.cpp",
-   "line": 19,
-   "col": 11,
-   "expect": {
-    "all": [
-     "tmpl_valarg.cpp:6:11"
-    ],
-    "none": [
-     "tmpl_valarg.cpp:1:1"
-    ]
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-tmpl-valarg-nested-qualified-enum-gd",
-   "difficulty": "moderate",
-   "semantic_area": "cpp-templates",
-   "lang": "cpp",
-   "comment": "Nested-qualified enum value as template arg (`Run<outer::Mode::kSlow>`): gd on the value token lands on the enumerator def.",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "tmpl_valarg.cpp",
-   "line": 37,
-   "col": 28,
-   "expect": {
-    "all": [
-     "tmpl_valarg.cpp:28:3"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-cfgtwin-thx-ifdef-member-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "cfgtwin/cfgtwin.c",
-   "line": 49,
-   "col": 7,
-   "comment": "Case B: `o->slabbed` inside `thx_ifdef`, a pTHX_-param fn wrapped in `#ifdef PERL_DEBUG_READONLY_OPS`. The macro-expansion exclusion over-reached the region body, so pTHX_ stayed literal, `o` mistyped, and the member went dark. Slice 1 narrows EXCLUDE_QUERY to the directive/condition tokens.",
-   "expect": {
-    "all": [
-     "cfgtwin.c:27:16"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-cfgtwin-ndef-thx-member-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "cfgtwin/cfgtwin.c",
-   "line": 93,
-   "col": 7,
-   "comment": "Case B (config-ACTIVE arm): `o->slabbed` inside `ndef_thx` under an always-true `#ifndef SOMETHING_NEVER_DEFINED`. The exclusion is condition-blind, so even the active arm went dark. Cured by the same EXCLUDE_QUERY narrowing.",
-   "expect": {
-    "all": [
-     "cfgtwin.c:27:16"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-cfgtwin-twin-thx-else-member-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "file": "cfgtwin/cfgtwin.c",
-   "line": 86,
-   "col": 7,
-   "comment": "Case B (`#else` arm of a pTHX_ twin): `o->slabbed` inside the `#else` arm of `twin_thx`. The #else body is region body too, so the pTHX_ use went dark. Cured by the same EXCLUDE_QUERY narrowing.",
-   "expect": {
-    "all": [
-     "cfgtwin.c:27:16"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  },
-  {
-   "id": "cpp-ctorif-decl-directive-late-member-goto-def",
-   "difficulty": "hard",
-   "semantic_area": "cpp-multilang-macros",
-   "lang": "cpp",
-   "root": "gold-corpus/cpp-fixture",
-   "comment": "Case A (reduced): gd on `w.late_field`, a member declared AFTER a ctor-initializer `#if`. Repairing the declaration-position directive keeps the class intact so the late member still attributes to Widget.",
-   "file": "ctorif/ctorif.cpp",
-   "line": 25,
-   "col": 6,
-   "expect": {
-    "all": [
-     "ctorif.cpp:20:9"
-    ],
-    "none": []
-   },
-   "status": "gold"
-  }
- ]
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "cpp-definition-call-to-free-function",
+      "difficulty": "simple",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "sample.cpp",
+      "line": 16,
+      "col": 12,
+      "expect": {
+        "all": [
+          "sample.cpp:13:5"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-chain-root-free-function-call",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "chainroot.cpp",
+      "line": 7,
+      "col": 19,
+      "expect": {
+        "all": [
+          "chainroot.cpp:3:10"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist-include-nav",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inc_nav.cpp",
+      "line": 0,
+      "col": 10,
+      "expect": {
+        "all": [
+          "incdep.h"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-svhead-comment-blocked-field-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Family M #1: `_SV_HEAD(ptrtype)` is a function-like member-block macro whose `\\`-continued body carries a trailing block comment on each field line. tree-sitter-cpp ends `preproc_arg` at the first comment, so the CST-span body kept only `sv_any` (perl5 sv.h `_SV_HEAD` shape \u2192 SV member intelligence dark). Fix: derive the body from raw source across continuations (strip comments) + handle function-like member-block macros as roles. `sv_flags` is the last, comment-blocked field with no `;` of its own.",
+      "file": "svhead.c",
+      "line": 14,
+      "col": 20,
+      "expect": {
+        "all": [
+          "svhead.c:10:14"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-svhead-continued-field-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "svhead.c",
+      "line": 15,
+      "col": 20,
+      "expect": {
+        "all": [
+          "svhead.c:9:14"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-svhead-first-field-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "svhead.c",
+      "line": 16,
+      "col": 20,
+      "expect": {
+        "all": [
+          "svhead.c:8:14"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-svhead-funclike-base-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "goto-def on the function-like member-block paste `_SV_HEAD(void*)` resolves to the macro #define, not itself.",
+      "file": "svhead.c",
+      "line": 11,
+      "col": 15,
+      "expect": {
+        "all": [
+          "svhead.c:7:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-member-block-field-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 8,
+      "col": 22,
+      "expect": {
+        "all": [
+          "member_block.cpp:3:32"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-member-block-base-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "member_block.cpp",
+      "line": 4,
+      "col": 14,
+      "expect": {
+        "all": [
+          "member_block.cpp:3:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-cross-file-enum-variant",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/xenum",
+      "file": "use.c",
+      "line": 2,
+      "col": 16,
+      "expect": {
+        "all": [
+          "opcodes.h:3:5"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-typing-op-type-offers-enum",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 6,
+      "col": 14,
+      "expect": {
+        "all": [
+          "domain_enum.c:5:29",
+          "domain_enum.c:4:6"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-mixed-slot-real-decl-no-enum",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_mixed.c",
+      "line": 3,
+      "col": 11,
+      "expect": {
+        "all": [
+          "domain_mixed.c:2:19"
+        ],
+        "none": [
+          "domain_mixed.c:1:"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-owner-separation-enum-side",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 3,
+      "col": 38,
+      "expect": {
+        "all": [
+          "domain_owner.c:2:21",
+          "domain_owner.c:1:6"
+        ],
+        "none": [
+          "domain_owner.c:3:20"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-domain-owner-separation-int-side",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 6,
+      "col": 37,
+      "expect": {
+        "all": [
+          "domain_owner.c:3:20"
+        ],
+        "none": [
+          "domain_owner.c:1:6",
+          "domain_owner.c:2:21"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-sym-typedef-use-to-def",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-symmetry",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "sympair/typedefpair.c",
+      "line": 1,
+      "col": 0,
+      "expect": {
+        "all": [
+          "typedefpair.c:1:24"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-sym-global-use-to-def",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-symmetry",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "sympair/globalpair.c",
+      "line": 1,
+      "col": 20,
+      "expect": {
+        "all": [
+          "globalpair.c:1:5"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-sym-type-use-to-def",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-symmetry",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "struct_refs.cpp",
+      "line": 1,
+      "col": 0,
+      "expect": {
+        "all": [
+          "struct_refs.cpp:1:8"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-sym-enum-variant-use-to-def",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-symmetry",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "xenum/use.c",
+      "line": 2,
+      "col": 16,
+      "expect": {
+        "all": [
+          "opcodes.h:3:5"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-brace-init-member-through-declared-var",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-parse-repair",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "brace_init.cpp",
+      "line": 3,
+      "col": 11,
+      "expect": {
+        "all": [
+          "brace_init.cpp:1:20"
+        ],
+        "none": []
+      }
+    },
+    {
+      "id": "cpp-definition-member-after-same-line-macro-splice",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-parse-repair",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "splice_member.c",
+      "line": 5,
+      "col": 9,
+      "expect": {
+        "all": [
+          "splice_member.c:3:21"
+        ],
+        "none": []
+      }
+    },
+    {
+      "id": "cpp-template-struct-gd-from-trailing-return-cross-file",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_sep.cpp",
+      "line": 2,
+      "col": 28,
+      "expect": {
+        "all": [
+          "tmpl_sep.h:3:33"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-member-goto-def",
+      "line": 29,
+      "col": 6,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:15:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-template-instance-param-typed-member-goto-def",
+      "line": 30,
+      "col": 6,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:14:7"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-typedef-chase-to-instance-member-goto-def",
+      "line": 32,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:15:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-instance-spec-exact-spelling-wins-goto-def",
+      "line": 35,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:25:10"
+        ],
+        "none": [
+          "tmpl_instance.cpp:22"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_instance.cpp",
+      "status": "gold",
+      "id": "cpp-instance-no-spec-falls-to-primary-goto-def",
+      "line": 36,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_instance.cpp:22:10"
+        ],
+        "none": [
+          "tmpl_instance.cpp:25"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-chain-gd-through-substituted-return",
+      "line": 32,
+      "col": 13,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:7:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-typing-chain-gd-through-param-field",
+      "line": 33,
+      "col": 14,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:7:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-partial-spec-member-gd",
+      "line": 36,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:22:7"
+        ],
+        "none": [
+          "tmpl_typing.cpp:19"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-chain-gd-through-partial-spec-binding",
+      "line": 36,
+      "col": 15,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:7:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-family-gd-ranked-spec-first-primary-kept",
+      "line": 37,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:23:9",
+          "tmpl_typing.cpp:19:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-exact-spec-beats-partial-gd",
+      "line": 39,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:26:9"
+        ],
+        "none": [
+          "tmpl_typing.cpp:23",
+          "tmpl_typing.cpp:19"
+        ]
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typing.cpp",
+      "status": "gold",
+      "id": "cpp-tmpl-no-spec-match-falls-to-primary-gd",
+      "line": 41,
+      "col": 7,
+      "expect": {
+        "all": [
+          "tmpl_typing.cpp:19:9"
+        ],
+        "none": [
+          "tmpl_typing.cpp:23",
+          "tmpl_typing.cpp:26"
+        ]
+      }
+    },
+    {
+      "id": "cpp-hitlist2-fnptr-typedef-gd-dark",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-2 #10: `typedef void *(*loader)(int);` \u2014 a function-pointer typedef, deeply nested declarator (pointer_declarator > function_declarator > parenthesized_declarator > pointer_declarator). gd from a use (`loader g_loader;`) can't reach the typedef name at all (references on the typedef name itself DOES find the use \u2014 verbs disagree on one symbol).",
+      "file": "fnptr_typedef.cpp",
+      "line": 1,
+      "col": 0,
+      "expect": {
+        "all": [
+          "fnptr_typedef.cpp:1:17"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-nested-union-cross-file-gd-dark",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/nestunion",
+      "comment": "hitlist-2 #16: `union U { struct { int ping; } data; }` in a header, accessed cross-file as `u->data.ping`. gd on `ping` at the use site can't reach the field decl (the anonymous-struct-in-union DX covers the defining file's own outline/completion, per union_nest.c, but not cross-file access).",
+      "file": "use.c",
+      "line": 2,
+      "col": 12,
+      "expect": {
+        "all": [
+          "msg.h:3:13"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-spec-ladder-type-gd",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-identity-precision",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_typegd.cpp",
+      "line": 6,
+      "col": 14,
+      "comment": "Type-REFERENCE gd consults the specificity ladder: the base-clause fmtr<int> offers the exact spec (ranked first) AND the primary (kept, never pruned) \u2014 the chrono.h:1904 -> 2101 shape.",
+      "expect": {
+        "all": [
+          "tmpl_typegd.cpp:4:20",
+          "tmpl_typegd.cpp:1:30"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-enum-constant-gd",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsenum/use.cc",
+      "line": 2,
+      "col": 24,
+      "comment": "ns::EnumClass::kValue gd: the constant resolves through its owning class (the qualifier segment), not the file-scope by-name tail \u2014 the abseil status.cc:223 shape.",
+      "expect": {
+        "all": [
+          "codes.h:5:3"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-namespace-middle-segment-gd",
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsenum/use.cc",
+      "line": 2,
+      "col": 18,
+      "comment": "gd on the MIDDLE segment (the enum-class name inside ns::Code::kBad) resolves to the enum def via the bare-word fallback.",
+      "expect": {
+        "all": [
+          "codes.h:4:12"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-call-gd-alpha",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsqual.cpp",
+      "line": 6,
+      "col": 32,
+      "comment": "gd from a qualified call lands on the SAME-namespace overload, not the sibling namespace's.",
+      "expect": {
+        "all": [
+          "nsqual.cpp:2:5"
+        ],
+        "none": [
+          "nsqual.cpp:5:5"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist2-qualified-call-gd-beta",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-namespace",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsqual.cpp",
+      "line": 6,
+      "col": 47,
+      "comment": "\u2026and the sibling namespace's call lands on ITS def \u2014 the pair proves qualifier-keyed selection.",
+      "expect": {
+        "all": [
+          "nsqual.cpp:5:5"
+        ],
+        "none": [
+          "nsqual.cpp:2:5"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-static-forward-decl-offers-body",
+      "file": "fwddef/state.c",
+      "line": 1,
+      "col": 11,
+      "comment": "gd on a static forward decl offers the bodied definition (ranked first) with the decl kept \u2014 hitlist-2 #15.",
+      "expect": {
+        "all": [
+          "state.c:8:12",
+          "state.c:2:12"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-call-through-forward-decl-offers-body",
+      "file": "fwddef/state.c",
+      "line": 4,
+      "col": 21,
+      "comment": "gd from a call that resolves to the forward decl offers the body too.",
+      "expect": {
+        "all": [
+          "state.c:8:12",
+          "state.c:2:12"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist2-decl-def",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "id": "cpp-hitlist2-extern-decl-offers-defining-tu",
+      "file": "fwddef/state.h",
+      "line": 3,
+      "col": 24,
+      "comment": "gd on `extern struct GameState g_state;` offers the defining TU's instance (reverse closure: state.c includes state.h); the extern decl is kept, never pruned.",
+      "expect": {
+        "all": [
+          "state.c:3:18",
+          "state.h:4:25"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-ctxparam-macro",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "ctxparam/ctxparam.c",
+      "id": "cpp-ctxparam-member-gd-control",
+      "line": 6,
+      "col": 11,
+      "comment": "gd on rcpv->refcount where rcpv is `RCPV *rcpv = RCPVx(pv)`. The uppercase macro-call `RCPVx(pv)` mis-fires a ctor-convention ClassName(RCPVx) that shadowed the declared type RCPV; member resolution then leaned on a single-entry package_parents fallback that broke once the header held a second decl. Fix: an explicit type annotation outranks an inferred flow class assertion (WitnessSource::priority ANNOT_SOURCE), so the receiver types RCPV and resolves the field robustly. Real-world: perl5 op.c:16170.",
+      "expect": {
+        "all": [
+          "ctx.h:30:"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-ctxparam-macro",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "ctxparam/ctxparam.c",
+      "id": "cpp-ctxparam-member-gd-nested",
+      "line": 14,
+      "col": 11,
+      "comment": "gd on rcpv->refcount inside Perl_rcpv_copy(pTHX_ char *pv). The pTHX_ param-macro chain is incidental \u2014 the break was the ctor-convention misfire on the RCPVx(pv) initializer shadowing the declared RCPV type (same root cause as -control). refcount lives on struct rcpv via typedef RCPV.",
+      "expect": {
+        "all": [
+          "ctx.h:30:"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-overload-arity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "overload_arity.cpp",
+      "id": "cpp-overload-arity-zero-arg",
+      "line": 9,
+      "col": 20,
+      "comment": "gd on a 0-arg call pick() ranks the 0-param overload FIRST; the whole family stays visible (never pruned). The `none` anchor asserts the winner is not preceded by a newline, i.e. it is the first result.",
+      "expect": {
+        "all": [
+          "overload_arity.cpp:5:5",
+          "overload_arity.cpp:6:5",
+          "overload_arity.cpp:7:5",
+          "overload_arity.cpp:8:5"
+        ],
+        "none": [
+          "\noverload_arity.cpp:5:5"
+        ]
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-overload-arity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "overload_arity.cpp",
+      "id": "cpp-overload-arity-one-arg",
+      "line": 10,
+      "col": 20,
+      "comment": "gd on a 1-arg call pick(1) ranks the 1-param overload FIRST; family never pruned.",
+      "expect": {
+        "all": [
+          "overload_arity.cpp:5:5",
+          "overload_arity.cpp:6:5",
+          "overload_arity.cpp:7:5",
+          "overload_arity.cpp:8:5"
+        ],
+        "none": [
+          "\noverload_arity.cpp:6:5"
+        ]
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-overload-arity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "overload_arity.cpp",
+      "id": "cpp-overload-arity-two-arg",
+      "line": 11,
+      "col": 20,
+      "comment": "gd on a 2-arg call pick(1, 2) ranks the exact 2-param overload FIRST, ahead of the defaulted 3/4-param overload; family never pruned.",
+      "expect": {
+        "all": [
+          "overload_arity.cpp:5:5",
+          "overload_arity.cpp:6:5",
+          "overload_arity.cpp:7:5",
+          "overload_arity.cpp:8:5"
+        ],
+        "none": [
+          "\noverload_arity.cpp:7:5"
+        ]
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-overload-arity",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "overload_arity.cpp",
+      "id": "cpp-overload-arity-defaulted",
+      "line": 12,
+      "col": 20,
+      "comment": "gd on a 3-arg call pick(1, 2, 3) ranks the defaulted overload (3 required, 4 total) FIRST \u2014 the only signature the arg count fits; family never pruned.",
+      "expect": {
+        "all": [
+          "overload_arity.cpp:5:5",
+          "overload_arity.cpp:6:5",
+          "overload_arity.cpp:7:5",
+          "overload_arity.cpp:8:5"
+        ],
+        "none": [
+          "\noverload_arity.cpp:8:5"
+        ]
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-template-outofline",
+      "line": 8,
+      "col": 30,
+      "comment": "bare grow(n) inside the OUT-OF-LINE TEMPLATE body Buf<T>::reserve is an implicit this->grow \u2014 links to the sibling method decl (the enclosing class comes off the peeled method symbol, not the package-less out-of-line body scope).",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:5:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-inclass",
+      "line": 13,
+      "col": 20,
+      "comment": "bare paint() inside the IN-CLASS body Widget::render is an implicit this->paint \u2014 links to the sibling method decl.",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:12:10"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-plain-outofline",
+      "line": 16,
+      "col": 24,
+      "comment": "bare width() inside the plain (non-template) OUT-OF-LINE body Widget::resize links to the sibling method decl.",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:13:9"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-free-function-only",
+      "line": 20,
+      "col": 17,
+      "comment": "bare helper() inside Gadget::run has NO sibling method of that name \u2014 the sibling-call pass leaves it untouched, so it still resolves to the FREE function (no false link, no over-claim).",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:19:5"
+        ],
+        "none": []
+      }
+    },
+    {
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-shadows-free",
+      "line": 25,
+      "col": 18,
+      "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the implicit-this sibling member Board::freefunc ranks FIRST (owner-matched), the free decl kept below (family never pruned). Resolved by owner-anchored overload ranking (Family Q) \u2014 the free fn no longer shadows the sibling.",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:25:10"
+        ],
+        "none": [
+          "\nsibling_call.cpp:25:10"
+        ]
+      }
+    },
+    {
+      "id": "cpp-family-q-qualified-enum-case-label",
+      "difficulty": "hard",
+      "semantic_area": "cpp-family-q-owner-anchor",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "ownerqual/use.cpp",
+      "line": 3,
+      "col": 18,
+      "comment": "gd on `case dynamic::STRING:` anchors on the `dynamic::` qualifier and lands on the nested-enum enumerator in kind.h - a same-named `#define STRING` in an unrelated file must NOT hijack it (macro lane preempted by owner-anchored resolution).",
+      "expect": {
+        "all": [
+          "kind.h:4:20"
+        ],
+        "none": [
+          "collide.cpp"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-family-q-qualified-enum-expr",
+      "difficulty": "hard",
+      "semantic_area": "cpp-family-q-owner-anchor",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "ownerqual/use.cpp",
+      "line": 8,
+      "col": 23,
+      "comment": "gd on `k == dynamic::STRING` (expression position) - same owner-anchored resolution as the case label; the `#define STRING` collider stays out.",
+      "expect": {
+        "all": [
+          "kind.h:4:20"
+        ],
+        "none": [
+          "collide.cpp"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-family-q-member-call-ranked-over-free",
+      "difficulty": "hard",
+      "semantic_area": "cpp-family-q-owner-anchor",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "memfree/use.cpp",
+      "line": 2,
+      "col": 17,
+      "comment": "gd on `logger.info(5)` where a same-named FREE `info` exists - the receiver-class member ranks FIRST (owner-matched), the free function stays in the set below (family never pruned).",
+      "expect": {
+        "all": [
+          "log.h:4:7",
+          "log.h:6:5"
+        ],
+        "none": [
+          "\nlog.h:4:7"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-family-q-namespace-scoped-enum-leak",
+      "difficulty": "hard",
+      "semantic_area": "cpp-family-q-owner-anchor",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "nsleak/use.cpp",
+      "line": 2,
+      "col": 16,
+      "comment": "gd on `level::info` where `info` is an unscoped enumerator of `enum level_enum` nested in `namespace level` - the qualifier is the NAMESPACE (not a cache key, and the enumerator is not linkage-visible), so resolution walks the origin include closure and bridges the namespace->enum->enumerator leak by span containment. The spdlog level::info shape.",
+      "expect": {
+        "all": [
+          "common.h:4:39"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-call-receiver-field-goto-def",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Field member access through a call-expression receiver: `cfMkStruct()->slot` where `cfMkStruct` is a pointer-returning prototype (`CallW *cfMkStruct(void);`). The callee's declared return type is the sole source for the receiver class, so the prototype/pointer skeleton patterns must carry @rettype; the existing expr_type_at_span member-chain path then resolves the field.",
+      "file": "callfield.c",
+      "line": 11,
+      "col": 26,
+      "expect": {
+        "all": [
+          "callfield.c:2:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-call-receiver-field-crossfile-var",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Cross-file field access through a VARIABLE receiver whose type is declared at the use site (`CfGadget *g = cfMakeGadget(); g->weight`). The struct lives in the included header; the variable's declared type resolves the field cross-file without needing the callee's return type.",
+      "file": "callfield_use.c",
+      "line": 4,
+      "col": 15,
+      "expect": {
+        "all": [
+          "callfield.h:2:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-call-receiver-field-crossfile-call",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Field access through a call-expression receiver whose callee prototype lives in an INCLUDED header (`cfMakeGadget()->height`, `CfGadget *cfMakeGadget(void);` in callfield.h). The callee return type crosses the boundary through query_sub_return_type's include-closure arm (resolved-target-keyed, not the Perl export model); expr_type_at_span's member-chain then types the receiver. See negctrl_use for the over-linking negative control.",
+      "file": "callfield_use.c",
+      "line": 5,
+      "col": 28,
+      "expect": {
+        "all": [
+          "callfield.h:3:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-call-receiver-field-crossfile-negctrl-positive",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Non-vacuity companion to the negative control: negctrl_pos.c DOES #include negctrl_other.h, so `ncMakeThing()->secret` resolves cross-file to the header's field. Same code as negctrl_use.c minus the include \u2014 the pair isolates the include-closure gate as the sole difference.",
+      "file": "negctrl_pos.c",
+      "line": 2,
+      "col": 27,
+      "expect": {
+        "all": [
+          "negctrl_other.h:2:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-call-receiver-field-crossfile-negctrl-silent",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Over-linking negative control: negctrl_use.c does NOT #include negctrl_other.h, where an unrelated same-named `ncMakeThing` (with a `secret` field) is declared. The include closure never reaches it, so the callee return type must not cross the boundary \u2014 gd on `secret` stays silent, never landing on the unrelated function's struct. Guards query_sub_return_type's include-closure gate against bare-name cross-contamination.",
+      "file": "negctrl_use.c",
+      "line": 8,
+      "col": 27,
+      "expect": {
+        "all": [],
+        "none": [
+          "negctrl_other.h"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-tmpl-valarg-enum-value-gd",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "comment": "Enum value as template ARGUMENT (`MakeError<StatusCode::kNotFound>`): gd on the value token lands on the enumerator def. Works via the owner-anchored qualified-read path; pinned so the template-arg slice can't regress it.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_valarg.cpp",
+      "line": 18,
+      "col": 35,
+      "expect": {
+        "all": [
+          "tmpl_valarg.cpp:3:3"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-tmpl-valarg-enum-qualifier-gd",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "comment": "The `StatusCode::` qualifier inside the template arg gds to the enum type def.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_valarg.cpp",
+      "line": 18,
+      "col": 24,
+      "expect": {
+        "all": [
+          "tmpl_valarg.cpp:1:12"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-tmpl-valarg-plain-const-gd",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "comment": "Plain constant as template arg (`Buffer<BUF_LIMIT>`): the grammar guesses TYPE, so the token is a PackageRef; gd must fall through type space to the value decl (`const int BUF_LIMIT`), not land at file top (1:1) via the module-file fallback.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_valarg.cpp",
+      "line": 19,
+      "col": 11,
+      "expect": {
+        "all": [
+          "tmpl_valarg.cpp:6:11"
+        ],
+        "none": [
+          "tmpl_valarg.cpp:1:1"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-tmpl-valarg-nested-qualified-enum-gd",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "comment": "Nested-qualified enum value as template arg (`Run<outer::Mode::kSlow>`): gd on the value token lands on the enumerator def.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_valarg.cpp",
+      "line": 37,
+      "col": 28,
+      "expect": {
+        "all": [
+          "tmpl_valarg.cpp:28:3"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cfgtwin-thx-ifdef-member-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cfgtwin/cfgtwin.c",
+      "line": 49,
+      "col": 7,
+      "comment": "Case B: `o->slabbed` inside `thx_ifdef`, a pTHX_-param fn wrapped in `#ifdef PERL_DEBUG_READONLY_OPS`. The macro-expansion exclusion over-reached the region body, so pTHX_ stayed literal, `o` mistyped, and the member went dark. Slice 1 narrows EXCLUDE_QUERY to the directive/condition tokens.",
+      "expect": {
+        "all": [
+          "cfgtwin.c:27:16"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cfgtwin-ndef-thx-member-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cfgtwin/cfgtwin.c",
+      "line": 93,
+      "col": 7,
+      "comment": "Case B (config-ACTIVE arm): `o->slabbed` inside `ndef_thx` under an always-true `#ifndef SOMETHING_NEVER_DEFINED`. The exclusion is condition-blind, so even the active arm went dark. Cured by the same EXCLUDE_QUERY narrowing.",
+      "expect": {
+        "all": [
+          "cfgtwin.c:27:16"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cfgtwin-twin-thx-else-member-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "cfgtwin/cfgtwin.c",
+      "line": 86,
+      "col": 7,
+      "comment": "Case B (`#else` arm of a pTHX_ twin): `o->slabbed` inside the `#else` arm of `twin_thx`. The #else body is region body too, so the pTHX_ use went dark. Cured by the same EXCLUDE_QUERY narrowing.",
+      "expect": {
+        "all": [
+          "cfgtwin.c:27:16"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-ctorif-decl-directive-late-member-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Case A (reduced): gd on `w.late_field`, a member declared AFTER a ctor-initializer `#if`. Repairing the declaration-position directive keeps the class intact so the late member still attributes to Widget.",
+      "file": "ctorif/ctorif.cpp",
+      "line": 25,
+      "col": 6,
+      "expect": {
+        "all": [
+          "ctorif.cpp:20:9"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-inline-ns-transparency-qualified-call-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "comment": "hitlist-5 Family A2: a qualified call into an inline namespace's transparent parent (`mylib::is_thing`, mirroring abseil's `absl::X` where every symbol is filed under `inline namespace head`) must goto-def the member. member_def_location expands the owner through pack_inline_owner_set, so `is_thing` filed under `v1` answers a lookup keyed on `mylib`.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inline_ns_transparency.cpp",
+      "line": 24,
+      "col": 18,
+      "expect": {
+        "all": [
+          "inline_ns_transparency.cpp:21:13"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-inline-ns-transparency-unqualified-call-goto-def",
+      "difficulty": "medium",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "comment": "hitlist-5 Family A: an unqualified same-inline-namespace call resolves to the member def (relative name lookup; the file carries an include closure like every real TU).",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inline_ns_transparency.cpp",
+      "line": 23,
+      "col": 11,
+      "expect": {
+        "all": [
+          "inline_ns_transparency.cpp:21:13"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-inline-ns-absent-member-goto-def-fail-safe",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "comment": "hitlist-5 Family B / slice 2: a qualified member that genuinely does not resolve (`mylib::absent`) must FAIL SAFE \u2014 no definition \u2014 never a confidently-wrong file-top 1:1. Guards both the fallback fail-safe and that the inline-owner expansion does not over-resolve an absent name to a same-named sibling def.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inline_ns_transparency.cpp",
+      "line": 26,
+      "col": 18,
+      "expect": {
+        "all": [],
+        "none": [
+          "inline_ns_transparency.cpp:"
+        ]
+      },
+      "status": "gold"
+    }
+  ]
 }
