@@ -513,8 +513,8 @@ impl<'a> CandidateSet<'a> {
     /// symmetry invariant: narrowing visibility here narrows references AND
     /// rename AND group walks together — no per-feature re-application. The
     /// seam future construction axes (closure visibility, language
-    /// boundaries) ride; exercised today by the invariant test.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// boundaries) ride; exercised by the invariant test and by
+    /// `--heatmap`'s `--include-deps` scope knob.
     pub fn with_visibility(mut self, mask: RoleMask) -> Self {
         self.visibility_override = Some(mask);
         self.visibility = std::sync::OnceLock::new();
