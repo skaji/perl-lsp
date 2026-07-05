@@ -48,18 +48,37 @@ pub fn pack_completion(
     // cursor-tier entry (`docs/adr/cursor-slots.md`); this adapter only
     // projects it onto LSP items.
     let slot = crate::cursor_slot::detect_slot(analysis, tree, source, point, language, Some(xidx));
-    if let crate::cursor_slot::Slot::Member { receiver, .. } = slot {
+    if let crate::cursor_slot::Slot::Member { receiver, .. } = &slot {
         if let Some(class) =
-            receiver.receiver_type.and_then(|ty| ty.class_name().map(|s| s.to_string()))
+            receiver.receiver_type.as_ref().and_then(|ty| ty.class_name().map(|s| s.to_string()))
         {
             // Mode A: the member items carry the operator-swap edit
             // (`p.` → `p->`) when the receiver's pointer depth wants
             // a different operator than was typed. The diagnostic
             // path (Mode B) is the universal fallback.
             if let Some(items) = symbols::member_completion_for_class(
-                analysis, &class, xidx, receiver.op_fix, point,
+                analysis, &class, xidx, receiver.op_fix.clone(), point,
             ) {
                 return (items, false);
+            }
+        }
+    }
+    // `o->op_type == |` — the equality's field operand types the slot to
+    // an enum DOMAIN. Rank that enum's members first (never prune the
+    // bare-identifier universe): the type-constrained-completion payoff of
+    // the `Slot::expected_type` seam (`docs/adr/cursor-slots.md`).
+    if let crate::cursor_slot::Slot::ArgPosition { .. } = &slot {
+        if let Some(crate::file_analysis::InferredType::ClassName(enum_name)) =
+            slot.expected_type(analysis, point, Some(xidx))
+        {
+            let members = analysis.enum_members(&enum_name, Some(xidx));
+            if !members.is_empty() {
+                let mut items = symbols::in_scope_completion(analysis, point);
+                let macros_live = macro_completion(source, point, language, path, &mut items);
+                let closure_live = closure_symbol_completion(
+                    files, analysis, source, point, language, path, module_index, &mut items);
+                rank_domain_members(&mut items, &members, &enum_name);
+                return (items, macros_live || closure_live);
             }
         }
     }
@@ -68,6 +87,32 @@ pub fn pack_completion(
     let closure_live = closure_symbol_completion(
         files, analysis, source, point, language, path, module_index, &mut items);
     (items, macros_live || closure_live)
+}
+
+/// Move a domain's enum members to the front of the completion list with a
+/// leading sort_text so the client ranks them first, without pruning the
+/// bare-identifier universe already gathered. Members keep declaration order
+/// (their numeric enum order) via a fixed-width index, and any copy already
+/// present in the gathered list (an in-scope enumerator) is de-duplicated so
+/// the ranked entry is the only one.
+fn rank_domain_members(items: &mut Vec<CompletionItem>, members: &[String], enum_name: &str) {
+    let member_set: std::collections::HashSet<&str> =
+        members.iter().map(String::as_str).collect();
+    items.retain(|i| !member_set.contains(i.label.as_str()));
+    // "000" leads: '0' (0x30) sorts before every identifier first char.
+    let mut ranked: Vec<CompletionItem> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| CompletionItem {
+            label: m.clone(),
+            kind: Some(CompletionItemKind::ENUM_MEMBER),
+            detail: Some(enum_name.to_string()),
+            sort_text: Some(format!("000{:04}{}", i, m)),
+            ..Default::default()
+        })
+        .collect();
+    ranked.append(items);
+    *items = ranked;
 }
 
 /// Bare-identifier cross-file completion: the file-scope symbols of every

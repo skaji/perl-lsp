@@ -33,7 +33,7 @@ Foo->bar(1);
         used_keys: Default::default(),
         first_arg_string: None,
     };
-    let slot = Slot::ArgPosition { callee: Some(callee), index: 0 };
+    let slot = Slot::ArgPosition { callee: Some(callee), index: 0, expected: None };
     let point = Point::new(0, 0);
     let ty = slot.expected_type(&analysis, point, None);
     assert_eq!(ty, Some(InferredType::Numeric), "param $x's last assignment types it Numeric: {:?}", ty);
@@ -47,8 +47,20 @@ fn expected_type_is_none_off_arg_position() {
     let slot = Slot::Identifier { prefix: "fo".to_string() };
     assert_eq!(slot.expected_type(&analysis, Point::new(0, 0), None), None);
 
-    let slot = Slot::ArgPosition { callee: None, index: 0 };
+    let slot = Slot::ArgPosition { callee: None, index: 0, expected: None };
     assert_eq!(slot.expected_type(&analysis, Point::new(0, 0), None), None);
+}
+
+/// A detector that resolved the type eagerly (the pack domain-comparison
+/// slot) carries it on `expected`; `expected_type` returns it verbatim
+/// without touching a callee — the seam's second producer.
+#[test]
+fn expected_type_returns_carried_domain() {
+    let src = "package Foo;\nsub bar { 1 }\n";
+    let (_tree, analysis) = build(src);
+    let dom = InferredType::ClassName("opcode".to_string());
+    let slot = Slot::ArgPosition { callee: None, index: 0, expected: Some(dom.clone()) };
+    assert_eq!(slot.expected_type(&analysis, Point::new(0, 0), None), Some(dom));
 }
 
 /// `Slot::sigil` decodes the bare-sigil-trigger fact back out of an

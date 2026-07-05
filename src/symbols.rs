@@ -373,6 +373,46 @@ pub(crate) fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
     }
 }
 
+/// Rank scope-variable candidates whose inferred type matches `expected`
+/// first, keeping every other candidate in place (never prunes). A matching
+/// variable keeps its `PRIORITY_LOCAL` slot while the non-matching locals it
+/// leads are nudged one tier down, so the client's sort_text agrees with the
+/// stable reorder the CLI/gold sees. Exact `InferredType` equality, or same
+/// class name (a `ClassName` matches by class).
+fn rank_candidates_by_expected_type(
+    candidates: &mut Vec<CompletionCandidate>,
+    expected: &InferredType,
+    analysis: &FileAnalysis,
+    point: Point,
+) {
+    use crate::file_analysis::PRIORITY_LOCAL;
+    let is_match = |c: &CompletionCandidate| -> bool {
+        matches!(c.kind, FaSymKind::Variable)
+            && analysis
+                .inferred_type_via_bag(&c.label, point)
+                .is_some_and(|t| inferred_type_matches(expected, &t))
+    };
+    let mut tagged: Vec<(bool, CompletionCandidate)> =
+        candidates.drain(..).map(|c| (is_match(&c), c)).collect();
+    for (m, c) in tagged.iter_mut() {
+        if !*m && matches!(c.kind, FaSymKind::Variable) && c.sort_priority == PRIORITY_LOCAL {
+            c.sort_priority = PRIORITY_LOCAL + 1;
+        }
+    }
+    tagged.sort_by_key(|(m, _)| !*m); // stable: matches (key false) lead
+    *candidates = tagged.into_iter().map(|(_, c)| c).collect();
+}
+
+/// Does `actual` satisfy the `expected` slot type — exact enum equality, or
+/// (for object types) the same class name.
+fn inferred_type_matches(expected: &InferredType, actual: &InferredType) -> bool {
+    expected == actual
+        || matches!(
+            (expected.class_name(), actual.class_name()),
+            (Some(a), Some(b)) if a == b
+        )
+}
+
 fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
     let additional_text_edits = if c.additional_edits.is_empty() {
         None
@@ -814,6 +854,17 @@ fn completion_items_native(
         // Perl detector at all.
         Slot::TypePosition { .. } | Slot::ArgPosition { .. } => Vec::new(),
     });
+
+    // Type-constrained ranking: when the cursor sits at a call arg whose
+    // callee has a typed param, scope variables whose inferred type matches
+    // rank first (`Slot::expected_type` — the seam's Perl consumer). Purely
+    // a reorder + priority boost on the gathered candidates; nothing is
+    // pruned (a mid-refactor mismatch stays visible).
+    if let Some(expected) = crate::cursor_slot::detect_call_slot(tree, source.as_bytes(), point)
+        .and_then(|s| s.expected_type(analysis, point, Some(module_index)))
+    {
+        rank_candidates_by_expected_type(&mut candidates, &expected, analysis, point);
+    }
 
     let mut items: Vec<CompletionItem> = candidates
         .drain(..)

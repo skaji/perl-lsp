@@ -1,0 +1,77 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "cpp-domain-completion-enum-members-rank-first",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_enum.c",
+      "line": 6,
+      "col": 25,
+      "expect": {
+        "all": [
+          "OP_NULL\topcode\nOP_CONST\topcode\nOP_SCOPE\topcode\nOP_max\topcode",
+          "classify"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-domain-completion-owner-separated-fruit-side-ranks",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 3,
+      "col": 45,
+      "expect": {
+        "all": [
+          "APPLE\tfruit\nBANANA\tfruit\nCHERRY\tfruit",
+          "ba"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-domain-completion-int-compared-field-declines-rank",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_owner.c",
+      "line": 6,
+      "col": 44,
+      "expect": {
+        "all": [
+          "APPLE"
+        ],
+        "none": [
+          "APPLE\tfruit"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-domain-completion-incoherent-slot-declines-rank",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "domain_mixed.c",
+      "line": 3,
+      "col": 18,
+      "expect": {
+        "all": [
+          "OP2_B"
+        ],
+        "none": [
+          "OP2_B\topcode2"
+        ]
+      },
+      "status": "gold"
+    }
+  ]
+}

@@ -977,6 +977,18 @@ pub struct LangPack {
     /// Call-expression node kinds (`call_expression`/`call`) — a chained
     /// receiver `f().attr` types through the call's inner member.
     pub call_kinds: &'static [&'static str],
+    /// Equality-comparison node kinds (`binary_expression`) whose operand
+    /// may be a domain-typed field — the type-constrained-completion slot
+    /// (`o->op_type == |` ranks the field's DOMAIN members first,
+    /// `docs/adr/cursor-slots.md`). The operand order is either side; the
+    /// slot is the member-access operand, the value the other. Paired with
+    /// `domain_compare_ops` so a `<`/`+` binary never opens the slot. Empty
+    /// = no domain-comparison completion.
+    pub domain_compare_kinds: &'static [&'static str],
+    /// The operator tokens (`==`, `!=`) that make a `domain_compare_kinds`
+    /// node a domain comparison — the pack owns which operators mean
+    /// "equality against a domain value" (rule #10). Empty = feature off.
+    pub domain_compare_ops: &'static [&'static str],
 }
 
 /// A declarative peel: descend a wrapper chain tree-sitter's fixed-depth
@@ -1053,6 +1065,8 @@ pub fn perl_pack() -> LangPack {
         member_kinds: &[],
         skip_kinds: &[],
         call_kinds: &[],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
     }
 }
 
@@ -1105,6 +1119,8 @@ pub fn python_pack() -> LangPack {
         member_kinds: &["attribute"],
         skip_kinds: &["string", "string_content", "comment", "concatenated_string"],
         call_kinds: &["call"],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
     }
 }
 
@@ -1140,6 +1156,8 @@ pub fn r_pack() -> LangPack {
         member_kinds: &[],
         skip_kinds: &[],
         call_kinds: &[],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
     }
 }
 
@@ -1188,6 +1206,8 @@ pub fn cmake_pack() -> LangPack {
         member_kinds: &[],
         skip_kinds: &[],
         call_kinds: &[],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
     }
 }
 
@@ -1326,6 +1346,8 @@ pub fn cpp_pack() -> LangPack {
         member_kinds: &["field_expression"],
         skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
         call_kinds: &["call_expression"],
+        domain_compare_kinds: &["binary_expression"],
+        domain_compare_ops: &["==", "!="],
     }
 }
 

@@ -294,6 +294,114 @@ pub fn member_completion_ctx_incremental(
     Some(MemberCompletionCtx { receiver_type, op_fix, op })
 }
 
+/// The domain-comparison completion context: the cursor sits after an
+/// equality operator (`o->op_type == |`) whose OTHER operand is a
+/// domain-typed field. Returns the field's DOMAIN as `ClassName(enum)` so
+/// completion ranks that enum's members first (`docs/adr/cursor-slots.md`
+/// — `Slot::expected_type`'s reserved comparison semantics). `None` when
+/// the cursor isn't at such a comparison, the field operand doesn't
+/// resolve, or the field carries no recovered domain.
+///
+/// Shares the member probe's splice/reparse: the sentinel completes the
+/// dangling value operand, so the comparison becomes syntactically whole
+/// and the field slot (which lies entirely before the cursor) types
+/// exactly as it does in finished source.
+pub fn domain_compare_ctx_incremental(
+    parser: &mut Parser,
+    cfg: &crate::query_extract::LangPack,
+    src: &str,
+    old: &Tree,
+    cursor: usize,
+    analysis: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Option<InferredType> {
+    if cfg.domain_compare_kinds.is_empty() || cfg.domain_compare_ops.is_empty() {
+        return None;
+    }
+    if cursor_in_skip(old, src, cursor, cfg) {
+        return None;
+    }
+    let patched = patch(src, cursor);
+    let mut edited = old.clone();
+    let pos = byte_to_point(src, cursor);
+    edited.edit(&InputEdit {
+        start_byte: cursor,
+        old_end_byte: cursor,
+        new_end_byte: cursor + SENTINEL.len(),
+        start_position: pos,
+        old_end_position: pos,
+        new_end_position: Point::new(pos.row, pos.column + SENTINEL.len()),
+    });
+    let tree = parser.parse(&patched, Some(&edited))?;
+    let node = find_sentinel(tree.root_node(), &patched, cursor)?;
+    let cmp = climb_to_domain_compare(node, cfg, &patched)?;
+    let slot = domain_slot_operand(cmp, cfg, cursor)?;
+    // The field slot is `recv OP field` — recover the receiver's class and
+    // the field name, then ask usage what enum this field is used AS.
+    let base = slot.named_child(0)?;
+    let field = slot.named_child(slot.named_child_count() - 1)?;
+    let base_ty = resolve_node_type(base, cfg, &patched, analysis, module_index)?;
+    let class = base_ty.class_name()?;
+    let field_name = field.utf8_text(patched.as_bytes()).ok()?;
+    let dom = analysis.field_domain(class, field_name, module_index)?;
+    Some(InferredType::ClassName(dom.domain))
+}
+
+/// Climb from the sentinel to the enclosing equality comparison — a
+/// `domain_compare_kinds` node whose operator is one of the pack's
+/// `domain_compare_ops`. The operator gate keeps `<`/`+`/arithmetic
+/// binaries from opening the slot.
+fn climb_to_domain_compare<'a>(
+    node: Node<'a>,
+    cfg: &crate::query_extract::LangPack,
+    patched: &str,
+) -> Option<Node<'a>> {
+    let mut n = node;
+    for _ in 0..6 {
+        let parent = n.parent()?;
+        if cfg.domain_compare_kinds.contains(&parent.kind())
+            && comparison_uses_domain_op(parent, cfg, patched)
+        {
+            return Some(parent);
+        }
+        n = parent;
+    }
+    None
+}
+
+/// True when the comparison's operator token is a domain-comparison
+/// operator. The operator is an anonymous child between the operands.
+fn comparison_uses_domain_op(
+    cmp: Node,
+    cfg: &crate::query_extract::LangPack,
+    patched: &str,
+) -> bool {
+    (0..cmp.child_count()).filter_map(|i| cmp.child(i)).any(|ch| {
+        !ch.is_named()
+            && ch
+                .utf8_text(patched.as_bytes())
+                .map(|t| cfg.domain_compare_ops.contains(&t))
+                .unwrap_or(false)
+    })
+}
+
+/// The comparison operand that is a member access (`o->op_type`) — the
+/// domain-typed field slot, as opposed to the value operand holding the
+/// spliced sentinel. The cursor-containment guard is belt-and-suspenders:
+/// the value operand parses as a bare identifier, never a member access.
+fn domain_slot_operand<'a>(
+    cmp: Node<'a>,
+    cfg: &crate::query_extract::LangPack,
+    cursor: usize,
+) -> Option<Node<'a>> {
+    (0..cmp.named_child_count())
+        .filter_map(|i| cmp.named_child(i))
+        .find(|n| {
+            cfg.member_kinds.contains(&n.kind())
+                && !(n.start_byte() <= cursor && cursor < n.end_byte())
+        })
+}
+
 /// The operator token actually written at a member access — `.` unless
 /// the anonymous child between the two named children spells `->`.
 fn typed_member_op(member: Node, patched: &str) -> crate::file_analysis::MemberOp {

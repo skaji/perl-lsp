@@ -1,0 +1,18 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "completion-arg-position-type-match-ranks-first",
+      "difficulty": "moderate",
+      "semantic_area": "type-constrained-completion",
+      "root": "gold-corpus/arg-rank-fixture",
+      "file": "main.pl",
+      "line": 8,
+      "col": 6,
+      "expect": {
+        "all": ["$total\tmy\n$label\tmy"]
+      },
+      "status": "gold"
+    }
+  ]
+}

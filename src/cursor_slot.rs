@@ -82,9 +82,16 @@ pub enum Slot {
     /// reserved for pack languages' declaration positions.
     #[allow(dead_code)]
     TypePosition { prefix: String },
-    /// `f(a, |)` and `x == |` — sig-help today; the type-constrained-
-    /// completion seam (`expected_type`) tomorrow.
-    ArgPosition { callee: Option<CalleeCtx>, index: usize },
+    /// `f(a, |)` and `x == |` — sig-help AND type-constrained completion.
+    /// `expected` carries a PRE-RESOLVED expected type when the detector
+    /// already knew it (the pack domain-comparison slot resolves the
+    /// field's DOMAIN eagerly); a Perl call-arg slot leaves it `None` and
+    /// `expected_type` resolves the callee's param type lazily.
+    ArgPosition {
+        callee: Option<CalleeCtx>,
+        index: usize,
+        expected: Option<InferredType>,
+    },
 }
 
 impl Slot {
@@ -104,23 +111,28 @@ impl Slot {
     }
 
     /// The type expected at this slot, when derivable — the seam for
-    /// type-constrained completion (`docs/adr/cursor-slots.md`). Consumed
-    /// by nothing yet: `ArgPosition` resolves a LOCAL callee's param type
-    /// at `index` via the same witness-bag path signature-help's own
-    /// param-type rendering uses (`inferred_type_via_bag` at the sub
-    /// body's end); a cross-file callee (whose param types are display
-    /// tags, not `InferredType`s) and every other slot answer `None`.
-    /// Consumed by nothing today (the parked type-constrained-completion
-    /// slice plugs in here); locked by `cursor_slot_tests.rs`, not a call
-    /// site.
-    #[allow(dead_code)]
+    /// type-constrained completion (`docs/adr/cursor-slots.md`). Two
+    /// producers: an `ArgPosition` carrying a pre-resolved `expected`
+    /// (the pack domain-comparison slot) returns it verbatim; a Perl
+    /// call-arg slot resolves a LOCAL callee's param type at `index` via
+    /// the witness-bag path signature-help's own param-type rendering uses
+    /// (`inferred_type_via_bag` at the sub body's end). A cross-file callee
+    /// (param types are display tags, not `InferredType`s) and every other
+    /// slot answer `None`. Consumed by completion ranking (backend +
+    /// symbols) and locked by `cursor_slot_tests.rs`.
     pub fn expected_type(
         &self,
         analysis: &FileAnalysis,
         point: Point,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<InferredType> {
-        let Slot::ArgPosition { callee: Some(c), index } = self else { return None };
+        let Slot::ArgPosition { callee, expected, index } = self else { return None };
+        // A detector that already knew the type (the pack domain-comparison
+        // slot) carries it; otherwise resolve the local callee's param type.
+        if let Some(t) = expected {
+            return Some(t.clone());
+        }
+        let c = callee.as_ref()?;
         let sig = analysis.signature_for_call(
             &c.name, c.is_method, c.invocant.as_deref(), point, module_index,
         )?;
@@ -172,6 +184,15 @@ pub fn detect_slot(
             },
             op: ctx.op,
         };
+    }
+    // `field == |` — the equality's field operand carries an enum DOMAIN.
+    // The slot hands that expected type to completion so the domain's
+    // members rank first (`docs/adr/cursor-slots.md`). No callee: this is
+    // a comparison, not a call, but it wants the same `expected_type` seam.
+    if let Some(expected) = crate::cursor_sentinel::domain_compare_ctx_incremental(
+        &mut parser, &lang_pack, source, tree, cursor, analysis, module_index,
+    ) {
+        return Slot::ArgPosition { callee: None, index: 0, expected: Some(expected) };
     }
     Slot::Identifier { prefix: identifier_prefix(source, cursor).to_string() }
 }
@@ -225,7 +246,7 @@ fn slot_from_cursor_context(ctx: CursorContext) -> Slot {
 pub fn detect_call_slot(tree: &Tree, source: &[u8], point: Point) -> Option<Slot> {
     let call_ctx = cursor_context::find_call_context(tree, source, point)?;
     let index = call_ctx.active_param;
-    Some(Slot::ArgPosition { callee: Some(call_ctx), index })
+    Some(Slot::ArgPosition { callee: Some(call_ctx), index, expected: None })
 }
 
 /// The identifier chars immediately before the byte cursor — the typed

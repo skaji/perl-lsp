@@ -6114,6 +6114,36 @@ impl FileAnalysis {
             .collect()
     }
 
+    /// The enumerators of `enum_name`, in declaration order — the members
+    /// a `field == |` domain slot ranks first. An enumerator carries its
+    /// enum as its symbol `package` (the inverse of `resolve_enumerator_enum`).
+    /// Local first; when the enum is declared cross-file (perl5's `opcode`
+    /// lives in a header, not the querying `.c`) its declaring file is
+    /// fetched by name so members enumerate even when none are in scope.
+    pub fn enum_members(
+        &self,
+        enum_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
+        let collect = |a: &FileAnalysis| -> Vec<String> {
+            a.symbols
+                .iter()
+                .filter(|s| {
+                    matches!(s.kind, SymKind::Enumerator) && s.package.as_deref() == Some(enum_name)
+                })
+                .map(|s| s.name.clone())
+                .collect()
+        };
+        let local = collect(self);
+        if !local.is_empty() {
+            return local;
+        }
+        module_index
+            .and_then(|idx| idx.get_cached(enum_name))
+            .map(|cached| collect(&cached.analysis))
+            .unwrap_or_default()
+    }
+
     /// The `TypeName(n)` a `Variable{name, scope}` declared type edges to, read
     /// from the recorded witness bag (the alias edge the skeleton emits for a
     /// class-shaped declared type). Scope-matched so two same-named fields in

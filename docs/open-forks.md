@@ -121,3 +121,33 @@ Format per entry:
   ever appears; today there's exactly one.
 - **Discussion needed:** none urgent; revisit only if type-constrained
   completion wants snippet candidates from a shared source.
+
+## Type-constrained completion — carried expected type vs new Slot variant — 2026-07-05 — OPEN
+- **Context:** the type-constrained-completion slice needed a slot for the
+  pack domain comparison (`o->op_type == |` → the field's enum DOMAIN). The
+  `Slot::expected_type` seam already existed; the question was how the pack
+  detector hands its EAGERLY-resolved domain type to that seam.
+- **Options:** A — reuse `ArgPosition`, adding an `expected: Option<InferredType>`
+  field the detector fills when it already knows the type (Perl call-arg
+  slots leave it `None` and resolve the callee's param lazily). B — mint a
+  new `Slot::Comparison { expected }` variant.
+- **Picked:** A. The ADR already grouped `x == |` under `ArgPosition`
+  ("wants sig-help AND type-constrained candidates. Carries the slot's
+  EXPECTED TYPE when derivable"), so the field is the shape the doc
+  reserved; a comparison and a call-arg answer the same `expected_type`
+  question with the same consumer. A new variant would fork the vocabulary
+  for one producer with no distinct consumer. `Slot` is ephemeral
+  (no serde), so no EXTRACT_VERSION cost either way.
+- **Undo cost:** trivial — the field defaults conceptually to `None`; drop
+  it and re-inline if a comparison ever needs consumer behavior a call-arg
+  doesn't share.
+- **Also parked here:** switch-`case |:` domain completion (the ADR's
+  "if cheap" half) — SKIPPED. It needs a distinct probe (climb to the
+  `switch_statement`, resolve the CONDITION field's domain) rather than the
+  `==`/`!=` binary the landed probe reads; not cheap enough to fold in now.
+- **Perl ranking tier:** the ArgPosition consumer boosts type-matching
+  scope vars by keeping them at `PRIORITY_LOCAL` and nudging the non-matching
+  locals they lead to `PRIORITY_LOCAL + 1` (0 is the priority floor, so a
+  sub-LOCAL tier isn't expressible; demoting the complement is the minimal
+  sort_text-visible reorder). Revisit if a second sub-LOCAL ranking axis
+  appears and the two need a shared ordering.

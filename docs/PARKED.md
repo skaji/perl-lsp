@@ -17,9 +17,12 @@ why parked, what unblocks it. Prune on landing.
 
 - **Perl domain typing** — needs a constant-group / Type::Tiny enum-domain
   model (`docs/adr/field-projections.md`).
-- **Type-constrained completion** at domain slots (`op_type == |` → `OP_*`)
-  — needs cursor-context work; extends the landed cursor `Slot` taxonomy
-  (`docs/adr/cursor-slots.md`) with a type-constrained domain slot.
+- **Type-constrained completion** — the cpp domain slot (`op_type == |` →
+  `OP_*` ranked first) and the Perl ArgPosition consumer LANDED on the
+  `Slot::expected_type` seam (`docs/adr/cursor-slots.md`). Residual: the
+  switch-`case |:` position (needs the switch-condition climb) and the
+  Perl-side domain source, which still wants the constant-group /
+  Type::Tiny enum-domain model above.
 - **Template rungs**: dependent types (`T::value_type`), value-arg
   deduction, template-template params.
 - **Flag-set domains** (`op_flags`/`OPf_*` — subset-of vs one-of).
