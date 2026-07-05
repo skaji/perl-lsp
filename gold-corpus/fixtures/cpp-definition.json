@@ -58,7 +58,7 @@
    "semantic_area": "cpp-multilang-macros",
    "lang": "cpp",
    "root": "gold-corpus/cpp-fixture",
-   "comment": "Family M #1: `_SV_HEAD(ptrtype)` is a function-like member-block macro whose `\\`-continued body carries a trailing block comment on each field line. tree-sitter-cpp ends `preproc_arg` at the first comment, so the CST-span body kept only `sv_any` (perl5 sv.h `_SV_HEAD` shape → SV member intelligence dark). Fix: derive the body from raw source across continuations (strip comments) + handle function-like member-block macros as roles. `sv_flags` is the last, comment-blocked field with no `;` of its own.",
+   "comment": "Family M #1: `_SV_HEAD(ptrtype)` is a function-like member-block macro whose `\\`-continued body carries a trailing block comment on each field line. tree-sitter-cpp ends `preproc_arg` at the first comment, so the CST-span body kept only `sv_any` (perl5 sv.h `_SV_HEAD` shape \u2192 SV member intelligence dark). Fix: derive the body from raw source across continuations (strip comments) + handle function-like member-block macros as roles. `sv_flags` is the last, comment-blocked field with no `;` of its own.",
    "file": "svhead.c",
    "line": 14,
    "col": 20,
@@ -889,7 +889,7 @@
    "id": "cpp-overload-arity-defaulted",
    "line": 12,
    "col": 20,
-   "comment": "gd on a 3-arg call pick(1, 2, 3) ranks the defaulted overload (3 required, 4 total) FIRST — the only signature the arg count fits; family never pruned.",
+   "comment": "gd on a 3-arg call pick(1, 2, 3) ranks the defaulted overload (3 required, 4 total) FIRST \u2014 the only signature the arg count fits; family never pruned.",
    "expect": {
     "all": [
      "overload_arity.cpp:5:5",
@@ -912,7 +912,7 @@
    "id": "cpp-sibling-call-template-outofline",
    "line": 8,
    "col": 30,
-   "comment": "bare grow(n) inside the OUT-OF-LINE TEMPLATE body Buf<T>::reserve is an implicit this->grow — links to the sibling method decl (the enclosing class comes off the peeled method symbol, not the package-less out-of-line body scope).",
+   "comment": "bare grow(n) inside the OUT-OF-LINE TEMPLATE body Buf<T>::reserve is an implicit this->grow \u2014 links to the sibling method decl (the enclosing class comes off the peeled method symbol, not the package-less out-of-line body scope).",
    "expect": {
     "all": [
      "sibling_call.cpp:5:10"
@@ -930,7 +930,7 @@
    "id": "cpp-sibling-call-inclass",
    "line": 13,
    "col": 20,
-   "comment": "bare paint() inside the IN-CLASS body Widget::render is an implicit this->paint — links to the sibling method decl.",
+   "comment": "bare paint() inside the IN-CLASS body Widget::render is an implicit this->paint \u2014 links to the sibling method decl.",
    "expect": {
     "all": [
      "sibling_call.cpp:12:10"
@@ -966,7 +966,7 @@
    "id": "cpp-sibling-call-free-function-only",
    "line": 20,
    "col": 17,
-   "comment": "bare helper() inside Gadget::run has NO sibling method of that name — the sibling-call pass leaves it untouched, so it still resolves to the FREE function (no false link, no over-claim).",
+   "comment": "bare helper() inside Gadget::run has NO sibling method of that name \u2014 the sibling-call pass leaves it untouched, so it still resolves to the FREE function (no false link, no over-claim).",
    "expect": {
     "all": [
      "sibling_call.cpp:19:5"
@@ -984,7 +984,7 @@
    "id": "cpp-sibling-call-shadows-free",
    "line": 25,
    "col": 18,
-   "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the implicit-this sibling member Board::freefunc ranks FIRST (owner-matched), the free decl kept below (family never pruned). Resolved by owner-anchored overload ranking (Family Q) — the free fn no longer shadows the sibling.",
+   "comment": "bare freefunc() inside Board::tick, where a same-named FREE function also exists: the implicit-this sibling member Board::freefunc ranks FIRST (owner-matched), the free decl kept below (family never pruned). Resolved by owner-anchored overload ranking (Family Q) \u2014 the free fn no longer shadows the sibling.",
    "expect": {
     "all": [
      "sibling_call.cpp:25:10"
@@ -1072,6 +1072,60 @@
     "none": []
    },
    "status": "gold"
+  },
+  {
+   "id": "cpp-call-receiver-field-goto-def",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Field member access through a call-expression receiver: `cfMkStruct()->slot` where `cfMkStruct` is a pointer-returning prototype (`CallW *cfMkStruct(void);`). The callee's declared return type is the sole source for the receiver class, so the prototype/pointer skeleton patterns must carry @rettype; the existing expr_type_at_span member-chain path then resolves the field.",
+   "file": "callfield.c",
+   "line": 11,
+   "col": 26,
+   "expect": {
+    "all": [
+     "callfield.c:2:9"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-call-receiver-field-crossfile-var",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Cross-file field access through a VARIABLE receiver whose type is declared at the use site (`CfGadget *g = cfMakeGadget(); g->weight`). The struct lives in the included header; the variable's declared type resolves the field cross-file without needing the callee's return type.",
+   "file": "callfield_use.c",
+   "line": 4,
+   "col": 15,
+   "expect": {
+    "all": [
+     "callfield.h:2:9"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-call-receiver-field-crossfile-call",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "XFAIL residual: field access through a call-expression receiver whose callee prototype lives in an INCLUDED header (`cfMakeGadget()->height`, `CfGadget *cfMakeGadget(void);` in callfield.h). The callee SYMBOL resolves cross-file, but its return type does not propagate: query_sub_return_type's cross-file arm uses find_exporters, which filters to Perl export/export_ok lists that C free functions never populate. Needs pack-language cross-file return typing (resolved-target-keyed, not export-model-keyed) to avoid over-linking same-named functions.",
+   "file": "callfield_use.c",
+   "line": 5,
+   "col": 28,
+   "expect": {
+    "all": [
+     "callfield.h:3:9"
+    ],
+    "none": []
+   },
+   "status": "xfail"
   }
  ]
 }

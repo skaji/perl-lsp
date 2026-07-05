@@ -73,12 +73,20 @@ why parked, what unblocks it. Prune on landing.
   shielded, so this residual's exposure is UNCHANGED: the auto-less case has
   no annotation witness to dominate the bogus flow class.)
   - great; yes, let's not stam guess blindly, we have the knowledges
-- **C struct-field member resolution through a call-expression receiver**
-  (`mkStruct()->field` where the callee's declared return is a struct
-  pointer) — dark; distinct from the landed cpp method chain roots
-  (methodchain works, C Field refs don't). Noted by the depth-B agent as
-  pre-existing; lives in the `expr_type_at_span` path. Unassigned.
-  - this sounds like it should be easy enough that we'll just do it!
+- **C free-function return type doesn't propagate cross-file** (the honest
+  residual of the call-receiver-field kill). Single-file `mkStruct()->field`
+  now resolves — the gap was purely that the pointer-returning and prototype
+  (`declaration`) skeleton patterns omitted `@rettype`, so the callee carried
+  no return-type witness for `expr_type_at_span`'s member-chain arm to type
+  the receiver through; adding rettype-bearing sibling patterns (dedup keeps
+  them via `upgrade_ret`) closed it. What REMAINS: `makeGadget()->field` where
+  the callee prototype lives in an INCLUDED header. The callee *symbol*
+  resolves cross-file, but `query_sub_return_type`'s cross-file arm walks
+  `find_exporters`, which filters to Perl `export`/`export_ok` lists that C
+  free functions never populate — so the return type never crosses the file
+  boundary. Needs pack-language cross-file return typing keyed off the
+  resolved call target (not the Perl export model), without over-linking
+  same-named free functions. Xfail row `cpp-call-receiver-field-crossfile-call`.
 - **json.hpp attribution stops mid-class** at a `#if`-conditional
   ctor-initializer — DECIDED arc: see
   `docs/adr/config-superposition-declarations.md` (re-anchor invariant +

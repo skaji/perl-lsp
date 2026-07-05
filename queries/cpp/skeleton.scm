@@ -301,6 +301,16 @@
   declarator: (pointer_declarator
     declarator: (function_declarator
       declarator: (identifier) @def.sub.name))) @def.sub
+; rettype-bearing sibling: a pointer-returning free function's declared
+; type (`Widget *mkStruct(...)`) rides on the `type:` field, sibling to the
+; `pointer_declarator` — so `mkStruct()->field` types the call receiver
+; through the same sub-return path a value-returning def already uses.
+; Name-span dedup (`upgrade_ret`) keeps THIS copy over the rettype-free one.
+(function_definition
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @def.sub.name))) @def.sub
 
 ; every function body is a lexical scope — one node-kind, so operator methods
 ; (`operator[]`/`operator=`), conversion operators (`operator bool()`),
@@ -332,6 +342,24 @@
       scope: (_) @qualifier
       name: (identifier) @def.method.name)
     parameters: (parameter_list) @scope.sub)) @def.method
+; rettype-bearing siblings for the prototypes above: a header-only decl
+; (`Widget *mkStruct(void);`) is the ONLY declaration of a function whose
+; body lives elsewhere, so its `type:` is the sole return-type source — a
+; call receiver (`mkStruct()->field`) has nothing else to type through.
+; Rettype-free sibling stays as the fallback (implicit-int / typeless), and
+; name-span dedup keeps this rettype-bearing copy when both fire.
+(declaration
+  type: (_) @rettype
+  declarator: (function_declarator
+    declarator: (identifier) @def.sub.name
+    parameters: (parameter_list) @scope.sub)) @def.sub
+(declaration
+  type: (_) @rettype
+  declarator: (function_declarator
+    declarator: (qualified_identifier
+      scope: (_) @qualifier
+      name: (identifier) @def.method.name)
+    parameters: (parameter_list) @scope.sub)) @def.method
 ; pointer-returning prototypes (`struct T *make_t(int a);`): the
 ; function_declarator nests inside a pointer_declarator, same as the
 ; definition form above — without this the decl is dropped and its
@@ -342,6 +370,24 @@
       declarator: (identifier) @def.sub.name
       parameters: (parameter_list) @scope.sub))) @def.sub
 (declaration
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @qualifier
+        name: (identifier) @def.method.name)
+      parameters: (parameter_list) @scope.sub))) @def.method
+; rettype-bearing siblings for the pointer-returning prototypes: same story
+; as the plain prototype above — `type:` is the sole return-type source for a
+; header-only pointer-returning decl, so the call-receiver field-access path
+; can resolve. Rettype-free sibling stays as fallback; dedup keeps this copy.
+(declaration
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (identifier) @def.sub.name
+      parameters: (parameter_list) @scope.sub))) @def.sub
+(declaration
+  type: (_) @rettype
   declarator: (pointer_declarator
     declarator: (function_declarator
       declarator: (qualified_identifier
