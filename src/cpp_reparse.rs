@@ -1150,6 +1150,10 @@ pub fn preprocess_validated_with(
     // before a constructor) — expansion can't repair a token it has no
     // definition for; known names are left for the expansion below.
     let stripped = strip_unresolved_structural_macros(parser, &stripped, external);
+    // Repair a conditional directive in DECLARATION position (a ctor-init `#if`)
+    // that misparses the enclosing class — blank the directive lines so the
+    // declaration parses, gated by the parser's damage/structure verdict.
+    let stripped = strip_declaration_position_directives(parser, &stripped);
     let src = stripped.as_str();
     let Some(tree) = parser.parse(src, None) else {
         return (src.to_string(), SpliceMap::default(), recovered);
@@ -1488,6 +1492,132 @@ fn strip_unresolved_structural_macros(
         }
     }
     cur
+}
+
+/// True when `line` opens with a conditional preprocessor directive
+/// (`#if`/`#ifdef`/`#ifndef`/`#elif`/`#else`/`#endif` and the C23 `#elifdef`
+/// spellings). Leading whitespace already stripped by the caller.
+fn is_conditional_directive(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('#') else { return false };
+    let kw: String = rest.trim_start().chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    matches!(
+        kw.as_str(),
+        "if" | "ifdef" | "ifndef" | "elif" | "elifdef" | "elifndef" | "else" | "endif"
+    )
+}
+
+/// The `(line_start, newline_exclusive_end)` range of every conditional
+/// directive line whose START falls inside `[span_start, span_end)`. Ranges
+/// stop before the `\n` so blanking them is newline-preserving (the arm bodies
+/// keep their line structure).
+fn conditional_directive_line_ranges(
+    bytes: &[u8],
+    span_start: usize,
+    span_end: usize,
+) -> Vec<(usize, usize)> {
+    let n = bytes.len();
+    let mut i = span_start.min(n);
+    while i > 0 && bytes[i - 1] != b'\n' {
+        i -= 1; // rewind to the start of span_start's physical line
+    }
+    let mut ranges = Vec::new();
+    let end = span_end.min(n);
+    while i < end {
+        let ls = i;
+        let mut le = i;
+        while le < n && bytes[le] != b'\n' {
+            le += 1;
+        }
+        let line = std::str::from_utf8(&bytes[ls..le]).unwrap_or("");
+        if is_conditional_directive(line.trim_start()) {
+            ranges.push((ls, le));
+        }
+        i = le + 1;
+    }
+    ranges
+}
+
+/// Repair a conditional preprocessor directive sitting in DECLARATION position
+/// — inside a class / struct / union body — that misparses. The ctor-
+/// initializer case (`Widget(...) \n #if X : a(), b() #endif { ... }`,
+/// nlohmann json.hpp `JSON_DIAGNOSTIC_POSITIONS`): tree-sitter recovers the
+/// `#if`-guarded init list as ERROR-wrapped bogus field declarations, minting
+/// PHANTOM members (`a`, `b`) and corrupting hover on the real ones. Blanking
+/// only the `#if`/`#elif`/`#else`/`#endif` LINES (arm bodies kept, newlines
+/// preserved) lets the declaration parse. Config-variant navigation is
+/// untouched — `collect_macro_defs` reparses the ORIGINAL source, not this
+/// transform.
+///
+/// Gated exactly like the sibling structural strips: a candidate region is
+/// adopted only when blanking it does NOT raise parse damage AND keeps the
+/// bodied-structure floor (`structure_count`), so a true `#if`/`#else` twin
+/// whose arms don't concatenate cleanly is left alone (its blank raises damage
+/// or drops a container → reverted). Candidates are narrowed to preproc regions
+/// that (a) misparse and (b) sit under a `field_declaration_list`, so healthy
+/// conditionals and file-scope config regions are never touched.
+/// `docs/adr/config-superposition-declarations.md` slice 1 (declaration-
+/// position repair).
+fn strip_declaration_position_directives(parser: &mut tree_sitter::Parser, src: &str) -> String {
+    let mut cur = src.to_string();
+    for _ in 0..4 {
+        let Some(tree) = parser.parse(&cur, None) else { return cur };
+        let damage = parse_damage(tree.root_node());
+        if damage == 0 {
+            return cur;
+        }
+        let structure = structure_count(tree.root_node());
+        let bytes = cur.as_bytes();
+        // Candidate directive-line sets: one per misparsing preproc region in
+        // declaration position.
+        let mut regions: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut walk = tree.root_node().walk();
+        let mut stack = vec![tree.root_node()];
+        while let Some(n) = stack.pop() {
+            for c in n.children(&mut walk) {
+                stack.push(c);
+            }
+            if matches!(n.kind(), "preproc_if" | "preproc_ifdef")
+                && parse_damage(n) > 0
+                && node_has_field_list_ancestor(n)
+            {
+                let lines = conditional_directive_line_ranges(bytes, n.start_byte(), n.end_byte());
+                if !lines.is_empty() {
+                    regions.push(lines);
+                }
+            }
+        }
+        if regions.is_empty() {
+            return cur;
+        }
+        // Per-region adopt/revert against the parser's own verdict, so one bad
+        // region never discards another's repair.
+        let mut adopted = false;
+        for lines in regions {
+            let tentative = blank_ranges(&cur, lines.into_iter());
+            let Some(t) = parser.parse(&tentative, None) else { continue };
+            if parse_damage(t.root_node()) <= damage && structure_count(t.root_node()) >= structure {
+                cur = tentative;
+                adopted = true;
+            }
+        }
+        if !adopted {
+            return cur;
+        }
+    }
+    cur
+}
+
+/// Whether `n` has a `field_declaration_list` (class/struct/union body)
+/// ancestor — the "declaration position" gate for the directive repair.
+fn node_has_field_list_ancestor(n: tree_sitter::Node) -> bool {
+    let mut p = n.parent();
+    while let Some(node) = p {
+        if node.kind() == "field_declaration_list" {
+            return true;
+        }
+        p = node.parent();
+    }
+    false
 }
 
 /// Gather macros from a C++ file's transitively `#include`d headers, so a

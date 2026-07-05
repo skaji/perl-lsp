@@ -1126,6 +1126,24 @@
     "none": []
    },
    "status": "gold"
+  },
+  {
+   "id": "cpp-ctorif-decl-directive-late-member-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Case A (reduced): gd on `w.late_field`, a member declared AFTER a ctor-initializer `#if`. Repairing the declaration-position directive keeps the class intact so the late member still attributes to Widget.",
+   "file": "ctorif/ctorif.cpp",
+   "line": 25,
+   "col": 6,
+   "expect": {
+    "all": [
+     "ctorif.cpp:20:9"
+    ],
+    "none": []
+   },
+   "status": "gold"
   }
  ]
 }

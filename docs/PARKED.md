@@ -71,11 +71,40 @@ why parked, what unblocks it. Prune on landing.
   pointer) — dark; distinct from the landed cpp method chain roots
   (methodchain works, C Field refs don't). Noted by the depth-B agent as
   pre-existing; lives in the `expr_type_at_span` path. Unassigned.
-- **json.hpp attribution stops mid-class** at a `#if`-conditional
-  ctor-initializer — DECIDED arc: see
-  `docs/adr/config-superposition-declarations.md` (re-anchor invariant +
-  declaration-scoped variants; spike gate first). Blast radius detail in
-  hitlist-3. BASEOP config-twin darkness (op.c) is the same tier.
+- **json.hpp `basic_json` attribution blast radius** (~4400 lines lose
+  membership) — **re-anchor invariant, still open.** Slice 1's
+  declaration-position directive repair landed
+  (`strip_declaration_position_directives`) and fixes the ISOLATED
+  ctor-initializer `#if` (no phantom `start_position`/`end_position`
+  members; late members still attribute — gold rows `cpp-ctorif-decl-
+  directive-*`). But that is NOT what corrupts json.hpp: **the ctor `#if`
+  in isolation causes only LOCAL damage** — a reduced class with the same
+  shape still parses and attributes correctly. The real blast radius is
+  **deep-error-propagation**: a failure ~4400 lines into `basic_json`
+  poisons the whole class node (the class never becomes a
+  `class_specifier` — it degrades to ERROR + `function_definition` +
+  `compound_statement` soup, so there is no class scope to attribute
+  to). The 80-line header parses fine standalone; the trigger is deep and
+  unbisected. Two remaining paths, either would bound it:
+  (a) an attribution-layer **re-anchor fallback** — positional/textual
+  class tracking so members attribute even when the `class_specifier`
+  node is corrupted (bounds blast radius for ANY misparse cause, the
+  general fix); (b) a deep-construct repair that keeps `basic_json`
+  parsing as a class. json.hpp `basic_json` is before == after
+  unattributed; commit 2 did not move it. If slice 2 variant tags land,
+  they still would NOT help here — the failure is a parse corruption, not
+  a config superposition.
+- **Slice 2 (config-superposition variant tags) re-scoped** — the spike
+  (`docs/adr/config-superposition-declarations.md`, findings 2026-07-05)
+  proved slice 2 is NOT needed for Case B (slice-1 exclusion narrowing
+  cured it) and does NOT fix Case A's blast radius (a parse corruption,
+  above). Variant tags remain justified only for **genuinely superposed
+  DECLARATIONS** — a field/def whose SHAPE differs per config, an
+  `#else`-twin function with a different body — where the payoff is
+  **labeled multi-arm navigation** (gd unions both arms, macro-def
+  precedent) and **arm-fold typing on true twins** (a config arm folded
+  as a branch arm through the existing reducers). Not motivated by any
+  measured darkness after slice 1.
 - **Strip-blanked tokens aren't re-minted as refs** (gr misses blanked
   `NS_BEGIN`-style occurrences; splice-blanked ones ARE re-minted).
 - **Per-macro-name salvage granularity** — a macro with both good and bad

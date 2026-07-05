@@ -251,6 +251,29 @@
           "insert"
         ]
       }
+    },
+    {
+      "id": "cpp-ctorif-decl-directive-no-phantom-members",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Case A (reduced): `w.` completion after a ctor-initializer `#if` (declaration position). The declaration-position directive repair blanks the #if/#endif lines so the ctor parses: the #if-guarded init-list targets (start_position/end_position) are NOT phantom members, and members after the ctor still attribute to Widget.",
+      "file": "ctorif/ctorif.cpp",
+      "line": 25,
+      "col": 6,
+      "expect": {
+        "all": [
+          "late_field",
+          "late_method",
+          "early_field"
+        ],
+        "none": [
+          "start_position",
+          "end_position"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

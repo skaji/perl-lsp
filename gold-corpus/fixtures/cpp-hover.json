@@ -546,6 +546,25 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-ctorif-decl-directive-late-member-hover",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Case A (reduced): hover on `w.late_field` (declared after the ctor-init `#if`) shows the real field, not corruption \u2014 the declaration-position directive repair kept the class attribution.",
+      "file": "ctorif/ctorif.cpp",
+      "line": 25,
+      "col": 6,
+      "expect": {
+        "all": [
+          "late_field",
+          "field"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }
