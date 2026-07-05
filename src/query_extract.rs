@@ -149,6 +149,13 @@ pub struct SkeletonAnalysis {
     /// A read of the var after the call and before its next rebind is a
     /// use-after-move bug (`FileAnalysis::use_after_move_reads`).
     pub moved_from: Vec<(String, crate::file_analysis::Span, crate::file_analysis::ScopeId)>,
+    /// Control-flow construct spans (`if`/`while`/`for`/`switch`/ternary/preproc
+    /// conditionals). The use-after-move check reads these to decide whether a
+    /// move is straight-line in its enclosing scope (`use_after_move_reads`).
+    pub control_regions: Vec<crate::file_analysis::Span>,
+    /// Parameter-list spans (`@param.region`). The use-after-move check reads
+    /// these to tell a moved parameter from a moved local (`use_after_move_reads`).
+    pub param_regions: Vec<crate::file_analysis::Span>,
     /// Domain-typing sites: a `@domain.slot` field access compared/assigned
     /// against a `@domain.value` token. Raw (value's enum resolves cross-file
     /// at query time); folds onto `Field{owner, name}` for the int-used-as-enum
@@ -861,6 +868,8 @@ impl SkeletonAnalysis {
             package_parents,
             flow_edges: std::mem::take(&mut self.flow_edges),
             moved_from: std::mem::take(&mut self.moved_from),
+            control_regions: std::mem::take(&mut self.control_regions),
+            param_regions: std::mem::take(&mut self.param_regions),
             domain_sites: std::mem::take(&mut self.domain_sites),
             ..Default::default()
         });
@@ -1859,6 +1868,20 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         .iter()
         .filter(|e| e.cap == "unevaluated")
         .map(|e| (e.start_byte, e.end_byte))
+        .collect();
+    // Control-flow construct spans (`@guard.region`): the use-after-move check
+    // reads these to decide whether a move is straight-line in its scope.
+    out.control_regions = events
+        .iter()
+        .filter(|e| e.cap == "guard.region")
+        .map(|e| Span { start: e.start, end: e.end })
+        .collect();
+    // Parameter-list spans (`@param.region`): the use-after-move check reads
+    // these to tell a moved parameter (not flagged) from a moved local.
+    out.param_regions = events
+        .iter()
+        .filter(|e| e.cap == "param.region")
+        .map(|e| Span { start: e.start, end: e.end })
         .collect();
 
     for e in &events {

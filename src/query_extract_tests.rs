@@ -1397,6 +1397,159 @@ void f() {
     assert_eq!(diags.len(), 1, "non-reset use after move still flags: {diags:?}");
 }
 
+// ---- honesty gates B / C / E: the silence side (false positives are worse
+// than false negatives; each negative below is a documented gate). Verified to
+// take the FPs on real spdlog/fmt/onednn headers to zero.
+
+#[test]
+fn cpp_uam_braceless_conditional_move_is_silent() {
+    // GATE C: the move is in a braceless `if` arm (no compound → no @scope), so
+    // the post-if read may be reached WITHOUT the move. Not straight-line ⇒
+    // silent. (Braced arms are their own scope and stay flaggable — see
+    // `cpp_conditional_move_still_flags_same_arm_read`.)
+    let src = "\
+void f(bool c) {
+  Widget x;
+  if (c) sink(std::move(x));
+  x.use();
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 0, "braceless conditional move is not straight-line: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_switch_case_move_is_silent() {
+    // GATE C: a move in one `case` and a read in another share the switch-body
+    // scope (case labels aren't scopes); which case runs is path-sensitive.
+    let src = "\
+void f(int k) {
+  Widget x;
+  switch (k) {
+    case 1: sink(std::move(x)); break;
+    case 2: x.use(); break;
+  }
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 0, "switch-case conditional move is silent: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_ternary_move_is_silent() {
+    // GATE C: the move is inside a ternary — a conditionally-evaluated operand.
+    let src = "\
+void f(bool c) {
+  Widget x;
+  int n = c ? consume(std::move(x)) : 0;
+  x.use();
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 0, "ternary conditional move is silent: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_loop_body_move_is_silent() {
+    // GATE C: a move in a loop body may run every iteration; a same-body read is
+    // path-sensitive across the back-edge. Loop bodies aren't scopes, so the
+    // whole loop gates the move.
+    let src = "\
+void f(int n) {
+  Widget x;
+  while (n-- > 0) {
+    sink(std::move(x));
+    x.use();
+  }
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 0, "loop-carried move is silent: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_member_init_list_move_is_silent() {
+    // GATE B: a move in a member-initializer list lands in the CLASS scope, not
+    // a function body (the init list is outside the ctor's `{}`), so it can't be
+    // bounded — and the moved value only initializes ONE subobject. This is the
+    // move-constructor flood the real headers exhibit.
+    let src = "\
+struct W {
+  Widget a_;
+  int b_;
+  W(Widget other) : a_(std::move(other)), b_(other.size()) {}
+};
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 0, "member-initializer-list move is silent: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_parameter_move_is_silent() {
+    // GATE E: moving a PARAMETER then reading it is the forwarding / subobject
+    // idiom (move-ctors, operator=), which this tier can't tell from a bug.
+    // Only moves of LOCALS are flagged.
+    let src = "\
+void f(Widget w) {
+  sink(std::move(w));
+  w.use();
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 0, "moved parameter is not flagged: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_local_in_nested_block_still_flags() {
+    // The gates don't over-suppress: a straight-line move + read of a LOCAL in a
+    // plain nested block (not a conditional/loop) is a real bug and still flags.
+    let src = "\
+void f() {
+  Widget x;
+  {
+    sink(std::move(x));
+    x.use();
+  }
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let diags = crate::symbols::pack_use_after_move_diagnostics(&fa);
+    assert_eq!(diags.len(), 1, "straight-line local move in a bare block still flags: {diags:?}");
+}
+
+#[test]
+fn cpp_uam_toggle_gates_pack_diagnostics() {
+    // The diagnostic is opt-in: `pack_diagnostics` emits it only when the toggle
+    // is set, and never for the default (off) options.
+    let src = "\
+void f() {
+  Widget x;
+  sink(std::move(x));
+  x.use();
+}
+";
+    let fa = cpp_skel(src).into_file_analysis();
+    let off = crate::symbols::pack_diagnostics(&fa, crate::symbols::DiagnosticOptions::default());
+    assert!(
+        !off.iter().any(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(s)) if s == "use-after-move")),
+        "off by default: {off:?}",
+    );
+    let on = crate::symbols::pack_diagnostics(
+        &fa,
+        crate::symbols::DiagnosticOptions { use_after_move: true, ..Default::default() },
+    );
+    assert!(
+        on.iter().any(|d| matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(s)) if s == "use-after-move")),
+        "on when toggled: {on:?}",
+    );
+}
+
 #[test]
 fn cpp_dynamic_cast_guard_narrows() {
     // `if (dynamic_cast<Derived*>(b))` refines b to Derived inside the block —
@@ -2274,4 +2427,3 @@ void go() {
     assert_eq!(gd(11, 13), Some((1, 9)), "w.get().spin() resolves spin on Widget");
     assert_eq!(gd(12, 9), Some((1, 9)), "w.v_.spin() resolves through the field's type");
 }
-

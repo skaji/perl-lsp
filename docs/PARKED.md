@@ -45,9 +45,20 @@ why parked, what unblocks it. Prune on landing.
 - **Template rungs**: dependent types (`T::value_type`), value-arg
   deduction, template-template params.
 - **Flag-set domains** (`op_flags`/`OPf_*` — subset-of vs one-of).
-- **Use-after-move re-wire** — needs path-sensitivity (function + test
-  kept, unwired).
-  - let's see how far we can go at this now that we're smarter
+- **Use-after-move** — the DECIDABLE subset is WIRED (opt-in
+  `initializationOptions.diagnostics.useAfterMove` / CLI `--use-after-move`,
+  off by default; `docs/adr/use-after-move.md`). Flags only a straight-line,
+  in-function, LOCAL moved-then-used, behind three honesty gates
+  (`use_after_move_reads`): B (in a function body — kills member-init /
+  delegating-ctor floods), C (straight-line — no conditional/loop/switch/
+  ternary/preproc between move and read), E (locals only — a moved parameter
+  is a forwarding/subobject idiom). Verified 0 FP over the spdlog/fmt/onednn
+  headers (was ~17 with the naive check). STILL PARKED, needs true
+  path-sensitivity + subobject/interprocedural analysis: a use in a different
+  branch arm, a loop-carried move, a `x.member` sibling-read after a
+  base-subobject move (`operator=`/move-ctor), and a by-mutable-ref reset
+  (`reset(x); x.use()`). Those stay silent by design — the gates trade recall
+  for zero false positives.
 - **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
   - i think this will just be closed; anyways it didn't look like it did the intended PPP,
     which is to have mojo helpers which mint dynamic helpers show their definitions;

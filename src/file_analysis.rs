@@ -3355,6 +3355,20 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub moved_from: Vec<(String, Span, ScopeId)>,
 
+    /// Control-flow construct spans (`if`/`while`/`for`/`switch`/ternary/preproc
+    /// conditionals). `use_after_move_reads` reads these for its straight-line
+    /// gate (gate C): a move nested in one of these, relative to its enclosing
+    /// scope, is not straight-line and is not flagged.
+    #[serde(default)]
+    pub control_regions: Vec<Span>,
+
+    /// Parameter-list spans. `use_after_move_reads` gate E: a move of a variable
+    /// declared inside one of these (a parameter) is not flagged — a moved
+    /// parameter is a forwarding / subobject-move idiom this tier can't tell
+    /// from a bug.
+    #[serde(default)]
+    pub param_regions: Vec<Span>,
+
     /// Every `#define` in this file — the macro identity/navigation lane. One
     /// entry per `#define` (config variants share a name). Goto-def consults
     /// this to prefer the `#define` over a use's self-span, rank variants, and
@@ -3467,6 +3481,8 @@ pub struct FileAnalysisParts {
     pub loader_config_params: Vec<LoaderConfigParam>,
     pub flow_edges: Vec<FlowEdge>,
     pub moved_from: Vec<(String, Span, ScopeId)>,
+    pub control_regions: Vec<Span>,
+    pub param_regions: Vec<Span>,
     pub domain_sites: Vec<DomainSite>,
 }
 
@@ -3650,6 +3666,8 @@ impl FileAnalysis {
             loader_config_params,
             flow_edges,
             moved_from,
+            control_regions,
+            param_regions,
             domain_sites,
         } = parts;
         witnesses.rebuild_index();
@@ -3694,6 +3712,8 @@ impl FileAnalysis {
             loader_config_params,
             flow_edges,
             moved_from,
+            control_regions,
+            param_regions,
             domain_sites,
             // Populated by the pack driver post-construction (macro identity lane).
             macro_defs: Vec::new(),
@@ -4185,14 +4205,84 @@ impl FileAnalysis {
     /// enclosing scope's end. Reads are matched on name + access AND filtered
     /// to the move's scope subtree, so a same-named var in another function
     /// never false-flags. Returns (var name, read span).
-    /// Parked with its LSP projection `pack_use_after_move_diagnostics` (see
-    /// the gate comment in `symbols::pack_diagnostics`).
-    #[allow(dead_code)]
+    ///
+    /// The check is deliberately the DECIDABLE subset: it flags only a
+    /// straight-line moved-then-used LOCAL. Three conservative gates keep it
+    /// honest (false positives are worse than false negatives for a
+    /// diagnostic — when unsure, stay silent); each is verified to zero the
+    /// FPs on real library headers (spdlog/fmt), see
+    /// `docs/adr/use-after-move.md`:
+    ///  - GATE B (in-function): the move must be lexically inside a function
+    ///    body. A member-initializer / delegating-ctor init-list move lands in
+    ///    the class/namespace scope, not the ctor body, and can't be bounded.
+    ///  - GATE C (straight-line): a move nested — relative to its scope —
+    ///    inside a conditional / loop / switch / ternary / preproc branch is
+    ///    not straight-line; proving the read is reached only after the move
+    ///    needs path-sensitivity this tier lacks.
+    ///  - GATE E (locals only): a moved PARAMETER is a forwarding /
+    ///    subobject-move idiom, not flagged.
+    /// What stays out: any use that needs true path-sensitivity (a use in a
+    /// different branch arm, a loop-carried move, a reset via a by-mutable-ref
+    /// call), and non-local / subobject moves.
     pub fn use_after_move_reads(&self) -> Vec<(String, Span)> {
         let key = |p: &Point| (p.row, p.column);
+        let contains = |outer: &Span, inner: &Span| {
+            key(&outer.start) <= key(&inner.start) && key(&inner.end) <= key(&outer.end)
+        };
         let mut out = Vec::new();
         for (name, move_span, move_scope) in &self.moved_from {
-            let scope_end = self.scope(*move_scope).span.end;
+            let scope_span = self.scope(*move_scope).span;
+            // GATE B (in-function): only a move that is lexically inside SOME
+            // function body is executable straight-line code we can reason
+            // about. A move whose scope chain has no Sub/Method — a member-
+            // initializer / delegating-ctor init list lands in the class or
+            // namespace scope, NOT the ctor body — can't be bounded, so it is
+            // never flagged. This is what silences the move-constructor floods
+            // on real headers (spdlog/fmt), where an init-list move shares a
+            // broad scope with every same-named param and member.
+            if !scope_chain_of(&self.scopes, *move_scope).iter().any(|s| {
+                matches!(
+                    self.scope(*s).kind,
+                    ScopeKind::Sub { .. } | ScopeKind::Method { .. }
+                )
+            }) {
+                continue;
+            }
+            // GATE C (straight-line): a move nested — relative to its enclosing
+            // scope — inside a conditional / loop / switch / ternary / preproc
+            // branch is not straight-line: the read may be reachable without the
+            // move, or the move may run every loop iteration, and proving
+            // otherwise needs path-sensitivity this tier doesn't have. Braced
+            // if/else arms are their OWN scope, so their region starts BEFORE
+            // the arm and is not `contains`ed by it — those stay flaggable
+            // (a same-arm read is a real bug); only the non-scope constructs
+            // (braceless arms, loop/switch bodies, ternary, preproc) gate here.
+            let straight_line = !self.control_regions.iter().any(|g| {
+                contains(&scope_span, g) && contains(g, move_span)
+            });
+            if !straight_line {
+                continue;
+            }
+            // GATE E (locals only): a moved PARAMETER is a forwarding /
+            // subobject-move idiom — move-constructors and `operator=` move
+            // the rvalue-ref param into a base/member subobject and then read
+            // sibling members, which this tier can't tell from a real bug
+            // without subobject + path analysis. Detect param-ness by the moved
+            // var's declaration landing inside a parameter list; only moves of
+            // LOCALS are flagged. This is what clears the last real-header FPs.
+            let chain = scope_chain_of(&self.scopes, *move_scope);
+            let moved_is_param = self.symbols.iter().any(|s| {
+                s.name == *name
+                    && chain.contains(&s.scope)
+                    && self
+                        .param_regions
+                        .iter()
+                        .any(|pr| contains(pr, &s.selection_span))
+            });
+            if moved_is_param {
+                continue;
+            }
+            let scope_end = scope_span.end;
             let region = Span { start: move_span.end, end: scope_end };
             let cutoff = earliest_rebind_in(&self.flow_edges, name, region).unwrap_or(scope_end);
             for r in &self.refs {

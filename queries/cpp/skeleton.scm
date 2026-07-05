@@ -732,6 +732,35 @@
 (sizeof_expression) @unevaluated
 (decltype) @unevaluated
 
+; control-flow constructs — a `std::move` nested in one of these (relative to
+; its enclosing @scope) is NOT straight-line, so the moved-from region can't be
+; bounded without path-sensitivity and the use-after-move check stays silent
+; (`FileAnalysis::use_after_move_reads` gate C). Braced if/else arms are their
+; OWN @scope, so their region starts BEFORE the arm — the containment test
+; (region strictly inside the move's scope) excludes them; only braceless
+; arms, loops (bodies aren't scopes), switch (cases aren't scopes), the ternary,
+; and preprocessor conditionals actually gate a move. Capturing the whole
+; construct (not just braceless bodies) keeps the pattern uniform; the
+; containment test does the braced/braceless discrimination.
+(if_statement) @guard.region
+(while_statement) @guard.region
+(for_statement) @guard.region
+(for_range_loop) @guard.region
+(do_statement) @guard.region
+(switch_statement) @guard.region
+(conditional_expression) @guard.region
+(preproc_if) @guard.region
+(preproc_ifdef) @guard.region
+(preproc_elif) @guard.region
+
+; parameter lists — the use-after-move check reads these to tell a moved LOCAL
+; (`Widget x;` in the body) from a moved PARAMETER. A moved parameter is
+; overwhelmingly a forwarding / subobject-move idiom (move-constructors,
+; `operator=`, perfect-forwarding wrappers) that reads sibling members after
+; the move; separating those from a genuine bug needs subobject + path
+; analysis this tier lacks, so parameter moves are not flagged (gate E).
+(parameter_list) @param.region
+
 ; `if (dynamic_cast<Derived*>(b)) { b->... }` narrows b to Derived INSIDE the
 ; block — the cpp analog of python `isinstance`. The pack's narrow_guard maps
 ; `dynamic_cast` + the template type to the refinement; core scopes it to

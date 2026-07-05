@@ -210,12 +210,14 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              one universal `(function_definition) @scope` — operators/ctors/
              conversion/destructor/out-of-line minted NO scope before; fixed
              declared-type inference + documentSymbol nesting + the FP below
-         · use-after-move diagnostic ..................... ⚠️ GATED
-             84% FP cut (105→17 on real headers) but the residual needs
-             PATH-sensitivity (conditional-move-on-returning-branch, switch-
-             case, partial/member move) — beyond the flow tier. Function +
-             test kept, unwired in `pack_diagnostics`. Re-wire when the FP
-             classes close.
+         · use-after-move diagnostic ............ ✅ OPT-IN (decidable subset)
+             Wired behind `diagnostics.useAfterMove` (off by default). Three
+             honesty gates on `use_after_move_reads` — B (in-function),
+             C (straight-line), E (locals only) — take the real-header FPs
+             17→0 (spdlog/fmt/onednn) while keeping the straight-line-local
+             true positives. Path-sensitive residuals (cross-branch use,
+             loop-carried move, partial/subobject move, by-ref reset) stay
+             silent by design. `docs/adr/use-after-move.md`.
          · TYPE-CONSTRAINED completion .................... ⬜ (sick)
              at a typed slot (`x.` where x:T, a `T`-typed arg position, a
              return slot), offer only members/values whose type matches the

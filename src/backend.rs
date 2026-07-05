@@ -252,6 +252,11 @@ pub struct Backend {
     /// resolver refresh callback (which also publishes diagnostics), hence the
     /// atomic. Default off — QA/plugin-author channel.
     unresolved_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    /// Opt-in `use-after-move` diagnostic toggle, set from
+    /// `initializationOptions.diagnostics.useAfterMove`. Shared with the
+    /// resolver refresh callback (atomic). Default off — pack-language (C++)
+    /// heuristic-adjacent channel.
+    use_after_move: Arc<std::sync::atomic::AtomicBool>,
     /// Per-document edit generation. Each `did_change` bumps it; a debounced
     /// rebuild task only proceeds if its captured generation is still the
     /// latest — so a burst of keystrokes triggers ONE analysis (~0.7s on a
@@ -284,6 +289,9 @@ impl Backend {
         symbols::DiagnosticOptions {
             unresolved_dispatch: self
                 .unresolved_dispatch
+                .load(std::sync::atomic::Ordering::Relaxed),
+            use_after_move: self
+                .use_after_move
                 .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -384,10 +392,12 @@ impl Backend {
         // Two-phase init: create ModuleIndex whose refresh callback references
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
         let unresolved_dispatch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let use_after_move = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let refresh_client = client.clone();
         let refresh_files = Arc::clone(&files);
         let refresh_unresolved_dispatch = Arc::clone(&unresolved_dispatch);
+        let refresh_use_after_move = Arc::clone(&use_after_move);
 
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -401,6 +411,7 @@ impl Backend {
             let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
             let unresolved_dispatch = Arc::clone(&refresh_unresolved_dispatch);
+            let use_after_move = Arc::clone(&refresh_use_after_move);
             tokio_handle.spawn(async move {
                 let module_index = match holder.get() {
                     Some(idx) => idx,
@@ -412,6 +423,8 @@ impl Backend {
                 let options = symbols::DiagnosticOptions {
                     unresolved_dispatch: unresolved_dispatch
                         .load(std::sync::atomic::Ordering::Relaxed),
+                    use_after_move: use_after_move
+                        .load(std::sync::atomic::Ordering::Relaxed),
                 };
                 files.for_each_open_mut(|uri, doc| {
                     let diagnostics = if doc.language == "perl" {
@@ -419,7 +432,7 @@ impl Backend {
                             .enrich_imported_types_with_keys(Some(module_index.as_ref()));
                         symbols::collect_diagnostics(&doc.analysis, module_index, options)
                     } else {
-                        symbols::pack_diagnostics(&doc.analysis)
+                        symbols::pack_diagnostics(&doc.analysis, options)
                     };
                     pending.push((uri.clone(), diagnostics));
                 });
@@ -437,6 +450,7 @@ impl Backend {
             client,
             files,
             unresolved_dispatch,
+            use_after_move,
             change_gen: Arc::new(dashmap::DashMap::new()),
             dispatch_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             perl_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -455,6 +469,7 @@ impl Backend {
         let module_index = Arc::clone(&self.module_index);
         let client = self.client.clone();
         let change_gen = Arc::clone(&self.change_gen);
+        let options = self.diagnostic_options();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             let is_latest = || change_gen.get(&uri).map(|v| *v) == Some(generation);
@@ -496,7 +511,7 @@ impl Backend {
             }
             let diags = files
                 .get_open(&uri)
-                .map(|doc| symbols::pack_diagnostics(&doc.analysis));
+                .map(|doc| symbols::pack_diagnostics(&doc.analysis, options));
             if let Some(diags) = diags {
                 client.publish_diagnostics(uri, diags, None).await;
             }
@@ -517,6 +532,7 @@ impl Backend {
             Arc::clone(&self.module_index),
             self.client.clone(),
             uri,
+            self.diagnostic_options(),
         );
     }
 
@@ -528,6 +544,7 @@ impl Backend {
         module_index: Arc<ModuleIndex>,
         client: Client,
         uri: Url,
+        options: symbols::DiagnosticOptions,
     ) {
         tokio::spawn(async move {
             let Some((text, path, language)) = files
@@ -568,7 +585,7 @@ impl Backend {
             }
             let diags = files
                 .get_open(&uri)
-                .map(|doc| symbols::pack_diagnostics(&doc.analysis));
+                .map(|doc| symbols::pack_diagnostics(&doc.analysis, options));
             if let Some(diags) = diags {
                 client.publish_diagnostics(uri, diags, None).await;
             }
@@ -587,6 +604,7 @@ impl Backend {
         let client = self.client.clone();
         let lock = Arc::clone(&self.pack_change_lock);
         let root = self.module_index.workspace_root();
+        let options = self.diagnostic_options();
         tokio::spawn(async move {
             let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
             {
@@ -625,6 +643,7 @@ impl Backend {
                     Arc::clone(&module_index),
                     client.clone(),
                     uri,
+                    options,
                 );
             }
         });
@@ -688,11 +707,10 @@ impl Backend {
             Some(doc) if doc.language == "perl" => {
                 symbols::collect_diagnostics(&doc.analysis, &self.module_index, options)
             }
-            // Pack languages stay honest-silent EXCEPT the high-confidence
-            // structural checks (member-access operator mismatch; use-after-
-            // move) — each fires only on a recorded site whose typed fact
-            // contradicts its value flow, no calibration guesswork.
-            Some(doc) => symbols::pack_diagnostics(&doc.analysis),
+            // Pack languages stay honest-silent EXCEPT the always-on
+            // member-access operator mismatch and the opt-in use-after-move
+            // (gated by `DiagnosticOptions.use_after_move`).
+            Some(doc) => symbols::pack_diagnostics(&doc.analysis, options),
             None => vec![],
         };
         self.client
@@ -791,6 +809,16 @@ impl LanguageServer for Backend {
                 .unwrap_or(false);
             self.unresolved_dispatch
                 .store(on, std::sync::atomic::Ordering::Relaxed);
+
+            // `{ "diagnostics": { "useAfterMove": true } }` enables the opt-in
+            // C++ use-after-move channel; absent = off.
+            let uam = opts
+                .get("diagnostics")
+                .and_then(|d| d.get("useAfterMove"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            self.use_after_move
+                .store(uam, std::sync::atomic::Ordering::Relaxed);
 
             // `{ "rename": { "overrideScope": "dispatch" } }` opts into the
             // precise method-override scope; absent / "hierarchy" = the default
