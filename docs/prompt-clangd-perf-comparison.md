@@ -91,8 +91,51 @@ perf regressions later, not just a one-shot.
   macro axes, honestly competitive on the common warm path, with the
   deep-semantic gap named so nobody is surprised."
 
+## Scouting findings (2026-07-05 — web research)
+
+**Standard corpora.** There is no curated "clangd test corpus." The
+community benchmarks C++ LSPs against **LLVM** (buildable via cmake →
+real `compile_commands.json`; clangd's own indexer perf work uses it) and
+**Chromium** (the scale stress). clangd ships only a micro-benchmark
+(`clang-tools-extra/clangd/benchmarks/IndexBenchmark.cpp` — times index
+*build* from a symbol slab, not navigation). ACTION: add **LLVM** as our
+scale corpus alongside the mid-size cpp-bench (abseil/redis/spdlog/fmt) —
+LLVM is the recognized baseline for a credible number.
+
+**No published matrix.** clangd-vs-ccls writeups (ykiko blog, ccls#880,
+Doug Schaefer's survey) are qualitative. Standard comparison axes:
+language-feature/C++-standard support, LSP protocol coverage, indexing
+time, memory, navigation latency, cross-CU resolution, template/macro
+accuracy. Our `e2e/compare-clangd.sh` behavior-level differential
+(PARITY/OURS/GAP) is NOVEL — nobody's published that table.
+
+**Recalibrations from clangd's own docs:**
+- **Memory at scale is GBs, not 320 MB.** clangd docs: Chromium-sized
+  index = "multiple hours" + "multiple GB of RAM." The 320 MB we measured
+  was abseil with a *partial* 159-entry compile DB (small working set).
+  Our post-Slice-1 **1.23 GB on abseil is a sane ballpark** vs
+  clangd-at-real-scale — don't over-index on the 320-vs-1230 framing.
+- **Parse-on-open latency is a KNOWN clangd weakness** (ccls's founding
+  pitch: "instant nav on open; clangd waits for the parse"). The op.c
+  cold-start responsiveness work targets a documented clangd soft spot;
+  ccls's pre-index→instant-open is the proven model.
+- clangd's other soft spots (all three sources): template dependent
+  types, header-context management, early C++20 modules, index-format
+  inefficiency. None overlap our current gaps.
+
+**Our differentiator axes** (build-independent whole-repo completeness —
+the 306 test/bench files clangd's compile-DB misses; macro/config-variant
+navigation) are NOT in the standard comparison rubric. That's both the
+opportunity and the honest niche.
+
+Sources: clangd.llvm.org/design/indexing, github.com/clangd/clangd/wiki/
+Measuring-performance, ykiko.me/en/articles/13394352064, github.com/
+MaskRay/ccls/issues/880.
+
 ## Sequencing
 Run AFTER the daily-driver push settles (benchmarking while fix agents
 saturate CPU poisons the numbers). Not blocking any current slice. A
 pointer from `docs/ROADMAP.md` / `docs/cpp-golive-map.md` (ARC 4 / ARC 5
-ship-gate) gets added at the next sweep so this is findable.
+ship-gate) gets added at the next sweep so this is findable. The corpus is
+LLVM (scale) + cpp-bench (mid-size behavior); the differential tool is
+`e2e/compare-clangd.sh`.
