@@ -7,7 +7,7 @@
       "semantic_area": "cpp-multilang-macros",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "Family M #3: references on a macro include uses inside OTHER macros' `#define` bodies (`FLAGS` used inside `IS_OK`, line 7). Macro bodies are one opaque preproc_arg token, so the nested use has no query capture — the macro-body ref lane (`macro_body_name_refs`) lexically scans each body for known-macro tokens and mints a read at its original span.",
+      "comment": "Family M #3: references on a macro include uses inside OTHER macros' `#define` bodies (`FLAGS` used inside `IS_OK`, line 7). Macro bodies are one opaque preproc_arg token, so the nested use has no query capture \u2014 the macro-body ref lane (`macro_body_name_refs`) lexically scans each body for known-macro tokens and mints a read at its original span.",
       "file": "macro_nested_ref.c",
       "line": 5,
       "col": 8,
@@ -26,7 +26,7 @@
       "semantic_area": "cpp-multilang-macros",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "Reverse direction: gr FROM the nested use site (the `FLAGS` token inside `IS_OK`'s body) returns the same identity set as from the def — the macro-body read carries the same FileScopeValue identity the #define and code-position uses do.",
+      "comment": "Reverse direction: gr FROM the nested use site (the `FLAGS` token inside `IS_OK`'s body) returns the same identity set as from the def \u2014 the macro-body read carries the same FileScopeValue identity the #define and code-position uses do.",
       "file": "macro_nested_ref.c",
       "line": 6,
       "col": 20,
@@ -155,7 +155,7 @@
         ]
       },
       "status": "gold",
-      "note": "gr on OP_SCOPE is OP_SCOPE's own references only — a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
+      "note": "gr on OP_SCOPE is OP_SCOPE's own references only \u2014 a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
     },
     {
       "id": "cpp-sym-enum-variant-def-to-uses",
@@ -405,7 +405,7 @@
       "file": "macrogr/use.c",
       "line": 3,
       "col": 15,
-      "comment": "gr from an unexpanded USE returns the SAME set as from the def — the Sub/Variable lane split is unified.",
+      "comment": "gr from an unexpanded USE returns the SAME set as from the def \u2014 the Sub/Variable lane split is unified.",
       "expect": {
         "all": [
           "\"col\":\"9\",\"file\":\"anno.h\",\"line\":\"3\"",
@@ -556,6 +556,26 @@
         "all": [
           "\"col\":\"3\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"28\"",
           "\"col\":\"27\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"38\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-inline-ns-transparency-references-all-calls",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "comment": "hitlist-5 Family A1: references on an inline-namespaced free-function def must find BOTH call sites \u2014 the unqualified same-namespace call AND the qualified `mylib::is_thing` call whose resolved_package is the transparent parent. The refs_to package gate expands the named owner through pack_inline_owner_set before comparing.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "inline_ns_transparency.cpp",
+      "line": 20,
+      "col": 12,
+      "expect": {
+        "all": [
+          "\"col\":\"13\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"21\"",
+          "\"col\":\"12\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"24\"",
+          "\"col\":\"19\",\"file\":\"inline_ns_transparency.cpp\",\"line\":\"25\""
         ],
         "none": []
       },

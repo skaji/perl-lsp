@@ -1100,19 +1100,28 @@ impl<'a> CandidateSet<'a> {
     /// class's own cached file. Serves the template-family ranked goto-def
     /// (one location per ladder class that actually defines the member).
     fn member_def_location(&self, class: &str, member: &str) -> Option<RefLocation> {
-        let is_member = |fa: &crate::file_analysis::FileAnalysis,
-                         s: &crate::file_analysis::Symbol| {
-            s.name == member && pack_member_of(fa, s, class)
+        // The member's def span in `fa` under `class`'s owner set, expanded
+        // through inline-namespace transparency so a symbol filed under an
+        // `inline namespace head` answers a lookup keyed on its transparent
+        // parent `absl`. The set is derived once per scanned fa (the inline
+        // attribution rides the file that opened the namespace, so it is
+        // recomputed per file, never shared).
+        let member_span_in = |fa: &crate::file_analysis::FileAnalysis| -> Option<Span> {
+            let owners = pack_inline_owner_set(fa, class);
+            fa.symbols
+                .iter()
+                .find(|s| s.name == member && pack_member_of(fa, s, &owners))
+                .map(|s| s.selection_span)
         };
-        if let Some(sym) = self.origin.symbols.iter().find(|s| is_member(self.origin, s)) {
-            return Some(self.origin_decl(sym.selection_span));
+        if let Some(span) = member_span_in(self.origin) {
+            return Some(self.origin_decl(span));
         }
         let idx = self.idx()?;
-        let loc_of = |cached: &crate::file_analysis::CachedModule, sym: &crate::file_analysis::Symbol| {
+        let loc_of = |cached: &crate::file_analysis::CachedModule, span: Span| {
             Url::from_file_path(&cached.path).ok()?;
             Some(RefLocation {
                 key: FileKey::Path(cached.path.clone()),
-                span: sym.selection_span,
+                span,
                 access: AccessKind::Declaration,
                 rewritable: true,
                 label: None,
@@ -1121,8 +1130,8 @@ impl<'a> CandidateSet<'a> {
         // Class-keyed cached module — the fast path when `class` names a
         // struct/class/enum that is itself a cache key.
         if let Some(cached) = idx.get_cached(class) {
-            if let Some(sym) = cached.analysis.symbols.iter().find(|s| is_member(&cached.analysis, s)) {
-                return loc_of(&cached, sym);
+            if let Some(span) = member_span_in(&cached.analysis) {
+                return loc_of(&cached, span);
             }
         }
         let Some((self_path, visible)) = idx.visibility_scope() else {
@@ -1143,8 +1152,8 @@ impl<'a> CandidateSet<'a> {
                 if !connected(&cached) {
                     continue;
                 }
-                if let Some(sym) = cached.analysis.symbols.iter().find(|s| is_member(&cached.analysis, s)) {
-                    return loc_of(&cached, sym);
+                if let Some(span) = member_span_in(&cached.analysis) {
+                    return loc_of(&cached, span);
                 }
             }
         }
@@ -1160,10 +1169,10 @@ impl<'a> CandidateSet<'a> {
             if !connected(cached) || Url::from_file_path(&cached.path).is_err() {
                 return;
             }
-            if let Some(sym) = cached.analysis.symbols.iter().find(|s| is_member(&cached.analysis, s)) {
+            if let Some(span) = member_span_in(&cached.analysis) {
                 let p = cached.path.to_string_lossy().into_owned();
                 if hit.as_ref().is_none_or(|(hp, _)| p < *hp) {
-                    hit = Some((p, sym.selection_span));
+                    hit = Some((p, span));
                 }
             }
         });
@@ -1795,9 +1804,22 @@ impl<'a> CandidateSet<'a> {
                     let bare = r.unqualified_target_name();
                     if let Some(cached) = idx.get_cached(pkg) {
                         if Url::from_file_path(&cached.path).is_ok() {
-                            let def_line =
-                                cached.sub_info(bare).map(|s| s.def_line()).unwrap_or(0);
-                            return vec![line_loc(cached.path.clone(), def_line)];
+                            match cached.sub_info(bare).map(|s| s.def_line()) {
+                                Some(line) => return vec![line_loc(cached.path.clone(), line)],
+                                // Fail safe for a pack `Scope::member` miss: the
+                                // owner-anchored member lookup already ran (and
+                                // missed), and `pkg` names no sub `bare` in the
+                                // resolved module — so `pkg::bare` is NOT a
+                                // module path. Manufacturing a file-top `1:1`
+                                // location is a confidently-wrong answer (worse
+                                // than none for goto-def: abseil's every-header
+                                // `namespace absl` makes `get_cached("absl")`
+                                // land on an arbitrary file). Perl keeps the
+                                // file-top fallback — landing on the `.pm` top
+                                // is meaningful there.
+                                None if self.pack => {}
+                                None => return vec![line_loc(cached.path.clone(), 0)],
+                            }
                         }
                     }
                 }
@@ -2325,7 +2347,7 @@ impl<'a> CandidateSet<'a> {
             for s in &fa.symbols {
                 let nested_container = matches!(s.kind, SymKind::Package | SymKind::Class)
                     && s.package.as_deref().is_some_and(|p| owners.iter().any(|o| o == p));
-                if !nested_container && !owners.iter().any(|o| pack_member_of(fa, s, o)) {
+                if !nested_container && !pack_member_of(fa, s, &owners) {
                     continue;
                 }
                 // a default-named symbol is structure, not an addressable name
@@ -3452,18 +3474,25 @@ fn template_instance_spelling(source: &str, span: Span) -> Option<String> {
 /// and "offered" never drift apart. Methods/subs key by package; a data
 /// member (or enum constant) must be the owner's OWN content, not a sub-body
 /// local carrying the owner as sticky package.
+/// Membership of `s` in an owner set already expanded through
+/// inline-namespace transparency (`pack_inline_owner_set`). The set is passed
+/// in — never a single raw package — so goto-def's owner lookup
+/// (`member_def_location`) and completion agree with the references gate that
+/// a symbol filed under an `inline namespace head` satisfies a query keyed on
+/// its transparent parent `absl`.
 fn pack_member_of(
     fa: &crate::file_analysis::FileAnalysis,
     s: &crate::file_analysis::Symbol,
-    owner: &str,
+    owners: &[String],
 ) -> bool {
+    let in_owners = |p: Option<&str>| p.is_some_and(|p| owners.iter().any(|o| o == p));
     match s.kind {
-        SymKind::Method | SymKind::Sub => s.package.as_deref() == Some(owner),
+        SymKind::Method | SymKind::Sub => in_owners(s.package.as_deref()),
         SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
             if !fa.symbol_is_class_content(s) {
                 return false;
             }
-            if s.package.as_deref() == Some(owner) {
+            if in_owners(s.package.as_deref()) {
                 return true;
             }
             // Unscoped-enum leak: `dynamic::STRING` / `level::info`
@@ -3480,7 +3509,7 @@ fn pack_member_of(
             // (`level`), without depending on how either tags package.
             matches!(s.kind, SymKind::Enumerator)
                 && fa.symbols.iter().any(|c| {
-                    c.name == owner
+                    owners.iter().any(|o| o == &c.name)
                         && c.span != s.span
                         && (c.span.start.row, c.span.start.column)
                             <= (s.span.start.row, s.span.start.column)
@@ -4324,6 +4353,20 @@ fn collect_from_analysis(
                 let ns_relative = relative_ns && matches!(target.kind, TargetKind::Sub { .. });
                 let pkg_matches = |pkg: &Option<String>| {
                     pkg_agrees(ns_relative, pkg.as_deref(), scope.as_deref())
+                        // Inline-namespace transparency: a call keyed on the
+                        // transparent parent (`mylib::is_thing`, `absl::X`)
+                        // reaches a def filed under an `inline namespace`
+                        // child (`v1`, `head`). The named owner expands
+                        // DOWNWARD through inline children exactly as
+                        // completion / goto-def's owner lookup do; only
+                        // name-matching refs reach here, so the per-ref set
+                        // build stays cheap.
+                        || match (pkg.as_deref(), scope.as_deref()) {
+                            (Some(named), Some(actual)) => pack_inline_owner_set(analysis, named)
+                                .iter()
+                                .any(|o| o == actual),
+                            _ => false,
+                        }
                         || (target.scope == OverrideScope::Hierarchy
                             && target.method_classes.iter().any(|c| Some(c) == pkg.as_ref()))
                 };
