@@ -2,6 +2,25 @@
   "capability": "outline",
   "rows": [
     {
+      "id": "cpp-outline-ns-extern-globals",
+      "difficulty": "simple",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "ns_extern_global.cpp",
+      "line": 0,
+      "col": 0,
+      "comment": "namespace-scope extern globals (array `kTable[256]` + scalar `kCounter`) outline as Variables under their owning namespace. hitlist-5 Finding E: the array declarator was minted as no symbol; now both appear.",
+      "expect": {
+        "all": [
+          "\"kind\":\"Variable\",\"line\":\"2\",\"name\":\"kTable\",\"package\":\"detail\"",
+          "\"kind\":\"Variable\",\"line\":\"3\",\"name\":\"kCounter\",\"package\":\"detail\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-outline-namespace-classes-and-functions",
       "difficulty": "simple",
       "semantic_area": "cpp-multilang",

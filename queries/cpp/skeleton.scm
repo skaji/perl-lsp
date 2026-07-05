@@ -679,6 +679,27 @@
   type: (_) @type.annot
   declarator: (identifier) @flow.target @def.local)
 
+; array declarations (`extern const unsigned char kPropertyBits[256];`,
+; `int table[8] = {...};`): the declarator is an array_declarator wrapping the
+; leaf identifier, which the plain-identifier forms above never see — so a
+; NAMESPACE/file-scope array global was minted as NO symbol at all (dead
+; goto-def, absent from outline). Capture the leaf as @def.local: the sticky
+; namespace context tags it with its owning namespace (package) and a
+; file/namespace-scope decl outlines, while a function-body array stays a
+; scope-hidden local — the same scope-driven local-vs-global distinction the
+; scalar forms already ride. (Bare + extern first, then the braced-init form.)
+(declaration
+  (storage_class_specifier)? @sym.attr
+  type: (_) @type.annot
+  declarator: (array_declarator
+    declarator: (identifier) @flow.target @def.local))
+(declaration
+  type: (_) @type.annot
+  declarator: (init_declarator
+    declarator: (array_declarator
+      declarator: (identifier) @flow.target @def.local)
+    value: (_) @flow.source))
+
 ; pointer / reference locals of ANY depth, bare and initialized — `T* p;`,
 ; `T** pp;`, `T& r = x;`, `if (Derived* d = dynamic_cast<...>(b))`. The
 ; @nested.target chain is unravelled by core (see params). The init form also

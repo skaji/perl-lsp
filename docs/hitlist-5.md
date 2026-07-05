@@ -182,17 +182,34 @@ nowhere (verified negative control) — no mis-pin. Gold:
 
 ---
 
-## Finding E — namespace-scope `extern` variable decls are not symbols (MEDIUM-LOW pain)
+## Finding E — namespace-scope `extern` variable decls are not symbols (MEDIUM-LOW pain) — **LANDED**
 
-`definition` on `ascii_internal::kPropertyBits` (ascii.h L90:26) → "No
-definition found"; same for `ascii_internal::kToLower` (L183:25). The decls
-(`ABSL_DLL extern const unsigned char kPropertyBits[256];`, ascii.h L71/74/77)
-are never emitted as symbols — absent from `--outline`. Goto-def on a
-namespaced global variable is dead.
+`definition` on `ascii_internal::kPropertyBits` (ascii.h use L90:26) → now
+`ascii.h:71:37` (the real decl); the decls also appear in `--outline` as
+`Variable … ascii_internal`.
 
-**Owning seam.** `queries/cpp/skeleton.scm` has no capture for `extern`
-variable declarations at namespace scope (only class fields / locals). Add a
-namespaced-variable-decl capture + `query_extract.rs` emission.
+**Two gaps, both closed.** (1) The array declarators (`extern const unsigned
+char kPropertyBits[256];`) matched NO skeleton pattern — the scalar/pointer
+forms only handle `(identifier)`/`(pointer_declarator)` leaves, so an
+`array_declarator` global minted nothing (dead gd, absent from outline). Added
+the array-declarator variants (bare/extern + braced-init) to
+`queries/cpp/skeleton.scm`; the leaf is captured as `@def.local`, so the sticky
+namespace context tags it with its owning namespace (package) and a
+namespace-scope decl outlines while a function-body array stays a scope-hidden
+local — the same scope-driven local-vs-global split the scalar forms ride.
+(2) Even minted, qualified reads didn't resolve: `symbol_is_class_content`
+(the owner-membership gate behind `pack_member_of` → `member_def_location` /
+`complete_pack_qualified`) recognized only `SymKind::Class` containers, so a
+namespace-scope global (owner = `SymKind::Package`) failed the gate. Extended
+the container filter to accept namespaces; the Sub-scope walk still excludes a
+sub-body local carrying the namespace as sticky package. Gold:
+`cpp-ns-extern-global-array-goto-def` / `-scalar-goto-def` (definition),
+`cpp-outline-ns-extern-globals` (outline).
+
+**PARKED residual.** Multi-dimensional array globals (`T m[3][4]` at namespace
+scope) — the single array-declarator pattern matches one level; a nested
+`array_declarator > array_declarator > identifier` isn't captured. Rare;
+kPropertyBits/kToLower/kToUpper are all single-dim.
 
 ---
 
@@ -224,7 +241,7 @@ namespaced-variable-decl capture + `query_extract.rs` emission.
 | `Scope::member` miss → module→file `1:1` fallback | goto-def PackageRef/type tail in `resolve.rs` | A2 (garbage half), B |
 | Reference identity matched by bare name, not owner-scoped | `refs_to` member/typedef arm | C |
 | ~~Bare sibling-method not pinned to enclosing type~~ **LANDED** — real cause: ref-/ptr-returning operator DEF never minted, so the pin's enclosing-class join dead-ended | `queries/cpp/skeleton.scm` operator-def patterns | D |
-| No symbol for namespace-scope `extern` var | `queries/cpp/skeleton.scm` + `query_extract.rs` | E |
+| ~~No symbol for namespace-scope `extern` var~~ **LANDED** — array-declarator mint + namespace-owner resolution gate | `queries/cpp/skeleton.scm` + `symbol_is_class_content` | E |
 
 ---
 
