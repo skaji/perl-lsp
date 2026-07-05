@@ -155,7 +155,7 @@
         ]
       },
       "status": "gold",
-      "note": "gr on OP_SCOPE is OP_SCOPE's own references only \u2014 a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
+      "note": "gr on OP_SCOPE is OP_SCOPE's own references only — a variant's relation to op_type is 'member of the domain enum', never a fan-out to every field site."
     },
     {
       "id": "cpp-sym-enum-variant-def-to-uses",
@@ -405,7 +405,7 @@
       "file": "macrogr/use.c",
       "line": 3,
       "col": 15,
-      "comment": "gr from an unexpanded USE returns the SAME set as from the def \u2014 the Sub/Variable lane split is unified.",
+      "comment": "gr from an unexpanded USE returns the SAME set as from the def — the Sub/Variable lane split is unified.",
       "expect": {
         "all": [
           "\"col\":\"9\",\"file\":\"anno.h\",\"line\":\"3\"",
@@ -521,6 +521,45 @@
         ],
         "none": []
       }
+    },
+    {
+      "id": "cpp-tmpl-valarg-enum-value-gr-from-def",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "comment": "gr from the enumerator def must include the template-ARGUMENT use site (line 18 col 32) alongside the expression-position use. The template-arg token is a type-guessed PackageRef; the Method{class} matcher needs a PackageRef arm gated on bare-constant-ness.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_valarg.cpp",
+      "line": 2,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"3\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"3\"",
+          "\"col\":\"34\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"21\"",
+          "\"col\":\"33\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"19\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-tmpl-valarg-nested-qualified-enum-gr",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-templates",
+      "lang": "cpp",
+      "comment": "gr from a NAMESPACED enum's enumerator def reaches its nested-qualified template-arg use.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "tmpl_valarg.cpp",
+      "line": 27,
+      "col": 4,
+      "expect": {
+        "all": [
+          "\"col\":\"3\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"28\"",
+          "\"col\":\"27\",\"file\":\"tmpl_valarg.cpp\",\"line\":\"38\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

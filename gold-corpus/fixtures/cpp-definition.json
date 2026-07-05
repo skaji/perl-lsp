@@ -1126,6 +1126,80 @@
     "none": []
    },
    "status": "xfail"
+  },
+  {
+   "id": "cpp-tmpl-valarg-enum-value-gd",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "comment": "Enum value as template ARGUMENT (`MakeError<StatusCode::kNotFound>`): gd on the value token lands on the enumerator def. Works via the owner-anchored qualified-read path; pinned so the template-arg slice can't regress it.",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_valarg.cpp",
+   "line": 18,
+   "col": 35,
+   "expect": {
+    "all": [
+     "tmpl_valarg.cpp:3:3"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-tmpl-valarg-enum-qualifier-gd",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "comment": "The `StatusCode::` qualifier inside the template arg gds to the enum type def.",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_valarg.cpp",
+   "line": 18,
+   "col": 24,
+   "expect": {
+    "all": [
+     "tmpl_valarg.cpp:1:12"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-tmpl-valarg-plain-const-gd",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "comment": "Plain constant as template arg (`Buffer<BUF_LIMIT>`): the grammar guesses TYPE, so the token is a PackageRef; gd must fall through type space to the value decl (`const int BUF_LIMIT`), not land at file top (1:1) via the module-file fallback.",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_valarg.cpp",
+   "line": 19,
+   "col": 11,
+   "expect": {
+    "all": [
+     "tmpl_valarg.cpp:6:11"
+    ],
+    "none": [
+     "tmpl_valarg.cpp:1:1"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-tmpl-valarg-nested-qualified-enum-gd",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "comment": "Nested-qualified enum value as template arg (`Run<outer::Mode::kSlow>`): gd on the value token lands on the enumerator def.",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_valarg.cpp",
+   "line": 37,
+   "col": 28,
+   "expect": {
+    "all": [
+     "tmpl_valarg.cpp:28:3"
+    ],
+    "none": []
+   },
+   "status": "gold"
   }
  ]
 }

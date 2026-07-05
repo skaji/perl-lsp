@@ -1819,6 +1819,19 @@ impl<'a> CandidateSet<'a> {
                                         SymKind::Package | SymKind::Class | SymKind::Module
                                     )
                             })
+                            // Type space missed: a pack grammar's TYPE guess in
+                            // a type/value-ambiguous slot (template argument)
+                            // can name a VALUE the pack index registered under
+                            // this same bare name — land on ITS decl, not the
+                            // file top. Pack-only structural gates; Perl module
+                            // lookups keep the file-top fallback.
+                            .or_else(|| {
+                                cached.analysis.symbols.iter().find(|s| {
+                                    s.name == r.target_name
+                                        && (cached.analysis.symbol_is_class_content(s)
+                                            || cached.analysis.symbol_is_file_scope_value(s))
+                                })
+                            })
                             .map(|s| s.selection_span)
                             .unwrap_or(Span {
                                 start: tree_sitter::Point::new(0, 0),
@@ -4374,6 +4387,15 @@ fn collect_from_analysis(
                                 .any(|c| Some(c.as_str()) == s.package.as_deref()))
                 }
             },
+            // The same bare-constant gate for a TYPE-guessed token: a pack
+            // grammar parses a value in a type/value-ambiguous slot (a
+            // template argument `MakeError<StatusCode::kNotFound>`) as a type,
+            // minting a PackageRef — for an enum-constant member that token is
+            // a use (the value hoists, exactly like the unresolved bare read
+            // above). Receiver-reached members stay out on the same gate.
+            (TargetKind::Method { .. }, RefKind::PackageRef) => {
+                target.bare_constant || bare_constant_member
+            }
             // A file-scope value's uses, all bare-name-keyed like its forward
             // resolutions: a value read (object-like macro / global / enum
             // constant), a type-position token (a type-alias `#define` used as
