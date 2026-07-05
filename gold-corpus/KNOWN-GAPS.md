@@ -241,9 +241,6 @@ corpora (json.hpp/abseil), not minimal repros:
   macro definition bodies are preproc-excluded from ref minting. goto-def
   through the same nested sites works; index-population only. Pinned
   `cpp-macro-nested-ref-in-macro-body` (xfail).
-- `bool` still reports Numeric (typedef-resolution / join→typing lane).
-- Overload arity ranking (finding #3): evaluated, not taken — needs
-  extraction-minted argument/parameter counts first.
 
 ## Refs symmetry (gd↔gr) — honest residuals
 
