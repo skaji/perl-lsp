@@ -1433,6 +1433,22 @@ pub enum InferredType {
     /// type — `docs/adr/optional-types.md`). Kept at the END for
     /// bincode variant-index stability (bump `EXTRACT_VERSION`).
     Undef,
+    /// A boolean-valued expression — a comparison (`$a == $b`, `$x eq $y`),
+    /// a logical negation (`!$x`, `!!$x`, `not $x`), a truth-test builtin
+    /// (`defined`, `exists`), a Moo/Moose `isa => 'Bool'` accessor, or a
+    /// C++ `bool` declaration / `true`/`false` literal / relational-or-
+    /// logical operator. NOT a class (`class_name()` → `None`).
+    ///
+    /// Perl has no distinct boolean value — truth is `1` / `''`, so Bool
+    /// is a *sub-lattice of Numeric*: it prints and dispatches like a
+    /// number, and a return-arm fold that sees `{Bool, Numeric}` joins to
+    /// `Numeric` (see `resolve_return_type`) rather than degrading to
+    /// Unknown. The variant lets the analyzer *say* "this is a truth
+    /// value" where it knows one — hover, inlay hints, future
+    /// boolean-context diagnostics — without lying that it's a general
+    /// number. Kept at the END for bincode variant-index stability (bump
+    /// `EXTRACT_VERSION`).
+    Bool,
 }
 
 /// Concrete parametric flavors + type-level operators. Each
@@ -2169,6 +2185,17 @@ pub fn resolve_return_type(return_types: &[InferredType]) -> Option<InferredType
     // coarse ArrayRef.
     if return_types.iter().all(|t| t.is_array_shaped()) {
         return Some(InferredType::ArrayRef);
+    }
+    // Bool is a sub-lattice of Numeric in Perl (truth is `1`/`''`), so a
+    // sub whose arms mix a comparison (`Bool`) with a plain number
+    // (`Numeric`) is coherently number-ish — join to the coarser Numeric
+    // rather than degrading to Unknown. All-Bool already returned via the
+    // exact-equal check above, so this only fires on a genuine mix.
+    if return_types
+        .iter()
+        .all(|t| matches!(t, InferredType::Bool | InferredType::Numeric))
+    {
+        return Some(InferredType::Numeric);
     }
     // Object subsumes HashRef: if some returns are Object(X) and others are
     // hash-shaped, the Object wins (overloaded hash access is common in Perl).
@@ -11577,6 +11604,9 @@ pub(crate) fn builtin_return_type(name: &str) -> Option<InferredType> {
         | "ref" | "chr" | "crypt" | "quotemeta" | "pack" | "readline"
         | "readlink" => Some(InferredType::String),
 
+        // Truth-test builtins — return a boolean (`1` / `''`).
+        "defined" | "exists" => Some(InferredType::Bool),
+
         _ => None,
     }
 }
@@ -11631,6 +11661,7 @@ pub fn inferred_type_to_tag(ty: &InferredType) -> String {
         // wire format stays backward-compatible, prefixed Maybe.
         InferredType::Optional(inner) => format!("Maybe:{}", inferred_type_to_tag(inner)),
         InferredType::Undef => "Undef".to_string(),
+        InferredType::Bool => "Bool".to_string(),
     }
 }
 
@@ -11697,6 +11728,7 @@ pub(crate) fn format_inferred_type(ty: &InferredType) -> String {
         },
         InferredType::Optional(inner) => format!("Maybe<{}>", format_inferred_type(inner)),
         InferredType::Undef => "Undef".to_string(),
+        InferredType::Bool => "Bool".to_string(),
     }
 }
 

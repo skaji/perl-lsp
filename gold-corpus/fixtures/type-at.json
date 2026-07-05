@@ -275,6 +275,112 @@
       },
       "status": "xfail",
       "note": "GAP: my $abs=$self->clone -> should be Mojo::URL but clone mistyped HashRef propagates."
+    },
+    {
+      "id": "ti-bool-comparison",
+      "difficulty": "simple",
+      "semantic_area": "bool",
+      "root": "gold-corpus/bool-fixture",
+      "file": "main.pl",
+      "line": 4,
+      "col": 4,
+      "expect": {
+        "all": [
+          "Bool"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "my $cmp = $x == $y -> the comparison result is Bool."
+    },
+    {
+      "id": "ti-bool-ordering-stays-numeric",
+      "difficulty": "simple",
+      "semantic_area": "bool",
+      "root": "gold-corpus/bool-fixture",
+      "file": "main.pl",
+      "line": 5,
+      "col": 4,
+      "expect": {
+        "all": [
+          "Numeric"
+        ],
+        "none": [
+          "Bool"
+        ]
+      },
+      "status": "gold",
+      "note": "my $seq = $x <=> $y -> the spaceship returns -1/0/1, a number, NOT Bool."
+    },
+    {
+      "id": "ti-bool-negation",
+      "difficulty": "simple",
+      "semantic_area": "bool",
+      "root": "gold-corpus/bool-fixture",
+      "file": "main.pl",
+      "line": 6,
+      "col": 4,
+      "expect": {
+        "all": [
+          "Bool"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "my $neg = !$x -> logical negation is Bool."
+    },
+    {
+      "id": "ti-bool-defined-builtin",
+      "difficulty": "simple",
+      "semantic_area": "bool",
+      "root": "gold-corpus/bool-fixture",
+      "file": "main.pl",
+      "line": 7,
+      "col": 4,
+      "expect": {
+        "all": [
+          "Bool"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "my $def = defined $x -> the truth-test builtin is Bool."
+    },
+    {
+      "id": "ti-bool-cpp-declared",
+      "difficulty": "simple",
+      "semantic_area": "bool",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "booltype.cpp",
+      "line": 2,
+      "col": 7,
+      "expect": {
+        "all": [
+          "Bool"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "bool flag = true -> the C++ declared bool type is Bool."
+    },
+    {
+      "id": "ti-bool-cpp-comparison",
+      "difficulty": "simple",
+      "semantic_area": "bool",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "booltype.cpp",
+      "line": 3,
+      "col": 7,
+      "expect": {
+        "all": [
+          "Bool"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "auto cmp = x == y -> the C++ comparison expression is Bool."
     }
   ]
 }

@@ -7009,6 +7009,8 @@ impl<'a> Builder<'a> {
             "binary_expression"
             | "equality_expression"
             | "relational_expression"
+            | "logical_not_expression"
+            | "unary_expression"
             | "postinc_expression"
             | "preinc_expression"
             | "func0op_call_expression"
@@ -7439,6 +7441,25 @@ impl<'a> Builder<'a> {
                     _ => None,
                 }
             }
+            // A comparison yields a boolean, EXCEPT the ordering operators
+            // `<=>` / `cmp` (which the grammar files under equality) — those
+            // return -1/0/1, a number. `eq`/`ne` sort under equality too;
+            // `lt`/`gt`/… under relational.
+            "equality_expression" | "relational_expression" => {
+                match self.get_operator_text(node).as_deref() {
+                    Some("<=>" | "cmp") => Some(InferredType::Numeric),
+                    Some(_) => Some(InferredType::Bool),
+                    None => None,
+                }
+            }
+            // `!$x` / `!!$x` is the boolify idiom; `not $x` its low-prec
+            // spelling. `-$x` / `+$x` / `\$x` are also `unary_expression`,
+            // so gate on the operator.
+            "logical_not_expression" => Some(InferredType::Bool),
+            "unary_expression" => match self.get_operator_text(node).as_deref() {
+                Some("!") => Some(InferredType::Bool),
+                _ => None,
+            },
             "postinc_expression" | "preinc_expression" => Some(InferredType::Numeric),
             "func1op_call_expression" | "func0op_call_expression" => {
                 let name = node.child(0)?.utf8_text(self.source).ok()?;
@@ -10543,7 +10564,7 @@ impl<'a> Builder<'a> {
         match isa {
             "Str" => Some(InferredType::String),
             "Int" | "Num" => Some(InferredType::Numeric),
-            "Bool" => Some(InferredType::Numeric),
+            "Bool" => Some(InferredType::Bool),
             "HashRef" => Some(InferredType::HashRef),
             "ArrayRef" => Some(InferredType::ArrayRef),
             "CodeRef" => Some(InferredType::CodeRef { return_edge: None }),

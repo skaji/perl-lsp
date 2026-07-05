@@ -1141,7 +1141,8 @@ pub fn cpp_pack() -> LangPack {
             use InferredType::*;
             match text.trim() {
                 "int" | "long" | "short" | "unsigned" | "size_t" | "int32_t" | "int64_t"
-                | "uint32_t" | "uint64_t" | "double" | "float" | "bool" | "char" => Some(Numeric),
+                | "uint32_t" | "uint64_t" | "double" | "float" | "char" => Some(Numeric),
+                "bool" => Some(Bool),
                 "std::string" | "string" | "std::string_view" => Some(String),
                 "auto" | "void" => None,
                 t => {
@@ -1325,6 +1326,7 @@ fn lit_type(suffix: &str) -> Option<InferredType> {
     match suffix {
         "string" => Some(InferredType::String),
         "number" => Some(InferredType::Numeric),
+        "bool" => Some(InferredType::Bool),
         "arrayref" => Some(InferredType::ArrayRef),
         "hashref" => Some(InferredType::HashRef),
         _ => None,

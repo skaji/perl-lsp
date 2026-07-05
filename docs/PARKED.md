@@ -30,8 +30,6 @@ why parked, what unblocks it. Prune on landing.
   kept, unwired).
 - **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
 - **PR #105** heatmap-viz refresh (pre-rebased on local `tmp-viz-trial`).
-- **bool → Numeric** — needs `InferredType::Bool` across the ~12-variant
-  lattice + reducers.
 - **Per-toolchain global system-header cache**; the cross-language
   "system root" generalization (perl=@INC, python=probe).
 - **Instance brands** (per-object dispatch scoping) — downstream of the

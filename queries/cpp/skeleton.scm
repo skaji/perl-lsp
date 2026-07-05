@@ -626,6 +626,14 @@
 ; ---- literals + variable reads (the edge-chase substrate) ----
 (number_literal) @expr.lit.number
 (string_literal) @expr.lit.string
+(true) @expr.lit.bool
+(false) @expr.lit.bool
+; A comparison / logical operator yields `bool` in C++ (unlike Perl's
+; value-preserving `&&`/`||`, C++'s ARE boolean). Gate on the operator so
+; an arithmetic `a + b` (same node kind) stays untyped and defers to the
+; edge chase.
+(binary_expression
+  operator: ["==" "!=" "<" ">" "<=" ">=" "&&" "||"]) @expr.lit.bool
 (identifier) @expr.read.var
 
 ; `return EXPR;` — the returned expression's OWN span already carries
