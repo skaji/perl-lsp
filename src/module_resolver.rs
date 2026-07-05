@@ -758,6 +758,13 @@ pub fn index_workspace_with_index(
 /// and write the fresh ones back — so a big monorepo doesn't re-analyze
 /// every header each launch. `cache_key` is the workspace root the cache
 /// dir hashes on (`None` ⇒ no persistence, e.g. tests).
+/// Slice-2 eviction off-switch: `PERL_LSP_NO_EVICT` keeps every resident pack
+/// bag in memory (the pre-Slice-2 footprint) — an emergency knob and the A/B
+/// lever for isolating an eviction-caused regression.
+fn eviction_enabled() -> bool {
+    std::env::var_os("PERL_LSP_NO_EVICT").is_none()
+}
+
 pub fn index_pack_languages(
     root: &std::path::Path,
     cache_key: Option<&str>,
@@ -766,6 +773,11 @@ pub fn index_pack_languages(
     // the single pack token's percentage is monotone. Called once per path
     // (warm-skip OR analyzed) — `done` reaches the grand total at the end.
     progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    // Slice-2 rehydration LRU byte cap (`maxCacheMb * 1 MiB`). The resident
+    // pack analyses are bag-stripped after indexing; a type query into an
+    // evicted file rehydrates its exact bag from SQLite into this cap. `0`
+    // disables retention (rehydrate-and-drop). See `docs/adr/memory-slice-2-lru.md`.
+    bag_cache_bytes: usize,
 ) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
@@ -819,7 +831,27 @@ pub fn index_pack_languages(
     let total = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     for (lang, paths) in lang_paths {
-        let pack_index = Arc::new(crate::module_index::ModuleIndex::new_for_cli());
+        // Slice-2 bag-rehydration LRU: a loader that opens THIS lang's SQLite
+        // conn on demand (rusqlite `Connection` isn't `Sync`, so we open per
+        // rehydration miss — rare, and SQLite handles concurrent readers) and
+        // decodes the one requested file's full bag.
+        let bag_cache = {
+            let cache_key_owned = cache_key.map(|s| s.to_string());
+            let loader = move |path: &std::path::Path| -> Option<crate::file_analysis::FileAnalysis> {
+                let conn = module_cache::open_cache_db(cache_key_owned.as_deref(), lang)?;
+                // The blob is persisted under the CANONICAL path (both feed
+                // paths write `canon`), while the resident copy may be
+                // registered under the walk's raw path — canonicalize so the
+                // keyed decode matches regardless of which form the caller holds.
+                let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                module_cache::load_one(&conn, &canon.to_string_lossy())
+                    .or_else(|| module_cache::load_one(&conn, &path.to_string_lossy()))
+            };
+            Arc::new(crate::pack_bag_cache::PackBagCache::new(bag_cache_bytes, loader))
+        };
+        let pack_index = Arc::new(
+            crate::module_index::ModuleIndex::new_for_cli().with_bag_cache(bag_cache),
+        );
         let conn = module_cache::open_cache_db(cache_key, lang);
         // A generation built under different analysis inputs (toolchain
         // change — or its probe FAILURE, which empties the system include
@@ -839,14 +871,29 @@ pub fn index_pack_languages(
             let temp: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
             let (_n, stale_names) = module_cache::warm_cache(conn, &temp);
             let stale: std::collections::HashSet<String> = stale_names.into_iter().collect();
-            for entry in temp.iter() {
-                if stale.contains(entry.key()) {
+            // Drain (not iterate): the disk blob keeps the FULL bag, so the
+            // resident register gets a bag-STRIPPED copy while the just-decoded
+            // full analysis is dropped at the end of each iteration (R2 — never
+            // retain the full bag past registration). `try_unwrap` takes
+            // ownership when the temp map was the only holder (the common case),
+            // avoiding a full clone; the clone is the refcount>1 fallback.
+            for (name, val) in temp.into_iter() {
+                if stale.contains(&name) {
                     continue;
                 }
-                if let Some(cached) = entry.value() {
-                    pack_index.register_symbols(cached.path.clone(), cached.analysis.clone());
-                    warmed.insert(cached.path.clone());
+                let Some(cached) = val else { continue };
+                let path = cached.path.clone();
+                let mut fa = match Arc::try_unwrap(cached) {
+                    Ok(cm) => {
+                        Arc::try_unwrap(cm.analysis).unwrap_or_else(|arc| (*arc).clone())
+                    }
+                    Err(arc) => (*arc.analysis).clone(),
+                };
+                if eviction_enabled() {
+                    fa.evict_witness_bag();
                 }
+                pack_index.register_symbols(path.clone(), Arc::new(fa));
+                warmed.insert(path);
             }
         }
 
@@ -854,8 +901,21 @@ pub fn index_pack_languages(
         // fresh analyses for a sequential write (rusqlite Connection isn't
         // Sync). register_symbols happens here so cross-file works even
         // when persistence is off.
-        let fresh: std::sync::Mutex<Vec<(PathBuf, Arc<crate::file_analysis::FileAnalysis>)>> =
-            std::sync::Mutex::new(Vec::new());
+        // Each entry carries the bag-STRIPPED resident arc (registered) plus
+        // the pre-encoded FULL blob (with bag) for the sequential disk write —
+        // so the resident copy is thin and the persisted copy stays complete.
+        // `None` blob = a degraded analysis we deliberately did NOT strip (see
+        // below) or a non-persisted build; nothing to write.
+        type FreshEntry = (
+            PathBuf,
+            Arc<crate::file_analysis::FileAnalysis>,
+            Option<Vec<u8>>,
+        );
+        let fresh: std::sync::Mutex<Vec<FreshEntry>> = std::sync::Mutex::new(Vec::new());
+        // Hoisted so the Rayon closure never touches `conn` (rusqlite
+        // `Connection` isn't `Sync`); the bag is stripped only when it can be
+        // rehydrated later — i.e. when there's a blob on disk.
+        let persist = conn.is_some() && eviction_enabled();
         paths.par_iter().for_each(|path| {
             // Tick before any early-out so warm-cache skips also advance the
             // bar — `done` must reach `grand_total`.
@@ -873,10 +933,24 @@ pub fn index_pack_languages(
                 let source = std::fs::read_to_string(path).ok()?;
                 Some(driver.analyze_with_path(&source, Some(path)))
             }));
-            if let Ok(Some(analysis)) = res {
+            if let Ok(Some(mut analysis)) = res {
+                // Serialize the FULL bag NOW (while present) for the disk write,
+                // then strip it from the resident copy — one struct, no clone
+                // (`docs/adr/memory-slice-2-lru.md`). Only strip when the bag is
+                // recoverable: persistence must be on (else there's no blob to
+                // rehydrate from) and the analysis non-degraded (`save_*` skip
+                // degraded rows, so their bag would be lost). Otherwise keep it
+                // resident.
+                let blob = if persist && !analysis.degraded {
+                    let b = module_cache::encode_analysis(&analysis);
+                    analysis.evict_witness_bag();
+                    b
+                } else {
+                    None
+                };
                 let arc = Arc::new(analysis);
                 pack_index.register_symbols(path.clone(), arc.clone());
-                fresh.lock().unwrap().push((canon.clone(), arc));
+                fresh.lock().unwrap().push((canon.clone(), arc, blob));
                 total.fetch_add(1, Ordering::Relaxed);
                 // Residency: this file's merged/expanded macro tables are a
                 // one-shot build input, now dead weight for the rest of the
@@ -892,16 +966,22 @@ pub fn index_pack_languages(
             }
         });
 
-        // WRITE the fresh analyses back (keyed by canonical path).
+        // WRITE the fresh analyses back (keyed by canonical path). The blob
+        // was pre-encoded from the FULL analysis; `deps_stamp` derives from the
+        // pinned `include_closure` (survives eviction), so the persisted row is
+        // byte-identical to `save_to_db`'s from the full struct.
         if let Some(ref conn) = conn {
-            for (path, arc) in fresh.into_inner().unwrap() {
-                let cached = Arc::new(CachedModule::new(path.clone(), arc));
-                module_cache::save_to_db(
-                    conn,
-                    &path.to_string_lossy(),
-                    &Some(cached),
-                    "workspace",
-                );
+            for (path, arc, blob) in fresh.into_inner().unwrap() {
+                if let Some(blob) = blob {
+                    module_cache::save_blob_to_db(
+                        conn,
+                        &path.to_string_lossy(),
+                        &path,
+                        &arc.include_closure,
+                        &blob,
+                        "workspace",
+                    );
+                }
             }
         }
         hub.attach_pack_index(lang, pack_index);
@@ -993,19 +1073,31 @@ pub fn pack_file_changed(
             }
         })
         .collect();
-    if let Some(ref pack) = pack {
-        for (p, arc) in &results {
-            pack.unregister_file(p);
-            pack.register_symbols(p.clone(), arc.clone());
-        }
-    }
-    // Refresh the persisted rows so the next session warms the new
-    // generation (a consumer's OWN stamp didn't change — without this
-    // rewrite the deps_stamp check would force a cold re-analyze).
-    if let Some(conn) = module_cache::open_cache_db(root_uri, lang) {
+    // Persist the FULL analyses (bag present) FIRST so the on-disk blob can
+    // rehydrate, then register bag-STRIPPED resident copies and drop each
+    // file's now-stale entry from the rehydration LRU (change #6). `results`
+    // holds the full arcs; `save_to_db` encodes them whole. Strip only when we
+    // actually persisted — else the bag would be unrecoverable, so keep it.
+    let persisted = if let Some(conn) = module_cache::open_cache_db(root_uri, lang) {
         for (p, arc) in &results {
             let cached = Arc::new(CachedModule::new(p.clone(), arc.clone()));
             module_cache::save_to_db(&conn, &p.to_string_lossy(), &Some(cached), "workspace");
+        }
+        true
+    } else {
+        false
+    };
+    if let Some(ref pack) = pack {
+        for (p, arc) in &results {
+            pack.unregister_file(p);
+            if persisted && !arc.degraded && eviction_enabled() {
+                let mut resident = (**arc).clone();
+                resident.evict_witness_bag();
+                pack.register_symbols(p.clone(), Arc::new(resident));
+            } else {
+                pack.register_symbols(p.clone(), arc.clone());
+            }
+            pack.invalidate_bag_cache(p);
         }
     }
 }

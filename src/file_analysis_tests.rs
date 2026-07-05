@@ -278,6 +278,42 @@ fn build_fa_from_source(source: &str) -> FileAnalysis {
     crate::builder::build(&tree, source.as_bytes())
 }
 
+/// Slice-2: `evict_witness_bag` clears the bag and sets the flag while every
+/// pinned projection (refs, symbols, resolved dispatch targets, parents)
+/// survives — the completeness guarantee that references/goto/rename stay whole
+/// after eviction (the bag-free whole-tree queries).
+#[test]
+fn evict_witness_bag_keeps_pinned_drops_bag() {
+    let src = "package Foo;\nsub bar { my $self = shift; return 'x'; }\nsub baz { Foo::bar(); }\n";
+    let mut fa = build_fa_from_source(src);
+    assert!(!fa.bag_is_evicted());
+    assert!(!fa.witnesses.is_empty(), "expected a populated bag pre-eviction");
+    let refs_before: Vec<_> = fa.refs.iter().map(|r| r.target_name.clone()).collect();
+    let syms_before: Vec<_> = fa.symbols.iter().map(|s| s.name.clone()).collect();
+    let targets_before: Vec<_> =
+        fa.refs.iter().map(|r| r.resolved_method_target.clone()).collect();
+    let parents_before = fa.package_parents.clone();
+    assert!(!refs_before.is_empty() && !syms_before.is_empty());
+
+    fa.evict_witness_bag();
+
+    assert!(fa.bag_is_evicted());
+    assert!(fa.witnesses.is_empty(), "bag vec must be cleared");
+    // Pinned fields byte-for-byte unchanged — the whole-tree queries stay complete.
+    let refs_after: Vec<_> = fa.refs.iter().map(|r| r.target_name.clone()).collect();
+    let syms_after: Vec<_> = fa.symbols.iter().map(|s| s.name.clone()).collect();
+    let targets_after: Vec<_> =
+        fa.refs.iter().map(|r| r.resolved_method_target.clone()).collect();
+    assert_eq!(refs_before, refs_after);
+    assert_eq!(syms_before, syms_after);
+    assert_eq!(targets_before, targets_after);
+    assert_eq!(parents_before, fa.package_parents);
+    // Idempotent.
+    fa.evict_witness_bag();
+    assert!(fa.bag_is_evicted());
+    assert!(fa.witnesses.is_empty());
+}
+
 /// Fully-qualified same-file call (`Foo::baz()`) — goto-def lands on the
 /// local `sub baz` in package Foo, and references on the def includes the
 /// qualified call site. The ref's `target_name` is the whole `Foo::baz`

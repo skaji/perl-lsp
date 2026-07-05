@@ -18,6 +18,35 @@ fn parse_source_to_cached(source: &str, path: &std::path::Path) -> Arc<CachedMod
     Arc::new(CachedModule::new(path.to_path_buf(), Arc::new(fa)))
 }
 
+/// Slice-2: `load_one` decodes a single persisted analysis BY PATH with its
+/// full witness bag present — the rehydration primitive. A resident copy may
+/// have had its bag evicted, but the on-disk blob is whole, so `load_one`
+/// resurrects it.
+#[test]
+fn load_one_rehydrates_full_bag() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_load_one.pm");
+    std::fs::write(&pm, "package L;\nsub f { my $s = shift; return 'x'; }\n1;\n").unwrap();
+    let source = std::fs::read_to_string(&pm).unwrap();
+    let cached = parse_source_to_cached(&source, &pm);
+    // Sanity: the freshly built analysis has a populated bag.
+    assert!(!cached.analysis.witnesses.is_empty());
+    save_to_db(&conn, &pm.to_string_lossy(), &Some(cached.clone()), "workspace");
+
+    let loaded = load_one(&conn, &pm.to_string_lossy()).expect("row should decode");
+    assert!(!loaded.bag_is_evicted());
+    assert!(
+        !loaded.witnesses.is_empty(),
+        "load_one must return the full bag, not an evicted one"
+    );
+    assert_eq!(loaded.witnesses.len(), cached.analysis.witnesses.len());
+    // A path with no row yields None (miss → caller degrades to bag-less).
+    assert!(load_one(&conn, "/no/such/path.pm").is_none());
+
+    let _ = std::fs::remove_file(&pm);
+}
+
 #[test]
 fn test_db_save_and_load_roundtrip() {
     let conn = test_db();

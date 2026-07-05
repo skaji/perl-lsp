@@ -333,7 +333,7 @@ fn closure_stamp(
 }
 
 /// Serialize FileAnalysis via bincode then compress with zstd.
-fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
+pub fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
     let bin = bincode::serialize(fa).ok()?;
     zstd::encode_all(bin.as_slice(), ZSTD_LEVEL).ok()
 }
@@ -344,6 +344,63 @@ fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
     let mut fa: FileAnalysis = bincode::deserialize(&bin).ok()?;
     fa.after_deserialize();
     Some(fa)
+}
+
+/// Keyed single-file decode — the Slice-2 rehydration primitive
+/// (`docs/adr/memory-slice-2-lru.md`). Loads ONE file's persisted analysis
+/// (full witness bag present) by path, without warming the whole table. The
+/// resident pack-index copy has its bag evicted after indexing; a type query
+/// that reaches into an evicted file rehydrates the exact bag through here.
+/// No mtime/closure validation: the caller (`PackBagCache`) invalidates its
+/// entry on file change, and the row's shape is EXTRACT_VERSION-pinned.
+pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT analysis FROM modules WHERE path = ?1",
+            params![path],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .ok()
+        .flatten()?;
+    if blob.is_empty() {
+        return None;
+    }
+    decode_analysis(&blob)
+}
+
+/// Persist a PRE-ENCODED analysis blob (the full witness bag serialized before
+/// the resident copy was bag-evicted). The blob is authored by
+/// `encode_analysis` while the bag is still present; this only writes the row,
+/// stamping mtime/size from `path` and `deps_stamp` from `include_closure`
+/// (pinned — it survives eviction), so the stored generation is byte-identical
+/// to what `save_to_db` would have written from the full analysis.
+pub fn save_blob_to_db(
+    conn: &Connection,
+    module_name: &str,
+    path: &std::path::Path,
+    include_closure: &[String],
+    blob: &[u8],
+    source: &str,
+) {
+    let (mtime, size) = file_stamp(path).unwrap_or((0, 0));
+    let deps = closure_stamp(include_closure, &mut std::collections::HashMap::new());
+    let r = conn.execute(
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, extract_version, deps_stamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            module_name,
+            path.to_string_lossy(),
+            mtime,
+            size,
+            source,
+            Some(blob),
+            EXTRACT_VERSION,
+            deps
+        ],
+    );
+    if let Err(e) = r {
+        log::warn!("Failed to save module blob for '{}': {}", module_name, e);
+    }
 }
 
 pub fn warm_cache(

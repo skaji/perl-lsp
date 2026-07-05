@@ -73,6 +73,7 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("module_index", Index),
         ("module_resolver", Index),
         ("module_cache", Index),
+        ("pack_bag_cache", Index),
         ("file_store", Index),
         ("resolve", Index),
         ("document", Index),
