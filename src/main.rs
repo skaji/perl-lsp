@@ -1432,17 +1432,30 @@ fn run_one(
         "workspace-symbol" => {
             let q = req.query.clone().unwrap_or_default().to_lowercase();
             let mut results = Vec::new();
+            let mut push = |name: &str, kind: &file_analysis::SymKind, file: String, span: file_analysis::Span| {
+                if name.to_lowercase().contains(&q) {
+                    results.push(serde_json::json!({
+                        "name": name, "kind": format!("{:?}", kind),
+                        "file": file,
+                        "line": span.start.row, "col": span.start.column,
+                    }));
+                }
+            };
             for entry in ws.workspace_raw().iter() {
+                let file = entry.key().display().to_string();
                 for sym in &entry.value().symbols {
-                    if sym.name.to_lowercase().contains(&q) {
-                        results.push(serde_json::json!({
-                            "name": sym.name, "kind": format!("{:?}", sym.kind),
-                            "file": entry.key().display().to_string(),
-                            "line": sym.selection_span.start.row, "col": sym.selection_span.start.column,
-                        }));
-                    }
+                    push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
             }
+            // Pack-language (C/C++/…) symbols live in per-language sub-indexes,
+            // not the Perl workspace map — sweep them so a C typedef/class/free
+            // function surfaces in workspace search too.
+            idx.for_each_pack_registered_file(&mut |path, analysis| {
+                let file = path.display().to_string();
+                for sym in &analysis.symbols {
+                    push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
+                }
+            });
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
         "rename" => {

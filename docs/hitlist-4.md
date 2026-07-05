@@ -188,7 +188,7 @@ of `op`; visible in `--outline op.h`), and the def-site hover reads
 
 ## Family synthesis
 
-### A — bare-name macro lane out-claims type names (resolve.rs)  → finding 3
+### A — bare-name macro lane out-claims type names (resolve.rs)  → finding 3  — **LANDED** (`fix/macro-type-arbitration`)
 
 **Mechanism:** `resolve()`'s pack backward/forward lanes treat "any visible
 `#define` of this name" as total identity for a bare token
@@ -208,6 +208,33 @@ early-return; optional rank signal: `#undef`-preceded redefinition = scoped
 internal. Include the ws-symbol exact-name check. Fixture: gd on `OP` at op.c
 179:25 must answer perl.h:3218 (gold row candidate); gd on `OP(...)` call-shaped
 uses in regexec.c must still answer the macro.
+
+**LANDED.** The gd hijack lived in the `definitions()` **forward** macro lane
+(`ranked_macro_variants`), not the backward `resolve_symbol_scoped` bare-name
+lane the triage first fingered. Fix = a **site-shape** gate: `token_is_call_shaped(source, point)`
+(is the token followed by `(`, skipping whitespace — the C-preprocessor rule
+for when a fn-like macro expands) meets the **candidate-shape** `MacroDef.params.is_some()`;
+a variant survives iff `call_shaped || m.params.is_none()`. At a parenless site
+the fn-like `#define OP(p)` drops out and the token falls through to the typedef
+lane LOGOP/UNOP already used; at `OP(node)` it stays. Both directions verified
+on perl5 (op.c:180 `OP`→perl.h:3218 typedef; regexec.c `OP(ST.me)`→regcomp.h:485
+macro) and in the reduced fixture `gold-corpus/cpp-fixture/macroarb/` (gold rows
+`cpp-macro-type-arbitration.json`; RED-confirmed: pre-fix both parenless sites
+land on the macro). ws-symbol sub-finding also landed: pack symbols live in the
+per-language `module_index` sub-indexes, invisible to the FileStore-only
+`workspace/symbol` sweep — added `ModuleIndex::for_each_pack_registered_file`
+and taught both the server handler and the CLI `--batch` handler to sweep it, so
+a C typedef/class/free-function surfaces in workspace search (gold
+`cpp-workspace-symbol.json`; the `OP` typedef Class now appears).
+**Residuals (PARKED):** (1) the `#undef`-preceded-redefinition rank signal was
+not needed and not added (the shape gate alone resolves the arbitration). (2) gr
+symmetry on the typedef token: `resolve_symbol_scoped`'s backward `RefKind::Variable`
+lane has no source access, so it can't run `token_is_call_shaped`; gr from a
+parenless `OP` still mints the macro `FileScopeValue` target (pre-existing). A
+first attempt to gate that lane on `MacroDef.params` alone broke gr for
+function-like decl-position macros (`int x ABSL_GUARDED_BY(mu)` — call-shaped in
+source but a parenless-looking Variable/Sub phantom in the CST), so it was
+reverted; a correct fix needs source threaded into that lane. Left as follow-up.
 
 ### B — the first-open degraded window (backend open/index path) → findings 1c, 2, 5c, 6b
 
@@ -285,8 +312,8 @@ extraction-payload, and DX issues respectively. No double-scheduling.
 
 ## Proposed slice order (by user pain)
 
-1. **Slice A** — gd-on-`OP` wrong answer (deterministic lie on a core type;
-   every navigation from it is poisoned).
+1. ~~**Slice A** — gd-on-`OP` wrong answer (deterministic lie on a core type;
+   every navigation from it is poisoned).~~ **LANDED** (`fix/macro-type-arbitration`).
 2. **Slice B** — first-open window (the first minute of every session lies
    about references/hover/completion, silently).
 3. **Slice C** — macro-body member fidelity (`OP*` hover, inlay noise on

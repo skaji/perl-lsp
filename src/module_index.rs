@@ -1001,6 +1001,21 @@ impl ModuleIndex {
         }
     }
 
+    /// Iterate every pack-language (C/C++/…) registered file's analysis. Pack
+    /// symbols live in per-language sub-indexes, not the Perl FileStore
+    /// workspace map, so `workspace/symbol` must sweep them separately or a
+    /// C typedef/class/function never surfaces in a workspace search.
+    pub fn for_each_pack_registered_file(
+        &self,
+        f: &mut dyn FnMut(&std::path::Path, &FileAnalysis),
+    ) {
+        for entry in self.pack_indexes.iter() {
+            entry
+                .value()
+                .for_each_registered_file(&mut |cached| f(&cached.path, &cached.analysis));
+        }
+    }
+
     /// Rebuild the reverse index (`func → modules`) from the current cache.
     /// `warm_cache` writes straight into `cache_raw()` and never touches the
     /// reverse index, so a CLI/full-startup warm path that skips this leaves
