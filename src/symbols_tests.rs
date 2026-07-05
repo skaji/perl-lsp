@@ -2790,6 +2790,72 @@ sub action ($c) {\n\
     );
 }
 
+/// Cross-file goto-def to a DYNAMICALLY-minted helper. The provider loops
+/// a literal `qw` list and registers `$app->helper("get_$name" => sub)`
+/// per element; `$c->get_order` in another file must goto-def to that
+/// registration call site. Mirrors `cross_file_plugin_helper_goto_def_resolves`
+/// (static widget), proving the dynamic names ride the identical app-surface
+/// bridge — no parallel lookup path.
+#[test]
+fn cross_file_dynamic_helper_goto_def_resolves() {
+    let provider_src = "package My::Plugin;\n\
+use Mojo::Base 'Mojolicious::Plugin';\n\
+sub register ($self, $app, $conf) {\n\
+  for my $name (qw(user order invoice)) {\n\
+    $app->helper(\"get_$name\" => sub ($c) { return Widget->new; });\n\
+  }\n\
+}\n\
+1;\n";
+    let provider = parse_analysis(provider_src);
+    // Sanity: the dynamic loop really minted the concrete `get_order` helper,
+    // bridged to the app surface (so the test can't pass vacuously).
+    assert!(
+        provider.symbols.iter().any(|s| s.name == "get_order"
+            && matches!(&s.namespace, crate::file_analysis::Namespace::Framework { id } if id == "mojo-helpers")),
+        "provider must mint the dynamic `get_order` helper",
+    );
+
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let provider_path = std::path::PathBuf::from("/tmp/perl_lsp_pin_My_DynPlugin.pm");
+    idx.register_workspace_module(provider_path.clone(), std::sync::Arc::new(provider));
+
+    let consumer_src = "package My::Ctrl;\n\
+use Mojo::Base 'Mojolicious::Controller';\n\
+sub action ($c) {\n\
+  my $w = $c->get_order;\n\
+  return $w;\n\
+}\n\
+1;\n";
+    let consumer = parse_analysis(consumer_src);
+
+    let byte = consumer_src.find("get_order;").expect("call site present");
+    let prefix = &consumer_src[..byte];
+    let pos = Position {
+        line: prefix.matches('\n').count() as u32,
+        character: (byte - prefix.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32,
+    };
+
+    let uri = Url::parse("file:///consumer.pl").unwrap();
+    let resp = find_definition(&crate::file_store::FileStore::new(), &consumer, pos, &uri, &idx);
+    let loc = match resp {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        Some(GotoDefinitionResponse::Array(mut v)) if !v.is_empty() => v.remove(0),
+        other => panic!("expected goto-def for cross-file dynamic helper, got {other:?}"),
+    };
+    assert!(
+        loc.uri.path().ends_with("My_DynPlugin.pm"),
+        "goto-def should land in the provider file, got {}",
+        loc.uri,
+    );
+    // Lands on the registration loop line (`$app->helper("get_$name" => …)`,
+    // line 4, 0-based), the provenance anchor for every minted helper.
+    assert_eq!(
+        loc.range.start.line, 4,
+        "goto-def should land on the registration call, got {}",
+        loc.range.start.line,
+    );
+}
+
 /// CG-3b cross-package glob attribution, cross-file: `DateTime::PP`
 /// installs `_ymd2rd` into `DateTime` via
 /// `*{ 'DateTime::' . $sub } = __PACKAGE__->can($sub)`. A `$self->_ymd2rd`
