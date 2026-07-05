@@ -737,6 +737,47 @@ struct s { int x; };
     assert_eq!(plan.blanked_source, src, "source unchanged");
 }
 
+/// Poisoned-persist lock: a header that RESOLVES (exists) but fails to read
+/// (non-UTF-8, transient I/O) silently truncates the closure — its transitive
+/// includes never enqueue. The BFS must report `complete=false` so the driver
+/// marks the analysis degraded and `save_to_db` refuses to freeze the truncated
+/// closure behind a self-validating `deps_stamp`. A fully-readable closure
+/// reports `complete=true`. An UNRESOLVED include is a legitimate boundary, not
+/// incompleteness.
+#[test]
+fn include_closure_reports_incomplete_on_unreadable_header() {
+    let dir = std::env::temp_dir().join(format!("closure_trunc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.h");
+    let bad = dir.join("bad.h");
+    let nested = dir.join("nested.h");
+    let main_c = dir.join("main.c");
+    std::fs::write(&nested, "#define NESTED 1\n").unwrap();
+    // `bad.h` resolves + canonicalizes (exists) but read_to_string fails on the
+    // invalid UTF-8, so its `#include "nested.h"` is never followed.
+    std::fs::write(&good, "#define OK 1\n").unwrap();
+    std::fs::write(&bad, [0xff, 0xfe, b'#', b'i', b'n', b'c']).unwrap();
+
+    let complete_src = "#include \"good.h\"\n";
+    std::fs::write(&main_c, complete_src).unwrap();
+    let (closure, complete) = crate::cpp_reparse::include_closure(&main_c, complete_src);
+    assert!(complete, "a fully-readable closure is complete");
+    assert_eq!(closure.len(), 1);
+
+    let trunc_src = "#include \"bad.h\"\n";
+    std::fs::write(&main_c, trunc_src).unwrap();
+    let (_closure, complete) = crate::cpp_reparse::include_closure(&main_c, trunc_src);
+    assert!(!complete, "an unreadable resolved header truncates → incomplete");
+
+    let unresolved_src = "#include \"no_such_system_header.h\"\n";
+    std::fs::write(&main_c, unresolved_src).unwrap();
+    let (closure, complete) = crate::cpp_reparse::include_closure(&main_c, unresolved_src);
+    assert!(complete, "an unresolved include is a boundary, not incompleteness");
+    assert!(closure.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// H1 lock: the tier-1 caches are keyed by (file, include-set) and cannot
 /// see header CONTENT edits; `evict_analysis_caches` is the invalidation
 /// seam the save/watcher path drives. After eviction, the macro table and
@@ -756,7 +797,7 @@ fn evict_analysis_caches_recovers_header_content_edits() {
     let t1 = included_macros(&main_c, src, &mut p);
     assert!(t1.contains_key("LIMIT"));
     assert!(!t1.contains_key("LIMIT2"));
-    assert_eq!(include_closure(&main_c, src).len(), 1);
+    assert_eq!(include_closure(&main_c, src).0.len(), 1);
 
     // Edit the header: new macro + a new nested include. The consuming
     // file's OWN include set is unchanged, so both caches keep serving
@@ -765,7 +806,7 @@ fn evict_analysis_caches_recovers_header_content_edits() {
     std::fs::write(&hdr, "#include \"hdr2.h\"\n#define LIMIT 5\n#define LIMIT2 7\n").unwrap();
     let t2 = included_macros(&main_c, src, &mut p);
     assert!(!t2.contains_key("LIMIT2"), "tier-1 hit: content edit invisible until evicted");
-    assert_eq!(include_closure(&main_c, src).len(), 1, "closure cache: same");
+    assert_eq!(include_closure(&main_c, src).0.len(), 1, "closure cache: same");
 
     // ...until the invalidation seam evicts the consumer.
     let evict: std::collections::HashSet<std::path::PathBuf> =
@@ -776,7 +817,7 @@ fn evict_analysis_caches_recovers_header_content_edits() {
     let t3 = included_macros(&main_c, src, &mut p);
     assert!(t3.contains_key("LIMIT2"), "fresh gather sees the header edit");
     assert!(t3.contains_key("NESTED"), "and the new nested include");
-    assert_eq!(include_closure(&main_c, src).len(), 2, "closure re-walked");
+    assert_eq!(include_closure(&main_c, src).0.len(), 2, "closure re-walked");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
