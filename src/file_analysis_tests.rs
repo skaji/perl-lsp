@@ -1502,7 +1502,7 @@ sub mix {
 
     let att_p = WitnessAttachment::Symbol(pick_sym.id);
     let q_p = ReducerQuery {
-        attachment: &att_p,
+        args: Vec::new(),        attachment: &att_p,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -1515,7 +1515,7 @@ sub mix {
 
     let att_m = WitnessAttachment::Symbol(mix_sym.id);
     let q_m = ReducerQuery {
-        attachment: &att_m,
+        args: Vec::new(),        attachment: &att_m,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,

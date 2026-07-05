@@ -4423,6 +4423,7 @@ impl FileAnalysis {
             framework: FrameworkFact::Plain,
             arity_hint: None,
             receiver,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
@@ -4464,6 +4465,7 @@ impl FileAnalysis {
             framework: FrameworkFact::Plain,
             arity_hint: None,
             receiver: None,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
@@ -5411,6 +5413,7 @@ impl FileAnalysis {
             framework: FrameworkFact::Plain,
             arity_hint: resolved_arity,
             receiver,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         match reg.query(&self.witnesses, &q) {
@@ -5487,6 +5490,7 @@ impl FileAnalysis {
             framework,
             arity_hint: arg_count.map(|n| n as u32),
             receiver: Some(receiver.clone()),
+            args: Vec::new(),
             context: Some(&ctx),
         };
         let reg = ReducerRegistry::with_defaults();
@@ -6051,6 +6055,7 @@ impl FileAnalysis {
             framework: crate::witnesses::FrameworkFact::Plain,
             arity_hint: None,
             receiver: None,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         let domain = match reg.query(&bag, &q) {
@@ -6148,6 +6153,7 @@ impl FileAnalysis {
             framework: FrameworkFact::Plain,
             arity_hint: None,
             receiver: None,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         let reg = ReducerRegistry::with_defaults();

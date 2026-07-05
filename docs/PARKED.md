@@ -23,7 +23,6 @@ why parked, what unblocks it. Prune on landing.
 - **Template rungs**: dependent types (`T::value_type`), value-arg
   deduction, template-template params.
 - **Flag-set domains** (`op_flags`/`OPf_*` — subset-of vs one-of).
-- **Parametric macro return** (`#define ID(x) (x)` → arg's type).
 - **Use-after-move re-wire** — needs path-sensitivity (function + test
   kept, unwired).
 - **PR #100** re-extraction onto `projection.rs` (user closes or reworks).

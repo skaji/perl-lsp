@@ -1,0 +1,29 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "cpp-macro-identity-param-return-chain",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "macro_param_return.cpp", "line": 16, "col": 11,
+      "expect": { "all": ["macro_param_return.cpp:3:10"], "none": [] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-macro-cast-wrapper-param-return-chain",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "macro_param_return.cpp", "line": 17, "col": 12,
+      "expect": { "all": ["macro_param_return.cpp:3:10"], "none": [] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-macro-select-second-param-return-chain",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture",
+      "file": "macro_param_return.cpp", "line": 18, "col": 16,
+      "expect": { "all": ["macro_param_return.cpp:3:10"], "none": [] },
+      "status": "gold"
+    }
+  ]
+}

@@ -12744,6 +12744,7 @@ impl<'a> Builder<'a> {
                     framework: FrameworkFact::Plain,
                     arity_hint: None,
                     receiver: None,
+                    args: Vec::new(),
                     context: Some(&ctx),
                 };
                 let resolved = match reg.query(&self.bag, &q) {
@@ -13539,6 +13540,7 @@ impl<'a> Builder<'a> {
             framework: FrameworkFact::Plain,
             arity_hint,
             receiver,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         match reg.query(&self.bag, &q) {
@@ -13625,6 +13627,7 @@ impl<'a> Builder<'a> {
             framework: FrameworkFact::Plain,
             arity_hint,
             receiver,
+            args: Vec::new(),
             context: Some(&ctx),
         };
         match reg.query(&self.bag, &q) {
@@ -13827,6 +13830,7 @@ impl<'a> Builder<'a> {
                     framework: FrameworkFact::Plain,
                     arity_hint: None,
                     receiver: None,
+                    args: Vec::new(),
                     context: Some(&ctx),
                 };
                 if let ReducedValue::Type(t) = reg.query(&self.bag, &q) {

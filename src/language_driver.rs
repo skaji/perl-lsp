@@ -376,6 +376,20 @@ impl PackDriver {
         // — and hand `into_file_analysis` the hints to lower onto the final
         // `SymbolId`s. `docs/adr/macro-handling.md`.
         skel.macro_returns = macro_return_hints(&macro_defs, parser);
+        // Param-return macros need each call site's argument spans so the
+        // call resolves to its n-th argument's own value witness (the
+        // parametric-return chase). Original coords — same frame as the
+        // remapped call/read witnesses.
+        let param_macro_names: std::collections::HashSet<String> = skel
+            .macro_returns
+            .iter()
+            .filter(|(_, h)| matches!(h, crate::query_extract::MacroReturnHint::Param(_)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !param_macro_names.is_empty() {
+            skel.macro_call_arg_spans =
+                crate::cpp_reparse::macro_call_arg_spans(parser, source, &param_macro_names);
+        }
         macro_defs
     }
 
@@ -567,8 +581,17 @@ fn macro_return_hints(
         }
         let hint = match &m.delegate {
             Some(g) => Some(MacroReturnHint::Delegate(g.clone())),
-            None => crate::cpp_reparse::classify_body_type(parser, &m.body)
-                .map(MacroReturnHint::Concrete),
+            None => {
+                let params = m.params.as_deref().unwrap_or(&[]);
+                // Param-dependent identity/projection first (`(x)`, `(b)`);
+                // else the param-independent body type (`((x)*(x))`).
+                crate::cpp_reparse::classify_param_return(parser, &m.body, params)
+                    .map(MacroReturnHint::Param)
+                    .or_else(|| {
+                        crate::cpp_reparse::classify_body_type(parser, &m.body)
+                            .map(MacroReturnHint::Concrete)
+                    })
+            }
         };
         if let Some(hint) = hint {
             out.push((m.name.clone(), hint));
@@ -880,6 +903,8 @@ fn remap_spans(
         moved_from,
         domain_sites,
         macro_returns: _,
+        // Populated in enrich_skeleton (post-remap) already in original coords.
+        macro_call_arg_spans: _,
         specializations: _,
         // name-keyed, ordered by byte position pre-remap — no spans to fix.
         template_params: _,

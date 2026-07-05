@@ -161,6 +161,13 @@ pub struct SkeletonAnalysis {
     /// return witness, and each call site an `Expr → Edge(Symbol)` so the call
     /// reflects the body's type. `docs/adr/macro-handling.md`.
     pub macro_returns: Vec<(String, MacroReturnHint)>,
+    /// Per-call-site argument spans for function-like macro calls, keyed by
+    /// the call-expression span (original coords). Lets a `Param(n)` macro's
+    /// call site edge `Expr(call) → Edge(Expr(arg_n))` so the parametric
+    /// return chases the argument's own value witness. Populated by the
+    /// driver's macro lane (it holds the tree); empty for languages with no
+    /// macro model.
+    pub macro_call_arg_spans: Vec<(Span, Vec<Span>)>,
     /// `return EXPR;` sites (`@expr.return.value`): (enclosing scope, the
     /// returned expression's span). Purely structural — this tier doesn't
     /// know what a `return` MEANS for any given language; the interpretation
@@ -181,6 +188,12 @@ pub struct SkeletonAnalysis {
 pub enum MacroReturnHint {
     Delegate(String),
     Concrete(InferredType),
+    /// The body is (or reduces to, under paren/cast wrappers) the macro's
+    /// `n`-th parameter — an identity/projection macro (`#define ID(x) (x)`,
+    /// `#define SEL2(a,b) (b)`). The return is the call's `n`-th argument's
+    /// type; the Symbol carries `ReturnExpr::Arg(n)` and each call site chases
+    /// the argument's own `Expr` witness. `docs/adr/macro-handling.md`.
+    Param(u32),
 }
 
 impl SkeletonAnalysis {
@@ -547,25 +560,45 @@ impl SkeletonAnalysis {
                 .filter(|s| matches!(s.kind, SymKind::Sub))
                 .map(|s| (s.name.as_str(), s.id))
                 .collect();
+            use crate::query_extract::MacroReturnHint;
+            let hint_of: std::collections::HashMap<&str, &MacroReturnHint> =
+                self.macro_returns.iter().map(|(n, h)| (n.as_str(), h)).collect();
             for (name, hint) in &self.macro_returns {
                 let Some(&sid) = sub_sid.get(name.as_str()) else { continue };
                 let span = symbols[sid.0 as usize].span;
                 let pay = match hint {
-                    crate::query_extract::MacroReturnHint::Delegate(g) => {
+                    MacroReturnHint::Delegate(g) => {
                         sub_sid.get(g.as_str()).map(|&gsid| WP::Edge(WA::Symbol(gsid)))
                     }
-                    crate::query_extract::MacroReturnHint::Concrete(t) => {
-                        Some(WP::InferredType(t.clone()))
+                    MacroReturnHint::Concrete(t) => Some(WP::InferredType(t.clone())),
+                    // The parametric identity/projection return is a deferred
+                    // `Arg(n)`; a call site substitutes it by chasing its own
+                    // argument below (`Arg` alone answers `None` at a bare sym
+                    // probe, exactly like `Receiver`).
+                    MacroReturnHint::Param(n) => {
+                        Some(WP::ReturnExpr(crate::witnesses::ReturnExpr::Arg(*n)))
                     }
                 };
                 if let Some(pay) = pay {
                     bag.push(mk(WA::Symbol(sid), pay, span));
                 }
             }
+            // Per-call-site argument spans (original coords) so a `Param(n)`
+            // call resolves to its n-th argument's value witness.
+            let call_args: std::collections::HashMap<Span, &Vec<Span>> =
+                self.macro_call_arg_spans.iter().map(|(s, a)| (*s, a)).collect();
             for (span, name) in &macro_call_spans {
-                if let Some(&sid) = sub_sid.get(name.as_str()) {
-                    bag.push(mk(WA::Expr(*span), WP::Edge(WA::Symbol(sid)), *span));
+                let Some(&sid) = sub_sid.get(name.as_str()) else { continue };
+                // Identity/projection macro: the call's value IS its n-th
+                // argument. Edge to the argument's own `Expr` witness rather
+                // than the param-agnostic Symbol return (edges-not-values).
+                if let Some(MacroReturnHint::Param(n)) = hint_of.get(name.as_str()).copied() {
+                    if let Some(arg) = call_args.get(span).and_then(|a| a.get(*n as usize)) {
+                        bag.push(mk(WA::Expr(*span), WP::Edge(WA::Expr(*arg)), *span));
+                        continue;
+                    }
                 }
+                bag.push(mk(WA::Expr(*span), WP::Edge(WA::Symbol(sid)), *span));
             }
         }
         // ---- Local/param vars: a variable READ resolves to the nearest

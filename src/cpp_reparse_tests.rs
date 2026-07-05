@@ -511,6 +511,52 @@ fn collect_macro_defs_recognizes_delegation() {
     assert_eq!(wrap.selection_span.start.column, 8); // after "#define "
 }
 
+/// The parametric-return lane: an identity/projection macro body reduces to
+/// one of its parameters (paren/cast wrappers transparent). `classify_param_
+/// return` reports the param index; a non-param body reports None (the
+/// param-independent `classify_body_type` lane handles those).
+#[test]
+fn classify_param_return_reads_param_index() {
+    let mut p = cpp_parser();
+    let params = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    // Bare identity.
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "(x)", &params(&["x"])),
+        Some(0)
+    );
+    // Cast wrapper — the cast type is ignored; still the argument's value.
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "((Widget*)(x))", &params(&["x"])),
+        Some(0)
+    );
+    // Two-param select-second.
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "(b)", &params(&["a", "b"])),
+        Some(1)
+    );
+    // An operator body is param-INDEPENDENT, not an identity.
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "((x)*(x))", &params(&["x"])),
+        None
+    );
+    // A bare identifier that isn't a parameter (a global) is not a param return.
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "(GLOBAL)", &params(&["x"])),
+        None
+    );
+    // Real redis shapes: `UNUSED(x) (void)(x)` and `ANNOTATE_HAPPENS_BEFORE(v)
+    // ((void) v)` are cast-to-void identities — the pervasive C spelling.
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "(void)(x)", &params(&["x"])),
+        Some(0)
+    );
+    assert_eq!(
+        crate::cpp_reparse::classify_param_return(&mut p, "((void) v)", &params(&["v"])),
+        Some(0)
+    );
+}
+
 // ===== Member-block macros as roles =====
 
 #[test]

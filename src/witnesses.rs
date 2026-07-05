@@ -312,6 +312,19 @@ pub enum ReturnExpr {
     /// Branch order matters when the hint is concrete — narrow guards
     /// (`Empty`, `Exact`, `AtLeast`) before `Any`.
     UnionOnArgs { branches: Vec<(ArgGuard, ReturnExpr)> },
+    /// The call's `n`-th argument type — the positional mirror of
+    /// `Receiver`. A parametric identity/projection macro (`#define ID(x)
+    /// (x)`, `#define SEL2(a,b) (b)`) declares `Arg(n)` on its Symbol;
+    /// `eval_return_expr` substitutes `q.args[n]`, `None` when the query
+    /// carries no args (build-time probe / no call site) — same honest
+    /// `None` as `Receiver` without a receiver. In-file call sites resolve
+    /// the concrete value by chasing the argument's own `Expr` witness
+    /// (edges-not-values); this declarative form serves introspection and
+    /// arg-threaded queries. See `docs/adr/macro-handling.md`.
+    ///
+    /// Kept at the END for bincode variant-index stability (bump
+    /// `EXTRACT_VERSION`).
+    Arg(u32),
 }
 
 /// Type-level operators with `ReturnExpr`-valued sub-positions —
@@ -591,6 +604,12 @@ pub struct ReducerQuery<'a> {
     /// known invocant. `None` for build-time symbol probes — `Receiver`
     /// then evaluates to `None` rather than guessing.
     pub receiver: Option<InferredType>,
+    /// Call-site argument types for `ReturnExpr::Arg(n)` substitution — the
+    /// positional mirror of `receiver`. `Arg(n)` evaluates to `args[n]`,
+    /// `None` when empty (build-time symbol probe / no call site), exactly
+    /// as `Receiver` returns `None` without a receiver. Threaded through
+    /// edge chases like `receiver`.
+    pub args: Vec<InferredType>,
     /// Optional scope topology + per-package framework. Lets the
     /// registry chase `Edge(Variable{...})` with `query_variable_type`
     /// semantics (scope-chain walk + framework fold) instead of a flat
@@ -1376,6 +1395,7 @@ fn eval_return_expr(re: &ReturnExpr, q: &ReducerQuery) -> Option<InferredType> {
     match re {
         ReturnExpr::Concrete(t) => Some(t.clone()),
         ReturnExpr::Receiver => q.receiver.clone(),
+        ReturnExpr::Arg(i) => q.args.get(*i as usize).cloned(),
         ReturnExpr::ReceiverOr(fallback) => {
             Some(q.receiver.clone().unwrap_or_else(|| fallback.clone()))
         }
@@ -1780,6 +1800,7 @@ impl ReducerRegistry {
                                 framework: q.framework,
                                 arity_hint: q.arity_hint,
                                 receiver: q.receiver.clone(),
+                                args: q.args.clone(),
                                 context: Some(&cached_ctx),
                             };
                             let v = self.query_rec(
@@ -1814,6 +1835,7 @@ impl ReducerRegistry {
                         framework: q.framework,
                         arity_hint: q.arity_hint,
                         receiver: q.receiver.clone(),
+                        args: q.args.clone(),
                         context: q.context,
                     };
                     let v = self.query_rec(bag, &sub_q, state);
@@ -1882,6 +1904,7 @@ impl ReducerRegistry {
                                 framework: q.framework,
                                 arity_hint: None,
                                 receiver: q.receiver.clone(),
+                                args: q.args.clone(),
                                 context: Some(&cached_ctx),
                             };
                             let v = self.query_rec(&cached.analysis.witnesses, &sub_q, state);
@@ -1908,6 +1931,7 @@ impl ReducerRegistry {
                         framework: q.framework,
                         arity_hint: None,
                         receiver: q.receiver.clone(),
+                        args: q.args.clone(),
                         context: q.context,
                     };
                     let v = self.query_rec(bag, &sub_q, state);
@@ -1943,6 +1967,7 @@ impl ReducerRegistry {
                                 framework: q.framework,
                                 arity_hint: None,
                                 receiver: q.receiver.clone(),
+                                args: q.args.clone(),
                                 context: Some(&cached_ctx),
                             };
                             let v = self.query_rec(&cached.analysis.witnesses, &sub_q, state);
@@ -2036,6 +2061,7 @@ impl ReducerRegistry {
                                 framework: q.framework,
                                 arity_hint: q.arity_hint,
                                 receiver,
+                                args: q.args.clone(),
                                 context: q.context,
                             };
                             if let ReducedValue::Type(t) = &*self.query_rec(bag, &sub_q, state) {
@@ -2074,6 +2100,7 @@ impl ReducerRegistry {
                         framework: q.framework,
                         arity_hint: Some(*arity),
                         receiver,
+                        args: q.args.clone(),
                         context: q.context,
                     };
                     if let ReducedValue::Type(t) = &*self.query_rec(bag, &sub_q, state) {
@@ -2107,6 +2134,7 @@ impl ReducerRegistry {
                                 framework: q.framework,
                                 arity_hint: None,
                                 receiver: q.receiver.clone(),
+                                args: q.args.clone(),
                                 context: q.context,
                             };
                             match &*self.query_rec(bag, &sub_q, state) {
@@ -2138,6 +2166,7 @@ impl ReducerRegistry {
                                         framework: q.framework,
                                         arity_hint: None,
                                         receiver: q.receiver.clone(),
+                                        args: q.args.clone(),
                                         context: q.context,
                                     };
                                     match &*self.query_rec(bag, &sub_q, state) {
@@ -2171,6 +2200,7 @@ impl ReducerRegistry {
                         framework: q.framework,
                         arity_hint: Some(*arity),
                         receiver,
+                        args: q.args.clone(),
                         context: q.context,
                     };
                     if let ReducedValue::Type(t) = &*self.query_rec(bag, &sub_q, state) {
@@ -2219,6 +2249,7 @@ impl ReducerRegistry {
                 framework,
                 arity_hint: None,
                 receiver: None,
+                args: Vec::new(),
                 context: Some(ctx),
             };
             if let ReducedValue::Type(t) = &*self.query_rec(bag, &q, state) {
@@ -2277,6 +2308,7 @@ pub fn query_sub_return_type(
             framework: FrameworkFact::Plain,
             arity_hint,
             receiver: receiver.clone(),
+            args: Vec::new(),
             context,
         };
         if let ReducedValue::Type(t) = reg.query(bag, &q) {
@@ -2305,6 +2337,7 @@ pub fn query_sub_return_type(
                 framework: FrameworkFact::Plain,
                 arity_hint,
                 receiver: effective_receiver,
+                args: Vec::new(),
                 context,
             };
             if let ReducedValue::Type(t) = reg.query(bag, &q) {
@@ -2344,6 +2377,7 @@ pub fn query_sub_return_type(
                     framework: FrameworkFact::Plain,
                     arity_hint,
                     receiver: receiver.clone(),
+                    args: Vec::new(),
                     context: Some(&cached_ctx),
                 };
                 if let ReducedValue::Type(t) = reg.query(&cached.analysis.witnesses, &q) {
@@ -2443,6 +2477,7 @@ pub(crate) fn emit_mutation_extension_witnesses(
                 framework: FrameworkFact::Plain,
                 arity_hint: None,
                 receiver: None,
+                args: Vec::new(),
                 context: Some(ctx),
             };
             match reg.query(bag, &q) {

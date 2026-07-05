@@ -449,6 +449,87 @@ pub fn classify_body_type(
     classify_expr_node(value)
 }
 
+/// The macro parameter this body reduces to, if any: `#define ID(x) (x)` →
+/// `Some(0)`, `#define SEL2(a,b) (b)` → `Some(1)`. Paren and cast wrappers are
+/// transparent — `#define CAST(x) ((Widget*)(x))` is still the argument's
+/// value (the cast type is not recovered; "record what's cheap" per the ADR).
+/// Returns `None` for a body that isn't a bare parameter under wrappers (a
+/// literal, an operator expression, `G(x)` delegation, `a + b`). The
+/// param-DEPENDENT sibling of `classify_body_type`.
+pub fn classify_param_return(
+    parser: &mut tree_sitter::Parser,
+    body: &str,
+    params: &[String],
+) -> Option<u32> {
+    let wrapped = format!("int __macro_ret__ = {body};");
+    let tree = parser.parse(&wrapped, None)?;
+    let decl = tree.root_node().named_child(0)?;
+    let value = decl
+        .child_by_field_name("declarator")
+        .filter(|n| n.kind() == "init_declarator")
+        .and_then(|n| n.child_by_field_name("value"))?;
+    let name = param_identity_node(value, wrapped.as_bytes())?;
+    params.iter().position(|p| p == name).map(|i| i as u32)
+}
+
+/// Strip paren/cast wrappers to the bare identifier a body evaluates to (the
+/// value's identity, not its type); `None` if the peeled core isn't a single
+/// identifier.
+fn param_identity_node<'a>(node: tree_sitter::Node, src: &'a [u8]) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" => node.utf8_text(src).ok(),
+        "parenthesized_expression" => param_identity_node(node.named_child(0)?, src),
+        "cast_expression" => param_identity_node(node.child_by_field_name("value")?, src),
+        _ => None,
+    }
+}
+
+/// Per-call-site argument spans for calls whose callee is one of `names`
+/// (function-like macros left unexpanded → `call_expression`s). Keyed by the
+/// call span so the macro lane can edge a `Param(n)` call to its n-th
+/// argument's value witness. Spans are in `source` (original) coordinates —
+/// the same frame the extractor's remapped witnesses land in.
+pub fn macro_call_arg_spans(
+    parser: &mut tree_sitter::Parser,
+    source: &str,
+    names: &std::collections::HashSet<String>,
+) -> Vec<(crate::file_analysis::Span, Vec<crate::file_analysis::Span>)> {
+    use crate::file_analysis::Span;
+    let Some(tree) = parser.parse(source, None) else { return Vec::new() };
+    let src = source.as_bytes();
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "call_expression" {
+            continue;
+        }
+        let Some(callee) = node.child_by_field_name("function") else { continue };
+        if callee.kind() != "identifier" {
+            continue;
+        }
+        let Some(callee_name) = callee.utf8_text(src).ok() else { continue };
+        if !names.contains(callee_name) {
+            continue;
+        }
+        let Some(arglist) = node.child_by_field_name("arguments") else { continue };
+        let mut argc = arglist.walk();
+        let arg_spans: Vec<Span> = arglist
+            .named_children(&mut argc)
+            .filter(|n| n.kind() != "comment")
+            .map(|n| Span { start: n.start_position(), end: n.end_position() })
+            .collect();
+        out.push((
+            Span { start: node.start_position(), end: node.end_position() },
+            arg_spans,
+        ));
+    }
+    out
+}
+
 fn classify_expr_node(node: tree_sitter::Node) -> Option<crate::file_analysis::InferredType> {
     use crate::file_analysis::InferredType;
     match node.kind() {

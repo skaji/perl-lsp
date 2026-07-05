@@ -84,7 +84,7 @@ fn mojo_sub_name_does_not_flip_type_to_hashref() {
         scope: ScopeId(0),
     };
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::MojoBase,
         arity_hint: None, receiver: None, context: None,
@@ -113,7 +113,7 @@ fn plain_hashref_access_without_class_evidence() {
         scope: ScopeId(1),
     };
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -153,7 +153,7 @@ fn bless_target_array_with_class_assertion_keeps_class() {
         scope: ScopeId(2),
     };
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -192,7 +192,7 @@ fn core_class_still_holds_class_against_hashref_access() {
         scope: ScopeId(0),
     };
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::CoreClass,
         arity_hint: None, receiver: None, context: None,
@@ -235,7 +235,7 @@ fn fluent_chain_get_to_resolves_via_edge_chase() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Expression(get_ref);
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -260,7 +260,7 @@ fn edge_with_unresolved_target_yields_none() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Expression(RefIdx(7));
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -289,7 +289,7 @@ fn edge_chase_terminates_on_cycle() {
     });
     let reg = ReducerRegistry::with_defaults();
     let q = ReducerQuery {
-        attachment: &a,
+        args: Vec::new(),        attachment: &a,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -317,7 +317,7 @@ fn edge_chase_resolves_transitively() {
     });
     let reg = ReducerRegistry::with_defaults();
     let q = ReducerQuery {
-        attachment: &a,
+        args: Vec::new(),        attachment: &a,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -363,7 +363,7 @@ fn narrowed_span_wins_over_outer_witness_at_inside_point() {
     };
 
     let inside = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: Some(p(5, 4)),
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -374,7 +374,7 @@ fn narrowed_span_wins_over_outer_witness_at_inside_point() {
     );
 
     let outside = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: Some(p(2, 0)),
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -412,7 +412,7 @@ fn branch_arms_agree_folds_to_that_type() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::BranchArm(span(0, 0, 0, 0));
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -431,7 +431,7 @@ fn branch_arms_disagree_folds_to_none() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::BranchArm(span(0, 0, 0, 0));
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -487,7 +487,7 @@ fn branch_arm_edge_resolves_through_variable() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::BranchArm(span(0, 0, 0, 0));
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -534,7 +534,7 @@ fn arity_zero_returns_string_default_returns_self() {
 
     // Caller passes no args: `$r->name` — arity 0.
     let q0 = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: Some(0),
@@ -549,7 +549,7 @@ fn arity_zero_returns_string_default_returns_self() {
     // Caller passes one arg: `$r->name('x')` — arity 1 falls through
     // to Any → Receiver, returning the invocant class.
     let q1 = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: Some(1),
@@ -564,7 +564,7 @@ fn arity_zero_returns_string_default_returns_self() {
     // Arity unknown — Empty doesn't match None (strict Some(0)
     // only), Any does. Returns Receiver substitution.
     let qn = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -588,7 +588,7 @@ fn numeric_then_string_prefers_numeric_noop_when_class_set() {
         scope: ScopeId(0),
     };
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -628,7 +628,7 @@ fn plugin_override_priority_dominates_builder_inferred_type() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Symbol(sym_id);
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -672,7 +672,7 @@ fn plugin_override_reducer_declines_builder_priority_witnesses() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Symbol(sym_id);
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None, receiver: None, context: None,
@@ -701,7 +701,7 @@ fn return_expr_concrete_resolves_directly() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Symbol(sym_id);
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -725,7 +725,7 @@ fn return_expr_receiver_substitutes_from_query() {
     let reg = ReducerRegistry::with_defaults();
     let att = WitnessAttachment::Symbol(sym_id);
     let q_with = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -737,7 +737,7 @@ fn return_expr_receiver_substitutes_from_query() {
         ReducedValue::Type(InferredType::ClassName("Foo".into()))
     );
     let q_without = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -745,6 +745,53 @@ fn return_expr_receiver_substitutes_from_query() {
         context: None,
     };
     assert_eq!(reg.query(&bag, &q_without), ReducedValue::None);
+}
+
+/// `Arg(n)` substitutes `q.args[n]` — the positional mirror of `Receiver`.
+/// Out-of-range or empty args return None (build-time probe, no call site).
+#[test]
+fn return_expr_arg_substitutes_nth_from_query() {
+    let sym_id = SymbolId(21);
+    let mut bag = WitnessBag::new();
+    bag.push(Witness {
+        attachment: WitnessAttachment::Symbol(sym_id),
+        source: WitnessSource::Builder("test".into()),
+        payload: WitnessPayload::ReturnExpr(ReturnExpr::Arg(1)),
+        span: span(0, 0, 0, 0),
+    });
+    let reg = ReducerRegistry::with_defaults();
+    let att = WitnessAttachment::Symbol(sym_id);
+    let q_with = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        arity_hint: None,
+        receiver: None,
+        args: vec![
+            InferredType::ClassName("Gadget".into()),
+            InferredType::ClassName("Widget".into()),
+        ],
+        context: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q_with),
+        ReducedValue::Type(InferredType::ClassName("Widget".into())),
+        "Arg(1) picks the second argument's type"
+    );
+    let q_without = ReducerQuery {
+        attachment: &att,
+        point: None,
+        framework: FrameworkFact::Plain,
+        arity_hint: None,
+        receiver: None,
+        args: Vec::new(),
+        context: None,
+    };
+    assert_eq!(
+        reg.query(&bag, &q_without),
+        ReducedValue::None,
+        "no args (bare sym probe) → None, like Receiver without a receiver"
+    );
 }
 
 /// `UnionOnArgs` dispatches on `q.arity_hint`. `Empty` matches `Some(0)`,
@@ -768,7 +815,7 @@ fn return_expr_union_on_args_dispatches_by_arity() {
     let att = WitnessAttachment::Symbol(sym_id);
 
     let q_empty = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: Some(0),
@@ -782,7 +829,7 @@ fn return_expr_union_on_args_dispatches_by_arity() {
     );
 
     let q_any = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: Some(1),
@@ -796,7 +843,7 @@ fn return_expr_union_on_args_dispatches_by_arity() {
     );
 
     let q_no_hint = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -833,7 +880,7 @@ fn return_expr_operator_rowof_wraps_receiver() {
         row: "Schema::Result::Users".into(),
     });
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -906,7 +953,7 @@ fn query_memo_keeps_inherited_receiver_per_child_in_one_query() {
         name: "m".into(),
     };
     let foo_q = ReducerQuery {
-        attachment: &foo_att,
+        args: Vec::new(),        attachment: &foo_att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,
@@ -920,7 +967,7 @@ fn query_memo_keeps_inherited_receiver_per_child_in_one_query() {
         name: "m".into(),
     };
     let bar_q = ReducerQuery {
-        attachment: &bar_att,
+        args: Vec::new(),        attachment: &bar_att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,

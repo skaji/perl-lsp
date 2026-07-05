@@ -14247,7 +14247,7 @@ fn slot_type(fa: &FileAnalysis, class: &str, key: &str) -> Option<InferredType> 
         app_surface_consumers: &fa.app_surface_consumers,
     };
     let q = ReducerQuery {
-        attachment: &att,
+        args: Vec::new(),        attachment: &att,
         point: None,
         framework: FrameworkFact::Plain,
         arity_hint: None,

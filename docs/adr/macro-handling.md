@@ -146,9 +146,25 @@ machinery (`cpp_macro_model::classify` + the per-file include closure the
 gather already computes). Symbol resolution and macro resolution converge on
 one pattern: **global set + reachability scope.**
 
+### Parametric return — LANDED
+
+An identity/projection macro (`#define ID(x) (x)`, `#define SEL2(a,b) (b)`,
+cast-wrapped `#define CID(x) ((T*)(x))`) returns its n-th **argument's** type.
+`cpp_reparse::classify_param_return` peels paren/cast wrappers to the bare
+parameter (the cast type isn't recovered — "record what's cheap") and reports
+its index, minted as `MacroReturnHint::Param(n)` in the driver's macro lane.
+The lowering declares `ReturnExpr::Arg(n)` on the macro's `Symbol` (the
+positional mirror of `ReturnExpr::Receiver` — `eval_return_expr` substitutes
+`q.args[n]`, `None` at a bare probe), and each call site edges `Expr(call) →
+Edge(Expr(arg_n))` so the call chases the argument's **own** value witness
+(edges-not-values; `docs/adr/return-expr.md`). `ID(w)->m()` on `Widget *w`
+resolves `m` on `Widget`. Config-variant macros whose first `#define`
+delegates (`likely`/`unlikely` → `__builtin_expect` under `#if __GNUC__`)
+stay in the delegation lane; projection macros returning a member
+(`((n)->value)`) are not bare params → not claimed.
+
 ## Parked (we'll get there — correctness on a solid base, deepen as needed)
 
-- **Parametric return** (`#define ID(x) (x)` → the arg's type) — arity/union tier.
 - **Effects** — the second superposition dimension.
 
 ## Consequences
