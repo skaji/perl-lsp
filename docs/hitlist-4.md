@@ -153,7 +153,7 @@ of `op`; visible in `--outline op.h`), and the def-site hover reads
 `op_type: U16TYPE` / `*variable*` while the use-site reads `op_type: opcode` /
 `*field* (stored as uint16_t)`.
 
-**Verdict:** **family C** — the macro-body member lane.
+**Verdict:** **family C** — the macro-body member lane. **LANDED** (see family C).
 
 ### 5. Enum variants: hover / inlay / references
 
@@ -231,7 +231,20 @@ docs); (ii) prioritize the opened file's include closure in the lazy index;
 degraded answers are at least labeled. Verify by scripting the LSP lane
 (probe scripts kept in scratchpad; consider promoting one into e2e).
 
-### C — the `#define`-body member lane is second-class (extraction) → findings 4, 6a, 5-def-hover
+### C — the `#define`-body member lane is second-class (extraction) → findings 4, 6a, 5-def-hover — **LANDED**
+
+**Status: LANDED** (`fix/macro-member-payload`, EXTRACT_VERSION 157). The
+member-block synth lane now mints each member with the SAME payload a plainly-
+declared struct field carries: `SymKind::Field`, the pointer `deref_stack`
+(peeled by the shared `query_extract::peel` + `C_FIELD_DECL_PEEL` — one deref
+walker for both lanes, rule #10), and the `ANNOT_SOURCE` type witness. The
+existing renderers then fixed findings 4 + 6a with no adapter change:
+`op_p->op_next` hovers `OP*` at both def (op.h:51) and cross-file use (op.c:190),
+the def-site reads `*field*` (was `*variable*`), and inlay emits no hint on
+BASEOP members. PARKED residual: the def-site type still displays the immediate
+alias leaf (`op_type: PERL_BITFIELD16`) rather than chasing to `unsigned short`
+in single-file context — same alias-chase gap as any plain field, not lane-
+specific.
 
 **Mechanism:** members declared inside a multi-line `#define` (BASEOP) and
 remapped back into the macro body get: `SymKind::Variable` with
@@ -273,6 +286,12 @@ degradation unless cheap.
 ### Polish (fold into A/C or a fifth micro-slice)
 
 - Enumerator hover: show value AND type (`OP_NULL = 0: opcode`). (5a)
+  **LEDGERED (still open):** distinct seam from family C — the enum-value
+  literal (`= 0`) is not captured on the `Enumerator` symbol at extraction, and
+  the hover render branch is the generic `name: type` path, not the macro-member
+  Field lane. Needs (i) capturing the enumerator value at extraction (store on
+  the symbol/detail), (ii) threading it into the `Enumerator` arm of
+  `render_symbol_hover`. Not taken with the family-C payload fix (different seam).
 - ws-symbol exact short-name ranking (`OP`). (3 sub-finding)
 
 ## In-flight overlap

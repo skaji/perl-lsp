@@ -657,8 +657,12 @@ fn inject_member_blocks(
         });
         skel.scope_count = skel.scopes.len();
         for m in &base.members {
+            // Field kind + deref_stack + the explicit-annotation witness below:
+            // the SAME payload a plainly-declared struct field carries, so no
+            // renderer (hover stars, inlay suppression, `*field*` labeling) can
+            // tell a macro-pasted member from a directly-declared one (rule #10).
             skel.symbols.push(SkelSymbol {
-                kind: "var".to_string(), // a data member (Variable), package-tagged
+                kind: "field".to_string(),
                 name: m.name.clone(),
                 start: m.name_span.start,
                 end: m.name_span.end,
@@ -667,13 +671,15 @@ fn inject_member_blocks(
                 package: Some(base.macro_name.clone()),
                 scope: scope_id,
                 return_type: None,
-                deref_stack: Vec::new(),
+                deref_stack: m.deref_stack.clone(),
                 attributes: Vec::new(),
                 arity: None,
             });
             // The role member emits the SAME `TypeName` edge an expanded field
             // does — the edge is canonical (the hover leaf + the type chase
-            // resolve `op_type` → `unsigned short`).
+            // resolve `op_type` → `unsigned short`). Tagged `ANNOT_SOURCE` (the
+            // explicit-annotation source a plain field's declared type carries)
+            // so priority and inlay suppression match field-for-field.
             let payload = match annot_type(&m.type_text) {
                 Some(InferredType::ClassName(cn)) => {
                     Some(WitnessPayload::Edge(WitnessAttachment::TypeName(cn)))
@@ -684,7 +690,7 @@ fn inject_member_blocks(
             if let Some(payload) = payload {
                 skel.witnesses.push(Witness {
                     attachment: WitnessAttachment::Variable { name: m.name.clone(), scope: scope_id },
-                    source: WitnessSource::Builder("member-block".into()),
+                    source: WitnessSource::Builder(crate::witnesses::ANNOT_SOURCE.into()),
                     payload,
                     span: m.name_span,
                 });

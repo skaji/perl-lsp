@@ -546,6 +546,27 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-family-c-macro-body-pointer-member-hover",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "baseop_ptr.c",
+      "line": 6,
+      "col": 22,
+      "comment": "Family C finding 4: a pointer member declared inside a `#define BASEOP` body hovers with its `*` kept (`op_next: OP*`, `*field*`) — the macro-body member lane now carries the same deref_stack + Field kind a plainly-declared field does.",
+      "expect": {
+        "all": [
+          "op_next: OP*",
+          "*field*"
+        ],
+        "none": [
+          "op_next: OP\n"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

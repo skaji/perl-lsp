@@ -251,6 +251,59 @@ fn sym_in<'a>(
 
 #[cfg(feature = "cpp")]
 #[test]
+fn macro_body_member_carries_field_payload_like_plain_field() {
+    // hitlist-4 family C (findings 4 + 6a): a member declared inside a
+    // `#define BASEOP` body must arrive with the SAME payload a plainly-declared
+    // struct field carries — Field kind, the pointer deref_stack, and the
+    // explicit-annotation (`ANNOT_SOURCE`) witness — so hover keeps the `*` and
+    // the redundant inlay hint is suppressed.
+    use crate::file_analysis::{InferredType, SymKind};
+    let src = "\
+#define BASEOP OP* op_next; unsigned op_type:9;
+struct op { BASEOP };
+";
+    let fa = cpp_driver().analyze(src);
+
+    let op_next = sym_in(&fa, "op_next");
+    assert_eq!(op_next.kind, SymKind::Field, "macro-body member is a Field, not a Variable");
+    assert!(!op_next.deref_stack.is_empty(), "pointer member keeps its deref_stack");
+    // finding 4: hover renders the pointer star through the single display path.
+    assert_eq!(
+        op_next.display_type(&InferredType::ClassName("OP".into())),
+        "OP*",
+        "hover keeps the pointer star"
+    );
+
+    // finding 6a: the explicit-annotation witness the inlay suppressor keys on
+    // is present on the member's own scope (parity with a plain field).
+    let op_type = sym_in(&fa, "op_type");
+    assert_eq!(op_type.kind, SymKind::Field);
+    assert!(
+        fa.witnesses.has_builder_source(
+            &crate::witnesses::WitnessAttachment::Variable {
+                name: "op_type".into(),
+                scope: op_type.scope,
+            },
+            crate::witnesses::ANNOT_SOURCE,
+        ),
+        "macro-body member carries the ANNOT_SOURCE witness"
+    );
+
+    // The renderers then agree: inlay over the member declarations emits no hint
+    // (Field kind + ANNOT_SOURCE both suppress) — exactly like a plain struct,
+    // whose fields are never hinted either.
+    let full = crate::symbols::inlay_hints(
+        &fa,
+        tower_lsp::lsp_types::Range {
+            start: tower_lsp::lsp_types::Position { line: 0, character: 0 },
+            end: tower_lsp::lsp_types::Position { line: 2, character: 0 },
+        },
+    );
+    assert!(full.is_empty(), "no inlay hints echo a macro-body member's declared type: {full:?}");
+}
+
+#[cfg(feature = "cpp")]
+#[test]
 fn file_scope_value_gate() {
     // `#define MAX 1` mints a file-scope Variable symbol; `int g;` is a
     // global; both are bare-name-keyed values (FileScopeValue targets). A
