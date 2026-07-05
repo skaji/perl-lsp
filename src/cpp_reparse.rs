@@ -172,8 +172,36 @@ const MACRO_DEF_QUERY: &str = r#"
 "#;
 
 /// Spans to never expand inside: string/char literals, comments, and
-/// the preprocessor definition/conditional lines themselves.
+/// the preprocessor definition/conditional DIRECTIVE lines themselves.
+///
+/// Conditional regions (`#ifdef`/`#if`/`#elif`) exclude only their
+/// `name:`/`condition:` field — the directive-line tokens — NOT the whole
+/// node: the region BODY must stay expandable so a macro use between
+/// `#ifdef` and `#endif` still expands (`docs/adr/config-superposition-
+/// declarations.md`, slice 1: whole-node exclusion left perl5's `pTHX_`
+/// literal inside every conditional function, mistyping the receiver).
+/// The condition/name stays excluded so a macro name on the directive line
+/// (`#ifdef FOO`, `#if defined(FOO)`) is never rewritten.
 const EXCLUDE_QUERY: &str = r#"
+(string_literal) @x
+(char_literal) @x
+(comment) @x
+(preproc_def) @x
+(preproc_function_def) @x
+(preproc_call) @x
+(preproc_ifdef name: (identifier) @x)
+(preproc_if condition: (_) @x)
+(preproc_elif condition: (_) @x)
+(preproc_include) @x
+"#;
+
+/// The pre-widening WIDE exclusion: whole conditional region excluded (body
+/// included). Used ONLY as the fallback when the default narrow expansion above
+/// RAISES parse damage on a file — a huge macro-heavy source (perl.h/op.c)
+/// re-excludes its region bodies and keeps its prior fast expansion instead of
+/// paying the salvage cliff for the widened scope. See `EXCLUDE_QUERY` and
+/// `docs/adr/config-superposition-declarations.md` slice 1.
+const EXCLUDE_QUERY_WIDE: &str = r#"
 (string_literal) @x
 (char_literal) @x
 (comment) @x
@@ -203,6 +231,7 @@ const CALL_QUERY: &str = r#"
 /// is safe.
 static MACRO_DEF_Q: OnceLock<Query> = OnceLock::new();
 static EXCLUDE_Q: OnceLock<Query> = OnceLock::new();
+static EXCLUDE_Q_WIDE: OnceLock<Query> = OnceLock::new();
 static INCLUDE_Q: OnceLock<Query> = OnceLock::new();
 static CALL_Q: OnceLock<Query> = OnceLock::new();
 
@@ -1127,7 +1156,25 @@ pub fn preprocess_validated_with(
     };
     let before = parse_damage(tree.root_node());
     let structure = structure_count(tree.root_node());
+    // First attempt: narrow exclusion — conditional-region BODIES are
+    // expandable, so a macro use inside `#ifdef`/`#if`/`#else` expands
+    // (perl5's `pTHX_` context-param convention). See `EXCLUDE_QUERY`.
     let (rewritten, map) = preprocess_with(&tree, src, external);
+    if rewritten == src {
+        return (rewritten, map, recovered);
+    }
+    if parser
+        .parse(&rewritten, None)
+        .is_some_and(|t| parse_damage(t.root_node()) <= before)
+    {
+        return (rewritten, map, recovered);
+    }
+    // The widened expansion RAISED damage. Re-exclude conditional-region bodies
+    // (the pre-widening WIDE scope) and retry: a huge macro-heavy file
+    // (perl.h/op.c) keeps its prior fast expansion and never pays the salvage
+    // cliff for the widened scope — small clean files already validated above
+    // and kept the win. `docs/adr/config-superposition-declarations.md` slice 1.
+    let (rewritten, map) = preprocess_with_mode(&tree, src, external, false, false);
     if rewritten == src {
         return (rewritten, map, recovered);
     }
@@ -1142,7 +1189,7 @@ pub fn preprocess_validated_with(
             // splice degrades to a length-preserving blank when THAT
             // validates (leaving the raw token glues the next declaration
             // into garbage — the reason it was spliced at all).
-            let full = compute_splices(&tree, src, external, false);
+            let full = compute_splices(&tree, src, external, false, false);
             let mut budget: u32 = SALVAGE_PARSE_BUDGET;
             let mut good =
                 salvage_splices(parser, src, &full, (before, structure), &mut budget);
@@ -1192,7 +1239,7 @@ pub fn preprocess_validated_with(
             // Perl_op_prune_chain_head`) so macro-name indirection —
             // goto-def + references THROUGH the alias — survives even when
             // the rest is discarded.
-            let (alias_rw, alias_map) = preprocess_with_mode(&tree, src, external, true);
+            let (alias_rw, alias_map) = preprocess_with_mode(&tree, src, external, true, false);
             match (alias_rw != src).then(|| parser.parse(&alias_rw, None)).flatten() {
                 Some(a) if parse_damage(a.root_node()) <= before => (alias_rw, alias_map, recovered),
                 _ => (src.to_string(), SpliceMap::default(), recovered),
@@ -2190,7 +2237,10 @@ pub fn preprocess_with(
     src: &str,
     external: &PreExpandedExternal,
 ) -> (String, SpliceMap) {
-    preprocess_with_mode(tree, src, external, false)
+    // Default: conditional-region bodies are expandable (narrow exclusion). The
+    // damage-raising fallback in `preprocess_validated_with` re-runs with the
+    // wide scope when this widening hurts a file.
+    preprocess_with_mode(tree, src, external, false, true)
 }
 
 /// The two-tier macro view the source-splice pass queries: file-LOCAL
@@ -2338,8 +2388,9 @@ fn preprocess_with_mode(
     src: &str,
     external: &PreExpandedExternal,
     alias_only: bool,
+    expand_region_bodies: bool,
 ) -> (String, SpliceMap) {
-    preprocess_with_mode_inner(tree, src, external, alias_only, force_slow_path())
+    preprocess_with_mode_inner(tree, src, external, alias_only, force_slow_path(), expand_region_bodies)
 }
 
 /// The splice pass proper, `force_slow` explicit (env-gate read at the public
@@ -2351,8 +2402,10 @@ fn preprocess_with_mode_inner(
     external: &PreExpandedExternal,
     alias_only: bool,
     force_slow: bool,
+    expand_region_bodies: bool,
 ) -> (String, SpliceMap) {
-    let mut splices = compute_splices_inner(tree, src, external, alias_only, force_slow);
+    let mut splices =
+        compute_splices_inner(tree, src, external, alias_only, force_slow, expand_region_bodies);
     apply(src, &mut splices)
 }
 
@@ -2363,8 +2416,9 @@ fn compute_splices(
     src: &str,
     external: &PreExpandedExternal,
     alias_only: bool,
+    expand_region_bodies: bool,
 ) -> Vec<Splice> {
-    compute_splices_inner(tree, src, external, alias_only, force_slow_path())
+    compute_splices_inner(tree, src, external, alias_only, force_slow_path(), expand_region_bodies)
 }
 
 fn compute_splices_inner(
@@ -2373,6 +2427,7 @@ fn compute_splices_inner(
     external: &PreExpandedExternal,
     alias_only: bool,
     force_slow: bool,
+    expand_region_bodies: bool,
 ) -> Vec<Splice> {
     let eff = crate::timings::phase("cpp.macro_expand", || {
         build_effective_macros(tree, src, external, alias_only, force_slow)
@@ -2380,7 +2435,7 @@ fn compute_splices_inner(
     if eff.is_empty() {
         return Vec::new();
     }
-    let excludes = exclusion_spans(tree);
+    let excludes = exclusion_spans(tree, expand_region_bodies);
     // The expansion-policy flip: leave a use unexpanded when it already parses
     // clean, expand only where leaving it raises `parse_damage` (parse-repair).
     // `error_spans` is that per-use oracle. The alias-salvage mode is exempt —
@@ -2538,8 +2593,17 @@ fn substitute(body: &str, params: &[String], args: &[String]) -> String {
 /// raw spans overlap; merging their union lets the caller test membership
 /// with a single forward cursor (the words it tests only ever move
 /// rightward) instead of scanning every span per word.
-fn exclusion_spans(tree: &Tree) -> Vec<(usize, usize)> {
-    let query = cached_query(&EXCLUDE_Q, &tree.language(), EXCLUDE_QUERY);
+/// `expand_region_bodies` selects the exclusion scope: `true` (default) leaves
+/// conditional-region BODIES expandable (excluding only the directive/condition
+/// tokens); `false` re-excludes the whole region — the pre-widening scope the
+/// damage-raising fallback drops back to.
+fn exclusion_spans(tree: &Tree, expand_region_bodies: bool) -> Vec<(usize, usize)> {
+    let (slot, src) = if expand_region_bodies {
+        (&EXCLUDE_Q, EXCLUDE_QUERY)
+    } else {
+        (&EXCLUDE_Q_WIDE, EXCLUDE_QUERY_WIDE)
+    };
+    let query = cached_query(slot, &tree.language(), src);
     let mut spans = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(query, tree.root_node(), b"" as &[u8]);
@@ -2764,7 +2828,9 @@ pub fn plan_member_blocks(parser: &mut tree_sitter::Parser, source: &str) -> Mem
     // (`_SV_HEAD(void*)` — the whole call is blanked). The per-candidate
     // parse-damage gate below reverts a use that (surprisingly) wasn't one.
     let cand_set: std::collections::HashSet<&str> = candidates.iter().map(String::as_str).collect();
-    let excludes = exclusion_spans(&tree);
+    // Member-block macro paste is orthogonal to region-body expansion; keep the
+    // wide exclusion so this consumer's behavior is unchanged by slice 1.
+    let excludes = exclusion_spans(&tree, false);
     let mut uses: Vec<(usize, usize, String)> = Vec::new(); // (start, end, macro)
     {
         let mut ex = 0usize;

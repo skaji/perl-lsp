@@ -1072,6 +1072,60 @@
     "none": []
    },
    "status": "gold"
+  },
+  {
+   "id": "cpp-cfgtwin-thx-ifdef-member-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "cfgtwin/cfgtwin.c",
+   "line": 49,
+   "col": 7,
+   "comment": "Case B: `o->slabbed` inside `thx_ifdef`, a pTHX_-param fn wrapped in `#ifdef PERL_DEBUG_READONLY_OPS`. The macro-expansion exclusion over-reached the region body, so pTHX_ stayed literal, `o` mistyped, and the member went dark. Slice 1 narrows EXCLUDE_QUERY to the directive/condition tokens.",
+   "expect": {
+    "all": [
+     "cfgtwin.c:27:16"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-cfgtwin-ndef-thx-member-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "cfgtwin/cfgtwin.c",
+   "line": 93,
+   "col": 7,
+   "comment": "Case B (config-ACTIVE arm): `o->slabbed` inside `ndef_thx` under an always-true `#ifndef SOMETHING_NEVER_DEFINED`. The exclusion is condition-blind, so even the active arm went dark. Cured by the same EXCLUDE_QUERY narrowing.",
+   "expect": {
+    "all": [
+     "cfgtwin.c:27:16"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-cfgtwin-twin-thx-else-member-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "cfgtwin/cfgtwin.c",
+   "line": 86,
+   "col": 7,
+   "comment": "Case B (`#else` arm of a pTHX_ twin): `o->slabbed` inside the `#else` arm of `twin_thx`. The #else body is region body too, so the pTHX_ use went dark. Cured by the same EXCLUDE_QUERY narrowing.",
+   "expect": {
+    "all": [
+     "cfgtwin.c:27:16"
+    ],
+    "none": []
+   },
+   "status": "gold"
   }
  ]
 }

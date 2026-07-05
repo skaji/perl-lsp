@@ -148,16 +148,17 @@ fn two_tier_matches_single_tier_expansion() {
 
     for src in cases {
         let tree = parse(&mut p, src);
-        // args: (…, alias_only, force_slow). Full mode both; the last flag
-        // toggles fast two-tier vs the old single-tier merge.
-        let (fast, fmap) = preprocess_with_mode_inner(&tree, src, &external, false, false);
-        let (slow, smap) = preprocess_with_mode_inner(&tree, src, &external, false, true);
+        // args: (…, alias_only, force_slow, expand_region_bodies). Full mode
+        // both; the force_slow flag toggles fast two-tier vs the old single-tier
+        // merge — exclusion scope held at the narrow default throughout.
+        let (fast, fmap) = preprocess_with_mode_inner(&tree, src, &external, false, false, true);
+        let (slow, smap) = preprocess_with_mode_inner(&tree, src, &external, false, true, true);
         assert_eq!(fast, slow, "expansion drift (full) on:\n{src}\nfast:\n{fast}\nslow:\n{slow}");
         assert_eq!(fmap.edits_for_test(), smap.edits_for_test(), "splice-map drift on:\n{src}");
 
         // alias-only mode (the parse-damage fallback) must also agree.
-        let (fa, _) = preprocess_with_mode_inner(&tree, src, &external, true, false);
-        let (sa, _) = preprocess_with_mode_inner(&tree, src, &external, true, true);
+        let (fa, _) = preprocess_with_mode_inner(&tree, src, &external, true, false, true);
+        let (sa, _) = preprocess_with_mode_inner(&tree, src, &external, true, true, true);
         assert_eq!(fa, sa, "alias-only expansion drift on:\n{src}");
     }
 }
