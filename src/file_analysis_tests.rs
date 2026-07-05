@@ -157,6 +157,7 @@ fn test_resolve_sub_return_type() {
             outline_label: None,
             attributes: Vec::new(),
             deref_stack: Vec::new(),
+            arity: None,
         }],
         ..Default::default()
     });

@@ -739,6 +739,98 @@
     ],
     "none": []
    }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-overload-arity",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "overload_arity.cpp",
+   "id": "cpp-overload-arity-zero-arg",
+   "line": 9,
+   "col": 20,
+   "comment": "gd on a 0-arg call pick() ranks the 0-param overload FIRST; the whole family stays visible (never pruned). The `none` anchor asserts the winner is not preceded by a newline, i.e. it is the first result.",
+   "expect": {
+    "all": [
+     "overload_arity.cpp:5:5",
+     "overload_arity.cpp:6:5",
+     "overload_arity.cpp:7:5",
+     "overload_arity.cpp:8:5"
+    ],
+    "none": [
+     "\noverload_arity.cpp:5:5"
+    ]
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-overload-arity",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "overload_arity.cpp",
+   "id": "cpp-overload-arity-one-arg",
+   "line": 10,
+   "col": 20,
+   "comment": "gd on a 1-arg call pick(1) ranks the 1-param overload FIRST; family never pruned.",
+   "expect": {
+    "all": [
+     "overload_arity.cpp:5:5",
+     "overload_arity.cpp:6:5",
+     "overload_arity.cpp:7:5",
+     "overload_arity.cpp:8:5"
+    ],
+    "none": [
+     "\noverload_arity.cpp:6:5"
+    ]
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-overload-arity",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "overload_arity.cpp",
+   "id": "cpp-overload-arity-two-arg",
+   "line": 11,
+   "col": 20,
+   "comment": "gd on a 2-arg call pick(1, 2) ranks the exact 2-param overload FIRST, ahead of the defaulted 3/4-param overload; family never pruned.",
+   "expect": {
+    "all": [
+     "overload_arity.cpp:5:5",
+     "overload_arity.cpp:6:5",
+     "overload_arity.cpp:7:5",
+     "overload_arity.cpp:8:5"
+    ],
+    "none": [
+     "\noverload_arity.cpp:7:5"
+    ]
+   }
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-overload-arity",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "overload_arity.cpp",
+   "id": "cpp-overload-arity-defaulted",
+   "line": 12,
+   "col": 20,
+   "comment": "gd on a 3-arg call pick(1, 2, 3) ranks the defaulted overload (3 required, 4 total) FIRST — the only signature the arg count fits; family never pruned.",
+   "expect": {
+    "all": [
+     "overload_arity.cpp:5:5",
+     "overload_arity.cpp:6:5",
+     "overload_arity.cpp:7:5",
+     "overload_arity.cpp:8:5"
+    ],
+    "none": [
+     "\noverload_arity.cpp:8:5"
+    ]
+   }
   }
  ]
 }

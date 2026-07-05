@@ -75,6 +75,10 @@ pub struct SkelSymbol {
     /// completion skips it), "union" for union containers (the hover-overlay /
     /// outline-nesting key), stamped in `into_file_analysis` from the kind.
     pub attributes: Vec<String>,
+    /// Declared parameter arity for a callable, counted structurally from the
+    /// def's parameter list (`@arity.sig`). `None` for non-callables and defs
+    /// whose parameter list the query didn't capture. Flows to `Symbol.arity`.
+    pub arity: Option<crate::file_analysis::ParamArity>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +98,10 @@ pub struct SkelRef {
     /// IMMEDIATE receiver is a simple variable. Rides onto the MethodCall ref
     /// so operator-correctness is a ref query, not a separate walk.
     pub member_op: Option<(crate::file_analysis::MemberOp, crate::file_analysis::Span)>,
+    /// Written argument count at a call ref (`call`/`qcall`/`member`), counted
+    /// structurally from the argument list. Flows to `Ref.arg_count`; `None`
+    /// for non-call refs.
+    pub arg_count: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +168,9 @@ pub struct SkeletonAnalysis {
     /// fuel) is cpp-specific and lives in `language_driver.rs`'s post-
     /// extraction pipeline (`emit_return_fuel`).
     pub return_sites: Vec<(crate::file_analysis::ScopeId, Span)>,
+    /// Callable parameter arities keyed by parameter_list span (`@arity.sig`).
+    /// Associated to def symbols by span containment in `into_file_analysis`.
+    pub param_sigs: Vec<(crate::file_analysis::Span, crate::file_analysis::ParamArity)>,
 }
 
 /// What a function-like macro's return resolves to (`SkeletonAnalysis::
@@ -272,6 +283,29 @@ impl SkeletonAnalysis {
             }
             bag.push(w);
         }
+        // Associate each callable def with its parameter arity: the def's OWN
+        // parameter list is the one span-contained in the def and starting
+        // earliest at/after the name token (a nested function-pointer decl or
+        // lambda param list starts later). `@arity.sig` fires a separate match
+        // from the def name, so this join is by span, not match_id.
+        {
+            let param_sigs = std::mem::take(&mut self.param_sigs);
+            let after = |a: Point, b: Point| (a.row, a.column) >= (b.row, b.column);
+            for s in self.symbols.iter_mut() {
+                if !matches!(s.kind.as_str(), "sub" | "method") {
+                    continue;
+                }
+                s.arity = param_sigs
+                    .iter()
+                    .filter(|(sp, _)| {
+                        after(sp.start, s.name_end)
+                            && after(s.end, sp.end)
+                            && after(sp.start, s.start)
+                    })
+                    .min_by_key(|(sp, _)| (sp.start.row, sp.start.column))
+                    .map(|(_, ar)| *ar);
+            }
+        }
         let mut symbols: Vec<Symbol> = self
             .symbols
             .iter()
@@ -326,6 +360,7 @@ impl SkeletonAnalysis {
                     a
                 },
                 deref_stack: s.deref_stack.clone(),
+                arity: s.arity,
             })
             .collect();
         // Tag a typedef-struct's members with its name. `typedef struct
@@ -593,6 +628,7 @@ impl SkeletonAnalysis {
                     resolves_to: Some(did),
                     resolved_method_target: None,
                     folded_from: None,
+                    arg_count: None,
                 }),
                 None => unresolved_reads.push((name.clone(), *read_scope, *read_span)),
             }
@@ -621,6 +657,7 @@ impl SkeletonAnalysis {
                     resolves_to: Some(did),
                     resolved_method_target: None,
                     folded_from: None,
+                    arg_count: None,
                 });
             }
         }
@@ -701,6 +738,7 @@ impl SkeletonAnalysis {
                     resolves_to: None,
                     resolved_method_target: None,
                     folded_from: None,
+                    arg_count: r.arg_count,
                 })
             })
             .collect();
@@ -746,6 +784,7 @@ impl SkeletonAnalysis {
                 resolves_to: None,
                 resolved_method_target: None,
                 folded_from: None,
+                arg_count: None,
             });
         }
         refs.extend(local_refs);
@@ -1415,6 +1454,18 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
     // match_id → was the IMMEDIATE member-access receiver a simple variable?
     // Recorded at construction (the un-peeled node); gates op-DX at the mint.
     let mut member_simple: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+    // A call's written arg count, keyed by its argument_list's START point
+    // (the `(`), which is adjacent to the callee/method name token's END — so
+    // a ref finds its arity by `ref.end == arglist.start` without a match join
+    // (member calls fire a separate match from their arg list). One entry per
+    // `@arity.args`.
+    let mut arg_counts_by_start: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    // A callable's declared parameter arity, keyed by the parameter_list span.
+    // Associated to its def symbol by span containment in `into_file_analysis`
+    // (`@arity.sig` fires a separate match from the def name).
+    let mut param_sigs: Vec<(crate::file_analysis::Span, crate::file_analysis::ParamArity)> =
+        Vec::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source);
     let mut match_counter = 0usize;
@@ -1466,6 +1517,42 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     text: inner.utf8_text(source).unwrap_or("").to_string(),
                     match_id: match_counter,
                 });
+                continue;
+            }
+            // `@arity.args`: a call's argument_list — count its arguments (the
+            // named children; the C `...` at a CALL site never appears here).
+            // Keyed by the list's start so the callee ref finds it by adjacency.
+            if cap == "arity.args" {
+                arg_counts_by_start
+                    .insert((node.start_position().row, node.start_position().column),
+                            node.named_child_count());
+                continue;
+            }
+            // `@arity.sig`: a callable's parameter_list — count declared params
+            // structurally. `optional_parameter_declaration` carries a default
+            // (counts toward `total`, not `required`); a template pack
+            // (`variadic_parameter_declaration`) or a C `...` token makes the
+            // signature variadic.
+            if cap == "arity.sig" {
+                let mut total = 0usize;
+                let mut required = 0usize;
+                let mut variadic = false;
+                let mut c = node.walk();
+                for ch in node.children(&mut c) {
+                    match ch.kind() {
+                        "parameter_declaration" => { total += 1; required += 1; }
+                        "optional_parameter_declaration" => { total += 1; }
+                        "variadic_parameter_declaration" | "..." => variadic = true,
+                        _ => {}
+                    }
+                }
+                param_sigs.push((
+                    crate::file_analysis::Span {
+                        start: node.start_position(),
+                        end: node.end_position(),
+                    },
+                    crate::file_analysis::ParamArity { total, required, variadic },
+                ));
                 continue;
             }
             // `@qualifier` on a templated owner (`Buf<T>::grow`): the class
@@ -1914,6 +2001,9 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         }
                         a
                     },
+                    // Filled by span association in `into_file_analysis` — the
+                    // `@arity.sig` match fires separately from this def name.
+                    arity: None,
                 });
             }
             "ref.label" => {
@@ -1989,6 +2079,12 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                         scope: cur_scope,
                         invocant: member_recv.get(&e.match_id).cloned(),
                         member_op,
+                        // A call ref's arg list opens right where its callee /
+                        // method token ends; plain (uncalled) member/type refs
+                        // have no adjacent arg list and stay `None`.
+                        arg_count: matches!(e.cap.as_str(), "ref.call" | "ref.qcall" | "ref.member")
+                            .then(|| arg_counts_by_start.get(&(e.end.row, e.end.column)).copied())
+                            .flatten(),
                     });
                 }
             }
@@ -2272,6 +2368,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             scope: *scope,
             invocant: None,
             member_op: None,
+            arg_count: Some(args.len()),
         });
         for effect in (pack.cmd_effects)(cmd) {
             match effect {
@@ -2289,6 +2386,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                             return_type: None,
                             deref_stack: Vec::new(),
                             attributes: Vec::new(),
+                            arity: None,
                         });
                     }
                 }
@@ -2305,6 +2403,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                                 scope: *scope,
                                 invocant: None,
                                 member_op: None,
+                                arg_count: None,
                             });
                         }
                     }
@@ -2483,6 +2582,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
             }
         }
     }
+    out.param_sigs = param_sigs;
     Ok(out)
 }
 

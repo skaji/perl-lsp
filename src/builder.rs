@@ -2029,6 +2029,9 @@ impl<'a> Builder<'a> {
             outline_label: None,
             attributes: Vec::new(),
             deref_stack: Vec::new(),
+            // Perl carries params in `SymbolDetail::Sub`; `param_arity()`
+            // reads them. No pack-minted arity here.
+            arity: None,
         });
         id
     }
@@ -2115,6 +2118,7 @@ impl<'a> Builder<'a> {
             resolves_to: None,
             resolved_method_target: None,
             folded_from: None,
+            arg_count: None,
         });
     }
 
@@ -3316,6 +3320,7 @@ impl<'a> Builder<'a> {
                     resolves_to: None,
                     resolved_method_target: None,
                     folded_from: None,
+                    arg_count: None,
                 });
             }
             plugin::EmitAction::Handler {
@@ -3406,6 +3411,7 @@ impl<'a> Builder<'a> {
                     resolves_to: None,
                     resolved_method_target: None,
                     folded_from: None,
+                    arg_count: None,
                 });
                 if let Some(c) = invocant_class {
                     self.method_call_invocant.insert(ref_idx, c);
@@ -3433,6 +3439,7 @@ impl<'a> Builder<'a> {
                         resolves_to: None,
                         resolved_method_target: None,
                         folded_from: None,
+                        arg_count: None,
                     });
                 }
             }
@@ -8468,6 +8475,7 @@ impl<'a> Builder<'a> {
                 resolves_to: None,
                 resolved_method_target: None,
                 folded_from: None,
+                arg_count: None,
             });
         }
     }
@@ -8590,6 +8598,7 @@ impl<'a> Builder<'a> {
                                 resolves_to: None,
                                 resolved_method_target: None,
                                 folded_from: None,
+                                arg_count: None,
                             });
                         }
                     }
@@ -8627,6 +8636,7 @@ impl<'a> Builder<'a> {
                                     resolves_to: None,
                                     resolved_method_target: None,
                                     folded_from: None,
+                                    arg_count: None,
                                 });
                             }
                         }
@@ -8645,6 +8655,7 @@ impl<'a> Builder<'a> {
                                 resolves_to: None,
                                 resolved_method_target: None,
                                 folded_from: None,
+                                arg_count: None,
                             });
                         }
                     }
@@ -11975,6 +11986,7 @@ impl<'a> Builder<'a> {
                 resolves_to: None,
                 resolved_method_target: None,
                 folded_from: None,
+                arg_count: None,
             });
         }
     }
@@ -12102,6 +12114,7 @@ impl<'a> Builder<'a> {
                 resolves_to: None,
                 resolved_method_target: None,
                 folded_from: None,
+                arg_count: None,
             });
         }
     }
@@ -13256,6 +13269,7 @@ impl<'a> Builder<'a> {
                 resolves_to: None,
                 resolved_method_target: None,
                 folded_from: None,
+                arg_count: None,
             });
         }
     }

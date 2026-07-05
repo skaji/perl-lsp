@@ -704,6 +704,45 @@ pub struct Symbol {
     /// every non-pack language. See `docs/adr/pointer-stack.md`.
     #[serde(default)]
     pub deref_stack: Vec<DerefStep>,
+    /// Declared parameter arity for a callable (`Sub`/`Method`), minted by a
+    /// pack that reads the parameter list structurally. Drives overload
+    /// arity ranking. `None` for non-callables and languages that carry
+    /// params elsewhere (Perl keeps them in `SymbolDetail::Sub` — ask
+    /// `param_arity()`, which reads both sources).
+    #[serde(default)]
+    pub arity: Option<ParamArity>,
+}
+
+/// A callable's declared parameter shape, as a set of counts — the fuel for
+/// overload arity ranking. Structural: whoever mints it counts the parameter
+/// list; the "which overload wins" interpretation lives on `fit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParamArity {
+    /// Declared parameters, NOT counting a trailing `...`.
+    pub total: usize,
+    /// Parameters without a default value — the minimum acceptable arg count.
+    pub required: usize,
+    /// A trailing `...` (C variadic / template pack): any arg count ≥
+    /// `required` is accepted.
+    pub variadic: bool,
+}
+
+impl ParamArity {
+    /// How well `argc` written arguments fit this signature, as a ranking key
+    /// (higher = better) — never a hard filter, since overload sets stay
+    /// visible unpruned. `2` = exact (`argc == total`, no variadic); `1` =
+    /// compatible (defaults fill the gap, or a variadic tail absorbs the
+    /// extra); `0` = mismatch (too few required, or too many for a fixed arity).
+    pub fn fit(&self, argc: usize) -> u8 {
+        let compatible = argc >= self.required && (self.variadic || argc <= self.total);
+        if !compatible {
+            0
+        } else if !self.variadic && argc == self.total {
+            2
+        } else {
+            1
+        }
+    }
 }
 
 /// One level of a pointer/reference declarator chain. `annotations` holds
@@ -939,6 +978,27 @@ impl Symbol {
         let stars: String = self.deref_stack.iter().map(|s| s.render()).collect();
         format!("{}{}", base, stars)
     }
+
+    /// This callable's declared parameter arity, from whichever source carries
+    /// it: the pack-minted `arity` field, else the Perl `SymbolDetail::Sub`
+    /// param list (`is_slurpy` → variadic, a `default` → optional). One
+    /// question, both answers — overload ranking asks the symbol, never the
+    /// shape (rule #10). `None` for non-callables.
+    pub fn param_arity(&self) -> Option<ParamArity> {
+        if let Some(a) = self.arity {
+            return Some(a);
+        }
+        if let SymbolDetail::Sub { params, .. } = &self.detail {
+            let total = params.iter().filter(|p| !p.is_slurpy && !p.is_invocant).count();
+            let required = params
+                .iter()
+                .filter(|p| !p.is_slurpy && !p.is_invocant && p.default.is_none())
+                .count();
+            let variadic = params.iter().any(|p| p.is_slurpy);
+            return Some(ParamArity { total, required, variadic });
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1129,6 +1189,14 @@ pub struct Ref {
     /// literal `'process'` instead (rule #9). `None` for non-folded refs.
     #[serde(default)]
     pub folded_from: Option<Span>,
+    /// Written argument count at a call site (`FunctionCall` / `MethodCall`):
+    /// the args as spelled, receiver excluded. A structural count the pack
+    /// mints from the argument list; interpretation ("which overload fits")
+    /// lives downstream (`ParamArity::fit`, overload ranking, arity-
+    /// discriminated return typing). `None` when unminted (Perl refs, non-call
+    /// kinds).
+    #[serde(default)]
+    pub arg_count: Option<usize>,
 }
 
 /// Split a possibly-qualified name into `(Option<package>, basename)`.
@@ -4450,7 +4518,7 @@ impl FileAnalysis {
                 RefKind::FunctionCall { .. } => {
                     if let Some(t) = self.sub_return_type_at_arity(
                         &self.refs[recv_idx].target_name,
-                        Some(0),
+                        Some(self.refs[recv_idx].arg_count.unwrap_or(0) as u32),
                     ) {
                         return Some(t);
                     }
@@ -4528,9 +4596,12 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::FunctionCall { .. } => {
+                    // Call-root chain arm: feed the call's real written arg
+                    // count so an arity-discriminated overload types by the
+                    // args actually passed, not a hardcoded 0.
                     if let Some(t) = self.sub_return_type_at_arity(
                         &self.refs[recv_idx].target_name,
-                        Some(0),
+                        Some(self.refs[recv_idx].arg_count.unwrap_or(0) as u32),
                     ) {
                         return Some(t);
                     }
