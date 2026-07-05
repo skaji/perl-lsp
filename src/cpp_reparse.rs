@@ -3001,6 +3001,10 @@ pub struct SynMember {
     /// The declared type spelling (`PERL_BITFIELD16`) — re-sources the SAME
     /// `TypeName` edge the expanded field would have (hover keeps working).
     pub type_text: String,
+    /// The pointer/reference stack (`OP*` → `[Pointer]`), peeled by the SAME
+    /// walker the plain-field query lane uses, so a macro-pasted field renders
+    /// its `*`s in hover exactly like a directly-declared one (rule #10).
+    pub deref_stack: Vec<crate::file_analysis::DerefStep>,
 }
 
 /// One synthetic base minted from a member-block macro (`BASEOP`).
@@ -3320,11 +3324,19 @@ fn synth_base(
         if name.is_empty() || type_text.is_empty() {
             return;
         }
+        // Pointer-ness via the SAME peel the plain-field query lane runs; a
+        // shape peel can't model (function-pointer field) degrades to no stack,
+        // exactly as the query lane does — parity either way.
+        let deref_stack = fd
+            .child_by_field_name("declarator")
+            .and_then(|d| crate::query_extract::peel(d, &crate::query_extract::C_FIELD_DECL_PEEL, sbytes))
+            .map(|(_, stack, _)| stack)
+            .unwrap_or_default();
         // synth byte → body byte (drop the prefix) → original Point.
         let ns = name_node.start_byte().saturating_sub(prefix.len());
         let ne = name_node.end_byte().saturating_sub(prefix.len());
         let name_span = Span { start: point_at(ns), end: point_at(ne) };
-        fields.push(SynMember { name, name_span, type_text });
+        fields.push(SynMember { name, name_span, type_text, deref_stack });
     });
     // Source order (the DFS visit order isn't guaranteed) — deterministic.
     fields.sort_by_key(|m| (m.name_span.start.row, m.name_span.start.column));

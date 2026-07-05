@@ -1,570 +1,591 @@
 {
-  "capability": "hover",
-  "rows": [
-    {
-      "id": "cpp-svhead-comment-blocked-field-hover",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "comment": "Family M #1: hover on the comment-blocked `sv_flags` field of a function-like member-block macro (`_SV_HEAD`).",
-      "file": "svhead.c",
-      "line": 14,
-      "col": 20,
-      "expect": {
-        "all": [
-          "sv_flags:",
-          "*field*"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-free-function-signature",
-      "difficulty": "simple",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "sample.cpp",
-      "line": 12,
-      "col": 4,
-      "expect": {
-        "all": [
-          "int compute(int x)",
-          "*function*"
-        ],
-        "none": [
-          "```perl"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-class",
-      "difficulty": "simple",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "sample.cpp",
-      "line": 1,
-      "col": 6,
-      "expect": {
-        "all": [
-          "class Shape",
-          "*class*"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-attribute-macro-exported",
-      "difficulty": "simple",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "attr_macro.cpp",
-      "line": 3,
-      "col": 20,
-      "expect": {
-        "all": [
-          "Q_CORE_EXPORT Gadget",
-          "*class*",
-          "*exported*"
-        ],
-        "none": [
-          "*deprecated*"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-unknown-macro-recovered-no-signal",
-      "difficulty": "simple",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "attr_macro.cpp",
-      "line": 9,
-      "col": 21,
-      "expect": {
-        "all": [
-          "Widget",
-          "*class*"
-        ],
-        "none": [
-          "*exported*",
-          "*deprecated*"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist-macro-field-type",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "macro_field_type.cpp",
-      "line": 2,
-      "col": 18,
-      "expect": {
-        "all": [
-          "unsigned short"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist-bitfield-typedef-field-type",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "bitfield_field.cpp",
-      "line": 1,
-      "col": 16,
-      "expect": {
-        "all": [
-          "op_type",
-          "unsigned short"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist-config-variant-macro-field-type",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "cfgvar_macro_field.cpp",
-      "line": 7,
-      "col": 28,
-      "expect": {
-        "all": [
-          "op_type",
-          "unsigned short"
-        ],
-        "none": [
-          "PERL_BITFIELD16"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hitlist-crossfile-macro-member-field-type",
-      "difficulty": "hard",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture/opmacro",
-      "file": "op.c",
-      "line": 1,
-      "col": 36,
-      "expect": {
-        "all": [
-          "op_type",
-          "unsigned short"
-        ],
-        "none": [
-          "PERL_BITFIELD16",
-          "U16TYPE"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-member-block-field-hover",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "member_block.cpp",
-      "line": 8,
-      "col": 22,
-      "expect": {
-        "all": [
-          "op_type",
-          "unsigned short"
-        ],
-        "none": [
-          "BASEOP",
-          "PERL_BITFIELD16"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-member-block-one-member-hover",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "member_block.cpp",
-      "line": 10,
-      "col": 22,
-      "expect": {
-        "all": [
-          "op_refcnt",
-          "unsigned short"
-        ],
-        "none": [
-          "REFCNT"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-enumerator-shows-parent-enum",
-      "difficulty": "simple",
-      "semantic_area": "cpp-multilang",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "cenum.c",
-      "line": 1,
-      "col": 5,
-      "expect": {
-        "all": [
-          "RED: Color",
-          "*enumerator*"
-        ],
-        "none": [
-          "```perl"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-domain-typing-op-type-headlines-enum",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_enum.c",
-      "line": 6,
-      "col": 14,
-      "expect": {
-        "all": [
-          "op_type: opcode",
-          "*field*"
-        ],
-        "none": [
-          "```perl"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-member-after-same-line-macro-splice",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-parse-repair",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "file": "splice_member.c",
-      "line": 5,
-      "col": 9,
-      "expect": {
-        "all": [
-          "size: Numeric",
-          "*field*"
-        ],
-        "none": [
-          "struct Widget {"
-        ]
-      }
-    },
-    {
-      "id": "cpp-hover-domain-mixed-slot-stays-storage",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_mixed.c",
-      "line": 3,
-      "col": 11,
-      "expect": {
-        "all": [
-          "tag: Numeric",
-          "*field*"
-        ],
-        "none": [
-          "opcode2"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-domain-owner-separation-enum-side",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_owner.c",
-      "line": 3,
-      "col": 38,
-      "expect": {
-        "all": [
-          "kind: fruit",
-          "*field*"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-hover-domain-owner-separation-int-side",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-domain",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "domain_owner.c",
-      "line": 6,
-      "col": 37,
-      "expect": {
-        "all": [
-          "kind: Numeric",
-          "*field*"
-        ],
-        "none": [
-          "fruit"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "c-union-member-hover-shows-overlay",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-unions",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "union_nest.c",
-      "line": 6,
-      "col": 17,
-      "expect": {
-        "all": [
-          "op_pmreplroot: OPX* — union member (overlays op_pmtargetoff)"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_instance.cpp",
-      "status": "gold",
-      "id": "cpp-template-instance-hover-keeps-args",
-      "line": 29,
-      "col": 4,
-      "expect": {
-        "all": [
-          "c: Crate<Payload>",
-          "*variable*"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-typing-param-return-substitutes",
-      "line": 29,
-      "col": 7,
-      "expect": {
-        "all": [
-          "T get()",
-          "*returns: int*"
-        ],
-        "none": []
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-typing-param-field-substitutes",
-      "line": 30,
-      "col": 7,
-      "expect": {
-        "all": [
-          "item_: int"
-        ],
-        "none": [
-          "item_: T"
-        ]
-      }
-    },
-    {
-      "difficulty": "hard",
-      "semantic_area": "cpp-templates",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "tmpl_typing.cpp",
-      "status": "gold",
-      "id": "cpp-tmpl-typing-trailing-return-substitutes",
-      "line": 34,
-      "col": 7,
-      "expect": {
-        "all": [
-          "auto tail() -> T*",
-          "*returns: Widget*"
-        ],
-        "none": []
-      }
-    },
-    {
-      "id": "cpp-hitlist2-using-reexport-hover-wrong-bare-name",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #8 companion, hitlist theme #14 (cross-verb disagreement): hover on `x.insert()` (Derived, re-exporting Base::insert via `using Base::insert;`) resolves to the WRONG bare-name match `Other::insert` (an unrelated same-named plant) even though gd on the identical position already reaches Base::insert correctly.",
-      "file": "using_reexport.cpp",
-      "line": 13,
-      "col": 6,
-      "expect": {
-        "all": [
-          "struct Base { void insert(); }"
-        ],
-        "none": [
-          "struct Other"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist2-decl-def",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "status": "gold",
-      "id": "cpp-hitlist2-hover-presents-ranked-def",
-      "file": "fwddef/state.c",
-      "line": 4,
-      "col": 21,
-      "comment": "hover is the CandidateSet's hover projection: at a call whose gd ranks the bodied def first, hover presents THAT def's signature, not the forward decl.",
-      "expect": {
-        "all": [
-          "static int helper(int n) { return n * 2; }",
-          "*function*"
-        ],
-        "none": [
-          "static int helper(int n);"
-        ]
-      }
-    },
-    {
-      "id": "cpp-ctxparam-member-hover-nested",
-      "difficulty": "hard",
-      "semantic_area": "cpp-ctxparam-macro",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "ctxparam/ctxparam.c",
-      "line": 14,
-      "col": 11,
-      "comment": "member hover on rcpv->refcount in Perl_rcpv_copy(pTHX_ ...) — the declared-type-wins fix (WitnessSource ANNOT_SOURCE priority) types the receiver RCPV so the field resolves; regressed to no-hover when the header held a second decl.",
-      "expect": {
-        "all": [
-          "refcount: Numeric",
-          "*field*"
-        ],
-        "none": [
-          "```perl"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-braced-init-hover-eq",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "braced_type.cpp",
-      "line": 6,
-      "col": 22,
-      "comment": "hover on `m` in `FlatMap<int,int> m = {{1,7},{2,9}}` — the EXPLICIT declared type governs the `= {...}` shape; the braced-init literals' Numeric flow witness must not clobber the annot (WitnessSource ANNOT_SOURCE priority extended to the plain-InferredType axis).",
-      "expect": {
-        "all": [
-          "m: FlatMap<int, int>"
-        ],
-        "none": [
-          "Numeric"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-braced-init-hover-direct",
-      "difficulty": "moderate",
-      "semantic_area": "cpp-hitlist",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "braced_type.cpp",
-      "line": 8,
-      "col": 22,
-      "comment": "hover on `d` in `FlatMap<int,int> d{{3,4}}` — the declared type governs the direct brace-init `{...}` shape too.",
-      "expect": {
-        "all": [
-          "d: FlatMap<int, int>"
-        ],
-        "none": [
-          "Numeric"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-family-q-member-decl-hover-not-free",
-      "difficulty": "hard",
-      "semantic_area": "cpp-family-q-owner-anchor",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "file": "memfree/log.h",
-      "line": 3,
-      "col": 8,
-      "comment": "hover on the member declaration `info` in `struct Logger` presents the MEMBER, not a color.h-style free `info` - the decl->def hunt no longer treats a package-`None` free function as the body of a package-`Logger` member.",
-      "expect": {
-        "all": [
-          "*method*"
-        ],
-        "none": [
-          "return x + 1"
-        ]
-      },
-      "status": "gold"
-    },
-    {
-      "id": "cpp-ctorif-decl-directive-late-member-hover",
-      "difficulty": "hard",
-      "semantic_area": "cpp-multilang-macros",
-      "lang": "cpp",
-      "root": "gold-corpus/cpp-fixture",
-      "comment": "Case A (reduced): hover on `w.late_field` (declared after the ctor-init `#if`) shows the real field, not corruption \u2014 the declaration-position directive repair kept the class attribution.",
-      "file": "ctorif/ctorif.cpp",
-      "line": 25,
-      "col": 6,
-      "expect": {
-        "all": [
-          "late_field",
-          "field"
-        ],
-        "none": []
-      },
-      "status": "gold"
-    }
-  ]
+ "capability": "hover",
+ "rows": [
+  {
+   "id": "cpp-svhead-comment-blocked-field-hover",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Family M #1: hover on the comment-blocked `sv_flags` field of a function-like member-block macro (`_SV_HEAD`).",
+   "file": "svhead.c",
+   "line": 14,
+   "col": 20,
+   "expect": {
+    "all": [
+     "sv_flags:",
+     "*field*"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-free-function-signature",
+   "difficulty": "simple",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "sample.cpp",
+   "line": 12,
+   "col": 4,
+   "expect": {
+    "all": [
+     "int compute(int x)",
+     "*function*"
+    ],
+    "none": [
+     "```perl"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-class",
+   "difficulty": "simple",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "sample.cpp",
+   "line": 1,
+   "col": 6,
+   "expect": {
+    "all": [
+     "class Shape",
+     "*class*"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-attribute-macro-exported",
+   "difficulty": "simple",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "attr_macro.cpp",
+   "line": 3,
+   "col": 20,
+   "expect": {
+    "all": [
+     "Q_CORE_EXPORT Gadget",
+     "*class*",
+     "*exported*"
+    ],
+    "none": [
+     "*deprecated*"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-unknown-macro-recovered-no-signal",
+   "difficulty": "simple",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "attr_macro.cpp",
+   "line": 9,
+   "col": 21,
+   "expect": {
+    "all": [
+     "Widget",
+     "*class*"
+    ],
+    "none": [
+     "*exported*",
+     "*deprecated*"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist-macro-field-type",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "macro_field_type.cpp",
+   "line": 2,
+   "col": 18,
+   "expect": {
+    "all": [
+     "unsigned short"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist-bitfield-typedef-field-type",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "bitfield_field.cpp",
+   "line": 1,
+   "col": 16,
+   "expect": {
+    "all": [
+     "op_type",
+     "unsigned short"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist-config-variant-macro-field-type",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "cfgvar_macro_field.cpp",
+   "line": 7,
+   "col": 28,
+   "expect": {
+    "all": [
+     "op_type",
+     "unsigned short"
+    ],
+    "none": [
+     "PERL_BITFIELD16"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hitlist-crossfile-macro-member-field-type",
+   "difficulty": "hard",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture/opmacro",
+   "file": "op.c",
+   "line": 1,
+   "col": 36,
+   "expect": {
+    "all": [
+     "op_type",
+     "unsigned short"
+    ],
+    "none": [
+     "PERL_BITFIELD16",
+     "U16TYPE"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-member-block-field-hover",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "member_block.cpp",
+   "line": 8,
+   "col": 22,
+   "expect": {
+    "all": [
+     "op_type",
+     "unsigned short"
+    ],
+    "none": [
+     "BASEOP",
+     "PERL_BITFIELD16"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-member-block-one-member-hover",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "member_block.cpp",
+   "line": 10,
+   "col": 22,
+   "expect": {
+    "all": [
+     "op_refcnt",
+     "unsigned short"
+    ],
+    "none": [
+     "REFCNT"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-enumerator-shows-parent-enum",
+   "difficulty": "simple",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "cenum.c",
+   "line": 1,
+   "col": 5,
+   "expect": {
+    "all": [
+     "RED: Color",
+     "*enumerator*"
+    ],
+    "none": [
+     "```perl"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-domain-typing-op-type-headlines-enum",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_enum.c",
+   "line": 6,
+   "col": 14,
+   "expect": {
+    "all": [
+     "op_type: opcode",
+     "*field*"
+    ],
+    "none": [
+     "```perl"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-member-after-same-line-macro-splice",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-parse-repair",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "file": "splice_member.c",
+   "line": 5,
+   "col": 9,
+   "expect": {
+    "all": [
+     "size: Numeric",
+     "*field*"
+    ],
+    "none": [
+     "struct Widget {"
+    ]
+   }
+  },
+  {
+   "id": "cpp-hover-domain-mixed-slot-stays-storage",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_mixed.c",
+   "line": 3,
+   "col": 11,
+   "expect": {
+    "all": [
+     "tag: Numeric",
+     "*field*"
+    ],
+    "none": [
+     "opcode2"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-domain-owner-separation-enum-side",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_owner.c",
+   "line": 3,
+   "col": 38,
+   "expect": {
+    "all": [
+     "kind: fruit",
+     "*field*"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-hover-domain-owner-separation-int-side",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-domain",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "domain_owner.c",
+   "line": 6,
+   "col": 37,
+   "expect": {
+    "all": [
+     "kind: Numeric",
+     "*field*"
+    ],
+    "none": [
+     "fruit"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "c-union-member-hover-shows-overlay",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-unions",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "union_nest.c",
+   "line": 6,
+   "col": 17,
+   "expect": {
+    "all": [
+     "op_pmreplroot: OPX* \u2014 union member (overlays op_pmtargetoff)"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_instance.cpp",
+   "status": "gold",
+   "id": "cpp-template-instance-hover-keeps-args",
+   "line": 29,
+   "col": 4,
+   "expect": {
+    "all": [
+     "c: Crate<Payload>",
+     "*variable*"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-typing-param-return-substitutes",
+   "line": 29,
+   "col": 7,
+   "expect": {
+    "all": [
+     "T get()",
+     "*returns: int*"
+    ],
+    "none": []
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-typing-param-field-substitutes",
+   "line": 30,
+   "col": 7,
+   "expect": {
+    "all": [
+     "item_: int"
+    ],
+    "none": [
+     "item_: T"
+    ]
+   }
+  },
+  {
+   "difficulty": "hard",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_typing.cpp",
+   "status": "gold",
+   "id": "cpp-tmpl-typing-trailing-return-substitutes",
+   "line": 34,
+   "col": 7,
+   "expect": {
+    "all": [
+     "auto tail() -> T*",
+     "*returns: Widget*"
+    ],
+    "none": []
+   }
+  },
+  {
+   "id": "cpp-hitlist2-using-reexport-hover-wrong-bare-name",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "hitlist-2 #8 companion, hitlist theme #14 (cross-verb disagreement): hover on `x.insert()` (Derived, re-exporting Base::insert via `using Base::insert;`) resolves to the WRONG bare-name match `Other::insert` (an unrelated same-named plant) even though gd on the identical position already reaches Base::insert correctly.",
+   "file": "using_reexport.cpp",
+   "line": 13,
+   "col": 6,
+   "expect": {
+    "all": [
+     "struct Base { void insert(); }"
+    ],
+    "none": [
+     "struct Other"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist2-decl-def",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "status": "gold",
+   "id": "cpp-hitlist2-hover-presents-ranked-def",
+   "file": "fwddef/state.c",
+   "line": 4,
+   "col": 21,
+   "comment": "hover is the CandidateSet's hover projection: at a call whose gd ranks the bodied def first, hover presents THAT def's signature, not the forward decl.",
+   "expect": {
+    "all": [
+     "static int helper(int n) { return n * 2; }",
+     "*function*"
+    ],
+    "none": [
+     "static int helper(int n);"
+    ]
+   }
+  },
+  {
+   "id": "cpp-ctxparam-member-hover-nested",
+   "difficulty": "hard",
+   "semantic_area": "cpp-ctxparam-macro",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "ctxparam/ctxparam.c",
+   "line": 14,
+   "col": 11,
+   "comment": "member hover on rcpv->refcount in Perl_rcpv_copy(pTHX_ ...) \u2014 the declared-type-wins fix (WitnessSource ANNOT_SOURCE priority) types the receiver RCPV so the field resolves; regressed to no-hover when the header held a second decl.",
+   "expect": {
+    "all": [
+     "refcount: Numeric",
+     "*field*"
+    ],
+    "none": [
+     "```perl"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-braced-init-hover-eq",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "braced_type.cpp",
+   "line": 6,
+   "col": 22,
+   "comment": "hover on `m` in `FlatMap<int,int> m = {{1,7},{2,9}}` \u2014 the EXPLICIT declared type governs the `= {...}` shape; the braced-init literals' Numeric flow witness must not clobber the annot (WitnessSource ANNOT_SOURCE priority extended to the plain-InferredType axis).",
+   "expect": {
+    "all": [
+     "m: FlatMap<int, int>"
+    ],
+    "none": [
+     "Numeric"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-braced-init-hover-direct",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-hitlist",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "braced_type.cpp",
+   "line": 8,
+   "col": 22,
+   "comment": "hover on `d` in `FlatMap<int,int> d{{3,4}}` \u2014 the declared type governs the direct brace-init `{...}` shape too.",
+   "expect": {
+    "all": [
+     "d: FlatMap<int, int>"
+    ],
+    "none": [
+     "Numeric"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-family-q-member-decl-hover-not-free",
+   "difficulty": "hard",
+   "semantic_area": "cpp-family-q-owner-anchor",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "memfree/log.h",
+   "line": 3,
+   "col": 8,
+   "comment": "hover on the member declaration `info` in `struct Logger` presents the MEMBER, not a color.h-style free `info` - the decl->def hunt no longer treats a package-`None` free function as the body of a package-`Logger` member.",
+   "expect": {
+    "all": [
+     "*method*"
+    ],
+    "none": [
+     "return x + 1"
+    ]
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-ctorif-decl-directive-late-member-hover",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Case A (reduced): hover on `w.late_field` (declared after the ctor-init `#if`) shows the real field, not corruption \u2014 the declaration-position directive repair kept the class attribution.",
+   "file": "ctorif/ctorif.cpp",
+   "line": 25,
+   "col": 6,
+   "expect": {
+    "all": [
+     "late_field",
+     "field"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-family-c-macro-body-pointer-member-hover",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "baseop_ptr.c",
+   "line": 6,
+   "col": 22,
+   "comment": "Family C finding 4: a pointer member declared inside a `#define BASEOP` body hovers with its `*` kept (`op_next: OP*`, `*field*`) \u2014 the macro-body member lane now carries the same deref_stack + Field kind a plainly-declared field does.",
+   "expect": {
+    "all": [
+     "op_next: OP*",
+     "*field*"
+    ],
+    "none": [
+     "op_next: OP\n"
+    ]
+   },
+   "status": "gold"
+  }
+ ]
 }

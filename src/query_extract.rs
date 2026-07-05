@@ -1042,6 +1042,22 @@ pub struct PeelSpec {
     pub record_stack: bool,
 }
 
+/// The declarator peel for C/C++ struct fields and locals: pointer/reference
+/// wrappers, `field_identifier`/`identifier` leaves, recording the deref stack.
+/// The cpp pack's `nested_peel` AND the member-block synth lane
+/// (`cpp_reparse::synth_base`) both peel through this, so a pointer field's
+/// `*`s are extracted by ONE walker whether the field was written plainly or
+/// pasted from a `#define BASEOP` body (rule #10 — no second deref walker).
+pub(crate) const C_FIELD_DECL_PEEL: PeelSpec = PeelSpec {
+    wrappers: &[
+        ("pointer_declarator", crate::file_analysis::DerefKind::Pointer),
+        ("reference_declarator", crate::file_analysis::DerefKind::Reference),
+    ],
+    annot_kinds: &["type_qualifier"],
+    leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.field")],
+    record_stack: true,
+};
+
 /// One effect of a command-dispatched statement.
 #[derive(Debug, Clone, Copy)]
 pub enum CmdEffect {
@@ -1323,19 +1339,11 @@ pub fn cpp_pack() -> LangPack {
         implicit_field_reads: true,
         trigger_chars: &[".", ">", ":"],
         receiver_names: &["this"],
-        nested_peel: PeelSpec {
-            wrappers: &[
-                ("pointer_declarator", crate::file_analysis::DerefKind::Pointer),
-                ("reference_declarator", crate::file_analysis::DerefKind::Reference),
-            ],
-            annot_kinds: &["type_qualifier"],
-            // `field_identifier` only ever names a struct/class member (the
-            // grammar's own distinction from a plain `identifier` local) —
-            // "def.field" here matches the plain (non-pointer) field pattern
-            // above.
-            leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.field")],
-            record_stack: true,
-        },
+        // `field_identifier` only ever names a struct/class member (the
+        // grammar's own distinction from a plain `identifier` local), so
+        // "def.field" matches the plain (non-pointer) field pattern above.
+        // Shared with the member-block synth lane (rule #10).
+        nested_peel: C_FIELD_DECL_PEEL,
         // DerefKind placeholder — record_stack false, so it's never read.
         recv_peel: PeelSpec {
             wrappers: &[
@@ -1459,7 +1467,7 @@ struct Event {
 /// (the receiver peel — the leaf is an invocant). Outermost level first
 /// (left-to-right display order, `Box*&` → `[Pointer, Reference]`). Depth-
 /// capped. The ONE peel: `nested_peel` and `recv_peel` are both this.
-fn peel<'a>(
+pub(crate) fn peel<'a>(
     mut node: tree_sitter::Node<'a>,
     spec: &PeelSpec,
     src: &[u8],

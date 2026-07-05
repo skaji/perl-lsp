@@ -696,6 +696,34 @@ struct op { BASEOP };
 }
 
 #[test]
+fn member_block_pointer_field_keeps_its_deref_stack() {
+    let mut p = cpp_parser();
+    // hitlist-4 finding 4: a pointer member declared inside a `#define BASEOP`
+    // body must peel its `*` into `deref_stack` (so hover renders `OP*`, not the
+    // bare `OP`), exactly as a plainly-declared field does. Non-pointer / bitfield
+    // members keep an EMPTY stack.
+    let src = "\
+#define BASEOP OP* op_next; unsigned op_type:9; OP** op_sibparent;
+struct op { BASEOP };
+";
+    let plan = crate::cpp_reparse::plan_member_blocks(&mut p, src);
+    let base = plan.bases.iter().find(|b| b.macro_name == "BASEOP").expect("BASEOP base");
+    let member = |n: &str| base.members.iter().find(|m| m.name == n).unwrap_or_else(|| panic!("member {n}"));
+    use crate::file_analysis::DerefKind;
+    assert_eq!(
+        member("op_next").deref_stack.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        vec![DerefKind::Pointer],
+        "single-pointer member peels one Pointer step"
+    );
+    assert_eq!(
+        member("op_sibparent").deref_stack.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        vec![DerefKind::Pointer, DerefKind::Pointer],
+        "double-pointer member peels two Pointer steps"
+    );
+    assert!(member("op_type").deref_stack.is_empty(), "bitfield member has no deref stack");
+}
+
+#[test]
 fn non_member_block_macros_are_untouched() {
     let mut p = cpp_parser();
     // A value macro and a function-like macro are NOT member blocks — no plan.
