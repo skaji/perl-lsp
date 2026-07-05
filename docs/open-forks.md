@@ -18,7 +18,7 @@ Format per entry:
 
 ---
 
-## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — OPEN
+## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — RATIFIED (veesh, 2026-07-05)
 - **Context:** hitlist-3 Family A+I slice. The implicit-field-read pass is
   gated by the pack's `implicit_field_reads` capability. The sibling-CALL
   half (a bare `foo()` inside a method body meaning `this->foo()`) needed a
@@ -37,6 +37,9 @@ Format per entry:
 - **Undo cost:** trivial — split into two bools and thread the second
   through `emit_return_fuel`; the sibling-call pass already stands alone as
   its own block, so it just reads a different flag.
+- **Ratification (veesh):** one flag for both, confirmed; the rename
+  (`implicit_field_reads` → something member-scoped) happens at a later
+  decrufting. Queued in PARKED design-debt.
 
 ## Sibling-call vs. same-named free function ranking — 2026-07-05 — RESOLVED (Family Q, 2026-07-05)
 - **Context:** same slice. When a method body calls `foo()` and BOTH a
@@ -107,7 +110,7 @@ Format per entry:
 - **Discussion needed:** none urgent; fold into B if/when a language tag
   exists.
 
-## `Slot::ModulePath`'s `in_use` field — 2026-07-05 — OPEN
+## `Slot::ModulePath`'s `in_use` field — 2026-07-05 — RATIFIED with direction (veesh, 2026-07-05)
 - **Context:** cursor Slot taxonomy (`docs/adr/cursor-slots.md`), migrating
   completion's context match onto `Slot`. The ADR sketches `ModulePath {
   prefix: String }` covering BOTH `use |` (typing the module name —
@@ -139,8 +142,12 @@ Format per entry:
   `cursor_slot_tests.rs::detect_slot_perl_use_module_name_is_module_path`.
   (The two renders now live set-side as
   `CandidateSet::complete_module_candidates` / `complete_qualified_path`.)
+- **Ratification (veesh):** keep, but GENERALIZE at a future decruft —
+  `in_use` should become a generic "which detector arm fired" fact the
+  Slot always carries, not a ModulePath-only special case. Queued in
+  PARKED design-debt.
 
-## Ref-type deref snippets — candidate data vs projection policy — 2026-07-05 — OPEN
+## Ref-type deref snippets — candidate data vs projection policy — 2026-07-05 — RATIFIED (veesh, 2026-07-05)
 - **Context:** the entity-content candidate-level migration (PARKED
   "Entity-content completion sources"). Every entity-content source now
   yields `CompletionCandidate` through one adapter projection
@@ -169,8 +176,12 @@ Format per entry:
   ever appears; today there's exactly one.
 - **Discussion needed:** none urgent; revisit only if type-constrained
   completion wants snippet candidates from a shared source.
+- **Ratification (veesh):** punt is fine — snippets likely push into the
+  candidate vocabulary eventually, but blast radius is low; the standing
+  condition is that layering rules hold (snippets stay adapter-side, no
+  analysis decisions leak into the projection).
 
-## Type-constrained completion — carried expected type vs new Slot variant — 2026-07-05 — OPEN
+## Type-constrained completion — carried expected type vs new Slot variant — 2026-07-05 — RATIFIED (veesh, 2026-07-05)
 - **Context:** the type-constrained-completion slice needed a slot for the
   pack domain comparison (`o->op_type == |` → the field's enum DOMAIN). The
   `Slot::expected_type` seam already existed; the question was how the pack
@@ -199,3 +210,6 @@ Format per entry:
   sub-LOCAL tier isn't expressible; demoting the complement is the minimal
   sort_text-visible reorder). Revisit if a second sub-LOCAL ranking axis
   appears and the two need a shared ordering.
+- **Ratification (veesh):** leave as is — "ArgPosition is a drop of a
+  lie, but Slot::Comparison would be sprawl." A friendly comment on the
+  variant acknowledges the stretch (landed in `src/cursor_slot.rs`).
