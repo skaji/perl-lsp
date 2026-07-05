@@ -586,6 +586,25 @@
     ]
    },
    "status": "gold"
+  },
+  {
+   "id": "cpp-svunion-stacked-memberblock-hover",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "hitlist-6 Family A: hover on `sv->sv_flags` (SV = struct STACKING a plain + a union-bearing member-block macro) resolves the stacked base's field despite the anonymous union in the pasted body.",
+   "file": "svunion.c",
+   "line": 21,
+   "col": 15,
+   "expect": {
+    "all": [
+     "sv_flags: Numeric",
+     "*field*"
+    ],
+    "none": []
+   },
+   "status": "gold"
   }
  ]
 }

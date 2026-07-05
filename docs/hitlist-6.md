@@ -20,7 +20,32 @@ reduced fixture** (no perl headers), so it is not a harness artifact.
 
 ---
 
-## FAMILY A — member-block macros with an anonymous union lose their struct edge  ·  HIGH
+## FAMILY A — member-block macros with an anonymous union lose their struct edge  ·  LANDED (re-diagnosed)
+
+> **UPDATE (fix-run):** the headline diagnosis below did **not** hold up. The
+> `(struct → member-block-macro)` parent edge attaches **correctly** even when
+> the pasted body contains an anonymous union / nested braces — verified at the
+> plan level (`plan_member_blocks` emits `[(STRUCT_SV, _SV_HEAD), (STRUCT_SV,
+> _SV_HEAD_UNION)]`, struct symbol name matches the edge) and end-to-end on the
+> **real perl5 tree, cold cache**: `sv->sv_flags` on an `SV *` receiver resolves
+> gd (`sv.h:211`), hover (`sv_flags: unsigned int`), and completion (full SV
+> member list). The probe's "all SV member navigation dark" symptom was a
+> **bounded-root / warm-SQLite artifact** — the reduced `A-FAIL-union-memberblock.c`
+> passes at the spike tip (single-file, cross-file, and against the exact sv.h
+> block). Locked as gold: `svunion.c` (gd/hover/completion rows).
+>
+> The one **genuine** residual the probe surfaced is narrower and a **different
+> seam**: perl5's `STRUCT_SV` tag is *itself* a macro (`#define STRUCT_SV sv` in
+> perl.h). The struct is defined in sv.h with no macro in scope → symbol named
+> `STRUCT_SV`; a using file that has the macro in scope expands a raw
+> `struct STRUCT_SV *` receiver to `struct sv`, so the tag lookup misses and
+> that spelling's member nav is dark. This is a **general cross-file
+> macro-named-tag asymmetry** (reproduces on a plain struct too — NOT
+> member-block-specific), and it spares the daily-driver `SV`-typedef path.
+> Pinned as xfail: `cpp-svmacrotag-cross-file-goto-def` /
+> `cpp-svmacrotag-cross-file-completion` (fixture `svmacrotag/`). See
+> `gold-corpus/KNOWN-GAPS.md` → C++ tier. The original mis-diagnosis is kept
+> below for the record.
 
 **The single most important finding.** All `SV` struct-member navigation in
 perl's guts is dark.
@@ -168,10 +193,13 @@ globals via `embedvar.h`.
 
 ## Fix-slice breakdown (by daily-driver pain)
 
-1. **Slice A (HIGH, opus)** — member-block edge attachment robust to
-   union/brace-bearing member-block bodies. Fixes all SV/body-struct member
-   navigation. `cpp_reparse.rs::plan_member_blocks`. Repro:
-   `hitlist-6-fixtures/A-FAIL-union-memberblock.c`.
+1. ~~**Slice A (HIGH, opus)** — member-block edge attachment robust to
+   union/brace-bearing member-block bodies.~~ **RE-DIAGNOSED / LANDED as a
+   regression net** (see Family A update). The edge already attaches robustly
+   through union/brace bodies; the "dark navigation" symptom was a
+   bounded-root/cache artifact. Gold lock: `svunion.c`. The genuine residual is
+   a *different* seam — cross-file macro-named struct tags — pinned xfail
+   (`svmacrotag/`); no `plan_member_blocks` change was warranted.
 2. **Slice D (MEDIUM-LOW)** — references coverage of field/member uses inside
    `#define` bodies. `cpp_reparse.rs` macro-body scan.
 3. **Slice B (LOW / product decision)** — whether gd-on-field should return
