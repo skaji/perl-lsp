@@ -152,6 +152,10 @@ async fn main() {
             cli_workspace_symbol(&args[2], &args[3]);
             return;
         }
+        Some("--heatmap") if args.len() >= 3 => {
+            cli_heatmap(&args[2], &args[3..]);
+            return;
+        }
         Some("--batch") if args.len() >= 3 => {
             cli_batch(&args[2]);
             return;
@@ -450,6 +454,12 @@ fn print_usage() {
     eprintln!("  perl-lsp --rename <root> <file> <line> <col> <new>     Cross-file rename");
     eprintln!("  perl-lsp --workspace-symbol <root> <query>             Search symbols");
     eprintln!("  perl-lsp --batch <root>                                Stream JSONL queries (one startup, many)");
+    eprintln!();
+    eprintln!("INSIGHT:");
+    eprintln!("  perl-lsp --heatmap <root> [--csv|--html] [--include-deps] [--all]");
+    eprintln!("                                                         Per-symbol usage (fan-in/fan-out)");
+    eprintln!("                                                         + unreferenced-symbol candidates");
+    eprintln!("                                                         (JSON default; --csv / --html viewer)");
     eprintln!();
     eprintln!("PLUGIN AUTHORING:");
     eprintln!("  perl-lsp --plugin-check <file.rhai>                    Lint a Rhai plugin");
@@ -1468,12 +1478,7 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
             | file_analysis::SymKind::Enumerator | file_analysis::SymKind::Handler => {}
             _ => continue,
         }
-        let hidden = match &sym.detail {
-            file_analysis::SymbolDetail::Sub { hide_in_outline, .. } => *hide_in_outline,
-            file_analysis::SymbolDetail::Handler { hide_in_outline, .. } => *hide_in_outline,
-            _ => false,
-        };
-        if hidden { continue; }
+        if sym.hidden_in_outline() { continue; }
         if matches!(sym.kind, file_analysis::SymKind::Variable | file_analysis::SymKind::Enumerator)
             && analysis.scope_within_sub_body(sym.scope)
         {
@@ -1994,6 +1999,315 @@ fn cli_workspace_symbol(root: &str, query: &str) {
         query: Some(query.to_string()), newname: None,
     };
     print_run_one(&ws, &idx, &req);
+}
+
+/// Which symbols a usage heatmap lists: nameable callables and packages.
+/// A listing policy, not an identity decision — identity is minted by the
+/// CandidateSet at the symbol's declaration. Anonymous subs (`(anon)`) and
+/// other non-identifier names have no nameable reference graph (their name
+/// would cross-link every other anon); lexical variables, hash-key/field
+/// slots, and handlers have no meaningful cross-file usage count.
+fn heatmap_symbol_eligible(sym: &file_analysis::Symbol) -> bool {
+    use file_analysis::SymKind;
+    sym.name.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        && matches!(
+            sym.kind,
+            SymKind::Sub
+                | SymKind::Method
+                | SymKind::Package
+                | SymKind::Class
+                | SymKind::Module
+        )
+}
+
+/// --heatmap <root> [--csv|--html] [--include-deps] [--all] — Code-usage heatmap.
+///
+/// Emits per-symbol USAGE metrics as a projection of the resolution
+/// CandidateSet (`docs/adr/resolution-candidate-set.md`): fan-in is the
+/// `references()` image of the set minted at each symbol's declaration —
+/// the SAME set the references/rename verbs project from, so heatmap counts
+/// cannot diverge from what `textDocument/references` answers, and every
+/// construction axis (visibility masks, group/attr field splats, override
+/// families, future closure/delegation gating) is inherited for free. It is
+/// a reporting view, not a new analysis tier:
+///
+///   * fan_in  — how many reference sites a symbol has across the workspace
+///               (call sites; the symbol's own declaration is excluded).
+///   * fan_out — how many DISTINCT callees a sub/method references in its body
+///               (cheap intra-file span containment; `null` for packages).
+///   * dead_code_candidate — fan_in == 0 AND no reachability guard fired.
+///
+/// HONEST LABEL: a "dead-code candidate" here is an UNREFERENCED SYMBOL — a
+/// reachability heuristic, NOT MISRA C:2012 Rule 2.2 dead code (undecidable).
+/// We OVER-APPROXIMATE reachability (sound for "is it live?", may under-report
+/// dead): a symbol is treated as reachable (never flagged) when it is exported,
+/// is a constructor, or — for methods, when ANY file in the workspace dispatches
+/// dynamically (`$obj->$method`) — could be reached through an edge the static
+/// graph can't see. Failure modes: symbolic code refs (`\&name`, `&{$n}`),
+/// `can`/`->$method` with an unresolved name, `AUTOLOAD`, and string `eval` are
+/// invisible; function candidates assume none of these reach them.
+fn cli_heatmap(root: &str, opts: &[String]) {
+    use file_analysis::{AccessKind, Namespace, SymKind};
+    use std::collections::HashSet;
+
+    let csv = opts.iter().any(|a| a == "--csv");
+    let html = opts.iter().any(|a| a == "--html");
+    let include_deps = opts.iter().any(|a| a == "--include-deps");
+    // By default only candidate-eligible kinds (subs/methods/packages with a
+    // body) are listed; `--all` keeps every counted symbol in `symbols`.
+    let emit_all = opts.iter().any(|a| a == "--all");
+
+    let (ws, idx) = cli_full_startup(root);
+
+    // Workspace-level soundness gate. Any dynamic method dispatch makes the
+    // static call graph an under-approximation of method reachability, so a
+    // zero-fan-in METHOD can't be proven dead.
+    let mut dynamic_dispatch_sites: u64 = 0;
+    for entry in ws.workspace_raw().iter() {
+        dynamic_dispatch_sites += entry.value().dynamic_dispatch_sites as u64;
+    }
+    let has_dynamic_dispatch = dynamic_dispatch_sites > 0;
+
+    // References across open + workspace files; `--include-deps` also walks
+    // cached @INC modules so a library symbol used only from a dependency
+    // shows nonzero fan-in. Applied as the CandidateSet's construction-time
+    // visibility so every projection inherits it. The default matches the
+    // set's own verdict — every heatmap symbol is workspace-declared, so
+    // `references_mask_for` answers EDITABLE by construction — while skipping
+    // that verdict's per-symbol whole-store scan.
+    let mask = if include_deps {
+        resolve::RoleMask::VISIBLE
+    } else {
+        resolve::RoleMask::EDITABLE
+    };
+    let scope = override_scope_from_env();
+
+    let within = |outer: &file_analysis::Span, inner: &file_analysis::Span| {
+        let s = |p: &tree_sitter::Point| (p.row, p.column);
+        s(&inner.start) >= s(&outer.start) && s(&inner.end) <= s(&outer.end)
+    };
+
+    let mut sources = SourceCache::new();
+    let mut symbol_rows: Vec<serde_json::Value> = Vec::new();
+    let mut dead_rows: Vec<serde_json::Value> = Vec::new();
+
+    // Stable file order so output is deterministic across runs.
+    let mut entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
+        .workspace_raw()
+        .iter()
+        .map(|e| (e.key().clone(), std::sync::Arc::clone(e.value())))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (path, analysis) in &entries {
+        let path_str = path.display().to_string();
+        for sym in &analysis.symbols {
+            // Fold arity-variant accessor twins / DSL-import infrastructure
+            // into their listed primary — same contract the outline honors.
+            // A fluent `rw` writer shares its getter's name/span/fan-in, so
+            // listing it would double-count one logical method.
+            if sym.hidden_in_outline() || !heatmap_symbol_eligible(sym) {
+                continue;
+            }
+
+            // The declared name token is a cursor position, so the set minted
+            // there is the one references/rename project from — identity is
+            // never re-derived heatmap-side.
+            let cs = resolve::resolve(
+                &ws,
+                analysis,
+                file_store::FileKey::Path(path.clone()),
+                sym.selection_span.start,
+                Some(&idx),
+                scope,
+            )
+            .with_visibility(mask);
+
+            // fan_in = the references image minus the symbol's declaration
+            // site(s). Group answers (attr field splats) mark their local
+            // decl spelling as a plain Read, so the symbol's own name token
+            // is excluded by span as well as by access kind.
+            let locs = cs.references();
+            let fan_in = locs
+                .iter()
+                .filter(|l| l.access != AccessKind::Declaration)
+                .filter(|l| {
+                    !(l.span == sym.selection_span
+                        && matches!(&l.key, file_store::FileKey::Path(p) if p == path))
+                })
+                .count();
+
+            // fan_out = distinct callee names referenced inside this body
+            // (subs/methods only). Packages have no body to scan.
+            let is_callable = matches!(sym.kind, SymKind::Sub | SymKind::Method);
+            let fan_out: Option<usize> = if is_callable {
+                let mut callees: HashSet<&str> = HashSet::new();
+                for r in &analysis.refs {
+                    if matches!(
+                        r.kind,
+                        file_analysis::RefKind::FunctionCall { .. }
+                            | file_analysis::RefKind::MethodCall { .. }
+                            | file_analysis::RefKind::DispatchCall { .. }
+                    ) && within(&sym.span, &r.span)
+                    {
+                        callees.insert(r.unqualified_target_name());
+                    }
+                }
+                // Don't count self-recursion as fan-out to itself.
+                callees.remove(sym.name.as_str());
+                Some(callees.len())
+            } else {
+                None
+            };
+
+            let exported = analysis.exports_name(&sym.name);
+            let native = matches!(sym.namespace, Namespace::Language);
+
+            // Reachability guard — why a zero-fan-in symbol is NOT flagged dead.
+            // Ordered most-specific-first.
+            let guard: Option<&'static str> = if fan_in > 0 {
+                None
+            } else if exported {
+                Some("exported")
+            } else if conventions::is_constructor_name(&sym.name) {
+                Some("constructor")
+            } else if !native {
+                // Framework-synthesized accessors/handlers — the user didn't
+                // write them, and the framework calls them through machinery
+                // the static graph doesn't model.
+                Some("framework-synthesized")
+            } else if matches!(sym.kind, SymKind::Package | SymKind::Class | SymKind::Module) {
+                // Packages are reachable through too many invisible vectors
+                // (`require`, app entrypoints, dynamic class strings) to flag.
+                Some("package-implicit-use")
+            } else if has_dynamic_dispatch
+                && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                && sym.package.as_deref().is_some_and(|p| p != "main")
+            {
+                // A sub declared in a class can be invoked as `$obj->name`;
+                // an unresolved dynamic dispatch ANYWHERE in the workspace
+                // could target it, so the static graph can't prove it dead.
+                // `main`-script free functions are excluded — they're not
+                // class methods, so their FunctionCall graph is authoritative.
+                Some("dynamic-dispatch")
+            } else {
+                None
+            };
+
+            let dead = fan_in == 0 && guard.is_none();
+            let (line, col) =
+                sources.display(&path_str, sym.selection_span.start.row, sym.selection_span.start.column);
+            let kind = format!("{:?}", sym.kind);
+
+            let row = serde_json::json!({
+                "name": sym.name,
+                "kind": kind,
+                "package": sym.package,
+                "file": path_str,
+                "line": line,
+                "col": col,
+                "fan_in": fan_in,
+                "fan_out": fan_out,
+                "exported": exported,
+                "dead_code_candidate": dead,
+                "reachable_guard": guard,
+            });
+
+            if dead {
+                dead_rows.push(row.clone());
+            }
+            if emit_all || is_callable || dead {
+                symbol_rows.push(row);
+            }
+        }
+    }
+
+    // Heaviest fan-in first — the hotspots a reader wants up top.
+    symbol_rows.sort_by(|a, b| {
+        b["fan_in"].as_u64().cmp(&a["fan_in"].as_u64())
+            .then_with(|| a["file"].as_str().cmp(&b["file"].as_str()))
+            .then_with(|| a["line"].as_u64().cmp(&b["line"].as_u64()))
+    });
+
+    if csv {
+        println!("name,kind,package,file,line,col,fan_in,fan_out,exported,dead_code_candidate,reachable_guard");
+        let cell = |v: &serde_json::Value| -> String {
+            match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => csv_escape(s),
+                other => other.to_string(),
+            }
+        };
+        for r in &symbol_rows {
+            println!(
+                "{},{},{},{},{},{},{},{},{},{},{}",
+                cell(&r["name"]), cell(&r["kind"]), cell(&r["package"]), cell(&r["file"]),
+                cell(&r["line"]), cell(&r["col"]), cell(&r["fan_in"]), cell(&r["fan_out"]),
+                cell(&r["exported"]), cell(&r["dead_code_candidate"]), cell(&r["reachable_guard"]),
+            );
+        }
+        return;
+    }
+
+    let out = serde_json::json!({
+        "schema": "perl-lsp.heatmap.v1",
+        "kind": "usage-heatmap",
+        "label": "dead_code_candidate: a symbol with no references found. Confirm it's unused before removing.",
+        "soundness": "Flagging errs toward reachable, so it never flags exported symbols, constructors, framework-synthesized members, packages, or (when the workspace uses dynamic dispatch) any method.",
+        "root": root,
+        "files_indexed": entries.len(),
+        "dynamic_dispatch_sites": dynamic_dispatch_sites,
+        "include_deps": include_deps,
+        "summary": {
+            "symbols_reported": symbol_rows.len(),
+            "dead_code_candidates": dead_rows.len(),
+        },
+        "symbols": symbol_rows,
+        "dead_code_candidates": dead_rows,
+    });
+
+    // `--html` wraps the SAME report in a self-contained, offline viewer
+    // (treemap heat + fan-in/fan-out butterfly). No external assets: the
+    // report JSON is embedded so the file opens straight off disk.
+    if html {
+        println!("{}", heatmap_html(&out));
+        return;
+    }
+
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+/// Render a `--heatmap` report as a single self-contained HTML document.
+///
+/// The whole report is embedded as a `<script type="application/json">`
+/// blob and drawn client-side with dependency-free SVG — no CDN, no build
+/// step, opens with a `file://` URL. Two views over the same `symbols[]`:
+/// a squarified treemap (tile area = fan_in+1, color = fan_in heat,
+/// dead-code candidates outlined) and a back-to-back fan-in/fan-out
+/// butterfly of the hottest symbols.
+fn heatmap_html(report: &serde_json::Value) -> String {
+    // The report carries file paths (attacker-adjacent text), so escape every
+    // `<` to its JSON unicode form: that makes a stray `</script>` impossible
+    // regardless of content, and `JSON.parse` restores the `<` client-side.
+    let data = serde_json::to_string(report)
+        .unwrap_or_else(|_| "{}".to_string())
+        .replace('<', "\\u003c");
+    HEATMAP_HTML_TEMPLATE.replace("__HEATMAP_DATA__", &data)
+}
+
+/// Self-contained viewer template; `__HEATMAP_DATA__` is replaced with the
+/// embedded report JSON. Kept as one literal so the asset travels with the
+/// binary (no runtime file lookup, no build-time bundling).
+const HEATMAP_HTML_TEMPLATE: &str = include_str!("heatmap.html");
+
+/// Minimal RFC-4180 CSV field escaping: quote when the value contains a
+/// comma, quote, or newline; double embedded quotes.
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// --clear-cache [<root>] — Remove the SQLite module cache.
