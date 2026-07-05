@@ -4268,11 +4268,14 @@ impl FileAnalysis {
     ///
     /// A site is included only when the receiver's type resolves; an
     /// unresolvable receiver is omitted (honest silence — the diagnostics
-    /// built on top miss it rather than guess). Covered receiver forms are
-    /// the ones that carry a typed scalar handle on a ref: a method-call
-    /// invocant (`$x->m`) and a scalar hash deref (`$x->{k}`). Array
-    /// (`$x->[i]`) and code (`$x->()`) derefs don't surface a receiver-typed
-    /// ref today and are the documented residual.
+    /// built on top miss it rather than guess). All four arrow forms are
+    /// covered: method (`$x->m`) and hash (`$x->{k}`) carry a receiver-typed
+    /// ref; array (`$x->[i]`) and code (`$x->()`) carry none, so the builder
+    /// records them as `arrow_deref_sites` and this query merges the two
+    /// sources. The residual is the receiver *shape*, not the arrow form: only
+    /// a plain scalar operand is recorded, so a chain receiver (`f()->[0]`,
+    /// `$x->{k}->()`) is skipped — only a plain scalar can be provably
+    /// `Undef`/`Optional`.
     pub fn deref_receiver_sites(
         &self,
         module_index: Option<&dyn CrossFileLookup>,
