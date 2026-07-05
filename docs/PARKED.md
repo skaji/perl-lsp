@@ -59,6 +59,37 @@ why parked, what unblocks it. Prune on landing.
   base-subobject move (`operator=`/move-ctor), and a by-mutable-ref reset
   (`reset(x); x.use()`). Those stay silent by design — the gates trade recall
   for zero false positives.
+- **C/C++ narrowing-diagnostics facts** — D1/D2/D3/D4/D6 are Perl-only
+  because their fact seams (`deref_receiver_sites`, `guard_sites`,
+  `arrow_deref_sites`) are minted only by `src/builder/narrowing.rs`, a
+  child of the Perl-only tree-sitter consumer. cpp goes through
+  `query_extract` and never runs `build()`. The cpp hover/goto **type**
+  tier already narrows (`narrow_guard` refines inside `dynamic_cast` /
+  `std::optional` guards — `cpp_dynamic_cast_guard_narrows`); what's missing
+  is the **diagnostics** layer. Needs a cpp nullability pass that lowers
+  `nullptr` comparisons + `std::optional` engagement state into the
+  `Undef`/`Optional` lattice ALONG cpp control flow (the analog of the Perl
+  guard/truncation machinery), plus cpp `guard_sites` for D3/D4. Then the
+  existing `deref_receiver_sites` / `guard_redundancies` seams and their
+  filters light up unchanged. `docs/adr/narrowing-diagnostics.md` (C/C++
+  applicability matrix).
+- **C/C++ `unresolved-method` (D8)** — the facts resolve (verified: a cpp
+  receiver types to its class via `expr_type_at_span`, classes mint
+  `SymKind::Class`, inheritance rides `package_parents`, and the
+  `class_has_unresolved_ancestor` valve silences the unscanned-base case).
+  Blocked on **macro member-injection**: a `#define … void run();` /
+  `Q_OBJECT`-style macro in a class body injects a member the skeleton
+  walker can't see, so a call to that present method reads as a false
+  `unresolved-method` (verified FP; no existing valve catches it). The
+  sound valve — silence any class whose body span contains a macro/opaque
+  token — is buildable (the `Class` symbol span + body `Block` scope cover
+  the full body), but its precision (correctly telling a member-injecting
+  macro from a benign one, including object-like macros from unscanned
+  headers that surface as bare identifiers) must be **calibrated against the
+  macro-heavy real substrate** (spdlog/fmt/onednn), the same bar
+  use-after-move cleared. Default-off + opt-in + pack-capability gate
+  (declared like `implicit_field_reads`, never `lang == cpp`) is understood;
+  only the valve + its calibration remain. `docs/adr/narrowing-diagnostics.md`.
 - **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
   - i think this will just be closed; anyways it didn't look like it did the intended PPP,
     which is to have mojo helpers which mint dynamic helpers show their definitions;

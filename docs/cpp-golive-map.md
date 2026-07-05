@@ -218,6 +218,28 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              true positives. Path-sensitive residuals (cross-branch use,
              loop-carried move, partial/subobject move, by-ref reset) stay
              silent by design. `docs/adr/use-after-move.md`.
+         · narrowing DIAGNOSTICS (D1/D2/D3/D4/D6/D8) ....... ⬜ PARKED for cpp
+             The narrowing FACTS are landed (the `dynamic_cast`/`optional`
+             row above + the narrowing TABLE at ~L300, ✅); this is the
+             DIAGNOSTICS layer on top, per D-code. All Perl-only today —
+             D1 `undef-deref`, D2 `optional-deref`, D3/D4 redundant/
+             contradictory-guard, D6 `deref-shape` read seams
+             (`deref_receiver_sites`/`guard_sites`) minted only by
+             `builder/narrowing.rs`; cpp uses `query_extract`, never runs
+             `build()`, so mints none. UNBLOCK: a cpp nullability pass
+             lowering `nullptr` compares + `std::optional` engagement into
+             the `Undef`/`Optional` lattice along cpp control flow, plus
+             cpp `guard_sites` (D3/D4). D8 `unresolved-method` is the
+             exception — its facts DO resolve for cpp (receiver→class via
+             `expr_type_at_span`, `SymKind::Class`, `package_parents` MRO,
+             `class_has_unresolved_ancestor` silences unscanned bases) — but
+             is parked on ONE valve: macro member-injection
+             (`#define … void run();` / `Q_OBJECT` in a class body) reads a
+             present method as absent (verified FP). Sound valve (silence any
+             class whose body span holds a macro/opaque token) is buildable;
+             needs spdlog/fmt/onednn calibration, same bar UAM cleared.
+             Pack-CAPABILITY gated, not `lang == cpp`.
+             `docs/adr/narrowing-diagnostics.md`, `docs/PARKED.md`.
          · TYPE-CONSTRAINED completion .................... ⬜ (sick)
              at a typed slot (`x.` where x:T, a `T`-typed arg position, a
              return slot), offer only members/values whose type matches the

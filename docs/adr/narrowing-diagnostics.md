@@ -95,6 +95,63 @@ is load-bearing: never tighten the narrower to catch more bugs at the cost
 of a false `Undef`/`Optional`, or every diagnostic built on it inherits
 the false positive.
 
+## C/C++ applicability
+
+These diagnostics are Perl-only *today*, and the split is by **fact
+source**, not by language name:
+
+| Code | Fact source | C/C++ status |
+|------|-------------|--------------|
+| D1 `undef-deref` | `deref_receiver_sites` + `Undef` narrowing (guard negation) | ⬜ needs cpp-narrowing layer |
+| D2 `optional-deref` | `deref_receiver_sites` + surviving `Optional` | ⬜ needs cpp-narrowing layer |
+| D3 `redundant-guard` / D4 `contradictory-guard` | `guard_sites` + prior narrowed type | ⬜ needs cpp-narrowing layer |
+| D6 `deref-shape-mismatch` | `deref_receiver_sites` + `ref…eq`-proved rep | ⬜ needs cpp-narrowing layer |
+| D8 `unresolved-method` (cross-file) | method resolution (`method_call_invocant_class` + MRO) | ⬜ parked on a macro-cleanliness valve |
+
+**D1/D2/D3/D4/D6 have no cpp facts.** The whole narrowing tier is a child
+of `builder` (`src/builder/narrowing.rs`) — the single tree-sitter
+consumer for Perl (rule #1). It recognizes Perl sigil places
+(`$self->{x}`), Perl guards (`defined`/`blessed`/`isa`/`ref…eq`), and
+lowers them to `InferredType::Optional`/`Undef`. The C/C++ path is
+`query_extract` (skeleton IR), which never runs `build()` and so mints
+none of the `deref_receiver_sites` / `guard_sites` / `arrow_deref_sites`
+these seams read. Cross-language narrowing *facts* do exist on the pack
+side — the `narrow_guard` pack hook already refines a receiver inside
+`if (dynamic_cast<Derived*>(b))` / `std::optional` engagement blocks
+(`cpp_dynamic_cast_guard_narrows`) — but that is the hover/goto **type**
+tier. The **diagnostics** tier on top of it does not exist: nothing pairs
+a cpp deref with a proven-`nullptr` / disengaged-`optional` receiver, and
+nothing records cpp guard sites for redundancy. Enabling D1/D2/D6 for cpp
+needs a nullability layer that lowers `nullptr` comparisons and
+`std::optional` engagement state into the same `Undef`/`Optional` lattice
+along cpp control flow; D3/D4 need cpp `guard_sites`. Until that lands,
+fake-enabling them ships a diagnostic that never fires (best case) or
+fires on facts it never validated (worse) — so they stay off, not faked.
+
+**D8 (`unresolved-method`) has the facts but not the safety.** Unlike the
+narrowing tier, cpp *does* resolve everything D8 needs: a receiver types
+to its class (`Foo f; f.b()` → `expr_type_at_span` = `ClassName("Foo")`,
+verified), classes mint `SymKind::Class` symbols, and inheritance edges
+ride `package_parents`, so `resolve_method_in_ancestors` + the
+`class_has_unresolved_ancestor` honest-silent valve both work — the
+unscanned-base case (`struct D : Ext` with `Ext` in an un-indexed header)
+correctly stays silent. The blocker is **macro member-injection**: a
+`#define DECL_RUN void run();` (or a `Q_OBJECT`-style macro from an
+unscanned header) inside a class body injects a member the skeleton walker
+never sees, so a call to that present method reads as absent and
+`class_has_unresolved_ancestor` does not fire (verified false positive).
+The class body span is available (the `Class` symbol span and the body
+`Block` scope both cover the full multi-line body), so the sound valve —
+"stay silent for any class whose body contains a macro/opaque token" — is
+buildable; but classifying "member-injecting macro" across every spelling
+(object-like macros from unscanned headers surface as bare unknown
+identifiers) is a precision knob that must be calibrated against the
+macro-heavy real substrate (spdlog/fmt/onednn) before it can be trusted.
+That calibration is the deliverable, and it is its own slice — see
+`docs/PARKED.md`. The diagnostic reuses no per-language shape: the gate is
+a pack **capability** (declared like `implicit_field_reads`), not a
+`lang == cpp` branch, so wiring it is mechanical once the valve is sound.
+
 ## Forward work
 
 - **D7 — `Optional` into a non-optional sink.** Blocked on declared sink
