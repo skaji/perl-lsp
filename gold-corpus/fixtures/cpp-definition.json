@@ -1418,6 +1418,42 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-svunion-stacked-memberblock-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-6 Family A: perl5 sv.h shape. `struct STRUCT_SV` STACKS two member-block macros — `_SV_HEAD(void*)` (plain fields) and `_SV_HEAD_UNION` (anonymous `union {..} sv_u`). The union-bearing member block must still attach its `(struct -> macro)` parent edge, so `sv->sv_flags` on an `SV *` receiver resolves the stacked base's field. The anonymous union in a stacked member-block body does NOT drop the edge (probe root-cause was a bounded-root/cache artifact).",
+      "file": "svunion.c",
+      "line": 21,
+      "col": 15,
+      "expect": {
+        "all": [
+          "svunion.c:10:14"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-svmacrotag-cross-file-goto-def",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/svmacrotag",
+      "comment": "hitlist-6 Family A residual (DISTINCT from the member-block edge, which works): perl5's real `STRUCT_SV` tag is itself a macro (`#define STRUCT_SV sv`). The struct is DEFINED in svdef.h (no macro in scope → symbol named `STRUCT_SV`), but a using file that has the macro in scope expands the `struct STRUCT_SV *` receiver to `struct sv`, so the tag lookup misses. General cross-file macro-named-tag asymmetry (hits plain structs too); the `SV` typedef path is unaffected. XPASSes when tag-name canonicalization reconciles the two.",
+      "file": "use.c",
+      "line": 2,
+      "col": 14,
+      "expect": {
+        "all": [
+          "svdef.h:4:14"
+        ],
+        "none": []
+      },
+      "status": "xfail"
     }
   ]
 }

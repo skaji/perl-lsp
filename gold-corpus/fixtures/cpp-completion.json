@@ -274,6 +274,47 @@
         ]
       },
       "status": "gold"
+    },
+    {
+      "id": "cpp-svunion-stacked-memberblock-completion",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "hitlist-6 Family A: `sv->` on an `SV *` (struct STACKING a plain `_SV_HEAD` + a union-bearing `_SV_HEAD_UNION` member-block macro) lists the stacked base's fields AND the flattened union members (union-overlay flattening, per union_nest.c). The anonymous union in a pasted member-block body does not defeat member completion.",
+      "file": "svunion.c",
+      "line": 21,
+      "col": 15,
+      "expect": {
+        "all": [
+          "sv_any",
+          "sv_refcnt",
+          "sv_flags",
+          "sv_u"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-svmacrotag-cross-file-completion",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/svmacrotag",
+      "comment": "hitlist-6 Family A residual (DISTINCT from the member-block edge): `STRUCT_SV` is a macro (`#define STRUCT_SV sv`). The struct is defined in svdef.h without the macro in scope, so `struct STRUCT_SV *` in a using file (which expands the tag to `struct sv`) fails to resolve to a class and `s->` falls back to top-level garbage instead of the member list. General macro-named-tag cross-file asymmetry. XPASSes when tag-name canonicalization lands.",
+      "file": "use.c",
+      "line": 2,
+      "col": 14,
+      "expect": {
+        "all": [
+          "sv_flags"
+        ],
+        "none": [
+          "via_tag"
+        ]
+      },
+      "status": "xfail"
     }
   ]
 }
