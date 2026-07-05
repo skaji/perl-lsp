@@ -6,6 +6,78 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.6.0 — 2026-07-05
+
+### Type narrowing
+
+The flow-sensitive type narrowing begun in v0.5.2 is now complete. A `defined`
+/ `blessed` / `isa` guard refines a value to its concrete type inside the branch
+it guards, and `Optional<T>` tracks maybe-undef values. That refined type flows
+through hover, completion, and goto — and, new this release, into the
+diagnostics below.
+
+- **Reassignment clears narrowing.** A narrowed type is dropped the moment its
+  scalar is rebound, so a later use never inherits a stale type.
+- **Completion peels `Optional<T>`.** Members complete on a maybe-undef value;
+  the optional-deref lint below then offers the guard that makes the access safe.
+- **Optional receivers dispatch leniently** — no spurious unresolved-method
+  warning on a call through a maybe-undef value.
+
+### Diagnostics (new)
+
+Lints that catch runtime errors by reading a value's inferred type at the point
+of use. Undef-deref is always on; the rest are opt-in, each a
+key under `initializationOptions.diagnostics` or a `--<kebab>` CLI flag.
+
+- **Undef dereference** (always on). Warns when you dereference a value the
+  flow analysis proves is `undef` — a `->method`, `->{k}`, `->[i]`, or `->()`
+  on the failing side of a `defined` guard — each a guaranteed runtime die.
+- **Unguarded optional dereference** (`optionalDeref`). Flags a deref of a
+  maybe-undef `Optional<T>` that no `defined`/`blessed` guard covers, with a
+  one-click "add `return unless defined …`" quick-fix.
+- **Redundant / contradictory guards** (`redundantGuard`). Flags a
+  `defined`/`isa`/`DOES` check whose outcome the value's known type already
+  decides — always true (dead `else`) or always false (dead branch).
+- **Dereference-shape mismatch** (`derefShape`). Flags a `->{k}` / `->[i]` /
+  `->()` whose form contradicts a rep a `ref … eq` guard just proved.
+- **Cross-file unresolved method** (`unresolvedMethodCrossFile`). Extends the
+  unresolved-method warning to narrowed and imported receivers.
+
+### Rename
+
+- **Cross-file symmetry.** Renaming a sub or method updates every importing
+  and calling file, in both directions across the boundary.
+- **Configurable method-override scope.** Renaming an overridden method renames
+  the whole override family by default — the base declaration, every override
+  up and down the hierarchy, and all call sites (matched over proven `@ISA` /
+  role edges, never by name). Set `rename.overrideScope: "dispatch"` to rename
+  only the definition under the cursor and the calls that dispatch to *it*
+  (including `SUPER::`), leaving sibling overrides untouched.
+- **`our` package variables** rename across their package, with UX guards.
+- **Lexical hash keys** — `my %h = (k => …); $h{k}` renames the key everywhere.
+- **Framework-aware groups.** Moo/Moose accessor groups (inheritance-aware),
+  Corinna field privacy, and DBIC column-keyed verbs each rename as a unit.
+
+### Heatmap (new)
+
+- **`perl-lsp --heatmap <root>`** — a per-symbol fan-in / fan-out and
+  dead-code view over the whole reference graph. JSON by default, `--csv` for
+  a flat table, `--html` for a self-contained offline viewer (treemap heat,
+  fan-in/out butterfly, dead-code queue).
+
+### Type inference
+
+- **DBIC**: result sources type their rows; `search` / `find` return typed
+  result sets and columns resolve as keys.
+- **Moo**: a constant array-ref of names expands into individual `has`
+  attributes.
+- **Mojolicious**: plugin-supplied route invocants resolve generically, so
+  goto and hover follow routes built through helper / plugin verbs.
+
+### Fixes
+
+- Skip the unresolved-method warning when `AUTOLOAD` is in the MRO.
+
 ## v0.5.3 - 2026-06-23
 
 ### Licensing
