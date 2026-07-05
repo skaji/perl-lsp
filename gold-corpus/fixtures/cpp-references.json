@@ -2,6 +2,25 @@
   "capability": "references",
   "rows": [
     {
+      "id": "cpp-macro-nested-ref-in-macro-body",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Family M #3 (PARKED): references on a macro should include uses inside OTHER macros' `#define` bodies (`FLAGS` used inside `IS_OK`, line 7). Macro definition bodies are preproc-excluded from ref minting, so the nested use is unindexed — perl5 `SvFLAGS` finds 190/347 real. goto-def through the same nested sites WORKS; this is index-population only. XPASS when the macro-body ref lane is added.",
+      "file": "macro_nested_ref.c",
+      "line": 5,
+      "col": 8,
+      "expect": {
+        "all": [
+          "\"file\":\"macro_nested_ref.c\",\"line\":\"7\"",
+          "\"file\":\"macro_nested_ref.c\",\"line\":\"12\""
+        ],
+        "none": []
+      },
+      "status": "xfail"
+    },
+    {
       "id": "cpp-references-free-function-def-and-call",
       "difficulty": "simple",
       "semantic_area": "cpp-multilang",

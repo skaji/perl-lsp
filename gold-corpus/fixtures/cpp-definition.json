@@ -53,6 +53,76 @@
    "status": "gold"
   },
   {
+   "id": "cpp-svhead-comment-blocked-field-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Family M #1: `_SV_HEAD(ptrtype)` is a function-like member-block macro whose `\\`-continued body carries a trailing block comment on each field line. tree-sitter-cpp ends `preproc_arg` at the first comment, so the CST-span body kept only `sv_any` (perl5 sv.h `_SV_HEAD` shape → SV member intelligence dark). Fix: derive the body from raw source across continuations (strip comments) + handle function-like member-block macros as roles. `sv_flags` is the last, comment-blocked field with no `;` of its own.",
+   "file": "svhead.c",
+   "line": 14,
+   "col": 20,
+   "expect": {
+    "all": [
+     "svhead.c:10:14"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-svhead-continued-field-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "svhead.c",
+   "line": 15,
+   "col": 20,
+   "expect": {
+    "all": [
+     "svhead.c:9:14"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-svhead-first-field-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "svhead.c",
+   "line": 16,
+   "col": 20,
+   "expect": {
+    "all": [
+     "svhead.c:8:14"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-svhead-funclike-base-goto-def",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang-macros",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "goto-def on the function-like member-block paste `_SV_HEAD(void*)` resolves to the macro #define, not itself.",
+   "file": "svhead.c",
+   "line": 11,
+   "col": 15,
+   "expect": {
+    "all": [
+     "svhead.c:7:9"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
    "id": "cpp-member-block-field-goto-def",
    "difficulty": "hard",
    "semantic_area": "cpp-multilang-macros",

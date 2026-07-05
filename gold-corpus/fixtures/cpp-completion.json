@@ -2,6 +2,26 @@
   "capability": "completion",
   "rows": [
     {
+      "id": "cpp-svhead-funclike-member-completion",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Family M #1: `s->` on a struct pasting the function-like member-block macro `_SV_HEAD(void*)` lists ALL its fields — including the comment-blocked ones tree-sitter truncated from `preproc_arg`.",
+      "file": "svhead.c",
+      "line": 14,
+      "col": 20,
+      "expect": {
+        "all": [
+          "sv_any",
+          "sv_refcnt",
+          "sv_flags"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-completion-access-specifier-external-public-only",
       "difficulty": "moderate",
       "semantic_area": "cpp-multilang",

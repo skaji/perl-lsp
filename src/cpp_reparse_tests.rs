@@ -605,6 +605,70 @@ struct sv { REFCNT };
 }
 
 #[test]
+fn funclike_member_block_comment_truncated_body_keeps_all_fields() {
+    let mut p = cpp_parser();
+    // The perl5 sv.h `_SV_HEAD` shape: a FUNCTION-like member-block macro whose
+    // `\`-continued body carries a trailing block comment on each field line, and
+    // whose last field has no `;` (the `;` comes from the paste). tree-sitter-cpp
+    // ends `preproc_arg` at the first comment, so a CST-span body kept only the
+    // first field. The body must be re-derived from raw source across the
+    // continuations, and the call-shaped paste handled as a role.
+    let src = "\
+#define _SV_HEAD(ptrtype) \\
+    ptrtype  sv_any;    /* pointer to body */    \\
+    unsigned sv_refcnt; /* how many refs */      \\
+    unsigned sv_flags   /* what we are */
+
+struct sv { _SV_HEAD(void*); };
+";
+    let plan = crate::cpp_reparse::plan_member_blocks(&mut p, src);
+    assert!(!plan.is_empty(), "function-like member block should be detected");
+
+    let base = plan.bases.iter().find(|b| b.macro_name == "_SV_HEAD").expect("_SV_HEAD base");
+    let names: Vec<&str> = base.members.iter().map(|m| m.name.as_str()).collect();
+    // All three fields survive — the comment-truncation no longer drops sv_flags.
+    assert_eq!(names, vec!["sv_any", "sv_refcnt", "sv_flags"]);
+
+    // The parent edge forms despite the comment-truncated def sitting right above
+    // the struct (comment neutralization keeps the blanked view parsing clean).
+    assert!(
+        plan.edges.contains(&("sv".to_string(), "_SV_HEAD".to_string())),
+        "edges: {:?}",
+        plan.edges
+    );
+    assert_eq!(errors(parse(&mut p, &plan.blanked_source).root_node()), 0, "blanked source parses clean");
+}
+
+#[test]
+fn comment_free_bitfield_block_synthesizes_every_field() {
+    let mut p = cpp_parser();
+    // The op.h `BASEOP` shape (comment-free): a bitfield-heavy field block. Every
+    // field — plain, bitfield, function-pointer, `U8` — must synthesize; the
+    // per-field split never drops one (Family M #2 was a use-site config-region
+    // misattribution, not a synthesis gap).
+    let src = "\
+#define BASEOP \\
+    OP*  op_next; \\
+    OP*  (*op_ppaddr)(pTHX); \\
+    PADOFFSET  op_targ; \\
+    PERL_BITFIELD16 op_type:9; \\
+    PERL_BITFIELD16 op_opt:1; \\
+    PERL_BITFIELD16 op_slabbed:1; \\
+    U8  op_flags; \\
+    U8  op_private;
+struct op { BASEOP };
+";
+    let plan = crate::cpp_reparse::plan_member_blocks(&mut p, src);
+    let base = plan.bases.iter().find(|b| b.macro_name == "BASEOP").expect("BASEOP base");
+    let names: Vec<&str> = base.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["op_next", "op_ppaddr", "op_targ", "op_type", "op_opt", "op_slabbed", "op_flags", "op_private"],
+        "all fields synthesize, none dropped"
+    );
+}
+
+#[test]
 fn non_member_block_macros_are_untouched() {
     let mut p = cpp_parser();
     // A value macro and a function-like macro are NOT member blocks — no plan.
@@ -684,3 +748,6 @@ fn predefined_macros_seed_reachability_config() {
     let seeded = KnownConfig::new(defined, universe);
     assert_eq!(classify(&guards, &seeded), Reachability::Active);
 }
+
+
+

@@ -223,6 +223,8 @@ fn walk_macro_defs(
 ) {
     let query = cached_query(&MACRO_DEF_Q, &tree.language(), MACRO_DEF_QUERY);
     let names: Vec<&str> = query.capture_names().to_vec();
+    // Bodies are re-derived from raw source (comment truncation), not node text.
+    let source = std::str::from_utf8(src).unwrap_or("");
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(query, tree.root_node(), src);
     while let Some(m) = it.next() {
@@ -241,7 +243,7 @@ fn walk_macro_defs(
                     oname = Some(txt.to_string());
                     name_node = Some(c.node);
                 }
-                "obody" => obody = Some(clean_body(txt)),
+                "obody" => obody = Some(clean_body(raw_macro_body(source, c.node.start_byte()))),
                 "bname" => {
                     bname = Some(txt.to_string());
                     name_node = Some(c.node);
@@ -260,7 +262,7 @@ fn walk_macro_defs(
                             .collect(),
                     )
                 }
-                "fbody" => fbody = Some(clean_body(txt)),
+                "fbody" => fbody = Some(clean_body(raw_macro_body(source, c.node.start_byte()))),
                 _ => {}
             }
         }
@@ -674,17 +676,200 @@ fn negate(cond: &str) -> String {
 const MAX_BODY_LEN: usize = 64 * 1024;
 
 /// Strip line continuations and collapse the multi-line macro body to
-/// single-line text suitable for in-place splicing.
+/// single-line text suitable for in-place splicing. Callers pass the RAW
+/// logical-line bytes (`raw_macro_body`), NOT the CST `preproc_arg` text:
+/// tree-sitter-cpp ends `preproc_arg` at the first trailing block comment on a
+/// continued line, dropping every field after it (perl5 `_SV_HEAD` kept only
+/// `sv_any`). We do the real C translation phases here — splice `\`-newline
+/// (phase 2), then remove comments (phase 3) — so a `/* … */` between fields
+/// no longer truncates the body.
 fn clean_body(raw: &str) -> String {
-    // tree-sitter folds a trailing line comment into `preproc_arg`; the C
-    // preprocessor strips comments, so drop it. Without this,
-    // `#define M x  // M M` puts `M` in M's body — a self-reference.
-    let raw = raw.find("//").map_or(raw, |i| &raw[..i]);
-    raw.replace("\\\n", " ")
-        .replace('\\', " ")
+    let spliced = raw.replace("\\\r\n", " ").replace("\\\n", " ").replace('\\', " ");
+    strip_c_comments(&spliced)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The byte at which a macro body's logical line ends: scan from `body_start`
+/// over physical lines, following each that ends (ignoring trailing whitespace)
+/// in `\` — C phase-2 line splicing, which runs BEFORE comment removal, so a
+/// trailing block comment never terminates the splice. Returns the offset of
+/// the final newline (or EOF). The CST cannot supply this: tree-sitter stops
+/// the whole `preproc_*` def at the first comment-bearing continued line.
+fn logical_body_end(src: &[u8], body_start: usize) -> usize {
+    let n = src.len();
+    let mut i = body_start;
+    loop {
+        let line_start = i;
+        while i < n && src[i] != b'\n' {
+            i += 1;
+        }
+        let mut j = i;
+        while j > line_start && matches!(src[j - 1], b' ' | b'\t' | b'\r') {
+            j -= 1;
+        }
+        let continues = j > line_start && src[j - 1] == b'\\';
+        if i >= n || !continues {
+            return i;
+        }
+        i += 1;
+    }
+}
+
+/// Replace comments inside `\`-continued preprocessor directives with spaces
+/// (length-preserving; newlines kept). tree-sitter-cpp ends `preproc_arg` at the
+/// first block comment on a continued line and reparses the rest of the macro
+/// body as top-level code, which corrupts any declaration adjacent to the def.
+/// Neutralizing the comments lets the whole directive parse as one def while
+/// every byte offset is preserved, so downstream spans stay in original coords.
+fn neutralize_directive_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+    while i < n {
+        let line_start = i;
+        let end = logical_body_end(bytes, line_start);
+        let mut k = line_start;
+        while k < end && matches!(bytes[k], b' ' | b'\t') {
+            k += 1;
+        }
+        // Only continued directives truncate; a single-line one parses fine.
+        let multiline = bytes[line_start..end].contains(&b'\n');
+        if k < end && bytes[k] == b'#' && multiline {
+            blank_comments_in_range(&mut out, line_start, end);
+        }
+        i = if end < n { end + 1 } else { end };
+    }
+    String::from_utf8(out).unwrap_or_else(|_| source.to_string())
+}
+
+/// Overwrite C comment bytes in `out[start..end)` with spaces (newlines kept),
+/// respecting string/char literals. In-place and length-preserving.
+fn blank_comments_in_range(out: &mut [u8], start: usize, end: usize) {
+    let end = end.min(out.len());
+    let mut i = start;
+    while i < end {
+        let two = (out[i], if i + 1 < end { out[i + 1] } else { 0 });
+        match two {
+            (b'/', b'*') => {
+                let cs = i;
+                i += 2;
+                while i < end && !(out[i] == b'*' && i + 1 < end && out[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(end);
+                for b in &mut out[cs..i] {
+                    if *b != b'\n' {
+                        *b = b' ';
+                    }
+                }
+            }
+            (b'/', b'/') => {
+                let cs = i;
+                while i < end && out[i] != b'\n' {
+                    i += 1;
+                }
+                for b in &mut out[cs..i] {
+                    *b = b' ';
+                }
+            }
+            (q @ (b'"' | b'\''), _) => {
+                i += 1;
+                while i < end {
+                    let c = out[i];
+                    i += 1;
+                    if c == b'\\' {
+                        i += 1;
+                    } else if c == q {
+                        break;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// The byte just past the `)` that closes the `(` at `open` (balanced over
+/// nesting). `None` if unbalanced. Used to span a function-like member-block
+/// paste (`_SV_HEAD(void*)`) through its argument list so the whole call blanks.
+fn balanced_paren_end(src: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < src.len() {
+        match src[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The raw macro body verbatim from source, from `body_start` to the end of its
+/// logical line. Bytes are unmodified (comments, `\`, tabs intact) so member
+/// positioning maps 1:1 back to original coordinates; the struct-parse consumer
+/// handles comments natively.
+fn raw_macro_body(source: &str, body_start: usize) -> &str {
+    let end = logical_body_end(source.as_bytes(), body_start);
+    source.get(body_start..end).unwrap_or("")
+}
+
+/// Replace C block (`/* … */`) and line (`//`) comments with a space, leaving
+/// string/char-literal contents untouched. Operates on already-spliced text;
+/// ASCII delimiters make the byte scan UTF-8-safe (multibyte bytes are ≥ 0x80,
+/// never a delimiter).
+fn strip_c_comments(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1)) {
+            (b'/', Some(b'*')) => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                out.push(b' ');
+            }
+            (b'/', Some(b'/')) => {
+                i += 2;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.push(b' ');
+            }
+            (q @ (b'"' | b'\''), _) => {
+                out.push(q);
+                i += 1;
+                while i < b.len() {
+                    let c = b[i];
+                    out.push(c);
+                    i += 1;
+                    if c == b'\\' && i < b.len() {
+                        out.push(b[i]);
+                        i += 1;
+                    } else if c == q {
+                        break;
+                    }
+                }
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_default()
 }
 
 /// Resolve macro refs WITHIN bodies to a fixpoint (depth-capped), so a
@@ -2548,15 +2733,24 @@ pub fn plan_member_blocks(parser: &mut tree_sitter::Parser, source: &str) -> Mem
     let Some(tree) = parser.parse(source, None) else { return MemberBlockPlan::identity(source) };
     let src = source.as_bytes();
 
-    // Candidates: file-local object-like macros whose body IS a field block
-    // (parses clean as `struct _ { body }` with ≥1 NAMED field). The body-parse
-    // is the discriminator — an alias body (`#define BASEOP BASEOP_DEFINITION`)
-    // has no named field, so it never qualifies. Cheap `;` pre-gate first.
+    // Candidates: file-local macros whose body IS a field block (parses clean as
+    // `struct _ { body }` with ≥1 NAMED field). The body-parse is the
+    // discriminator — an alias body (`#define BASEOP BASEOP_DEFINITION`) has no
+    // named field, so it never qualifies. Cheap `;` pre-gate first. A candidate
+    // is OBJECT-like (pasted bare: `struct op { BASEOP };`) and/or FUNCTION-like
+    // (pasted as a call: `struct sv { _SV_HEAD(void*); }`, perl5's parametric
+    // member block); the paste-shape governs use detection + blanking below.
     let variants = collect_macro_variants(&tree, src);
     let mut candidates: Vec<String> = Vec::new();
+    let mut func_like: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut obj_like: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, defs) in &variants {
-        if defs.iter().any(|m| m.params.is_none() && m.body.contains(';') && body_is_field_block(parser, &m.body)) {
+        let is_obj = defs.iter().any(|m| m.params.is_none() && m.body.contains(';') && body_is_field_block(parser, &m.body));
+        let is_func = defs.iter().any(|m| m.params.is_some() && m.body.contains(';') && body_is_field_block(parser, &m.body));
+        if is_obj || is_func {
             candidates.push(name.clone());
+            if is_obj { obj_like.insert(name.clone()); }
+            if is_func { func_like.insert(name.clone()); }
         }
     }
     if candidates.is_empty() {
@@ -2564,11 +2758,11 @@ pub fn plan_member_blocks(parser: &mut tree_sitter::Parser, source: &str) -> Mem
     }
     candidates.sort_unstable(); // determinism: candidate processing order
 
-    // Every bare whole-word use of a candidate (not a call `NAME(`, not inside a
-    // string / comment / preprocessor line). Once a macro is known to be a
-    // field block, any bare use is a member-block paste — position need not be
-    // re-derived; the per-candidate parse-damage gate below reverts a use that
-    // (surprisingly) wasn't one.
+    // Every member-block paste of a candidate (not inside a string / comment /
+    // preprocessor line). An object-like macro pastes bare (`BASEOP`); a
+    // function-like one pastes as a call whose argument list is part of the paste
+    // (`_SV_HEAD(void*)` — the whole call is blanked). The per-candidate
+    // parse-damage gate below reverts a use that (surprisingly) wasn't one.
     let cand_set: std::collections::HashSet<&str> = candidates.iter().map(String::as_str).collect();
     let excludes = exclusion_spans(&tree);
     let mut uses: Vec<(usize, usize, String)> = Vec::new(); // (start, end, macro)
@@ -2591,9 +2785,17 @@ pub fn plan_member_blocks(parser: &mut tree_sitter::Parser, source: &str) -> Mem
                     j += 1;
                 }
                 let is_call = j < src.len() && src[j] == b'(';
-                if !excluded && !is_call {
+                if !excluded {
                     if let Some(&c) = cand_set.get(word) {
-                        uses.push((start, i, c.to_string()));
+                        // Function-like paste: the use spans through the balanced
+                        // argument list so blanking clears `_SV_HEAD(void*)` whole.
+                        if is_call && func_like.contains(c) {
+                            if let Some(close) = balanced_paren_end(src, j) {
+                                uses.push((start, close, c.to_string()));
+                            }
+                        } else if !is_call && obj_like.contains(c) {
+                            uses.push((start, i, c.to_string()));
+                        }
                     }
                 }
                 continue;
@@ -2606,8 +2808,20 @@ pub fn plan_member_blocks(parser: &mut tree_sitter::Parser, source: &str) -> Mem
     // parse damage. A genuine member-block paste parses corrupt unexpanded and
     // clean blanked → damage drops; a candidate used somewhere as an expression
     // would raise damage → that candidate is rejected (unblanked).
-    let mut blanked = source.to_string();
-    let mut current_damage = parse_damage(tree.root_node());
+    //
+    // Blank atop a comment-neutralized copy: a `\`-continued define with a
+    // trailing block comment ends `preproc_arg` at the comment, and tree-sitter
+    // reparses the rest of the body as top-level code — corrupting any
+    // declaration ADJACENT to the define (an SV struct right after `_SV_HEAD`
+    // became an ERROR node, so its member-block parent edge never formed). The
+    // neutralization is length-preserving, so `uses` offsets and every span stay
+    // in original coordinates; the baseline damage comes from the same view.
+    let neutralized = neutralize_directive_comments(source);
+    let mut blanked = neutralized.clone();
+    let mut current_damage = parser
+        .parse(&neutralized, None)
+        .map(|t| parse_damage(t.root_node()))
+        .unwrap_or_else(|| parse_damage(tree.root_node()));
     let mut confirmed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for cand in &candidates {
         let tentative = blank_ranges(&blanked, uses.iter().filter(|(_, _, m)| m == cand).map(|(s, e, _)| (*s, *e)));
@@ -2672,11 +2886,23 @@ fn blank_ranges(src: &str, ranges: impl Iterator<Item = (usize, usize)>) -> Stri
     out
 }
 
+/// The struct-body text for a field-block macro: `\`→space, plus a single
+/// normalized trailing `;`. A function-like member-block body omits the final
+/// `;` (it comes from the paste — `_SV_HEAD(void*);`), so the last field would
+/// otherwise fail to parse. Only trailing bytes change, so field offsets before
+/// it map 1:1 back to source for member positioning.
+fn field_block_inner(body: &str) -> String {
+    let b = body.replace('\\', " ");
+    let trimmed = b.trim_end();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
+    format!("{trimmed}; ")
+}
+
 /// Does `body` parse as a struct field block — `struct _ { body }` clean with
 /// ≥1 NAMED field? The discriminator that promotes a macro to a member-block
 /// role (an alias body like `BASEOP_DEFINITION` has no named field → not one).
 fn body_is_field_block(parser: &mut tree_sitter::Parser, body: &str) -> bool {
-    let synth = format!("struct __mb__ {{ {} }};", body.replace('\\', " "));
+    let synth = format!("struct __mb__ {{ {} }};", field_block_inner(body));
     let Some(tree) = parser.parse(&synth, None) else { return false };
     let dmg = parse_damage(tree.root_node());
     let src = synth.as_bytes();
@@ -2718,7 +2944,7 @@ fn synth_base(
     // Parse `struct _ { body }` and read each named field; `\`→space keeps the
     // body byte-length identical so token offsets map straight back.
     let prefix = "struct __mb__ { ";
-    let synth = format!("{prefix}{} }};", site.body.replace('\\', " "));
+    let synth = format!("{prefix}{} }};", field_block_inner(&site.body));
     let synth_tree = parser.parse(&synth, None)?;
     let sbytes = synth.as_bytes();
     let mut fields: Vec<SynMember> = Vec::new();
@@ -2775,28 +3001,29 @@ fn field_block_variant_sites(
     while let Some(m) = it.next() {
         let mut name_node: Option<tree_sitter::Node> = None;
         let mut body_node: Option<tree_sitter::Node> = None;
-        let mut is_object_like = false;
         for c in m.captures {
+            // Object- and function-like field-block macros both mint a base; the
+            // params of a function-like one (`_SV_HEAD(ptrtype)`) are absorbed by
+            // the paste, so only name + body matter for positioning members.
             match names[c.index as usize] {
-                "oname" => {
-                    name_node = Some(c.node);
-                    is_object_like = true;
-                }
-                "obody" => body_node = Some(c.node),
+                "oname" | "fname" => name_node = Some(c.node),
+                "obody" | "fbody" => body_node = Some(c.node),
                 _ => {}
             }
         }
         let (Some(nn), Some(bn)) = (name_node, body_node) else { continue };
-        if !is_object_like || nn.utf8_text(src).unwrap_or("") != macro_name {
+        if nn.utf8_text(src).unwrap_or("") != macro_name {
             continue;
         }
-        let body_text = bn.utf8_text(src).unwrap_or("");
+        // Raw logical body, not the comment-truncated `preproc_arg` span, so
+        // every field is present and byte offsets still map 1:1 to source.
+        let body_text = raw_macro_body(source, bn.start_byte());
         if !body_text.contains(';') || !body_is_field_block(parser, body_text) {
             continue;
         }
         out.push(VariantSite {
             guards: guard_trail(nn, src),
-            body: source[bn.start_byte()..bn.end_byte()].to_string(),
+            body: body_text.to_string(),
             start_point: bn.start_position(),
         });
     }

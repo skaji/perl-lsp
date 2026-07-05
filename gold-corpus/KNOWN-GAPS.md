@@ -228,6 +228,19 @@ corpora (json.hpp/abseil), not minimal repros:
   covers only the declarator-strip lane).
 - Salvage granularity is per-MACRO-NAME: a name with mixed good/bad use
   sites degrades as a whole group.
+- Member gd/hover/completion go dark inside config-INACTIVE regions
+  (`#ifdef DEBUGGING`, `#ifdef PERL_DEBUG_READONLY_OPS`) — the receiver's
+  type doesn't reach the superposed body. This is what made perl5's
+  `op_targ`/`op_opt`/`op_flags`/`sv_flags` look "field-dropped": every
+  field works in active code and dies in the same inactive block
+  (`op_slabbed` works at op.c:394, dark at op.c:633 in the same function's
+  `#ifdef` twin). NOT a per-field synthesis gap — the config-superposition-
+  on-declarations tier (PARKED).
+- References on a macro miss uses inside OTHER macros' `#define` bodies
+  (`FLAGS` used inside `IS_OK`; perl5 `SvFLAGS` 190/347, `SvANY` 111/207) —
+  macro definition bodies are preproc-excluded from ref minting. goto-def
+  through the same nested sites works; index-population only. Pinned
+  `cpp-macro-nested-ref-in-macro-body` (xfail).
 - `bool` still reports Numeric (typedef-resolution / join→typing lane).
 - Overload arity ranking (finding #3): evaluated, not taken — needs
   extraction-minted argument/parameter counts first.

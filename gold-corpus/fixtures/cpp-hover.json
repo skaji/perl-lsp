@@ -2,6 +2,25 @@
   "capability": "hover",
   "rows": [
     {
+      "id": "cpp-svhead-comment-blocked-field-hover",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Family M #1: hover on the comment-blocked `sv_flags` field of a function-like member-block macro (`_SV_HEAD`).",
+      "file": "svhead.c",
+      "line": 14,
+      "col": 20,
+      "expect": {
+        "all": [
+          "sv_flags:",
+          "*field*"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-hover-free-function-signature",
       "difficulty": "simple",
       "semantic_area": "cpp-multilang",
