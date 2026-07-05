@@ -226,6 +226,15 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              (behind toolchain discovery — "almost-global",
              keyed per toolchain; the in-process memoize above
              is the down-payment)
+         · BOUNDED MEMORY (abseil) .......... 🔵 Slice 1 ✅, Slice 2 designed
+             Slice 1 evicted per-file macro gather caches (4.02→1.22 GB,
+             `evict_gather_caches_keep_headers`). Slice 2 (measured: the
+             witness bag is 71.5% of the 1.2 GB resident, NOT the refs) =
+             evict the bag from pack-workspace analyses + rehydrate on demand
+             from the 26 MB SQLite blob into a byte-capped LRU; targets
+             ~0.5 GB, completeness-preserving (refs/symbols/name-index stay
+             pinned). `docs/adr/memory-slice-2-lru.md` +
+             `docs/prompt-memory-slice-2.md`. EXTRACT_VERSION unchanged.
 
        FLOW DIFFERENTIATORS (where a flow-aware engine beats clangd):
          · dynamic_cast + `std::optional` engaged narrowing  ✅

@@ -4,6 +4,16 @@ Status: design + measurements. No LRU shipped in this slice. The only code
 change landed here is an **env-gated diagnostic** (`PERL_LSP_MEM_REPORT`, inert
 by default) that reports the resident size of the four cpp gather caches.
 
+> **Slice 2 update (measured, supersedes Problem 2 below):** a heap-composition
+> probe (`PERL_LSP_HEAP_DUMP`) shows the post-Slice-1 resident is NOT dominated
+> by `FileAnalysis` **refs** (18.4%) but by the **witness bag** — 613 MB /
+> **71.5%** of the 857 MB payload. Slice 2 is therefore "evict the witness bag,
+> rehydrate on demand", not the generic name-index/whole-body LRU Problem 2
+> sketched (that becomes an optional Slice 3). Full design + numbers:
+> `docs/adr/memory-slice-2-lru.md`; implementation brief:
+> `docs/prompt-memory-slice-2.md`. Problem 3's "drop the witness bag" bullet was
+> the right instinct — the measurement promotes it to the headline.
+
 ## TL;DR — the surprise
 
 The 4 GB peak on abseil is **NOT** what the original brief (or my own first

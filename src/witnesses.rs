@@ -502,6 +502,22 @@ impl WitnessBag {
         Self::default()
     }
 
+    /// Rough resident-byte estimate `(witness_vec, rebuilt_index)` for the
+    /// memory-composition probe (`docs/adr/memory-slice-2-lru.md`). Flat
+    /// `size_of` of each element's inline footprint plus the `Vec`/`HashMap`
+    /// backing-store capacity; deep `String`s inside attachments/payloads are
+    /// NOT drilled (a modest undercount, called out in the ADR methodology).
+    /// Not on any query path — a diagnostic only.
+    pub fn heap_bytes_estimate(&self) -> (usize, usize) {
+        let vec_bytes = self.witnesses.capacity() * std::mem::size_of::<Witness>();
+        let idx_entry = std::mem::size_of::<(WitnessAttachment, Vec<usize>)>() + 1;
+        let mut idx_bytes = self.index.capacity() * idx_entry;
+        for v in self.index.values() {
+            idx_bytes += v.capacity() * std::mem::size_of::<usize>();
+        }
+        (vec_bytes, idx_bytes)
+    }
+
     pub fn push(&mut self, w: Witness) -> usize {
         let idx = self.witnesses.len();
         self.index.entry(w.attachment.clone()).or_default().push(idx);

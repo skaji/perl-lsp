@@ -12448,6 +12448,266 @@ fn format_parametric_type(p: &ParametricType) -> String {
     }
 }
 
+/// Per-bucket resident-heap estimate for one or many `FileAnalysis`es, summed
+/// by `add`. Measurement support for the bounded-memory work
+/// (`docs/adr/memory-slice-2-lru.md`); NOT on any query path, wired only behind
+/// the `PERL_LSP_HEAP_DUMP` env gate at the end of pack indexing.
+///
+/// Methodology: flat `size_of` of each collection's element footprint times its
+/// `capacity` (so `Vec`/`HashMap` backing slack is counted), plus the deep
+/// `String` capacities of the dominant string-bearing buckets (ref target
+/// names, symbol names, the include closure, the reverse-index keys). Deep
+/// strings inside the long-tail structs are NOT drilled — a deliberate,
+/// documented undercount that keeps the probe cheap; the dominant buckets it
+/// drills are what the eviction design turns on.
+#[derive(Default, Clone, Debug)]
+pub struct HeapBreakdown {
+    pub files: usize,
+    /// `refs` vec + every ref's `target_name`.
+    pub refs: usize,
+    /// `symbols` vec + names/packages/attributes.
+    pub symbols: usize,
+    /// Witness-bag `witnesses` vec.
+    pub witness_vec: usize,
+    /// Witness-bag rebuilt attachment index (serde-skip, rebuilt on load).
+    pub witness_index: usize,
+    /// `include_closure` + `include_directives` strings — the abseil
+    /// header-path duplication.
+    pub include: usize,
+    /// `scopes` vec + package names.
+    pub scopes: usize,
+    /// The serde-skip reverse indices rebuilt on load
+    /// (`refs_by_name`/`refs_by_target`/`symbols_by_name`/… ).
+    pub rebuilt_indices: usize,
+    /// `imports` + `call_bindings` + `method_call_bindings` + `fold_ranges`.
+    pub bindings: usize,
+    /// The pack/cpp flat fact vectors (domain sites, flow edges, macro defs,
+    /// guard/deref sites, projections, moved-from, regions, …).
+    pub cpp_extras: usize,
+    /// The per-package small maps/sets (parents, uses, frameworks, exports,
+    /// role/dynamic sets, provenance, template params, …).
+    pub misc: usize,
+    /// `size_of::<FileAnalysis>()` — the inline struct shell, once per file.
+    pub shell: usize,
+}
+
+impl HeapBreakdown {
+    pub fn add(&mut self, o: &HeapBreakdown) {
+        self.files += o.files;
+        self.refs += o.refs;
+        self.symbols += o.symbols;
+        self.witness_vec += o.witness_vec;
+        self.witness_index += o.witness_index;
+        self.include += o.include;
+        self.scopes += o.scopes;
+        self.rebuilt_indices += o.rebuilt_indices;
+        self.bindings += o.bindings;
+        self.cpp_extras += o.cpp_extras;
+        self.misc += o.misc;
+        self.shell += o.shell;
+    }
+
+    pub fn total(&self) -> usize {
+        self.refs
+            + self.symbols
+            + self.witness_vec
+            + self.witness_index
+            + self.include
+            + self.scopes
+            + self.rebuilt_indices
+            + self.bindings
+            + self.cpp_extras
+            + self.misc
+            + self.shell
+    }
+}
+
+impl std::fmt::Display for HeapBreakdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mb = |b: usize| b as f64 / 1_048_576.0;
+        let t = self.total().max(1);
+        let row = |f: &mut std::fmt::Formatter<'_>, name: &str, b: usize| {
+            writeln!(
+                f,
+                "  {name:<20} {:>9.1} MB  ({:>4.1}%)",
+                mb(b),
+                b as f64 / t as f64 * 100.0
+            )
+        };
+        writeln!(
+            f,
+            "FileAnalysis heap composition ({} files, ~{:.1} MB estimated payload):",
+            self.files,
+            mb(self.total())
+        )?;
+        row(f, "refs", self.refs)?;
+        row(f, "rebuilt_indices", self.rebuilt_indices)?;
+        row(f, "witness_vec", self.witness_vec)?;
+        row(f, "witness_index", self.witness_index)?;
+        row(f, "symbols", self.symbols)?;
+        row(f, "include_closure", self.include)?;
+        row(f, "scopes", self.scopes)?;
+        row(f, "bindings", self.bindings)?;
+        row(f, "cpp_extras", self.cpp_extras)?;
+        row(f, "misc_maps", self.misc)?;
+        row(f, "struct_shell", self.shell)?;
+        write!(f, "  {:-<20} {:>9.1} MB", "TOTAL ", mb(self.total()))
+    }
+}
+
+impl FileAnalysis {
+    /// Estimate this analysis's resident heap by bucket. See `HeapBreakdown`.
+    pub fn heap_estimate(&self) -> HeapBreakdown {
+        fn vcap<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        fn mcap<K, V>(m: &HashMap<K, V>) -> usize {
+            // hashbrown: ~1 control byte per slot on top of the (K,V) pair.
+            m.capacity() * (std::mem::size_of::<(K, V)>() + 1)
+        }
+        fn scap<T>(s: &HashSet<T>) -> usize {
+            s.capacity() * (std::mem::size_of::<T>() + 1)
+        }
+        fn strcaps<'a>(it: impl Iterator<Item = &'a String>) -> usize {
+            it.map(|s| s.capacity() + std::mem::size_of::<String>()).sum()
+        }
+        // HashMap<String, Vec<V>>: flat table + deep key strings + value vecs.
+        fn map_str_vec<V>(m: &HashMap<String, Vec<V>>) -> usize {
+            let mut b = mcap(m);
+            for (k, v) in m {
+                b += k.capacity() + v.capacity() * std::mem::size_of::<V>();
+            }
+            b
+        }
+
+        let mut h = HeapBreakdown {
+            files: 1,
+            shell: std::mem::size_of::<FileAnalysis>(),
+            ..Default::default()
+        };
+
+        // refs — the dominant bucket for a big-fan-in TU.
+        h.refs = vcap(&self.refs) + strcaps(self.refs.iter().map(|r| &r.target_name));
+
+        // symbols + their deep strings.
+        h.symbols = vcap(&self.symbols)
+            + self
+                .symbols
+                .iter()
+                .map(|s| {
+                    s.name.capacity()
+                        + s.package.as_ref().map_or(0, |p| p.capacity())
+                        + vcap(&s.attributes)
+                        + strcaps(s.attributes.iter())
+                        + vcap(&s.deref_stack)
+                })
+                .sum::<usize>();
+
+        // witness bag.
+        let (wv, wi) = self.witnesses.heap_bytes_estimate();
+        h.witness_vec = wv;
+        h.witness_index = wi;
+
+        // include closure — the shared-header-path duplication.
+        h.include = vcap(&self.include_closure)
+            + strcaps(self.include_closure.iter())
+            + vcap(&self.include_directives)
+            + self
+                .include_directives
+                .iter()
+                .map(|(_, s)| s.capacity())
+                .sum::<usize>();
+
+        // scopes.
+        h.scopes = vcap(&self.scopes)
+            + self
+                .scopes
+                .iter()
+                .map(|s| s.package.as_ref().map_or(0, |p| p.capacity()))
+                .sum::<usize>();
+
+        // The serde-skip reverse indices (rebuilt on load, resident-only).
+        h.rebuilt_indices = {
+            fn mcap<K, V>(m: &HashMap<K, V>) -> usize {
+                m.capacity() * (std::mem::size_of::<(K, V)>() + 1)
+            }
+            let mut b = self.scope_starts.capacity()
+                * std::mem::size_of::<(Point, ScopeId)>()
+                + self.export_lookup.capacity()
+                    * (std::mem::size_of::<String>() + 1)
+                + self
+                    .export_lookup
+                    .iter()
+                    .map(|s| s.capacity())
+                    .sum::<usize>()
+                + mcap(&self.symbols_by_scope)
+                + mcap(&self.refs_by_target)
+                + mcap(&self.call_ref_by_start);
+            for (k, v) in &self.symbols_by_name {
+                b += k.capacity() + v.capacity() * std::mem::size_of::<SymbolId>();
+            }
+            b += mcap(&self.symbols_by_name);
+            for (k, v) in &self.refs_by_name {
+                b += k.capacity() + v.capacity() * std::mem::size_of::<usize>();
+            }
+            b += mcap(&self.refs_by_name);
+            for v in self.symbols_by_scope.values() {
+                b += v.capacity() * std::mem::size_of::<SymbolId>();
+            }
+            for v in self.refs_by_target.values() {
+                b += v.capacity() * std::mem::size_of::<usize>();
+            }
+            b
+        };
+
+        // bindings / imports.
+        h.bindings = vcap(&self.imports)
+            + vcap(&self.call_bindings)
+            + vcap(&self.method_call_bindings)
+            + vcap(&self.fold_ranges);
+
+        // pack/cpp flat fact vectors.
+        h.cpp_extras = vcap(&self.provisional_dispatches)
+            + vcap(&self.guard_sites)
+            + vcap(&self.arrow_deref_sites)
+            + vcap(&self.gated_param_types)
+            + vcap(&self.attr_projections)
+            + vcap(&self.key_writes)
+            + vcap(&self.flow_edges)
+            + vcap(&self.moved_from)
+            + vcap(&self.control_regions)
+            + vcap(&self.param_regions)
+            + vcap(&self.macro_defs)
+            + vcap(&self.domain_sites)
+            + vcap(&self.plugin_loads)
+            + vcap(&self.loader_config_params)
+            + vcap(&self.package_ranges);
+
+        // per-package small maps/sets + export lists.
+        h.misc = map_str_vec(&self.package_parents)
+            + map_str_vec(&self.package_uses)
+            + map_str_vec(&self.role_requires)
+            + map_str_vec(&self.template_params)
+            + map_str_vec(&self.export_tags)
+            + mcap(&self.specializes)
+            + mcap(&self.type_provenance)
+            + mcap(&self.package_framework)
+            + scap(&self.framework_imports)
+            + scap(&self.reassigned_scalars)
+            + scap(&self.dynamic_parent_packages)
+            + scap(&self.role_packages)
+            + scap(&self.column_keyed_verbs)
+            + vcap(&self.export)
+            + vcap(&self.export_ok)
+            + vcap(&self.reexport_modules)
+            + vcap(&self.receiver_names)
+            + vcap(&self.app_surface_consumers)
+            + vcap(&self.plugin_namespaces);
+
+        h
+    }
+}
+
 #[cfg(test)]
 #[path = "file_analysis_tests.rs"]
 mod tests;
