@@ -391,6 +391,32 @@ fn bodyless_define_joins_the_config_universe() {
     assert!(matches!(classify(&else_arm.guards, &cfg), Reachability::Unreachable { .. }));
 }
 
+/// Nested-macro-body refs: a use of a known macro inside another `#define`'s
+/// body is minted at its ORIGINAL span; the macro's own params and
+/// stringify/paste operands are excluded.
+#[test]
+fn macro_body_name_refs_mints_known_macro_uses() {
+    let mut p = cpp_parser();
+    let src = "\
+#define FLAGS(x)  (x)->f
+#define IS_OK(x)  (FLAGS(x) & 1)
+#define STR(x)    #x
+#define CAT(a,b)  a ## b
+";
+    let known: std::collections::HashSet<String> =
+        ["FLAGS", "IS_OK", "STR", "CAT", "x"].iter().map(|s| s.to_string()).collect();
+    let refs = crate::cpp_reparse::macro_body_name_refs(&mut p, src, &known);
+    // FLAGS used inside IS_OK's body (line index 1) is the one real ref.
+    let flags: Vec<_> = refs.iter().filter(|(n, _)| n == "FLAGS").collect();
+    assert_eq!(flags.len(), 1, "one FLAGS body use, got {refs:?}");
+    let (_, span) = flags[0];
+    assert_eq!(span.start.row, 1, "FLAGS use is on the IS_OK line");
+    // `x` is a param everywhere it appears in a body — never minted, even
+    // though it's in `known`. `#x` (stringify) and `a`/`b` (paste operands)
+    // are not references either.
+    assert!(refs.iter().all(|(n, _)| n != "x"), "params excluded: {refs:?}");
+}
+
 /// End-to-end reachability over the captured variants: WIN32 absent → its
 /// variant is UNREACHABLE-labeled (not dropped); the HAS knob's two branches
 /// are UNKNOWN.

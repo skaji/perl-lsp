@@ -151,13 +151,21 @@ why parked, what unblocks it. Prune on landing.
 - **Enum value as template argument** not a ref (`MakeError<StatusCode::
   kNotFound>`) — hitlist-2 residual, unassigned.
   - looks easy enough to close
-- **Refs inside another macro's `#define` body aren't indexed** — a use of
-  `FLAGS` inside `IS_OK`'s body, redis `OBJ_ENCODING_EMBSTR` in
-  `sdsEncodedObject`, perl5 `SvFLAGS` (190/347 grep-real) / `SvANY`
-  (111/200). Macro definition bodies are preproc-excluded from ref minting;
-  gd THROUGH the same nested sites works, so this is index-population only.
-  Pinned `cpp-macro-nested-ref-in-macro-body` (xfail); unassigned.
-  - let's close this guy too
+- **Nested-macro-body refs — cross-file reach residual** (the core case
+  LANDED). A use of macro `A` inside `B`'s `#define` body now mints a ref:
+  `macro_body_name_refs` (`cpp_reparse.rs`) lexically scans each opaque
+  `preproc_arg` body for identifier tokens naming a KNOWN macro (this file's
+  `#define`s ∪ the include closure's) and mints a read at the original span,
+  fed into `skel.var_reads` from `enrich_skeleton`. Params + `#`/`##`
+  stringify/paste operands + comments/literals are excluded (precision:
+  prefer silence over a wrong ref). Gold `cpp-macro-nested-ref-in-macro-body`
+  (+`-from-use`) promoted to gold. perl5 gr: `SvFLAGS` 190→320,
+  `SvANY` 111→176 (grep-real ~347 / ~200). **Residual:** a body token naming
+  a macro defined in a header the file's include closure doesn't reach (perl5
+  headers aren't self-contained — `hv.h` uses `SvFLAGS` but may not resolve
+  `sv.h`) still goes unminted, hence 320<347. Unblock: a broader TU-level
+  macro universe (or a reverse "who-defines" index) so the `known` set spans
+  the real translation unit, not just the resolved include graph.
 - **`fmt::` qualified-path completion** unfiltered (the completion half
   of namespace participation — gd/gr half landed in slice B).
   - this should be closed
