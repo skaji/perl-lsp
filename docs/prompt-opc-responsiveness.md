@@ -59,9 +59,31 @@ still runs synchronously on the message loop.
 
 Move the `FileStore::open` build **off the message loop** (`spawn_blocking`,
 awaited inside `did_open`) so the loop stays responsive during the cold build,
-and give the on-open read verbs a bounded wait (reusing `coldWaitMs`, the same
-machinery as `await_index_ready`) for the in-flight initial build — small/medium
-files still return their full answer on the first pull (build < cap); a
-pathological file like op.c degrades after the cap and heals when the build
-lands. Guard discipline: the wait snapshots the `Notify` Arc and drops all
-store/DashMap guards before awaiting.
+and give the on-open read verbs a bounded wait (`await_open_ready`, reusing
+`coldWaitMs` — the same machinery/knob as `await_index_ready`) for the in-flight
+initial build. A per-URI `Notify` marks the build in flight; a verb finding the
+doc still absent waits on it, snapshotting the `Notify` Arc and dropping every
+store/DashMap guard before the await.
+
+- Small/medium files (build < cap) still return their full answer on the first
+  pull — zero regression, and the existing cpp e2e/gold rows (fast fixtures)
+  are unaffected.
+- A pathological file like op.c degrades after the cap and heals: the doc is in
+  the store once the build lands (~1.6 s), so any re-pull is warm. Because the
+  on-open pulls that raced the build returned degraded, `did_open` sends
+  `workspace/semanticTokens/refresh` + `inlayHint/refresh` (LSP server-initiated,
+  only when the build outran the cap) so the visible highlighting/hints heal
+  without a keystroke.
+
+### Before / after (cold, headless nvim, perl5 tree)
+
+| request (first, on open) | before | after |
+|--------------------------|-------:|------:|
+| documentSymbol           | **1666 ms** (full, loop frozen) | **760 ms** (degraded) → heals to 270 syms on re-pull |
+| foldingRange / semanticTokens / hover | blocked behind the 1.6 s build | ~400 ms each (own bounded wait), loop responsive |
+
+The head-of-line block is gone: the ~1.6 s build no longer runs on the message
+loop, so every on-open request returns within its own bounded wait instead of
+serializing behind the full build. `cargo test` (default + all-langs), gold
+(both modes cold), perl + cpp e2e, and `cold-start-repro` 15/15 stay green;
+`EXTRACT_VERSION` unchanged (162 — a scheduling change, no cache-shape impact).

@@ -354,6 +354,12 @@ pub struct Backend {
     /// Bounded-wait cap (ms) for the cold-open pull-verb heal; 0 disables it.
     /// Set from `initializationOptions.coldWaitMs`, default `DEFAULT_COLD_WAIT_MS`.
     cold_wait_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// URIs whose initial `did_open` build is in flight (running off the message
+    /// loop). A read verb that finds the doc still absent bounded-waits on the
+    /// per-URI `Notify` instead of racing an empty store — the same heal shape
+    /// as `await_index_ready`, but for the file's own first build (a big
+    /// macro-heavy C file is ~1.3 s and must not run synchronously on `did_open`).
+    opening: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
 }
 
 impl Backend {
@@ -564,6 +570,36 @@ impl Backend {
         }
         let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
     }
+
+    /// Bounded wait for a freshly-opened document's INITIAL build, when it is
+    /// still in flight (`did_open` runs the build off the message loop so the
+    /// loop stays responsive during the ~1.3 s cold build of a big C file). A
+    /// read verb calls this before `get_open`: a small/medium file (build <
+    /// cap) resolves warm on the first pull exactly as before; a pathological
+    /// file degrades after the cap and heals once the build lands + republishes.
+    ///
+    /// GUARD DISCIPLINE: holds NO FileStore / DashMap guard across the await —
+    /// it snapshots the `Notify` Arc out of the `opening` map and drops that
+    /// guard before awaiting. Callers snapshot `analysis` fresh AFTER it.
+    async fn await_open_ready(&self, uri: &Url) {
+        if self.files.get_open(uri).is_some() {
+            return; // already built
+        }
+        let Some(notify) = self.opening.get(uri).map(|n| Arc::clone(n.value())) else {
+            return; // not an in-flight open (unknown/closed file)
+        };
+        let cap = self.cold_wait_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the final presence re-check to close the
+        // notify lost-wakeup race, then wait bounded.
+        let waited = notify.notified();
+        if self.files.get_open(uri).is_some() {
+            return;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
+    }
 }
 
 impl Backend {
@@ -653,6 +689,7 @@ impl Backend {
             rename_options: Arc::new(std::sync::Mutex::new(crate::resolve::RenameOptions::default())),
             index_ready: Arc::new(IndexReady::default()),
             cold_wait_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_COLD_WAIT_MS)),
+            opening: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -1176,13 +1213,48 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
         let text = params.text_document.text;
-        // Run the on-open analyze in cached-only mode: a C++ file's cross-file
-        // macro gather is served from cache if warm, else SKIPPED (degraded, no
-        // ~1.5s cold gather blocking the open). `files.open` builds the document
-        // synchronously on this thread, so the thread-local applies exactly to it.
-        crate::cpp_reparse::set_gather_cached_only(true);
-        let opened = self.files.open(uri.clone(), text);
-        crate::cpp_reparse::set_gather_cached_only(false);
+        // Build the document OFF the message loop. `FileStore::open` runs the
+        // whole pack pipeline (macro transform + extraction) synchronously — for
+        // a 16k-line macro-heavy C file that is ~1.3 s even cached-only, and
+        // running it here would head-of-line block every request the client
+        // fires on open. cached-only skips the cross-file GATHER (a further
+        // ~1.5 s, warmed later by `spawn_pack_gather_refresh`); the per-file
+        // build is intrinsic and must simply not block the loop.
+        //
+        // A per-URI `Notify` marks the build in flight so read verbs bounded-wait
+        // for it (`await_open_ready`) instead of racing the empty store. The
+        // `set_gather_cached_only` thread-local is set INSIDE the blocking closure
+        // so it applies exactly to this build's thread.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.opening.insert(uri.clone(), Arc::clone(&notify));
+        let files = Arc::clone(&self.files);
+        let uri_build = uri.clone();
+        let build_started = std::time::Instant::now();
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::cpp_reparse::set_gather_cached_only(true);
+            let opened = files.open(uri_build, text);
+            crate::cpp_reparse::set_gather_cached_only(false);
+            opened
+        })
+        .await
+        .unwrap_or(false);
+        // Doc is in the store (or the build failed): drop the in-flight marker
+        // and wake any verb waiting on it.
+        self.opening.remove(&uri);
+        notify.notify_waiters();
+        // If the build outran the bounded wait, the verbs the client fired on
+        // open (semanticTokens, inlayHint) returned degraded. Their content is
+        // now in the store — nudge the client to re-request (LSP server-initiated
+        // refresh) so the visible highlighting/hints heal without a keystroke.
+        // A fast build (< cap) answered those on the first pull; no nudge needed.
+        let cap = self.cold_wait_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if opened && cap > 0 && build_started.elapsed().as_millis() as u64 > cap {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let _ = client.semantic_tokens_refresh().await;
+                let _ = client.inlay_hint_refresh().await;
+            });
+        }
         let mut needs_gather_refresh = false;
         if opened {
             if let Some(doc) = self.files.get_open(&uri) {
@@ -1280,6 +1352,7 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1294,10 +1367,12 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        // Cold-open bounded wait: if this file's family index is in-flight, block
-        // briefly for it so the query resolves warm instead of returning the one
-        // degraded answer the user never re-triggers. Guard dropped before the
-        // await; analysis snapshotted AFTER so any heal is picked up.
+        // Cold-open bounded waits: first the file's own initial build (may still
+        // be in flight — `did_open` runs it off the loop), then its family index
+        // — so the query resolves warm instead of returning the one degraded
+        // answer the user never re-triggers. Guards dropped before each await;
+        // analysis snapshotted AFTER so any heal is picked up.
+        self.await_open_ready(uri).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language).await;
         }
@@ -1383,8 +1458,9 @@ impl LanguageServer for Backend {
     ) -> Result<Option<request::GotoImplementationResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        // Cold-open bounded wait (see `await_index_ready`): block briefly for an
-        // in-flight family index so implementations resolves warm.
+        // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
+        // the file's own initial build, then an in-flight family index.
+        self.await_open_ready(uri).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language).await;
         }
@@ -1424,9 +1500,11 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        // Cold-open bounded wait (see `await_index_ready`): block briefly for an
-        // in-flight family index so cross-file references resolve warm (the
-        // in-window `op_free` 1 → 118 heal) instead of returning def-only.
+        // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
+        // the file's own initial build, then an in-flight family index so
+        // cross-file references resolve warm (the in-window `op_free` 1 → 118
+        // heal) instead of returning def-only.
+        self.await_open_ready(uri).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language).await;
         }
@@ -1490,6 +1568,7 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
+        self.await_open_ready(&params.text_document.uri).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(&params.text_document.uri) {
@@ -1548,6 +1627,7 @@ impl LanguageServer for Backend {
                 "rename: the new name must not be empty or whitespace",
             ));
         }
+        self.await_open_ready(uri).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
@@ -1588,8 +1668,10 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        // Cold-open bounded wait (see `await_index_ready` + goto_definition):
-        // block briefly for an in-flight family index so hover resolves warm.
+        // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
+        // the file's own initial build, then an in-flight family index so hover
+        // resolves warm.
+        self.await_open_ready(uri).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language).await;
         }
@@ -1656,6 +1738,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
+        self.await_open_ready(uri).await;
         // Snapshot + drop the store guard before completion resolves (both the
         // pack and Perl paths gather cross-file candidates through `resolve()`,
         // which re-locks the open shards via `for_each_open`); see
@@ -1738,6 +1821,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SignatureHelp>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1754,6 +1838,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<DocumentHighlight>>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1771,6 +1856,7 @@ impl LanguageServer for Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1791,6 +1877,7 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1865,6 +1952,7 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1882,6 +1970,7 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1895,6 +1984,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2054,6 +2144,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<LinkedEditingRanges>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
