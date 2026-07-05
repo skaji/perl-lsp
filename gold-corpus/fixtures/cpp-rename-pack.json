@@ -58,6 +58,27 @@
     ]
    },
    "status": "gold"
+  },
+  {
+   "id": "cpp-tmpl-valarg-enum-value-rename-from-site",
+   "difficulty": "moderate",
+   "semantic_area": "cpp-templates",
+   "lang": "cpp",
+   "comment": "Rename initiated AT the template-arg use must rewrite the def, the expression use, and the template-arg token itself (currently the site's own edit is missing).",
+   "root": "gold-corpus/cpp-fixture",
+   "file": "tmpl_valarg.cpp",
+   "line": 18,
+   "col": 35,
+   "newname": "kMissing",
+   "expect": {
+    "all": [
+     "\"col\":\"2\",\"end_col\":\"11\",\"end_line\":\"2\",\"line\":\"2\"",
+     "\"col\":\"33\",\"end_col\":\"42\",\"end_line\":\"20\",\"line\":\"20\"",
+     "\"col\":\"32\",\"end_col\":\"41\",\"end_line\":\"18\",\"line\":\"18\""
+    ],
+    "none": []
+   },
+   "status": "gold"
   }
  ]
 }

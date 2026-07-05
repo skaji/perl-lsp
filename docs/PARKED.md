@@ -136,10 +136,26 @@ why parked, what unblocks it. Prune on landing.
   `for_each_open_mut`-writer deadlock). Repro lock: `e2e/cold-start-repro.sh`
   (pre-fix ~7.5% cold-run failure, post-fix 0). Also: debounce-window staleness
   (mid-typing `doc.analysis` describes prior text). KNOWN-GAPS "LSP session
-  determinism".
-- **Enum value as template argument** not a ref (`MakeError<StatusCode::
-  kNotFound>`) — hitlist-2 residual, unassigned.
-  - looks easy enough to close
+  determinism". A nastier variant observed on the e2e macro suite: the degraded
+  cold-window answer's ANALYSIS can be PERSISTED (the macro seethrough e2e
+  fails on the first post-`--clear-cache` run, then intermittently KEEPS
+  failing warm until the next `--clear-cache`) — a first-query-degraded blob
+  written to the module cache serves every later session. Reproduces on
+  the same commit both with and without unrelated diffs; a stale-blob
+  invalidation (or a "don't persist during the degraded window" gate) wants
+  the same completion signal this entry already asks for.
+- **Enum value as template argument** — FIXED. The token always had a ref
+  (the `@ref.type` catch-all fires in template args; the grammar guesses
+  TYPE for value args), so the fix is resolution-side: gd's PackageRef arms
+  fall through type space to value space (pack structural gates), and
+  `collect_from_analysis` matches `(Method{class}, PackageRef)` under the
+  bare-constant hoist gate. gd/gr/rename all reach the site; plain-constant
+  (`Buffer<BUF_LIMIT>`) and nested-qualified (`Run<outer::Mode::kSlow>`)
+  covered. Pinned in `tmpl_valarg.cpp` gold rows. Honest residual: the
+  `StatusCode::` QUALIFIER token is still ref-less (namespace_identifier —
+  gd works via the word fallback; gr on the enum type misses qualifier
+  positions in ALL positions, not just template args — the namespace-
+  participation completion/gr gap below).
 - **Refs inside another macro's `#define` body aren't indexed** — a use of
   `FLAGS` inside `IS_OK`'s body, redis `OBJ_ENCODING_EMBSTR` in
   `sdsEncodedObject`, perl5 `SvFLAGS` (190/347 grep-real) / `SvANY`

@@ -6685,7 +6685,22 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::PackageRef => {
-                    return self.find_package_or_class(&r.target_name);
+                    // Type space first; on a miss, value space. A pack
+                    // grammar's TYPE guess in a type/value-ambiguous slot
+                    // (a template argument `MakeError<StatusCode::kNotFound>`,
+                    // `Buffer<MAX>`) mints a PackageRef for a VALUE token —
+                    // the structural gates are pack-only shapes, so Perl
+                    // package refs never take the fallback.
+                    return self.find_package_or_class(&r.target_name).or_else(|| {
+                        self.symbols_named(&r.target_name)
+                            .iter()
+                            .map(|&sid| self.symbol(sid))
+                            .find(|s| {
+                                self.symbol_is_class_content(s)
+                                    || self.symbol_is_file_scope_value(s)
+                            })
+                            .map(|s| s.selection_span)
+                    });
                 }
                 RefKind::HashKeyAccess { ref owner, .. } => {
                     // Try the pre-resolved owner first
