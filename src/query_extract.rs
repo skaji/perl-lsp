@@ -168,6 +168,13 @@ pub struct SkeletonAnalysis {
     /// driver's macro lane (it holds the tree); empty for languages with no
     /// macro model.
     pub macro_call_arg_spans: Vec<(Span, Vec<Span>)>,
+    /// Call sites (`@expr.call`): (call-expression span, callee name). The
+    /// call's VALUE is the callee's own resolution — resolved in
+    /// `into_file_analysis` against the symbol table: a `Class` callee is a
+    /// functional cast / constructor (→ an instance of that class), a
+    /// callable (sub / function-like macro) flows its return, an unresolvable
+    /// name yields NO witness (no name-case guess — `docs/adr/macro-handling.md`).
+    pub call_sites: Vec<(Span, String)>,
     /// `return EXPR;` sites (`@expr.return.value`): (enclosing scope, the
     /// returned expression's span). Purely structural — this tier doesn't
     /// know what a `return` MEANS for any given language; the interpretation
@@ -275,25 +282,8 @@ impl SkeletonAnalysis {
                 kept.insert(key)
             });
         }
-        // A function-like macro left unexpanded is a call. When its name is
-        // uppercase the ctor convention mis-fired an `Expr → ClassName(macro)`
-        // witness at the call — drop those; the macro's real return (its body's
-        // type) is emitted below. Keyed on the macro NAME the ctor witness
-        // carries, not the call span (which lives on the whole-call node).
-        let macro_names: std::collections::HashSet<&str> =
-            self.macro_returns.iter().map(|(n, _)| n.as_str()).collect();
-        let mut macro_call_spans: Vec<(Span, String)> = Vec::new();
         let mut bag = crate::witnesses::WitnessBag::default();
         for w in self.witnesses {
-            use crate::witnesses::{WitnessAttachment as WA, WitnessPayload as WP};
-            if let (WA::Expr(span), WP::InferredType(InferredType::ClassName(cn))) =
-                (&w.attachment, &w.payload)
-            {
-                if macro_names.contains(cn.as_str()) {
-                    macro_call_spans.push((*span, cn.clone()));
-                    continue; // the ctor mis-fire — replaced by the macro return
-                }
-            }
             bag.push(w);
         }
         // Associate each callable def with its parameter arity: the def's OWN
@@ -533,6 +523,20 @@ impl SkeletonAnalysis {
                     }
                 }
             }
+            // A class VIEWED AS A CALLABLE (a functional cast / constructor,
+            // `Widget(x)`) produces an instance of itself. Its `Symbol` answers
+            // `ClassName(name)` so a call site edging to it materializes the
+            // instance — the ctor's value is the class's identity, asked of the
+            // resolved class rather than guessed from the callee's name case.
+            for sym in &symbols {
+                if matches!(sym.kind, SymKind::Class) {
+                    bag.push(mk(
+                        WA::Symbol(sym.id),
+                        WP::InferredType(InferredType::ClassName(sym.name.clone())),
+                        sym.span,
+                    ));
+                }
+            }
             // Inheritance edges: MethodOnClass{child,m} → Edge(parent,m), so
             // the registry walks the MRO for an inherited method's return.
             for (child, parent) in &self.parents {
@@ -551,10 +555,7 @@ impl SkeletonAnalysis {
             // Function-like macro typing: the macro's `Symbol` carries its
             // body's implied return (delegation → an Edge to the callee's own
             // return, else the classified concrete type), so a left-unexpanded
-            // call `F(args)` types through the sub-return path. Each mis-fired
-            // ctor call span (stripped above) is re-sourced as an Edge to the
-            // macro's Symbol, so the enclosing `auto x = F(..)` / `x = F(..)`
-            // reflects the body type instead of the phantom class.
+            // call `F(args)` types through the sub-return path.
             let sub_sid: std::collections::HashMap<&str, SymbolId> = symbols
                 .iter()
                 .filter(|s| matches!(s.kind, SymKind::Sub))
@@ -583,12 +584,36 @@ impl SkeletonAnalysis {
                     bag.push(mk(WA::Symbol(sid), pay, span));
                 }
             }
+            // Call-site value resolution: a call's value IS the callee's own
+            // resolution. A callee that names a symbol — a `Class` (functional
+            // cast / constructor → the class instance), a sub, or a function-
+            // like macro — edges `Expr(call) → Edge(Symbol(callee))`; the
+            // Symbol answers `ClassName` for a class and its return for a
+            // callable. A callee that resolves to NOTHING mints no witness (no
+            // name-case guess — an unknown uppercase macro leaves the enclosing
+            // `auto x = F(..)` honestly untyped). Prefer a `Class` over a
+            // like-named callable (the constructor is the stronger claim).
+            let callee_sid: std::collections::HashMap<&str, SymbolId> = {
+                let mut m: std::collections::HashMap<&str, SymbolId> =
+                    std::collections::HashMap::new();
+                for s in &symbols {
+                    match s.kind {
+                        SymKind::Class => {
+                            m.insert(s.name.as_str(), s.id);
+                        }
+                        SymKind::Sub | SymKind::Method => {
+                            m.entry(s.name.as_str()).or_insert(s.id);
+                        }
+                        _ => {}
+                    }
+                }
+                m
+            };
             // Per-call-site argument spans (original coords) so a `Param(n)`
             // call resolves to its n-th argument's value witness.
             let call_args: std::collections::HashMap<Span, &Vec<Span>> =
                 self.macro_call_arg_spans.iter().map(|(s, a)| (*s, a)).collect();
-            for (span, name) in &macro_call_spans {
-                let Some(&sid) = sub_sid.get(name.as_str()) else { continue };
+            for (span, name) in &self.call_sites {
                 // Identity/projection macro: the call's value IS its n-th
                 // argument. Edge to the argument's own `Expr` witness rather
                 // than the param-agnostic Symbol return (edges-not-values).
@@ -598,7 +623,9 @@ impl SkeletonAnalysis {
                         continue;
                     }
                 }
-                bag.push(mk(WA::Expr(*span), WP::Edge(WA::Symbol(sid)), *span));
+                if let Some(&sid) = callee_sid.get(name.as_str()) {
+                    bag.push(mk(WA::Expr(*span), WP::Edge(WA::Symbol(sid)), *span));
+                }
             }
         }
         // ---- Local/param vars: a variable READ resolves to the nearest
@@ -881,12 +908,6 @@ pub struct LangPack {
     /// Map a `@type.annot` token's text to a type — the pack predicate
     /// for languages whose ring 3 is partly in the tree (`x: int`).
     pub annot_type: fn(text: &str) -> Option<InferredType>,
-    /// Is a bare call to `name` a CONSTRUCTOR in this language's
-    /// conventions? (Python: PEP8 capitalization; Perl: ->new, handled
-    /// by the walker.) Returns the instantiated class name. This is a
-    /// pack predicate for the same reason conventions.rs exists: name
-    /// conventions are language facts, not engine facts.
-    pub ctor_class: fn(callee: &str) -> Option<String>,
     /// Module-name → workspace-relative candidate paths — the entire
     /// per-language cross-file resolution strategy ("the one executable
     /// line"). Python: `pkg.mod` → pkg/mod.py | pkg/mod/__init__.py.
@@ -918,8 +939,8 @@ pub struct LangPack {
     /// Does calling `method` on a variable REBIND it — putting a moved-from
     /// object back into a known state (`clear`/`reset`/`assign`/…)? Used to end
     /// a moved-from region (and any narrowing) at the reset call, so a use after
-    /// it is clean. Pack-owned language vocab (like `op_map` / `ctor_class`):
-    /// core asks the value, never enumerates names itself.
+    /// it is clean. Pack-owned language vocab (like `op_map`): core asks the
+    /// value, never enumerates names itself.
     pub rebind_method: fn(method: &str) -> bool,
     /// Does a bare, receiver-less identifier that names an enclosing class's
     /// field mean an implicit member read (`return inner_;` = `this->inner_`)?
@@ -1047,7 +1068,6 @@ pub fn perl_pack() -> LangPack {
             _ => None,
         },
         annot_type: |_| None,
-        ctor_class: |_| None,
         module_paths: |m| vec![format!("{}.pm", m.replace("::", "/"))],
         shape_ctor: |_| false,
         import_call: |_, _| None,
@@ -1084,13 +1104,6 @@ pub fn python_pack() -> LangPack {
                 Some(InferredType::ClassName(t.to_string()))
             }
             _ => None,
-        },
-        ctor_class: |callee| {
-            callee
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_uppercase())
-                .then(|| callee.to_string())
         },
         module_paths: |m| {
             let base = m.replace('.', "/");
@@ -1132,7 +1145,6 @@ pub fn r_pack() -> LangPack {
         annot_type: |_| None,
         // No reliable lexical ctor convention in R (S4/R5 exist but
         // rare); class typing arrives via shapes and S3 later.
-        ctor_class: |_| None,
         // source("util.R") hands us the path verbatim; library(pkg)
         // resolves into the installed-library tree (a real install
         // would consult .libPaths() — not modeled here).
@@ -1167,7 +1179,6 @@ pub fn cmake_pack() -> LangPack {
         shape_name: |_, raw| raw.to_string(),
         default_name: |_| None,
         annot_type: |_| None,
-        ctor_class: |_| None,
         // include(util.cmake) is a literal path; add_subdirectory(src)
         // means src/CMakeLists.txt. The whole resolution strategy.
         module_paths: |m| {
@@ -1266,16 +1277,6 @@ pub fn cpp_pack() -> LangPack {
                     typeish.then(|| ClassName(tag.rsplit("::").next().unwrap_or(tag).to_string()))
                 }
             }
-        },
-        // explicit constructor call `Foo(...)`: capitalized (or
-        // namespaced-capitalized) callee names a class — the C++ idiom,
-        // same role conventions.rs plays for Perl.
-        ctor_class: |callee| {
-            let last = callee.rsplit("::").next().unwrap_or(callee);
-            last.chars()
-                .next()
-                .is_some_and(|c| c.is_uppercase())
-                .then(|| callee.to_string())
         },
         // #include "a/b.h" / <vector>: strip the delimiters; a quoted
         // path is workspace-relative verbatim, a system header resolves
@@ -2115,7 +2116,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     // a Rebind FlowEdge at the RECEIVER position so the moved-from
                     // window (and the narrowing cutoff) end there, sparing the
                     // receiver read itself. The pack owns which method names
-                    // rebind (cpp vocab, like its op_map / ctor_class).
+                    // rebind (cpp vocab, like its op_map).
                     if e.cap == "ref.member"
                         && (pack.rebind_method)(&e.text)
                         && member_simple.get(&e.match_id).copied().unwrap_or(false)
@@ -2313,26 +2314,22 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 }
             }
             "expr.call" => {
-                // Constructor convention: when the pack says this
-                // callee instantiates a class, the call expression IS
-                // a value of that class — a direct witness, same as a
-                // literal. Otherwise no claim (return typing is a
-                // later pack layer).
+                // A call's VALUE is the callee's own resolution — deferred to
+                // `into_file_analysis`, where the symbol table is known: a
+                // `Class` callee is a functional cast / constructor, a callable
+                // flows its return, an unresolvable name types nothing. Record
+                // (span, callee) and mark the span as a value-producing site so
+                // an enclosing `auto x = f(..)` flow edge targets it; the type
+                // witness is minted later once the callee resolves (no name-case
+                // guess). `docs/adr/macro-handling.md`.
                 let callee = events
                     .iter()
                     .find(|x| x.match_id == e.match_id && x.cap == "ref.call")
                     .map(|x| x.text.clone());
-                if let Some(class) = callee.and_then(|c| (pack.ctor_class)(&c)) {
+                if let Some(callee) = callee {
                     let span = Span { start: e.start, end: e.end };
                     lit_spans.push((e.start_byte, e.end_byte, span));
-                    out.witnesses.push(crate::witnesses::Witness {
-                        attachment: crate::witnesses::WitnessAttachment::Expr(span),
-                        source: crate::witnesses::WitnessSource::Builder("skeleton-ctor".into()),
-                        payload: crate::witnesses::WitnessPayload::InferredType(
-                            InferredType::ClassName(class),
-                        ),
-                        span,
-                    });
+                    out.call_sites.push((span, callee));
                 }
             }
             _ => {}

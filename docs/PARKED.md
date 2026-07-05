@@ -56,16 +56,25 @@ why parked, what unblocks it. Prune on landing.
 
 ## Residual-bug tier (pinned, xfail'd where reducible)
 
-- **Ctor-convention heuristic misfires on uppercase macro/function-style
-  calls** (`RCPVx(pv)` mints `ClassName("RCPVx")` as a flow witness —
-  root seed of the hitlist-3 #1 bug). The annotation-priority fix shields
-  ANNOTATED receivers; an `auto`/annotation-less local initialized from
-  an uppercase call still mistypes. Wants the heuristic gated on "callee
-  resolves to a known type/ctor", not name case alone. (The round-3
-  braced-init fix generalized the annotation-dominates axis to every
-  `InferredType` flavor, not just `ClassName` — but `ClassName` was already
-  shielded, so this residual's exposure is UNCHANGED: the auto-less case has
-  no annotation witness to dominate the bogus flow class.)
+- **Cross-file functional-cast / constructor typing** (callee is NOT a
+  local symbol). The name-case ctor heuristic is DEAD: a call's value is now
+  the callee's own resolution (`query_extract::into_file_analysis` call-site
+  loop → `Expr(call) → Edge(Symbol(callee))`; a `Class` symbol answers
+  `ClassName`, a callable its return, an unresolvable name NOTHING —
+  `docs/adr/macro-handling.md`). This fixed the `RCPVx(pv)` misfire outright
+  (an unresolvable uppercase call leaves an `auto` local honestly untyped;
+  gold `ctxparam` + unit `ctor_convention_unresolvable_uppercase_call_no_phantom_class`).
+  The residual: a call whose callee resolves ONLY cross-file (Python
+  `g = Greeter()` where `Greeter` is a class in another module, or a C++
+  functional cast to a header-defined class) types nothing, because the
+  callee isn't a local symbol and cross-file classes aren't registered under
+  their own name in the module index (Python `Greeter` is registered under
+  module `a`). Unblock: index pack classes by name so `get_cached(callee)`
+  finds them, then a no-terminal-invent cross-file call-value edge resolves
+  at query time (idx present). Xfail-adjacent: unit
+  `python_cross_file_method_dispatch_through_mro_walk` now asserts `g` is
+  honestly `None` locally (its real subject — cross-file MRO dispatch keyed
+  on the class name — is unaffected).
 - **C struct-field member resolution through a call-expression receiver**
   (`mkStruct()->field` where the callee's declared return is a struct
   pointer) — dark; distinct from the landed cpp method chain roots

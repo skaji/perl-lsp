@@ -455,9 +455,16 @@ fn python_cross_file_function_refs_through_refs_to() {
 #[test]
 fn python_cross_file_method_dispatch_through_mro_walk() {
     // The full chain: pack resolver (module_paths predicate) registers
-    // a.py in the production ModuleIndex; b's bag types `g` via the
-    // PEP8 constructor predicate; resolve_method_in_ancestors finds
-    // greet on Greeter CROSS-FILE through the production index arms.
+    // a.py in the production ModuleIndex; resolve_method_in_ancestors finds
+    // greet on Greeter CROSS-FILE through the production index arms. The
+    // constructor convention that once typed `g` from the callee's name
+    // case is retired — a call's value is the callee's own resolution
+    // (`docs/adr/macro-handling.md`). `Greeter` is a cross-file class NOT
+    // registered under its own name (its module is `a`), so it resolves to
+    // no local/cross-file symbol here and `g` stays honestly untyped rather
+    // than guessed. The cross-file constructor-typing gap is ledgered in
+    // `docs/PARKED.md`; the dispatch below is keyed on the class name
+    // directly and is unaffected.
     let dir = std::env::temp_dir().join(format!("qx-spike-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -473,12 +480,11 @@ fn python_cross_file_method_dispatch_through_mro_walk() {
     resolve_imports_with_pack(&imports_b, &dir, &python_pack(), &mut python_parser, &idx)
         .unwrap();
 
-    use crate::file_analysis::InferredType;
     let end = tree_sitter::Point { row: 4, column: 0 };
     assert_eq!(
         fa_b.inferred_type_via_bag("g", end),
-        Some(InferredType::ClassName("Greeter".into())),
-        "constructor convention types the instance",
+        None,
+        "no name-case guess: `g` is untyped until the callee resolves to a known type",
     );
     match fa_b.resolve_method_in_ancestors("Greeter", "greet", Some(&idx)) {
         Some(crate::file_analysis::MethodResolution::CrossFile { class, def_module }) => {
