@@ -661,6 +661,11 @@ pub fn index_workspace_with_index(
     root: &std::path::Path,
     files: &crate::file_store::FileStore,
     module_index: Option<&crate::module_index::ModuleIndex>,
+    // Per-file progress tick (done, total), called from the Rayon workers as
+    // files complete. LSP-agnostic: the caller owns any notification / throttle
+    // policy. Invoked once per path processed (success OR skip), so `done`
+    // reaches `total` at the end.
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
@@ -696,6 +701,8 @@ pub fn index_workspace_with_index(
     paths.extend(scan_entrypoint_scripts(root, &[]));
 
     let count = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let total = paths.len();
 
     let timing = crate::timings::is_enabled();
     paths.par_iter().for_each(|path| {
@@ -732,6 +739,10 @@ pub fn index_workspace_with_index(
                 log::warn!("Panic while indexing {:?}, skipping", path);
             }
         }
+        if let Some(cb) = progress {
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            cb(d, total);
+        }
     });
 
     count.load(Ordering::Relaxed)
@@ -751,6 +762,10 @@ pub fn index_pack_languages(
     root: &std::path::Path,
     cache_key: Option<&str>,
     hub: &crate::module_index::ModuleIndex,
+    // Per-file progress tick (done, grand_total) across ALL pack languages, so
+    // the single pack token's percentage is monotone. Called once per path
+    // (warm-skip OR analyzed) — `done` reaches the grand total at the end.
+    progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
@@ -764,7 +779,11 @@ pub fn index_pack_languages(
     crate::cpp_reparse::set_macro_persist_dir(module_cache::cache_dir_for_workspace(cache_key));
 
     let reg = crate::language_driver::LanguageRegistry::with_enabled();
-    let total = AtomicUsize::new(0);
+
+    // Collect every language's paths UP FRONT so the grand total (the progress
+    // denominator) is known before any file is analyzed — a single monotone
+    // 0→100% stream across all pack languages on the one shared token.
+    let mut lang_paths: Vec<(&'static str, Vec<PathBuf>)> = Vec::new();
     for lang in reg.languages() {
         if lang == "perl" {
             continue;
@@ -793,6 +812,13 @@ pub fn index_pack_languages(
         if paths.is_empty() {
             continue;
         }
+        lang_paths.push((lang, paths));
+    }
+    let grand_total: usize = lang_paths.iter().map(|(_, p)| p.len()).sum();
+
+    let total = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    for (lang, paths) in lang_paths {
         let pack_index = Arc::new(crate::module_index::ModuleIndex::new_for_cli());
         let conn = module_cache::open_cache_db(cache_key, lang);
         // A generation built under different analysis inputs (toolchain
@@ -831,6 +857,12 @@ pub fn index_pack_languages(
         let fresh: std::sync::Mutex<Vec<(PathBuf, Arc<crate::file_analysis::FileAnalysis>)>> =
             std::sync::Mutex::new(Vec::new());
         paths.par_iter().for_each(|path| {
+            // Tick before any early-out so warm-cache skips also advance the
+            // bar — `done` must reach `grand_total`.
+            if let Some(cb) = progress {
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                cb(d, grand_total);
+            }
             let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
             if warmed.contains(&canon) {
                 return; // valid cache hit
