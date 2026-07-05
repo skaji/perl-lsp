@@ -155,22 +155,30 @@ over-count direction. `find-references` on any common member name (`key_type`,
 
 ---
 
-## Family D — bare sibling-method call resolves to a foreign same-named method (HIGH pain)
+## Family D — bare sibling-method call resolves to a foreign same-named method (HIGH pain) — **LANDED**
 
 `definition` on the unqualified sibling call `emplace(key, T{})` inside
-`ordered_map::operator[]` (ordered_map.hpp L103:15) → `json.hpp:3303:31`, and
-`hover` there → `std::pair<iterator,bool> emplace(Args&&...)` labeled
-*function* — that is **`basic_json::emplace`, the wrong class**. The correct
-target is `ordered_map`'s own `emplace(const key_type&, T&&)` at
-ordered_map.hpp:73.
+`ordered_map::operator[]` (ordered_map.hpp L103:15) → now
+`ordered_map.hpp:73:31` + `88:31` (both `ordered_map::emplace` overloads), the
+enclosing class — NOT `basic_json::emplace`.
 
-**Owning seam.** `language_driver.rs::emit_return_fuel`'s bare
-sibling-method-call pinning (`resolved_package` → enclosing class) plus the
-method-call resolution in `resolve.rs`: the pin to enclosing `ordered_map`
-either wasn't applied or lost to a workspace-wide same-name method winner
-(`basic_json::emplace`). Because the wrong target is `basic_json`, this is
-**adjacent to the assigned "json.hpp basic_json re-anchor" work** — see overlap
-list; the sibling-pinning failure may share that root.
+**Root cause (not what the seam note guessed).** The sibling-pin machinery was
+fine; the enclosing method `operator[]` was **never minted as a symbol**. The
+skeleton had no `function_definition` operator-def pattern for a
+reference-/pointer-RETURNING operator (`T& operator[](...) { ... }` — the return
+wrapper nests the `function_declarator`, so the bare `operator_name` patterns
+missed it). With no `operator[]` Method symbol, `emit_return_fuel`'s
+scope→symbol→enclosing-class join dead-ended, the pin never fired, and (post
+json-reanchor) the bare call resolved to nothing (pre-reanchor: to
+`basic_json::emplace`).
+
+**Fix.** `queries/cpp/skeleton.scm`: add the ref-/ptr-returning operator
+DEFINITION patterns (in-class + out-of-line), mirroring the field-decl operator
+prototypes that already existed. The enclosing operator now mints its Method
+symbol; the existing pin resolves the bare sibling call to the enclosing class.
+A bare call to a method that lives ONLY on a foreign class still resolves
+nowhere (verified negative control) — no mis-pin. Gold:
+`cpp-sibling-call-ref-operator-def` (positive + `none` foreign-class guard).
 
 ---
 
@@ -215,7 +223,7 @@ namespaced-variable-decl capture + `query_extract.rs` emission.
 | Inline-namespace owner set expanded for completion only | `resolve.rs`: `pack_member_of` / `member_def_location` / `pkg_agrees` don't call `pack_inline_owner_set` | A1, A2 (resolvable half), A3, root of B |
 | `Scope::member` miss → module→file `1:1` fallback | goto-def PackageRef/type tail in `resolve.rs` | A2 (garbage half), B |
 | Reference identity matched by bare name, not owner-scoped | `refs_to` member/typedef arm | C |
-| Bare sibling-method not pinned to enclosing type | `emit_return_fuel` pinning + method-call resolution | D |
+| ~~Bare sibling-method not pinned to enclosing type~~ **LANDED** — real cause: ref-/ptr-returning operator DEF never minted, so the pin's enclosing-class join dead-ended | `queries/cpp/skeleton.scm` operator-def patterns | D |
 | No symbol for namespace-scope `extern` var | `queries/cpp/skeleton.scm` + `query_extract.rs` | E |
 
 ---

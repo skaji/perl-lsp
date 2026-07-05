@@ -995,6 +995,26 @@
       }
     },
     {
+      "difficulty": "hard",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "status": "gold",
+      "file": "sibling_call.cpp",
+      "id": "cpp-sibling-call-ref-operator-def",
+      "line": 33,
+      "col": 36,
+      "comment": "bare enroll(k) inside a REFERENCE-returning operator[] DEFINITION (`int& operator[](...) { ... }`) is an implicit this->enroll — pins to the ENCLOSING class Slots, NOT the same-named Registry::enroll in a sibling class. Regression lock for hitlist-5 Family D: the inline ref-/ptr-returning operator def must mint its method symbol, or the sibling-pin's scope→symbol→enclosing-class join dead-ends and the bare call resolves nowhere (or, pre-json-reanchor, to a foreign same-named method).",
+      "expect": {
+        "all": [
+          "sibling_call.cpp:33:10"
+        ],
+        "none": [
+          "sibling_call.cpp:30:10"
+        ]
+      }
+    },
+    {
       "id": "cpp-family-q-qualified-enum-case-label",
       "difficulty": "hard",
       "semantic_area": "cpp-family-q-owner-anchor",

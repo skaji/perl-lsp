@@ -449,11 +449,43 @@
 (function_definition
   declarator: (function_declarator
     declarator: (operator_name) @def.sub.name)) @def.sub
+; reference- / pointer-returning inline operator DEFINITIONS
+; (`T& operator[](...) { ... }`, `T* operator->() { ... }`): the return
+; wrapper nests the function_declarator, exactly like the field-decl operator
+; forms above. Without these the inline body's method symbol is never minted,
+; so the implicit-`this` sibling-pin's enclosing-class lookup (which joins a
+; body scope to its owning method SYMBOL) dead-ends and a bare sibling call
+; inside the operator body resolves nowhere.
+(function_definition
+  type: (_) @rettype
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (operator_name) @def.sub.name))) @def.sub
+(function_definition
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (operator_name) @def.sub.name))) @def.sub
 (function_definition
   declarator: (function_declarator
     declarator: (qualified_identifier
       scope: (_) @qualifier
       name: (operator_name) @def.method.name))) @def.method
+; out-of-line ref-/pointer-returning operator defs (`T& Vec2::operator[](...)`)
+(function_definition
+  type: (_) @rettype
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @qualifier
+        name: (operator_name) @def.method.name)))) @def.method
+(function_definition
+  type: (_) @rettype
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier
+        scope: (_) @qualifier
+        name: (operator_name) @def.method.name)))) @def.method
 ; pointer-/reference-returning operator decls (`Vec2& operator+=(...)`)
 (field_declaration
   type: (_) @rettype
