@@ -893,6 +893,136 @@ fn dbg_cpp_cst() {
     }
 }
 
+/// A `Point` for `needle`'s first byte at the given occurrence — tree-sitter
+/// columns ARE byte offsets, matching `reanchor_truncated_containers`.
+fn tok(src: &str, needle: &str, occ: usize) -> Point {
+    let mut idx = 0;
+    for _ in 0..occ {
+        idx += src[idx..].find(needle).expect("needle") + needle.len();
+    }
+    let f = idx + src[idx..].find(needle).expect("needle");
+    let row = src[..f].bytes().filter(|&b| b == b'\n').count();
+    let col = f - src[..f].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    Point { row, column: col }
+}
+
+/// Build a bare `SkelSymbol` at the named token, with the given kind/package —
+/// enough surface for `reanchor_truncated_containers` (name span + start).
+fn sksym(src: &str, kind: &str, name: &str, occ: usize, package: Option<&str>) -> super::SkelSymbol {
+    let ns = tok(src, name, occ);
+    super::SkelSymbol {
+        kind: kind.to_string(),
+        name: name.to_string(),
+        start: ns,
+        end: ns,
+        name_start: ns,
+        name_end: Point { row: ns.row, column: ns.column + name.len() },
+        package: package.map(str::to_string),
+        scope: crate::file_analysis::ScopeId(0),
+        return_type: None,
+        deref_stack: Vec::new(),
+        attributes: Vec::new(),
+        arity: None,
+    }
+}
+
+/// The re-anchor invariant (`docs/prompt-json-reanchor.md`): when a deep
+/// misparse truncates a `class_specifier`, its late members become siblings in
+/// the enclosing scope and lose their `package` (json.hpp `basic_json`: ~4400
+/// lines fall through to `nlohmann`). The recovery brace-matches the ORIGINAL
+/// source (balanced — each `#if`/`#else` arm is individually brace-balanced C++,
+/// so both-arms-present text still balances; only the macro-expanded transform
+/// unbalances) and re-attributes each member to the innermost container that
+/// textually encloses it.
+#[test]
+fn reanchor_recovers_members_after_truncated_class() {
+    // The class body braces are REAL (as in the original source); the fall-
+    // through is simulated by giving late members the enclosing scope's name —
+    // exactly the post-truncation skeleton the extractor produces.
+    let src = "namespace ns {\nclass Widget {\n  int early;\n  int mid;\n  int late;\n  void tail() {}\n};\n}\n";
+    let mut skel = SkeletonAnalysis::default();
+    skel.symbols = vec![
+        sksym(src, "package", "ns", 0, None),
+        sksym(src, "class", "Widget", 0, Some("ns")),
+        // early is correctly attributed; mid/late/tail fell through to `ns`
+        // (a literal namespace = an ancestor container) — the truncation shape.
+        sksym(src, "field", "early", 0, Some("Widget")),
+        sksym(src, "field", "mid", 0, Some("ns")),
+        sksym(src, "field", "late", 0, Some("ns")),
+        sksym(src, "method", "tail", 0, Some("ns")),
+    ];
+
+    skel.reanchor_truncated_containers(src);
+    let pkg = |name: &str| skel.symbols.iter().find(|s| s.name == name).and_then(|s| s.package.clone());
+
+    // Every member — including the late fall-through ones — lands in Widget.
+    assert_eq!(pkg("early").as_deref(), Some("Widget"));
+    assert_eq!(pkg("mid").as_deref(), Some("Widget"));
+    assert_eq!(pkg("late").as_deref(), Some("Widget"));
+    assert_eq!(pkg("tail").as_deref(), Some("Widget"));
+    // The class itself stays in its namespace (its name is before the body).
+    assert_eq!(pkg("Widget").as_deref(), Some("ns"));
+    assert_eq!(pkg("ns"), None);
+}
+
+/// Non-computable enclosing scope (a MACRO-defined namespace like json.hpp's
+/// `nlohmann`, whose name span covers the macro token, not `nlohmann`): the
+/// fallen-through member still recovers, because the current package names no
+/// computable container.
+#[test]
+fn reanchor_recovers_through_macro_namespace() {
+    let src = "class Widget {\n  int early;\n  int late;\n};\n";
+    let mut skel = SkeletonAnalysis::default();
+    skel.symbols = vec![
+        sksym(src, "class", "Widget", 0, Some("nlohmann")),
+        sksym(src, "field", "early", 0, Some("Widget")),
+        // `late` fell through to `nlohmann` — a name with no computable
+        // container symbol in this file (macro-synthesized namespace).
+        sksym(src, "field", "late", 0, Some("nlohmann")),
+    ];
+    skel.reanchor_truncated_containers(src);
+    let pkg = |name: &str| skel.symbols.iter().find(|s| s.name == name).and_then(|s| s.package.clone());
+    assert_eq!(pkg("late").as_deref(), Some("Widget"));
+    // Widget's own name is before its body brace → not inside any computable
+    // container → its (macro-namespace) package is left as-is.
+    assert_eq!(pkg("Widget").as_deref(), Some("nlohmann"));
+}
+
+/// Upgrade-only guard: a `::`-qualifier attribution (out-of-line def) names a
+/// container that does NOT textually enclose the symbol — leave it alone, never
+/// overwrite qualifier knowledge with the textual scope.
+#[test]
+fn reanchor_preserves_out_of_line_qualifier() {
+    // `run` is written at namespace scope (outside Buf's braces) but attributed
+    // to Buf via the `Buf::` qualifier.
+    let src = "namespace ns {\nclass Buf {\n  void run();\n};\nvoid Buf::run() { work(); }\n}\n";
+    let mut skel = SkeletonAnalysis::default();
+    skel.symbols = vec![
+        sksym(src, "package", "ns", 0, None),
+        sksym(src, "class", "Buf", 0, Some("ns")),
+        // the out-of-line def (2nd `run`) attributed to Buf, sitting in `ns`.
+        sksym(src, "method", "run", 1, Some("Buf")),
+    ];
+    skel.reanchor_truncated_containers(src);
+    let run = skel.symbols.iter().find(|s| s.name == "run").unwrap();
+    assert_eq!(run.package.as_deref(), Some("Buf"), "qualifier preserved, not re-anchored to ns");
+}
+
+/// A forward declaration (`class X;` — no body) is not a computable container:
+/// it must not seed a bogus extent that swallows a following symbol.
+#[test]
+fn reanchor_ignores_forward_declarations() {
+    let src = "namespace ns {\nclass Fwd;\nint free_var;\n}\n";
+    let mut skel = SkeletonAnalysis::default();
+    skel.symbols = vec![
+        sksym(src, "class", "Fwd", 0, Some("ns")),
+        sksym(src, "field", "free_var", 0, Some("ns")),
+    ];
+    skel.reanchor_truncated_containers(src);
+    let fv = skel.symbols.iter().find(|s| s.name == "free_var").unwrap();
+    assert_eq!(fv.package.as_deref(), Some("ns"), "forward decl has no body → free_var untouched");
+}
+
 fn cpp_skel(src: &str) -> SkeletonAnalysis {
     let mut parser = cpp_parser();
     let tree = parser.parse(src, None).unwrap();

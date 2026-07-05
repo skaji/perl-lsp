@@ -97,6 +97,14 @@ body `{` (row 20643) lands exactly on **row 25771**. Recovery therefore
 runs **after `remap_spans`**, when skeleton symbols are back in ORIGINAL
 coordinates, and brace-matches the ORIGINAL source.
 
+Why the original source balances even though it contains BOTH arms of every
+`#if`/`#else`: each preprocessor arm is written as an individually
+brace-balanced C++ fragment (json.hpp's `set_parent`: the `#if` arm is a run
+of complete `if (...) { ... }` statements, the `#else` arm two brace-free
+`static_cast`s). Both-arms-present text therefore stays balanced. The
+transform breaks this — the macro-expansion / conditional handling drops or
+mangles braces asymmetrically (28 net extra closes over `basic_json`).
+
 ### Mechanism
 
 A post-remap pass (`SkeletonAnalysis::reanchor_truncated_containers`, gated
@@ -145,10 +153,30 @@ a declared symbol, membership recovers. Point-repairs remain welcome as
 complements (they reduce the count that needs recovering), but the
 invariant is the deliverable.
 
-## Acceptance
+## Landed
 
-- RED fixture: a class with a `#if`-in-ctor-initializer mid-body followed
-  by many members; a LATE member must attribute to the class (member
-  completion / goto-def / hover).
-- Real json.hpp: `basic_json` member attribution before/after
-  (headline: the ~673-member `nlohmann`→`basic_json` recovery).
+`LangPack::brace_scoped_members` (true for C/C++ only) gates
+`SkeletonAnalysis::reanchor_truncated_containers`, called from
+`PackDriver::analyze_with_path` right after `remap_spans`. The extent
+primitive is `brace_body_extent` (comment/string/char/raw-string aware).
+
+**Real json.hpp acceptance** (`--lang-analyze`, `basic_json` line range):
+
+| package        | before | after |
+|----------------|-------:|------:|
+| `basic_json`   |     92 |   763 |
+| `nlohmann` (fall-through) | 673 | 2 (the class decl itself) |
+| nested (`json_value`/`data`/`patch_operations`) | 64 | 64 (preserved) |
+
+Split form (`include/nlohmann/json.hpp`): identical 763 recovery.
+
+Tests (`query_extract_tests.rs`): the truncation recovery, recovery through
+a macro-defined namespace, the out-of-line-qualifier guard, and the
+forward-declaration guard. RED without the pass (late members stay in the
+enclosing scope). A minimal SELF-CONTAINED fixture that reproduces the
+tree-sitter truncation could NOT be found — the corruption is emergent from
+json.hpp's full macro-expansion soup (an isolated `#if`-in-ctor class is
+repaired by slice-1's strip; a raw parse of the same shape does not
+truncate). The unit tests therefore drive the pass on the exact
+post-truncation skeleton shape directly, and the real json.hpp numbers are
+the integration acceptance.
