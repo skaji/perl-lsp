@@ -1115,7 +1115,7 @@
    "semantic_area": "cpp-multilang",
    "lang": "cpp",
    "root": "gold-corpus/cpp-fixture",
-   "comment": "XFAIL residual: field access through a call-expression receiver whose callee prototype lives in an INCLUDED header (`cfMakeGadget()->height`, `CfGadget *cfMakeGadget(void);` in callfield.h). The callee SYMBOL resolves cross-file, but its return type does not propagate: query_sub_return_type's cross-file arm uses find_exporters, which filters to Perl export/export_ok lists that C free functions never populate. Needs pack-language cross-file return typing (resolved-target-keyed, not export-model-keyed) to avoid over-linking same-named functions.",
+   "comment": "Field access through a call-expression receiver whose callee prototype lives in an INCLUDED header (`cfMakeGadget()->height`, `CfGadget *cfMakeGadget(void);` in callfield.h). The callee return type crosses the boundary through query_sub_return_type's include-closure arm (resolved-target-keyed, not the Perl export model); expr_type_at_span's member-chain then types the receiver. See negctrl_use for the over-linking negative control.",
    "file": "callfield_use.c",
    "line": 5,
    "col": 28,
@@ -1125,7 +1125,43 @@
     ],
     "none": []
    },
-   "status": "xfail"
+   "status": "gold"
+  },
+  {
+   "id": "cpp-call-receiver-field-crossfile-negctrl-positive",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Non-vacuity companion to the negative control: negctrl_pos.c DOES #include negctrl_other.h, so `ncMakeThing()->secret` resolves cross-file to the header's field. Same code as negctrl_use.c minus the include — the pair isolates the include-closure gate as the sole difference.",
+   "file": "negctrl_pos.c",
+   "line": 2,
+   "col": 27,
+   "expect": {
+    "all": [
+     "negctrl_other.h:2:9"
+    ],
+    "none": []
+   },
+   "status": "gold"
+  },
+  {
+   "id": "cpp-call-receiver-field-crossfile-negctrl-silent",
+   "difficulty": "hard",
+   "semantic_area": "cpp-multilang",
+   "lang": "cpp",
+   "root": "gold-corpus/cpp-fixture",
+   "comment": "Over-linking negative control: negctrl_use.c does NOT #include negctrl_other.h, where an unrelated same-named `ncMakeThing` (with a `secret` field) is declared. The include closure never reaches it, so the callee return type must not cross the boundary — gd on `secret` stays silent, never landing on the unrelated function's struct. Guards query_sub_return_type's include-closure gate against bare-name cross-contamination.",
+   "file": "negctrl_use.c",
+   "line": 8,
+   "col": 27,
+   "expect": {
+    "all": [],
+    "none": [
+     "negctrl_other.h"
+    ]
+   },
+   "status": "gold"
   },
   {
    "id": "cpp-tmpl-valarg-enum-value-gd",

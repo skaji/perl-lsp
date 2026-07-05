@@ -2395,6 +2395,74 @@ pub fn query_sub_return_type(
                     return Some(t);
                 }
             }
+            // Pack cross-file: a call whose callee is defined in an INCLUDED
+            // header carries no Perl export edge (C free functions never
+            // populate `@EXPORT`). Its return type crosses the boundary by the
+            // SAME include-closure visibility goto-def uses (`pack_def_paths`):
+            // a candidate def is reachable iff the querying file sees its path
+            // or the candidate includes the querying file. Gate on that
+            // resolved-target identity — never a bare name match — so a
+            // same-named free function in an unrelated TU can't contaminate.
+            // Distinct return types across reachable candidates (a genuine
+            // ambiguity) collapse to silence; agreeing decls (prototype +
+            // definition of the one function) fold to their shared answer.
+            if let Some((self_path, visible)) = idx.visibility_scope() {
+                let self_str = self_path.to_string_lossy();
+                let mut answer: Option<InferredType> = None;
+                let mut ambiguous = false;
+                for cached in idx.def_candidates(sub_name) {
+                    let p = cached.path.to_string_lossy();
+                    let reachable = visible.contains(p.as_ref())
+                        || cached
+                            .analysis
+                            .include_closure
+                            .iter()
+                            .any(|c| c.as_str() == self_str.as_ref());
+                    if !reachable {
+                        continue;
+                    }
+                    let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                        s.name == sub_name
+                            && matches!(
+                                s.kind,
+                                crate::file_analysis::SymKind::Sub
+                                    | crate::file_analysis::SymKind::Method
+                            )
+                            && cached.analysis.is_linkage_visible(s)
+                    }) else {
+                        continue;
+                    };
+                    let cached_ctx = BagContext {
+                        scopes: &cached.analysis.scopes,
+                        package_framework: &cached.analysis.package_framework,
+                        module_index: Some(idx),
+                        package_parents: &cached.analysis.package_parents,
+                        app_surface_consumers: &cached.analysis.app_surface_consumers,
+                    };
+                    let att = WitnessAttachment::Symbol(sym.id);
+                    let q = ReducerQuery {
+                        attachment: &att,
+                        point: None,
+                        framework: FrameworkFact::Plain,
+                        arity_hint,
+                        receiver: receiver.clone(),
+                        args: Vec::new(),
+                        context: Some(&cached_ctx),
+                    };
+                    if let ReducedValue::Type(t) = reg.query(&cached.analysis.witnesses, &q) {
+                        match &answer {
+                            Some(existing) if *existing != t => ambiguous = true,
+                            None => answer = Some(t),
+                            _ => {}
+                        }
+                    }
+                }
+                if !ambiguous {
+                    if let Some(t) = answer {
+                        return Some(t);
+                    }
+                }
+            }
         }
     }
     None

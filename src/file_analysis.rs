@@ -4903,9 +4903,10 @@ impl FileAnalysis {
                     }
                 }
                 RefKind::FunctionCall { .. } => {
-                    if let Some(t) = self.sub_return_type_at_arity(
+                    if let Some(t) = self.sub_return_type_at_arity_ctx(
                         &self.refs[recv_idx].target_name,
                         Some(self.refs[recv_idx].arg_count.unwrap_or(0) as u32),
+                        module_index,
                     ) {
                         return Some(t);
                     }
@@ -4986,9 +4987,10 @@ impl FileAnalysis {
                     // Call-root chain arm: feed the call's real written arg
                     // count so an arity-discriminated overload types by the
                     // args actually passed, not a hardcoded 0.
-                    if let Some(t) = self.sub_return_type_at_arity(
+                    if let Some(t) = self.sub_return_type_at_arity_ctx(
                         &self.refs[recv_idx].target_name,
                         Some(self.refs[recv_idx].arg_count.unwrap_or(0) as u32),
+                        module_index,
                     ) {
                         return Some(t);
                     }
@@ -5011,7 +5013,22 @@ impl FileAnalysis {
         sub_name: &str,
         arity: Option<u32>,
     ) -> Option<InferredType> {
-        let ctx = self.bag_context(None);
+        self.sub_return_type_at_arity_ctx(sub_name, arity, None)
+    }
+
+    /// Index-threaded sibling of `sub_return_type_at_arity`. A free-function
+    /// call whose callee's prototype lives in an INCLUDED header carries no
+    /// local symbol and no Perl export edge; its return type crosses the file
+    /// boundary only through `query_sub_return_type`'s include-closure arm,
+    /// which needs the index. `expr_type_at_span`'s call arms route here so a
+    /// pack `makeGadget()->field` types its receiver cross-file.
+    pub fn sub_return_type_at_arity_ctx(
+        &self,
+        sub_name: &str,
+        arity: Option<u32>,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
+        let ctx = self.bag_context(module_index);
         crate::witnesses::query_sub_return_type(
             &self.witnesses,
             &self.symbols,

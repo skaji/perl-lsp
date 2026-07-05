@@ -97,20 +97,6 @@ why parked, what unblocks it. Prune on landing.
 
 ## Residual-bug tier (pinned, xfail'd where reducible)
 
-- **C free-function return type doesn't propagate cross-file** (the honest
-  residual of the call-receiver-field kill). Single-file `mkStruct()->field`
-  now resolves — the gap was purely that the pointer-returning and prototype
-  (`declaration`) skeleton patterns omitted `@rettype`, so the callee carried
-  no return-type witness for `expr_type_at_span`'s member-chain arm to type
-  the receiver through; adding rettype-bearing sibling patterns (dedup keeps
-  them via `upgrade_ret`) closed it. What REMAINS: `makeGadget()->field` where
-  the callee prototype lives in an INCLUDED header. The callee *symbol*
-  resolves cross-file, but `query_sub_return_type`'s cross-file arm walks
-  `find_exporters`, which filters to Perl `export`/`export_ok` lists that C
-  free functions never populate — so the return type never crosses the file
-  boundary. Needs pack-language cross-file return typing keyed off the
-  resolved call target (not the Perl export model), without over-linking
-  same-named free functions. Xfail row `cpp-call-receiver-field-crossfile-call`.
 - **Cross-file functional-cast / constructor typing** (callee is NOT a
   local symbol). The name-case ctor heuristic is DEAD: a call's value is now
   the callee's own resolution (`query_extract::into_file_analysis` call-site
