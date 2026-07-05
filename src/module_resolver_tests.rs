@@ -145,3 +145,69 @@ fn entrypoint_scan_finds_shebang_scripts_in_conventional_dirs() {
     assert_eq!(with_extra, vec!["cron", "jobs", "login", "worker"]);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn workspace_index_progress_is_throttled_monotone_and_completes() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    // A real-ish tree: enough files that per-file emission would be a storm,
+    // so the throttle's effect is observable.
+    let dir = std::env::temp_dir().join(format!("qx-progress-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n_files = 240usize;
+    for i in 0..n_files {
+        std::fs::write(
+            dir.join(format!("Mod{i}.pm")),
+            format!("package Mod{i};\nsub run {{ my ($self) = @_; return {i}; }}\n1;\n"),
+        )
+        .unwrap();
+    }
+
+    // Mirror the backend's throttle: emit only on a >=2% advance or the final
+    // tick. `emitted` is what a client would see as Report notifications.
+    let last_pct = AtomicU8::new(0);
+    let emitted: Mutex<Vec<(u8, usize, usize)>> = Mutex::new(Vec::new());
+    let raw_ticks = std::sync::atomic::AtomicUsize::new(0);
+    let cb = |done: usize, total: usize| {
+        raw_ticks.fetch_add(1, Ordering::Relaxed);
+        let pct = if total == 0 {
+            100u8
+        } else {
+            ((done * 100 / total).min(100)) as u8
+        };
+        let prev = last_pct.fetch_max(pct, Ordering::Relaxed);
+        if pct >= prev.saturating_add(2) || done >= total {
+            emitted.lock().unwrap().push((pct, done, total));
+        }
+    };
+
+    let files = crate::file_store::FileStore::new();
+    let indexed =
+        index_workspace_with_index(&dir, &files, None, Some(&cb as &(dyn Fn(usize, usize) + Sync)));
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(indexed, n_files, "all files indexed");
+    // The callback fires once per file (no matter success/skip).
+    assert_eq!(raw_ticks.load(Ordering::Relaxed), n_files);
+
+    let emitted = emitted.into_inner().unwrap();
+    // Bounded: a >=2% throttle caps Reports well under the file count. With 240
+    // files this is ~50 max, never hundreds.
+    assert!(
+        emitted.len() <= 60,
+        "throttled emission count should be bounded, got {}",
+        emitted.len()
+    );
+    assert!(!emitted.is_empty(), "at least one Report");
+
+    // Percentages are monotone non-decreasing (the client bar never rewinds).
+    for w in emitted.windows(2) {
+        assert!(w[1].0 >= w[0].0, "percent must not decrease: {:?}", emitted);
+    }
+    // The stream ends at 100% with done == total (the final Report before End).
+    let (last_pct, last_done, last_total) = *emitted.last().unwrap();
+    assert_eq!(last_pct, 100);
+    assert_eq!(last_done, n_files);
+    assert_eq!(last_total, n_files);
+}

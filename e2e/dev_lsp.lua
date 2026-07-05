@@ -84,7 +84,9 @@ return function(opts)
         if not tok:match("workspace%-index") then return end
         if v.kind == "begin" or v.kind == "report" then
           st.active[tok] = true
-          st.msg = (v.title or "Indexing") .. (v.message and (": " .. v.message) or "")
+          st.msg = (v.title or "Indexing")
+            .. (v.percentage and (" " .. v.percentage .. "%") or "")
+            .. (v.message and (" — " .. v.message) or "")
           if not st.timer then
             st.timer = uv.new_timer()
             st.timer:start(0, 90, vim.schedule_wrap(function()

@@ -587,12 +587,13 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // @INC scan + SQLite warm.
     module_index.set_workspace_root(Some(root_uri.as_str()));
     let ws = file_store::FileStore::new();
-    let indexed = module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index));
+    let indexed =
+        module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None);
     eprintln!("Indexed {} files", indexed);
     // Pack languages (C++/Python/…) → per-language sub-indexes (separate
     // caches, no cross-language overlap), attached to the hub for routing.
     let pack_indexed =
-        module_resolver::index_pack_languages(&root_path, Some(&root_uri), &module_index);
+        module_resolver::index_pack_languages(&root_path, Some(&root_uri), &module_index, None);
     if pack_indexed > 0 {
         // Name the languages actually served rather than the
         // generic "pack-language" — a pure-C++ workspace should read "C/C++",

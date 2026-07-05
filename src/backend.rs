@@ -428,20 +428,74 @@ impl Backend {
                     )),
                 }));
             }
+            // Throttled percentage progress. The Rayon index workers call `cb`
+            // per file (cheap: an atomic `fetch_max` guard); only a ≥2% advance
+            // (or the final tick) crosses the channel, where a tokio task owns
+            // the actual `Report` notification. This keeps `send_notification`
+            // OFF the Rayon worker threads — no `block_on` from the pool — and
+            // bounds emissions to ~50 per index regardless of file count.
+            let emitter = progress.then(|| {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(u32, usize, usize)>();
+                let client_e = client.clone();
+                let token_e = token.clone();
+                let handle = rt.spawn(async move {
+                    while let Some((pct, done, total)) = rx.recv().await {
+                        client_e
+                            .send_notification::<notification::Progress>(ProgressParams {
+                                token: token_e.clone(),
+                                value: ProgressParamsValue::WorkDone(
+                                    WorkDoneProgress::Report(WorkDoneProgressReport {
+                                        cancellable: Some(false),
+                                        message: Some(format!("{done}/{total} files")),
+                                        percentage: Some(pct),
+                                    }),
+                                ),
+                            })
+                            .await;
+                    }
+                });
+                (tx, handle)
+            });
+            let last_pct = std::sync::atomic::AtomicU8::new(0);
+            let cb = emitter.as_ref().map(|(tx, _)| {
+                let tx = tx.clone();
+                move |done: usize, total: usize| {
+                    let pct = if total == 0 {
+                        100u8
+                    } else {
+                        ((done * 100 / total).min(100)) as u8
+                    };
+                    let prev = last_pct.fetch_max(pct, std::sync::atomic::Ordering::Relaxed);
+                    if pct >= prev.saturating_add(2) || done >= total {
+                        let _ = tx.send((pct as u32, done, total));
+                    }
+                }
+            });
+            let cb_ref: Option<&(dyn Fn(usize, usize) + Sync)> =
+                cb.as_ref().map(|c| c as &(dyn Fn(usize, usize) + Sync));
             let count = if want_perl {
                 crate::module_resolver::index_workspace_with_index(
                     &root_path,
                     &files,
                     Some(&module_index),
+                    cb_ref,
                 )
             } else {
                 crate::module_resolver::index_pack_languages(
                     &root_path,
                     Some(root_uri.as_str()),
                     &module_index,
-                );
-                0
+                    cb_ref,
+                )
             };
+            // Drop the sender(s) so the emitter's channel closes, then drain it
+            // — guarantees the final Report lands before End.
+            drop(cb);
+            if let Some((tx, handle)) = emitter {
+                drop(tx);
+                let _ = rt.block_on(handle);
+            }
             if progress {
                 rt.block_on(client.send_notification::<notification::Progress>(ProgressParams {
                     token,
