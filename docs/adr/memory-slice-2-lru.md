@@ -253,3 +253,12 @@ perl-lsp --clear-cache <abseil-root>
 PERL_LSP_HEAP_DUMP=1 PERL_LSP_MEM_REPORT=1 /usr/bin/time -v \
   perl-lsp --references <abseil-root> <abseil>/absl/strings/string_view.h 41 15
 ```
+
+---
+
+**Scale follow-up:** `docs/chromium-scale-analysis.md` measures this design at
+Chromium scale (131K C++ files). Per-file resident cost is linear at
+~0.51 MB/file (Slice 2 cuts it ~3.4× vs the bag-resident model), projecting
+whole-tree Chromium to ~67 GB. The pinned `refs`/`symbols` are the wall, and
+the analysis argues the next step is a **relational SQLite reverse-index**
+(shred refs into indexed tables, query on disk) rather than a Slice-3 ref-LRU.
