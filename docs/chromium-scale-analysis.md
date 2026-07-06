@@ -146,3 +146,7 @@ line (the exact wrapper used here is in the session scratchpad).
 
 Chromium is the corpus that turns "SQLite as a query engine" from a
 nice-to-have into the load-bearing decision for whole-tree scale.
+
+**Design landed:** `docs/adr/relational-ref-index.md` (schema, query path,
+scale benchmarks at 105M rows) + `docs/prompt-relational-ref-index.md` (the
+implementation brief).
