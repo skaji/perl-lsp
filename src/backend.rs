@@ -1707,18 +1707,34 @@ impl LanguageServer for Backend {
         // One construction, one projection — target/group/lexical branching,
         // visibility (incl. the origin's include-closure scope and the pack
         // VISIBLE widening), and the cross-file walk all live inside the set.
-        let mut cs = crate::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            point,
-            Some(base_idx),
-            self.override_scope(),
-        );
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
-        Ok(refs_to_locations(cs.references()))
+        // The backward walk does real I/O now (relational retrieval +
+        // candidate-blob rehydration) — run construction + projection on the
+        // blocking pool, never the reactor. Everything moved is Arc'd.
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let uri = uri.clone();
+        let scope = self.override_scope();
+        let locs = tokio::task::spawn_blocking(move || {
+            let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => &*module_index,
+            };
+            let mut cs = crate::resolve::resolve(
+                &files,
+                &analysis,
+                FileKey::Url(uri),
+                point,
+                Some(base_idx),
+                scope,
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            refs_to_locations(cs.references())
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        Ok(locs)
     }
 
     async fn prepare_rename(
@@ -1806,20 +1822,35 @@ impl LanguageServer for Backend {
             Some(i) => i,
             None => &*self.module_index,
         };
-        let mut cs = crate::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            point,
-            Some(base_idx),
-            self.override_scope(),
-        );
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
-        cs.rename_edits(new_name)
-            .map(edit_pairs_to_workspace_edit)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)
+        // Same blocking-pool routing as `references`: rename projects the
+        // references image, which now reads SQLite + rehydrates blobs.
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let uri = uri.clone();
+        let new_name = new_name.clone();
+        let scope = self.override_scope();
+        tokio::task::spawn_blocking(move || {
+            let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => &*module_index,
+            };
+            let mut cs = crate::resolve::resolve(
+                &files,
+                &analysis,
+                FileKey::Url(uri),
+                point,
+                Some(base_idx),
+                scope,
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            cs.rename_edits(&new_name)
+                .map(edit_pairs_to_workspace_edit)
+                .map_err(tower_lsp::jsonrpc::Error::invalid_params)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {

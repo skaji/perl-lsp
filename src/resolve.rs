@@ -2372,8 +2372,9 @@ fn import_candidates(
             if !mask.contains(RoleMask::OPEN) {
                 continue;
             }
+            let whole = cached.as_ref().map(|c| idx.bag_present(c));
             let detail =
-                completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
+                completion_detail_for_import(is.remote(), whole.as_deref(), &import.module_name);
             out.push(CompletionCandidate {
                 label: local.clone(),
                 kind: FaSymKind::Sub,
@@ -2508,12 +2509,14 @@ fn unimported_export_candidates(
 
 fn completion_detail_for_import(
     name: &str,
-    cached: Option<&crate::file_analysis::CachedModule>,
+    // The bag-present analysis (`idx.bag_present`) — return types read the
+    // bag, and the resident index copy may be evicted.
+    whole: Option<&crate::file_analysis::FileAnalysis>,
     module_name: &str,
 ) -> String {
     use crate::file_analysis::format_inferred_type;
-    if let Some(cached) = cached {
-        if let Some(sub_info) = cached.sub_info(name) {
+    if let Some(whole) = whole {
+        if let Some(sub_info) = whole.sub_info_view(name) {
             if let Some(rt) = sub_info.return_type(None) {
                 return format!("→ {} ({})", format_inferred_type(&rt), module_name);
             }

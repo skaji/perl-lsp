@@ -186,7 +186,41 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         )
         .ok();
     if rows_version.as_deref() != Some(REF_ROWS_VERSION) {
-        clear_derived_rows(conn)?;
+        // DROP, not DELETE: a format change may alter the table SHAPE, and
+        // `CREATE TABLE IF NOT EXISTS` above no-ops on the old shape — a
+        // row-only wipe would leave every future shred failing on a missing
+        // column while composition quietly masks it (refs stay resident,
+        // retrieval dead). Recreate from scratch.
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS refs;
+             DROP TABLE IF EXISTS files;
+             DROP TABLE IF EXISTS strings;
+             CREATE TABLE files (
+                file_id INTEGER PRIMARY KEY,
+                path    TEXT NOT NULL UNIQUE,
+                source  TEXT NOT NULL DEFAULT 'import'
+             );
+             CREATE TABLE strings (
+                str_id INTEGER PRIMARY KEY,
+                s      TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE refs (
+                file_id   INTEGER NOT NULL,
+                name_id   INTEGER NOT NULL,
+                kind      INTEGER NOT NULL,
+                start_row INTEGER NOT NULL,
+                start_col INTEGER NOT NULL,
+                end_row   INTEGER NOT NULL,
+                end_col   INTEGER NOT NULL,
+                access    INTEGER NOT NULL,
+                flags     INTEGER NOT NULL,
+                qual_kind INTEGER NOT NULL,
+                qual_id   INTEGER,
+                arg_count INTEGER
+             );
+             CREATE INDEX idx_refs_name ON refs(name_id);
+             CREATE INDEX idx_refs_file ON refs(file_id);",
+        )?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('ref_rows_version', ?1)",
             params![REF_ROWS_VERSION],
@@ -454,7 +488,9 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
 }
 
 /// Decompress + deserialize an analysis blob.
-fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
+/// Public for the bulk writers' failure recovery: a failed chunk commit
+/// un-strips its resident copies by decoding the blobs it still holds.
+pub fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
     let bin = zstd::decode_all(blob).ok()?;
     let mut fa: FileAnalysis = bincode::deserialize(&bin).ok()?;
     fa.after_deserialize();
@@ -549,9 +585,15 @@ pub fn shred_ref_rows(
     source: &str,
     seeds: &[crate::file_analysis::RefRowSeed],
 ) -> rusqlite::Result<()> {
+    // Sticky workspace tier: project lib/ files are inside the walk AND on
+    // @INC (add_project_lib_paths), so the resolver re-shreds them as
+    // 'import'. The walk's verdict wins — downgrading would let the @INC
+    // hard-clear take an editable file's generation out from under its
+    // stripped resident copy.
     conn.execute(
         "INSERT INTO files (path, source) VALUES (?1, ?2)
-         ON CONFLICT(path) DO UPDATE SET source = excluded.source",
+         ON CONFLICT(path) DO UPDATE SET source =
+           CASE WHEN files.source = 'workspace' THEN 'workspace' ELSE excluded.source END",
         params![path, source],
     )?;
     let file_id: i64 = conn.query_row(
@@ -613,6 +655,26 @@ pub fn invalidate_generation(conn: &Connection, path: &str) {
     delete_ref_rows(conn, path);
 }
 
+/// Tier-scoped eraser: drops the generation ONLY when its rows carry
+/// `source` — the walk's dead-row GC must not take a dual-homed file's
+/// import-tier generation (project-lib files leave the walk when
+/// gitignored but stay valid @INC modules).
+pub fn invalidate_generation_tier(conn: &Connection, path: &str, source: &str) {
+    let _ = conn.execute(
+        "DELETE FROM modules WHERE path = ?1 AND source = ?2",
+        params![path, source],
+    );
+    let _ = conn.execute(
+        "DELETE FROM refs WHERE file_id IN
+           (SELECT file_id FROM files WHERE path = ?1 AND source = ?2)",
+        params![path, source],
+    );
+    let _ = conn.execute(
+        "DELETE FROM files WHERE path = ?1 AND source = ?2",
+        params![path, source],
+    );
+}
+
 /// Remove a deleted file's rows (the removal half of `shred_ref_rows`).
 pub fn delete_ref_rows(conn: &Connection, path: &str) {
     let _ = conn.execute(
@@ -649,9 +711,20 @@ pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
     for key in keys {
         let rows = stmt.query_map(params![key], |row| row.get::<_, String>(0));
         if let Ok(rows) = rows {
-            for p in rows.flatten() {
-                if seen.insert(p.clone()) {
-                    out.push(p);
+            for r in rows {
+                match r {
+                    Ok(p) => {
+                        if seen.insert(p.clone()) {
+                            out.push(p);
+                        }
+                    }
+                    // A step-level error (corrupt page, IO) ends the scan —
+                    // the candidate list is TRUNCATED, which reads as
+                    // "fewer references" with no other witness. Say so.
+                    Err(e) => {
+                        log::warn!("ref candidate scan aborted mid-iteration: {}", e);
+                        break;
+                    }
                 }
             }
         }
@@ -717,7 +790,12 @@ pub fn warm_cache_streaming(
     let mut stale_names = Vec::new();
     let mut stat_memo: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
-    for row in rows.flatten() {
+    for row in rows.map(|r| {
+        if let Err(ref e) = r {
+            log::warn!("cache warm scan error (row skipped / scan may truncate): {}", e);
+        }
+        r
+    }).flatten() {
         let (module_name, path_str, cached_mtime, cached_size, analysis_blob, row_extract_version, row_deps_stamp) = row;
         if path_str.is_empty() {
             continue; // negative sentinel — no pack consumer
@@ -781,7 +859,12 @@ pub fn warm_cache(
     // Closure members overlap heavily across rows; stat each once per warm.
     let mut stat_memo: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
-    for row in rows.flatten() {
+    for row in rows.map(|r| {
+        if let Err(ref e) = r {
+            log::warn!("cache warm scan error (row skipped / scan may truncate): {}", e);
+        }
+        r
+    }).flatten() {
         let (module_name, path_str, cached_mtime, cached_size, analysis_blob, row_extract_version, row_deps_stamp) = row;
 
         // Negative sentinel: empty path + NULL blob.

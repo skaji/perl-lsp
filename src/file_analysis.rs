@@ -29,33 +29,11 @@ impl CachedModule {
     /// Returns a lightweight view into the full `FileAnalysis`. Works for
     /// any declared sub — exported or not.
     pub fn sub_info(&self, name: &str) -> Option<SubInfo<'_>> {
-        // Prefer the first matching Sub/Method symbol. Builder may emit several
-        // when rw accessors exist (getter + setter); overloads are collected as
-        // additional symbols with the same name.
-        let mut syms = self.analysis.symbols.iter().filter(|s| {
-            s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method)
-        });
-        let primary = syms.next()?;
-        let overloads: Vec<&Symbol> = syms.collect();
-
-        // Keys are owned by `Sub { package: primary.package, name }` — the
-        // sub's hash keys live under the same package as the sub itself.
-        let hash_keys: Vec<String> = self
-            .analysis
-            .hash_key_defs_for_owner(&HashKeyOwner::Sub {
-                package: primary.package.clone(),
-                name: name.to_string(),
-            })
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-
-        Some(SubInfo {
-            analysis: &self.analysis,
-            primary,
-            overloads,
-            hash_keys,
-        })
+        // NOTE: views minted from an index copy read ITS bag — consumers of
+        // the bag-backed accessors (`return_type`, `param_inferred_type`)
+        // must mint from `idx.bag_present(&cached)` via `sub_info_view`
+        // instead, or an evicted copy silently answers "no type".
+        self.analysis.sub_info_view(name)
     }
 
     /// Locate a package-global variable declaration (`our $x` / `our @arr`
@@ -143,6 +121,36 @@ impl CachedModule {
 ///
 /// Composed of a primary symbol plus any additional symbols with the same
 /// name (for rw accessor setter overloads).
+impl FileAnalysis {
+    /// The `SubInfo` view over THIS analysis — mint it from a bag-present
+    /// copy (`idx.bag_present(&cached)`) when the bag-backed accessors will
+    /// be read; an evicted index copy answers those with `None`.
+    pub fn sub_info_view(&self, name: &str) -> Option<SubInfo<'_>> {
+        // Prefer the first matching Sub/Method symbol. Builder may emit several
+        // when rw accessors exist (getter + setter); overloads are collected as
+        // additional symbols with the same name.
+        let mut syms = self
+            .symbols
+            .iter()
+            .filter(|s| s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method));
+        let primary = syms.next()?;
+        let overloads: Vec<&Symbol> = syms.collect();
+
+        // Keys are owned by `Sub { package: primary.package, name }` — the
+        // sub's hash keys live under the same package as the sub itself.
+        let hash_keys: Vec<String> = self
+            .hash_key_defs_for_owner(&HashKeyOwner::Sub {
+                package: primary.package.clone(),
+                name: name.to_string(),
+            })
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        Some(SubInfo { analysis: self, primary, overloads, hash_keys })
+    }
+}
+
 pub struct SubInfo<'a> {
     analysis: &'a FileAnalysis,
     primary: &'a Symbol,
@@ -5572,7 +5580,7 @@ impl FileAnalysis {
                             imported_returns.insert(sym.name.clone(), ty);
                         }
                     }
-                    if let Some(sub_info) = cached.sub_info(&sym.name) {
+                    if let Some(sub_info) = whole.sub_info_view(&sym.name) {
                         let hk = sub_info.hash_keys();
                         if !hk.is_empty() {
                             imported_hash_keys
@@ -7911,7 +7919,8 @@ impl FileAnalysis {
                                             // inherited method in `class`'s own module.
                                             let module = def_module.as_deref().unwrap_or(class.as_str());
                                             if let Some(cached) = idx.get_cached(module) {
-                                                if let Some(sub_info) = cached.sub_info(mname) {
+                                                let whole = idx.bag_present(&cached);
+                                                if let Some(sub_info) = whole.sub_info_view(mname) {
                                                     let sig = format_cross_file_signature(mname, &sub_info);
                                                     let mut text = format!("```perl\n{}\n```\n\n*class {} — resolved from `{}`*", sig, class, r.target_name);
                                                     if let Some(rt) = sub_info.return_type(Some(idx)) {
@@ -8020,7 +8029,8 @@ impl FileAnalysis {
                                     // inherited method in `class`'s own module.
                                     let module = def_module.as_deref().unwrap_or(class.as_str());
                                     if let Some(cached) = idx.get_cached(module) {
-                                        if let Some(sub_info) = cached.sub_info(method) {
+                                        let whole = idx.bag_present(&cached);
+                                        if let Some(sub_info) = whole.sub_info_view(method) {
                                             let class_label = if class != cn {
                                                 format!("{} (from {})", cn, class)
                                             } else {
@@ -12233,7 +12243,8 @@ impl FileAnalysis {
                 Some(MethodResolution::CrossFile { ref class, .. }) => {
                     if let Some(idx) = module_index {
                         if let Some(cached) = idx.get_cached(class) {
-                            if let Some(sub_info) = cached.sub_info(name) {
+                            let whole = idx.bag_present(&cached);
+                            if let Some(sub_info) = whole.sub_info_view(name) {
                                 return Some(cross_file_resolved(&sub_info));
                             }
                         }
@@ -12268,7 +12279,8 @@ impl FileAnalysis {
                         // or in a module it re-exports. `defining_module_cached`
                         // chases the same re-export edges (seen-set bounded).
                         if let Some(cached) = idx.defining_module_cached(&import.module_name, remote) {
-                            if let Some(sub_info) = cached.sub_info(remote) {
+                            let whole = idx.bag_present(&cached);
+                            if let Some(sub_info) = whole.sub_info_view(remote) {
                                 return Some(cross_file_resolved(&sub_info));
                             }
                         }

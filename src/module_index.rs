@@ -303,7 +303,7 @@ pub struct ModuleIndex {
     /// resident pack `FileAnalysis` has its witness bag evicted; a type query
     /// reaching into an evicted file rehydrates the exact persisted bag through
     /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
-    bag_cache: std::sync::OnceLock<Arc<crate::pack_bag_cache::PackBagCache>>,
+    bag_cache: std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
     /// Read-connection opener for the relational ref index
     /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
     /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
@@ -311,13 +311,17 @@ pub struct ModuleIndex {
     /// and `rusqlite::Connection` isn't `Sync`); `None` (tests, no cache
     /// dir) contributes no candidates and the resident sweep still covers.
     ref_rows_opener:
-        std::sync::OnceLock<Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>>,
+        std::sync::RwLock<Option<Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>>>,
     /// The retained read connection the opener fills lazily — one per index,
     /// so the statement cache amortizes across queries (a heatmap projects
     /// references once per symbol; per-call opens would re-prepare every
     /// statement). WAL readers see each write txn that committed before
     /// their own read txn begins, so retaining it never serves stale rows.
-    ref_rows_conn: std::sync::Mutex<Option<rusqlite::Connection>>,
+    /// Paired with the DB file's inode at open: `--clear-cache` UNLINKS the
+    /// file, and an fd pinning the dead inode would serve frozen rows
+    /// forever — an inode change (or missing file) drops the conn so the
+    /// next query reopens the recreated DB.
+    ref_rows_conn: std::sync::Mutex<Option<(rusqlite::Connection, u64)>>,
 }
 
 impl ModuleIndex {
@@ -364,8 +368,8 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: std::sync::OnceLock::new(),
-            ref_rows_opener: std::sync::OnceLock::new(),
+            bag_cache: std::sync::RwLock::new(None),
+            ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
@@ -739,8 +743,8 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: std::sync::OnceLock::new(),
-            ref_rows_opener: std::sync::OnceLock::new(),
+            bag_cache: std::sync::RwLock::new(None),
+            ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
@@ -794,8 +798,8 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: std::sync::OnceLock::new(),
-            ref_rows_opener: std::sync::OnceLock::new(),
+            bag_cache: std::sync::RwLock::new(None),
+            ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
@@ -938,14 +942,21 @@ impl ModuleIndex {
         self,
         cache: Arc<crate::pack_bag_cache::PackBagCache>,
     ) -> Self {
-        let _ = self.bag_cache.set(cache);
+        self.set_bag_cache(cache);
         self
     }
 
-    /// Post-`Arc` variant for the hub (set once, alongside the workspace
-    /// root) — the Perl workspace tier's rehydration LRU.
+    /// Post-`Arc` variant for the hub, set alongside the workspace root.
+    /// LAST root wins — a re-rooted session must not keep rehydrating from
+    /// the first root's DB while the writers moved to the new one.
     pub fn set_bag_cache(&self, cache: Arc<crate::pack_bag_cache::PackBagCache>) {
-        let _ = self.bag_cache.set(cache);
+        if let Ok(mut g) = self.bag_cache.write() {
+            *g = Some(cache);
+        }
+    }
+
+    fn bag_cache_ref(&self) -> Option<Arc<crate::pack_bag_cache::PackBagCache>> {
+        self.bag_cache.read().ok().and_then(|g| g.clone())
     }
 
     /// Install the relational ref index's read-connection opener (once).
@@ -955,7 +966,13 @@ impl ModuleIndex {
         &self,
         opener: Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>,
     ) {
-        let _ = self.ref_rows_opener.set(opener);
+        if let Ok(mut g) = self.ref_rows_opener.write() {
+            *g = Some(opener);
+        }
+        // The retained conn belongs to the previous opener's DB.
+        if let Ok(mut c) = self.ref_rows_conn.lock() {
+            *c = None;
+        }
     }
 
     /// Drop `path`'s rehydrated analysis from this index's LRU (a
@@ -963,7 +980,7 @@ impl ModuleIndex {
     /// hub each carry one — the watcher and the bulk-index writers rely on
     /// this taking effect on both.
     pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
-        if let Some(bc) = self.bag_cache.get() {
+        if let Some(bc) = self.bag_cache_ref() {
             bc.invalidate(path);
         }
     }
@@ -975,12 +992,16 @@ impl ModuleIndex {
     /// `refs_present`: the miss policy and LRU selection must never diverge
     /// between the type path and the reference path.
     fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        if let Some(bc) = self.bag_cache.get() {
+        if let Some(bc) = self.bag_cache_ref() {
             if let Some(full) = bc.bag_for(&cached.path) {
                 return full;
             }
         }
-        log::debug!(
+        // Warn, not debug: an evicted copy whose blob can't rehydrate means
+        // references/types for this file are quietly incomplete this session
+        // (the next warm start re-parses it — decode failures invalidate the
+        // row's stamp match by re-analysis).
+        log::warn!(
             "rehydration miss for evicted copy {:?} — serving stripped resident",
             cached.path
         );
@@ -1393,17 +1414,43 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
-        let Some(opener) = self.ref_rows_opener.get() else {
+        let Some(opener) = self.ref_rows_opener.read().ok().and_then(|g| g.clone()) else {
             return Vec::new();
         };
-        let mut guard = match self.ref_rows_conn.lock() {
-            Ok(g) => g,
-            Err(_) => return Vec::new(),
-        };
-        if guard.is_none() {
-            *guard = opener();
+        fn db_ino(conn: &rusqlite::Connection) -> u64 {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return conn
+                    .path()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.ino())
+                    .unwrap_or(0);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = conn;
+                0
+            }
         }
-        let Some(conn) = guard.as_ref() else { return Vec::new() };
+        // Poison-proof: the Option is a pure cache — a panic in some earlier
+        // holder must not permanently disable retrieval.
+        let mut guard = self
+            .ref_rows_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((conn, ino)) = guard.as_ref() {
+            if db_ino(conn) != *ino {
+                *guard = None; // file unlinked/recreated — reopen below
+            }
+        }
+        if guard.is_none() {
+            *guard = opener().map(|c| {
+                let ino = db_ino(&c);
+                (c, ino)
+            });
+        }
+        let Some((conn, _)) = guard.as_ref() else { return Vec::new() };
         crate::module_cache::ref_candidate_files(conn, keys)
             .into_iter()
             .map(std::path::PathBuf::from)

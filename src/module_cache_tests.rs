@@ -539,3 +539,46 @@ fn hard_clear_wipes_derived_rows() {
         "fingerprint change must clear derived rows"
     );
 }
+
+/// A row-format bump must recreate the derived tables, not just clear rows:
+/// `CREATE TABLE IF NOT EXISTS` no-ops on the old SHAPE, and a shape change
+/// (v1 `files` had no `source` column) would otherwise fail every future
+/// shred while composition masks it (refs stay resident, retrieval dead).
+#[test]
+fn ref_rows_version_bump_recreates_old_shape_tables() {
+    let conn = Connection::open_in_memory().unwrap();
+    // Simulate a v1-era DB: old files shape + stale version stamp.
+    conn.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('ref_rows_version', '1');
+         CREATE TABLE files (file_id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+         CREATE TABLE strings (str_id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE);
+         CREATE TABLE refs (file_id INTEGER, name_id INTEGER);",
+    )
+    .unwrap();
+    init_schema(&conn).unwrap();
+    // The v2 shape must accept a tier-tagged shred.
+    shred_ref_rows(&conn, "/migrated.pm", "workspace", &[]).unwrap();
+    assert!(has_ref_rows(&conn, "/migrated.pm"));
+}
+
+/// The @INC hard-clear is tier-scoped: a PERL5LIB change must take the
+/// import tier (blobs AND derived rows) while workspace rows — possibly
+/// committed by the concurrent indexer moments earlier — survive.
+#[test]
+fn inc_clear_is_import_tier_scoped() {
+    let conn = test_db();
+    validate_inc_paths(&conn, &[PathBuf::from("/lib/a")]).unwrap();
+    shred_ref_rows(&conn, "/ws/File.pm", "workspace", &[]).unwrap();
+    shred_ref_rows(&conn, "/inc/Dep.pm", "import", &[]).unwrap();
+
+    validate_inc_paths(&conn, &[PathBuf::from("/lib/CHANGED")]).unwrap();
+    assert!(
+        has_ref_rows(&conn, "/ws/File.pm"),
+        "workspace rows must survive an @INC change"
+    );
+    assert!(
+        !has_ref_rows(&conn, "/inc/Dep.pm"),
+        "import rows must clear on an @INC change"
+    );
+}

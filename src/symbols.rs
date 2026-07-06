@@ -1307,7 +1307,8 @@ pub fn hover_info(
                     .defining_module_cached(&import.module_name, &remote_name)
                     .or_else(|| module_index.get_cached(&import.module_name))
                 {
-                    if let Some(sub_info) = cached.sub_info(&remote_name) {
+                    let whole = module_index.bag_present(&cached);
+                    if let Some(sub_info) = whole.sub_info_view(&remote_name) {
                         // Present the sig under the LOCAL name — that's
                         // what the user typed and what hover should lead
                         // with; the remote name is just how we fetched it.
@@ -1342,7 +1343,8 @@ pub fn hover_info(
             if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
                 let bare = r.unqualified_target_name();
                 if let Some(cached) = module_index.get_cached(pkg) {
-                    if let Some(sub_info) = cached.sub_info(bare) {
+                    let whole = module_index.bag_present(&cached);
+                    if let Some(sub_info) = whole.sub_info_view(bare) {
                         let sig = format_imported_signature(bare, &sub_info);
                         let mut parts = vec![format!("```perl\n{}\n```", sig)];
                         if let Some(doc) = sub_info.doc() {

@@ -745,7 +745,14 @@ pub fn index_workspace_with_index(
     let mut warmed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if let Some(ref conn) = conn {
         let mut dead_rows: Vec<PathBuf> = Vec::new();
-        let backfill_tx = conn.unchecked_transaction().ok();
+        // Backfill shreds are DEFERRED past the warm scan: writing inside
+        // the streaming SELECT's transaction pins a read snapshot that a
+        // concurrent resolver-thread commit turns into SQLITE_BUSY_SNAPSHOT
+        // (not retried by the busy handler) — silently voiding the whole
+        // backfill. Row-less files stay WHOLE this session (refs resident);
+        // their rows land below for the next one.
+        let mut pending_backfill: Vec<(PathBuf, Vec<crate::file_analysis::RefRowSeed>)> =
+            Vec::new();
         let (_n, _stale) =
             module_cache::warm_cache_streaming(conn, Some("workspace"), &mut |_name, path, mut fa| {
                 if !canon_members.contains(&path) {
@@ -753,18 +760,13 @@ pub fn index_workspace_with_index(
                     return;
                 }
                 let path_str = path.to_string_lossy();
-                // Refs are stripped below ONLY when their rows are known
-                // present — an evicted copy without rows is invisible to the
-                // backward walk (rows name candidates; the blob rehydrates).
-                let mut rows_ok = module_cache::has_ref_rows(conn, &path_str);
+                // Refs strip ONLY when their rows are known present — an
+                // evicted copy without rows is invisible to the backward
+                // walk (rows name candidates; the blob rehydrates).
+                let rows_ok = module_cache::has_ref_rows(conn, &path_str);
                 if !rows_ok {
-                    let seeds: Vec<_> = fa.refs.iter().map(|r| r.row_seed()).collect();
-                    match module_cache::shred_ref_rows(conn, &path_str, "workspace", &seeds) {
-                        Ok(()) => rows_ok = true,
-                        Err(e) => {
-                            log::warn!("Failed to backfill ref rows for {:?}: {}", path, e)
-                        }
-                    }
+                    pending_backfill
+                        .push((path.clone(), fa.refs.iter().map(|r| r.row_seed()).collect()));
                 }
                 if let Some(idx) = module_index {
                     idx.record_workspace_projections(&path, &fa);
@@ -783,13 +785,32 @@ pub fn index_workspace_with_index(
                 count.fetch_add(1, Ordering::Relaxed);
                 warmed.insert(path);
             });
-        if let Some(tx) = backfill_tx {
-            if let Err(e) = tx.commit() {
-                log::error!("Workspace warm backfill commit failed: {}", e);
+        for chunk in pending_backfill.chunks(128) {
+            if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+                log::error!("Workspace backfill txn open failed; rows defer to next warm");
+                break;
+            }
+            for (path, seeds) in chunk {
+                if let Err(e) = module_cache::shred_ref_rows(
+                    conn,
+                    &path.to_string_lossy(),
+                    "workspace",
+                    seeds,
+                ) {
+                    log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                }
+            }
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                log::error!("Workspace backfill commit failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK");
             }
         }
         for path in dead_rows {
-            module_cache::invalidate_generation(conn, &path.to_string_lossy());
+            module_cache::invalidate_generation_tier(
+                conn,
+                &path.to_string_lossy(),
+                "workspace",
+            );
         }
     }
 
@@ -823,7 +844,10 @@ pub fn index_workspace_with_index(
                 if batch.is_empty() {
                     return;
                 }
-                let tx = conn.unchecked_transaction().ok();
+                // IMMEDIATE: take the write lock up front — a deferred txn
+                // that reads before writing can hit an unretryable
+                // SQLITE_BUSY_SNAPSHOT against the resolver thread's writes.
+                let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
                 for (path, blob, seeds, closure, stamp) in batch.iter() {
                     let path_str = path.to_string_lossy();
                     module_cache::save_blob_to_db_stamped(
@@ -835,16 +859,28 @@ pub fn index_workspace_with_index(
                         log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
                     }
                 }
-                if let Some(tx) = tx {
-                    if let Err(e) = tx.commit() {
+                if txn_open {
+                    if let Err(e) = conn.execute_batch("COMMIT") {
+                        let _ = conn.execute_batch("ROLLBACK");
                         // The chunk rolled back but resident copies were
-                        // already stripped — loud, never silent (the
-                        // busy_timeout makes this pathological, not routine).
+                        // already stripped. The blob in hand IS the whole
+                        // analysis — un-strip by re-registering full copies,
+                        // so nothing is lost beyond the persistence itself
+                        // (disk full / lock storm stays loud AND self-heals).
                         log::error!(
-                            "Workspace persist commit failed ({} files dropped): {}",
+                            "Workspace persist commit failed ({} files, re-registering whole copies): {}",
                             batch.len(),
                             e
                         );
+                        for (path, blob, ..) in batch.iter() {
+                            if let Some(fa) = module_cache::decode_analysis(blob) {
+                                let arc = std::sync::Arc::new(fa);
+                                files.insert_workspace_arc(path.clone(), arc.clone());
+                                if let Some(idx) = module_index {
+                                    idx.register_workspace_resident(path.clone(), arc);
+                                }
+                            }
+                        }
                     }
                 }
                 // A racing query may have pinned the previous generation in
@@ -856,6 +892,30 @@ pub fn index_workspace_with_index(
                 }
                 batch.clear();
             };
+            // A panic anywhere in a chunk must not kill the writer (workers
+            // keep stripping copies whose sends would silently fail) — treat
+            // it like a failed commit: re-register whole copies and go on.
+            let mut safe_chunk = |batch: &mut Vec<WsFresh>| {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    write_chunk(batch)
+                }));
+                if r.is_err() {
+                    log::error!(
+                        "workspace writer chunk panicked ({} files) — re-registering whole copies",
+                        batch.len()
+                    );
+                    for (path, blob, ..) in batch.iter() {
+                        if let Some(fa) = module_cache::decode_analysis(blob) {
+                            let arc = std::sync::Arc::new(fa);
+                            files.insert_workspace_arc(path.clone(), arc.clone());
+                            if let Some(idx) = module_index {
+                                idx.register_workspace_resident(path.clone(), arc);
+                            }
+                        }
+                    }
+                    batch.clear();
+                }
+            };
             while let Ok(entry) = fresh_rx.recv() {
                 batch.push(entry);
                 while batch.len() < 128 {
@@ -864,9 +924,9 @@ pub fn index_workspace_with_index(
                         Err(_) => break,
                     }
                 }
-                write_chunk(&mut batch);
+                safe_chunk(&mut batch);
             }
-            write_chunk(&mut batch);
+            safe_chunk(&mut batch);
         });
 
         paths.par_iter().for_each(|path| {
@@ -882,8 +942,10 @@ pub fn index_workspace_with_index(
                 return;
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let source = std::fs::read_to_string(path).ok()?;
+                // Stamp BEFORE reading: stamp-after-read can bless a stale
+                // parse with a fresh mtime when the file changes in between.
                 let stamp = module_cache::file_stamp(path).unwrap_or((0, 0));
+                let source = std::fs::read_to_string(path).ok()?;
                 let mut parser = create_parser();
                 let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
                 let tree = parser.parse(&source, None)?;
@@ -903,6 +965,17 @@ pub fn index_workspace_with_index(
 
             match result {
                 Ok(Some((mut analysis, stamp))) => {
+                    // The file changed while we parsed: the watcher (or next
+                    // warm) owns the fresher truth — registering this copy
+                    // would overwrite it and re-persist a generation the
+                    // watcher may have just invalidated.
+                    if module_cache::file_stamp(path) != Some(stamp) {
+                        if let Some(cb) = progress {
+                            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            cb(d, total);
+                        }
+                        return;
+                    }
                     // Projections that read the bag run on the whole
                     // analysis; the persisted generation is encoded whole;
                     // only then is the resident copy stripped.
@@ -1104,7 +1177,10 @@ pub fn index_pack_languages(
         let mut warmed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         if let Some(ref conn) = conn {
             let mut dead_rows: Vec<PathBuf> = Vec::new();
-            let backfill_tx = conn.unchecked_transaction().ok();
+            // Deferred past the warm scan — same SQLITE_BUSY_SNAPSHOT
+            // rationale as the workspace indexer's backfill.
+            let mut pending_backfill: Vec<(PathBuf, Vec<crate::file_analysis::RefRowSeed>)> =
+                Vec::new();
             let (_n, _stale) = module_cache::warm_cache_streaming(conn, None, &mut |_name, path, mut fa| {
                 if !canon_members.contains(&path) {
                     dead_rows.push(path);
@@ -1113,15 +1189,10 @@ pub fn index_pack_languages(
                 let path_str = path.to_string_lossy();
                 // Refs strip only when their rows are known present — rows
                 // name candidates for the backward walk; the blob rehydrates.
-                let mut rows_ok = module_cache::has_ref_rows(conn, &path_str);
+                let rows_ok = module_cache::has_ref_rows(conn, &path_str);
                 if !rows_ok {
-                    let seeds: Vec<_> = fa.refs.iter().map(|r| r.row_seed()).collect();
-                    match module_cache::shred_ref_rows(conn, &path_str, "workspace", &seeds) {
-                        Ok(()) => rows_ok = true,
-                        Err(e) => {
-                            log::warn!("Failed to backfill ref rows for {:?}: {}", path, e)
-                        }
-                    }
+                    pending_backfill
+                        .push((path.clone(), fa.refs.iter().map(|r| r.row_seed()).collect()));
                 }
                 if eviction_enabled() {
                     fa.evict_witness_bag();
@@ -1132,13 +1203,32 @@ pub fn index_pack_languages(
                 pack_index.register_symbols(path.clone(), Arc::new(fa));
                 warmed.insert(path);
             });
-            if let Some(tx) = backfill_tx {
-                if let Err(e) = tx.commit() {
-                    log::error!("Pack warm backfill commit failed: {}", e);
+            for chunk in pending_backfill.chunks(128) {
+                if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+                    log::error!("Pack backfill txn open failed; rows defer to next warm");
+                    break;
+                }
+                for (path, seeds) in chunk {
+                    if let Err(e) = module_cache::shred_ref_rows(
+                        conn,
+                        &path.to_string_lossy(),
+                        "workspace",
+                        seeds,
+                    ) {
+                        log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                    }
+                }
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    log::error!("Pack backfill commit failed: {}", e);
+                    let _ = conn.execute_batch("ROLLBACK");
                 }
             }
             for path in dead_rows {
-                module_cache::invalidate_generation(conn, &path.to_string_lossy());
+                module_cache::invalidate_generation_tier(
+                    conn,
+                    &path.to_string_lossy(),
+                    "workspace",
+                );
             }
         }
 
@@ -1174,7 +1264,8 @@ pub fn index_pack_languages(
                     if batch.is_empty() {
                         return;
                     }
-                    let tx = conn.unchecked_transaction().ok();
+                    // IMMEDIATE — same snapshot rationale as the workspace writer.
+                    let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
                     for (path, arc, blob, seeds, stamp) in batch.iter() {
                         let path_str = path.to_string_lossy();
                         module_cache::save_blob_to_db_stamped(
@@ -1192,13 +1283,20 @@ pub fn index_pack_languages(
                             log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
                         }
                     }
-                    if let Some(tx) = tx {
-                        if let Err(e) = tx.commit() {
+                    if txn_open {
+                        if let Err(e) = conn.execute_batch("COMMIT") {
+                            let _ = conn.execute_batch("ROLLBACK");
                             log::error!(
-                                "Pack persist commit failed ({} files dropped): {}",
+                                "Pack persist commit failed ({} files, re-registering whole copies): {}",
                                 batch.len(),
                                 e
                             );
+                            for (path, _arc, blob, ..) in batch.iter() {
+                                if let Some(fa) = module_cache::decode_analysis(blob) {
+                                    pack_index_writer
+                                        .register_symbols(path.clone(), Arc::new(fa));
+                                }
+                            }
                         }
                     }
                     // A racing query may have pinned the previous generation
@@ -1208,6 +1306,23 @@ pub fn index_pack_languages(
                     }
                     batch.clear();
                 };
+                let mut safe_chunk = |batch: &mut Vec<FreshEntry>| {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        write_chunk(batch)
+                    }));
+                    if r.is_err() {
+                        log::error!(
+                            "pack writer chunk panicked ({} files) — re-registering whole copies",
+                            batch.len()
+                        );
+                        for (path, _arc, blob, ..) in batch.iter() {
+                            if let Some(fa) = module_cache::decode_analysis(blob) {
+                                pack_index_writer.register_symbols(path.clone(), Arc::new(fa));
+                            }
+                        }
+                        batch.clear();
+                    }
+                };
                 while let Ok(entry) = fresh_rx.recv() {
                     batch.push(entry);
                     while batch.len() < 128 {
@@ -1216,9 +1331,9 @@ pub fn index_pack_languages(
                             Err(_) => break,
                         }
                     }
-                    write_chunk(&mut batch);
+                    safe_chunk(&mut batch);
                 }
-                write_chunk(&mut batch);
+                safe_chunk(&mut batch);
             });
 
             paths.par_iter().for_each(|path| {
@@ -1240,6 +1355,10 @@ pub fn index_pack_languages(
                     Some((driver.analyze_with_path(&source, Some(path)), stamp))
                 }));
                 if let Ok(Some((mut analysis, stamp))) = res {
+                    // Same changed-under-us guard as the workspace worker.
+                    if module_cache::file_stamp(path) != Some(stamp) {
+                        return;
+                    }
                     // Encode the FULL analysis for the disk write, then strip
                     // the resident copy — one struct, no clone
                     // (`docs/adr/memory-slice-2-lru.md`). Strip only when the
