@@ -1152,7 +1152,7 @@ impl<'a> CandidateSet<'a> {
         let connected = |cached: &crate::file_analysis::CachedModule| {
             let p = cached.path.to_string_lossy();
             visible.contains(p.as_ref())
-                || cached.analysis.include_closure.iter().any(|c| c.as_ref() == self_str)
+                || cached.analysis.include_closure.contains(&self_str)
         };
         // Name-indexed def candidates first (a File-scope member the index
         // registered) — the cheap subset, path-sorted for determinism.
@@ -1298,7 +1298,7 @@ impl<'a> CandidateSet<'a> {
                     }
                     let p = cached.path.to_string_lossy().into_owned();
                     let connected = visible.contains(&p)
-                        || cached.analysis.include_closure.iter().any(|c| c.as_ref() == self_str);
+                        || cached.analysis.include_closure.contains(&self_str);
                     if !connected {
                         continue;
                     }
@@ -1448,7 +1448,7 @@ impl<'a> CandidateSet<'a> {
                 }
                 let p = cached.path.to_string_lossy().into_owned();
                 let connected = visible.contains(&p)
-                    || cached.analysis.include_closure.iter().any(|c| c.as_ref() == self_str);
+                    || cached.analysis.include_closure.contains(&self_str);
                 if !connected {
                     continue;
                 }
@@ -2100,7 +2100,7 @@ impl<'a> CandidateSet<'a> {
             if mask.contains(RoleMask::DEPENDENCY) && !self.origin.include_closure.is_empty() {
                 if let Some(idx) = self.module_index {
                     let visible: std::collections::HashSet<String> =
-                        self.origin.include_closure.iter().map(|a| a.as_ref().to_owned()).collect();
+                        self.origin.include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
                     for (name, cached) in idx.visible_defs_with_prefix(prefix, &visible) {
                         // Only linkage-visible defs (a TU-static never
                         // completes elsewhere). Symbol detail (kind, parent
@@ -2338,7 +2338,7 @@ impl<'a> CandidateSet<'a> {
                 module_index.for_each_cached_file(&mut |cached| {
                     let p = cached.path.to_string_lossy();
                     let connected = visible.contains(p.as_ref())
-                        || cached.analysis.include_closure.iter().any(|c| c.as_ref() == self_str);
+                        || cached.analysis.include_closure.contains(&self_str);
                     if !connected {
                         return;
                     }
@@ -3066,7 +3066,7 @@ pub fn refs_to(
             idx.for_each_cached_file(&mut |cached| {
                 let own = cached.path.to_string_lossy();
                 if file_sees_target(target, &cached.analysis, &own) {
-                    seen_by_inclusion.extend(cached.analysis.include_closure.iter().map(|a| a.as_ref().to_owned()));
+                    seen_by_inclusion.extend(cached.analysis.include_closure.iter_strs().map(|a| a.as_ref().to_owned()));
                 }
             });
         }
@@ -3928,7 +3928,7 @@ fn pack_def_paths(
         // targets.
         if c.analysis.names_macro_def(name, None)
             || visible.contains(&p)
-            || c.analysis.include_closure.iter().any(|c| c.as_ref() == self_str)
+            || c.analysis.include_closure.contains(&self_str)
         {
             out.push(p);
         }
@@ -4261,7 +4261,7 @@ fn file_sees_target(target: &TargetRef, analysis: &FileAnalysis, file_str: &str)
         || target
             .def_paths
             .iter()
-            .any(|d| d == file_str || analysis.include_closure.iter().any(|c| c.as_ref() == d.as_str()))
+            .any(|d| d == file_str || analysis.include_closure.contains(d))
 }
 
 /// A `FileKey`'s canonical path string — the spelling the visibility facts
@@ -4293,7 +4293,7 @@ fn collect_from_analysis(
         .iter()
         .filter(|a| {
             a.def_path == file_str
-                || analysis.include_closure.iter().any(|c| c.as_ref() == a.def_path)
+                || analysis.include_closure.contains(&a.def_path)
         })
         .collect();
 

@@ -2439,11 +2439,7 @@ pub fn query_sub_return_type(
                     // so gate BEFORE rehydrating — an unreachable candidate
                     // never pays a bag decode.
                     let reachable = visible.contains(p.as_ref())
-                        || cached
-                            .analysis
-                            .include_closure
-                            .iter()
-                            .any(|c| c.as_ref() == self_str.as_ref());
+                        || cached.analysis.include_closure.contains(self_str.as_ref());
                     if !reachable {
                         continue;
                     }

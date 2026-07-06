@@ -54,12 +54,22 @@ Format per entry:
   B — dedupe identical closure SETS across files (headers within one
   subtree share suffixes; measure hit rate first). C — roaring bitmaps
   over the global file table (best compression, new dep).
-- **Picked:** nothing yet — out of scope for the symbols phase; logged
-  because the measurement moved it to #1.
-- **Undo cost:** n/a (unpicked).
-- **Discussion needed:** whether closure membership checks can move
-  behind a small trait so the representation can change without touching
-  the gates (same seam discipline as the present-views).
+- **Picked:** A, landed same day (`path_intern::ClosureList` — sorted
+  `Arc<[u32]>` over a process-global path-id table; serde keeps the
+  `Vec<String>` blob shape so no EXTRACT_VERSION bump). Membership became
+  id binary-search (`contains`), set/save consumers go through
+  `iter_strs`. One subtlety worth remembering: `closure_stamp` had to
+  SORT before hashing — id order is global mint order, nondeterministic
+  across sessions, and an order-sensitive hash would have silently
+  invalidated every warm row every run. Measured on abseil: closure
+  bucket 10.8 → 1.8 MB (residual is `include_directives` strings), whole
+  payload 20.2 → 11.2 MB; table 1,123 paths / 0.1 MB. Chromium
+  projection: 2,827 MB → roughly 300–500 MB + a ~150 MB one-time table.
+- **Undo cost:** small — representation is private to `ClosureList`;
+  swapping to dedup'd sets (B) or bitmaps (C) touches only the type.
+- **Discussion needed:** whether `include_directives` (now the residual)
+  should ride the same table; and whether B (closure-set dedup) stacks
+  worthwhile savings on top at chromium depth.
 
 ## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — RATIFIED + RENAME LANDED (veesh, 2026-07-05)
 - **Context:** hitlist-3 Family A+I slice. The implicit-member pass is

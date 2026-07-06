@@ -508,15 +508,21 @@ pub fn file_stamp(path: &std::path::Path) -> Option<(i64, i64)> {
 /// → 0, so the Perl path pays nothing. `stat_memo` dedups stats across a warm
 /// run (closures overlap heavily — op.c and sv.c share ~90% of perl5's tree).
 fn closure_stamp(
-    closure: &[std::sync::Arc<str>],
+    closure: &crate::file_analysis::path_intern::ClosureList,
     stat_memo: &mut std::collections::HashMap<String, (i64, i64)>,
 ) -> i64 {
     use std::hash::{Hash, Hasher};
     if closure.is_empty() {
         return 0;
     }
+    // Deterministic member order: the id-list iterates in global mint
+    // order, which varies run-to-run (Rayon interning races) — an
+    // order-sensitive hash would invalidate every warm row. Sort the
+    // strings.
+    let mut members: Vec<std::sync::Arc<str>> = closure.iter_strs().collect();
+    members.sort();
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for p in closure {
+    for p in members {
         let stamp = *stat_memo
             .entry(p.as_ref().to_owned())
             .or_insert_with(|| file_stamp(std::path::Path::new(p.as_ref())).unwrap_or((0, -1)));
@@ -574,7 +580,7 @@ pub fn save_blob_to_db(
     conn: &Connection,
     module_name: &str,
     path: &std::path::Path,
-    include_closure: &[std::sync::Arc<str>],
+    include_closure: &crate::file_analysis::path_intern::ClosureList,
     blob: &[u8],
     source: &str,
 ) {
@@ -592,7 +598,7 @@ pub fn save_blob_to_db_stamped(
     conn: &Connection,
     module_name: &str,
     path: &std::path::Path,
-    include_closure: &[std::sync::Arc<str>],
+    include_closure: &crate::file_analysis::path_intern::ClosureList,
     blob: &[u8],
     source: &str,
     stamp: (i64, i64),

@@ -846,7 +846,7 @@ pub fn index_workspace_with_index(
         Vec<u8>,
         Vec<crate::file_analysis::RefRowSeed>,
         Vec<crate::file_analysis::SymRowSeed>,
-        Vec<std::sync::Arc<str>>,
+        crate::file_analysis::path_intern::ClosureList,
         (i64, i64),
     );
     let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
@@ -1463,6 +1463,12 @@ pub fn index_pack_languages(
         let mut agg = crate::file_analysis::HeapBreakdown::default();
         hub.for_each_pack_registered_file(&mut |_path, fa| agg.add(&fa.heap_estimate()));
         eprintln!("[heap-dump] {agg}");
+        let (paths, bytes) = crate::file_analysis::path_intern::table_stats();
+        eprintln!(
+            "[heap-dump] path-id table (process-wide, counted once): {} paths, {:.1} MB",
+            paths,
+            bytes as f64 / (1024.0 * 1024.0)
+        );
     }
     total.load(Ordering::Relaxed)
 }
@@ -1497,7 +1503,7 @@ pub fn pack_file_changed(
     let mut consumers: Vec<PathBuf> = Vec::new();
     if let Some(ref pack) = pack {
         pack.for_each_registered_file(&mut |cm| {
-            if cm.analysis.include_closure.iter().any(|c| c.as_ref() == canon_str) {
+            if cm.analysis.include_closure.contains(&canon_str) {
                 consumers.push(cm.path.clone());
             }
         });

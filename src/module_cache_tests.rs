@@ -378,7 +378,8 @@ fn header_change_invalidates_consumer_row_via_deps_stamp() {
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
     let tree = parser.parse(&source, None).unwrap();
     let mut fa = crate::builder::build(&tree, source.as_bytes());
-    fa.include_closure = vec![hdr_canon.into()];
+    fa.include_closure =
+        crate::file_analysis::path_intern::ClosureList::from_iter(std::iter::once(hdr_canon.as_str()));
     let cached = Some(Arc::new(CachedModule::new(pm.clone(), Arc::new(fa))));
     // warm_cache serves the 'import' tier ('workspace' rows stream through
     // warm_cache_streaming); the deps_stamp semantics under test are

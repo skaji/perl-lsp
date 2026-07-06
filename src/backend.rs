@@ -960,7 +960,7 @@ impl Backend {
                             .ok()
                             .map(|p| p.canonicalize().unwrap_or(p) == canon)
                             .unwrap_or(false);
-                    if is_self || analysis.include_closure.iter().any(|c| c.as_ref() == canon_str) {
+                    if is_self || analysis.include_closure.contains(&canon_str) {
                         to_refresh.push(u);
                     }
                 }

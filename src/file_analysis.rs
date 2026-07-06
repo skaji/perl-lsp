@@ -343,6 +343,129 @@ pub mod path_intern {
             Ok(super::intern_all(raw.iter().map(|s| s.as_str())))
         }
     }
+
+    // ---- Global path-id table (the ClosureList substrate) ----
+    //
+    // Closures at scale are the largest resident bucket as 16-byte
+    // `Arc<str>` pointer vecs (chromium: 2.8 GB / 41% of the floor). A
+    // sorted `Arc<[u32]>` over one process-global id table is 4× smaller
+    // per entry and turns the hot membership gate into id-compare binary
+    // search. IDs are process-local (never serialized — the blob keeps
+    // `Vec<String>`), so the table only ever grows within a session.
+
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    struct PathIds {
+        by_str: HashMap<Arc<str>, u32>,
+        by_id: Vec<Arc<str>>,
+    }
+
+    static IDS: OnceLock<RwLock<PathIds>> = OnceLock::new();
+
+    fn ids() -> &'static RwLock<PathIds> {
+        IDS.get_or_init(|| {
+            RwLock::new(PathIds { by_str: HashMap::new(), by_id: Vec::new() })
+        })
+    }
+
+    /// The id for `s`, minting one if unseen.
+    fn id_intern(s: &str) -> u32 {
+        {
+            let g = ids().read().unwrap();
+            if let Some(&id) = g.by_str.get(s) {
+                return id;
+            }
+        }
+        let mut g = ids().write().unwrap();
+        if let Some(&id) = g.by_str.get(s) {
+            return id;
+        }
+        let a: Arc<str> = Arc::from(s);
+        let id = g.by_id.len() as u32;
+        g.by_id.push(a.clone());
+        g.by_str.insert(a, id);
+        id
+    }
+
+    /// The id for `s` ONLY if some closure already interned it — a miss
+    /// means no closure can contain it (lookups must not grow the table).
+    fn id_lookup(s: &str) -> Option<u32> {
+        ids().read().unwrap().by_str.get(s).copied()
+    }
+
+    fn str_of(id: u32) -> Arc<str> {
+        ids().read().unwrap().by_id[id as usize].clone()
+    }
+
+    /// Process-wide table cost (counted ONCE, not per file): unique paths
+    /// and their string bytes across both the Arc pool and the id table.
+    pub fn table_stats() -> (usize, usize) {
+        let g = ids().read().unwrap();
+        let bytes: usize = g
+            .by_id
+            .iter()
+            .map(|a| a.len() + std::mem::size_of::<Arc<str>>() * 2 + 8)
+            .sum();
+        (g.by_id.len(), bytes)
+    }
+
+    /// A file's `#include` closure as sorted path-ids over the global
+    /// table. Semantically a set of path strings; consumers ask membership
+    /// (`contains`) or iterate the strings — the representation is private
+    /// so it can keep shrinking (`docs/open-forks.md`, closure
+    /// representation fork).
+    #[derive(Debug, Clone, Default)]
+    pub struct ClosureList(Arc<[u32]>);
+
+    impl ClosureList {
+        pub fn from_iter<'a>(items: impl Iterator<Item = &'a str>) -> Self {
+            let mut v: Vec<u32> = items.map(id_intern).collect();
+            v.sort_unstable();
+            v.dedup();
+            ClosureList(v.into())
+        }
+
+        pub fn contains(&self, s: &str) -> bool {
+            match id_lookup(s) {
+                Some(id) => self.0.binary_search(&id).is_ok(),
+                None => false,
+            }
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// The member paths as shared strings (save path, visibility sets).
+        pub fn iter_strs(&self) -> impl Iterator<Item = Arc<str>> + '_ {
+            self.0.iter().map(|&id| str_of(id))
+        }
+
+        /// Per-file resident bytes (the id array; the global table is
+        /// counted once process-wide, not per file).
+        pub fn heap_bytes(&self) -> usize {
+            self.0.len() * std::mem::size_of::<u32>()
+        }
+    }
+
+    impl serde::Serialize for ClosureList {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(self.iter_strs().map(|a| a.as_ref().to_owned()))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for ClosureList {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            use serde::Deserialize;
+            let raw = Vec::<String>::deserialize(d)?;
+            Ok(ClosureList::from_iter(raw.iter().map(|s| s.as_str())))
+        }
+    }
 }
 
 pub trait CrossFileLookup {
@@ -529,11 +652,11 @@ impl<'a> ScopedLookup<'a> {
     /// the self path so it matches the candidates' canonical `CachedModule.path`.
     pub fn new(
         inner: &'a dyn CrossFileLookup,
-        include_closure: &[std::sync::Arc<str>],
+        include_closure: &path_intern::ClosureList,
         self_path: Option<&std::path::Path>,
     ) -> Self {
         let mut visible: std::collections::HashSet<String> =
-            include_closure.iter().map(|a| a.as_ref().to_owned()).collect();
+            include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
         let self_path = self_path.map(|p| {
             let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             visible.insert(canon.to_string_lossy().into_owned());
@@ -3991,8 +4114,8 @@ pub struct FileAnalysis {
     /// `get_cached` candidates by reachability; `docs/adr/macro-handling.md`,
     /// "the include-closure lie"). Pack-language only; Perl leaves it empty, so
     /// the ranking is a no-op there (empty closure → global winner unchanged).
-    #[serde(default, with = "path_intern::vec")]
-    pub include_closure: Vec<std::sync::Arc<str>>,
+    #[serde(default)]
+    pub include_closure: path_intern::ClosureList,
 
     /// This analysis was produced from degraded inputs — a parse/extract
     /// failure, or a skipped cross-file macro gather (the on-open
@@ -4335,7 +4458,7 @@ impl FileAnalysis {
             // Populated post-construction: `include_directives` from the skeleton,
             // `include_closure` by the driver (it holds the resolving file path).
             include_directives: Vec::new(),
-            include_closure: Vec::new(),
+            include_closure: path_intern::ClosureList::default(),
             degraded: false,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
@@ -13112,12 +13235,9 @@ impl FileAnalysis {
         h.witness_index = wi;
 
         // include closure — the shared-header-path duplication.
-        h.include = vcap(&self.include_closure)
-            // Interned Arc<str>: per-file cost is the pointer vec; the shared
-            // string bytes are counted once per unique path process-wide, which
-            // this per-file estimate approximates as len/refcount-free 16-byte
-            // fat pointers (the interner pool itself is a few hundred KB).
-            + self.include_closure.capacity() * std::mem::size_of::<std::sync::Arc<str>>()
+        // Sorted path-ids over the global table: 4 bytes per entry; the
+        // table's string bytes are process-wide, counted once, not per file.
+        h.include = self.include_closure.heap_bytes()
             + vcap(&self.include_directives)
             + self
                 .include_directives
