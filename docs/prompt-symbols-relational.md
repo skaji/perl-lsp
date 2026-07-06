@@ -123,7 +123,16 @@ present; `symbols_evicted` flag; consumers that read symbol detail from a
 `rehydrate_or_resident` LRU body — one miss policy for bag / refs /
 symbols). `whole_present` grows the third axis.
 
-### Phase C — register-from-tables warm start
+### Phase C — register-from-tables warm start (PARKED → the Surface)
+
+Parked deliberately, not dropped: the no-decode warm start needs a
+per-file registration seed (names + kinds + linkage + specializes +
+closure + the Perl projections), and that seed IS the span-free Surface
+`docs/prompt-storage-engine.md` Phase 1 builds — building it twice
+against two different shapes is the wasteful path. When the Surface
+lands (persisted as its own small column), warm registration decodes
+Surfaces only and the 9-minute chromium decode-everything wall falls out
+of that work. The original sketch below is kept for the record.
 
 Warm start today decodes every blob once (streaming, one resident at a
 time) to (a) re-register name→file feeds and (b) re-shred missing rows.
