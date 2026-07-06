@@ -123,3 +123,36 @@ fn freshness_dirty_closure_walks_imports_and_parent_chains() {
     idx.remove(&app);
     assert!(idx.dirty_consumers(&mid).is_empty());
 }
+
+/// cpp surfaces: file-scope values, class fields, and enum constants are
+/// cross-file-visible (C linkage exports everything) — adding one must
+/// flip equality, while a function-body edit must not.
+#[cfg(feature = "cpp")]
+#[test]
+fn cpp_values_are_on_the_surface_and_bodies_are_not() {
+    let build_cpp = |src: &str| {
+        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        let driver = reg
+            .for_path(std::path::Path::new("/fake/surface_test.cpp"))
+            .expect("cpp driver");
+        driver.analyze_with_path(src, None)
+    };
+    let base = "int counter = 0;\nenum Color { RED, GREEN };\nclass Box {\npublic:\n    int width;\n    int area() { return width * 2; }\n};\n";
+    let s0 = Surface::project(&build_cpp(base));
+
+    // Body edit inside a method: surface-equal.
+    let body = base.replace("return width * 2;", "int w = width;\n        return w + w;");
+    assert_eq!(s0, Surface::project(&build_cpp(&body)), "cpp body edit must not change the surface");
+
+    // New file-scope global: unequal.
+    let global = base.replace("int counter = 0;", "int counter = 0;\nint other = 1;");
+    assert_ne!(s0, Surface::project(&build_cpp(&global)), "new global must change the surface");
+
+    // New enum constant: unequal.
+    let variant = base.replace("RED, GREEN", "RED, GREEN, BLUE");
+    assert_ne!(s0, Surface::project(&build_cpp(&variant)), "new enum constant must change the surface");
+
+    // New class field: unequal.
+    let field = base.replace("int width;", "int width;\n    int height;");
+    assert_ne!(s0, Surface::project(&build_cpp(&field)), "new field must change the surface");
+}

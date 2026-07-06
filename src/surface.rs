@@ -40,6 +40,9 @@ pub struct PackageSurface {
     pub is_role: bool,
     /// Cross-file-callable members, sorted by (name, kind).
     pub methods: Vec<MethodSurface>,
+    /// Cross-file-visible non-callables owned by this package (class
+    /// fields, named-enum constants, `our` globals), sorted by (name, kind).
+    pub values: Vec<ValueSurface>,
 }
 
 /// One callable's cross-file-visible contract.
@@ -62,11 +65,26 @@ pub struct MethodSurface {
     pub hash_keys: Vec<String>,
 }
 
+/// One cross-file-visible non-callable: a C global / enum constant /
+/// struct field, a Perl `our` package global. Adding, removing, or
+/// re-kinding one IS a cross-file change (member access, bare-value
+/// reads, goto-def all see it) — without these the cpp firewall reads a
+/// new global as Unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValueSurface {
+    pub name: String,
+    /// `SymKind` discriminant via `sym_kind_code`.
+    pub kind: u8,
+}
+
 /// The whole file's span-free cross-file surface. `Default` is the empty
 /// surface (a file exporting nothing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Surface {
     pub packages: Vec<PackageSurface>,
+    /// Cross-file-visible values with no owning package (C file-scope
+    /// globals / anonymous-enum constants), sorted.
+    pub free_values: Vec<ValueSurface>,
     /// Modules this file loads (`use`/`require`/plugin loads) — the
     /// DEPENDENCY half of the freshness edge: this file's enrichment
     /// depends on the Surface of each import ∪ parent ∪ bridge.
@@ -87,6 +105,7 @@ impl Surface {
     pub fn project(fa: &FileAnalysis) -> Surface {
         let mut by_pkg: std::collections::BTreeMap<String, PackageSurface> =
             std::collections::BTreeMap::new();
+        let mut free_values: Vec<ValueSurface> = Vec::new();
         // Every package with parents or role-ness exists on the surface
         // even if it declares no callable members.
         for (pkg, parents) in &fa.package_parents {
@@ -147,10 +166,39 @@ impl Surface {
                         hash_keys,
                     });
                 }
+                SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
+                    // Cross-file-visible values: the C-linkage file-scope
+                    // gate OR class content (fields / named-enum constants
+                    // reachable via member access).
+                    if !(fa.is_linkage_visible(sym) || fa.symbol_is_class_content(sym)) {
+                        continue;
+                    }
+                    let v = ValueSurface {
+                        name: sym.name.clone(),
+                        kind: crate::file_analysis::sym_kind_code(&sym.kind),
+                    };
+                    match sym.package.clone() {
+                        Some(pkg) => {
+                            by_pkg
+                                .entry(pkg.clone())
+                                .or_insert_with(|| PackageSurface {
+                                    name: pkg,
+                                    ..Default::default()
+                                })
+                                .values
+                                .push(v);
+                        }
+                        None => free_values.push(v),
+                    }
+                }
                 _ => {}
             }
         }
         let mut packages: Vec<PackageSurface> = by_pkg.into_values().collect();
+        let sort_values = |vs: &mut Vec<ValueSurface>| {
+            vs.sort_by(|a, b| (&a.name, a.kind).cmp(&(&b.name, b.kind)));
+            vs.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
+        };
         for p in &mut packages {
             p.is_role = fa.is_role_package(&p.name);
             p.methods.sort_by(|a, b| (&a.name, a.kind).cmp(&(&b.name, b.kind)));
@@ -158,7 +206,9 @@ impl Surface {
             // once — the FIRST after sort, matching sub_info_view's
             // primary-pick determinism closely enough for equality use.
             p.methods.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
+            sort_values(&mut p.values);
         }
+        sort_values(&mut free_values);
         let mut imports: Vec<String> = fa
             .imports
             .iter()
@@ -187,6 +237,7 @@ impl Surface {
         plugin_bridges.dedup();
         Surface {
             packages,
+            free_values,
             imports,
             exports: sorted(&fa.export),
             exports_ok: sorted(&fa.export_ok),
