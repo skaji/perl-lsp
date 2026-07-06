@@ -153,6 +153,12 @@ async fn main() {
             cli_heatmap(&args[2], &args[3..]);
             return;
         }
+        Some("--refs-parity") if args.len() >= 3 => {
+            let sample = args.get(3).and_then(|a| a.strip_prefix("--sample="))
+                .and_then(|n| n.parse::<usize>().ok());
+            cli_refs_parity(&args[2], sample);
+            return;
+        }
         Some("--batch") if args.len() >= 3 => {
             cli_batch(&args[2]);
             return;
@@ -2366,6 +2372,152 @@ fn heatmap_symbol_row(
     (row, is_callable, dead)
 }
 
+/// --refs-parity <root> — the relational-ref-index migration net
+/// (`docs/prompt-relational-ref-index.md`). Mints the CandidateSet at every
+/// heatmap-eligible symbol declaration (Perl workspace + pack files) and
+/// projects `references()` twice — resident scan (`PERL_LSP_REF_ROWS=0`) vs
+/// SQL retrieval (`=1`) — asserting identical (file, span, access,
+/// rewritable) sets. Exit 1 on any divergence. A dev/CI net, not a user
+/// verb: run it against a real corpus after touching `refs_to`, the shred,
+/// or the eviction seams.
+fn cli_refs_parity(root: &str, sample: Option<usize>) {
+    // The A/B needs the resident side complete: keep refs + bags resident
+    // (rows are still written — eviction and persistence are independent).
+    std::env::set_var("PERL_LSP_NO_EVICT", "1");
+    let (ws, idx) = cli_full_startup(root);
+    let scope = override_scope_from_env();
+
+    let mut pack_entries: Vec<(
+        std::path::PathBuf,
+        std::sync::Arc<file_analysis::FileAnalysis>,
+        std::sync::Arc<module_index::ModuleIndex>,
+    )> = Vec::new();
+    idx.for_each_pack_index(|_lang, pack| {
+        pack.for_each_registered_file(&mut |cached| {
+            // Index copies are refs-evicted; fan-out scans + set minting read
+            // refs, so take the refs-present view (resident when not evicted,
+            // rehydrated otherwise). Batch-CLI-sized cost, not a query path.
+            pack_entries.push((
+                cached.path.clone(),
+                file_analysis::CrossFileLookup::refs_present(pack.as_ref(), cached),
+                std::sync::Arc::clone(pack),
+            ));
+        });
+    });
+    pack_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
+        .workspace_raw()
+        .iter()
+        .map(|e| (e.key().clone(), std::sync::Arc::clone(e.value())))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let normalize = |locs: &[resolve::RefLocation]| -> Vec<String> {
+        let mut v: Vec<String> = locs
+            .iter()
+            .map(|l| {
+                format!(
+                    "{:?}:{}:{}-{}:{}:{:?}:{}",
+                    l.key,
+                    l.span.start.row,
+                    l.span.start.column,
+                    l.span.end.row,
+                    l.span.end.column,
+                    l.access,
+                    l.rewritable
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // `--sample=N` strides the symbol universe down to ~N checks — the
+    // per-phase quick net (~a minute). The full sweep (no flag) is the
+    // pre-merge gate: it re-runs the OLD O(symbols × tree) resident walk
+    // per symbol, so it is heatmap×2-shaped by construction.
+    let mut seen_symbols = 0usize;
+    let total_symbols: usize = entries.iter().map(|(_, a)| a.symbols.len()).sum::<usize>()
+        + pack_entries.iter().map(|(_, a, _)| a.symbols.len()).sum::<usize>();
+    let stride = sample
+        .map(|n| (total_symbols / n.max(1)).max(1))
+        .unwrap_or(1);
+    let mut checked = 0usize;
+    let mut mismatched = 0usize;
+    let mut check = |ws: &file_store::FileStore,
+                     routing: &dyn file_analysis::CrossFileLookup,
+                     path: &std::path::Path,
+                     analysis: &file_analysis::FileAnalysis,
+                     is_pack: bool,
+                     checked: &mut usize,
+                     mismatched: &mut usize| {
+        for sym in &analysis.symbols {
+            seen_symbols += 1;
+            if seen_symbols % stride != 0 {
+                continue;
+            }
+            if sym.hidden_in_outline() || !heatmap_symbol_eligible(sym) {
+                continue;
+            }
+            if *checked % 200 == 0 && *checked > 0 {
+                eprintln!("refs-parity: {} checked...", *checked);
+            }
+            let mut cs = resolve::resolve(
+                ws,
+                analysis,
+                file_store::FileKey::Path(path.to_path_buf()),
+                sym.selection_span.start,
+                Some(routing),
+                scope,
+            );
+            if is_pack {
+                cs = cs.pack_routed();
+            } else {
+                cs = cs.with_visibility(resolve::RoleMask::VISIBLE);
+            }
+            std::env::set_var("PERL_LSP_REF_ROWS", "0");
+            let resident = normalize(&cs.references());
+            std::env::set_var("PERL_LSP_REF_ROWS", "1");
+            let rows = normalize(&cs.references());
+            std::env::remove_var("PERL_LSP_REF_ROWS");
+            *checked += 1;
+            if resident != rows {
+                *mismatched += 1;
+                let only_resident: Vec<_> =
+                    resident.iter().filter(|x| !rows.contains(x)).take(3).collect();
+                let only_rows: Vec<_> =
+                    rows.iter().filter(|x| !resident.contains(x)).take(3).collect();
+                eprintln!(
+                    "PARITY MISMATCH {}::{} @ {:?} — resident {} vs rows {}\n  only-resident: {:?}\n  only-rows: {:?}",
+                    sym.package.as_deref().unwrap_or(""),
+                    sym.name,
+                    path,
+                    resident.len(),
+                    rows.len(),
+                    only_resident,
+                    only_rows
+                );
+            }
+        }
+    };
+
+    for (path, analysis) in &entries {
+        check(&ws, &idx, path, analysis, false, &mut checked, &mut mismatched);
+    }
+    for (path, analysis, pack) in &pack_entries {
+        check(&ws, pack.as_ref(), path, analysis, true, &mut checked, &mut mismatched);
+    }
+
+    println!(
+        "refs-parity: {} symbols checked, {} mismatched",
+        checked, mismatched
+    );
+    if mismatched > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// --heatmap <root> [--csv|--html] [--include-deps] [--all] — Code-usage heatmap.
 ///
 /// Emits per-symbol USAGE metrics as a projection of the resolution
@@ -2415,9 +2567,12 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     )> = Vec::new();
     idx.for_each_pack_index(|_lang, pack| {
         pack.for_each_registered_file(&mut |cached| {
+            // Index copies are refs-evicted; fan-out scans + set minting read
+            // refs, so take the refs-present view (resident when not evicted,
+            // rehydrated otherwise). Batch-CLI-sized cost, not a query path.
             pack_entries.push((
                 cached.path.clone(),
-                std::sync::Arc::clone(&cached.analysis),
+                file_analysis::CrossFileLookup::refs_present(pack.as_ref(), cached),
                 std::sync::Arc::clone(pack),
             ));
         });

@@ -93,6 +93,30 @@ pub fn open_cache_db(_workspace_root: Option<&str>, _lang: &str) -> Option<Conne
     None
 }
 
+/// Read-only open for query-path consumers (the relational retrieval, bag
+/// rehydration): no schema init, no WAL pragma churn — the writer created
+/// the schema. Returns `None` when the DB file doesn't exist yet (nothing
+/// persisted → no candidates), or in tests.
+#[cfg(not(test))]
+pub fn open_cache_db_readonly(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
+    let dir = cache_dir_for_workspace(workspace_root)?;
+    let db_path = if lang == "perl" {
+        dir.join("modules.db")
+    } else {
+        dir.join(format!("modules-{lang}.db"))
+    };
+    Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()
+}
+
+#[cfg(test)]
+pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Option<Connection> {
+    None
+}
+
 /// Bumped when the ROW format of the relational ref index changes shape.
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
 /// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the

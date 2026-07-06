@@ -304,6 +304,14 @@ pub struct ModuleIndex {
     /// reaching into an evicted file rehydrates the exact persisted bag through
     /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
     bag_cache: Option<Arc<crate::pack_bag_cache::PackBagCache>>,
+    /// Read-connection opener for the relational ref index
+    /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
+    /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
+    /// for pack sub-indexes). Opened per retrieval (WAL readers are cheap
+    /// and `rusqlite::Connection` isn't `Sync`); `None` (tests, no cache
+    /// dir) contributes no candidates and the resident sweep still covers.
+    ref_rows_opener:
+        std::sync::OnceLock<Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>>,
 }
 
 impl ModuleIndex {
@@ -351,6 +359,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             bag_cache: None,
+            ref_rows_opener: std::sync::OnceLock::new(),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -378,6 +387,14 @@ impl ModuleIndex {
         }
         *guard = Some(root.map(String::from));
         self.workspace_root.condvar.notify_one();
+        drop(guard);
+        // The hub's relational-ref-index reader: the SAME cache key the
+        // resolver thread writes under (both spell it as this root string),
+        // so retrieval and shred always address one DB.
+        let key = root.map(String::from);
+        self.set_ref_rows_opener(Arc::new(move || {
+            crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")
+        }));
     }
 
     /// Get the workspace root URI if set.
@@ -697,6 +714,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             bag_cache: None,
+            ref_rows_opener: std::sync::OnceLock::new(),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -750,6 +768,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             bag_cache: None,
+            ref_rows_opener: std::sync::OnceLock::new(),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -874,6 +893,16 @@ impl ModuleIndex {
     ) -> Self {
         self.bag_cache = Some(cache);
         self
+    }
+
+    /// Install the relational ref index's read-connection opener (once).
+    /// Callable post-`Arc` (interior `OnceLock`) because the hub is shared
+    /// before the workspace root — and therefore the cache path — is known.
+    pub fn set_ref_rows_opener(
+        &self,
+        opener: Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>,
+    ) {
+        let _ = self.ref_rows_opener.set(opener);
     }
 
     /// Drop `path`'s rehydrated bag from this pack index's LRU (a changed/saved
@@ -1280,6 +1309,47 @@ impl CrossFileLookup for ModuleIndex {
         visible: &std::collections::HashSet<String>,
     ) -> Option<Arc<CachedModule>> {
         self.get_cached_scoped(module_name, visible)
+    }
+
+    fn refs_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if !cached.analysis.refs_are_evicted() {
+            return cached.analysis.clone();
+        }
+        // Same LRU as bag rehydration — the persisted blob is one whole
+        // analysis, so either consumer's miss loads it for both.
+        if let Some(bc) = &self.bag_cache {
+            if let Some(full) = bc.bag_for(&cached.path) {
+                return full;
+            }
+        }
+        cached.analysis.clone()
+    }
+
+    fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
+        let Some(opener) = self.ref_rows_opener.get() else {
+            return Vec::new();
+        };
+        let Some(conn) = opener() else { return Vec::new() };
+        crate::module_cache::ref_candidate_files(&conn, keys)
+            .into_iter()
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+
+    fn cached_by_path(&self, path: &std::path::Path) -> Option<Arc<CachedModule>> {
+        // Pack sub-indexes: the per-path registry is O(1). The Perl hub's
+        // cache is name-keyed with unique paths — linear fallback (hub
+        // candidate sets are @INC-sized, not tree-sized).
+        if let Some(cm) = self.all_files.get(path) {
+            return Some(cm.value().clone());
+        }
+        self.cache.iter().find_map(|entry| {
+            entry
+                .value()
+                .as_ref()
+                .filter(|cm| cm.path == path)
+                .cloned()
+        })
     }
 
     fn bag_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {

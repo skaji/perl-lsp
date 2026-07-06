@@ -292,6 +292,35 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
     }
+    /// A cached module's analysis with its `refs` GUARANTEED present — the
+    /// refs twin of `bag_present` (`docs/adr/relational-ref-index.md`).
+    /// Resident index copies have refs evicted after persist; the backward
+    /// walk rehydrates the exact persisted analysis for candidate files.
+    /// Default (never-evicted impls): a cheap `Arc` bump.
+    fn refs_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        cached.analysis.clone()
+    }
+    /// Every indexed file holding at least one ref row keyed by one of
+    /// `keys` — the relational reverse index's candidate-file retrieval
+    /// (`SELECT DISTINCT path … WHERE name_id IN keys`). The backward walk
+    /// rehydrates these and runs the one matcher over them. Default: empty
+    /// (impls without a row store contribute no candidates; the resident
+    /// sweep still covers their files).
+    fn ref_candidate_paths(&self, _keys: &[String]) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    /// Path-keyed cached-module lookup — the retrieval above hands back
+    /// paths; this maps them onto the resident registration (for the
+    /// visibility gate + `refs_present`). Default `None`.
+    fn cached_by_path(
+        &self,
+        _path: &std::path::Path,
+    ) -> Option<std::sync::Arc<CachedModule>> {
+        None
+    }
     fn parents_cached(&self, module_name: &str) -> Vec<String>;
     fn modules_with_symbol(&self, name: &str) -> Vec<String>;
     fn find_exporters(&self, func_name: &str) -> Vec<String>;
@@ -438,6 +467,25 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // hit the trait default and read the evicted bag — silent Slice-2
         // type regressions while goto/refs stay green.
         self.inner.bag_present(cached)
+    }
+    fn refs_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the LRU.
+        self.inner.refs_present(cached)
+    }
+    fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
+        // Unscoped by design, like `def_candidates`: the backward walk applies
+        // its own per-file closure gate; pre-narrowing here would hide sites
+        // in files the textual-inclusion extension admits.
+        self.inner.ref_candidate_paths(keys)
+    }
+    fn cached_by_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<std::sync::Arc<CachedModule>> {
+        self.inner.cached_by_path(path)
     }
     fn parents_cached(&self, module_name: &str) -> Vec<String> {
         self.inner.parents_cached(module_name)
@@ -1300,6 +1348,24 @@ pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The relational ref index's shared key function: rows are keyed by
+/// `name_match_key(ref.target_name)`, retrieval probes
+/// `name_match_key(target.name)` — one function on both sides, so a row can
+/// never be missed by a spelling the matcher would accept (arms compare
+/// exact names or their unqualified tails; equal names have equal tails).
+/// Sigil variables keep the sigil on the tail (`$Foo::x` → `$x`) because
+/// variable identities carry it.
+pub fn name_match_key(name: &str) -> String {
+    let mut chars = name.chars();
+    if let Some(sigil) = chars.next() {
+        if matches!(sigil, '$' | '@' | '%') {
+            let (_, base) = split_qualified(chars.as_str());
+            return format!("{sigil}{base}");
+        }
+    }
+    split_qualified(name).1.to_string()
+}
+
 impl Ref {
     /// The unqualified callable name for a `FunctionCall` ref. A
     /// fully-qualified call (`Foo::Bar::baz(...)`) keeps the whole path in
@@ -1322,10 +1388,7 @@ impl Ref {
     /// equal tails). Sigil variables keep their sigil on the tail because
     /// variable symbols key with it (`$x`, not `x`).
     pub fn match_key(&self) -> String {
-        if let Some((_, sigil_base)) = self.qualified_var_target() {
-            return sigil_base;
-        }
-        self.unqualified_target_name().to_string()
+        name_match_key(&self.target_name)
     }
 
     /// For a fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`,
@@ -3573,6 +3636,15 @@ pub struct FileAnalysis {
     #[serde(skip, default)]
     bag_evicted: bool,
 
+    /// Refs twin of `bag_evicted` (`docs/adr/relational-ref-index.md`):
+    /// `evict_refs` stripped this resident copy's `refs` after the blob +
+    /// relational rows were persisted. `#[serde(skip)]` — a rehydrated
+    /// analysis is refs-present. Consumers that would read a foreign file's
+    /// refs route through `CrossFileLookup::refs_present` when set; an empty
+    /// `refs` here is "on disk", never "no references".
+    #[serde(skip, default)]
+    refs_evicted: bool,
+
     /// Witness-bag baseline — `enrich_imported_types_with_keys`
     /// truncates back to this length before re-deriving so repeat
     /// calls stay idempotent.
@@ -4050,6 +4122,7 @@ impl FileAnalysis {
             type_provenance,
             witnesses,
             bag_evicted: false,
+            refs_evicted: false,
             package_framework,
             base_symbol_count: 0,
             base_witness_count: 0,
@@ -4119,6 +4192,26 @@ impl FileAnalysis {
     /// here means "on disk, not resident", not "no type facts".
     pub fn bag_is_evicted(&self) -> bool {
         self.bag_evicted
+    }
+
+    /// Strip the resident `refs` (and the ref-keyed rebuilt indexes) from an
+    /// index copy whose blob + relational rows are persisted — the refs twin
+    /// of `evict_witness_bag`. Lossless: the on-disk analysis keeps the full
+    /// vec; the backward walk retrieves candidates from the relational index
+    /// and rehydrates through `refs_present`. Touches no other pinned field.
+    /// Idempotent.
+    pub fn evict_refs(&mut self) {
+        self.refs = Vec::new();
+        self.refs_by_name = std::collections::HashMap::new();
+        self.refs_by_target = std::collections::HashMap::new();
+        self.call_ref_by_start = std::collections::HashMap::new();
+        self.refs_evicted = true;
+    }
+
+    /// True when `evict_refs` stripped this copy's refs: empty means "on
+    /// disk, not resident", never "no references".
+    pub fn refs_are_evicted(&self) -> bool {
+        self.refs_evicted
     }
 
     pub(crate) fn finalize_post_walk(&mut self) {

@@ -860,7 +860,7 @@ pub fn index_pack_languages(
         let bag_cache = {
             let cache_key_owned = cache_key.map(|s| s.to_string());
             let loader = move |path: &std::path::Path| -> Option<crate::file_analysis::FileAnalysis> {
-                let conn = module_cache::open_cache_db(cache_key_owned.as_deref(), lang)?;
+                let conn = module_cache::open_cache_db_readonly(cache_key_owned.as_deref(), lang)?;
                 // The blob is persisted under the CANONICAL path (both feed
                 // paths write `canon`), while the resident copy may be
                 // registered under the walk's raw path — canonicalize so the
@@ -874,6 +874,14 @@ pub fn index_pack_languages(
         let pack_index = Arc::new(
             crate::module_index::ModuleIndex::new_for_cli().with_bag_cache(bag_cache),
         );
+        // This sub-index's relational-ref-index reader — same per-language DB
+        // the drain below writes blobs + rows into.
+        {
+            let cache_key_owned = cache_key.map(|s| s.to_string());
+            pack_index.set_ref_rows_opener(Arc::new(move || {
+                module_cache::open_cache_db_readonly(cache_key_owned.as_deref(), lang)
+            }));
+        }
         let conn = module_cache::open_cache_db(cache_key, lang);
         // A generation built under different analysis inputs (toolchain
         // change — or its probe FAILURE, which empties the system include
@@ -925,6 +933,7 @@ pub fn index_pack_languages(
                 }
                 if eviction_enabled() {
                     fa.evict_witness_bag();
+                    fa.evict_refs();
                 }
                 pack_index.register_symbols(path.clone(), Arc::new(fa));
                 warmed.insert(path);
@@ -986,6 +995,10 @@ pub fn index_pack_languages(
                     let seeds: Vec<_> =
                         analysis.refs.iter().map(|r| r.row_seed()).collect();
                     analysis.evict_witness_bag();
+                    // Refs follow the bag (`docs/adr/relational-ref-index.md`):
+                    // the blob + rows carry them; the backward walk retrieves
+                    // candidates relationally and rehydrates.
+                    analysis.evict_refs();
                     b.map(|b| (b, seeds))
                 } else {
                     None
@@ -1163,6 +1176,7 @@ pub fn pack_file_changed(
             if persisted && !arc.degraded && eviction_enabled() {
                 let mut resident = (**arc).clone();
                 resident.evict_witness_bag();
+                resident.evict_refs();
                 pack.register_symbols(p.clone(), Arc::new(resident));
             } else {
                 pack.register_symbols(p.clone(), arc.clone());

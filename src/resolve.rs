@@ -2964,6 +2964,36 @@ pub fn group_rename_edits(
     out
 }
 
+/// The relational retrieval switch (`docs/adr/relational-ref-index.md`).
+/// Default OFF until the eviction slice flips it; `PERL_LSP_REF_ROWS=1`
+/// enables the SQL candidate pass (the A/B lever the parity harness runs
+/// both sides of), `=0` forces it off.
+fn ref_rows_enabled() -> bool {
+    match std::env::var("PERL_LSP_REF_ROWS") {
+        Ok(v) => v != "0",
+        // Default ON — resident pack refs are evicted after persist, so the
+        // SQL retrieval IS the reference path for index copies. `=0` forces
+        // the resident-only walk (pair with PERL_LSP_NO_EVICT=1, or dep-file
+        // sites vanish — the parity harness runs exactly that pairing).
+        Err(_) => true,
+    }
+}
+
+/// The name keys the relational retrieval probes for `target`: the target
+/// name's match key plus every delegation alias's — the same
+/// `name_match_key` spelling rows are written under, so retrieval is exactly
+/// as generous as the matcher's name checks.
+fn retrieval_keys(target: &TargetRef, aliases: &[DelegationAlias]) -> Vec<String> {
+    let mut keys = vec![crate::file_analysis::name_match_key(&target.name)];
+    for a in aliases {
+        let k = crate::file_analysis::name_match_key(&a.name);
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
 /// Collect every reference to `target` across the masked file set.
 ///
 /// - `files`   — open + workspace store
@@ -3046,6 +3076,38 @@ pub fn refs_to(
                 continue;
             }
             collect_from_analysis(&key, entry.value(), target, &aliases, module_index, &file_str, &mut out);
+        }
+    }
+
+    // Relational retrieval (`docs/adr/relational-ref-index.md`): the files
+    // holding name-keyed candidate rows, rehydrated (`refs_present`) and run
+    // through the SAME matcher as every resident copy. Runs BEFORE the
+    // resident sweep and claims `covered_paths`, so each file is collected
+    // from its best copy exactly once; the sweep behind it still contributes
+    // declaration-only files and files without rows (degraded, persistence
+    // off, mid-index lag) — composition stays at-least-as-complete whether
+    // or not resident refs were evicted.
+    if ref_rows_enabled() && mask.contains(RoleMask::DEPENDENCY) {
+        if let Some(idx) = module_index {
+            let keys = retrieval_keys(target, &aliases);
+            for path in idx.ref_candidate_paths(&keys) {
+                if covered_paths.contains(&path) {
+                    continue;
+                }
+                let Some(cached) = idx.cached_by_path(&path) else {
+                    continue;
+                };
+                covered_paths.insert(path);
+                let key = FileKey::Path(cached.path.clone());
+                let file_str = canonical_file_str(&key);
+                if !gate(&cached.analysis, &file_str) {
+                    continue;
+                }
+                let full = idx.refs_present(&cached);
+                collect_from_analysis(
+                    &key, &full, target, &aliases, module_index, &file_str, &mut out,
+                );
+            }
         }
     }
 
