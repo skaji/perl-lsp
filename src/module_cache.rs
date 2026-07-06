@@ -267,7 +267,13 @@ pub fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite:
             stored,
             current_hash
         );
-        conn.execute("DELETE FROM modules", [])?;
+        // Import-tier only: workspace blobs bake plugin emissions and their
+        // own source, not @INC paths — and the workspace indexer may have
+        // written them BEFORE this validation ran (two writers, one DB).
+        // Derived rows are cleared wholesale (they aren't tier-tagged); the
+        // warm backfill re-shreds row-less blobs from the decode it does
+        // anyway.
+        conn.execute("DELETE FROM modules WHERE source = 'import'", [])?;
         clear_derived_rows(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('inc_hash', ?1)",
@@ -615,15 +621,18 @@ pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
 /// (valid_rows_seen, stale_names) like `warm_cache`.
 pub fn warm_cache_streaming(
     conn: &Connection,
+    source_filter: Option<&str>,
     each: &mut dyn FnMut(String, PathBuf, FileAnalysis),
 ) -> (usize, Vec<String>) {
-    let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules",
-    ) {
+    let sql = match source_filter {
+        Some(_) => "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules WHERE source = ?1",
+        None => "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules",
+    };
+    let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(_) => return (0, Vec::new()),
     };
-    let rows = match stmt.query_map([], |row| {
+    let map_row = |row: &rusqlite::Row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -633,7 +642,12 @@ pub fn warm_cache_streaming(
             row.get::<_, i64>(5)?,
             row.get::<_, i64>(6)?,
         ))
-    }) {
+    };
+    let rows = match source_filter {
+        Some(f) => stmt.query_map(params![f], map_row),
+        None => stmt.query_map([], map_row),
+    };
+    let rows = match rows {
         Ok(r) => r,
         Err(_) => return (0, Vec::new()),
     };
@@ -676,8 +690,11 @@ pub fn warm_cache(
     conn: &Connection,
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
 ) -> (usize, Vec<String>) {
+    // Name-keyed warm serves the @INC tier only; 'workspace' rows are
+    // path-keyed and stream through `warm_cache_streaming` — loading them
+    // here would pollute the module cache with path-string keys.
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules",
+        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules WHERE source = 'import'",
     ) {
         Ok(s) => s,
         Err(_) => return (0, Vec::new()),

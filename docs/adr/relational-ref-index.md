@@ -304,22 +304,33 @@ Consequences baked into the design:
   lifecycle next to SQLite — which we already ship, already key by file,
   already invalidate correctly, and which measures fast enough (above).
 
-## Phases (this ADR decides phase 1; the seam anticipates 2–3)
+## Phases — as landed (re-scoped by the phase-1 heap dump)
 
-1. **Refs relational** — pack languages + Perl @INC deps (every tier that
-   already persists blobs). Perl *workspace* files are RAM-only today
-   (never written to SQLite) and small in practice; they keep resident refs
-   until phase 3 gives them a persistence path. The scan arms they ride are
-   untouched, so this is purely "some arms got faster/lighter".
-2. **Symbols relational** — the same shred for `symbols`/`all_defs`, making
-   goto-def candidate discovery and workspace/symbol a query, and unpinning
-   the second-largest resident bucket.
-3. **Header-only residency** — with refs and symbols relational, the
-   resident per-file floor drops to a header (path, roles, closure ids,
-   parents, return-type map). Warm start stops decoding 131K blobs to
-   re-register them (today's warm path decodes everything it warms);
-   `files`/`strings` become the registration source and Perl workspace
-   files join the persistence path. That is the "fits anywhere" end state.
+1. **Refs relational** (LANDED) — the shred + retrieval + eviction across
+   pack workspace, Perl @INC, and (with phase 3) Perl workspace tiers.
+   v1 retrieval is *candidate-file discovery*: the indexed SELECT names the
+   files holding matching rows; the UNCHANGED matcher runs over the
+   rehydrated analysis. This trades some hot-name latency (bounded by the
+   blob LRU) for parity-by-construction; the row-level fast path (arms
+   decidable from the qual columns alone) remains the designed optimization
+   inside the same seam.
+2. **Closure interning + streaming warm** (LANDED — measurement replaced
+   the planned symbols shred, which was 9% of payload vs the closure's 47%
+   post-phase-1). `include_closure` is `Vec<Arc<str>>` through a
+   process-global interner; the pack warm path streams one row at a time
+   instead of decoding the whole table before stripping.
+3. **Perl workspace persistence** (LANDED) — `index_workspace_with_index`
+   persists blobs + rows to `modules.db` (`source='workspace'`), warm
+   starts skip re-parsing unchanged files, and Perl workspace copies evict
+   refs + bag like every other tier (hub-side blob LRU; registration
+   projections that read the bag run before the strip; the watcher
+   invalidates a changed file's persisted generation and the resident sweep
+   covers its fresh full copy).
+
+Deferred, designed to land on the same seam: **symbols relational** (the
+`symbols`/`all_defs` shred — unpins the now-largest resident bucket and
+gives warm start a register-from-tables path that never decodes unqueried
+blobs) and the row-level matcher fast path above.
 
 ## Migration net
 

@@ -2233,11 +2233,31 @@ impl LanguageServer for Backend {
             return;
         }
         let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
         tokio::task::spawn_blocking(move || {
+            // The persisted generation (blob + ref rows) is now stale for
+            // these paths; drop it so warm starts re-parse and the
+            // relational retrieval can't serve outdated spans. The fresh
+            // in-RAM copy registered below is FULL (never stripped), so the
+            // resident sweep covers it until the next bulk index persists a
+            // new generation.
+            let ws_key = module_index.workspace_root();
+            let conn = crate::module_cache::open_cache_db(ws_key.as_deref(), "perl");
             for (path, typ) in perl_changes {
+                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if let Some(ref conn) = conn {
+                    let canon_str = canon.to_string_lossy();
+                    crate::module_cache::delete_ref_rows(conn, &canon_str);
+                    let _ = conn.execute(
+                        "DELETE FROM modules WHERE path = ?1 AND source = 'workspace'",
+                        rusqlite::params![canon_str],
+                    );
+                }
+                module_index.invalidate_bag_cache(&canon);
                 match typ {
                     FileChangeType::DELETED => {
                         files.remove_workspace(&path);
+                        files.remove_workspace(&canon);
                     }
                     _ => {
                         // Re-index the file (created or changed)
@@ -2245,7 +2265,7 @@ impl LanguageServer for Backend {
                             let mut parser = crate::module_resolver::create_parser();
                             if let Some(tree) = parser.parse(&source, None) {
                                 let analysis = crate::builder::build(&tree, source.as_bytes());
-                                files.insert_workspace(path, analysis);
+                                files.insert_workspace(canon, analysis);
                             }
                         }
                     }

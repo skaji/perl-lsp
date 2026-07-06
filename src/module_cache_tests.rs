@@ -380,7 +380,10 @@ fn header_change_invalidates_consumer_row_via_deps_stamp() {
     let mut fa = crate::builder::build(&tree, source.as_bytes());
     fa.include_closure = vec![hdr_canon.into()];
     let cached = Some(Arc::new(CachedModule::new(pm.clone(), Arc::new(fa))));
-    save_to_db(&conn, "Consumer", &cached, "workspace");
+    // warm_cache serves the 'import' tier ('workspace' rows stream through
+    // warm_cache_streaming); the deps_stamp semantics under test are
+    // source-independent.
+    save_to_db(&conn, "Consumer", &cached, "import");
 
     // Unchanged closure → row warms.
     let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
@@ -430,7 +433,7 @@ fn degraded_analysis_is_not_persisted() {
 fn input_fingerprint_change_clears_table() {
     let conn = test_db();
     validate_input_fingerprint(&conn, 0xA).unwrap();
-    save_to_db(&conn, "Foo", &None, "workspace");
+    save_to_db(&conn, "Foo", &None, "import");
 
     validate_input_fingerprint(&conn, 0xA).unwrap();
     let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();

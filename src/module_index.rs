@@ -303,7 +303,7 @@ pub struct ModuleIndex {
     /// resident pack `FileAnalysis` has its witness bag evicted; a type query
     /// reaching into an evicted file rehydrates the exact persisted bag through
     /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
-    bag_cache: Option<Arc<crate::pack_bag_cache::PackBagCache>>,
+    bag_cache: std::sync::OnceLock<Arc<crate::pack_bag_cache::PackBagCache>>,
     /// Read-connection opener for the relational ref index
     /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
     /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
@@ -358,7 +358,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: None,
+            bag_cache: std::sync::OnceLock::new(),
             ref_rows_opener: std::sync::OnceLock::new(),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
@@ -392,9 +392,24 @@ impl ModuleIndex {
         // resolver thread writes under (both spell it as this root string),
         // so retrieval and shred always address one DB.
         let key = root.map(String::from);
-        self.set_ref_rows_opener(Arc::new(move || {
-            crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")
-        }));
+        {
+            let key = key.clone();
+            self.set_ref_rows_opener(Arc::new(move || {
+                crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")
+            }));
+        }
+        // The hub's rehydration LRU: Perl workspace copies are refs/bag-
+        // evicted once persisted; queries that need the whole analysis
+        // rehydrate through this, same as the pack sub-indexes. Fixed
+        // 128 MiB cap (Perl analyses are 10-100x smaller than cpp ones).
+        let loader = move |path: &std::path::Path| {
+            let conn = crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")?;
+            crate::module_cache::load_one(&conn, &path.to_string_lossy())
+        };
+        self.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
+            128 * 1024 * 1024,
+            loader,
+        )));
     }
 
     /// Get the workspace root URI if set.
@@ -713,7 +728,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: None,
+            bag_cache: std::sync::OnceLock::new(),
             ref_rows_opener: std::sync::OnceLock::new(),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
@@ -767,7 +782,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: None,
+            bag_cache: std::sync::OnceLock::new(),
             ref_rows_opener: std::sync::OnceLock::new(),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
@@ -834,6 +849,34 @@ impl ModuleIndex {
     /// whether the target came from `use` or from the project tree.
     ///
     /// No-op for files without a `package` declaration (top-level scripts).
+    /// The registration reads that need the FULL analysis (loader-config
+    /// shapes read the witness bag via `expr_type_at_span`). The workspace
+    /// indexer calls this on the whole analysis BEFORE stripping the
+    /// resident copy; `register_workspace_module` runs it for callers that
+    /// register full copies (the watcher path).
+    pub fn record_workspace_projections(&self, path: &std::path::Path, analysis: &FileAnalysis) {
+        for imp in &analysis.imports {
+            self.loaded_modules.insert(imp.module_name.clone(), ());
+        }
+        for f in &analysis.plugin_loads {
+            self.loaded_modules.insert(f.name.clone(), ());
+        }
+        self.record_loader_shapes(&path.display().to_string(), analysis);
+    }
+
+    /// The residency half of workspace registration: name/edge feeds + the
+    /// cache insert. Reads only pinned fields, so a refs/bag-stripped copy
+    /// registers identically to a full one.
+    pub fn register_workspace_resident(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
+        let Some(module_name) = first_package_name(&analysis) else { return };
+        self.workspace_modules.insert(module_name.clone(), ());
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        self.edges.purge_module(&module_name);
+        self.edges.feed(&module_name, &analysis);
+        self.cache.insert(module_name, Some(cached));
+    }
+
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         // Loaded-module tracking feeds the entrypoint-scan lint and must
         // run BEFORE the packageless early-return: Mojolicious::Lite
@@ -841,35 +884,8 @@ impl ModuleIndex {
         // `plugin 'X'` loads (via SyntheticUse imports) the lint needs
         // to see. Workspace scan re-runs every startup, so this set
         // needs no warm-rebuild feed.
-        for imp in &analysis.imports {
-            self.loaded_modules.insert(imp.module_name.clone(), ());
-        }
-        // Method-form loads (`$app->plugin('X')`, the nested cascade)
-        // are recorded as `plugin_loads` by the trigger-independent
-        // builder recognizer — feed them too. Names are short
-        // (`FeatureFlags`); `is_module_loaded` tail-matches them to FQ
-        // providers (`Clove::App::Plugin::FeatureFlags`).
-        for f in &analysis.plugin_loads {
-            self.loaded_modules.insert(f.name.clone(), ());
-        }
-        self.record_loader_shapes(&path.display().to_string(), &analysis);
-        let Some(module_name) = first_package_name(&analysis) else { return };
-        self.workspace_modules.insert(module_name.clone(), ());
-        // Canonicalize the path — `Url::from_file_path` in symbols.rs
-        // requires absolute paths, so relative workspace paths (e.g.
-        // "./test_files/lib/Users.pm" from CLI `.` root) would silently
-        // fail conversion and break cross-file goto-def.
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
-
-        // Re-registration happens on file-watcher save. Old edges still
-        // point at this module, so without a purge they accumulate
-        // forever — a name or bridge that a previous version declared
-        // lingers after it's removed, and cross-file lookups return
-        // phantom modules.
-        self.edges.purge_module(&module_name);
-        self.edges.feed(&module_name, &analysis);
-        self.cache.insert(module_name, Some(cached));
+        self.record_workspace_projections(&path, &analysis);
+        self.register_workspace_resident(path, analysis);
     }
 
     /// Register a pack-language file under each CLASS name it defines —
@@ -888,11 +904,17 @@ impl ModuleIndex {
     /// `Arc`-wrapped and registered. Consuming builder so the field is set once
     /// on the owned value (the index is shared immutably thereafter).
     pub fn with_bag_cache(
-        mut self,
+        self,
         cache: Arc<crate::pack_bag_cache::PackBagCache>,
     ) -> Self {
-        self.bag_cache = Some(cache);
+        let _ = self.bag_cache.set(cache);
         self
+    }
+
+    /// Post-`Arc` variant for the hub (set once, alongside the workspace
+    /// root) — the Perl workspace tier's rehydration LRU.
+    pub fn set_bag_cache(&self, cache: Arc<crate::pack_bag_cache::PackBagCache>) {
+        let _ = self.bag_cache.set(cache);
     }
 
     /// Install the relational ref index's read-connection opener (once).
@@ -908,7 +930,7 @@ impl ModuleIndex {
     /// Drop `path`'s rehydrated bag from this pack index's LRU (a changed/saved
     /// file's bag is stale). No-op on the Perl hub (no bag cache).
     pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
-        if let Some(bc) = &self.bag_cache {
+        if let Some(bc) = self.bag_cache.get() {
             bc.invalidate(path);
         }
     }
@@ -1317,7 +1339,7 @@ impl CrossFileLookup for ModuleIndex {
         }
         // Same LRU as bag rehydration — the persisted blob is one whole
         // analysis, so either consumer's miss loads it for both.
-        if let Some(bc) = &self.bag_cache {
+        if let Some(bc) = self.bag_cache.get() {
             if let Some(full) = bc.bag_for(&cached.path) {
                 return full;
             }
@@ -1364,7 +1386,7 @@ impl CrossFileLookup for ModuleIndex {
         // decode failure) degrade to the bag-less resident copy rather than
         // fabricate — the type query then returns None, as it would pre-Slice-2
         // for a genuinely bag-less file.
-        if let Some(bc) = &self.bag_cache {
+        if let Some(bc) = self.bag_cache.get() {
             if let Some(full) = bc.bag_for(&cached.path) {
                 return full;
             }

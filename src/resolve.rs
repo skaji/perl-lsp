@@ -3063,6 +3063,65 @@ pub fn refs_to(
         });
     }
 
+    // Relational retrieval (`docs/adr/relational-ref-index.md`): the files
+    // holding name-keyed candidate rows, rehydrated (`refs_present`) and run
+    // through the SAME matcher as every resident copy. Runs BEFORE the
+    // resident sweep and claims `covered_paths`, so each file is collected
+    // from its best copy exactly once; the sweep behind it still contributes
+    // declaration-only files and files without rows (degraded, persistence
+    // off, mid-index lag) — composition stays at-least-as-complete whether
+    // or not resident refs were evicted.
+    if ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY) {
+        if let Some(idx) = module_index {
+            let keys = retrieval_keys(target, &aliases);
+            for path in idx.ref_candidate_paths(&keys) {
+                if covered_paths.contains(&path) {
+                    continue;
+                }
+                // Tier attribution: a FileStore workspace entry rides the
+                // WORKSPACE role (Perl project files); everything else the
+                // rows name lives in a module-index tier (DEPENDENCY —
+                // @INC and the pack caches). The mask must admit the
+                // candidate's OWN tier, or an EDITABLE rename would walk
+                // read-only deps (and vice versa).
+                let ws_arc = files
+                    .workspace_raw()
+                    .get(&path)
+                    .map(|e| std::sync::Arc::clone(e.value()));
+                let cached = match ws_arc {
+                    Some(arc) => {
+                        if !mask.contains(RoleMask::WORKSPACE) {
+                            continue;
+                        }
+                        std::sync::Arc::new(crate::file_analysis::CachedModule::new(
+                            path.clone(),
+                            arc,
+                        ))
+                    }
+                    None => {
+                        if !mask.contains(RoleMask::DEPENDENCY) {
+                            continue;
+                        }
+                        match idx.cached_by_path(&path) {
+                            Some(cm) => cm,
+                            None => continue,
+                        }
+                    }
+                };
+                covered_paths.insert(path);
+                let key = FileKey::Path(cached.path.clone());
+                let file_str = canonical_file_str(&key);
+                if !gate(&cached.analysis, &file_str) {
+                    continue;
+                }
+                let full = idx.refs_present(&cached);
+                collect_from_analysis(
+                    &key, &full, target, &aliases, module_index, &file_str, &mut out,
+                );
+            }
+        }
+    }
+
     // Workspace files.
     if mask.contains(RoleMask::WORKSPACE) {
         for entry in files.workspace_raw().iter() {
@@ -3076,38 +3135,6 @@ pub fn refs_to(
                 continue;
             }
             collect_from_analysis(&key, entry.value(), target, &aliases, module_index, &file_str, &mut out);
-        }
-    }
-
-    // Relational retrieval (`docs/adr/relational-ref-index.md`): the files
-    // holding name-keyed candidate rows, rehydrated (`refs_present`) and run
-    // through the SAME matcher as every resident copy. Runs BEFORE the
-    // resident sweep and claims `covered_paths`, so each file is collected
-    // from its best copy exactly once; the sweep behind it still contributes
-    // declaration-only files and files without rows (degraded, persistence
-    // off, mid-index lag) — composition stays at-least-as-complete whether
-    // or not resident refs were evicted.
-    if ref_rows_enabled() && mask.contains(RoleMask::DEPENDENCY) {
-        if let Some(idx) = module_index {
-            let keys = retrieval_keys(target, &aliases);
-            for path in idx.ref_candidate_paths(&keys) {
-                if covered_paths.contains(&path) {
-                    continue;
-                }
-                let Some(cached) = idx.cached_by_path(&path) else {
-                    continue;
-                };
-                covered_paths.insert(path);
-                let key = FileKey::Path(cached.path.clone());
-                let file_str = canonical_file_str(&key);
-                if !gate(&cached.analysis, &file_str) {
-                    continue;
-                }
-                let full = idx.refs_present(&cached);
-                collect_from_analysis(
-                    &key, &full, target, &aliases, module_index, &file_str, &mut out,
-                );
-            }
         }
     }
 

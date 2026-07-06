@@ -1983,13 +1983,22 @@ fn cli_dump_package(root: &str, package_name: &str) {
                 && s.name == package_name
         });
         if has_package {
-            found = Some((entry.key().display().to_string(), Arc::clone(analysis)));
+            // Index copies are bag/refs-evicted; the dump reads the bag
+            // (params, returns, witness counts), so take the whole view —
+            // an evicted copy would honestly-but-uselessly dump zero facts.
+            let cm = Arc::new(file_analysis::CachedModule::new(
+                entry.key().clone(),
+                Arc::clone(analysis),
+            ));
+            let whole = file_analysis::CrossFileLookup::bag_present(&module_index, &cm);
+            found = Some((entry.key().display().to_string(), whole));
             break;
         }
     }
     if found.is_none() {
         if let Some(cached) = module_index.get_cached(package_name) {
-            found = Some((cached.path.display().to_string(), Arc::clone(&cached.analysis)));
+            let whole = file_analysis::CrossFileLookup::bag_present(&module_index, &cached);
+            found = Some((cached.path.display().to_string(), whole));
         }
     }
 
@@ -2423,7 +2432,18 @@ fn cli_refs_parity(root: &str, sample: Option<usize>) {
     let mut entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
         .workspace_raw()
         .iter()
-        .map(|e| (e.key().clone(), std::sync::Arc::clone(e.value())))
+        .map(|e| {
+            // Workspace copies may be refs-evicted; fan-out scans + set
+            // minting read refs, so take the refs-present view.
+            let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
+                e.key().clone(),
+                std::sync::Arc::clone(e.value()),
+            ));
+            (
+                e.key().clone(),
+                file_analysis::CrossFileLookup::refs_present(&idx, &cm),
+            )
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -2629,7 +2649,18 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     let mut entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
         .workspace_raw()
         .iter()
-        .map(|e| (e.key().clone(), std::sync::Arc::clone(e.value())))
+        .map(|e| {
+            // Workspace copies may be refs-evicted; fan-out scans + set
+            // minting read refs, so take the refs-present view.
+            let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
+                e.key().clone(),
+                std::sync::Arc::clone(e.value()),
+            ));
+            (
+                e.key().clone(),
+                file_analysis::CrossFileLookup::refs_present(&idx, &cm),
+            )
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
