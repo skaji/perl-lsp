@@ -77,6 +77,18 @@ pub struct ValueSurface {
     pub kind: u8,
 }
 
+/// One `#define`'s cross-file-visible contract. Under textual inclusion
+/// the BODY is semantics for every consumer (an expansion change with an
+/// unchanged name would silently under-invalidate without it), and the
+/// guard trail decides which definition a config sees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacroSurface {
+    pub name: String,
+    pub params: Option<Vec<String>>,
+    pub body: String,
+    pub guards: Vec<String>,
+}
+
 /// The whole file's span-free cross-file surface. `Default` is the empty
 /// surface (a file exporting nothing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -85,6 +97,13 @@ pub struct Surface {
     /// Cross-file-visible values with no owning package (C file-scope
     /// globals / anonymous-enum constants), sorted.
     pub free_values: Vec<ValueSurface>,
+    /// `#define`s, sorted by (name, guards) — config variants of one name
+    /// each surface.
+    pub macros: Vec<MacroSurface>,
+    /// Raw `#include` specs (pack languages), sorted. A header adding or
+    /// dropping an include changes every consumer's transitive closure —
+    /// cross-file-visible even though nothing else moved.
+    pub includes: Vec<String>,
     /// Modules this file loads (`use`/`require`/plugin loads) — the
     /// DEPENDENCY half of the freshness edge: this file's enrichment
     /// depends on the Surface of each import ∪ parent ∪ bridge.
@@ -235,9 +254,27 @@ impl Surface {
             .collect();
         plugin_bridges.sort_unstable();
         plugin_bridges.dedup();
+        let mut macros: Vec<MacroSurface> = fa
+            .macro_defs
+            .iter()
+            .map(|m| MacroSurface {
+                name: m.name.clone(),
+                params: m.params.clone(),
+                body: m.body.clone(),
+                guards: m.guards.clone(),
+            })
+            .collect();
+        macros.sort_by(|a, b| (&a.name, &a.guards).cmp(&(&b.name, &b.guards)));
+        macros.dedup();
+        let mut includes: Vec<String> =
+            fa.include_directives.iter().map(|(_, raw)| raw.clone()).collect();
+        includes.sort_unstable();
+        includes.dedup();
         Surface {
             packages,
             free_values,
+            macros,
+            includes,
             imports,
             exports: sorted(&fa.export),
             exports_ok: sorted(&fa.export_ok),
@@ -302,6 +339,28 @@ pub enum SurfaceVerdict {
     Changed,
 }
 
+/// What the index retains per file: enough to answer "did the surface
+/// change?" (the fingerprint) and "who consumes what this file provides?"
+/// (the provided names) — NOT the surface itself. Full surfaces resident
+/// for every indexed file would rebuild the payload the eviction axes
+/// stripped (cpp macro BODIES ride the surface); persistence of full
+/// surfaces belongs to the warm-start blob, not this index.
+struct SurfaceRecord {
+    fingerprint: u64,
+    /// Names the file provides (its declared packages).
+    provided: Vec<String>,
+}
+
+/// Process-local surface identity. In-memory only (SipHash keys are
+/// per-process) — the persisted form will carry its own stable encoding.
+fn surface_fingerprint(s: &Surface) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let bytes = bincode::serialize(s).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 /// The hand-rolled freshness engine (`docs/prompt-storage-engine.md`
 /// phase 3, the eval's recommended first cut): per-file surface records +
 /// a name-keyed reverse-dependency index. The dependency edge is DECLARED
@@ -311,7 +370,7 @@ pub enum SurfaceVerdict {
 /// which dirties A importing B, because A's enrichment reads through B).
 #[derive(Default)]
 pub struct FreshnessIndex {
-    surfaces: dashmap::DashMap<std::path::PathBuf, Surface>,
+    surfaces: dashmap::DashMap<std::path::PathBuf, SurfaceRecord>,
     /// provider NAME (package/module) → consumer paths.
     consumers: dashmap::DashMap<String, std::collections::HashSet<std::path::PathBuf>>,
     /// consumer path → the provider names it last declared edges to
@@ -343,9 +402,10 @@ impl FreshnessIndex {
     /// return what changed. Call with the WHOLE analysis's projection at
     /// registration/rebuild time.
     pub fn record(&self, path: &std::path::Path, surface: Surface) -> SurfaceVerdict {
+        let fingerprint = surface_fingerprint(&surface);
         let verdict = match self.surfaces.get(path) {
             None => SurfaceVerdict::FirstSeen,
-            Some(old) if *old == surface => SurfaceVerdict::Unchanged,
+            Some(old) if old.fingerprint == fingerprint => SurfaceVerdict::Unchanged,
             Some(_) => SurfaceVerdict::Changed,
         };
         if verdict != SurfaceVerdict::Unchanged {
@@ -365,7 +425,9 @@ impl FreshnessIndex {
                     .or_default()
                     .insert(path.to_path_buf());
             }
-            self.surfaces.insert(path.to_path_buf(), surface);
+            let provided = Self::provided_names(&surface).map(str::to_owned).collect();
+            self.surfaces
+                .insert(path.to_path_buf(), SurfaceRecord { fingerprint, provided });
         }
         verdict
     }
@@ -392,7 +454,7 @@ impl FreshnessIndex {
     ) -> std::collections::HashSet<std::path::PathBuf> {
         let mut dirty: std::collections::HashSet<std::path::PathBuf> = Default::default();
         let mut frontier: Vec<String> = match self.surfaces.get(changed_path) {
-            Some(s) => Self::provided_names(&s).map(str::to_owned).collect(),
+            Some(r) => r.provided.clone(),
             None => return dirty,
         };
         let mut seen_names: std::collections::HashSet<String> = frontier.iter().cloned().collect();
@@ -404,10 +466,10 @@ impl FreshnessIndex {
                 }
                 // A dirty consumer's OWN providers propagate: its enriched
                 // result feeds files that depend on IT.
-                if let Some(s) = self.surfaces.get(c.as_path()) {
-                    for p in Self::provided_names(&s) {
-                        if seen_names.insert(p.to_owned()) {
-                            frontier.push(p.to_owned());
+                if let Some(r) = self.surfaces.get(c.as_path()) {
+                    for p in &r.provided {
+                        if seen_names.insert(p.clone()) {
+                            frontier.push(p.clone());
                         }
                     }
                 }

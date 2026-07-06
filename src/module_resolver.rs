@@ -1509,6 +1509,10 @@ pub fn index_pack_languages(
                         // before its blob can rehydrate it.
                         let (feed, specs) =
                             crate::module_index::ModuleIndex::prepare_pack_feed(&analysis);
+                        // Surface must project from the WHOLE analysis; the
+                        // freshness index is session-local, so recording
+                        // before the writer's COMMIT is safe.
+                        let _ = pack_index.record_surface(&canon, &analysis);
                         analysis.evict_witness_bag();
                         analysis.evict_refs();
                         analysis.evict_symbols();
@@ -1618,14 +1622,39 @@ pub fn pack_file_changed(
         });
     }
 
-    let mut evict: std::collections::HashSet<PathBuf> = consumers.iter().cloned().collect();
-    evict.insert(canon.clone());
-    crate::cpp_reparse::evict_analysis_caches(&evict);
-
     if deleted {
         if let Some(ref pack) = pack {
             pack.unregister_file(&canon);
+            pack.remove_surface(&canon);
         }
+    }
+
+    // The surface gate (the freshness firewall, pack flavor): re-analyze
+    // the CHANGED file first, alone. If its span-free surface is unchanged
+    // — a body edit, a comment, a reformat in a header — every consumer's
+    // analysis is still semantically valid (macro bodies and include
+    // directives are ON the surface, so textual-inclusion effects are
+    // covered) and the whole consumer re-analysis storm is skipped. A
+    // deep-header comment edit re-parses ONE file, not hundreds of TUs.
+    let mut changed_verdict = crate::surface::SurfaceVerdict::Changed;
+    let mut changed_fa: Option<Arc<crate::file_analysis::FileAnalysis>> = None;
+    if !deleted {
+        crate::cpp_reparse::evict_analysis_caches(&std::iter::once(canon.clone()).collect());
+        if let (Some(ref pack), Ok(source)) = (&pack, std::fs::read_to_string(&canon)) {
+            let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                driver.analyze_with_path(&source, Some(&canon))
+            }));
+            if let Ok(fa) = probe {
+                changed_verdict = pack.record_surface(&canon, &fa);
+                changed_fa = Some(Arc::new(fa));
+            }
+        }
+    }
+    let skip_consumers = matches!(changed_verdict, crate::surface::SurfaceVerdict::Unchanged);
+    if !skip_consumers && !consumers.is_empty() {
+        // The changed file's own caches were evicted before the probe and are
+        // fresh — evict only the consumers' so they re-gather.
+        crate::cpp_reparse::evict_analysis_caches(&consumers.iter().cloned().collect());
     }
 
     // Re-analyze the changed file (unless deleted) + every consumer
@@ -1634,13 +1663,16 @@ pub fn pack_file_changed(
     // cache winner slot. Consumers re-analyze on delete too — their splices
     // and closures baked the departed header.
     let mut targets: Vec<PathBuf> = Vec::with_capacity(consumers.len() + 1);
-    if !deleted {
-        targets.push(canon);
+    if !deleted && changed_fa.is_none() {
+        targets.push(canon.clone());
     }
-    targets.extend(consumers);
+    if !skip_consumers {
+        targets.extend(consumers);
+    }
     targets.sort();
     targets.dedup();
-    let results: Vec<(PathBuf, Arc<crate::file_analysis::FileAnalysis>)> = targets
+    targets.retain(|p| changed_fa.is_none() || *p != canon);
+    let mut results: Vec<(PathBuf, Arc<crate::file_analysis::FileAnalysis>)> = targets
         .par_iter()
         .filter_map(|p| {
             let reg = crate::language_driver::LanguageRegistry::with_enabled();
@@ -1655,6 +1687,9 @@ pub fn pack_file_changed(
             }
         })
         .collect();
+    if let Some(fa) = changed_fa {
+        results.push((canon.clone(), fa));
+    }
     // Persist the FULL analyses (bag present) FIRST so the on-disk blob can
     // rehydrate, then register bag-STRIPPED resident copies and drop each
     // file's now-stale entry from the rehydration LRU (change #6). `results`

@@ -155,4 +155,15 @@ fn cpp_values_are_on_the_surface_and_bodies_are_not() {
     // New class field: unequal.
     let field = base.replace("int width;", "int width;\n    int height;");
     assert_ne!(s0, Surface::project(&build_cpp(&field)), "new field must change the surface");
+
+    // Macro BODY change (same name): unequal — textual inclusion makes
+    // the body cross-file semantics.
+    let with_macro = format!("#define LIMIT 10\n{base}");
+    let sm = Surface::project(&build_cpp(&with_macro));
+    let macro_edit = with_macro.replace("#define LIMIT 10", "#define LIMIT 20");
+    assert_ne!(
+        sm,
+        Surface::project(&build_cpp(&macro_edit)),
+        "macro body change must change the surface"
+    );
 }

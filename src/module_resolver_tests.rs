@@ -211,3 +211,69 @@ fn workspace_index_progress_is_throttled_monotone_and_completes() {
     assert_eq!(last_done, n_files);
     assert_eq!(last_total, n_files);
 }
+
+/// The pack-tier surface gate: a body/comment-only edit in a header leaves
+/// its span-free surface unchanged, so `pack_file_changed` re-analyzes the
+/// header ALONE and every consumer's registration survives untouched. A
+/// cross-file-visible edit (new method) re-analyzes consumers too.
+#[cfg(feature = "cpp")]
+#[test]
+fn pack_file_changed_surface_gate_skips_consumers_on_body_edit() {
+    let dir = std::env::temp_dir().join(format!("pack-surface-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hdr = dir.join("box.h");
+    let tu = dir.join("use.cpp");
+    std::fs::write(&hdr, "class Box { public: int width() { return 1; } };\n").unwrap();
+    std::fs::write(&tu, "#include \"box.h\"\nint f() { Box b; return b.width(); }\n").unwrap();
+
+    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let driver = reg.for_id("cpp").expect("cpp driver");
+    let hub = crate::module_index::ModuleIndex::new_for_test();
+    let pack = Arc::new(crate::module_index::ModuleIndex::new_for_test());
+    hub.attach_pack_index("cpp", pack.clone());
+
+    for p in [&hdr, &tu] {
+        let src = std::fs::read_to_string(p).unwrap();
+        let fa = Arc::new(driver.analyze_with_path(&src, Some(p)));
+        pack.register_symbols(p.clone(), fa);
+    }
+    let canon_tu = std::fs::canonicalize(&tu).unwrap();
+    let canon_hdr = std::fs::canonicalize(&hdr).unwrap();
+    let arc_of = |path: &std::path::Path| {
+        let mut found = None;
+        pack.for_each_registered_file(&mut |cm| {
+            if cm.path == path {
+                found = Some(Arc::as_ptr(&cm.analysis) as usize);
+            }
+        });
+        found.expect("registered")
+    };
+    // Sanity: the consumer edge exists (use.cpp's closure holds box.h).
+    let tu_before = arc_of(&canon_tu);
+    let hdr_before = arc_of(&canon_hdr);
+
+    // Body-only edit: return value changes, surface identical.
+    std::fs::write(&hdr, "class Box { public: int width() { return 2; } };\n").unwrap();
+    crate::module_resolver::pack_file_changed(None, &hub, &hdr, false);
+    assert_ne!(arc_of(&canon_hdr), hdr_before, "changed file re-registered");
+    assert_eq!(
+        arc_of(&canon_tu),
+        tu_before,
+        "surface unchanged: consumer registration must survive untouched"
+    );
+
+    // Cross-file-visible edit: a new method lands on the surface.
+    std::fs::write(
+        &hdr,
+        "class Box { public: int width() { return 2; } int height() { return 3; } };\n",
+    )
+    .unwrap();
+    crate::module_resolver::pack_file_changed(None, &hub, &hdr, false);
+    assert_ne!(
+        arc_of(&canon_tu),
+        tu_before,
+        "surface changed: consumer must re-analyze"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

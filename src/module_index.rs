@@ -985,7 +985,17 @@ impl ModuleIndex {
         path: &std::path::Path,
         fa: &FileAnalysis,
     ) -> crate::surface::SurfaceVerdict {
-        self.freshness.record(path, crate::surface::Surface::project(fa))
+        // Canonicalize here so every caller (open-doc, worker, watcher)
+        // lands on one key — a fresh/canon split would make every edit
+        // look FirstSeen and the gate never fires.
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.freshness.record(&canon, crate::surface::Surface::project(fa))
+    }
+
+    /// Drop `path`'s recorded surface and its dep edges (file deleted).
+    pub fn remove_surface(&self, path: &std::path::Path) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.freshness.remove(&canon);
     }
 
     /// The transitive consumers of `path`'s last-recorded surface — the
@@ -994,7 +1004,8 @@ impl ModuleIndex {
         &self,
         path: &std::path::Path,
     ) -> std::collections::HashSet<std::path::PathBuf> {
-        self.freshness.dirty_consumers(path)
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.freshness.dirty_consumers(&canon)
     }
 
     /// The name/edge feed half of workspace registration, run on the WHOLE
@@ -1265,6 +1276,7 @@ impl ModuleIndex {
     pub fn register_symbols(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         // Feed source and stored copy are the same whole analysis here;
         // indexers that strip go through `register_symbols_stripping`.
+        let _ = self.record_surface(&path, &analysis);
         let feed: Vec<(String, bool)> = collect_linkage_feed(&analysis);
         let specs: Vec<(String, String)> =
             analysis.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -1295,6 +1307,7 @@ impl ModuleIndex {
         strip_bag: bool,
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
+        let _ = self.record_surface(&path, &fa);
         let feed = collect_linkage_feed(&fa);
         let specs: Vec<(String, String)> =
             fa.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
