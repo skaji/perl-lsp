@@ -395,7 +395,7 @@ fn file_stamp(path: &std::path::Path) -> Option<(i64, i64)> {
 /// → 0, so the Perl path pays nothing. `stat_memo` dedups stats across a warm
 /// run (closures overlap heavily — op.c and sv.c share ~90% of perl5's tree).
 fn closure_stamp(
-    closure: &[String],
+    closure: &[std::sync::Arc<str>],
     stat_memo: &mut std::collections::HashMap<String, (i64, i64)>,
 ) -> i64 {
     use std::hash::{Hash, Hasher};
@@ -405,9 +405,9 @@ fn closure_stamp(
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for p in closure {
         let stamp = *stat_memo
-            .entry(p.clone())
-            .or_insert_with(|| file_stamp(std::path::Path::new(p)).unwrap_or((0, -1)));
-        p.hash(&mut h);
+            .entry(p.as_ref().to_owned())
+            .or_insert_with(|| file_stamp(std::path::Path::new(p.as_ref())).unwrap_or((0, -1)));
+        p.as_ref().hash(&mut h);
         stamp.hash(&mut h);
     }
     h.finish() as i64
@@ -459,7 +459,7 @@ pub fn save_blob_to_db(
     conn: &Connection,
     module_name: &str,
     path: &std::path::Path,
-    include_closure: &[String],
+    include_closure: &[std::sync::Arc<str>],
     blob: &[u8],
     source: &str,
 ) {
@@ -603,6 +603,73 @@ pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
     )
     .map(|n| n as u64)
     .unwrap_or(0)
+}
+
+/// Streaming warm: identical row validation to `warm_cache`, but each valid
+/// positive entry is handed to `each` one at a time and nothing is retained
+/// here — the caller registers a stripped resident copy and drops the full
+/// decode before the next row. This bounds the warm-path transient to ONE
+/// file's full analysis instead of the whole table's (the 884 MB abseil
+/// warm peak vs its 276 MB cold peak). Negative sentinels are skipped —
+/// the pack warm path has no consumer for them. Returns
+/// (valid_rows_seen, stale_names) like `warm_cache`.
+pub fn warm_cache_streaming(
+    conn: &Connection,
+    each: &mut dyn FnMut(String, PathBuf, FileAnalysis),
+) -> (usize, Vec<String>) {
+    let mut stmt = match conn.prepare(
+        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules",
+    ) {
+        Ok(s) => s,
+        Err(_) => return (0, Vec::new()),
+    };
+    let rows = match stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    }) {
+        Ok(r) => r,
+        Err(_) => return (0, Vec::new()),
+    };
+
+    let mut count = 0usize;
+    let mut stale_names = Vec::new();
+    let mut stat_memo: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for row in rows.flatten() {
+        let (module_name, path_str, cached_mtime, cached_size, analysis_blob, row_extract_version, row_deps_stamp) = row;
+        if path_str.is_empty() {
+            continue; // negative sentinel — no pack consumer
+        }
+        let path = PathBuf::from(&path_str);
+        match file_stamp(&path) {
+            Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
+            _ => continue, // changed or deleted on disk
+        }
+        if row_extract_version < EXTRACT_VERSION {
+            stale_names.push(module_name);
+            continue; // stale rows re-analyze; don't register the old shape
+        }
+        let Some(blob) = analysis_blob.filter(|b| !b.is_empty()) else {
+            continue;
+        };
+        let Some(fa) = decode_analysis(&blob) else {
+            log::warn!("Failed to decode cached analysis for '{}', skipping", module_name);
+            continue;
+        };
+        if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
+            continue;
+        }
+        count += 1;
+        each(module_name, path, fa);
+    }
+    (count, stale_names)
 }
 
 pub fn warm_cache(

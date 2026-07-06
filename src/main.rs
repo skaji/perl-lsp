@@ -1822,7 +1822,17 @@ fn enriched_tree_diagnostics(
     let mut all = Vec::new();
     for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
-        let enriched = bincode::serialize(&**entry.value())
+        // Index copies may be refs/bag-evicted; diagnostics read refs
+        // (unresolved calls) and the bag (types), so take the refs-present
+        // view first — resident when whole, rehydrated otherwise.
+        let whole = file_analysis::CrossFileLookup::refs_present(
+            idx,
+            &std::sync::Arc::new(file_analysis::CachedModule::new(
+                entry.key().clone(),
+                std::sync::Arc::clone(entry.value()),
+            )),
+        );
+        let enriched = bincode::serialize(&*whole)
             .ok()
             .and_then(|bin| bincode::deserialize::<file_analysis::FileAnalysis>(&bin).ok())
             .map(|mut fa| {
@@ -1832,7 +1842,7 @@ fn enriched_tree_diagnostics(
             });
         let diags = match &enriched {
             Some(fa) => symbols::collect_diagnostics(fa, idx, options),
-            None => symbols::collect_diagnostics(entry.value(), idx, options),
+            None => symbols::collect_diagnostics(&whole, idx, options),
         };
         for d in diags {
             all.push((file.clone(), d));
@@ -1843,11 +1853,15 @@ fn enriched_tree_diagnostics(
     // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
     // diagnostics` / `--check` / gold see the same Mode-B answers the LSP
     // publishes. No enrichment (pack files aren't cross-file-enriched).
-    idx.for_each_pack_registered_file(&mut |path, analysis| {
-        let file = path.display().to_string();
-        for d in symbols::pack_diagnostics(analysis, options) {
-            all.push((file.clone(), d));
-        }
+    idx.for_each_pack_index(|_lang, pack| {
+        pack.for_each_registered_file(&mut |cm| {
+            let file = cm.path.display().to_string();
+            // Same refs-present routing: pack index copies are evicted.
+            let whole = file_analysis::CrossFileLookup::refs_present(pack.as_ref(), cm);
+            for d in symbols::pack_diagnostics(&whole, options) {
+                all.push((file.clone(), d));
+            }
+        });
     });
     all
 }

@@ -4167,7 +4167,7 @@ mod pack_symmetry {
 
         let header = cpp(header_src);
         let mut user = cpp(use_src);
-        user.include_closure = vec!["/fake/vis/def.h".to_string()];
+        user.include_closure = vec!["/fake/vis/def.h".into()];
         let user_bare = cpp(use_src); // same tokens, no closure
         let stranger = cpp("int g(void) { return OP_VIS_A; }\n");
 
@@ -4289,7 +4289,7 @@ mod pack_symmetry {
         let header_src = "extern struct GS g_state;\n";
         let header = cpp(header_src);
         let mut tu = cpp("struct GS g_state;\n");
-        tu.include_closure = vec!["/fake/dd/state.h".to_string()];
+        tu.include_closure = vec!["/fake/dd/state.h".into()];
         let idx = crate::module_index::ModuleIndex::new_for_test();
         idx.register_symbols(PathBuf::from("/fake/dd/state.h"), Arc::new(header));
         idx.register_symbols(PathBuf::from("/fake/dd/state.c"), Arc::new(tu));
@@ -4327,11 +4327,11 @@ mod pack_symmetry {
         use std::sync::Arc;
         let def_src = "int compute_thing(int n) { return n; }\n";
         let mut def_tu = cpp(def_src);
-        def_tu.include_closure = vec!["/fake/inc/lib.h".to_string()];
+        def_tu.include_closure = vec!["/fake/inc/lib.h".into()];
         let header = cpp("int compute_thing(int n);\n");
         let mut host = cpp("int a(void) { return compute_thing(1); }\n");
         host.include_closure =
-            vec!["/fake/inc/lib.h".to_string(), "/fake/inc/frag.c".to_string()];
+            vec!["/fake/inc/lib.h".into(), "/fake/inc/frag.c".into()];
         // The fragment: same call, EMPTY closure (compiled only by textual
         // inclusion into host.c).
         let frag = cpp("int b(void) { return compute_thing(2); }\n");
@@ -4394,7 +4394,7 @@ mod pack_symmetry {
 
         let header = cpp(header_src);
         let mut user = cpp(use_src);
-        user.include_closure = vec![header_path.to_string_lossy().into_owned()];
+        user.include_closure = vec![header_path.to_string_lossy().as_ref().into()];
 
         let idx = crate::module_index::ModuleIndex::new_for_test();
         idx.register_symbols(header_path.clone(), Arc::new(header));

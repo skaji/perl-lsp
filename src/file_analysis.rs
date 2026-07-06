@@ -256,6 +256,55 @@ impl<'a> SubInfo<'a> {
 ///
 /// Object-safe by design: a `&dyn CrossFileLookup` rides
 /// `witnesses::BagContext`, hence the `&mut dyn FnMut` callback params.
+/// Process-global path interner (`docs/adr/relational-ref-index.md`,
+/// residency phases): closure paths repeat across nearly every file in a
+/// tree (abseil shares ~90% of its header universe per TU), so resident
+/// copies share ONE allocation per unique path instead of one per
+/// (file × path). Serialized form stays a plain string sequence — blob
+/// layout unchanged, interning happens on the way in.
+pub mod path_intern {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static POOL: OnceLock<Mutex<HashSet<Arc<str>>>> = OnceLock::new();
+
+    pub fn intern(s: &str) -> Arc<str> {
+        let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut g = pool.lock().unwrap();
+        if let Some(a) = g.get(s) {
+            return a.clone();
+        }
+        let a: Arc<str> = Arc::from(s);
+        g.insert(a.clone());
+        a
+    }
+
+    /// `#[serde(with = "path_intern::vec")]` — a `Vec<Arc<str>>` that reads
+    /// and writes as `Vec<String>` (unchanged on-disk shape), interning each
+    /// element on deserialize.
+    pub mod vec {
+        use super::intern;
+        use std::sync::Arc;
+
+        pub fn serialize<S: serde::Serializer>(
+            v: &[Arc<str>],
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            s.collect_seq(v.iter().map(|a| a.as_ref()))
+        }
+
+        pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> Result<Vec<Arc<str>>, D::Error> {
+            use serde::Deserialize;
+            Ok(Vec::<String>::deserialize(d)?
+                .iter()
+                .map(|s| intern(s))
+                .collect())
+        }
+    }
+}
+
 pub trait CrossFileLookup {
     fn get_cached(&self, module_name: &str) -> Option<std::sync::Arc<CachedModule>>;
     /// `get_cached` scoped to a querying file's VISIBILITY set (its own path +
@@ -427,11 +476,11 @@ impl<'a> ScopedLookup<'a> {
     /// the self path so it matches the candidates' canonical `CachedModule.path`.
     pub fn new(
         inner: &'a dyn CrossFileLookup,
-        include_closure: &[String],
+        include_closure: &[std::sync::Arc<str>],
         self_path: Option<&std::path::Path>,
     ) -> Self {
         let mut visible: std::collections::HashSet<String> =
-            include_closure.iter().cloned().collect();
+            include_closure.iter().map(|a| a.as_ref().to_owned()).collect();
         let self_path = self_path.map(|p| {
             let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             visible.insert(canon.to_string_lossy().into_owned());
@@ -3809,8 +3858,8 @@ pub struct FileAnalysis {
     /// `get_cached` candidates by reachability; `docs/adr/macro-handling.md`,
     /// "the include-closure lie"). Pack-language only; Perl leaves it empty, so
     /// the ranking is a no-op there (empty closure → global winner unchanged).
-    #[serde(default)]
-    pub include_closure: Vec<String>,
+    #[serde(default, with = "path_intern::vec")]
+    pub include_closure: Vec<std::sync::Arc<str>>,
 
     /// This analysis was produced from degraded inputs — a parse/extract
     /// failure, or a skipped cross-file macro gather (the on-open
@@ -12859,7 +12908,11 @@ impl FileAnalysis {
 
         // include closure — the shared-header-path duplication.
         h.include = vcap(&self.include_closure)
-            + strcaps(self.include_closure.iter())
+            // Interned Arc<str>: per-file cost is the pointer vec; the shared
+            // string bytes are counted once per unique path process-wide, which
+            // this per-file estimate approximates as len/refcount-free 16-byte
+            // fat pointers (the interner pool itself is a few hundred KB).
+            + self.include_closure.capacity() * std::mem::size_of::<std::sync::Arc<str>>()
             + vcap(&self.include_directives)
             + self
                 .include_directives

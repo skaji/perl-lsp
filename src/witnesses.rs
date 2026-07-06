@@ -2443,7 +2443,7 @@ pub fn query_sub_return_type(
                             .analysis
                             .include_closure
                             .iter()
-                            .any(|c| c.as_str() == self_str.as_ref());
+                            .any(|c| c.as_ref() == self_str.as_ref());
                     if !reachable {
                         continue;
                     }

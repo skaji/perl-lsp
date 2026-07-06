@@ -378,7 +378,7 @@ fn header_change_invalidates_consumer_row_via_deps_stamp() {
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
     let tree = parser.parse(&source, None).unwrap();
     let mut fa = crate::builder::build(&tree, source.as_bytes());
-    fa.include_closure = vec![hdr_canon];
+    fa.include_closure = vec![hdr_canon.into()];
     let cached = Some(Arc::new(CachedModule::new(pm.clone(), Arc::new(fa))));
     save_to_db(&conn, "Consumer", &cached, "workspace");
 

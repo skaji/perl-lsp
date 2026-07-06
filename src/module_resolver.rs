@@ -898,32 +898,12 @@ pub fn index_pack_languages(
         // skips re-analyzing them. Version-stale rows are re-analyzed.
         let mut warmed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         if let Some(ref conn) = conn {
-            let temp: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
-            let (_n, stale_names) = module_cache::warm_cache(conn, &temp);
-            let stale: std::collections::HashSet<String> = stale_names.into_iter().collect();
-            // Drain (not iterate): the disk blob keeps the FULL bag, so the
-            // resident register gets a bag-STRIPPED copy while the just-decoded
-            // full analysis is dropped at the end of each iteration (R2 — never
-            // retain the full bag past registration). `try_unwrap` takes
-            // ownership when the temp map was the only holder (the common case),
-            // avoiding a full clone; the clone is the refcount>1 fallback.
-            // Backfill seam: a blob that predates the relational ref index
-            // (or survived a REF_ROWS_VERSION wipe) has no rows; shred from
-            // the analysis we just decoded anyway — the entire migration
-            // story, no separate pass. One txn bounds the first-run cost.
+            // STREAMING warm: one row decodes, backfills its ref rows if the
+            // blob predates the relational index, strips bag + refs, registers,
+            // and drops — the whole-table temp map this replaces held every
+            // full analysis at once (the warm-peak-above-cold-peak artifact).
             let backfill_tx = conn.unchecked_transaction().ok();
-            for (name, val) in temp.into_iter() {
-                if stale.contains(&name) {
-                    continue;
-                }
-                let Some(cached) = val else { continue };
-                let path = cached.path.clone();
-                let mut fa = match Arc::try_unwrap(cached) {
-                    Ok(cm) => {
-                        Arc::try_unwrap(cm.analysis).unwrap_or_else(|arc| (*arc).clone())
-                    }
-                    Err(arc) => (*arc.analysis).clone(),
-                };
+            let (_n, _stale) = module_cache::warm_cache_streaming(conn, &mut |_name, path, mut fa| {
                 let path_str = path.to_string_lossy();
                 if !module_cache::has_ref_rows(conn, &path_str) {
                     let seeds: Vec<_> = fa.refs.iter().map(|r| r.row_seed()).collect();
@@ -937,7 +917,7 @@ pub fn index_pack_languages(
                 }
                 pack_index.register_symbols(path.clone(), Arc::new(fa));
                 warmed.insert(path);
-            }
+            });
             if let Some(tx) = backfill_tx {
                 let _ = tx.commit();
             }
@@ -1099,7 +1079,7 @@ pub fn pack_file_changed(
     let mut consumers: Vec<PathBuf> = Vec::new();
     if let Some(ref pack) = pack {
         pack.for_each_registered_file(&mut |cm| {
-            if cm.analysis.include_closure.iter().any(|c| c == &canon_str) {
+            if cm.analysis.include_closure.iter().any(|c| c.as_ref() == canon_str) {
                 consumers.push(cm.path.clone());
             }
         });

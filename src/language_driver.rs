@@ -453,7 +453,10 @@ impl PackDriver {
         if let (Some(f), Some(p)) = (self.include_closure, path) {
             let (closure, complete) =
                 crate::timings::phase("cpp.include_closure", || f(p, source));
-            fa.include_closure = closure;
+            fa.include_closure = closure
+                .iter()
+                .map(|s| crate::file_analysis::path_intern::intern(s))
+                .collect();
             closure_incomplete = !complete;
         }
         // Never persist an analysis built from a partial dependency view: a
