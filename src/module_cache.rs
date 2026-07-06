@@ -188,7 +188,11 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             flags        INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_syms_name ON syms(name_id);
-        CREATE INDEX IF NOT EXISTS idx_syms_file ON syms(file_id);",
+        CREATE INDEX IF NOT EXISTS idx_syms_file ON syms(file_id);
+        CREATE TABLE IF NOT EXISTS stubs (
+            path TEXT PRIMARY KEY,
+            stub BLOB NOT NULL
+        );",
     )?;
     // Row-format generation for the derived tables (see REF_ROWS_VERSION).
     let rows_version: Option<String> = conn
@@ -321,7 +325,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// decoded analyses it is loading anyway.
 pub fn clear_derived_rows(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "DELETE FROM refs; DELETE FROM syms; DELETE FROM files; DELETE FROM strings;",
+        "DELETE FROM refs; DELETE FROM syms; DELETE FROM files; DELETE FROM strings; \
+         DELETE FROM stubs;",
     )
 }
 
@@ -533,6 +538,81 @@ fn closure_stamp(
     acc as i64
 }
 
+/// The register-from-Surface warm payload: everything bulk registration
+/// derives from a WHOLE analysis, precomputed at persist time so warm
+/// start never decodes the full blob. `skeleton` is the bag/refs/symbols-
+/// stripped analysis — the exact struct the resident copy would be, so
+/// all present-view routing and rehydration behave identically to a
+/// full-decode-then-strip warm by construction.
+pub struct WarmStub {
+    pub feed: Vec<(String, bool)>,
+    pub specs: Vec<(String, String)>,
+    pub surface: crate::surface::Surface,
+    pub skeleton: FileAnalysis,
+}
+
+/// Bump when the stub's MEANING changes without breaking its bincode
+/// decode (a decode break self-heals to the full-blob path). Mismatch
+/// wipes the `stubs` table; the next warm backfills from full decodes.
+const STUB_VERSION: &str = "1";
+
+/// Gate the `stubs` table on the current stub generation — call once
+/// before a stub-consuming warm scan.
+pub fn validate_stub_version(conn: &Connection) {
+    let cur: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'stub_version'", [], |r| r.get(0))
+        .ok();
+    if cur.as_deref() == Some(STUB_VERSION) {
+        return;
+    }
+    let _ = conn.execute("DELETE FROM stubs", []);
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('stub_version', ?1)",
+        params![STUB_VERSION],
+    );
+}
+
+/// Encode by reference (`&[T]` and `Vec<T>` share a bincode encoding) so
+/// the persist path never clones the feed/surface/skeleton it already holds.
+pub fn encode_stub(
+    feed: &[(String, bool)],
+    specs: &[(String, String)],
+    surface: &crate::surface::Surface,
+    skeleton: &FileAnalysis,
+) -> Option<Vec<u8>> {
+    let bin = bincode::serialize(&(feed, specs, surface, skeleton)).ok()?;
+    zstd::encode_all(bin.as_slice(), ZSTD_LEVEL).ok()
+}
+
+pub fn decode_stub(blob: &[u8]) -> Option<WarmStub> {
+    let bin = zstd::decode_all(blob).ok()?;
+    let (feed, specs, surface, mut skeleton): (
+        Vec<(String, bool)>,
+        Vec<(String, String)>,
+        crate::surface::Surface,
+        FileAnalysis,
+    ) = bincode::deserialize(&bin).ok()?;
+    skeleton.after_deserialize();
+    // The eviction flags are `#[serde(skip)]` because a decoded BLOB is
+    // whole; the stub's skeleton is the opposite — stripped on all three
+    // axes by construction. Re-mark it, or its empty bag/refs/symbols
+    // would read as "no facts" instead of "on disk".
+    skeleton.evict_witness_bag();
+    skeleton.evict_refs();
+    skeleton.evict_symbols();
+    Some(WarmStub { feed, specs, surface, skeleton })
+}
+
+pub fn save_stub(conn: &Connection, path: &str, blob: &[u8]) {
+    let r = conn.execute(
+        "INSERT OR REPLACE INTO stubs (path, stub) VALUES (?1, ?2)",
+        params![path, blob],
+    );
+    if let Err(e) = r {
+        log::warn!("Failed to save warm stub for '{}': {}", path, e);
+    }
+}
+
 /// Serialize FileAnalysis via bincode then compress with zstd.
 pub fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
     let bin = bincode::serialize(fa).ok()?;
@@ -623,6 +703,13 @@ pub fn save_blob_to_db_stamped(
     if let Err(e) = r {
         log::warn!("Failed to save module blob for '{}': {}", module_name, e);
     }
+    // A rewritten modules row orphans any prior stub for the path — a stale
+    // skeleton paired with a fresh stamp would be served as valid on the
+    // next warm. Writers that have a fresh stub re-insert it right after.
+    let _ = conn.execute(
+        "DELETE FROM stubs WHERE path = ?1",
+        params![path.to_string_lossy()],
+    );
 }
 
 /// Replace one file's derived rows — refs AND symbols — in the relational
@@ -730,6 +817,7 @@ pub fn shred_derived_rows(
 /// else spells modules-table SQL.
 pub fn invalidate_generation(conn: &Connection, path: &str) {
     let _ = conn.execute("DELETE FROM modules WHERE path = ?1", params![path]);
+    let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path]);
     delete_ref_rows(conn, path);
 }
 
@@ -742,6 +830,9 @@ pub fn invalidate_generation_tier(conn: &Connection, path: &str, source: &str) {
         "DELETE FROM modules WHERE path = ?1 AND source = ?2",
         params![path, source],
     );
+    // Stubs are workspace-tier only; a dual-homed file keeping its import
+    // generation has no stub to preserve.
+    let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path]);
     let _ = conn.execute(
         "DELETE FROM refs WHERE file_id IN
            (SELECT file_id FROM files WHERE path = ?1 AND source = ?2)",
@@ -1031,6 +1122,101 @@ pub fn warm_cache_streaming(
     (count, stale_names)
 }
 
+/// Every path that currently has shredded derived rows — the bulk twin of
+/// `has_ref_rows` for warm scans (one query instead of one per file).
+pub fn paths_with_ref_rows(conn: &Connection) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(mut stmt) = conn.prepare("SELECT path FROM files") else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+        for p in rows.flatten() {
+            out.insert(p);
+        }
+    }
+    out
+}
+
+/// The register-from-Surface warm scan: stream row METADATA (never the
+/// `analysis` column — its overflow pages are what the 9-minute wall is
+/// made of), validate stamps/version, and serve each valid file from its
+/// stub when one decodes and `each_stub` accepts it (returns true).
+/// Otherwise fall back to a point-decode of that one file's full blob →
+/// `each_full` — the same one-transient-decode bound as
+/// `warm_cache_streaming`. Closure-stamp validation runs on whichever
+/// struct is in hand (stub skeleton or full analysis); both carry the
+/// pinned `include_closure`.
+pub fn warm_pack_stream_with_stubs(
+    conn: &Connection,
+    use_stubs: bool,
+    each_stub: &mut dyn FnMut(PathBuf, WarmStub) -> bool,
+    each_full: &mut dyn FnMut(String, PathBuf, FileAnalysis),
+) -> usize {
+    let mut stmt = match conn.prepare(
+        "SELECT m.module_name, m.path, m.mtime_secs, m.file_size, m.extract_version, \
+                m.deps_stamp, s.stub \
+         FROM modules m LEFT JOIN stubs s ON s.path = m.path",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+        ))
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let mut count = 0usize;
+    let mut stat_memo: std::collections::HashMap<String, (i64, i64)> =
+        std::collections::HashMap::new();
+    for row in rows.flatten() {
+        let (module_name, path_str, cached_mtime, cached_size, row_extract_version, row_deps_stamp, stub_blob) =
+            row;
+        if path_str.is_empty() {
+            continue; // negative sentinel — no pack consumer
+        }
+        let path = PathBuf::from(&path_str);
+        match file_stamp(&path) {
+            Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
+            _ => continue, // changed or deleted on disk
+        }
+        if row_extract_version < EXTRACT_VERSION {
+            continue; // stale rows re-analyze; don't register the old shape
+        }
+        if use_stubs {
+            if let Some(stub) = stub_blob.as_deref().and_then(decode_stub) {
+                if closure_stamp(&stub.skeleton.include_closure, &mut stat_memo)
+                    != row_deps_stamp
+                {
+                    continue;
+                }
+                if each_stub(path.clone(), stub) {
+                    count += 1;
+                    continue;
+                }
+                // Declined (e.g. derived rows missing — the full analysis is
+                // needed to re-shred): fall through to the blob.
+            }
+        }
+        let Some(fa) = load_one(conn, &path_str) else { continue };
+        if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
+            continue;
+        }
+        count += 1;
+        each_full(module_name, path, fa);
+    }
+    count
+}
+
 pub fn warm_cache(
     conn: &Connection,
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
@@ -1160,6 +1346,10 @@ pub fn save_to_db(
     );
     if let Err(e) = r {
         log::warn!("Failed to save module cache for '{}': {}", module_name, e);
+    }
+    if !path_str.is_empty() {
+        // Same stale-stub guard as `save_blob_to_db_stamped`.
+        let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path_str]);
     }
 }
 

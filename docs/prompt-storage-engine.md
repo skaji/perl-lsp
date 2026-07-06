@@ -189,21 +189,26 @@ DELETE+INSERT — the store never rebuilds wholesale after first index.
   workspace registration and on open-doc Perl edits; `Changed` verdicts
   re-enrich + republish exactly the OPEN docs in the dirty closure.
   Engine choice (hand-rolled over Salsa) logged in `docs/open-forks.md`.
+- **Value symbols + macros/includes on the Surface landed**: `values` /
+  `free_values` (linkage-visible non-callables), `MacroSurface`
+  (name/params/BODY/guards — the body IS cross-file semantics under
+  textual inclusion) and raw `#include` specs, each with equality-net
+  arms (cpp nets behind the feature flag).
+- **Pack-tier freshness landed**: `pack_file_changed` re-analyzes the
+  changed file FIRST and records its surface; an `Unchanged` verdict
+  skips consumer eviction + re-analysis entirely (a deep-header comment
+  edit re-parses one file, not every TU). Consumer discovery stays
+  include-closure-based (the existing scan) — `FreshnessIndex` needed no
+  closure edge kind; only its equality half gates the pack tier. Bulk
+  registration (`register_symbols`, `register_symbols_stripping`, the
+  deferred writer arm) records surfaces so the first post-startup edit
+  benefits. `FreshnessIndex` retains fingerprint + provided names, not
+  full Surfaces (macro bodies resident at 38K files would rebuild the
+  stripped payload). Net: `pack_file_changed_surface_gate_*` in
+  `module_resolver_tests.rs`.
 
 Next, in order:
 
-1. **Value symbols on the Surface.** `is_linkage_visible` non-callables
-   (C globals/enum constants/macro-artifact Variables; Perl `our`
-   globals) are cross-file-visible but not yet projected — for cpp the
-   equality firewall is too coarse without them (adding a global reads
-   as Unchanged). Add `values` to `PackageSurface` + a package-less
-   `free_values` bucket, with equality-net arms, BEFORE wiring pack-tier
-   freshness.
-2. **Pack-tier freshness**: record surfaces in `register_symbols_*`;
-   dirty edges for cpp are include-closure-based, not name-import-based
-   — decide whether `FreshnessIndex` grows a closure edge kind or packs
-   reuse the existing consumer scan (`pack_file_changed` already walks
-   `include_closure.contains`).
 3. **Register-from-Surface warm** (the parked symbols phase C): persist
    the Surface per file (ALTER TABLE modules ADD COLUMN surface BLOB —
    the deps_stamp precedent, no SCHEMA_VERSION bump), stream surfaces at

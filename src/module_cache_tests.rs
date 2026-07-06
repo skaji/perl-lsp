@@ -641,3 +641,98 @@ fn inc_clear_is_import_tier_scoped() {
         "import rows must clear on an @INC change"
     );
 }
+
+/// The register-from-Surface warm stub: encode/decode round-trip, and the
+/// warm stream's lane selection — a valid stub serves registration without
+/// touching the full blob; a declined stub (rows missing) falls back to the
+/// full decode; a stale file stamp serves neither.
+#[test]
+fn warm_stub_roundtrip_and_lane_selection() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_warmstub.pm");
+    std::fs::write(&pm, "package Stubbed;\nsub go { my $x = shift; return $x + 1 }\n1;\n")
+        .unwrap();
+    let source = std::fs::read_to_string(&pm).unwrap();
+    let cached = parse_source_to_cached(&source, &pm);
+    let path_str = pm.to_string_lossy().to_string();
+
+    // Build the stub halves the way the fresh worker does: feed + surface
+    // from the WHOLE analysis, skeleton stripped.
+    let whole = (*cached.analysis).clone();
+    let feed = vec![("go".to_string(), false)];
+    let specs: Vec<(String, String)> = Vec::new();
+    let surface = crate::surface::Surface::project(&whole);
+    let mut skeleton = whole;
+    skeleton.evict_witness_bag();
+    skeleton.evict_refs();
+    skeleton.evict_symbols();
+
+    let blob = encode_stub(&feed, &specs, &surface, &skeleton).expect("encodes");
+    let stub = decode_stub(&blob).expect("decodes");
+    assert_eq!(stub.feed, feed);
+    assert_eq!(stub.surface, surface);
+    assert!(stub.skeleton.symbols_are_evicted() && stub.skeleton.refs_are_evicted());
+
+    // Persist the modules row (deletes any stub for the path), then the stub.
+    save_to_db(&conn, &path_str, &Some(cached.clone()), "workspace");
+    validate_stub_version(&conn);
+    save_stub(&conn, &path_str, &blob);
+
+    let run = |conn: &Connection, accept: bool| -> (usize, usize) {
+        let (mut stubs, mut fulls) = (0usize, 0usize);
+        warm_pack_stream_with_stubs(
+            conn,
+            true,
+            &mut |_p, _s| {
+                stubs += 1;
+                accept
+            },
+            &mut |_n, _p, _fa| fulls += 1,
+        );
+        (stubs, fulls)
+    };
+    // Stub lane accepted: full blob untouched.
+    assert_eq!(run(&conn, true), (1, 0));
+    // Stub declined (e.g. derived rows missing): falls back to full decode.
+    assert_eq!(run(&conn, false), (1, 1));
+    // use_stubs=false (NO_EVICT): straight to the full lane.
+    let (mut stubs, mut fulls) = (0usize, 0usize);
+    warm_pack_stream_with_stubs(&conn, false, &mut |_p, _s| { stubs += 1; true }, &mut |_n, _p, _fa| fulls += 1);
+    assert_eq!((stubs, fulls), (0, 1));
+
+    // A rewritten modules row must orphan the stub (stale-skeleton guard).
+    save_to_db(&conn, &path_str, &Some(cached), "workspace");
+    assert_eq!(run(&conn, true), (0, 1));
+
+    // Stale file stamp: neither lane serves.
+    std::fs::write(&pm, "package Stubbed;\nsub go { 2 }\nsub extra { 3 }\n1;\n").unwrap();
+    assert_eq!(run(&conn, true), (0, 0));
+
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// STUB_VERSION mismatch wipes the stubs table (never serves an old
+/// generation's meaning under a new reader).
+#[test]
+fn stub_version_gate_wipes_on_mismatch() {
+    let conn = test_db();
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('stub_version', 'ancient')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO stubs (path, stub) VALUES ('/x', x'00')",
+        [],
+    )
+    .unwrap();
+    validate_stub_version(&conn);
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM stubs", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0, "mismatched generation wiped");
+    // Current version: idempotent, keeps rows.
+    conn.execute("INSERT INTO stubs (path, stub) VALUES ('/y', x'00')", []).unwrap();
+    validate_stub_version(&conn);
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM stubs", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1);
+}

@@ -985,11 +985,22 @@ impl ModuleIndex {
         path: &std::path::Path,
         fa: &FileAnalysis,
     ) -> crate::surface::SurfaceVerdict {
+        self.record_surface_value(path, crate::surface::Surface::project(fa))
+    }
+
+    /// Record an ALREADY-projected surface (the warm-stub path decodes the
+    /// persisted projection; the fresh worker projects once and shares it
+    /// with the stub encoder).
+    pub fn record_surface_value(
+        &self,
+        path: &std::path::Path,
+        surface: crate::surface::Surface,
+    ) -> crate::surface::SurfaceVerdict {
         // Canonicalize here so every caller (open-doc, worker, watcher)
         // lands on one key — a fresh/canon split would make every edit
         // look FirstSeen and the gate never fires.
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.freshness.record(&canon, crate::surface::Surface::project(fa))
+        self.freshness.record(&canon, surface)
     }
 
     /// Drop `path`'s recorded surface and its dep edges (file deleted).

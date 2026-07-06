@@ -1277,7 +1277,11 @@ pub fn index_pack_languages(
             .collect();
         let mut warmed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         if let Some(ref conn) = conn {
-            let mut dead_rows: Vec<PathBuf> = Vec::new();
+            module_cache::validate_stub_version(conn);
+            // Both warm lanes append to these; RefCell because the two
+            // FnMut closures live simultaneously (single-threaded scan).
+            let dead_rows: std::cell::RefCell<Vec<PathBuf>> = Default::default();
+            let warmed_cell = std::cell::RefCell::new(&mut warmed);
             // Deferred past the warm scan — same SQLITE_BUSY_SNAPSHOT
             // rationale as the workspace indexer's backfill.
             let mut pending_backfill: Vec<(
@@ -1285,32 +1289,92 @@ pub fn index_pack_languages(
                 Vec<crate::file_analysis::RefRowSeed>,
                 Vec<crate::file_analysis::SymRowSeed>,
             )> = Vec::new();
-            let (_n, _stale) = module_cache::warm_cache_streaming(conn, None, &mut |_name, path, mut fa| {
-                if !canon_members.contains(&path) {
-                    dead_rows.push(path);
-                    return;
-                }
-                let path_str = path.to_string_lossy();
-                // Refs strip only when their rows are known present — rows
-                // name candidates for the backward walk; the blob rehydrates.
-                let rows_ok = module_cache::has_ref_rows(conn, &path_str);
-                if !rows_ok {
-                    pending_backfill.push((
+            // Stubs whose files warmed through the FULL path this scan —
+            // written after it so the next warm takes the stub lane.
+            let mut pending_stubs: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+            let rows_present = module_cache::paths_with_ref_rows(conn);
+            // A stub's skeleton is stripped by construction; under NO_EVICT
+            // the resident copies must stay whole, so stubs are bypassed.
+            let use_stubs = eviction_enabled();
+            let _n = module_cache::warm_pack_stream_with_stubs(
+                conn,
+                use_stubs,
+                &mut |path, stub| {
+                    if !canon_members.contains(&path) {
+                        dead_rows.borrow_mut().push(path);
+                        return true; // handled: dead row, no blob needed
+                    }
+                    if !rows_present.contains(path.to_string_lossy().as_ref()) {
+                        // Rows missing (REF_ROWS_VERSION wipe): the re-shred
+                        // needs the full analysis — decline to the blob lane.
+                        return false;
+                    }
+                    let _ = pack_index.record_surface_value(&path, stub.surface);
+                    pack_index.register_symbols_inner(
                         path.clone(),
-                        fa.refs.iter().map(|r| r.row_seed()).collect(),
-                        fa.sym_row_seeds(),
-                    ));
+                        Arc::new(stub.skeleton),
+                        &stub.feed,
+                        &stub.specs,
+                    );
+                    warmed_cell.borrow_mut().insert(path);
+                    true
+                },
+                &mut |_name, path, mut fa| {
+                    if !canon_members.contains(&path) {
+                        dead_rows.borrow_mut().push(path);
+                        return;
+                    }
+                    let path_str = path.to_string_lossy();
+                    // Refs strip only when their rows are known present — rows
+                    // name candidates for the backward walk; the blob rehydrates.
+                    let rows_ok = rows_present.contains(path_str.as_ref());
+                    if !rows_ok {
+                        pending_backfill.push((
+                            path.clone(),
+                            fa.refs.iter().map(|r| r.row_seed()).collect(),
+                            fa.sym_row_seeds(),
+                        ));
+                    }
+                    // Registration-owned strip, spelled as its halves so the
+                    // stub backfill can reuse the feed + surface it derives.
+                    let (feed, specs) =
+                        crate::module_index::ModuleIndex::prepare_pack_feed(&fa);
+                    let surface = crate::surface::Surface::project(&fa);
+                    let _ = pack_index.record_surface_value(&path, surface.clone());
+                    let strip_bag = eviction_enabled();
+                    if strip_bag {
+                        fa.evict_witness_bag();
+                    }
+                    let fully_stripped = strip_bag && rows_ok;
+                    if fully_stripped {
+                        fa.evict_refs();
+                        fa.evict_symbols();
+                    }
+                    let arc = Arc::new(fa);
+                    pack_index.register_symbols_inner(path.clone(), arc.clone(), &feed, &specs);
+                    if fully_stripped {
+                        if let Some(blob) =
+                            module_cache::encode_stub(&feed, &specs, &surface, &arc)
+                        {
+                            pending_stubs.push((path.clone(), blob));
+                        }
+                    }
+                    warmed_cell.borrow_mut().insert(path);
+                },
+            );
+            for chunk in pending_stubs.chunks(256) {
+                if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+                    log::error!("Pack stub backfill txn open failed; stubs defer to next warm");
+                    break;
                 }
-                // Registration-owned strip (feeds read the whole copy).
-                let strip_bag = eviction_enabled();
-                let _ = pack_index.register_symbols_stripping(
-                    path.clone(),
-                    fa,
-                    strip_bag,
-                    strip_bag && rows_ok,
-                );
-                warmed.insert(path);
-            });
+                for (path, blob) in chunk {
+                    module_cache::save_stub(conn, &path.to_string_lossy(), blob);
+                }
+                if let Err(e) = conn.execute_batch("COMMIT") {
+                    log::error!("Pack stub backfill commit failed: {}", e);
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
+            }
             for chunk in pending_backfill.chunks(128) {
                 if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
                     log::error!("Pack backfill txn open failed; rows defer to next warm");
@@ -1332,7 +1396,7 @@ pub fn index_pack_languages(
                     let _ = conn.execute_batch("ROLLBACK");
                 }
             }
-            for path in dead_rows {
+            for path in dead_rows.into_inner() {
                 module_cache::invalidate_generation_tier(
                     conn,
                     &path.to_string_lossy(),
@@ -1362,6 +1426,10 @@ pub fn index_pack_languages(
             specs: Vec<(String, String)>,
             deferred: bool,
             blob: Vec<u8>,
+            // Warm stub (deferred/stripped entries only) — persisted in the
+            // same chunk txn as the blob so the next warm start registers
+            // from it without decoding `blob`.
+            stub_blob: Option<Vec<u8>>,
             seeds: Vec<crate::file_analysis::RefRowSeed>,
             sym_seeds: Vec<crate::file_analysis::SymRowSeed>,
             stamp: (i64, i64),
@@ -1399,6 +1467,9 @@ pub fn index_pack_languages(
                             conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
                         ) {
                             log::warn!("Failed to shred derived rows for {:?}: {}", e.path, err);
+                        }
+                        if let Some(sb) = &e.stub_blob {
+                            module_cache::save_stub(conn, &path_str, sb);
                         }
                     }
                     let committed = txn_open
@@ -1512,11 +1583,14 @@ pub fn index_pack_languages(
                         // Surface must project from the WHOLE analysis; the
                         // freshness index is session-local, so recording
                         // before the writer's COMMIT is safe.
-                        let _ = pack_index.record_surface(&canon, &analysis);
+                        let surface = crate::surface::Surface::project(&analysis);
                         analysis.evict_witness_bag();
                         analysis.evict_refs();
                         analysis.evict_symbols();
                         let arc = Arc::new(analysis);
+                        let stub_blob =
+                            module_cache::encode_stub(&feed, &specs, &surface, &arc);
+                        let _ = pack_index.record_surface_value(&canon, surface);
                         let (blob, seeds, sym_seeds) = payload.unwrap();
                         let _ = fresh_tx.send(FreshEntry {
                             path: canon.clone(),
@@ -1525,6 +1599,7 @@ pub fn index_pack_languages(
                             specs,
                             deferred: true,
                             blob,
+                            stub_blob,
                             seeds,
                             sym_seeds,
                             stamp,
@@ -1540,6 +1615,7 @@ pub fn index_pack_languages(
                                 specs: Vec::new(),
                                 deferred: false,
                                 blob,
+                                stub_blob: None,
                                 seeds,
                                 sym_seeds,
                                 stamp,
