@@ -461,7 +461,7 @@ fn shred_ref_rows_roundtrip() {
     assert!(!has_ref_rows(&conn, &path_str));
     let seeds: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
     assert!(!seeds.is_empty(), "call sites must produce row seeds");
-    shred_ref_rows(&conn, &path_str, "workspace", &seeds).unwrap();
+    shred_derived_rows(&conn, &path_str, "workspace", &seeds, &[]).unwrap();
     assert!(has_ref_rows(&conn, &path_str));
 
     // Retrieval by the match key finds the file; an unknown key finds nothing.
@@ -472,17 +472,54 @@ fn shred_ref_rows_roundtrip() {
     assert!(n >= 2, "two call sites expected, got {n}");
 
     // Re-shred replaces: same seeds again must not double the rows.
-    shred_ref_rows(&conn, &path_str, "workspace", &seeds).unwrap();
+    shred_derived_rows(&conn, &path_str, "workspace", &seeds, &[]).unwrap();
     assert_eq!(ref_count_named(&conn, "helper"), n);
 
     // A zero-ref shred still marks the file as shredded (the backfill marker).
     let other = dir.join("TestModule_shred_empty.pm");
-    shred_ref_rows(&conn, &other.to_string_lossy(), "workspace", &[]).unwrap();
+    shred_derived_rows(&conn, &other.to_string_lossy(), "workspace", &[], &[]).unwrap();
     assert!(has_ref_rows(&conn, &other.to_string_lossy()));
 
     delete_ref_rows(&conn, &path_str);
     assert!(!has_ref_rows(&conn, &path_str));
     assert!(ref_candidate_files(&conn, &["helper".to_string()]).is_empty());
+
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// Symbol rows ride the same shred generation as refs: written together,
+/// replaced together (never accumulated), erased together.
+#[test]
+fn shred_sym_rows_same_generation() {
+    let conn = test_db();
+    let source = "package S;\nsub helper { 1 }\nsub caller_a { helper(); }\n1;\n";
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_symshred.pm");
+    std::fs::write(&pm, source).unwrap();
+    let cached = parse_source_to_cached(source, &pm);
+    let path_str = pm.to_string_lossy().to_string();
+
+    let seeds: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let sym_seeds = cached.analysis.sym_row_seeds();
+    assert!(
+        sym_seeds.iter().any(|s| s.name == "helper"),
+        "sub symbols must project into row seeds; got {:?}",
+        sym_seeds.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+    shred_derived_rows(&conn, &path_str, "workspace", &seeds, &sym_seeds).unwrap();
+    let count = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM syms", [], |r| r.get(0)).unwrap()
+    };
+    let n = count(&conn);
+    assert!(n >= 2, "expected sym rows for S's subs, got {n}");
+
+    // Re-shred replaces.
+    shred_derived_rows(&conn, &path_str, "workspace", &seeds, &sym_seeds).unwrap();
+    assert_eq!(count(&conn), n);
+
+    // Deletion takes both families.
+    delete_ref_rows(&conn, &path_str);
+    assert_eq!(count(&conn), 0);
 
     let _ = std::fs::remove_file(&pm);
 }
@@ -530,7 +567,7 @@ fn hard_clear_wipes_derived_rows() {
         qual: None,
         arg_count: None,
     }];
-    shred_ref_rows(&conn, "/some/file.pm", "workspace", &seeds).unwrap();
+    shred_derived_rows(&conn, "/some/file.pm", "workspace", &seeds, &[]).unwrap();
     assert!(has_ref_rows(&conn, "/some/file.pm"));
     validate_plugin_fingerprint(&conn, "fingerprint-a").unwrap();
     validate_plugin_fingerprint(&conn, "fingerprint-b").unwrap();
@@ -558,7 +595,7 @@ fn ref_rows_version_bump_recreates_old_shape_tables() {
     .unwrap();
     init_schema(&conn).unwrap();
     // The v2 shape must accept a tier-tagged shred.
-    shred_ref_rows(&conn, "/migrated.pm", "workspace", &[]).unwrap();
+    shred_derived_rows(&conn, "/migrated.pm", "workspace", &[], &[]).unwrap();
     assert!(has_ref_rows(&conn, "/migrated.pm"));
 }
 
@@ -579,7 +616,7 @@ fn ref_rows_current_stamp_with_stale_shape_recreates_tables() {
     ))
     .unwrap();
     init_schema(&conn).unwrap();
-    shred_ref_rows(&conn, "/migrated.pm", "workspace", &[]).unwrap();
+    shred_derived_rows(&conn, "/migrated.pm", "workspace", &[], &[]).unwrap();
     assert!(has_ref_rows(&conn, "/migrated.pm"));
 }
 
@@ -590,8 +627,8 @@ fn ref_rows_current_stamp_with_stale_shape_recreates_tables() {
 fn inc_clear_is_import_tier_scoped() {
     let conn = test_db();
     validate_inc_paths(&conn, &[PathBuf::from("/lib/a")]).unwrap();
-    shred_ref_rows(&conn, "/ws/File.pm", "workspace", &[]).unwrap();
-    shred_ref_rows(&conn, "/inc/Dep.pm", "import", &[]).unwrap();
+    shred_derived_rows(&conn, "/ws/File.pm", "workspace", &[], &[]).unwrap();
+    shred_derived_rows(&conn, "/inc/Dep.pm", "import", &[], &[]).unwrap();
 
     validate_inc_paths(&conn, &[PathBuf::from("/lib/CHANGED")]).unwrap();
     assert!(

@@ -129,7 +129,7 @@ pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Opt
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
 /// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the
 /// next warm re-shreds rows from the already-decoded analyses for free.
-const REF_ROWS_VERSION: &str = "2";
+const REF_ROWS_VERSION: &str = "3";
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -175,7 +175,20 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             arg_count INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name_id);
-        CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);",
+        CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
+        CREATE TABLE IF NOT EXISTS syms (
+            file_id      INTEGER NOT NULL,
+            name_id      INTEGER NOT NULL,
+            kind         INTEGER NOT NULL,
+            start_row    INTEGER NOT NULL,
+            start_col    INTEGER NOT NULL,
+            end_row      INTEGER NOT NULL,
+            end_col      INTEGER NOT NULL,
+            container_id INTEGER,
+            flags        INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_syms_name ON syms(name_id);
+        CREATE INDEX IF NOT EXISTS idx_syms_file ON syms(file_id);",
     )?;
     // Row-format generation for the derived tables (see REF_ROWS_VERSION).
     let rows_version: Option<String> = conn
@@ -195,6 +208,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         .prepare("SELECT source FROM files LIMIT 1")
         .map(|_| ())
         .and_then(|_| conn.prepare("SELECT qual_kind FROM refs LIMIT 1").map(|_| ()))
+        .and_then(|_| conn.prepare("SELECT flags FROM syms LIMIT 1").map(|_| ()))
         .is_ok();
     if rows_version.as_deref() != Some(REF_ROWS_VERSION) || !shape_ok {
         // DROP, not DELETE: a format change may alter the table SHAPE, and
@@ -204,6 +218,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // retrieval dead). Recreate from scratch.
         conn.execute_batch(
             "DROP TABLE IF EXISTS refs;
+             DROP TABLE IF EXISTS syms;
              DROP TABLE IF EXISTS files;
              DROP TABLE IF EXISTS strings;
              CREATE TABLE files (
@@ -230,7 +245,20 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                 arg_count INTEGER
              );
              CREATE INDEX idx_refs_name ON refs(name_id);
-             CREATE INDEX idx_refs_file ON refs(file_id);",
+             CREATE INDEX idx_refs_file ON refs(file_id);
+             CREATE TABLE syms (
+                file_id      INTEGER NOT NULL,
+                name_id      INTEGER NOT NULL,
+                kind         INTEGER NOT NULL,
+                start_row    INTEGER NOT NULL,
+                start_col    INTEGER NOT NULL,
+                end_row      INTEGER NOT NULL,
+                end_col      INTEGER NOT NULL,
+                container_id INTEGER,
+                flags        INTEGER NOT NULL
+             );
+             CREATE INDEX idx_syms_name ON syms(name_id);
+             CREATE INDEX idx_syms_file ON syms(file_id);",
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('ref_rows_version', ?1)",
@@ -292,7 +320,9 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 /// the rows with it. Cheap to rebuild — the next warm re-shreds from the
 /// decoded analyses it is loading anyway.
 pub fn clear_derived_rows(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("DELETE FROM refs; DELETE FROM files; DELETE FROM strings;")
+    conn.execute_batch(
+        "DELETE FROM refs; DELETE FROM syms; DELETE FROM files; DELETE FROM strings;",
+    )
 }
 
 pub fn compute_inc_hash(inc_paths: &[PathBuf]) -> String {
@@ -329,6 +359,10 @@ pub fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite:
         conn.execute("DELETE FROM modules WHERE source = 'import'", [])?;
         conn.execute(
             "DELETE FROM refs WHERE file_id IN (SELECT file_id FROM files WHERE source = 'import')",
+            [],
+        )?;
+        conn.execute(
+            "DELETE FROM syms WHERE file_id IN (SELECT file_id FROM files WHERE source = 'import')",
             [],
         )?;
         conn.execute("DELETE FROM files WHERE source = 'import'", [])?;
@@ -584,17 +618,19 @@ pub fn save_blob_to_db_stamped(
     }
 }
 
-/// Replace one file's rows in the relational ref index. Runs inside the
-/// caller's transaction when one is open (bulk drains wrap N files per
-/// `BEGIN`); standalone callers get per-statement autocommit, which is fine
-/// for single-file updates. Upserts the `files` row even for a zero-ref
-/// file — presence in `files` is the "already shredded" marker the warm
-/// backfill checks.
-pub fn shred_ref_rows(
+/// Replace one file's derived rows — refs AND symbols — in the relational
+/// index. One function so both families are the same generation by
+/// construction (`files` presence is the single "already shredded" marker;
+/// a marker per family would let them drift). Runs inside the caller's
+/// transaction when one is open (bulk drains wrap N files per `BEGIN`);
+/// standalone callers get per-statement autocommit, which is fine for
+/// single-file updates. Upserts the `files` row even for an empty file.
+pub fn shred_derived_rows(
     conn: &Connection,
     path: &str,
     source: &str,
     seeds: &[crate::file_analysis::RefRowSeed],
+    sym_seeds: &[crate::file_analysis::SymRowSeed],
 ) -> rusqlite::Result<()> {
     // Sticky workspace tier: project lib/ files are inside the walk AND on
     // @INC (add_project_lib_paths), so the resolver re-shreds them as
@@ -613,6 +649,7 @@ pub fn shred_ref_rows(
         |row| row.get(0),
     )?;
     conn.execute("DELETE FROM refs WHERE file_id = ?1", params![file_id])?;
+    conn.execute("DELETE FROM syms WHERE file_id = ?1", params![file_id])?;
     let mut intern = conn.prepare_cached("INSERT OR IGNORE INTO strings (s) VALUES (?1)")?;
     let mut lookup = conn.prepare_cached("SELECT str_id FROM strings WHERE s = ?1")?;
     let mut insert = conn.prepare_cached(
@@ -654,6 +691,29 @@ pub fn shred_ref_rows(
             seed.arg_count,
         ])?;
     }
+    let mut insert_sym = conn.prepare_cached(
+        "INSERT INTO syms (file_id, name_id, kind, start_row, start_col, end_row, end_col,
+                           container_id, flags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for seed in sym_seeds {
+        let name_id = intern_str(&seed.name, &mut memo)?;
+        let container_id = match seed.container.as_deref() {
+            Some(c) => Some(intern_str(c, &mut memo)?),
+            None => None,
+        };
+        insert_sym.execute(params![
+            file_id,
+            name_id,
+            seed.kind,
+            seed.span.start.row as i64,
+            seed.span.start.column as i64,
+            seed.span.end.row as i64,
+            seed.span.end.column as i64,
+            container_id,
+            seed.flags,
+        ])?;
+    }
     Ok(())
 }
 
@@ -681,22 +741,31 @@ pub fn invalidate_generation_tier(conn: &Connection, path: &str, source: &str) {
         params![path, source],
     );
     let _ = conn.execute(
+        "DELETE FROM syms WHERE file_id IN
+           (SELECT file_id FROM files WHERE path = ?1 AND source = ?2)",
+        params![path, source],
+    );
+    let _ = conn.execute(
         "DELETE FROM files WHERE path = ?1 AND source = ?2",
         params![path, source],
     );
 }
 
-/// Remove a deleted file's rows (the removal half of `shred_ref_rows`).
+/// Remove a deleted file's rows (the removal half of `shred_derived_rows`).
 pub fn delete_ref_rows(conn: &Connection, path: &str) {
     let _ = conn.execute(
         "DELETE FROM refs WHERE file_id IN (SELECT file_id FROM files WHERE path = ?1)",
+        params![path],
+    );
+    let _ = conn.execute(
+        "DELETE FROM syms WHERE file_id IN (SELECT file_id FROM files WHERE path = ?1)",
         params![path],
     );
     let _ = conn.execute("DELETE FROM files WHERE path = ?1", params![path]);
 }
 
 /// Has `path` been shredded into the relational index? (`files` presence is
-/// the marker — `shred_ref_rows` upserts it even for zero-ref files.)
+/// the marker — `shred_derived_rows` upserts it even for empty files.)
 pub fn has_ref_rows(conn: &Connection, path: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM files WHERE path = ?1",

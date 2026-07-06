@@ -1499,7 +1499,7 @@ impl Ref {
 /// One ref's projection into the relational ref index
 /// (`docs/adr/relational-ref-index.md`) — pure data, no storage types.
 /// Minted post-fold (the qual columns carry the baked verdicts), consumed
-/// by `module_cache::shred_ref_rows`. Kind/qual discriminants are the row
+/// by `module_cache::shred_derived_rows`. Kind/qual discriminants are the row
 /// format's contract: changing them means bumping `REF_ROWS_VERSION`.
 #[derive(Debug, Clone)]
 pub struct RefRowSeed {
@@ -1559,6 +1559,43 @@ impl Ref {
             qual,
             arg_count: self.arg_count.map(|c| c as i64),
         }
+    }
+}
+
+/// One symbol's projection into the relational store — the enumeration
+/// surface (`docs/prompt-symbols-relational.md`): workspace/symbol answers
+/// from these rows, and the phase-C registration feed reads name + kind +
+/// the linkage flag. Full `Symbol` detail (SymbolDetail, deref stacks,
+/// attributes, full span) stays blob-only and rehydrates. Kind/flag
+/// discriminants are row-format contract: changing them bumps
+/// `REF_ROWS_VERSION`.
+#[derive(Debug, Clone)]
+pub struct SymRowSeed {
+    pub name: String,
+    pub kind: u8,
+    /// `selection_span` — the landing site workspace/symbol reports.
+    pub span: Span,
+    pub container: Option<String>,
+    /// bit 0: linkage-visible (the `is_linkage_visible` scope-kind gate,
+    /// baked at shred time so the registration feed never needs scopes).
+    pub flags: u8,
+}
+
+/// Stable row-format discriminant for `SymKind` (explicit, not `as u8` —
+/// enum reordering must not silently re-key persisted rows).
+pub fn sym_kind_code(k: &SymKind) -> u8 {
+    match k {
+        SymKind::Variable => 0,
+        SymKind::Sub => 1,
+        SymKind::Method => 2,
+        SymKind::Package => 3,
+        SymKind::Class => 4,
+        SymKind::Module => 5,
+        SymKind::Field => 6,
+        SymKind::Enumerator => 7,
+        SymKind::HashKeyDef => 8,
+        SymKind::Handler => 9,
+        SymKind::Namespace => 10,
     }
 }
 
@@ -7450,6 +7487,22 @@ impl FileAnalysis {
                 .is_some_and(|s| matches!(s.kind, ScopeKind::File)),
             _ => false,
         }
+    }
+
+    /// Project every symbol into its relational row seed
+    /// (`docs/prompt-symbols-relational.md`). A method on the analysis (not
+    /// on `Symbol`) because the linkage flag needs the owning scope's kind.
+    pub fn sym_row_seeds(&self) -> Vec<SymRowSeed> {
+        self.symbols
+            .iter()
+            .map(|s| SymRowSeed {
+                name: s.name.clone(),
+                kind: sym_kind_code(&s.kind),
+                span: s.selection_span,
+                container: s.package.clone(),
+                flags: u8::from(self.is_linkage_visible(s)),
+            })
+            .collect()
     }
 
     /// Find all symbols in a given scope.

@@ -751,8 +751,11 @@ pub fn index_workspace_with_index(
         // (not retried by the busy handler) — silently voiding the whole
         // backfill. Row-less files stay WHOLE this session (refs resident);
         // their rows land below for the next one.
-        let mut pending_backfill: Vec<(PathBuf, Vec<crate::file_analysis::RefRowSeed>)> =
-            Vec::new();
+        let mut pending_backfill: Vec<(
+            PathBuf,
+            Vec<crate::file_analysis::RefRowSeed>,
+            Vec<crate::file_analysis::SymRowSeed>,
+        )> = Vec::new();
         let (_n, _stale) =
             module_cache::warm_cache_streaming(conn, Some("workspace"), &mut |_name, path, mut fa| {
                 if !canon_members.contains(&path) {
@@ -765,8 +768,11 @@ pub fn index_workspace_with_index(
                 // walk (rows name candidates; the blob rehydrates).
                 let rows_ok = module_cache::has_ref_rows(conn, &path_str);
                 if !rows_ok {
-                    pending_backfill
-                        .push((path.clone(), fa.refs.iter().map(|r| r.row_seed()).collect()));
+                    pending_backfill.push((
+                        path.clone(),
+                        fa.refs.iter().map(|r| r.row_seed()).collect(),
+                        fa.sym_row_seeds(),
+                    ));
                 }
                 if let Some(idx) = module_index {
                     idx.record_workspace_projections(&path, &fa);
@@ -790,14 +796,15 @@ pub fn index_workspace_with_index(
                 log::error!("Workspace backfill txn open failed; rows defer to next warm");
                 break;
             }
-            for (path, seeds) in chunk {
-                if let Err(e) = module_cache::shred_ref_rows(
+            for (path, seeds, sym_seeds) in chunk {
+                if let Err(e) = module_cache::shred_derived_rows(
                     conn,
                     &path.to_string_lossy(),
                     "workspace",
                     seeds,
+                    sym_seeds,
                 ) {
-                    log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                    log::warn!("Failed to backfill derived rows for {:?}: {}", path, e);
                 }
             }
             if let Err(e) = conn.execute_batch("COMMIT") {
@@ -824,6 +831,7 @@ pub fn index_workspace_with_index(
         PathBuf,
         Vec<u8>,
         Vec<crate::file_analysis::RefRowSeed>,
+        Vec<crate::file_analysis::SymRowSeed>,
         Vec<std::sync::Arc<str>>,
         (i64, i64),
     );
@@ -848,15 +856,15 @@ pub fn index_workspace_with_index(
                 // that reads before writing can hit an unretryable
                 // SQLITE_BUSY_SNAPSHOT against the resolver thread's writes.
                 let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
-                for (path, blob, seeds, closure, stamp) in batch.iter() {
+                for (path, blob, seeds, sym_seeds, closure, stamp) in batch.iter() {
                     let path_str = path.to_string_lossy();
                     module_cache::save_blob_to_db_stamped(
                         conn, &path_str, path, closure, blob, "workspace", *stamp,
                     );
-                    if let Err(e) =
-                        module_cache::shred_ref_rows(conn, &path_str, "workspace", seeds)
-                    {
-                        log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
+                    if let Err(e) = module_cache::shred_derived_rows(
+                        conn, &path_str, "workspace", seeds, sym_seeds,
+                    ) {
+                        log::warn!("Failed to shred derived rows for {:?}: {}", path, e);
                     }
                 }
                 if txn_open {
@@ -986,9 +994,10 @@ pub fn index_workspace_with_index(
                         if let Some(blob) = module_cache::encode_analysis(&analysis) {
                             let seeds: Vec<_> =
                                 analysis.refs.iter().map(|r| r.row_seed()).collect();
+                            let sym_seeds = analysis.sym_row_seeds();
                             let closure = analysis.include_closure.clone();
-                            let _ =
-                                fresh_tx.send((canon.clone(), blob, seeds, closure, stamp));
+                            let _ = fresh_tx
+                                .send((canon.clone(), blob, seeds, sym_seeds, closure, stamp));
                             if strip {
                                 analysis.evict_witness_bag();
                                 analysis.evict_refs();
@@ -1050,10 +1059,15 @@ fn save_module_generation(
     if let Some(m) = result {
         if !m.analysis.degraded {
             let seeds: Vec<_> = m.analysis.refs.iter().map(|r| r.row_seed()).collect();
-            if let Err(e) =
-                module_cache::shred_ref_rows(conn, &m.path.to_string_lossy(), "import", &seeds)
-            {
-                log::warn!("Failed to shred ref rows for '{}': {}", module_name, e);
+            let sym_seeds = m.analysis.sym_row_seeds();
+            if let Err(e) = module_cache::shred_derived_rows(
+                conn,
+                &m.path.to_string_lossy(),
+                "import",
+                &seeds,
+                &sym_seeds,
+            ) {
+                log::warn!("Failed to shred derived rows for '{}': {}", module_name, e);
             }
         }
     }
@@ -1179,8 +1193,11 @@ pub fn index_pack_languages(
             let mut dead_rows: Vec<PathBuf> = Vec::new();
             // Deferred past the warm scan — same SQLITE_BUSY_SNAPSHOT
             // rationale as the workspace indexer's backfill.
-            let mut pending_backfill: Vec<(PathBuf, Vec<crate::file_analysis::RefRowSeed>)> =
-                Vec::new();
+            let mut pending_backfill: Vec<(
+                PathBuf,
+                Vec<crate::file_analysis::RefRowSeed>,
+                Vec<crate::file_analysis::SymRowSeed>,
+            )> = Vec::new();
             let (_n, _stale) = module_cache::warm_cache_streaming(conn, None, &mut |_name, path, mut fa| {
                 if !canon_members.contains(&path) {
                     dead_rows.push(path);
@@ -1191,8 +1208,11 @@ pub fn index_pack_languages(
                 // name candidates for the backward walk; the blob rehydrates.
                 let rows_ok = module_cache::has_ref_rows(conn, &path_str);
                 if !rows_ok {
-                    pending_backfill
-                        .push((path.clone(), fa.refs.iter().map(|r| r.row_seed()).collect()));
+                    pending_backfill.push((
+                        path.clone(),
+                        fa.refs.iter().map(|r| r.row_seed()).collect(),
+                        fa.sym_row_seeds(),
+                    ));
                 }
                 if eviction_enabled() {
                     fa.evict_witness_bag();
@@ -1208,14 +1228,15 @@ pub fn index_pack_languages(
                     log::error!("Pack backfill txn open failed; rows defer to next warm");
                     break;
                 }
-                for (path, seeds) in chunk {
-                    if let Err(e) = module_cache::shred_ref_rows(
+                for (path, seeds, sym_seeds) in chunk {
+                    if let Err(e) = module_cache::shred_derived_rows(
                         conn,
                         &path.to_string_lossy(),
                         "workspace",
                         seeds,
+                        sym_seeds,
                     ) {
-                        log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                        log::warn!("Failed to backfill derived rows for {:?}: {}", path, e);
                     }
                 }
                 if let Err(e) = conn.execute_batch("COMMIT") {
@@ -1246,6 +1267,7 @@ pub fn index_pack_languages(
             Arc<crate::file_analysis::FileAnalysis>,
             Vec<u8>,
             Vec<crate::file_analysis::RefRowSeed>,
+            Vec<crate::file_analysis::SymRowSeed>,
             (i64, i64),
         );
         let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<FreshEntry>();
@@ -1266,7 +1288,7 @@ pub fn index_pack_languages(
                     }
                     // IMMEDIATE — same snapshot rationale as the workspace writer.
                     let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
-                    for (path, arc, blob, seeds, stamp) in batch.iter() {
+                    for (path, arc, blob, seeds, sym_seeds, stamp) in batch.iter() {
                         let path_str = path.to_string_lossy();
                         module_cache::save_blob_to_db_stamped(
                             conn,
@@ -1277,10 +1299,10 @@ pub fn index_pack_languages(
                             "workspace",
                             *stamp,
                         );
-                        if let Err(e) =
-                            module_cache::shred_ref_rows(conn, &path_str, "workspace", seeds)
-                        {
-                            log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
+                        if let Err(e) = module_cache::shred_derived_rows(
+                            conn, &path_str, "workspace", seeds, sym_seeds,
+                        ) {
+                            log::warn!("Failed to shred derived rows for {:?}: {}", path, e);
                         }
                     }
                     if txn_open {
@@ -1368,7 +1390,8 @@ pub fn index_pack_languages(
                         module_cache::encode_analysis(&analysis).map(|blob| {
                             let seeds: Vec<_> =
                                 analysis.refs.iter().map(|r| r.row_seed()).collect();
-                            (blob, seeds)
+                            let sym_seeds = analysis.sym_row_seeds();
+                            (blob, seeds, sym_seeds)
                         })
                     } else {
                         None
@@ -1379,8 +1402,8 @@ pub fn index_pack_languages(
                     }
                     let arc = Arc::new(analysis);
                     pack_index.register_symbols(path.clone(), arc.clone());
-                    if let Some((blob, seeds)) = payload {
-                        let _ = fresh_tx.send((canon.clone(), arc, blob, seeds, stamp));
+                    if let Some((blob, seeds, sym_seeds)) = payload {
+                        let _ = fresh_tx.send((canon.clone(), arc, blob, seeds, sym_seeds, stamp));
                     }
                     total.fetch_add(1, Ordering::Relaxed);
                     // Residency: this file's merged/expanded macro tables are a
@@ -1505,8 +1528,11 @@ pub fn pack_file_changed(
             module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace");
             if !arc.degraded {
                 let seeds: Vec<_> = arc.refs.iter().map(|r| r.row_seed()).collect();
-                if let Err(e) = module_cache::shred_ref_rows(&conn, &p_str, "workspace", &seeds) {
-                    log::warn!("Failed to shred ref rows for {:?}: {}", p, e);
+                let sym_seeds = arc.sym_row_seeds();
+                if let Err(e) = module_cache::shred_derived_rows(
+                    &conn, &p_str, "workspace", &seeds, &sym_seeds,
+                ) {
+                    log::warn!("Failed to shred derived rows for {:?}: {}", p, e);
                 }
             }
         }
