@@ -35,6 +35,11 @@ perf_bench = []
 
 [dependencies]
 tower-lsp = "0.20"
+# `tower::Service` + `futures` power the `panic_guard` service wrapper (the
+# process-survival seam). Both already ride in transitively via tower-lsp; named
+# here so the wrapper can implement `Service` and use `catch_unwind`/`BoxFuture`.
+tower = { version = "0.4", default-features = false }
+futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 tree-sitter = "0.25"
 ts-parser-perl = "1.1.4"

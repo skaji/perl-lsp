@@ -429,13 +429,31 @@ impl Backend {
                 if want_perl { "perl" } else { "pack" }
             ));
             if progress {
-                // Belt-and-braces timeout: even a capable client that stalls
-                // on the reply must not block indexing behind it.
+                // tower-lsp holds the server→client request's oneshot SENDER in
+                // its pending map until the reply lands, and panics ("receiver
+                // already dropped") if that reply arrives after we dropped the
+                // RECEIVER. A bare `timeout(.., send_request)` drops the receiver
+                // on timeout, so a slow client's late `create` reply would take
+                // the whole server down (#36). Spawn the request onto a DETACHED
+                // task instead: dropping its `JoinHandle` on timeout leaves the
+                // task — and its receiver — alive, so a late reply routes to a
+                // live receiver (a harmless `Ok`) rather than panicking. The 2s
+                // cap only bounds how long we wait; indexing must proceed even if
+                // a capable-but-slow client never answers.
+                let create = rt.spawn({
+                    let client = client.clone();
+                    let token = token.clone();
+                    async move {
+                        let _ = client
+                            .send_request::<request::WorkDoneProgressCreate>(
+                                WorkDoneProgressCreateParams { token },
+                            )
+                            .await;
+                    }
+                });
                 let _ = rt.block_on(tokio::time::timeout(
                     std::time::Duration::from_secs(2),
-                    client.send_request::<request::WorkDoneProgressCreate>(
-                        WorkDoneProgressCreateParams { token: token.clone() },
-                    ),
+                    create,
                 ));
                 rt.block_on(client.send_notification::<notification::Progress>(ProgressParams {
                     token: token.clone(),
@@ -2253,8 +2271,12 @@ impl LanguageServer for Backend {
         let start_line = params.range.start.line as usize;
         let end_line = params.range.end.line as usize;
         let lines: Vec<&str> = source.lines().collect();
-        if start_line >= lines.len() { return Ok(None); }
-        let end = (end_line + 1).min(lines.len());
+        let end = end_line.saturating_add(1).min(lines.len());
+        // A malformed or inverted client range (start after end, or start past
+        // EOF) must degrade, not panic on the slice.
+        if start_line >= end {
+            return Ok(None);
+        }
         let range_text: String = lines[start_line..end].join("\n") + "\n";
 
         // Shell out to perltidy on the range

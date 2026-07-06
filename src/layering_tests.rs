@@ -82,6 +82,9 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("timings", Model),
         ("builtins_pod", Index),
         ("backend", Lsp),
+        // process-survival service wrapper: catches handler panics at the
+        // request/notification boundary (no crate:: imports, DAG-neutral)
+        ("panic_guard", Lsp),
         ("symbols", Lsp),
         ("cursor_context", Lsp),
         // one Slot vocabulary over cursor_context (Perl) + cursor_sentinel

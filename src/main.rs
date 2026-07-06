@@ -14,6 +14,7 @@ mod module_cache;
 mod module_index;
 mod module_resolver;
 mod pack_bag_cache;
+mod panic_guard;
 mod plugin;
 mod plugin_cli;
 mod pod;
@@ -229,7 +230,12 @@ async fn main() {
 
     let (service, socket) = LspService::new(Backend::new);
 
-    Server::new(stdin, stdout, socket).serve(service).await;
+    // Wrap the service so a panic in any handler degrades to a logged warning +
+    // graceful response instead of unwinding tower-lsp's single `serve` task.
+    // See `panic_guard` for why the boundary lives here and not per-handler.
+    Server::new(stdin, stdout, socket)
+        .serve(panic_guard::PanicGuard::new(service))
+        .await;
 
     // `serve()` returns when the client's stdin/socket reaches EOF — the CLEAN
     // `shutdown`+`exit` path AND the UNCLEAN path (editor crash / kill with no
