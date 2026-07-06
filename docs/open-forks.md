@@ -318,3 +318,53 @@ Format per entry:
 - **Discussion needed:** whether the Perl workspace tier should get the
   same lane (its warm is milliseconds on bugzilla today; chromium-scale
   Perl trees don't exist in the corpus set).
+
+## Mission-2 hardening round — deferred findings — 2026-07-06 — OPEN (Claude)
+
+Fixed in the round (for the record): free callables were absent from the
+Surface (a C free-function signature change read as Unchanged — the
+firewall's worst failure mode); the dirty walk missed consumers of
+RENAMED-away packages (`stale_provided` now seeds one walk); the deleted
+pack file's own reparse caches leaked (deletion was semantically
+invisible to re-analyzed consumers); open-doc surfaces were recorded
+POST-enrichment (verdict flapping against pre-enrichment indexer
+records); the Unchanged gate skipped consumer deps-stamp refresh (the
+restart cold storm); watcher re-registration dropped the verdict (stale
+open consumers after git pull); stub-lane rows with an unrehydratable
+blob (NULL/empty) no longer register; deferred stub backfill is
+stamp-guarded against racing edits; `remove_surface` parent-canonicalizes
+deleted paths; method dedup collapses only FULLY-equal duplicates.
+
+Deferred, in rough priority order:
+
+- **Concurrent surface writers (buffer vs disk)**: a bulk index or watcher
+  tick re-records a DISK build over an open doc's BUFFER record; an edit
+  reverting the buffer to the disk state then reads Unchanged against the
+  wrong baseline and skips a consumer refresh. Needs record provenance
+  (open-doc records outrank background ones while the doc is open) or a
+  doc-open guard on background recording. Rare (requires an unsaved
+  contract change raced by a background re-record), silent when hit.
+- **Verdict-policy seam**: the record→gate→act sequence is spelled in
+  three places now (open-doc edits, the watcher, `pack_file_changed`).
+  A `FreshnessIndex`-owned policy hook (or a `record_and_dirty` that
+  returns the closure) would make the next registration path inherit the
+  gate by construction instead of by remembering.
+- **Probe serialization in `pack_file_changed`** (Changed case): the
+  changed file's probe runs serially before the parallel consumer fan-out
+  (~one header-analysis of added latency per save while actively editing
+  a widely-included header whose surface DID change). Speculative
+  consumer re-analysis concurrent with the probe would restore the old
+  wall clock at the cost of wasted work on Unchanged — measure before
+  building.
+- **`warm_pack_stream_with_stubs` two-closure API**: the shared-state
+  RefCell dance at the call site wants a single
+  `FnMut(path, WarmPayload) -> Directive` shape.
+- **Pack provided-names vocabulary**: `SurfaceRecord.provided` is
+  packages-only; a future pack-tier NAME-keyed dirty walk (cpp uses
+  include-closure consumers today, so nothing reads it) would
+  under-invalidate for free-function headers. If that walk ever lands,
+  feed `provided` from the linkage feed, not `packages`.
+- **Declined micro-optimizations**: per-registration `fs::canonicalize`
+  in `record_surface_value` stays (correctness guard; ~µs against per-file
+  analysis costs); cold-path stub encoding stays (measured cold wall
+  unchanged, and it buys the FIRST warm, not the second).

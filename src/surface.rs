@@ -10,7 +10,7 @@
 //! - **No spans, no `Point`s, no byte offsets, no `ScopeId`/`SymbolId`/
 //!   `RefIdx`, anywhere.** Every one of those shifts on unrelated edits.
 //!   The equality tests are the regression net; a field addition without an
-//!   equality test is a review reject (the prompt's R1).
+//!   equality test is a review reject (`docs/prompt-storage-engine.md`).
 //! - **Typed fields, not display strings** — `Option<InferredType>`, never
 //!   `"returns Foo"` (rule #10's lossy-string form). File-internal
 //!   attachment identities inside a type (a `CodeRef` body edge) are
@@ -97,6 +97,10 @@ pub struct Surface {
     /// Cross-file-visible values with no owning package (C file-scope
     /// globals / anonymous-enum constants), sorted.
     pub free_values: Vec<ValueSurface>,
+    /// Package-less callables — C's dominant export shape (free functions;
+    /// also file-scope Perl subs in packageless scripts). Sorted like
+    /// package methods.
+    pub free_methods: Vec<MethodSurface>,
     /// `#define`s, sorted by (name, guards) — config variants of one name
     /// each surface.
     pub macros: Vec<MacroSurface>,
@@ -125,6 +129,16 @@ impl Surface {
         let mut by_pkg: std::collections::BTreeMap<String, PackageSurface> =
             std::collections::BTreeMap::new();
         let mut free_values: Vec<ValueSurface> = Vec::new();
+        let mut free_methods: Vec<MethodSurface> = Vec::new();
+        // One pass over the (few) HashKeyDef symbols instead of an
+        // O(symbols) scan per sub — projection runs per registration.
+        let hash_key_defs: Vec<&crate::file_analysis::Symbol> = fa
+            .symbols
+            .iter()
+            .filter(|s| {
+                matches!(s.detail, crate::file_analysis::SymbolDetail::HashKeyDef { .. })
+            })
+            .collect();
         // Every package with parents or role-ness exists on the surface
         // even if it declares no callable members.
         for (pkg, parents) in &fa.package_parents {
@@ -146,7 +160,6 @@ impl Surface {
                     });
                 }
                 SymKind::Sub | SymKind::Method | SymKind::Handler => {
-                    let Some(pkg) = sym.package.clone() else { continue };
                     // Cross-file-visible only: lexical subs aren't
                     // addressable outside their block.
                     if matches!(
@@ -155,25 +168,31 @@ impl Surface {
                     ) {
                         continue;
                     }
+                    let owner = HashKeyOwner::Sub {
+                        package: sym.package.clone(),
+                        name: sym.name.clone(),
+                    };
                     let hash_keys: Vec<String> = {
-                        let mut ks: Vec<String> = fa
-                            .hash_key_defs_for_owner(&HashKeyOwner::Sub {
-                                package: Some(pkg.clone()),
-                                name: sym.name.clone(),
-                            })
+                        let mut ks: Vec<String> = hash_key_defs
                             .iter()
+                            .filter(|s| {
+                                if let crate::file_analysis::SymbolDetail::HashKeyDef {
+                                    owner: ref o,
+                                    ..
+                                } = s.detail
+                                {
+                                    o.found_by(&owner)
+                                } else {
+                                    false
+                                }
+                            })
                             .map(|s| s.name.clone())
                             .collect();
                         ks.sort_unstable();
                         ks.dedup();
                         ks
                     };
-                    let entry =
-                        by_pkg.entry(pkg.clone()).or_insert_with(|| PackageSurface {
-                            name: pkg.clone(),
-                            ..Default::default()
-                        });
-                    entry.methods.push(MethodSurface {
+                    let m = MethodSurface {
                         name: sym.name.clone(),
                         kind: crate::file_analysis::sym_kind_code(&sym.kind),
                         arity: sym
@@ -183,7 +202,23 @@ impl Surface {
                             .symbol_return_type_via_bag(sym.id, None)
                             .map(|t| despan(&t)),
                         hash_keys,
-                    });
+                    };
+                    match sym.package.clone() {
+                        // Package-less callables (C free functions, subs in
+                        // packageless scripts) are cross-file-visible too —
+                        // for C they're MOST of the surface.
+                        None => free_methods.push(m),
+                        Some(pkg) => {
+                            by_pkg
+                                .entry(pkg.clone())
+                                .or_insert_with(|| PackageSurface {
+                                    name: pkg,
+                                    ..Default::default()
+                                })
+                                .methods
+                                .push(m);
+                        }
+                    }
                 }
                 SymKind::Variable | SymKind::Field | SymKind::Enumerator => {
                     // Cross-file-visible values: the C-linkage file-scope
@@ -218,16 +253,22 @@ impl Surface {
             vs.sort_by(|a, b| (&a.name, a.kind).cmp(&(&b.name, b.kind)));
             vs.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
         };
+        // Duplicate names collapse only when FULLY equal (rw accessor
+        // pairs). Name-only dedup would hide a contract edit to the
+        // shadowed duplicate — Perl dispatches the LAST definition, so a
+        // change to either must flip equality. Stable sort keeps builder
+        // order among name-equal entries: deterministic per source.
+        let sort_methods = |ms: &mut Vec<MethodSurface>| {
+            ms.sort_by(|a, b| (&a.name, a.kind).cmp(&(&b.name, b.kind)));
+            ms.dedup();
+        };
         for p in &mut packages {
             p.is_role = fa.is_role_package(&p.name);
-            p.methods.sort_by(|a, b| (&a.name, a.kind).cmp(&(&b.name, b.kind)));
-            // Duplicate symbols for one name (rw accessor pairs) surface
-            // once — the FIRST after sort, matching sub_info_view's
-            // primary-pick determinism closely enough for equality use.
-            p.methods.dedup_by(|a, b| a.name == b.name && a.kind == b.kind);
+            sort_methods(&mut p.methods);
             sort_values(&mut p.values);
         }
         sort_values(&mut free_values);
+        sort_methods(&mut free_methods);
         let mut imports: Vec<String> = fa
             .imports
             .iter()
@@ -273,6 +314,7 @@ impl Surface {
         Surface {
             packages,
             free_values,
+            free_methods,
             macros,
             includes,
             imports,
@@ -349,21 +391,37 @@ struct SurfaceRecord {
     fingerprint: u64,
     /// Names the file provides (its declared packages).
     provided: Vec<String>,
+    /// Names the LAST re-record dropped (renamed/deleted packages).
+    /// Consumers of a departed name are exactly the ones its removal
+    /// breaks, so the dirty walk seeds from `provided ∪ stale_provided`
+    /// until the next re-record replaces the set.
+    stale_provided: Vec<String>,
 }
 
 /// Process-local surface identity. In-memory only (SipHash keys are
-/// per-process) — the persisted form will carry its own stable encoding.
+/// per-process) — the persisted form carries its own stable encoding.
+/// Streams the serialization straight into the hasher: record() runs per
+/// keystroke on open docs, so no intermediate buffer.
 fn surface_fingerprint(s: &Surface) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let bytes = bincode::serialize(s).unwrap_or_default();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    h.finish()
+    use std::hash::Hasher;
+    struct HashWriter(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = HashWriter(std::collections::hash_map::DefaultHasher::new());
+    let _ = bincode::serialize_into(&mut w, s);
+    w.0.finish()
 }
 
-/// The hand-rolled freshness engine (`docs/prompt-storage-engine.md`
-/// phase 3, the eval's recommended first cut): per-file surface records +
-/// a name-keyed reverse-dependency index. The dependency edge is DECLARED
+/// The freshness engine (`docs/prompt-storage-engine.md`): per-file
+/// surface records + a name-keyed reverse-dependency index. The
+/// dependency edge is DECLARED
 /// by the consumer's own surface — file F depends on every name in its
 /// imports ∪ parents ∪ bridges — and the dirty walk is provider-name →
 /// consumers, transitive with a seen-set (C's change dirties B extends C,
@@ -425,9 +483,21 @@ impl FreshnessIndex {
                     .or_default()
                     .insert(path.to_path_buf());
             }
-            let provided = Self::provided_names(&surface).map(str::to_owned).collect();
-            self.surfaces
-                .insert(path.to_path_buf(), SurfaceRecord { fingerprint, provided });
+            let provided: Vec<String> =
+                Self::provided_names(&surface).map(str::to_owned).collect();
+            let stale_provided: Vec<String> = match self.surfaces.get(path) {
+                Some(old) => old
+                    .provided
+                    .iter()
+                    .filter(|n| !provided.contains(n))
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            self.surfaces.insert(
+                path.to_path_buf(),
+                SurfaceRecord { fingerprint, provided, stale_provided },
+            );
         }
         verdict
     }
@@ -454,7 +524,11 @@ impl FreshnessIndex {
     ) -> std::collections::HashSet<std::path::PathBuf> {
         let mut dirty: std::collections::HashSet<std::path::PathBuf> = Default::default();
         let mut frontier: Vec<String> = match self.surfaces.get(changed_path) {
-            Some(r) => r.provided.clone(),
+            // stale_provided too: a RENAMED/DELETED package's consumers are
+            // exactly the ones its departure broke.
+            Some(r) => {
+                r.provided.iter().chain(r.stale_provided.iter()).cloned().collect()
+            }
             None => return dirty,
         };
         let mut seen_names: std::collections::HashSet<String> = frontier.iter().cloned().collect();

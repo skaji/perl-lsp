@@ -1024,19 +1024,35 @@ impl Backend {
     /// in the transitive dirty closure (closed workspace consumers stay
     /// correct through the query-time walks; their always-enriched
     /// materialization is the next phase).
-    async fn refresh_dirty_open_consumers(&self, uri: &Url) {
-        let Ok(path) = uri.to_file_path() else { return };
+    /// Record the open doc's surface right after a rebuild — BEFORE
+    /// `publish_diagnostics` enriches the analysis in place.
+    /// `Surface::project`'s contract is the file's OWN facts: an enriched
+    /// projection would fingerprint imported types into the record and
+    /// flip-flop verdicts against the workspace indexer's pre-enrichment
+    /// records (spurious Changed storms on body edits).
+    fn record_open_doc_surface(
+        &self,
+        uri: &Url,
+    ) -> Option<(std::path::PathBuf, crate::surface::SurfaceVerdict)> {
+        let path = uri.to_file_path().ok()?;
         let canon = std::fs::canonicalize(&path).unwrap_or(path);
-        let verdict = match self.files.get_open(uri) {
-            Some(doc) if doc.language == "perl" => {
-                self.module_index.record_surface(&canon, &doc.analysis)
-            }
-            _ => return,
-        };
+        let doc = self.files.get_open(uri)?;
+        if doc.language != "perl" {
+            return None;
+        }
+        let verdict = self.module_index.record_surface(&canon, &doc.analysis);
+        Some((canon, verdict))
+    }
+
+    async fn refresh_dirty_open_consumers(
+        &self,
+        canon: &std::path::Path,
+        verdict: crate::surface::SurfaceVerdict,
+    ) {
         if verdict != crate::surface::SurfaceVerdict::Changed {
             return;
         }
-        let dirty = self.module_index.dirty_consumers(&canon);
+        let dirty = self.module_index.dirty_consumers(canon);
         if dirty.is_empty() {
             return;
         }
@@ -1501,11 +1517,15 @@ impl LanguageServer for Backend {
                     }
                 }
             }
+            // Pre-enrichment record — publish_diagnostics enriches in place.
+            let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
             // Surface-gated consumer refresh: a body edit stops here
             // (Unchanged); a contract change republishes the open docs
             // that can see it.
-            self.refresh_dirty_open_consumers(&uri).await;
+            if let Some((canon, verdict)) = recorded {
+                self.refresh_dirty_open_consumers(&canon, verdict).await;
+            }
             return;
         }
         if let Some(mut doc) = self.files.get_open_mut(&uri) {
@@ -1530,8 +1550,11 @@ impl LanguageServer for Backend {
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(text);
             }
+            let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
-            self.refresh_dirty_open_consumers(&uri).await;
+            if let Some((canon, verdict)) = recorded {
+                self.refresh_dirty_open_consumers(&canon, verdict).await;
+            }
         }
         // The saved bytes are on disk: re-register this file's indexed copy,
         // evict the macro/closure caches it participates in, and refresh its
@@ -2341,7 +2364,11 @@ impl LanguageServer for Backend {
         }
         let files = Arc::clone(&self.files);
         let module_index = Arc::clone(&self.module_index);
-        tokio::task::spawn_blocking(move || {
+        let dirty = tokio::task::spawn_blocking(move || {
+            // Externally changed deps break their consumers' enrichment too
+            // — collect the dirty closure while the records are in hand and
+            // hand it back for the open-doc republish below.
+            let mut dirty_all: std::collections::HashSet<PathBuf> = Default::default();
             // The persisted generation (blob + ref rows) is now stale for
             // these paths; drop it so warm starts re-parse and the
             // relational retrieval can't serve outdated spans. The fresh
@@ -2376,6 +2403,9 @@ impl LanguageServer for Backend {
                     FileChangeType::DELETED => {
                         files.remove_workspace(&path);
                         files.remove_workspace(&canon);
+                        // Consumers of the departed file's packages, BEFORE
+                        // the record (and its provided names) are removed.
+                        dirty_all.extend(module_index.dirty_consumers(&canon));
                         // The hub's path/name registrations must go too, or
                         // the dead file stays a retrieval candidate and a
                         // phantom module in name lookups.
@@ -2394,13 +2424,36 @@ impl LanguageServer for Backend {
                                 let arc = Arc::new(analysis);
                                 files.insert_workspace_arc(canon.clone(), arc.clone());
                                 module_index.record_workspace_projections(&canon, &arc);
-                                module_index.register_workspace_resident(canon, arc);
+                                let verdict = module_index
+                                    .register_workspace_resident(canon.clone(), arc);
+                                if verdict == crate::surface::SurfaceVerdict::Changed {
+                                    dirty_all
+                                        .extend(module_index.dirty_consumers(&canon));
+                                }
                             }
                         }
                     }
                 }
             }
+            dirty_all
+        })
+        .await
+        .unwrap_or_default();
+        if dirty.is_empty() {
+            return;
+        }
+        let mut to_refresh: Vec<Url> = Vec::new();
+        self.files.for_each_open(|u, _doc| {
+            if let Ok(p) = u.to_file_path() {
+                let c = std::fs::canonicalize(&p).unwrap_or(p);
+                if dirty.contains(&c) {
+                    to_refresh.push(u.clone());
+                }
+            }
         });
+        for u in to_refresh {
+            self.publish_diagnostics(&u).await;
+        }
     }
 
     async fn range_formatting(

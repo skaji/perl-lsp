@@ -302,6 +302,16 @@ impl ModuleEdgeIndexes {
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
 /// thread populates the cache by parsing `.pm` files in-process.
 #[allow(dead_code)]
+/// What `prepare_pack_parts` hands back: the (possibly stripped) arc to
+/// register plus the whole-analysis halves — feed, specialization edges,
+/// projected surface — extracted BEFORE the strip.
+pub(crate) struct PackRegistrationParts {
+    pub arc: Arc<FileAnalysis>,
+    pub feed: Vec<(String, bool)>,
+    pub specs: Vec<(String, String)>,
+    pub surface: crate::surface::Surface,
+}
+
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
@@ -357,7 +367,7 @@ pub struct ModuleIndex {
     /// name-keyed views can't reach those, but whole-project sweeps
     /// (`for_each_cached_file`) must.
     all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
-    /// The freshness engine (`docs/prompt-storage-engine.md` phase 3):
+    /// The freshness engine (`docs/prompt-storage-engine.md`):
     /// per-file span-free surface records + the reverse-dependency index.
     /// Fed at registration (whole copy, pre-strip) and on open-doc
     /// rebuilds; `dirty_consumers` names who must re-enrich after a
@@ -961,19 +971,29 @@ impl ModuleIndex {
     /// here — indexers strip via `register_workspace_stripping`, which feeds
     /// from the whole analysis first. Files without a `package` declaration
     /// get only the path entry.
-    pub fn register_workspace_resident(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
+    /// Returns the surface verdict so re-registration seams (the watcher)
+    /// can act on `Changed` — dropping it leaves open consumers stale
+    /// after an external edit (git pull) to a dep.
+    pub fn register_workspace_resident(
+        &self,
+        path: std::path::PathBuf,
+        analysis: Arc<FileAnalysis>,
+    ) -> crate::surface::SurfaceVerdict {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let _ = self.record_surface(&path, &analysis);
+        let verdict = self.record_surface(&path, &analysis);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Path-keyed registry first: the relational retrieval resolves
         // candidate paths through `cached_by_path`, and packageless files
         // (Mojolicious::Lite entrypoints) exist ONLY here.
         self.all_files.insert(cached.path.clone(), cached.clone());
-        let Some(module_name) = first_package_name(&analysis) else { return };
+        let Some(module_name) = first_package_name(&analysis) else {
+            return verdict;
+        };
         self.workspace_modules.insert(module_name.clone(), ());
         self.edges.purge_module(&module_name);
         self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
+        verdict
     }
 
     /// Project + record `fa`'s span-free surface for `path` — the
@@ -1004,9 +1024,22 @@ impl ModuleIndex {
     }
 
     /// Drop `path`'s recorded surface and its dep edges (file deleted).
+    /// A deleted file can't canonicalize, but the record was keyed under
+    /// the RESOLVED path while it existed — resolve the parent and rejoin
+    /// (the Perl watcher's delete fallback) so symlinked roots still hit.
     pub fn remove_surface(&self, path: &std::path::Path) {
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            path.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .and_then(|d| path.file_name().map(|f| d.join(f)))
+                .unwrap_or_else(|| path.to_path_buf())
+        });
         self.freshness.remove(&canon);
+        // Belt over braces: if the caller's raw spelling was the recorded
+        // key (registration itself fell back), remove that too.
+        if canon != path {
+            self.freshness.remove(path);
+        }
     }
 
     /// The transitive consumers of `path`'s last-recorded surface — the
@@ -1083,7 +1116,7 @@ impl ModuleIndex {
     /// entry plus its name-keyed cache row and edges (a dead file must not
     /// stay a retrieval candidate or a phantom module).
     pub fn unregister_workspace_path(&self, path: &std::path::Path) {
-        self.freshness.remove(path);
+        self.remove_surface(path);
         self.all_files.remove(path);
         let name = self.cache.iter().find_map(|entry| {
             entry
@@ -1311,17 +1344,19 @@ impl ModuleIndex {
         (feed, specs)
     }
 
-    pub fn register_symbols_stripping(
-        &self,
-        path: std::path::PathBuf,
+    /// The ONE speller of the pack strip ordering: feed + specs + surface
+    /// project from the WHOLE analysis, THEN the requested axes evict, then
+    /// the arc is minted. Every pack registration that strips (bulk warm,
+    /// fresh worker, edit swap) routes here so the "reads-whole-before-
+    /// evict" invariant can't drift between separately-spelled copies —
+    /// and the stub encoder gets exactly the halves registration used.
+    pub(crate) fn prepare_pack_parts(
         mut fa: FileAnalysis,
         strip_bag: bool,
         strip_rows: bool,
-    ) -> Arc<FileAnalysis> {
-        let _ = self.record_surface(&path, &fa);
-        let feed = collect_linkage_feed(&fa);
-        let specs: Vec<(String, String)> =
-            fa.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    ) -> PackRegistrationParts {
+        let (feed, specs) = Self::prepare_pack_feed(&fa);
+        let surface = crate::surface::Surface::project(&fa);
         if strip_bag {
             fa.evict_witness_bag();
         }
@@ -1329,9 +1364,20 @@ impl ModuleIndex {
             fa.evict_refs();
             fa.evict_symbols();
         }
-        let arc = Arc::new(fa);
-        self.register_symbols_inner(path, arc.clone(), &feed, &specs);
-        arc
+        PackRegistrationParts { arc: Arc::new(fa), feed, specs, surface }
+    }
+
+    pub fn register_symbols_stripping(
+        &self,
+        path: std::path::PathBuf,
+        fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> Arc<FileAnalysis> {
+        let parts = Self::prepare_pack_parts(fa, strip_bag, strip_rows);
+        let _ = self.record_surface_value(&path, parts.surface);
+        self.register_symbols_inner(path, parts.arc.clone(), &parts.feed, &parts.specs);
+        parts.arc
     }
 
     pub(crate) fn register_symbols_inner(

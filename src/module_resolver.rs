@@ -756,6 +756,7 @@ pub fn index_workspace_with_index(
             Vec<crate::file_analysis::RefRowSeed>,
             Vec<crate::file_analysis::SymRowSeed>,
         )> = Vec::new();
+        let rows_present = module_cache::paths_with_ref_rows(conn);
         let (_n, _stale) =
             module_cache::warm_cache_streaming(conn, Some("workspace"), &mut |_name, path, mut fa| {
                 if !canon_members.contains(&path) {
@@ -766,7 +767,7 @@ pub fn index_workspace_with_index(
                 // Refs strip ONLY when their rows are known present — an
                 // evicted copy without rows is invisible to the backward
                 // walk (rows name candidates; the blob rehydrates).
-                let rows_ok = module_cache::has_ref_rows(conn, &path_str);
+                let rows_ok = rows_present.contains(path_str.as_ref());
                 if !rows_ok {
                     pending_backfill.push((
                         path.clone(),
@@ -1291,7 +1292,7 @@ pub fn index_pack_languages(
             )> = Vec::new();
             // Stubs whose files warmed through the FULL path this scan —
             // written after it so the next warm takes the stub lane.
-            let mut pending_stubs: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+            let mut pending_stubs: Vec<(PathBuf, Vec<u8>, (i64, i64))> = Vec::new();
             let rows_present = module_cache::paths_with_ref_rows(conn);
             // A stub's skeleton is stripped by construction; under NO_EVICT
             // the resident copies must stay whole, so stubs are bypassed.
@@ -1319,15 +1320,15 @@ pub fn index_pack_languages(
                     warmed_cell.borrow_mut().insert(path);
                     true
                 },
-                &mut |_name, path, mut fa| {
+                &mut |_name, path, fa| {
                     if !canon_members.contains(&path) {
                         dead_rows.borrow_mut().push(path);
                         return;
                     }
-                    let path_str = path.to_string_lossy();
+                    let path_str = path.to_string_lossy().into_owned();
                     // Refs strip only when their rows are known present — rows
                     // name candidates for the backward walk; the blob rehydrates.
-                    let rows_ok = rows_present.contains(path_str.as_ref());
+                    let rows_ok = rows_present.contains(path_str.as_str());
                     if !rows_ok {
                         pending_backfill.push((
                             path.clone(),
@@ -1335,30 +1336,31 @@ pub fn index_pack_languages(
                             fa.sym_row_seeds(),
                         ));
                     }
-                    // Registration-owned strip, spelled as its halves so the
-                    // stub backfill can reuse the feed + surface it derives.
-                    let (feed, specs) =
-                        crate::module_index::ModuleIndex::prepare_pack_feed(&fa);
-                    let surface = crate::surface::Surface::project(&fa);
-                    let _ = pack_index.record_surface_value(&path, surface.clone());
                     let strip_bag = eviction_enabled();
-                    if strip_bag {
-                        fa.evict_witness_bag();
-                    }
                     let fully_stripped = strip_bag && rows_ok;
+                    let parts = crate::module_index::ModuleIndex::prepare_pack_parts(
+                        fa,
+                        strip_bag,
+                        fully_stripped,
+                    );
                     if fully_stripped {
-                        fa.evict_refs();
-                        fa.evict_symbols();
-                    }
-                    let arc = Arc::new(fa);
-                    pack_index.register_symbols_inner(path.clone(), arc.clone(), &feed, &specs);
-                    if fully_stripped {
-                        if let Some(blob) =
-                            module_cache::encode_stub(&feed, &specs, &surface, &arc)
-                        {
-                            pending_stubs.push((path.clone(), blob));
+                        if let Some(blob) = module_cache::encode_stub(
+                            &parts.feed,
+                            &parts.specs,
+                            &parts.surface,
+                            &parts.arc,
+                        ) {
+                            let stamp = module_cache::file_stamp(&path).unwrap_or((0, 0));
+                            pending_stubs.push((path.clone(), blob, stamp));
                         }
                     }
+                    let _ = pack_index.record_surface_value(&path, parts.surface);
+                    pack_index.register_symbols_inner(
+                        path.clone(),
+                        parts.arc,
+                        &parts.feed,
+                        &parts.specs,
+                    );
                     warmed_cell.borrow_mut().insert(path);
                 },
             );
@@ -1367,8 +1369,13 @@ pub fn index_pack_languages(
                     log::error!("Pack stub backfill txn open failed; stubs defer to next warm");
                     break;
                 }
-                for (path, blob) in chunk {
-                    module_cache::save_stub(conn, &path.to_string_lossy(), blob);
+                for (path, blob, stamp) in chunk {
+                    module_cache::save_stub_if_current(
+                        conn,
+                        &path.to_string_lossy(),
+                        blob,
+                        *stamp,
+                    );
                 }
                 if let Err(e) = conn.execute_batch("COMMIT") {
                     log::error!("Pack stub backfill commit failed: {}", e);
@@ -1452,6 +1459,7 @@ pub fn index_pack_languages(
                     }
                     // IMMEDIATE — same snapshot rationale as the workspace writer.
                     let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+                    let stubs_writable = module_cache::stub_version_current(conn);
                     for e in batch.iter() {
                         let path_str = e.path.to_string_lossy();
                         module_cache::save_blob_to_db_stamped(
@@ -1469,7 +1477,9 @@ pub fn index_pack_languages(
                             log::warn!("Failed to shred derived rows for {:?}: {}", e.path, err);
                         }
                         if let Some(sb) = &e.stub_blob {
-                            module_cache::save_stub(conn, &path_str, sb);
+                            if stubs_writable {
+                                module_cache::save_stub(conn, &path_str, sb);
+                            }
                         }
                     }
                     let committed = txn_open
@@ -1578,25 +1588,24 @@ pub fn index_pack_languages(
                         // BOTH to the writer — it registers after the chunk
                         // COMMITS, so an evicted copy is never reachable
                         // before its blob can rehydrate it.
-                        let (feed, specs) =
-                            crate::module_index::ModuleIndex::prepare_pack_feed(&analysis);
-                        // Surface must project from the WHOLE analysis; the
-                        // freshness index is session-local, so recording
-                        // before the writer's COMMIT is safe.
-                        let surface = crate::surface::Surface::project(&analysis);
-                        analysis.evict_witness_bag();
-                        analysis.evict_refs();
-                        analysis.evict_symbols();
-                        let arc = Arc::new(analysis);
-                        let stub_blob =
-                            module_cache::encode_stub(&feed, &specs, &surface, &arc);
-                        let _ = pack_index.record_surface_value(&canon, surface);
+                        let parts = crate::module_index::ModuleIndex::prepare_pack_parts(
+                            analysis, true, true,
+                        );
+                        let stub_blob = module_cache::encode_stub(
+                            &parts.feed,
+                            &parts.specs,
+                            &parts.surface,
+                            &parts.arc,
+                        );
+                        // Recording before the writer's COMMIT is safe — the
+                        // freshness index is session-local.
+                        let _ = pack_index.record_surface_value(&canon, parts.surface);
                         let (blob, seeds, sym_seeds) = payload.unwrap();
                         let _ = fresh_tx.send(FreshEntry {
                             path: canon.clone(),
-                            arc,
-                            feed,
-                            specs,
+                            arc: parts.arc,
+                            feed: parts.feed,
+                            specs: parts.specs,
                             deferred: true,
                             blob,
                             stub_blob,
@@ -1690,15 +1699,26 @@ pub fn pack_file_changed(
     let pack = hub.pack_index(lang);
 
     let mut consumers: Vec<PathBuf> = Vec::new();
+    // Closures ride along for the Unchanged case: the consumers' persisted
+    // deps_stamps must be recomputed (the edited header's mtime moved) or
+    // the next warm scan rejects every consumer row and the cold storm the
+    // gate prevents in-session comes back at restart.
+    let mut consumer_closures: Vec<(PathBuf, crate::file_analysis::path_intern::ClosureList)> =
+        Vec::new();
     if let Some(ref pack) = pack {
         pack.for_each_registered_file(&mut |cm| {
             if cm.analysis.include_closure.contains(&canon_str) {
                 consumers.push(cm.path.clone());
+                consumer_closures.push((cm.path.clone(), cm.analysis.include_closure.clone()));
             }
         });
     }
 
     if deleted {
+        // The departed file's own header/macro/closure caches go too — a
+        // consumer re-gather resolving the deleted header from its
+        // still-warm entry would make the deletion invisible.
+        crate::cpp_reparse::evict_analysis_caches(&std::iter::once(canon.clone()).collect());
         if let Some(ref pack) = pack {
             pack.unregister_file(&canon);
             pack.remove_surface(&canon);
@@ -1788,6 +1808,21 @@ pub fn pack_file_changed(
                 ) {
                     log::warn!("Failed to shred derived rows for {:?}: {}", p, e);
                 }
+            }
+        }
+        if skip_consumers {
+            // Unchanged gate: the consumers' rows/blobs/stubs are still
+            // valid, but the edited header's mtime moved every consumer's
+            // closure stamp — refresh them or the next warm rejects every
+            // consumer row (the restart cold storm).
+            let mut memo = std::collections::HashMap::new();
+            for (p, closure) in &consumer_closures {
+                module_cache::refresh_deps_stamp(
+                    &conn,
+                    &p.to_string_lossy(),
+                    closure,
+                    &mut memo,
+                );
             }
         }
         if let Some(tx) = tx {

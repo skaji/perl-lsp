@@ -167,3 +167,83 @@ fn cpp_values_are_on_the_surface_and_bodies_are_not() {
         "macro body change must change the surface"
     );
 }
+
+/// Free (package-less) callables — C's dominant export shape — are on the
+/// surface: adding one, or changing one's signature, must flip equality;
+/// a body edit must not. Perl duplicate definitions (last wins at runtime)
+/// each surface, so editing the SECOND definition's contract flips too.
+#[cfg(feature = "cpp")]
+#[test]
+fn cpp_free_functions_are_on_the_surface() {
+    let build_cpp = |src: &str| {
+        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        let driver = reg
+            .for_path(std::path::Path::new("/fake/surface_free.c"))
+            .expect("c driver");
+        driver.analyze_with_path(src, None)
+    };
+    let base = "int helper(int x) { return x + 1; }\nint get(void) { return 0; }\n";
+    let s0 = Surface::project(&build_cpp(base));
+
+    // Body edit: equal.
+    let body = base.replace("return x + 1;", "int y = x;\n    return y + 1;");
+    assert_eq!(
+        s0,
+        Surface::project(&build_cpp(&body)),
+        "free-function body edit must not change the surface"
+    );
+
+    // New free function: unequal.
+    let added = format!("{base}int helper2(int a, int b) {{ return a + b; }}\n");
+    assert_ne!(
+        s0,
+        Surface::project(&build_cpp(&added)),
+        "new free function must change the surface"
+    );
+
+    // Arity change on an existing free function: unequal.
+    let arity = base.replace("int helper(int x)", "int helper(int x, int y)");
+    assert_ne!(
+        s0,
+        Surface::project(&build_cpp(&arity)),
+        "free-function arity change must change the surface"
+    );
+}
+
+/// A RENAMED (or deleted) package's consumers are exactly the files its
+/// departure breaks — the dirty walk must seed from the names the
+/// re-record DROPPED, not just the new surface's names.
+#[test]
+fn freshness_dirty_walk_covers_renamed_away_providers() {
+    use std::path::PathBuf;
+    let idx = FreshnessIndex::default();
+    let lib = PathBuf::from("/w/Lib.pm");
+    let user = PathBuf::from("/w/User.pm");
+
+    let s_lib = surface("package Foo;\nsub make { my ($s)=@_; return 1 }\n1;\n");
+    let s_user = surface("package User;\nuse Foo;\nsub go { my ($s)=@_; return 2 }\n1;\n");
+    idx.record(&lib, s_lib);
+    idx.record(&user, s_user);
+
+    // Rename Foo -> Bar: User (consumer of the DEPARTED name) must dirty.
+    let s_renamed = surface("package Bar;\nsub make { my ($s)=@_; return 1 }\n1;\n");
+    assert_eq!(idx.record(&lib, s_renamed), SurfaceVerdict::Changed);
+    let dirty = idx.dirty_consumers(&lib);
+    assert!(
+        dirty.contains(&user),
+        "consumer of the renamed-away package must be in the dirty set"
+    );
+
+    // The NEXT re-record replaces the stale set: an unrelated change to
+    // the renamed file no longer drags Foo's old consumers around forever
+    // once they stopped depending on it... but User still imports Foo, so
+    // its edge keeps it dirty through the consumers map regardless.
+    let s_renamed2 =
+        surface("package Bar;\nsub make { my ($s)=@_; return 1 }\nsub extra { my ($s)=@_; return 2 }\n1;\n");
+    assert_eq!(idx.record(&lib, s_renamed2), SurfaceVerdict::Changed);
+    let dirty2 = idx.dirty_consumers(&lib);
+    assert!(
+        !dirty2.contains(&user),
+        "stale-provided names last exactly one re-record: Bar has no consumers"
+    );
+}

@@ -276,6 +276,10 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE modules ADD COLUMN deps_stamp INTEGER NOT NULL DEFAULT 0;",
     );
+    // Stub generation gate — stamped here so every fresh DB is writable by
+    // the persist writers (their per-chunk `stub_version_current` check
+    // would otherwise fail-closed until the first warm scan stamped it).
+    validate_stub_version(conn);
 
     let version: Option<String> = conn
         .query_row(
@@ -554,7 +558,7 @@ pub struct WarmStub {
 /// Bump when the stub's MEANING changes without breaking its bincode
 /// decode (a decode break self-heals to the full-blob path). Mismatch
 /// wipes the `stubs` table; the next warm backfills from full decodes.
-const STUB_VERSION: &str = "1";
+const STUB_VERSION: &str = "2";
 
 /// Gate the `stubs` table on the current stub generation — call once
 /// before a stub-consuming warm scan.
@@ -603,6 +607,12 @@ pub fn decode_stub(blob: &[u8]) -> Option<WarmStub> {
     Some(WarmStub { feed, specs, surface, skeleton })
 }
 
+/// The single speller of stub-row removal — every modules-row rewrite or
+/// invalidation routes here so a schema change edits one string.
+pub fn delete_stub(conn: &Connection, path: &str) {
+    let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path]);
+}
+
 pub fn save_stub(conn: &Connection, path: &str, blob: &[u8]) {
     let r = conn.execute(
         "INSERT OR REPLACE INTO stubs (path, stub) VALUES (?1, ?2)",
@@ -611,6 +621,32 @@ pub fn save_stub(conn: &Connection, path: &str, blob: &[u8]) {
     if let Err(e) = r {
         log::warn!("Failed to save warm stub for '{}': {}", path, e);
     }
+}
+
+/// Deferred-backfill guard: insert only while the modules row still carries
+/// `stamp`. A concurrent `pack_file_changed` may rewrite the row (deleting
+/// its stub) between the warm scan that encoded this stub and this deferred
+/// write — re-inserting would revive the pre-edit generation under a
+/// fresh-looking row.
+pub fn save_stub_if_current(conn: &Connection, path: &str, blob: &[u8], stamp: (i64, i64)) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO stubs (path, stub)
+         SELECT ?1, ?2 FROM modules
+         WHERE path = ?1 AND mtime_secs = ?3 AND file_size = ?4",
+        params![path, blob, stamp.0, stamp.1],
+    );
+}
+
+/// Cheap per-chunk re-check for writers: a concurrent process running a
+/// DIFFERENT stub generation may wipe + restamp the table mid-session;
+/// writing this generation's stubs under the other generation's stamp
+/// would serve mixed meanings to the next warm.
+pub fn stub_version_current(conn: &Connection) -> bool {
+    conn.query_row("SELECT value FROM meta WHERE key = 'stub_version'", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .map(|v| v == STUB_VERSION)
+    .unwrap_or(false)
 }
 
 /// Serialize FileAnalysis via bincode then compress with zstd.
@@ -706,9 +742,25 @@ pub fn save_blob_to_db_stamped(
     // A rewritten modules row orphans any prior stub for the path — a stale
     // skeleton paired with a fresh stamp would be served as valid on the
     // next warm. Writers that have a fresh stub re-insert it right after.
+    delete_stub(conn, &path.to_string_lossy());
+}
+
+/// Recompute a persisted row's `deps_stamp` from CURRENT disk state without
+/// touching its blob/rows/stub. For consumers of an Unchanged-surface edit:
+/// their content is still valid, but a closure member's mtime moved, so the
+/// stored stamp would fail the next warm scan and re-trigger the very cold
+/// storm the gate prevents in-session. The file's own mtime/size stamp is
+/// left alone — a consumer that itself changed on disk stays invalid.
+pub fn refresh_deps_stamp(
+    conn: &Connection,
+    path: &str,
+    include_closure: &crate::file_analysis::path_intern::ClosureList,
+    stat_memo: &mut std::collections::HashMap<String, (i64, i64)>,
+) {
+    let deps = closure_stamp(include_closure, stat_memo);
     let _ = conn.execute(
-        "DELETE FROM stubs WHERE path = ?1",
-        params![path.to_string_lossy()],
+        "UPDATE modules SET deps_stamp = ?1 WHERE path = ?2",
+        params![deps, path],
     );
 }
 
@@ -817,7 +869,7 @@ pub fn shred_derived_rows(
 /// else spells modules-table SQL.
 pub fn invalidate_generation(conn: &Connection, path: &str) {
     let _ = conn.execute("DELETE FROM modules WHERE path = ?1", params![path]);
-    let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path]);
+    delete_stub(conn, path);
     delete_ref_rows(conn, path);
 }
 
@@ -830,9 +882,11 @@ pub fn invalidate_generation_tier(conn: &Connection, path: &str, source: &str) {
         "DELETE FROM modules WHERE path = ?1 AND source = ?2",
         params![path, source],
     );
-    // Stubs are workspace-tier only; a dual-homed file keeping its import
-    // generation has no stub to preserve.
-    let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path]);
+    // Stubs are workspace-tier only — an import-tier invalidation must not
+    // orphan a dual-homed file's still-valid workspace stub.
+    if source == "workspace" {
+        delete_stub(conn, path);
+    }
     let _ = conn.execute(
         "DELETE FROM refs WHERE file_id IN
            (SELECT file_id FROM files WHERE path = ?1 AND source = ?2)",
@@ -1152,47 +1206,57 @@ pub fn warm_pack_stream_with_stubs(
     each_stub: &mut dyn FnMut(PathBuf, WarmStub) -> bool,
     each_full: &mut dyn FnMut(String, PathBuf, FileAnalysis),
 ) -> usize {
+    // Cheap integer/text columns first; the stub BLOB is column 6 and is
+    // only accessed AFTER the stamp/version checks pass (lazy row access —
+    // rejected rows never pull the blob's pages). `length(m.analysis)`
+    // reads the record header, not the blob: a stub must never register
+    // when its full blob can't rehydrate it (NULL/empty ⇒ wrong-empty
+    // answers instead of a fresh re-analysis).
     let mut stmt = match conn.prepare(
         "SELECT m.module_name, m.path, m.mtime_secs, m.file_size, m.extract_version, \
-                m.deps_stamp, s.stub \
+                m.deps_stamp, s.stub, length(m.analysis) \
          FROM modules m LEFT JOIN stubs s ON s.path = m.path",
     ) {
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, i64>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, Option<Vec<u8>>>(6)?,
-        ))
-    });
-    let rows = match rows {
+    let mut rows = match stmt.query([]) {
         Ok(r) => r,
         Err(_) => return 0,
     };
     let mut count = 0usize;
     let mut stat_memo: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
-    for row in rows.flatten() {
-        let (module_name, path_str, cached_mtime, cached_size, row_extract_version, row_deps_stamp, stub_blob) =
-            row;
+    loop {
+        let row = match rows.next() {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(e) => {
+                log::warn!("pack warm scan error (scan may truncate): {}", e);
+                break;
+            }
+        };
+        let Ok(path_str) = row.get::<_, String>(1) else { continue };
         if path_str.is_empty() {
             continue; // negative sentinel — no pack consumer
         }
+        let (Ok(cached_mtime), Ok(cached_size)) =
+            (row.get::<_, i64>(2), row.get::<_, i64>(3))
+        else {
+            continue;
+        };
         let path = PathBuf::from(&path_str);
         match file_stamp(&path) {
             Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
             _ => continue, // changed or deleted on disk
         }
-        if row_extract_version < EXTRACT_VERSION {
+        if row.get::<_, i64>(4).map(|v| v < EXTRACT_VERSION).unwrap_or(true) {
             continue; // stale rows re-analyze; don't register the old shape
         }
-        if use_stubs {
+        let Ok(row_deps_stamp) = row.get::<_, i64>(5) else { continue };
+        let blob_len = row.get::<_, Option<i64>>(7).ok().flatten().unwrap_or(0);
+        if use_stubs && blob_len > 0 {
+            let stub_blob = row.get::<_, Option<Vec<u8>>>(6).ok().flatten();
             if let Some(stub) = stub_blob.as_deref().and_then(decode_stub) {
                 if closure_stamp(&stub.skeleton.include_closure, &mut stat_memo)
                     != row_deps_stamp
@@ -1207,6 +1271,7 @@ pub fn warm_pack_stream_with_stubs(
                 // needed to re-shred): fall through to the blob.
             }
         }
+        let module_name = row.get::<_, String>(0).unwrap_or_default();
         let Some(fa) = load_one(conn, &path_str) else { continue };
         if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
             continue;
@@ -1349,7 +1414,7 @@ pub fn save_to_db(
     }
     if !path_str.is_empty() {
         // Same stale-stub guard as `save_blob_to_db_stamped`.
-        let _ = conn.execute("DELETE FROM stubs WHERE path = ?1", params![path_str]);
+        delete_stub(conn, &path_str);
     }
 }
 

@@ -736,3 +736,48 @@ fn stub_version_gate_wipes_on_mismatch() {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM stubs", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 1);
 }
+
+/// `refresh_deps_stamp` — the Unchanged gate's persistence half. A header
+/// body edit moves every consumer row's closure stamp; refreshing it (and
+/// nothing else) keeps the row warm-valid without re-persisting content.
+#[test]
+fn refresh_deps_stamp_revalidates_consumer_rows() {
+    let conn = test_db();
+    let dir = std::env::temp_dir().join(format!("deps-refresh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let header = dir.join("dep.h");
+    let consumer = dir.join("use.c");
+    std::fs::write(&header, "int helper(void);\n").unwrap();
+    std::fs::write(&consumer, "#include \"dep.h\"\n").unwrap();
+
+    // A consumer row whose closure contains the header.
+    let cached = parse_source_to_cached("1;\n", &consumer);
+    let mut fa = (*cached.analysis).clone();
+    fa.include_closure = crate::file_analysis::path_intern::ClosureList::from_iter(
+        [header.to_string_lossy()].iter().map(|s| s.as_ref()),
+    );
+    let blob = encode_analysis(&fa).unwrap();
+    let consumer_str = consumer.to_string_lossy().into_owned();
+    save_blob_to_db(&conn, &consumer_str, &consumer, &fa.include_closure, &blob, "workspace");
+    let stored: i64 = conn
+        .query_row("SELECT deps_stamp FROM modules WHERE path=?1", params![consumer_str], |r| r.get(0))
+        .unwrap();
+
+    // "Edit" the header (content + mtime move) — the stored stamp is stale.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&header, "int helper(void); /* body-ish edit */\n").unwrap();
+    let mut memo = std::collections::HashMap::new();
+    refresh_deps_stamp(&conn, &consumer_str, &fa.include_closure, &mut memo);
+    let refreshed: i64 = conn
+        .query_row("SELECT deps_stamp FROM modules WHERE path=?1", params![consumer_str], |r| r.get(0))
+        .unwrap();
+    assert_ne!(stored, refreshed, "closure member moved: stamp must change");
+
+    // And it now matches a fresh recompute (what the next warm scan checks).
+    let mut memo2 = std::collections::HashMap::new();
+    let expect = closure_stamp(&fa.include_closure, &mut memo2);
+    assert_eq!(refreshed, expect);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
