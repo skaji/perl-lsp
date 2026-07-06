@@ -371,6 +371,17 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
     }
+    /// A cached module's analysis whole on BOTH axes — bag AND refs present.
+    /// Consumers that read types and references from the same copy (the
+    /// whole-tree diagnostics sweep) route here: `refs_present` alone returns
+    /// the resident copy when refs survived but the bag was evicted (the
+    /// shred-failure degradation path), silently dropping invocant types.
+    fn whole_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        cached.analysis.clone()
+    }
     /// Every indexed file holding at least one ref row keyed by one of
     /// `keys` — the relational reverse index's candidate-file retrieval
     /// (`SELECT DISTINCT path … WHERE name_id IN keys`). The backward walk
@@ -542,6 +553,13 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     ) -> std::sync::Arc<FileAnalysis> {
         // Same delegation rule as `bag_present` — the inner index owns the LRU.
         self.inner.refs_present(cached)
+    }
+    fn whole_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the LRU.
+        self.inner.whole_present(cached)
     }
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         // Unscoped by design, like `def_candidates`: the backward walk applies

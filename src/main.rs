@@ -1823,9 +1823,11 @@ fn enriched_tree_diagnostics(
     for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
         // Index copies may be refs/bag-evicted; diagnostics read refs
-        // (unresolved calls) and the bag (types), so take the refs-present
-        // view first — resident when whole, rehydrated otherwise.
-        let whole = file_analysis::CrossFileLookup::refs_present(
+        // (unresolved calls) AND the bag (types), so take the whole-on-both-
+        // axes view — resident when whole, rehydrated otherwise. `refs_present`
+        // alone would serve a bag-evicted copy when rows survived but the bag
+        // didn't, silently dropping the invocant types diagnostics gate on.
+        let whole = file_analysis::CrossFileLookup::whole_present(
             idx,
             &std::sync::Arc::new(file_analysis::CachedModule::new(
                 entry.key().clone(),
@@ -1856,8 +1858,8 @@ fn enriched_tree_diagnostics(
     idx.for_each_pack_index(|_lang, pack| {
         pack.for_each_registered_file(&mut |cm| {
             let file = cm.path.display().to_string();
-            // Same refs-present routing: pack index copies are evicted.
-            let whole = file_analysis::CrossFileLookup::refs_present(pack.as_ref(), cm);
+            // Same whole-view routing: pack index copies are evicted.
+            let whole = file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cm);
             for d in symbols::pack_diagnostics(&whole, options) {
                 all.push((file.clone(), d));
             }

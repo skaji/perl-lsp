@@ -1413,6 +1413,13 @@ impl CrossFileLookup for ModuleIndex {
         self.rehydrate_or_resident(cached)
     }
 
+    fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if !cached.analysis.refs_are_evicted() && !cached.analysis.bag_is_evicted() {
+            return cached.analysis.clone();
+        }
+        self.rehydrate_or_resident(cached)
+    }
+
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         let Some(opener) = self.ref_rows_opener.read().ok().and_then(|g| g.clone()) else {
             return Vec::new();

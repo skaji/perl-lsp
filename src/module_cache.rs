@@ -185,7 +185,18 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             |row| row.get(0),
         )
         .ok();
-    if rows_version.as_deref() != Some(REF_ROWS_VERSION) {
+    // The stamp alone is trusted too far: a DB stamped current by a build
+    // whose migration didn't actually reshape the tables would never
+    // re-migrate, leaving every shred failing on a missing column while
+    // composition quietly masks it (refs stay resident, retrieval dead,
+    // diagnostics typeless). Probe the shape the current format requires so
+    // a lying stamp still triggers the rebuild.
+    let shape_ok = conn
+        .prepare("SELECT source FROM files LIMIT 1")
+        .map(|_| ())
+        .and_then(|_| conn.prepare("SELECT qual_kind FROM refs LIMIT 1").map(|_| ()))
+        .is_ok();
+    if rows_version.as_deref() != Some(REF_ROWS_VERSION) || !shape_ok {
         // DROP, not DELETE: a format change may alter the table SHAPE, and
         // `CREATE TABLE IF NOT EXISTS` above no-ops on the old shape — a
         // row-only wipe would leave every future shred failing on a missing

@@ -562,6 +562,27 @@ fn ref_rows_version_bump_recreates_old_shape_tables() {
     assert!(has_ref_rows(&conn, "/migrated.pm"));
 }
 
+/// The version stamp can lie: a DB stamped CURRENT whose tables still carry
+/// an older shape (stamped by a build whose migration didn't reshape) would
+/// never re-migrate on the stamp check alone — every shred fails on the
+/// missing column while composition masks it (refs stay resident, retrieval
+/// dead, diagnostics typeless). The shape probe must trigger the rebuild.
+#[test]
+fn ref_rows_current_stamp_with_stale_shape_recreates_tables() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('ref_rows_version', '{REF_ROWS_VERSION}');
+         CREATE TABLE files (file_id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE);
+         CREATE TABLE strings (str_id INTEGER PRIMARY KEY, s TEXT NOT NULL UNIQUE);
+         CREATE TABLE refs (file_id INTEGER, name_id INTEGER);",
+    ))
+    .unwrap();
+    init_schema(&conn).unwrap();
+    shred_ref_rows(&conn, "/migrated.pm", "workspace", &[]).unwrap();
+    assert!(has_ref_rows(&conn, "/migrated.pm"));
+}
+
 /// The @INC hard-clear is tier-scoped: a PERL5LIB change must take the
 /// import tier (blobs AND derived rows) while workspace rows — possibly
 /// committed by the concurrent indexer moments earlier — survive.

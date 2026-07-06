@@ -234,6 +234,22 @@ the watcher's deleted-path canonicalization + missing hub re-registration,
 atomic fingerprint check-and-stamp (BEGIN IMMEDIATE), and refs eviction now
 conditional on rows actually existing.
 
+A CI round caught the composition's nastiest failure shape end-to-end: a DB
+whose `ref_rows_version` stamp said current but whose tables carried the old
+shape (stamped by a build whose migration cleared rows without reshaping)
+never re-migrated — every shred failed on the missing column, refs stayed
+resident, the bag got evicted anyway, and the whole-tree diagnostics sweep
+ran typeless. Fewer invocant types means fewer `unresolved-method` hits, so
+the degradation *removed* four known-gap false positives and read as a fix:
+four xfail gold rows XPASSed and were wrongly promoted, then failed in CI
+where the store was healthy. Fixes: the version check now probes the actual
+shape (`files.source` / `refs.qual_kind`) so a lying stamp still triggers
+the DROP+recreate; the diagnostics sweep takes `whole_present` (bag AND refs,
+rehydrating if either is evicted) instead of `refs_present` alone; the four
+rows are demoted back to xfail with the mechanism in their notes. Moral for
+future rows: a diagnostics-absence XPASS is only promotable after checking
+the diagnostic didn't vanish because its *inputs* did.
+
 Known deferrals, deliberate: `warm_cache` and `warm_cache_streaming` share
 validation by convention not construction (merge candidate); heatmap /
 parity / diagnostics each spell their own refs-present entry collection
