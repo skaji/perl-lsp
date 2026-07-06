@@ -287,3 +287,34 @@ Format per entry:
 - **Ratification (veesh):** leave as is — "ArgPosition is a drop of a
   lie, but Slot::Comparison would be sprawl." A friendly comment on the
   variant acknowledges the stretch (landed in `src/cursor_slot.rs`).
+
+## Warm stubs — separate table vs. blob column — 2026-07-06 — OPEN (Claude, mission 2)
+
+- **Context:** register-from-Surface warm start persists a per-file stub
+  (registration feed + specialization edges + projected Surface + the
+  stripped skeleton) so warm scans never decode full analysis blobs.
+  Where does the stub live?
+- **Options:** A — `ALTER TABLE modules ADD COLUMN stub BLOB` (the
+  `deps_stamp` precedent). B — a separate `stubs(path PRIMARY KEY, stub)`
+  table joined at warm.
+- **Picked:** B. SQLite reads a record left-to-right; a column appended
+  AFTER the `analysis` BLOB sits past its overflow-page chain, so every
+  stub read would drag the full blob off disk — the exact cost the lane
+  exists to skip. The separate table also gets its own `stub_version`
+  meta wipe without touching blob validity.
+- **Undo cost:** low — the stub is a pure cache derived from the blob in
+  the same txn; dropping the table (or the version gate wiping it)
+  degrades to the full-decode lane and backfills on the next warm.
+- **Tradeoffs accepted:** (a) every modules-row rewrite must DELETE the
+  path's stub or a stale skeleton pairs with a fresh stamp — enforced
+  inside `save_to_db`/`save_blob_to_db_stamped` so writers can't forget;
+  (b) `pack_file_changed` deletes but doesn't rewrite stubs, so edited
+  files take the full lane on the next warm (bounded: only edited files);
+  (c) NO_EVICT bypasses stubs entirely (skeletons are stripped by
+  construction — a whole-copy session can't register them);
+  (d) stub-lane files whose derived rows vanished (REF_ROWS_VERSION
+  wipe) decline to the full lane because re-shredding needs the whole
+  analysis.
+- **Discussion needed:** whether the Perl workspace tier should get the
+  same lane (its warm is milliseconds on bugzilla today; chromium-scale
+  Perl trees don't exist in the corpus set).

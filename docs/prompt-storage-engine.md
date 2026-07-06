@@ -207,21 +207,30 @@ DELETE+INSERT — the store never rebuilds wholesale after first index.
   stripped payload). Net: `pack_file_changed_surface_gate_*` in
   `module_resolver_tests.rs`.
 
+- **Register-from-Surface warm landed (the stub lane)**: each persisted
+  pack file gets a warm stub in a separate `stubs` table (separate so
+  reading it never drags the analysis blob's overflow pages) — feed +
+  specs + projected Surface + the stripped skeleton. Warm start
+  registers from stubs without decoding full blobs; declined lanes
+  (rows missing, NO_EVICT, decode break, version gate) fall back to a
+  point full-decode, and full-lane warms backfill stubs so old caches
+  converge. Staleness: modules-row rewrites delete the stub; writers
+  re-insert in the same chunk txn. Measured on abseil: warm 1.6 s →
+  0.4 s, warm peak RSS 47 → 34 MB, cold unchanged; references
+  byte-identical, `--refs-parity` clean, gold 413/16/0/0/0. Chromium
+  projection (decode-dominated warm): 9 min → low minutes; not re-run
+  (bucket-share projection per the mission's measurement policy).
+
 Next, in order:
 
-3. **Register-from-Surface warm** (the parked symbols phase C): persist
-   the Surface per file (ALTER TABLE modules ADD COLUMN surface BLOB —
-   the deps_stamp precedent, no SCHEMA_VERSION bump), stream surfaces at
-   warm (no full-blob decode), derive the registration feeds from them
-   (needs #1's values for the pack name feed), register stubs that
-   rehydrate on first query. Kills the 9-minute chromium warm wall.
-4. **Workspace-tier always-enriched (R4)**: enriched results as an
+1. **Hardening round** over the whole mission diff (surface + gates +
+   stub lane).
+2. **Workspace-tier always-enriched (R4)**: enriched results as an
    overlay cache keyed by (file, dep-surface fingerprint), invalidated
    by the dirty walk — never in-place mutation of shared Arcs. The
    `--check` sweep (deep-copy + re-enrich per file per run) is the
    first consumer; hover/completion on closed files follow.
-5. **Hardening round** over the whole mission diff, then the phase-4
-   materialized SQL views if the budget allows.
+3. The phase-4 materialized SQL views if the budget allows.
 
 ## Honest boundaries / risks
 
