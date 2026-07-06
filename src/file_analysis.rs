@@ -4108,7 +4108,15 @@ impl FileAnalysis {
             stamped.push((i, target));
         }
         for (i, target) in stamped {
-            self.refs[i].resolved_method_target = target;
+            // Monotone: a re-stamp that can't re-derive the invocant class must
+            // not ERASE an authoritative freeze. Witnesses only accrue (finalize
+            // → enrichment adds the index), so a class never legitimately
+            // retracts; the only Some→None here is a synthesized member ref
+            // whose class was frozen from the field decl (a macro-body
+            // `->field` whose receiver is an untypeable macro parameter). Keep it.
+            if target.is_some() {
+                self.refs[i].resolved_method_target = target;
+            }
         }
     }
 

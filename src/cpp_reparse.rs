@@ -561,28 +561,43 @@ pub fn macro_call_arg_spans(
     out
 }
 
-/// Identifier tokens inside a `#define` body that name a KNOWN macro — the
-/// nested-macro uses the preprocessor hides from the code parser (`#define
-/// IS_OK(x) (FLAGS(x) & 1)` references FLAGS; perl5 `SvFLAGS` inside
-/// `SvOK`/`SvTRUE`). tree-sitter models a macro body as one opaque `preproc_arg`
-/// token, so these never surface as query captures and find-references on the
-/// inner macro goes dark. We lexically scan each body in ORIGINAL coordinates
-/// (def bodies are never spliced) and mint a use per token that (a) names a
-/// known macro and (b) is not the macro's own parameter. Comments, string/char
-/// literals, and `#`/`##` stringify/paste operands are skipped — a pasted or
-/// stringified token is textual, not a real reference (rule: prefer silence
-/// over a wrong ref). Body end is the LOGICAL line end (`logical_body_end`),
-/// not the CST node's, so continuation-past-comment tokens are still seen.
+/// The two reference lanes a `#define` body hides from the code parser (the
+/// body is one opaque `preproc_arg` token, so nothing inside it surfaces as a
+/// query capture): known-macro NAME uses, and member-access FIELD uses.
+#[derive(Default)]
+pub struct MacroBodyRefs {
+    /// `(name, span)` per token naming a KNOWN macro (`#define IS_OK(x)
+    /// (FLAGS(x) & 1)` references `FLAGS`; perl5 `SvFLAGS` inside `SvOK`).
+    pub name_refs: Vec<(String, crate::file_analysis::Span)>,
+    /// `(field, span)` per member-access token (`->op_next` / `.op_next`)
+    /// inside a body. Untyped here — the receiver is a macro parameter with no
+    /// type — so it is left as a bare `(field, span)` candidate; the assembly
+    /// pass (`into_file_analysis`) resolves it against the file's own field
+    /// symbols and mints a class-frozen `MethodCall` ref so references on the
+    /// field include the in-body use (perl5 `->op_next` drills are heavy in
+    /// bodies like `OP_NAME`/`cUNOPx`; rule #7).
+    pub member_refs: Vec<(String, crate::file_analysis::Span)>,
+}
+
+/// Scan every `#define` body in ORIGINAL coordinates (def bodies are never
+/// spliced) for the two hidden reference lanes above. A NAME use is minted per
+/// token that (a) names a known macro and (b) is not the macro's own parameter;
+/// a MEMBER use is minted per identifier immediately following a `->`/`.`
+/// operator. Comments, string/char literals, and `#`/`##` stringify/paste
+/// operands are skipped — a pasted or stringified token is textual, not a real
+/// reference (rule: prefer silence over a wrong ref). Body end is the LOGICAL
+/// line end (`logical_body_end`), not the CST node's, so continuation-past-
+/// comment tokens are still seen.
 pub fn macro_body_name_refs(
     parser: &mut tree_sitter::Parser,
     source: &str,
     known: &std::collections::HashSet<String>,
-) -> Vec<(String, crate::file_analysis::Span)> {
-    let Some(tree) = parser.parse(source, None) else { return Vec::new() };
+) -> MacroBodyRefs {
+    let mut out = MacroBodyRefs::default();
+    let Some(tree) = parser.parse(source, None) else { return out };
     let src = source.as_bytes();
     let query = cached_query(&MACRO_DEF_Q, &tree.language(), MACRO_DEF_QUERY);
     let names: Vec<&str> = query.capture_names().to_vec();
-    let mut out = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(query, tree.root_node(), src);
     while let Some(m) = it.next() {
@@ -611,14 +626,15 @@ pub fn macro_body_name_refs(
 }
 
 /// Lexically scan `body`'s logical extent (comment/literal-aware) and push a
-/// `(name, span)` per known-macro identifier token. Point coordinates are
+/// NAME use per known-macro identifier token and a MEMBER use per identifier
+/// that immediately follows a `->`/`.` member operator. Point coordinates are
 /// tracked from the node's start position; identifiers never cross a newline.
 fn scan_body_name_refs(
     src: &[u8],
     body: tree_sitter::Node,
     known: &std::collections::HashSet<String>,
     params: &[String],
-    out: &mut Vec<(String, crate::file_analysis::Span)>,
+    out: &mut MacroBodyRefs,
 ) {
     use crate::file_analysis::Span;
     let is_id = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
@@ -687,24 +703,46 @@ fn scan_body_name_refs(
                     i += 1;
                 }
                 let name = &src[tok_start..i];
-                // Stringify/paste-right operand: `#TOKEN` or `Y ## TOKEN`.
-                let stringified = prev_nonspace == b'#';
-                // Paste-left operand: `TOKEN ## Y` — peek past spaces for `##`.
-                let mut j = i;
-                while j < end && matches!(src[j], b' ' | b'\t') {
-                    j += 1;
-                }
-                let pasted = src.get(j) == Some(&b'#') && src.get(j + 1) == Some(&b'#');
-                if !stringified && !pasted {
+                let span = Span {
+                    start: tree_sitter::Point { row: srow, column: scol },
+                    end: tree_sitter::Point { row, column: col },
+                };
+                // A member-access token (`recv->FIELD` / `recv.FIELD`) is a
+                // field use, never a macro invocation — look back past inline
+                // whitespace for the operator. `->` needs both bytes; a `.` is
+                // a member dot unless it's the second `.` of `..`. Digit-led
+                // tokens (a float's `.5`) can't be a field, so gate on an
+                // identifier START. The receiver is a macro param with no type,
+                // so the field's class is resolved downstream, not here.
+                let is_member = name.first().is_some_and(|c| *c == b'_' || c.is_ascii_alphabetic())
+                    && {
+                        let mut k = tok_start;
+                        while k > start && matches!(src[k - 1], b' ' | b'\t') {
+                            k -= 1;
+                        }
+                        (k >= start + 2 && src[k - 1] == b'>' && src[k - 2] == b'-')
+                            || (k > start
+                                && src[k - 1] == b'.'
+                                && !(k >= start + 2 && src[k - 2] == b'.'))
+                    };
+                if is_member {
                     if let Ok(s) = std::str::from_utf8(name) {
-                        if known.contains(s) && !params.iter().any(|p| p == s) {
-                            out.push((
-                                s.to_string(),
-                                Span {
-                                    start: tree_sitter::Point { row: srow, column: scol },
-                                    end: tree_sitter::Point { row, column: col },
-                                },
-                            ));
+                        out.member_refs.push((s.to_string(), span));
+                    }
+                } else {
+                    // Stringify/paste-right operand: `#TOKEN` or `Y ## TOKEN`.
+                    let stringified = prev_nonspace == b'#';
+                    // Paste-left operand: `TOKEN ## Y` — peek past spaces for `##`.
+                    let mut j = i;
+                    while j < end && matches!(src[j], b' ' | b'\t') {
+                        j += 1;
+                    }
+                    let pasted = src.get(j) == Some(&b'#') && src.get(j + 1) == Some(&b'#');
+                    if !stringified && !pasted {
+                        if let Ok(s) = std::str::from_utf8(name) {
+                            if known.contains(s) && !params.iter().any(|p| p == s) {
+                                out.name_refs.push((s.to_string(), span));
+                            }
                         }
                     }
                 }

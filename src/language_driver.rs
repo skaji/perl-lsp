@@ -388,8 +388,15 @@ impl PackDriver {
             let mut known: std::collections::HashSet<String> =
                 macro_defs.iter().map(|m| m.name.clone()).collect();
             known.extend(ctx.external.macro_names().map(str::to_string));
-            for (name, span) in crate::cpp_reparse::macro_body_name_refs(parser, source, &known) {
+            let body_refs = crate::cpp_reparse::macro_body_name_refs(parser, source, &known);
+            for (name, span) in body_refs.name_refs {
                 skel.var_reads.push((name, crate::file_analysis::ScopeId(0), span));
+            }
+            // Field/member uses inside bodies (`->op_next`) — untyped here (the
+            // receiver is a macro param), resolved to the declaring class and
+            // minted as a class-frozen MethodCall ref in `into_file_analysis`.
+            for (field, span) in body_refs.member_refs {
+                skel.macro_body_member_reads.push((field, span));
             }
         }
         // Function-like macro typing (the expansion flip's payoff): a
@@ -1010,6 +1017,8 @@ fn remap_spans(
         template_params: _,
         return_sites,
         param_sigs,
+        // Populated later (enrich_skeleton) already in original coords — no remap.
+        macro_body_member_reads: _,
     } = skel;
 
     for s in symbols.iter_mut() {
