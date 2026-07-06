@@ -332,6 +332,15 @@ Deferred, designed to land on the same seam: **symbols relational** (the
 gives warm start a register-from-tables path that never decodes unqueried
 blobs) and the row-level matcher fast path above.
 
+**Whole-tree Chromium, measured (all three phases, 4-core/15 GB box):**
+the run the baseline could not finish — killed at 20 GB having indexed
+38K files — completes: **132,659 files, cold index 3 h 02 m wall, peak RSS
+7.3 GB; warm start 9 m 01 s, peak 6.7 GB** (0.05 MB/file — 10× under the
+baseline's 0.51 MB/file slope, ~67 GB projected). The store lands at
+6.1 GB (`modules-cpp.db`): 34.8 M ref rows over 2.16 M interned strings.
+The remaining resident floor is the stripped analyses' symbols/outline
+buckets — the deferred symbols shred is what moves it next.
+
 ## Migration net
 
 - **Parity harness (the load-bearing gate):** on a real corpus (abseil),

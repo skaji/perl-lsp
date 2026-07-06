@@ -150,3 +150,9 @@ nice-to-have into the load-bearing decision for whole-tree scale.
 **Design landed:** `docs/adr/relational-ref-index.md` (schema, query path,
 scale benchmarks at 105M rows) + `docs/prompt-relational-ref-index.md` (the
 implementation brief).
+
+**Outcome, measured:** with all three phases landed, the whole tree
+(132,659 files) cold-indexes to completion in 3 h 02 m at **7.3 GB peak**
+(vs death at 20 GB / 38K files here); a warm start replays the 6.1 GB
+store in 9 m at 6.7 GB peak. 0.05 MB/file — the ~67 GB projection above
+becomes ~7 GB actual. Numbers live in the ADR's phases section.
