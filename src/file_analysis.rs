@@ -1313,6 +1313,21 @@ impl Ref {
         split_qualified(&self.target_name).1
     }
 
+    /// The name key this ref is retrievable under in the relational ref
+    /// index (`docs/adr/relational-ref-index.md`). One function serves both
+    /// sides: rows are keyed by `match_key(ref)`, queries probe
+    /// `match_key`-shaped spellings of the target name — so retrieval can
+    /// never miss a ref any matcher arm could match (arms compare either the
+    /// exact `target_name` or its unqualified tail; equal full names have
+    /// equal tails). Sigil variables keep their sigil on the tail because
+    /// variable symbols key with it (`$x`, not `x`).
+    pub fn match_key(&self) -> String {
+        if let Some((_, sigil_base)) = self.qualified_var_target() {
+            return sigil_base;
+        }
+        self.unqualified_target_name().to_string()
+    }
+
     /// For a fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`,
     /// `%Pkg::h`) return `(package, sigil+basename)` — the package the
     /// global lives in, paired with the sigil-bearing bare name that keys
@@ -1329,6 +1344,72 @@ impl Ref {
         }
         let (pkg, base) = split_qualified(chars.as_str());
         pkg.map(|p| (p, format!("{sigil}{base}")))
+    }
+}
+
+/// One ref's projection into the relational ref index
+/// (`docs/adr/relational-ref-index.md`) — pure data, no storage types.
+/// Minted post-fold (the qual columns carry the baked verdicts), consumed
+/// by `module_cache::shred_ref_rows`. Kind/qual discriminants are the row
+/// format's contract: changing them means bumping `REF_ROWS_VERSION`.
+#[derive(Debug, Clone)]
+pub struct RefRowSeed {
+    /// Retrieval key — `Ref::match_key()`.
+    pub key: String,
+    pub kind: u8,
+    pub span: Span,
+    pub access: u8,
+    pub flags: u8,
+    pub qual_kind: u8,
+    pub qual: Option<String>,
+    pub arg_count: Option<i64>,
+}
+
+impl Ref {
+    pub fn row_seed(&self) -> RefRowSeed {
+        let kind = match &self.kind {
+            RefKind::Variable => 0,
+            RefKind::FunctionCall { .. } => 1,
+            RefKind::MethodCall { .. } => 2,
+            RefKind::PackageRef => 3,
+            RefKind::HashKeyAccess { .. } => 4,
+            RefKind::ContainerAccess => 5,
+            RefKind::DispatchCall { .. } => 6,
+        };
+        let (qual_kind, qual): (u8, Option<String>) = match &self.kind {
+            RefKind::FunctionCall { resolved_package } => {
+                (1, resolved_package.clone())
+            }
+            RefKind::MethodCall { .. } => (
+                2,
+                self.resolved_method_target
+                    .as_ref()
+                    .map(|t| t.invocant_class().to_string()),
+            ),
+            RefKind::DispatchCall { dispatcher, .. } => (3, Some(dispatcher.clone())),
+            RefKind::HashKeyAccess { owner, .. } => match owner {
+                Some(HashKeyOwner::Class(c)) => (4, Some(c.clone())),
+                Some(HashKeyOwner::Sub { name, .. }) => (5, Some(name.clone())),
+                _ => (0, None),
+            },
+            _ => (0, None),
+        };
+        let flags = u8::from(self.folded_from.is_some())
+            | (u8::from(self.resolves_to.is_some()) << 1);
+        RefRowSeed {
+            key: self.match_key(),
+            kind,
+            span: self.span,
+            access: match self.access {
+                AccessKind::Read => 0,
+                AccessKind::Write => 1,
+                AccessKind::Declaration => 2,
+            },
+            flags,
+            qual_kind,
+            qual,
+            arg_count: self.arg_count.map(|c| c as i64),
+        }
     }
 }
 

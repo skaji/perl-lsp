@@ -93,6 +93,12 @@ pub fn open_cache_db(_workspace_root: Option<&str>, _lang: &str) -> Option<Conne
     None
 }
 
+/// Bumped when the ROW format of the relational ref index changes shape.
+/// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
+/// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the
+/// next warm re-shreds rows from the already-decoded analyses for free.
+const REF_ROWS_VERSION: &str = "1";
+
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (
@@ -112,8 +118,47 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS builtins (
             name TEXT PRIMARY KEY,
             doc  TEXT NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            file_id INTEGER PRIMARY KEY,
+            path    TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS strings (
+            str_id INTEGER PRIMARY KEY,
+            s      TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS refs (
+            file_id   INTEGER NOT NULL,
+            name_id   INTEGER NOT NULL,
+            kind      INTEGER NOT NULL,
+            start_row INTEGER NOT NULL,
+            start_col INTEGER NOT NULL,
+            end_row   INTEGER NOT NULL,
+            end_col   INTEGER NOT NULL,
+            access    INTEGER NOT NULL,
+            flags     INTEGER NOT NULL,
+            qual_kind INTEGER NOT NULL,
+            qual_id   INTEGER,
+            arg_count INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name_id);
+        CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);",
     )?;
+    // Row-format generation for the derived tables (see REF_ROWS_VERSION).
+    let rows_version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'ref_rows_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if rows_version.as_deref() != Some(REF_ROWS_VERSION) {
+        clear_derived_rows(conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('ref_rows_version', ?1)",
+            params![REF_ROWS_VERSION],
+        )?;
+    }
     // Pre-existing tables (same schema version) predate `deps_stamp`; add it
     // in place rather than bumping SCHEMA_VERSION (a bump drops every row —
     // old rows carry 0, which validates only for empty-closure analyses, so
@@ -134,6 +179,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         Some(SCHEMA_VERSION) => Ok(()),
         Some(_) => {
             conn.execute_batch("DROP TABLE IF EXISTS modules;")?;
+            clear_derived_rows(conn)?;
             conn.execute_batch(
                 "CREATE TABLE modules (
                     module_name      TEXT PRIMARY KEY,
@@ -160,6 +206,15 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Wipe the derived relational tables (`refs`/`files`/`strings`). Runs
+/// alongside every `DELETE FROM modules` hard-clear: the rows are shredded
+/// from the blobs, so a generation that invalidates the blobs invalidates
+/// the rows with it. Cheap to rebuild — the next warm re-shreds from the
+/// decoded analyses it is loading anyway.
+pub fn clear_derived_rows(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("DELETE FROM refs; DELETE FROM files; DELETE FROM strings;")
 }
 
 pub fn compute_inc_hash(inc_paths: &[PathBuf]) -> String {
@@ -189,6 +244,7 @@ pub fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite:
             current_hash
         );
         conn.execute("DELETE FROM modules", [])?;
+        clear_derived_rows(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('inc_hash', ?1)",
             params![current_hash],
@@ -281,6 +337,7 @@ pub fn validate_plugin_fingerprint(conn: &Connection, fingerprint: &str) -> rusq
             fingerprint
         );
         conn.execute("DELETE FROM modules", [])?;
+        clear_derived_rows(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('plugin_fingerprint', ?1)",
             params![fingerprint],
@@ -401,6 +458,127 @@ pub fn save_blob_to_db(
     if let Err(e) = r {
         log::warn!("Failed to save module blob for '{}': {}", module_name, e);
     }
+}
+
+/// Replace one file's rows in the relational ref index. Runs inside the
+/// caller's transaction when one is open (bulk drains wrap N files per
+/// `BEGIN`); standalone callers get per-statement autocommit, which is fine
+/// for single-file updates. Upserts the `files` row even for a zero-ref
+/// file — presence in `files` is the "already shredded" marker the warm
+/// backfill checks.
+pub fn shred_ref_rows(
+    conn: &Connection,
+    path: &str,
+    seeds: &[crate::file_analysis::RefRowSeed],
+) -> rusqlite::Result<()> {
+    conn.execute("INSERT OR IGNORE INTO files (path) VALUES (?1)", params![path])?;
+    let file_id: i64 = conn.query_row(
+        "SELECT file_id FROM files WHERE path = ?1",
+        params![path],
+        |row| row.get(0),
+    )?;
+    conn.execute("DELETE FROM refs WHERE file_id = ?1", params![file_id])?;
+    let mut intern = conn.prepare_cached("INSERT OR IGNORE INTO strings (s) VALUES (?1)")?;
+    let mut lookup = conn.prepare_cached("SELECT str_id FROM strings WHERE s = ?1")?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO refs (file_id, name_id, kind, start_row, start_col, end_row, end_col,
+                           access, flags, qual_kind, qual_id, arg_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    // Per-call interning memo: files repeat the same handful of names heavily.
+    let mut memo: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut intern_str = |s: &str,
+                          memo: &mut std::collections::HashMap<String, i64>|
+     -> rusqlite::Result<i64> {
+        if let Some(id) = memo.get(s) {
+            return Ok(*id);
+        }
+        intern.execute(params![s])?;
+        let id: i64 = lookup.query_row(params![s], |row| row.get(0))?;
+        memo.insert(s.to_string(), id);
+        Ok(id)
+    };
+    for seed in seeds {
+        let name_id = intern_str(&seed.key, &mut memo)?;
+        let qual_id = match seed.qual.as_deref() {
+            Some(q) => Some(intern_str(q, &mut memo)?),
+            None => None,
+        };
+        insert.execute(params![
+            file_id,
+            name_id,
+            seed.kind,
+            seed.span.start.row as i64,
+            seed.span.start.column as i64,
+            seed.span.end.row as i64,
+            seed.span.end.column as i64,
+            seed.access,
+            seed.flags,
+            seed.qual_kind,
+            qual_id,
+            seed.arg_count,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Remove a deleted file's rows (the removal half of `shred_ref_rows`).
+pub fn delete_ref_rows(conn: &Connection, path: &str) {
+    let _ = conn.execute(
+        "DELETE FROM refs WHERE file_id IN (SELECT file_id FROM files WHERE path = ?1)",
+        params![path],
+    );
+    let _ = conn.execute("DELETE FROM files WHERE path = ?1", params![path]);
+}
+
+/// Has `path` been shredded into the relational index? (`files` presence is
+/// the marker — `shred_ref_rows` upserts it even for zero-ref files.)
+pub fn has_ref_rows(conn: &Connection, path: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM files WHERE path = ?1",
+        params![path],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// The retrieval half: every indexed file containing at least one ref row
+/// whose match key is one of `keys` — the candidate-file set `refs_to`'s
+/// SQL arms rehydrate and run the (unchanged) matcher over.
+pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT DISTINCT f.path FROM refs r
+           JOIN files f ON f.file_id = r.file_id
+          WHERE r.name_id = (SELECT str_id FROM strings WHERE s = ?1)",
+    ) else {
+        return out;
+    };
+    let mut seen = std::collections::HashSet::new();
+    for key in keys {
+        let rows = stmt.query_map(params![key], |row| row.get::<_, String>(0));
+        if let Ok(rows) = rows {
+            for p in rows.flatten() {
+                if seen.insert(p.clone()) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Row count for one match key — the count-first surface for hot-name
+/// capping (`docs/adr/relational-ref-index.md`).
+pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM refs
+          WHERE name_id = (SELECT str_id FROM strings WHERE s = ?1)",
+        params![key],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n as u64)
+    .unwrap_or(0)
 }
 
 pub fn warm_cache(
@@ -549,6 +727,7 @@ pub fn validate_input_fingerprint(conn: &Connection, fingerprint: u64) -> rusqli
             fingerprint
         );
         conn.execute("DELETE FROM modules", [])?;
+        clear_derived_rows(conn)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('input_fingerprint', ?1)",
             params![fingerprint],

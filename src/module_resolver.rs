@@ -178,7 +178,7 @@ pub fn spawn_resolver(
                     insert_into_cache(&cache, &edges, &module_name, result.clone());
 
                     if let Some(ref conn) = db {
-                        module_cache::save_to_db(conn, &module_name, &result, "import");
+                        save_module_generation(conn, &module_name, &result);
                     }
 
                     // Descend into the module's own dependencies so the
@@ -376,7 +376,7 @@ pub fn spawn_test_resolver(
                     let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
                     insert_into_cache(&cache, &edges, &module_name, result.clone());
                     if let Some(ref conn) = db {
-                        module_cache::save_to_db(conn, &module_name, &result, "import");
+                        save_module_generation(conn, &module_name, &result);
                     }
                     stale_modules.remove(&module_name);
                     let _g = resolved.mu.lock().unwrap();
@@ -765,6 +765,28 @@ fn eviction_enabled() -> bool {
     std::env::var_os("PERL_LSP_NO_EVICT").is_none()
 }
 
+/// Persist one module's generation: blob + its relational ref rows, always
+/// together (`docs/adr/relational-ref-index.md` — rows and blob describe the
+/// same analysis or neither exists). `save_to_db` skips degraded analyses;
+/// mirror that here so no rows exist for an unpersisted blob.
+fn save_module_generation(
+    conn: &rusqlite::Connection,
+    module_name: &str,
+    result: &Option<Arc<CachedModule>>,
+) {
+    module_cache::save_to_db(conn, module_name, result, "import");
+    if let Some(m) = result {
+        if !m.analysis.degraded {
+            let seeds: Vec<_> = m.analysis.refs.iter().map(|r| r.row_seed()).collect();
+            if let Err(e) =
+                module_cache::shred_ref_rows(conn, &m.path.to_string_lossy(), &seeds)
+            {
+                log::warn!("Failed to shred ref rows for '{}': {}", module_name, e);
+            }
+        }
+    }
+}
+
 pub fn index_pack_languages(
     root: &std::path::Path,
     cache_key: Option<&str>,
@@ -877,6 +899,11 @@ pub fn index_pack_languages(
             // retain the full bag past registration). `try_unwrap` takes
             // ownership when the temp map was the only holder (the common case),
             // avoiding a full clone; the clone is the refcount>1 fallback.
+            // Backfill seam: a blob that predates the relational ref index
+            // (or survived a REF_ROWS_VERSION wipe) has no rows; shred from
+            // the analysis we just decoded anyway — the entire migration
+            // story, no separate pass. One txn bounds the first-run cost.
+            let backfill_tx = conn.unchecked_transaction().ok();
             for (name, val) in temp.into_iter() {
                 if stale.contains(&name) {
                     continue;
@@ -889,11 +916,21 @@ pub fn index_pack_languages(
                     }
                     Err(arc) => (*arc.analysis).clone(),
                 };
+                let path_str = path.to_string_lossy();
+                if !module_cache::has_ref_rows(conn, &path_str) {
+                    let seeds: Vec<_> = fa.refs.iter().map(|r| r.row_seed()).collect();
+                    if let Err(e) = module_cache::shred_ref_rows(conn, &path_str, &seeds) {
+                        log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                    }
+                }
                 if eviction_enabled() {
                     fa.evict_witness_bag();
                 }
                 pack_index.register_symbols(path.clone(), Arc::new(fa));
                 warmed.insert(path);
+            }
+            if let Some(tx) = backfill_tx {
+                let _ = tx.commit();
             }
         }
 
@@ -906,10 +943,13 @@ pub fn index_pack_languages(
         // so the resident copy is thin and the persisted copy stays complete.
         // `None` blob = a degraded analysis we deliberately did NOT strip (see
         // below) or a non-persisted build; nothing to write.
+        // The persisted payload (`None` = degraded / persistence off): the
+        // pre-encoded FULL blob plus the ref-row seeds shredded from the same
+        // analysis — blob and rows always describe one generation.
         type FreshEntry = (
             PathBuf,
             Arc<crate::file_analysis::FileAnalysis>,
-            Option<Vec<u8>>,
+            Option<(Vec<u8>, Vec<crate::file_analysis::RefRowSeed>)>,
         );
         let fresh: std::sync::Mutex<Vec<FreshEntry>> = std::sync::Mutex::new(Vec::new());
         // Hoisted so the Rayon closure never touches `conn` (rusqlite
@@ -943,8 +983,10 @@ pub fn index_pack_languages(
                 // resident.
                 let blob = if persist && !analysis.degraded {
                     let b = module_cache::encode_analysis(&analysis);
+                    let seeds: Vec<_> =
+                        analysis.refs.iter().map(|r| r.row_seed()).collect();
                     analysis.evict_witness_bag();
-                    b
+                    b.map(|b| (b, seeds))
                 } else {
                     None
                 };
@@ -971,16 +1013,30 @@ pub fn index_pack_languages(
         // pinned `include_closure` (survives eviction), so the persisted row is
         // byte-identical to `save_to_db`'s from the full struct.
         if let Some(ref conn) = conn {
-            for (path, arc, blob) in fresh.into_inner().unwrap() {
-                if let Some(blob) = blob {
-                    module_cache::save_blob_to_db(
-                        conn,
-                        &path.to_string_lossy(),
-                        &path,
-                        &arc.include_closure,
-                        &blob,
-                        "workspace",
-                    );
+            // Batched: one transaction per chunk keeps the WAL bounded at
+            // Chromium scale while making each file's blob + ref rows land
+            // atomically together.
+            let entries = fresh.into_inner().unwrap();
+            for chunk in entries.chunks(250) {
+                let tx = conn.unchecked_transaction().ok();
+                for (path, arc, payload) in chunk {
+                    if let Some((blob, seeds)) = payload {
+                        let path_str = path.to_string_lossy();
+                        module_cache::save_blob_to_db(
+                            conn,
+                            &path_str,
+                            path,
+                            &arc.include_closure,
+                            blob,
+                            "workspace",
+                        );
+                        if let Err(e) = module_cache::shred_ref_rows(conn, &path_str, seeds) {
+                            log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
+                        }
+                    }
+                }
+                if let Some(tx) = tx {
+                    let _ = tx.commit();
                 }
             }
         }
@@ -1079,9 +1135,23 @@ pub fn pack_file_changed(
     // holds the full arcs; `save_to_db` encodes them whole. Strip only when we
     // actually persisted — else the bag would be unrecoverable, so keep it.
     let persisted = if let Some(conn) = module_cache::open_cache_db(root_uri, lang) {
+        if deleted {
+            module_cache::delete_ref_rows(&conn, &canon_str);
+        }
+        let tx = conn.unchecked_transaction().ok();
         for (p, arc) in &results {
+            let p_str = p.to_string_lossy();
             let cached = Arc::new(CachedModule::new(p.clone(), arc.clone()));
-            module_cache::save_to_db(&conn, &p.to_string_lossy(), &Some(cached), "workspace");
+            module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace");
+            if !arc.degraded {
+                let seeds: Vec<_> = arc.refs.iter().map(|r| r.row_seed()).collect();
+                if let Err(e) = module_cache::shred_ref_rows(&conn, &p_str, &seeds) {
+                    log::warn!("Failed to shred ref rows for {:?}: {}", p, e);
+                }
+            }
+        }
+        if let Some(tx) = tx {
+            let _ = tx.commit();
         }
         true
     } else {

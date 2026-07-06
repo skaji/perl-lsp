@@ -442,3 +442,97 @@ fn input_fingerprint_change_clears_table() {
     let (n, _) = warm_cache(&conn, &cache);
     assert_eq!(n, 0, "changed inputs: table cleared");
 }
+
+/// Relational ref index: shred → candidate-file retrieval round-trip, the
+/// re-shred replaces (never accumulates), and per-file deletion.
+#[test]
+fn shred_ref_rows_roundtrip() {
+    let conn = test_db();
+    let source = "package S;\nsub helper { 1 }\nsub caller_a { helper(); helper(); }\n1;\n";
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_shred.pm");
+    std::fs::write(&pm, source).unwrap();
+    let cached = parse_source_to_cached(source, &pm);
+    let path_str = pm.to_string_lossy().to_string();
+
+    assert!(!has_ref_rows(&conn, &path_str));
+    let seeds: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    assert!(!seeds.is_empty(), "call sites must produce row seeds");
+    shred_ref_rows(&conn, &path_str, &seeds).unwrap();
+    assert!(has_ref_rows(&conn, &path_str));
+
+    // Retrieval by the match key finds the file; an unknown key finds nothing.
+    let hits = ref_candidate_files(&conn, &["helper".to_string()]);
+    assert_eq!(hits, vec![path_str.clone()]);
+    assert!(ref_candidate_files(&conn, &["nonesuch".to_string()]).is_empty());
+    let n = ref_count_named(&conn, "helper");
+    assert!(n >= 2, "two call sites expected, got {n}");
+
+    // Re-shred replaces: same seeds again must not double the rows.
+    shred_ref_rows(&conn, &path_str, &seeds).unwrap();
+    assert_eq!(ref_count_named(&conn, "helper"), n);
+
+    // A zero-ref shred still marks the file as shredded (the backfill marker).
+    let other = dir.join("TestModule_shred_empty.pm");
+    shred_ref_rows(&conn, &other.to_string_lossy(), &[]).unwrap();
+    assert!(has_ref_rows(&conn, &other.to_string_lossy()));
+
+    delete_ref_rows(&conn, &path_str);
+    assert!(!has_ref_rows(&conn, &path_str));
+    assert!(ref_candidate_files(&conn, &["helper".to_string()]).is_empty());
+
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// The row seeds must key by the same spelling retrieval probes: qualified
+/// calls key by their bare tail, sigil variables keep the sigil.
+#[test]
+fn ref_row_seed_match_keys() {
+    let source = "package K;\nour $x = 1;\nFoo::Bar::baz();\nprint $Foo::Bar::x;\n1;\n";
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_keys.pm");
+    std::fs::write(&pm, source).unwrap();
+    let cached = parse_source_to_cached(source, &pm);
+    let keys: Vec<String> = cached.analysis.refs.iter().map(|r| r.match_key()).collect();
+    assert!(
+        keys.iter().any(|k| k == "baz"),
+        "qualified call keys by bare tail; got {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "$x"),
+        "qualified sigil var keys by sigil+base; got {keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|k| k.contains("::")),
+        "no qualified spellings in match keys; got {keys:?}"
+    );
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// Hard-clears (inc hash / plugin fingerprint / input fingerprint) must wipe
+/// the derived row tables together with the blobs they derive from.
+#[test]
+fn hard_clear_wipes_derived_rows() {
+    let conn = test_db();
+    let seeds = vec![crate::file_analysis::RefRowSeed {
+        key: "k".into(),
+        kind: 1,
+        span: crate::file_analysis::Span {
+            start: tree_sitter::Point { row: 0, column: 0 },
+            end: tree_sitter::Point { row: 0, column: 1 },
+        },
+        access: 0,
+        flags: 0,
+        qual_kind: 0,
+        qual: None,
+        arg_count: None,
+    }];
+    shred_ref_rows(&conn, "/some/file.pm", &seeds).unwrap();
+    assert!(has_ref_rows(&conn, "/some/file.pm"));
+    validate_plugin_fingerprint(&conn, "fingerprint-a").unwrap();
+    validate_plugin_fingerprint(&conn, "fingerprint-b").unwrap();
+    assert!(
+        !has_ref_rows(&conn, "/some/file.pm"),
+        "fingerprint change must clear derived rows"
+    );
+}
