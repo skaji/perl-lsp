@@ -357,6 +357,12 @@ pub struct ModuleIndex {
     /// name-keyed views can't reach those, but whole-project sweeps
     /// (`for_each_cached_file`) must.
     all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
+    /// The freshness engine (`docs/prompt-storage-engine.md` phase 3):
+    /// per-file span-free surface records + the reverse-dependency index.
+    /// Fed at registration (whole copy, pre-strip) and on open-doc
+    /// rebuilds; `dirty_consumers` names who must re-enrich after a
+    /// surface CHANGE, and an Unchanged verdict is the early-cutoff.
+    freshness: Arc<crate::surface::FreshnessIndex>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
     /// class-rank source for the cache-slot tie-break. Recorded at
@@ -435,6 +441,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
+            freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -813,6 +820,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
+            freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -869,6 +877,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
+            freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -954,6 +963,7 @@ impl ModuleIndex {
     /// get only the path entry.
     pub fn register_workspace_resident(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let _ = self.record_surface(&path, &analysis);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Path-keyed registry first: the relational retrieval resolves
         // candidate paths through `cached_by_path`, and packageless files
@@ -964,6 +974,27 @@ impl ModuleIndex {
         self.edges.purge_module(&module_name);
         self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Project + record `fa`'s span-free surface for `path` — the
+    /// freshness engine's write half. Call with a WHOLE analysis (the
+    /// projection reads symbols + the bag). Returns the early-cutoff
+    /// verdict; `Changed` means `dirty_consumers(path)` names stale files.
+    pub fn record_surface(
+        &self,
+        path: &std::path::Path,
+        fa: &FileAnalysis,
+    ) -> crate::surface::SurfaceVerdict {
+        self.freshness.record(path, crate::surface::Surface::project(fa))
+    }
+
+    /// The transitive consumers of `path`'s last-recorded surface — the
+    /// re-enrich set after a `Changed` verdict.
+    pub fn dirty_consumers(
+        &self,
+        path: &std::path::Path,
+    ) -> std::collections::HashSet<std::path::PathBuf> {
+        self.freshness.dirty_consumers(path)
     }
 
     /// The name/edge feed half of workspace registration, run on the WHOLE
@@ -1013,6 +1044,7 @@ impl ModuleIndex {
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
         let module_name = self.workspace_feed_prestrip(&fa);
+        let _ = self.record_surface(&path, &fa);
         if strip_bag {
             fa.evict_witness_bag();
         }
@@ -1029,6 +1061,7 @@ impl ModuleIndex {
     /// entry plus its name-keyed cache row and edges (a dead file must not
     /// stay a retrieval candidate or a phantom module).
     pub fn unregister_workspace_path(&self, path: &std::path::Path) {
+        self.freshness.remove(path);
         self.all_files.remove(path);
         let name = self.cache.iter().find_map(|entry| {
             entry

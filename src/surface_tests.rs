@@ -77,3 +77,49 @@ fn surface_serde_roundtrip() {
     let back: Surface = bincode::deserialize(&bin).unwrap();
     assert_eq!(s0, back);
 }
+
+/// The freshness engine: verdicts, the reverse-dep walk, transitivity
+/// through a parent chain, and edge maintenance on re-record.
+#[test]
+fn freshness_dirty_closure_walks_imports_and_parent_chains() {
+    use std::path::PathBuf;
+    let idx = FreshnessIndex::default();
+    let base = PathBuf::from("/w/Base.pm");
+    let mid = PathBuf::from("/w/Mid.pm");
+    let app = PathBuf::from("/w/App.pm");
+
+    // Base::Level0 <- Mid extends it <- App imports Mid.
+    let s_base = surface("package Base;\nsub greet { my ($s)=@_; return 'hi' }\n1;\n");
+    let s_mid = surface("package Mid;\nuse parent 'Base';\nsub own { my ($s)=@_; return 1 }\n1;\n");
+    let s_app = surface("package App;\nuse Mid;\nsub run { my ($s)=@_; return 2 }\n1;\n");
+
+    assert_eq!(idx.record(&base, s_base.clone()), SurfaceVerdict::FirstSeen);
+    assert_eq!(idx.record(&mid, s_mid), SurfaceVerdict::FirstSeen);
+    assert_eq!(idx.record(&app, s_app), SurfaceVerdict::FirstSeen);
+
+    // Re-recording an identical surface is the firewall.
+    assert_eq!(idx.record(&base, s_base), SurfaceVerdict::Unchanged);
+
+    // A surface CHANGE to Base dirties Mid (extends Base) and App
+    // (imports Mid, whose enrichment reads through to Base) — transitive.
+    let s_base2 = surface(
+        "package Base;\nsub greet { my ($s)=@_; return 'hi' }\nsub extra { my ($s)=@_; return 3 }\n1;\n",
+    );
+    assert_eq!(idx.record(&base, s_base2), SurfaceVerdict::Changed);
+    let dirty = idx.dirty_consumers(&base);
+    assert!(dirty.contains(&mid), "direct extender is dirty");
+    assert!(dirty.contains(&app), "transitive importer is dirty");
+    assert!(!dirty.contains(&base), "the changed file itself is not in the closure");
+
+    // Mid drops its parent edge — re-record maintains edges; Base's
+    // closure loses the chain.
+    let s_mid2 = surface("package Mid;\nsub own { my ($s)=@_; return 1 }\n1;\n");
+    assert_eq!(idx.record(&mid, s_mid2), SurfaceVerdict::Changed);
+    let dirty = idx.dirty_consumers(&base);
+    assert!(!dirty.contains(&mid), "edge removed with the parent");
+    assert!(!dirty.contains(&app), "chain broken");
+
+    // Removal drops records + edges.
+    idx.remove(&app);
+    assert!(idx.dirty_consumers(&mid).is_empty());
+}

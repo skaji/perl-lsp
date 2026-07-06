@@ -18,6 +18,25 @@ Format per entry:
 
 ---
 
+## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — OPEN (picked hand-rolled first cut)
+- **Context:** storage-engine mission phase 3 (docs/prompt-storage-engine.md;
+  eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes
+  the engine choice reversible.
+- **Options:** A — hand-rolled `FreshnessIndex` (surface records +
+  name-keyed reverse-dep + seen-set dirty walk, ~150 lines, no deps).
+  B — Salsa 0.27 (revision machinery, durability, auto edges; `'db`
+  virality, memory-tuning burden, pre-1.0). C — comemo (lighter, no
+  revision machinery).
+- **Picked:** A, per the eval's own recommendation: we already own the
+  reverse-index discipline, and the engine sits entirely behind
+  `Surface`/`SurfaceVerdict` — swapping in Salsa later touches the
+  recording sites, not the consumers.
+- **Undo cost:** moderate — reimplement `record`/`dirty_consumers` over
+  salsa inputs/tracked fns; call sites unchanged.
+- **Discussion needed:** when the query graph deepens (materialized
+  workspace enrichment, phase 4 SQL views), revisit whether the dirty-set
+  still suffices or Salsa's cancellation/durability earns its costs.
+
 ## Unregister inverse under symbol eviction: recorded name list vs self-healing candidates — 2026-07-06 — OPEN
 - **Context:** symbols-relational phase B. `unregister_file` walked
   `old.analysis.symbols` to remove name registrations; under symbol

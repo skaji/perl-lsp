@@ -237,6 +237,135 @@ fn despan(t: &InferredType) -> InferredType {
     }
 }
 
+/// The verdict `FreshnessIndex::record` hands back — what a rebuild of one
+/// file means for everyone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceVerdict {
+    /// First sighting — no prior surface to compare (startup registration).
+    FirstSeen,
+    /// Surface equal: a body edit / reformat / comment. NOTHING cross-file
+    /// changed — consumers stay fresh, the walk stops here.
+    Unchanged,
+    /// Cross-file-visible change — `dirty_consumers` names who must
+    /// re-enrich.
+    Changed,
+}
+
+/// The hand-rolled freshness engine (`docs/prompt-storage-engine.md`
+/// phase 3, the eval's recommended first cut): per-file surface records +
+/// a name-keyed reverse-dependency index. The dependency edge is DECLARED
+/// by the consumer's own surface — file F depends on every name in its
+/// imports ∪ parents ∪ bridges — and the dirty walk is provider-name →
+/// consumers, transitive with a seen-set (C's change dirties B extends C,
+/// which dirties A importing B, because A's enrichment reads through B).
+#[derive(Default)]
+pub struct FreshnessIndex {
+    surfaces: dashmap::DashMap<std::path::PathBuf, Surface>,
+    /// provider NAME (package/module) → consumer paths.
+    consumers: dashmap::DashMap<String, std::collections::HashSet<std::path::PathBuf>>,
+    /// consumer path → the provider names it last declared edges to
+    /// (the removal half — edges must not accumulate across re-records).
+    deps_of: dashmap::DashMap<std::path::PathBuf, Vec<String>>,
+}
+
+impl FreshnessIndex {
+    /// Names `s` DEPENDS on: its imports, every package's parents, and the
+    /// classes its plugins bridge onto.
+    fn dep_names(s: &Surface) -> Vec<String> {
+        let mut names: Vec<String> = s.imports.clone();
+        for p in &s.packages {
+            names.extend(p.parents.iter().cloned());
+        }
+        names.extend(s.plugin_bridges.iter().cloned());
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Names `s` PROVIDES: its declared packages (the keys consumers'
+    /// edges point at — Perl imports/extends by package name).
+    fn provided_names(s: &Surface) -> impl Iterator<Item = &str> {
+        s.packages.iter().map(|p| p.name.as_str())
+    }
+
+    /// Record `path`'s freshly-built surface; maintain its outgoing edges;
+    /// return what changed. Call with the WHOLE analysis's projection at
+    /// registration/rebuild time.
+    pub fn record(&self, path: &std::path::Path, surface: Surface) -> SurfaceVerdict {
+        let verdict = match self.surfaces.get(path) {
+            None => SurfaceVerdict::FirstSeen,
+            Some(old) if *old == surface => SurfaceVerdict::Unchanged,
+            Some(_) => SurfaceVerdict::Changed,
+        };
+        if verdict != SurfaceVerdict::Unchanged {
+            let new_deps = Self::dep_names(&surface);
+            let old_deps = self
+                .deps_of
+                .insert(path.to_path_buf(), new_deps.clone())
+                .unwrap_or_default();
+            for gone in old_deps.iter().filter(|d| !new_deps.contains(d)) {
+                if let Some(mut set) = self.consumers.get_mut(gone) {
+                    set.remove(path);
+                }
+            }
+            for dep in &new_deps {
+                self.consumers
+                    .entry(dep.clone())
+                    .or_default()
+                    .insert(path.to_path_buf());
+            }
+            self.surfaces.insert(path.to_path_buf(), surface);
+        }
+        verdict
+    }
+
+    /// Drop a deleted file's record and edges.
+    pub fn remove(&self, path: &std::path::Path) {
+        self.surfaces.remove(path);
+        if let Some((_, deps)) = self.deps_of.remove(path) {
+            for d in deps {
+                if let Some(mut set) = self.consumers.get_mut(&d) {
+                    set.remove(path);
+                }
+            }
+        }
+    }
+
+    /// The transitive dirty closure after `changed_path`'s surface changed:
+    /// every file whose enrichment can observe it, walked provider-name →
+    /// consumers with a seen-set (bounded, cycle-safe). The changed file
+    /// itself is NOT in the set (its own rebuild triggered this).
+    pub fn dirty_consumers(
+        &self,
+        changed_path: &std::path::Path,
+    ) -> std::collections::HashSet<std::path::PathBuf> {
+        let mut dirty: std::collections::HashSet<std::path::PathBuf> = Default::default();
+        let mut frontier: Vec<String> = match self.surfaces.get(changed_path) {
+            Some(s) => Self::provided_names(&s).map(str::to_owned).collect(),
+            None => return dirty,
+        };
+        let mut seen_names: std::collections::HashSet<String> = frontier.iter().cloned().collect();
+        while let Some(name) = frontier.pop() {
+            let Some(consumers) = self.consumers.get(&name) else { continue };
+            for c in consumers.iter() {
+                if c == changed_path || !dirty.insert(c.clone()) {
+                    continue;
+                }
+                // A dirty consumer's OWN providers propagate: its enriched
+                // result feeds files that depend on IT.
+                if let Some(s) = self.surfaces.get(c.as_path()) {
+                    for p in Self::provided_names(&s) {
+                        if seen_names.insert(p.to_owned()) {
+                            frontier.push(p.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        dirty
+    }
+}
+
 #[cfg(test)]
 #[path = "surface_tests.rs"]
 mod tests;

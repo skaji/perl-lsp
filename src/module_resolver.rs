@@ -1048,8 +1048,10 @@ pub fn index_workspace_with_index(
                         // residency + FileStore mirror in the writer AFTER
                         // its chunk commits. Until then the file reads as
                         // "not yet indexed" — never wrong-empty.
-                        let module_name =
-                            module_index.and_then(|idx| idx.workspace_feed_prestrip(&analysis));
+                        let module_name = module_index.and_then(|idx| {
+                            let _ = idx.record_surface(&canon, &analysis);
+                            idx.workspace_feed_prestrip(&analysis)
+                        });
                         analysis.evict_witness_bag();
                         analysis.evict_refs();
                         analysis.evict_symbols();

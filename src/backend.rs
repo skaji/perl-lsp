@@ -1017,6 +1017,43 @@ impl Backend {
         Some((Url::from_file_path(&cached.path).ok(), span, line))
     }
 
+    /// The freshness engine's consumption half for OPEN docs: after an
+    /// edit to `uri` rebuilt its analysis, record the new surface. An
+    /// `Unchanged` verdict is the early-cutoff — a body edit refreshes
+    /// nobody. `Changed` re-enriches + republishes exactly the OPEN docs
+    /// in the transitive dirty closure (closed workspace consumers stay
+    /// correct through the query-time walks; their always-enriched
+    /// materialization is the next phase).
+    async fn refresh_dirty_open_consumers(&self, uri: &Url) {
+        let Ok(path) = uri.to_file_path() else { return };
+        let canon = std::fs::canonicalize(&path).unwrap_or(path);
+        let verdict = match self.files.get_open(uri) {
+            Some(doc) if doc.language == "perl" => {
+                self.module_index.record_surface(&canon, &doc.analysis)
+            }
+            _ => return,
+        };
+        if verdict != crate::surface::SurfaceVerdict::Changed {
+            return;
+        }
+        let dirty = self.module_index.dirty_consumers(&canon);
+        if dirty.is_empty() {
+            return;
+        }
+        let mut to_refresh: Vec<Url> = Vec::new();
+        self.files.for_each_open(|u, _doc| {
+            if let Ok(p) = u.to_file_path() {
+                let c = std::fs::canonicalize(&p).unwrap_or(p);
+                if dirty.contains(&c) {
+                    to_refresh.push(u.clone());
+                }
+            }
+        });
+        for u in to_refresh {
+            self.publish_diagnostics(&u).await;
+        }
+    }
+
     fn enrich_analysis(&self, uri: &Url) {
         if let Some(mut doc) = self.files.get_open_mut(uri) {
             // enrichment is Perl-flavored (imported-type/hash-key keys);
@@ -1465,6 +1502,10 @@ impl LanguageServer for Backend {
                 }
             }
             self.publish_diagnostics(&uri).await;
+            // Surface-gated consumer refresh: a body edit stops here
+            // (Unchanged); a contract change republishes the open docs
+            // that can see it.
+            self.refresh_dirty_open_consumers(&uri).await;
             return;
         }
         if let Some(mut doc) = self.files.get_open_mut(&uri) {
@@ -1490,6 +1531,7 @@ impl LanguageServer for Backend {
                 doc.update(text);
             }
             self.publish_diagnostics(&uri).await;
+            self.refresh_dirty_open_consumers(&uri).await;
         }
         // The saved bytes are on disk: re-register this file's indexed copy,
         // evict the macro/closure caches it participates in, and refresh its
