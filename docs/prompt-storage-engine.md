@@ -173,6 +173,51 @@ DELETE+INSERT — the store never rebuilds wholesale after first index.
    Phase 3 keeps perpetually true. Optionally revisit Salsa here if the query
    graph has deepened past what the dirty-set comfortably serves.
 
+## Progress (this branch)
+
+- **Phase 2 is landed** ahead of this prompt (refs + syms rows, three
+  eviction axes, `whole_present`, `--refs-parity`; see
+  `docs/prompt-symbols-relational.md` incl. its hardening round).
+- **Phase 1 landed**: `src/surface.rs` — `Surface`/`PackageSurface`/
+  `MethodSurface`, `Surface::project(&FileAnalysis)`, the `despan`
+  sanitizer (CodeRef's Expr edge is the one InferredType span carrier),
+  canonical ordering, and the R1 equality nets (body-edit/reformat/
+  local-rename equal; return-type/method/parent/export/import unequal;
+  bincode roundtrip).
+- **Phase 3 first cut landed**: `FreshnessIndex` (records + name-keyed
+  reverse-dep + transitive dirty walk) on the hub; recorded at every
+  workspace registration and on open-doc Perl edits; `Changed` verdicts
+  re-enrich + republish exactly the OPEN docs in the dirty closure.
+  Engine choice (hand-rolled over Salsa) logged in `docs/open-forks.md`.
+
+Next, in order:
+
+1. **Value symbols on the Surface.** `is_linkage_visible` non-callables
+   (C globals/enum constants/macro-artifact Variables; Perl `our`
+   globals) are cross-file-visible but not yet projected — for cpp the
+   equality firewall is too coarse without them (adding a global reads
+   as Unchanged). Add `values` to `PackageSurface` + a package-less
+   `free_values` bucket, with equality-net arms, BEFORE wiring pack-tier
+   freshness.
+2. **Pack-tier freshness**: record surfaces in `register_symbols_*`;
+   dirty edges for cpp are include-closure-based, not name-import-based
+   — decide whether `FreshnessIndex` grows a closure edge kind or packs
+   reuse the existing consumer scan (`pack_file_changed` already walks
+   `include_closure.contains`).
+3. **Register-from-Surface warm** (the parked symbols phase C): persist
+   the Surface per file (ALTER TABLE modules ADD COLUMN surface BLOB —
+   the deps_stamp precedent, no SCHEMA_VERSION bump), stream surfaces at
+   warm (no full-blob decode), derive the registration feeds from them
+   (needs #1's values for the pack name feed), register stubs that
+   rehydrate on first query. Kills the 9-minute chromium warm wall.
+4. **Workspace-tier always-enriched (R4)**: enriched results as an
+   overlay cache keyed by (file, dep-surface fingerprint), invalidated
+   by the dirty walk — never in-place mutation of shared Arcs. The
+   `--check` sweep (deep-copy + re-enrich per file per run) is the
+   first consumer; hover/completion on closed files follow.
+5. **Hardening round** over the whole mission diff, then the phase-4
+   materialized SQL views if the budget allows.
+
 ## Honest boundaries / risks
 
 - **R1 — span leakage into Surface** is the whole-design failure mode and it
