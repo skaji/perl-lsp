@@ -505,17 +505,21 @@ pub fn resolve_symbol_scoped(
         // an inline method carries the class as sticky `package` too, so the
         // package tag alone would over-claim.
         if analysis.symbol_is_class_content(sym) {
-            let class = sym.package.clone().expect("class content is package-tagged");
-            let mut t = TargetRef::method(
-                sym.name.clone(),
-                class,
-                analysis,
-                module_index,
-                scope,
-            );
-            t.def_paths = pack_class_def_paths(&t, analysis, module_index);
-            t.bare_constant = analysis.class_content_is_bare_constant(sym);
-            return Some(ResolvedTarget::Target(t));
+            // The class tag normally rides class-content symbols by construction;
+            // a malformed/adversarial FileAnalysis without it has no target to
+            // mint here, so fall through to the remaining lanes rather than assert.
+            if let Some(class) = sym.package.clone() {
+                let mut t = TargetRef::method(
+                    sym.name.clone(),
+                    class,
+                    analysis,
+                    module_index,
+                    scope,
+                );
+                t.def_paths = pack_class_def_paths(&t, analysis, module_index);
+                t.bare_constant = analysis.class_content_is_bare_constant(sym);
+                return Some(ResolvedTarget::Target(t));
+            }
         }
         // A file-scope global / anonymous-enum constant: bare-name-keyed,
         // like the generic cross-file goto-def tail that resolves its uses.
@@ -646,8 +650,12 @@ pub fn resolve_symbol_scoped(
             _ => ResolvedTarget::Local,
         },
         kind => {
-            let mut t = TargetRef::from_rename_kind(kind, analysis, module_index, scope)
-                .expect("Function/Method/Package/Handler kinds map to a target");
+            // A kind that doesn't map to a target (malformed input reaching a
+            // rename kind the constructor doesn't cover) has no resolution here.
+            let Some(mut t) = TargetRef::from_rename_kind(kind, analysis, module_index, scope)
+            else {
+                return None;
+            };
             // A member-ACCESS cursor (`c->fd`) reaches here as a generic
             // Method kind; when the member is pack class content the target
             // is the same one its DEF site mints, so it carries the same
@@ -4156,6 +4164,8 @@ fn collect_from_analysis(
                 &analysis.include_closure,
                 Some(path.as_path()),
             ));
+            // SAFETY: scoped_storage was just set to Some(..) on the line above,
+            // in this same match arm — a lifetime-extension idiom, not a fallible read.
             Some(scoped_storage.as_ref().unwrap() as &dyn CrossFileLookup)
         }
         other => other,
@@ -4270,7 +4280,12 @@ fn collect_from_analysis(
         let matches_kind = alias_matched || match (&target.kind, &r.kind) {
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::FunctionCall { resolved_package }) => {
-                let scope = callable_scope_for_refs.as_ref().unwrap();
+                // callable_scope_for_refs is derived from the same target.kind
+                // match above; a mismatch means malformed input rather than a
+                // real match, so skip this ref instead of asserting the invariant.
+                let Some(scope) = callable_scope_for_refs.as_ref() else {
+                    continue;
+                };
                 // Under Hierarchy a bare call into ANY family class matches (the
                 // whole override family); Dispatch keeps the strict single
                 // scope. A bare imported call the single-file walk couldn't pin
@@ -4339,7 +4354,11 @@ fn collect_from_analysis(
                 // class then fans out over `method_rename_chain` so
                 // `$child->m` matches an ancestor-defined target while
                 // unrelated same-named methods stay out.
-                let scope = callable_scope_for_refs.as_ref().unwrap();
+                // Same derived-from-the-same-match invariant as the FunctionCall
+                // arm above; skip rather than assert if it ever doesn't hold.
+                let Some(scope) = callable_scope_for_refs.as_ref() else {
+                    continue;
+                };
                 let method = r.unqualified_target_name();
                 {
                     let resolved_class = match r.resolved_method_target.as_ref() {

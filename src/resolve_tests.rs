@@ -4884,3 +4884,69 @@ fn complete_qualified_path_pack_gathers_owner_members_only() {
     assert!(labels.iter().any(|l| l == "detail_helper"), "missing detail_helper: {labels:?}");
     assert!(!labels.iter().any(|l| l == "format_to"), "parent member leaked: {labels:?}");
 }
+
+/// A cursor position far past EOF (a malformed/stale LSP request — the
+/// client's document went out of sync, or the position was corrupted in
+/// transit) must resolve to "no target," never panic. `symbol_at` /
+/// `ref_at` / `rename_kind_at` are all span-containment checks so this
+/// already held structurally; this locks it in as an explicit contract for
+/// `resolve_symbol`'s attacker-influenced `point` argument.
+#[test]
+fn resolve_symbol_out_of_bounds_point_returns_none() {
+    let fa = parse("package Foo;\nsub bar { 1 }\n1;\n");
+    let resolved = resolve_symbol(
+        &fa,
+        tree_sitter::Point { row: 9_999, column: 9_999 },
+        None,
+    );
+    assert!(resolved.is_none(), "expected no resolution past EOF, got {resolved:?}");
+}
+
+/// `TargetRef::from_rename_kind` is a total function over `RenameKind`: the
+/// `Variable`/`HashKey` arms return `None` rather than a target. This is
+/// the same "no target for this kind" contract `resolve_symbol_scoped`'s
+/// `kind => { let Some(t) = ... else { return None }; }` catch-all relies
+/// on instead of `.expect`-ing a target always exists.
+#[test]
+fn from_rename_kind_returns_none_for_kinds_with_no_target() {
+    use crate::file_analysis::RenameKind;
+    let fa = parse("package Foo;\nsub bar { 1 }\n1;\n");
+    assert!(TargetRef::from_rename_kind(RenameKind::Variable, &fa, None, OverrideScope::default())
+        .is_none());
+    assert!(TargetRef::from_rename_kind(
+        RenameKind::HashKey("k".to_string()),
+        &fa,
+        None,
+        OverrideScope::default()
+    )
+    .is_none());
+}
+
+/// Regression for the `collect_from_analysis` scope-derivation refactor
+/// (`callable_scope_for_refs.as_ref().unwrap()` → graceful skip): a plain
+/// package-scoped sub rename/reference walk must still find both the decl
+/// and the call site exactly as before the hardening.
+#[test]
+fn collect_from_analysis_still_finds_sub_refs_after_scope_hardening() {
+    let fa = parse("package Foo;\nsub greet { 1 }\ngreet();\n1;\n");
+    let target = TargetRef {
+        name: "greet".to_string(),
+        kind: TargetKind::Sub { package: Some("Foo".to_string()) },
+        method_classes: Vec::new(),
+        scope: OverrideScope::Dispatch,
+        def_paths: Vec::new(),
+        bare_constant: false,
+    };
+    let store = FileStore::new();
+    let path = PathBuf::from("/tmp/resolve_test_scope_hardening.pm");
+    store.insert_workspace(path.clone(), fa);
+    let results = refs_to(&store, None, &target, RoleMask::EDITABLE);
+    assert!(
+        results.iter().any(|r| r.access == AccessKind::Declaration),
+        "expected declaration, got {results:?}"
+    );
+    assert!(
+        results.iter().any(|r| r.access == AccessKind::Read),
+        "expected call-site read, got {results:?}"
+    );
+}
