@@ -19,6 +19,7 @@ mod plugin;
 mod plugin_cli;
 mod pod;
 mod query_cache;
+mod surface;
 // Kept-as-spike PoC modules: measured by their own tests, deliberately not
 // wired into the build pipeline (the go-live map's "ADDITIVE DEPTH" tier —
 // overload/dispatch/templates/superposition — plus the Perl seams they

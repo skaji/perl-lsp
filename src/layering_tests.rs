@@ -27,6 +27,7 @@ fn layer_map() -> HashMap<&'static str, Layer> {
     HashMap::from([
         ("file_analysis", Model),
         ("witnesses", Model),
+        ("surface", Model),
         ("conventions", Model),
         ("graph", Model),
         ("cst", Cst),
