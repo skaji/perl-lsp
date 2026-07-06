@@ -407,15 +407,25 @@ fn macro_body_name_refs_mints_known_macro_uses() {
     let known: std::collections::HashSet<String> =
         ["FLAGS", "IS_OK", "STR", "CAT", "x"].iter().map(|s| s.to_string()).collect();
     let refs = crate::cpp_reparse::macro_body_name_refs(&mut p, src, &known);
+    let name_refs = &refs.name_refs;
     // FLAGS used inside IS_OK's body (line index 1) is the one real ref.
-    let flags: Vec<_> = refs.iter().filter(|(n, _)| n == "FLAGS").collect();
-    assert_eq!(flags.len(), 1, "one FLAGS body use, got {refs:?}");
+    let flags: Vec<_> = name_refs.iter().filter(|(n, _)| n == "FLAGS").collect();
+    assert_eq!(flags.len(), 1, "one FLAGS body use, got {name_refs:?}");
     let (_, span) = flags[0];
     assert_eq!(span.start.row, 1, "FLAGS use is on the IS_OK line");
     // `x` is a param everywhere it appears in a body — never minted, even
     // though it's in `known`. `#x` (stringify) and `a`/`b` (paste operands)
     // are not references either.
-    assert!(refs.iter().all(|(n, _)| n != "x"), "params excluded: {refs:?}");
+    assert!(name_refs.iter().all(|(n, _)| n != "x"), "params excluded: {name_refs:?}");
+    // `(x)->f` inside FLAGS's body: `f` is a member-access token, recovered
+    // into the member lane (never the name lane), untyped for the assembly
+    // pass to resolve to its declaring struct.
+    assert!(
+        refs.member_refs.iter().any(|(n, s)| n == "f" && s.start.row == 0),
+        "->f member use recovered: {:?}",
+        refs.member_refs
+    );
+    assert!(name_refs.iter().all(|(n, _)| n != "f"), "member token not in name lane");
 }
 
 /// End-to-end reachability over the captured variants: WIN32 absent → its

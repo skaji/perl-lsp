@@ -1580,40 +1580,13 @@ impl<'a> CandidateSet<'a> {
             }
         }
 
-        // Forward domain bridge: goto-def on a domain-typed field slot offers
-        // the DOMAIN enum's def IN ADDITION to the field decl (`op_type` →
-        // both its `PERL_BITFIELD16 op_type` decl AND `enum opcode`). The
-        // field decl stays FIRST (the primary); the enum is an extra offer.
-        // Runs before the local / member resolution below so it augments a
-        // same-file field too. When the field decl does NOT resolve here, the
-        // enum must not mask the shared member/cross-file paths below (that
-        // made goto-def site-dependent) — it becomes the LAST-resort fallback
-        // instead, returned only when every decl-resolving path has passed.
-        let mut domain_enum_fallback: Option<RefLocation> = None;
-        if let Some(idx) = self.idx() {
-            if let Some(r) = analysis.ref_at(point) {
-                if matches!(r.kind, RefKind::MethodCall { .. }) {
-                    if let Some(cn) = analysis.method_call_invocant_class(r, Some(idx)) {
-                        let field = r.unqualified_target_name();
-                        if let Some(dom) = analysis.field_domain(&cn, field, Some(idx)) {
-                            let el = self.type_def_location(&dom.domain, idx);
-                            if let Some(fl) = self.member_field_def_location(&cn, field, idx) {
-                                let mut locs: Vec<RefLocation> = vec![fl];
-                                if let Some(el) = el {
-                                    if !locs.iter().any(|l| {
-                                        file_key_eq(&l.key, &el.key) && l.span == el.span
-                                    }) {
-                                        locs.push(el);
-                                    }
-                                }
-                                return locs;
-                            }
-                            domain_enum_fallback = el;
-                        }
-                    }
-                }
-            }
-        }
+        // Plain goto-def on a field returns the field DECLARATION only — its
+        // inferred domain type (`op_type` → `enum opcode`) is a TYPE, not a
+        // declaration, so it does not fold into goto-def. The domain bridge
+        // (`field_domain`) still powers hover and a future goto-type-definition
+        // (both read it directly); a domain-typed field resolves through the
+        // same general member/cross-file paths below as any other field.
+        // (hitlist-6 Family B, user decision.)
 
         // Template-family ranked member goto-def: a member use on a template
         // INSTANCE resolves down the specificity ladder (exact spec >
@@ -2009,12 +1982,6 @@ impl<'a> CandidateSet<'a> {
             }
         }
 
-        // The domain bridge's enum offer, only when no path resolved the
-        // decl — better than nothing at a site whose member resolution is
-        // broken, and never masking a resolvable decl.
-        if let Some(el) = domain_enum_fallback {
-            return vec![el];
-        }
         // Last resort (pack): a token no query captures — a namespace middle
         // segment (`StatusCode` in `absl::StatusCode::kNotFound` is a
         // namespace_identifier, ref-less) — resolves by word to a named
@@ -2031,45 +1998,9 @@ impl<'a> CandidateSet<'a> {
         Vec::new()
     }
 
-    /// The def location of a data field `field` on `class` (or an ancestor) —
-    /// local Symbol or a cross-file member — the SAME resolution the member
-    /// goto-def branch produces. Shared with the domain bridge so the field's
-    /// own decl stays the primary target while the enum is offered alongside.
-    fn member_field_def_location(
-        &self,
-        class: &str,
-        field: &str,
-        idx: &dyn CrossFileLookup,
-    ) -> Option<RefLocation> {
-        use crate::file_analysis::MethodResolution;
-        match self.origin.resolve_method_in_ancestors(class, field, Some(idx))? {
-            MethodResolution::Local { sym_id, .. } => {
-                Some(self.origin_decl(self.origin.symbol(sym_id).selection_span))
-            }
-            MethodResolution::CrossFile { class, def_module } => {
-                let module = def_module.as_deref().unwrap_or(&class);
-                let cached = idx.get_cached(module)?;
-                let sym = cached.analysis.symbols.iter().find(|s| {
-                    matches!(s.kind, SymKind::Variable | SymKind::Field)
-                        && s.name == field
-                        && s.package.as_deref() == Some(class.as_str())
-                })?;
-                Some(RefLocation {
-                    key: FileKey::Path(cached.path.clone()),
-                    span: sym.selection_span,
-                    access: AccessKind::Declaration,
-                    rewritable: true,
-                    label: None
-                })
-            }
-        }
-    }
-
     /// The def location of a named type (a Class symbol — enum/struct/
     /// typedef — or a namespace/module), local first, then cross-file by
-    /// name. Used by the domain bridge to offer the enum def alongside a
-    /// domain-typed field, the spec-ladder type gd, and the bare-word
-    /// fallback.
+    /// name. Used by the spec-ladder type gd and the bare-word fallback.
     fn type_def_location(&self, type_name: &str, idx: &dyn CrossFileLookup) -> Option<RefLocation> {
         let wanted =
             |k: &SymKind| matches!(k, SymKind::Class | SymKind::Package | SymKind::Module);

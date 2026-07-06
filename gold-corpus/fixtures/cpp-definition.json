@@ -174,20 +174,22 @@
       "status": "gold"
     },
     {
-      "id": "cpp-definition-domain-typing-op-type-offers-enum",
+      "id": "cpp-definition-domain-typing-op-type-field-decl-only",
       "difficulty": "hard",
       "semantic_area": "cpp-multilang-domain",
       "lang": "cpp",
+      "comment": "hitlist-6 Family B (user decision): plain goto-def on a field returns the field DECLARATION only. `op_type`'s inferred domain type (`enum opcode`) is a TYPE, reachable via hover / goto-type-definition (both read `field_domain` directly), NOT folded into goto-def. Was the two-target `op-type-offers-enum` row; the enum target (4:6) is now explicitly excluded.",
       "root": "gold-corpus/cpp-fixture",
       "file": "domain_enum.c",
       "line": 6,
       "col": 14,
       "expect": {
         "all": [
-          "domain_enum.c:5:29",
-          "domain_enum.c:4:6"
+          "domain_enum.c:5:29"
         ],
-        "none": []
+        "none": [
+          "domain_enum.c:4:6"
+        ]
       },
       "status": "gold"
     },
@@ -215,16 +217,17 @@
       "difficulty": "hard",
       "semantic_area": "cpp-multilang-domain",
       "lang": "cpp",
+      "comment": "hitlist-6 Family B: gd on the domain-typed `b->kind` (basket) returns only the field decl (2:21); the inferred `enum fruit` (1:6) is no longer folded in. Still must NOT reach the crate `kind` decl (3:20) — the owner-separation invariant is intact.",
       "root": "gold-corpus/cpp-fixture",
       "file": "domain_owner.c",
       "line": 3,
       "col": 38,
       "expect": {
         "all": [
-          "domain_owner.c:2:21",
-          "domain_owner.c:1:6"
+          "domain_owner.c:2:21"
         ],
         "none": [
+          "domain_owner.c:1:6",
           "domain_owner.c:3:20"
         ]
       },
@@ -247,6 +250,44 @@
           "domain_owner.c:1:6",
           "domain_owner.c:2:21"
         ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-op-next-field-single-target-no-enum",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-domain",
+      "lang": "cpp",
+      "comment": "hitlist-6 Family B contrast: `op_next` has no domain (enum) inference, so gd returns exactly ONE target — the field decl in the BASEOP macro body (7:20). The Family B change (drop the enum fold) must not regress the already-single-target field.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "baseop_ptr.c",
+      "line": 9,
+      "col": 7,
+      "expect": {
+        "all": [
+          "baseop_ptr.c:7:20"
+        ],
+        "none": [
+          "baseop_ptr.c:6:"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-definition-field-use-in-macro-body-to-decl",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "comment": "hitlist-6 Family D reverse nav: goto-def FROM the recovered field use inside a `#define` body (`(x)->f`, line 6) lands on the field declaration (line 9). The macro-body member ref carries a Local dispatch edge to the field's SymbolId, so navigation works without typing the (macro-parameter) receiver.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macro_nested_ref.c",
+      "line": 5,
+      "col": 23,
+      "expect": {
+        "all": [
+          "macro_nested_ref.c:9:16"
+        ],
+        "none": []
       },
       "status": "gold"
     },

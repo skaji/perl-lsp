@@ -2,6 +2,44 @@
   "capability": "references",
   "rows": [
     {
+      "id": "cpp-references-field-use-in-macro-body",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "comment": "hitlist-6 Family D: references on a struct FIELD include member-access uses (`(x)->f`) buried in a `#define` body. The body is one opaque preproc_arg, so the field drill has no query capture — the macro-body MEMBER lane recovers it, resolves `f` to its declaring class from the file's own field symbols, and mints a class-frozen MethodCall ref. Query is from the `f` field decl; the in-body use is line 6, the decl line 9.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macro_nested_ref.c",
+      "line": 8,
+      "col": 15,
+      "expect": {
+        "all": [
+          "\"col\":\"24\",\"file\":\"macro_nested_ref.c\",\"line\":\"6\"",
+          "\"col\":\"16\",\"file\":\"macro_nested_ref.c\",\"line\":\"9\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-references-family-field-use-in-macro-body",
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-macros",
+      "lang": "cpp",
+      "comment": "hitlist-6 Family D, the perl5 `op_next` shape: a member-block macro (BASEOP) replicates `op_next` across a struct family, and a `LINKLIST(o) ((o)->op_next ? (o)->op_next : 0)` macro drills it twice inside its body. references on `op_next` (from the real use line 11) includes BOTH in-body uses (line 9). The receiver is an untypeable macro parameter, so the use is attributed to the field's declaring class from the decl — not from invocant typing.",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "macro_field_ref.c",
+      "line": 10,
+      "col": 7,
+      "expect": {
+        "all": [
+          "\"col\":\"28\",\"file\":\"macro_field_ref.c\",\"line\":\"9\"",
+          "\"col\":\"43\",\"file\":\"macro_field_ref.c\",\"line\":\"9\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
       "id": "cpp-macro-nested-ref-in-macro-body",
       "difficulty": "hard",
       "semantic_area": "cpp-multilang-macros",

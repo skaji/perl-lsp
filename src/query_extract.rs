@@ -137,6 +137,15 @@ pub struct SkeletonAnalysis {
     /// scope-chain walk WITHOUT the declared-before constraint (a forward
     /// goto is valid C).
     pub label_refs: Vec<(String, crate::file_analysis::ScopeId, crate::file_analysis::Span)>,
+    /// Member-access field uses recovered from inside `#define` macro bodies:
+    /// `(field name, span)`. A macro body is one opaque `preproc_arg` token, so
+    /// a `->op_next` buried in a def has no query capture. `into_file_analysis`
+    /// resolves each against THIS file's field symbols and — when the name maps
+    /// to a UNIQUE declaring class — mints a class-frozen `MethodCall` ref, so
+    /// references on the field include the in-body use (rule #7). The receiver
+    /// is a macro parameter with no type, hence the class is frozen from the
+    /// field decl rather than inferred from the (untypeable) invocant.
+    pub macro_body_member_reads: Vec<(String, crate::file_analysis::Span)>,
     /// The pack's receiver param names (Python `self`/`cls`). A Variable so
     /// named is the method receiver, not a class member — its (wrongly
     /// sticky-tagged) class package is cleared in `into_file_analysis`.
@@ -1038,6 +1047,75 @@ impl SkeletonAnalysis {
             });
         }
         refs.extend(local_refs);
+        // Field/member uses recovered from `#define` bodies (`->op_next`): the
+        // receiver is a macro parameter with no type, so resolve the field to
+        // its declaring class from THIS file's own field symbols and freeze the
+        // class on the ref. Only a name that maps to ONE declaring class is
+        // minted — an ambiguous field (same name on two structs) or a
+        // cross-file-only field stays silent (documented residual), keeping the
+        // over-approximation honest. The frozen `MethodTarget` is exactly what
+        // `refs_to`'s `(Method, MethodCall)` arm reads, so references on the
+        // field include the in-body use without needing the invocant to type.
+        if !self.macro_body_member_reads.is_empty() {
+            // field name → every (declaring class, decl SymbolId). The receiver
+            // in a macro body is an untypeable macro parameter, so the class is
+            // taken from the field DECL. A name shared by several structs —
+            // overwhelmingly a member-block-replicated field (perl5 `op_next` is
+            // spliced into every OP struct via `BASEOP`) — is genuinely one
+            // logical field; attribute the use to EACH declaring class so a
+            // references query on any of them counts it. Per query that is +1
+            // (the class-frozen ref matches only that class's target); the
+            // over-approximation is only across unrelated same-named fields (a
+            // documented, references-tolerant honest over-count, not a wrong
+            // "is this a field" — the token IS a field member access).
+            let mut field_owners: std::collections::HashMap<
+                &str,
+                Vec<(&str, crate::file_analysis::SymbolId)>,
+            > = std::collections::HashMap::new();
+            for s in &symbols {
+                if s.kind == SymKind::Field {
+                    if let Some(pkg) = s.package.as_deref() {
+                        let v = field_owners.entry(s.name.as_str()).or_default();
+                        if !v.iter().any(|(p, _)| *p == pkg) {
+                            v.push((pkg, s.id));
+                        }
+                    }
+                }
+            }
+            let claimed: std::collections::HashSet<(usize, usize)> =
+                refs.iter().map(|r| (r.span.start.row, r.span.start.column)).collect();
+            for (field, span) in &self.macro_body_member_reads {
+                if claimed.contains(&(span.start.row, span.start.column)) {
+                    continue;
+                }
+                let Some(owners) = field_owners.get(field.as_str()) else { continue };
+                for (class, sym_id) in owners {
+                    refs.push(crate::file_analysis::Ref {
+                        kind: crate::file_analysis::RefKind::MethodCall {
+                            invocant: crate::conventions::Invocant::assume_canonical(String::new()),
+                            invocant_span: None,
+                            method_name_span: *span,
+                            member_op: None,
+                        },
+                        span: *span,
+                        scope: crate::file_analysis::ScopeId(0),
+                        target_name: field.clone(),
+                        access: crate::file_analysis::AccessKind::Read,
+                        resolves_to: None,
+                        // Local edge (the field decl IS in this file): references
+                        // matches on `invocant_class`, and goto-def from the
+                        // in-body use lands on `sym_id` — no query-time invocant
+                        // typing (the receiver is an untypeable macro parameter).
+                        resolved_method_target: Some(crate::file_analysis::MethodTarget::Local {
+                            sym_id: *sym_id,
+                            invocant_class: class.to_string(),
+                        }),
+                        folded_from: None,
+                        arg_count: None,
+                    });
+                }
+            }
+        }
         let mut package_parents: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for (child, parent) in &self.parents {
