@@ -51,23 +51,33 @@ pub fn cache_dir_for_workspace(workspace_root: Option<&str>) -> Option<PathBuf> 
     }
 }
 
+/// Per-language DB filename — Perl keeps `modules.db` (back-compat), every
+/// pack language gets its own `modules-{lang}.db` so names never comingle on
+/// disk (a Perl `Box` and a C++ class `Box` live in different files). The
+/// ONE spelling both openers share.
+fn db_path_for(dir: &std::path::Path, lang: &str) -> PathBuf {
+    if lang == "perl" {
+        dir.join("modules.db")
+    } else {
+        dir.join(format!("modules-{lang}.db"))
+    }
+}
+
 #[cfg(not(test))]
 pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
     let dir = cache_dir_for_workspace(workspace_root)?;
     std::fs::create_dir_all(&dir).ok()?;
-    // Per-language DB — Perl keeps `modules.db` (back-compat), every pack
-    // language gets its own `modules-{lang}.db` so names never comingle on
-    // disk (a Perl `Box` and a C++ class `Box` live in different files).
-    let db_path = if lang == "perl" {
-        dir.join("modules.db")
-    } else {
-        dir.join(format!("modules-{lang}.db"))
-    };
+    let db_path = db_path_for(&dir, lang);
     log::info!("Module cache: {:?}", db_path);
 
     match Connection::open(&db_path) {
         Ok(conn) => {
             let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+            // Two writers share the Perl DB (resolver thread + workspace
+            // indexer); a busy writer must wait, not fail its txn — a failed
+            // commit after resident copies were stripped is unrecoverable
+            // for the session.
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
             match init_schema(&conn) {
                 Ok(()) => Some(conn),
                 Err(e) => {
@@ -76,6 +86,7 @@ pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connect
                     let _ = std::fs::remove_file(&db_path);
                     let conn = Connection::open(&db_path).ok()?;
                     let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
                     init_schema(&conn).ok()?;
                     Some(conn)
                 }
@@ -100,16 +111,13 @@ pub fn open_cache_db(_workspace_root: Option<&str>, _lang: &str) -> Option<Conne
 #[cfg(not(test))]
 pub fn open_cache_db_readonly(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
     let dir = cache_dir_for_workspace(workspace_root)?;
-    let db_path = if lang == "perl" {
-        dir.join("modules.db")
-    } else {
-        dir.join(format!("modules-{lang}.db"))
-    };
-    Connection::open_with_flags(
-        &db_path,
+    let conn = Connection::open_with_flags(
+        db_path_for(&dir, lang),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .ok()
+    .ok()?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+    Some(conn)
 }
 
 #[cfg(test)]
@@ -121,7 +129,7 @@ pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Opt
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
 /// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the
 /// next warm re-shreds rows from the already-decoded analyses for free.
-const REF_ROWS_VERSION: &str = "1";
+const REF_ROWS_VERSION: &str = "2";
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -145,7 +153,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE TABLE IF NOT EXISTS files (
             file_id INTEGER PRIMARY KEY,
-            path    TEXT NOT NULL UNIQUE
+            path    TEXT NOT NULL UNIQUE,
+            source  TEXT NOT NULL DEFAULT 'import'
         );
         CREATE TABLE IF NOT EXISTS strings (
             str_id INTEGER PRIMARY KEY,
@@ -269,12 +278,15 @@ pub fn validate_inc_paths(conn: &Connection, inc_paths: &[PathBuf]) -> rusqlite:
         );
         // Import-tier only: workspace blobs bake plugin emissions and their
         // own source, not @INC paths — and the workspace indexer may have
-        // written them BEFORE this validation ran (two writers, one DB).
-        // Derived rows are cleared wholesale (they aren't tier-tagged); the
-        // warm backfill re-shreds row-less blobs from the decode it does
-        // anyway.
+        // written its rows BEFORE this validation runs (two writers, one
+        // DB), so anything broader would delete rows mid-write and leave
+        // already-evicted resident copies with no retrieval source.
         conn.execute("DELETE FROM modules WHERE source = 'import'", [])?;
-        clear_derived_rows(conn)?;
+        conn.execute(
+            "DELETE FROM refs WHERE file_id IN (SELECT file_id FROM files WHERE source = 'import')",
+            [],
+        )?;
+        conn.execute("DELETE FROM files WHERE source = 'import'", [])?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('inc_hash', ?1)",
             params![current_hash],
@@ -352,6 +364,22 @@ pub fn hydrate_builtins(conn: &Connection) -> rusqlite::Result<DashMap<String, S
 /// plugin QA impossible. Mirrors `validate_inc_paths`: same meta-row
 /// pattern, same hard-clear on mismatch.
 pub fn validate_plugin_fingerprint(conn: &Connection, fingerprint: &str) -> rusqlite::Result<()> {
+    // IMMEDIATE: check-and-stamp must be atomic against the other writer
+    // (resolver thread vs workspace indexer) — two validators both reading
+    // a missing stamp would both hard-clear, the second deleting rows the
+    // first writer committed in between.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = validate_plugin_fingerprint_inner(conn, fingerprint);
+    match &result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+    }
+    result
+}
+
+fn validate_plugin_fingerprint_inner(conn: &Connection, fingerprint: &str) -> rusqlite::Result<()> {
     let stored: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'plugin_fingerprint'",
@@ -380,7 +408,7 @@ pub fn validate_plugin_fingerprint(conn: &Connection, fingerprint: &str) -> rusq
 /// Whole seconds miss two same-length writes within one second (generated
 /// files, rapid saves) — the M1 staleness window. The `mtime_secs` column
 /// name is historical; the value is an opaque equality-checked stamp.
-fn file_stamp(path: &std::path::Path) -> Option<(i64, i64)> {
+pub fn file_stamp(path: &std::path::Path) -> Option<(i64, i64)> {
     use std::hash::{Hash, Hasher};
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
@@ -469,7 +497,26 @@ pub fn save_blob_to_db(
     blob: &[u8],
     source: &str,
 ) {
-    let (mtime, size) = file_stamp(path).unwrap_or((0, 0));
+    let stamp = file_stamp(path).unwrap_or((0, 0));
+    save_blob_to_db_stamped(conn, module_name, path, include_closure, blob, source, stamp)
+}
+
+/// `save_blob_to_db` with a caller-captured `file_stamp` — the bulk drains
+/// persist analyses parsed earlier, and stamping at WRITE time would blesses
+/// a stale parse with a fresh stamp when the file changed in between (the
+/// next warm would then serve the pre-edit analysis as valid). Capture the
+/// stamp at parse time; a mid-index edit makes the row invalid by
+/// construction.
+pub fn save_blob_to_db_stamped(
+    conn: &Connection,
+    module_name: &str,
+    path: &std::path::Path,
+    include_closure: &[std::sync::Arc<str>],
+    blob: &[u8],
+    source: &str,
+    stamp: (i64, i64),
+) {
+    let (mtime, size) = stamp;
     let deps = closure_stamp(include_closure, &mut std::collections::HashMap::new());
     let r = conn.execute(
         "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, extract_version, deps_stamp)
@@ -499,9 +546,14 @@ pub fn save_blob_to_db(
 pub fn shred_ref_rows(
     conn: &Connection,
     path: &str,
+    source: &str,
     seeds: &[crate::file_analysis::RefRowSeed],
 ) -> rusqlite::Result<()> {
-    conn.execute("INSERT OR IGNORE INTO files (path) VALUES (?1)", params![path])?;
+    conn.execute(
+        "INSERT INTO files (path, source) VALUES (?1, ?2)
+         ON CONFLICT(path) DO UPDATE SET source = excluded.source",
+        params![path, source],
+    )?;
     let file_id: i64 = conn.query_row(
         "SELECT file_id FROM files WHERE path = ?1",
         params![path],
@@ -550,6 +602,15 @@ pub fn shred_ref_rows(
         ])?;
     }
     Ok(())
+}
+
+/// Drop one file's whole persisted generation — blob row AND derived ref
+/// rows, together (the eraser twin of the write invariant "blob + rows
+/// describe one generation"). Every invalidation seam calls this; nobody
+/// else spells modules-table SQL.
+pub fn invalidate_generation(conn: &Connection, path: &str) {
+    let _ = conn.execute("DELETE FROM modules WHERE path = ?1", params![path]);
+    delete_ref_rows(conn, path);
 }
 
 /// Remove a deleted file's rows (the removal half of `shred_ref_rows`).
@@ -819,6 +880,19 @@ pub fn save_to_db(
 /// `validate_inc_paths`: a generation built under degraded/different inputs
 /// must not be served under the current ones (H8).
 pub fn validate_input_fingerprint(conn: &Connection, fingerprint: u64) -> rusqlite::Result<()> {
+    // Same atomic check-and-stamp rationale as `validate_plugin_fingerprint`.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = validate_input_fingerprint_inner(conn, fingerprint);
+    match &result {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+    }
+    result
+}
+
+fn validate_input_fingerprint_inner(conn: &Connection, fingerprint: u64) -> rusqlite::Result<()> {
     let fingerprint = format!("{:016x}", fingerprint);
     let stored: Option<String> = conn
         .query_row(

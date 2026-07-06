@@ -312,6 +312,12 @@ pub struct ModuleIndex {
     /// dir) contributes no candidates and the resident sweep still covers.
     ref_rows_opener:
         std::sync::OnceLock<Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>>,
+    /// The retained read connection the opener fills lazily — one per index,
+    /// so the statement cache amortizes across queries (a heatmap projects
+    /// references once per symbol; per-call opens would re-prepare every
+    /// statement). WAL readers see each write txn that committed before
+    /// their own read txn begins, so retaining it never serves stale rows.
+    ref_rows_conn: std::sync::Mutex<Option<rusqlite::Connection>>,
 }
 
 impl ModuleIndex {
@@ -360,6 +366,7 @@ impl ModuleIndex {
             all_files: Arc::new(DashMap::new()),
             bag_cache: std::sync::OnceLock::new(),
             ref_rows_opener: std::sync::OnceLock::new(),
+            ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -616,10 +623,14 @@ impl ModuleIndex {
     /// Look up the return type of an imported function. Zero I/O.
     #[cfg(test)]
     pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
+        use crate::file_analysis::CrossFileLookup;
         let modules = self.edges.names.get(func_name)?;
         for module_name in modules.value() {
             if let Some(cached) = self.get_cached(module_name) {
-                if let Some(ty) = cached.analysis.sub_return_type_local(func_name) {
+                // Return types resolve through the bag; the resident copy
+                // may be bag-evicted (any persisted tier).
+                let whole = self.bag_present(&cached);
+                if let Some(ty) = whole.sub_return_type_local(func_name) {
                     return Some(ty.clone());
                 }
             }
@@ -730,6 +741,7 @@ impl ModuleIndex {
             all_files: Arc::new(DashMap::new()),
             bag_cache: std::sync::OnceLock::new(),
             ref_rows_opener: std::sync::OnceLock::new(),
+            ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -784,6 +796,7 @@ impl ModuleIndex {
             all_files: Arc::new(DashMap::new()),
             bag_cache: std::sync::OnceLock::new(),
             ref_rows_opener: std::sync::OnceLock::new(),
+            ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -841,19 +854,13 @@ impl ModuleIndex {
         }
     }
 
-    /// Register a workspace-indexed file under its primary package name
-    /// so cross-file resolution (method lookup, Handler walks) can find
-    /// it without first requiring an `@INC` resolve. Workspace files
-    /// otherwise live only in `FileStore` — this bridges them into the
-    /// ModuleIndex so queries that key on package name work uniformly
-    /// whether the target came from `use` or from the project tree.
-    ///
-    /// No-op for files without a `package` declaration (top-level scripts).
-    /// The registration reads that need the FULL analysis (loader-config
-    /// shapes read the witness bag via `expr_type_at_span`). The workspace
-    /// indexer calls this on the whole analysis BEFORE stripping the
-    /// resident copy; `register_workspace_module` runs it for callers that
-    /// register full copies (the watcher path).
+    /// The workspace-registration reads that need the FULL analysis:
+    /// loaded-module tracking (imports + method-form plugin loads — fed
+    /// even for PACKAGELESS entrypoint scripts, which is where `plugin
+    /// 'X'` loads live) and loader-config shapes, which read the witness
+    /// bag via `expr_type_at_span`. Callers stripping a resident copy run
+    /// this on the whole analysis FIRST; `register_workspace_module`
+    /// bundles it for full-copy callers.
     pub fn record_workspace_projections(&self, path: &std::path::Path, analysis: &FileAnalysis) {
         for imp in &analysis.imports {
             self.loaded_modules.insert(imp.module_name.clone(), ());
@@ -864,17 +871,41 @@ impl ModuleIndex {
         self.record_loader_shapes(&path.display().to_string(), analysis);
     }
 
-    /// The residency half of workspace registration: name/edge feeds + the
-    /// cache insert. Reads only pinned fields, so a refs/bag-stripped copy
-    /// registers identically to a full one.
+    /// The residency half of workspace registration: the path-keyed
+    /// registry, name/edge feeds, and the cache insert. Reads only pinned
+    /// fields, so a refs/bag-stripped copy registers identically to a full
+    /// one. Files without a `package` declaration get only the path entry.
     pub fn register_workspace_resident(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
-        let Some(module_name) = first_package_name(&analysis) else { return };
-        self.workspace_modules.insert(module_name.clone(), ());
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        // Path-keyed registry first: the relational retrieval resolves
+        // candidate paths through `cached_by_path`, and packageless files
+        // (Mojolicious::Lite entrypoints) exist ONLY here.
+        self.all_files.insert(cached.path.clone(), cached.clone());
+        let Some(module_name) = first_package_name(&analysis) else { return };
+        self.workspace_modules.insert(module_name.clone(), ());
         self.edges.purge_module(&module_name);
         self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Remove a deleted workspace file's registrations — the path-keyed
+    /// entry plus its name-keyed cache row and edges (a dead file must not
+    /// stay a retrieval candidate or a phantom module).
+    pub fn unregister_workspace_path(&self, path: &std::path::Path) {
+        self.all_files.remove(path);
+        let name = self.cache.iter().find_map(|entry| {
+            entry
+                .value()
+                .as_ref()
+                .filter(|cm| cm.path == path)
+                .map(|_| entry.key().clone())
+        });
+        if let Some(name) = name {
+            self.edges.purge_module(&name);
+            self.cache.remove(&name);
+            self.workspace_modules.remove(&name);
+        }
     }
 
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
@@ -927,12 +958,33 @@ impl ModuleIndex {
         let _ = self.ref_rows_opener.set(opener);
     }
 
-    /// Drop `path`'s rehydrated bag from this pack index's LRU (a changed/saved
-    /// file's bag is stale). No-op on the Perl hub (no bag cache).
+    /// Drop `path`'s rehydrated analysis from this index's LRU (a
+    /// changed/saved file's copy is stale). Pack sub-indexes AND the Perl
+    /// hub each carry one — the watcher and the bulk-index writers rely on
+    /// this taking effect on both.
     pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
         if let Some(bc) = self.bag_cache.get() {
             bc.invalidate(path);
         }
+    }
+
+    /// Rehydrate `cached`'s whole persisted analysis through this index's
+    /// LRU, degrading to the (evicted) resident copy on a miss rather than
+    /// fabricating — the caller's query then answers as it would for a
+    /// genuinely fact-less file. One body serves `bag_present` and
+    /// `refs_present`: the miss policy and LRU selection must never diverge
+    /// between the type path and the reference path.
+    fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if let Some(bc) = self.bag_cache.get() {
+            if let Some(full) = bc.bag_for(&cached.path) {
+                return full;
+            }
+        }
+        log::debug!(
+            "rehydration miss for evicted copy {:?} — serving stripped resident",
+            cached.path
+        );
+        cached.analysis.clone()
     }
 
     /// The sub-index for `lang`, if this distribution indexes it.
@@ -1337,22 +1389,22 @@ impl CrossFileLookup for ModuleIndex {
         if !cached.analysis.refs_are_evicted() {
             return cached.analysis.clone();
         }
-        // Same LRU as bag rehydration — the persisted blob is one whole
-        // analysis, so either consumer's miss loads it for both.
-        if let Some(bc) = self.bag_cache.get() {
-            if let Some(full) = bc.bag_for(&cached.path) {
-                return full;
-            }
-        }
-        cached.analysis.clone()
+        self.rehydrate_or_resident(cached)
     }
 
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         let Some(opener) = self.ref_rows_opener.get() else {
             return Vec::new();
         };
-        let Some(conn) = opener() else { return Vec::new() };
-        crate::module_cache::ref_candidate_files(&conn, keys)
+        let mut guard = match self.ref_rows_conn.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        if guard.is_none() {
+            *guard = opener();
+        }
+        let Some(conn) = guard.as_ref() else { return Vec::new() };
+        crate::module_cache::ref_candidate_files(conn, keys)
             .into_iter()
             .map(std::path::PathBuf::from)
             .collect()
@@ -1375,23 +1427,12 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn bag_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        // Never-evicted copy (open docs, Perl hub, degraded pack files kept
-        // whole): a cheap Arc bump, no I/O.
+        // Never-evicted copy (open docs, degraded files kept whole): a cheap
+        // Arc bump, no I/O.
         if !cached.analysis.bag_is_evicted() {
             return cached.analysis.clone();
         }
-        // A pack cross-file type query threads the PACK sub-index as its
-        // `module_index` (it owns `visibility_scope`), so `self.bag_cache` is
-        // the right one. Rehydrate the exact persisted bag; on a miss (no row /
-        // decode failure) degrade to the bag-less resident copy rather than
-        // fabricate — the type query then returns None, as it would pre-Slice-2
-        // for a genuinely bag-less file.
-        if let Some(bc) = self.bag_cache.get() {
-            if let Some(full) = bc.bag_for(&cached.path) {
-                return full;
-            }
-        }
-        cached.analysis.clone()
+        self.rehydrate_or_resident(cached)
     }
 
     fn parents_cached(&self, module_name: &str) -> Vec<String> {

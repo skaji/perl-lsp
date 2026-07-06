@@ -2510,11 +2510,11 @@ fn cli_refs_parity(root: &str, sample: Option<usize>) {
             } else {
                 cs = cs.with_visibility(resolve::RoleMask::VISIBLE);
             }
-            std::env::set_var("PERL_LSP_REF_ROWS", "0");
+            resolve::set_ref_rows_override(Some(false));
             let resident = normalize(&cs.references());
-            std::env::set_var("PERL_LSP_REF_ROWS", "1");
+            resolve::set_ref_rows_override(Some(true));
             let rows = normalize(&cs.references());
-            std::env::remove_var("PERL_LSP_REF_ROWS");
+            resolve::set_ref_rows_override(None);
             *checked += 1;
             if resident != rows {
                 *mismatched += 1;

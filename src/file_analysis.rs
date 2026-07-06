@@ -271,6 +271,19 @@ pub mod path_intern {
     pub fn intern(s: &str) -> Arc<str> {
         let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
         let mut g = pool.lock().unwrap();
+        intern_locked(&mut g, s)
+    }
+
+    /// Intern a whole closure under ONE lock acquisition — Rayon parse
+    /// workers intern thousands of entries per file; per-element locking
+    /// serializes the pool across every worker.
+    pub fn intern_all<'a>(items: impl Iterator<Item = &'a str>) -> Vec<Arc<str>> {
+        let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut g = pool.lock().unwrap();
+        items.map(|s| intern_locked(&mut g, s)).collect()
+    }
+
+    fn intern_locked(g: &mut HashSet<Arc<str>>, s: &str) -> Arc<str> {
         if let Some(a) = g.get(s) {
             return a.clone();
         }
@@ -297,10 +310,8 @@ pub mod path_intern {
             d: D,
         ) -> Result<Vec<Arc<str>>, D::Error> {
             use serde::Deserialize;
-            Ok(Vec::<String>::deserialize(d)?
-                .iter()
-                .map(|s| intern(s))
-                .collect())
+            let raw = Vec::<String>::deserialize(d)?;
+            Ok(super::intern_all(raw.iter().map(|s| s.as_str())))
         }
     }
 }
@@ -5545,15 +5556,19 @@ impl FileAnalysis {
         if let Some(idx) = module_index {
             for import in &self.imports {
                 let Some(cached) = idx.get_cached(&import.module_name) else { continue };
-                for sym in &cached.analysis.symbols {
+                // Return-shape reads go through the bag — the resident index
+                // copy may be bag-evicted (workspace tier included), so take
+                // the bag-present view for the whole scan.
+                let whole = idx.bag_present(&cached);
+                for sym in &whole.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                         continue;
                     }
-                    if !cached.analysis.exports_name(&sym.name) {
+                    if !whole.exports_name(&sym.name) {
                         continue;
                     }
                     if matches!(sym.detail, SymbolDetail::Sub { .. }) {
-                        if let Some(ty) = cached.analysis.symbol_return_type_via_bag(sym.id, None) {
+                        if let Some(ty) = whole.symbol_return_type_via_bag(sym.id, None) {
                             imported_returns.insert(sym.name.clone(), ty);
                         }
                     }

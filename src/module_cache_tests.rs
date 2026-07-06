@@ -461,7 +461,7 @@ fn shred_ref_rows_roundtrip() {
     assert!(!has_ref_rows(&conn, &path_str));
     let seeds: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
     assert!(!seeds.is_empty(), "call sites must produce row seeds");
-    shred_ref_rows(&conn, &path_str, &seeds).unwrap();
+    shred_ref_rows(&conn, &path_str, "workspace", &seeds).unwrap();
     assert!(has_ref_rows(&conn, &path_str));
 
     // Retrieval by the match key finds the file; an unknown key finds nothing.
@@ -472,12 +472,12 @@ fn shred_ref_rows_roundtrip() {
     assert!(n >= 2, "two call sites expected, got {n}");
 
     // Re-shred replaces: same seeds again must not double the rows.
-    shred_ref_rows(&conn, &path_str, &seeds).unwrap();
+    shred_ref_rows(&conn, &path_str, "workspace", &seeds).unwrap();
     assert_eq!(ref_count_named(&conn, "helper"), n);
 
     // A zero-ref shred still marks the file as shredded (the backfill marker).
     let other = dir.join("TestModule_shred_empty.pm");
-    shred_ref_rows(&conn, &other.to_string_lossy(), &[]).unwrap();
+    shred_ref_rows(&conn, &other.to_string_lossy(), "workspace", &[]).unwrap();
     assert!(has_ref_rows(&conn, &other.to_string_lossy()));
 
     delete_ref_rows(&conn, &path_str);
@@ -530,7 +530,7 @@ fn hard_clear_wipes_derived_rows() {
         qual: None,
         arg_count: None,
     }];
-    shred_ref_rows(&conn, "/some/file.pm", &seeds).unwrap();
+    shred_ref_rows(&conn, "/some/file.pm", "workspace", &seeds).unwrap();
     assert!(has_ref_rows(&conn, "/some/file.pm"));
     validate_plugin_fingerprint(&conn, "fingerprint-a").unwrap();
     validate_plugin_fingerprint(&conn, "fingerprint-b").unwrap();

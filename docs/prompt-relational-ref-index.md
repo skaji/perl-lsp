@@ -215,3 +215,27 @@ exists, CI otherwise.
   + refs rehydration changes that cache's traffic pattern; the byte cap is
   shared. If refs-fallback traffic evicts hot bags in practice, split caps —
   but measure first.
+
+## Post-landing hardening (review round, all applied)
+
+The adversarial review over the landed phases surfaced and fixed: the
+inc-hash hard-clear wiping just-written workspace rows (derived rows are now
+tier-tagged; `@INC` changes clear the import tier only), persistence gated
+on the eviction switch (now independent — `PERL_LSP_NO_EVICT` keeps copies
+whole but still writes blobs+rows, so a cold parity run genuinely exercises
+retrieval), silent chunk-rollback under SQLITE_BUSY (busy_timeout on every
+open + commit results checked and logged loudly), the whole-tree staging
+transient (fresh entries now stream to a writer thread that persists while
+workers parse — this also shrinks the mid-index no-rows window to one chunk
+and invalidates the rehydration LRU per chunk), warm resurrection of files
+the walk no longer includes (walk-set intersection + dead-row GC),
+parse-time stamps (a mid-index edit invalidates its row by construction),
+the watcher's deleted-path canonicalization + missing hub re-registration,
+atomic fingerprint check-and-stamp (BEGIN IMMEDIATE), and refs eviction now
+conditional on rows actually existing.
+
+Known deferrals, deliberate: `warm_cache` and `warm_cache_streaming` share
+validation by convention not construction (merge candidate); heatmap /
+parity / diagnostics each spell their own refs-present entry collection
+(one helper wanted); hot-name capping policy (`ref_count_named`) is an API
+without a consumer until a client-facing truncation story exists.

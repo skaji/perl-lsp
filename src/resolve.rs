@@ -2964,17 +2964,35 @@ pub fn group_rename_edits(
     out
 }
 
+/// Per-process override for the relational retrieval switch — the parity
+/// harness toggles this between two projections of one set (an env write
+/// there would race other threads reading the env). 0 = defer to the env.
+static REF_ROWS_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_ref_rows_override(on: Option<bool>) {
+    REF_ROWS_OVERRIDE.store(
+        match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// The relational retrieval switch (`docs/adr/relational-ref-index.md`).
-/// Default OFF until the eviction slice flips it; `PERL_LSP_REF_ROWS=1`
-/// enables the SQL candidate pass (the A/B lever the parity harness runs
-/// both sides of), `=0` forces it off.
+/// ON by default — resident index copies are refs-evicted after persist, so
+/// the SQL retrieval IS the reference path for them. `PERL_LSP_REF_ROWS=0`
+/// forces the resident-only walk (pair it with PERL_LSP_NO_EVICT=1, or
+/// evicted-file sites vanish — the parity harness runs exactly that pairing).
 fn ref_rows_enabled() -> bool {
+    match REF_ROWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
     match std::env::var("PERL_LSP_REF_ROWS") {
         Ok(v) => v != "0",
-        // Default ON — resident pack refs are evicted after persist, so the
-        // SQL retrieval IS the reference path for index copies. `=0` forces
-        // the resident-only walk (pair with PERL_LSP_NO_EVICT=1, or dep-file
-        // sites vanish — the parity harness runs exactly that pairing).
         Err(_) => true,
     }
 }
@@ -3041,6 +3059,12 @@ pub fn refs_to(
         files.for_each_open(|url, doc| {
             let url = url.clone();
             if let Ok(p) = url.to_file_path() {
+                // Claim the canonical spelling too: candidate rows are keyed
+                // canonical, and an open doc reached through a symlinked
+                // root must shadow its own persisted generation.
+                if let Ok(canon) = std::fs::canonicalize(&p) {
+                    covered_paths.insert(canon);
+                }
                 covered_paths.insert(p);
             }
             // The walk applies visibility: role mask picked the tier, the
@@ -3058,6 +3082,9 @@ pub fn refs_to(
         // doesn't duplicate them (an open file's pre-close state isn't meaningful).
         files.for_each_open(|url, _doc| {
             if let Ok(p) = url.to_file_path() {
+                if let Ok(canon) = std::fs::canonicalize(&p) {
+                    covered_paths.insert(canon);
+                }
                 covered_paths.insert(p);
             }
         });

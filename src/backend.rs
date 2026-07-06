@@ -2244,28 +2244,50 @@ impl LanguageServer for Backend {
             let ws_key = module_index.workspace_root();
             let conn = crate::module_cache::open_cache_db(ws_key.as_deref(), "perl");
             for (path, typ) in perl_changes {
-                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+                // A DELETED file can't canonicalize (it's gone) — resolve the
+                // parent instead so the spelling still matches the canonical
+                // keys everything was registered/persisted under.
+                let canon = path.canonicalize().unwrap_or_else(|_| {
+                    match (path.parent(), path.file_name()) {
+                        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                            .map(|d| d.join(name))
+                            .unwrap_or_else(|_| path.clone()),
+                        _ => path.clone(),
+                    }
+                });
                 if let Some(ref conn) = conn {
-                    let canon_str = canon.to_string_lossy();
-                    crate::module_cache::delete_ref_rows(conn, &canon_str);
-                    let _ = conn.execute(
-                        "DELETE FROM modules WHERE path = ?1 AND source = 'workspace'",
-                        rusqlite::params![canon_str],
-                    );
+                    crate::module_cache::invalidate_generation(conn, &canon.to_string_lossy());
+                    if canon != path {
+                        crate::module_cache::invalidate_generation(
+                            conn,
+                            &path.to_string_lossy(),
+                        );
+                    }
                 }
                 module_index.invalidate_bag_cache(&canon);
                 match typ {
                     FileChangeType::DELETED => {
                         files.remove_workspace(&path);
                         files.remove_workspace(&canon);
+                        // The hub's path/name registrations must go too, or
+                        // the dead file stays a retrieval candidate and a
+                        // phantom module in name lookups.
+                        module_index.unregister_workspace_path(&canon);
                     }
                     _ => {
-                        // Re-index the file (created or changed)
+                        // Re-index the file (created or changed). The fresh
+                        // copy registers WHOLE (refs + bag) in both stores:
+                        // its persisted generation was just invalidated, so
+                        // the resident copy is the only source until the
+                        // next bulk index re-persists.
                         if let Ok(source) = std::fs::read_to_string(&path) {
                             let mut parser = crate::module_resolver::create_parser();
                             if let Some(tree) = parser.parse(&source, None) {
                                 let analysis = crate::builder::build(&tree, source.as_bytes());
-                                files.insert_workspace(canon, analysis);
+                                let arc = Arc::new(analysis);
+                                files.insert_workspace_arc(canon.clone(), arc.clone());
+                                module_index.record_workspace_projections(&canon, &arc);
+                                module_index.register_workspace_resident(canon, arc);
                             }
                         }
                     }

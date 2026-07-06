@@ -714,31 +714,56 @@ pub fn index_workspace_with_index(
     let cache_key = module_index.and_then(|i| i.workspace_root());
     let conn = module_cache::open_cache_db(cache_key.as_deref(), "perl");
     // Validate-and-stamp the plugin fingerprint BEFORE writing: the resolver
-    // thread runs the same check concurrently on this DB, and an unstamped
-    // fresh DB reads as a mismatch there — it would hard-clear the rows this
-    // indexer is about to write. First validator stamps; the other then
-    // matches and clears nothing.
+    // thread runs the same (atomic) check concurrently on this DB, and an
+    // unstamped fresh DB reads as a mismatch there — it would hard-clear the
+    // rows this indexer is about to write.
     if let Some(ref conn) = conn {
         let _ = module_cache::validate_plugin_fingerprint(
             conn,
             &crate::plugin::rhai_host::plugin_fingerprint(),
         );
     }
-    let persist = conn.is_some() && eviction_enabled();
+    // Persistence and eviction are independent: blobs + rows are written
+    // whenever a DB exists (the parity harness runs under PERL_LSP_NO_EVICT
+    // and still needs the relational side populated); only the resident
+    // STRIP obeys the eviction switch.
+    let persist = conn.is_some();
+    let strip = persist && eviction_enabled();
+
+    // The walk's canonical membership set: warm rows are admitted only for
+    // files the CURRENT walk still includes — a path newly gitignored (or
+    // newly over the size cap) must not resurrect from its cached row, and
+    // its stale generation is dropped.
+    let canon_members: std::collections::HashSet<PathBuf> = paths
+        .iter()
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+        .collect();
 
     // WARM: stream valid 'workspace' rows — record projections from the
     // full decode, strip, register, drop. Stale/changed rows fall through
     // to the parallel re-parse below.
     let mut warmed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if let Some(ref conn) = conn {
+        let mut dead_rows: Vec<PathBuf> = Vec::new();
         let backfill_tx = conn.unchecked_transaction().ok();
         let (_n, _stale) =
             module_cache::warm_cache_streaming(conn, Some("workspace"), &mut |_name, path, mut fa| {
+                if !canon_members.contains(&path) {
+                    dead_rows.push(path);
+                    return;
+                }
                 let path_str = path.to_string_lossy();
-                if !module_cache::has_ref_rows(conn, &path_str) {
+                // Refs are stripped below ONLY when their rows are known
+                // present — an evicted copy without rows is invisible to the
+                // backward walk (rows name candidates; the blob rehydrates).
+                let mut rows_ok = module_cache::has_ref_rows(conn, &path_str);
+                if !rows_ok {
                     let seeds: Vec<_> = fa.refs.iter().map(|r| r.row_seed()).collect();
-                    if let Err(e) = module_cache::shred_ref_rows(conn, &path_str, &seeds) {
-                        log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                    match module_cache::shred_ref_rows(conn, &path_str, "workspace", &seeds) {
+                        Ok(()) => rows_ok = true,
+                        Err(e) => {
+                            log::warn!("Failed to backfill ref rows for {:?}: {}", path, e)
+                        }
                     }
                 }
                 if let Some(idx) = module_index {
@@ -746,7 +771,9 @@ pub fn index_workspace_with_index(
                 }
                 if eviction_enabled() {
                     fa.evict_witness_bag();
-                    fa.evict_refs();
+                    if rows_ok {
+                        fa.evict_refs();
+                    }
                 }
                 let arc = std::sync::Arc::new(fa);
                 files.insert_workspace_arc(path.clone(), arc.clone());
@@ -757,100 +784,165 @@ pub fn index_workspace_with_index(
                 warmed.insert(path);
             });
         if let Some(tx) = backfill_tx {
-            let _ = tx.commit();
+            if let Err(e) = tx.commit() {
+                log::error!("Workspace warm backfill commit failed: {}", e);
+            }
+        }
+        for path in dead_rows {
+            module_cache::invalidate_generation(conn, &path.to_string_lossy());
         }
     }
 
-    type WsFresh = (PathBuf, Vec<u8>, Vec<crate::file_analysis::RefRowSeed>, Vec<std::sync::Arc<str>>);
-    let fresh: std::sync::Mutex<Vec<WsFresh>> = std::sync::Mutex::new(Vec::new());
-
+    // Fresh entries stream to a dedicated writer over a channel: the writer
+    // persists (batched txns) WHILE workers parse, so only a small window of
+    // blobs+seeds is ever in flight (never the whole tree's), and a query
+    // racing the bulk index sees each file's rows as soon as its chunk
+    // commits. Parse-time stamps ride along so a mid-index edit invalidates
+    // the row by construction.
+    type WsFresh = (
+        PathBuf,
+        Vec<u8>,
+        Vec<crate::file_analysis::RefRowSeed>,
+        Vec<std::sync::Arc<str>>,
+        (i64, i64),
+    );
+    let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
     let timing = crate::timings::is_enabled();
-    paths.par_iter().for_each(|path| {
-        // Blobs are keyed canonical (matches the warm rows + the CLI's
-        // canonicalized origin staging); register under the same spelling
-        // so cold and warm runs key the stores identically.
-        let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-        if warmed.contains(&canon) {
+
+    // The Connection moves INTO the writer thread (rusqlite connections are
+    // Send, not Sync); nothing after the scope needs it.
+    let writer_conn = conn;
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            let Some(conn) = writer_conn.as_ref() else {
+                while fresh_rx.recv().is_ok() {}
+                return;
+            };
+            let mut batch: Vec<WsFresh> = Vec::new();
+            let mut write_chunk = |batch: &mut Vec<WsFresh>| {
+                if batch.is_empty() {
+                    return;
+                }
+                let tx = conn.unchecked_transaction().ok();
+                for (path, blob, seeds, closure, stamp) in batch.iter() {
+                    let path_str = path.to_string_lossy();
+                    module_cache::save_blob_to_db_stamped(
+                        conn, &path_str, path, closure, blob, "workspace", *stamp,
+                    );
+                    if let Err(e) =
+                        module_cache::shred_ref_rows(conn, &path_str, "workspace", seeds)
+                    {
+                        log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
+                    }
+                }
+                if let Some(tx) = tx {
+                    if let Err(e) = tx.commit() {
+                        // The chunk rolled back but resident copies were
+                        // already stripped — loud, never silent (the
+                        // busy_timeout makes this pathological, not routine).
+                        log::error!(
+                            "Workspace persist commit failed ({} files dropped): {}",
+                            batch.len(),
+                            e
+                        );
+                    }
+                }
+                // A racing query may have pinned the previous generation in
+                // the rehydration LRU while this chunk was in flight.
+                if let Some(idx) = module_index {
+                    for (path, ..) in batch.iter() {
+                        idx.invalidate_bag_cache(path);
+                    }
+                }
+                batch.clear();
+            };
+            while let Ok(entry) = fresh_rx.recv() {
+                batch.push(entry);
+                while batch.len() < 128 {
+                    match fresh_rx.try_recv() {
+                        Ok(e) => batch.push(e),
+                        Err(_) => break,
+                    }
+                }
+                write_chunk(&mut batch);
+            }
+            write_chunk(&mut batch);
+        });
+
+        paths.par_iter().for_each(|path| {
+            // Blobs are keyed canonical (matches the warm rows + the CLI's
+            // canonicalized origin staging); register under the same spelling
+            // so cold and warm runs key the stores identically.
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if warmed.contains(&canon) {
+                if let Some(cb) = progress {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    cb(d, total);
+                }
+                return;
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let source = std::fs::read_to_string(path).ok()?;
+                let stamp = module_cache::file_stamp(path).unwrap_or((0, 0));
+                let mut parser = create_parser();
+                let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
+                let tree = parser.parse(&source, None)?;
+                let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
+                let t_build = if timing { Some(std::time::Instant::now()) } else { None };
+                let analysis = crate::builder::build(&tree, source.as_bytes());
+                let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
+                if timing {
+                    crate::timings::record_built(
+                        path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                        parse_dur,
+                        build_dur,
+                    );
+                }
+                Some((analysis, stamp))
+            }));
+
+            match result {
+                Ok(Some((mut analysis, stamp))) => {
+                    // Projections that read the bag run on the whole
+                    // analysis; the persisted generation is encoded whole;
+                    // only then is the resident copy stripped.
+                    if let Some(idx) = module_index {
+                        idx.record_workspace_projections(&canon, &analysis);
+                    }
+                    if persist && !analysis.degraded {
+                        if let Some(blob) = module_cache::encode_analysis(&analysis) {
+                            let seeds: Vec<_> =
+                                analysis.refs.iter().map(|r| r.row_seed()).collect();
+                            let closure = analysis.include_closure.clone();
+                            let _ =
+                                fresh_tx.send((canon.clone(), blob, seeds, closure, stamp));
+                            if strip {
+                                analysis.evict_witness_bag();
+                                analysis.evict_refs();
+                            }
+                        }
+                    }
+                    let arc = std::sync::Arc::new(analysis);
+                    files.insert_workspace_arc(canon.clone(), arc.clone());
+                    if let Some(idx) = module_index {
+                        idx.register_workspace_resident(canon.clone(), arc);
+                    }
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(None) => { /* parse failed, skip */ }
+                Err(_) => {
+                    log::warn!("Panic while indexing {:?}, skipping", path);
+                }
+            }
             if let Some(cb) = progress {
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 cb(d, total);
             }
-            return;
-        }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let source = std::fs::read_to_string(path).ok()?;
-            let mut parser = create_parser();
-            let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
-            let tree = parser.parse(&source, None)?;
-            let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
-            let t_build = if timing { Some(std::time::Instant::now()) } else { None };
-            let analysis = crate::builder::build(&tree, source.as_bytes());
-            let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
-            if timing {
-                crate::timings::record_built(
-                    path.strip_prefix(root).unwrap_or(path).display().to_string(),
-                    parse_dur,
-                    build_dur,
-                );
-            }
-            Some(analysis)
-        }));
+        });
 
-        match result {
-            Ok(Some(mut analysis)) => {
-                // Projections that read the bag run on the whole analysis;
-                // the persisted generation is encoded whole; only then is
-                // the resident copy stripped (blob + rows must exist for
-                // every stripped copy — eviction strictly follows persist).
-                if let Some(idx) = module_index {
-                    idx.record_workspace_projections(&canon, &analysis);
-                }
-                if persist && !analysis.degraded {
-                    if let Some(blob) = module_cache::encode_analysis(&analysis) {
-                        let seeds: Vec<_> =
-                            analysis.refs.iter().map(|r| r.row_seed()).collect();
-                        let closure = analysis.include_closure.clone();
-                        fresh.lock().unwrap().push((canon.clone(), blob, seeds, closure));
-                        analysis.evict_witness_bag();
-                        analysis.evict_refs();
-                    }
-                }
-                let arc = std::sync::Arc::new(analysis);
-                files.insert_workspace_arc(canon.clone(), arc.clone());
-                if let Some(idx) = module_index {
-                    idx.register_workspace_resident(canon.clone(), arc);
-                }
-                count.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(None) => { /* parse failed, skip */ }
-            Err(_) => {
-                log::warn!("Panic while indexing {:?}, skipping", path);
-            }
-        }
-        if let Some(cb) = progress {
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            cb(d, total);
-        }
+        drop(fresh_tx);
+        let _ = writer.join();
     });
-
-    // Sequential drain (rusqlite Connection isn't Sync): blob + rows per
-    // file, batched transactions.
-    if let Some(ref conn) = conn {
-        let entries = fresh.into_inner().unwrap();
-        for chunk in entries.chunks(250) {
-            let tx = conn.unchecked_transaction().ok();
-            for (path, blob, seeds, closure) in chunk {
-                let path_str = path.to_string_lossy();
-                module_cache::save_blob_to_db(conn, &path_str, path, closure, blob, "workspace");
-                if let Err(e) = module_cache::shred_ref_rows(conn, &path_str, seeds) {
-                    log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
-                }
-            }
-            if let Some(tx) = tx {
-                let _ = tx.commit();
-            }
-        }
-    }
 
     count.load(Ordering::Relaxed)
 }
@@ -886,7 +978,7 @@ fn save_module_generation(
         if !m.analysis.degraded {
             let seeds: Vec<_> = m.analysis.refs.iter().map(|r| r.row_seed()).collect();
             if let Err(e) =
-                module_cache::shred_ref_rows(conn, &m.path.to_string_lossy(), &seeds)
+                module_cache::shred_ref_rows(conn, &m.path.to_string_lossy(), "import", &seeds)
             {
                 log::warn!("Failed to shred ref rows for '{}': {}", module_name, e);
             }
@@ -1000,146 +1092,195 @@ pub fn index_pack_languages(
             );
         }
 
-        // WARM: load valid cached analyses (keyed by file path), register
-        // their classes, and remember which paths are fresh so the walk
-        // skips re-analyzing them. Version-stale rows are re-analyzed.
+        // WARM: stream valid cached analyses (keyed by file path) one row
+        // at a time — register a stripped copy, drop the whole decode before
+        // the next row, so at most one full analysis is transiently
+        // resident. Version-stale rows re-analyze; rows for files the
+        // CURRENT walk no longer includes are dropped, not resurrected.
+        let canon_members: std::collections::HashSet<PathBuf> = paths
+            .iter()
+            .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
+            .collect();
         let mut warmed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         if let Some(ref conn) = conn {
-            // STREAMING warm: one row decodes, backfills its ref rows if the
-            // blob predates the relational index, strips bag + refs, registers,
-            // and drops — the whole-table temp map this replaces held every
-            // full analysis at once (the warm-peak-above-cold-peak artifact).
+            let mut dead_rows: Vec<PathBuf> = Vec::new();
             let backfill_tx = conn.unchecked_transaction().ok();
             let (_n, _stale) = module_cache::warm_cache_streaming(conn, None, &mut |_name, path, mut fa| {
+                if !canon_members.contains(&path) {
+                    dead_rows.push(path);
+                    return;
+                }
                 let path_str = path.to_string_lossy();
-                if !module_cache::has_ref_rows(conn, &path_str) {
+                // Refs strip only when their rows are known present — rows
+                // name candidates for the backward walk; the blob rehydrates.
+                let mut rows_ok = module_cache::has_ref_rows(conn, &path_str);
+                if !rows_ok {
                     let seeds: Vec<_> = fa.refs.iter().map(|r| r.row_seed()).collect();
-                    if let Err(e) = module_cache::shred_ref_rows(conn, &path_str, &seeds) {
-                        log::warn!("Failed to backfill ref rows for {:?}: {}", path, e);
+                    match module_cache::shred_ref_rows(conn, &path_str, "workspace", &seeds) {
+                        Ok(()) => rows_ok = true,
+                        Err(e) => {
+                            log::warn!("Failed to backfill ref rows for {:?}: {}", path, e)
+                        }
                     }
                 }
                 if eviction_enabled() {
                     fa.evict_witness_bag();
-                    fa.evict_refs();
+                    if rows_ok {
+                        fa.evict_refs();
+                    }
                 }
                 pack_index.register_symbols(path.clone(), Arc::new(fa));
                 warmed.insert(path);
             });
             if let Some(tx) = backfill_tx {
-                let _ = tx.commit();
+                if let Err(e) = tx.commit() {
+                    log::error!("Pack warm backfill commit failed: {}", e);
+                }
+            }
+            for path in dead_rows {
+                module_cache::invalidate_generation(conn, &path.to_string_lossy());
             }
         }
 
-        // Analyze only the new/changed/stale files (parallel); collect the
-        // fresh analyses for a sequential write (rusqlite Connection isn't
-        // Sync). register_symbols happens here so cross-file works even
-        // when persistence is off.
-        // Each entry carries the bag-STRIPPED resident arc (registered) plus
-        // the pre-encoded FULL blob (with bag) for the sequential disk write —
-        // so the resident copy is thin and the persisted copy stays complete.
-        // `None` blob = a degraded analysis we deliberately did NOT strip (see
-        // below) or a non-persisted build; nothing to write.
-        // The persisted payload (`None` = degraded / persistence off): the
-        // pre-encoded FULL blob plus the ref-row seeds shredded from the same
-        // analysis — blob and rows always describe one generation.
+        // Analyze only the new/changed/stale files (parallel). Fresh entries
+        // stream to a dedicated writer thread over a channel: blobs + rows
+        // land in batched txns WHILE workers analyze, so only a bounded
+        // window of encoded blobs is in flight and a query racing the bulk
+        // index sees each file's rows as soon as its chunk commits.
+        // Persistence and eviction are independent: blobs + rows are written
+        // whenever a DB exists; only the resident STRIP obeys the eviction
+        // switch (the bag/refs are stripped only when recoverable — persisted
+        // and non-degraded).
         type FreshEntry = (
             PathBuf,
             Arc<crate::file_analysis::FileAnalysis>,
-            Option<(Vec<u8>, Vec<crate::file_analysis::RefRowSeed>)>,
+            Vec<u8>,
+            Vec<crate::file_analysis::RefRowSeed>,
+            (i64, i64),
         );
-        let fresh: std::sync::Mutex<Vec<FreshEntry>> = std::sync::Mutex::new(Vec::new());
-        // Hoisted so the Rayon closure never touches `conn` (rusqlite
-        // `Connection` isn't `Sync`); the bag is stripped only when it can be
-        // rehydrated later — i.e. when there's a blob on disk.
-        let persist = conn.is_some() && eviction_enabled();
-        paths.par_iter().for_each(|path| {
-            // Tick before any early-out so warm-cache skips also advance the
-            // bar — `done` must reach `grand_total`.
-            if let Some(cb) = progress {
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                cb(d, grand_total);
-            }
-            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if warmed.contains(&canon) {
-                return; // valid cache hit
-            }
-            let reg = crate::language_driver::LanguageRegistry::with_enabled();
-            let Some(driver) = reg.for_path(path).filter(|d| d.id() == lang) else { return };
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let source = std::fs::read_to_string(path).ok()?;
-                Some(driver.analyze_with_path(&source, Some(path)))
-            }));
-            if let Ok(Some(mut analysis)) = res {
-                // Serialize the FULL bag NOW (while present) for the disk write,
-                // then strip it from the resident copy — one struct, no clone
-                // (`docs/adr/memory-slice-2-lru.md`). Only strip when the bag is
-                // recoverable: persistence must be on (else there's no blob to
-                // rehydrate from) and the analysis non-degraded (`save_*` skip
-                // degraded rows, so their bag would be lost). Otherwise keep it
-                // resident.
-                let blob = if persist && !analysis.degraded {
-                    let b = module_cache::encode_analysis(&analysis);
-                    let seeds: Vec<_> =
-                        analysis.refs.iter().map(|r| r.row_seed()).collect();
-                    analysis.evict_witness_bag();
-                    // Refs follow the bag (`docs/adr/relational-ref-index.md`):
-                    // the blob + rows carry them; the backward walk retrieves
-                    // candidates relationally and rehydrates.
-                    analysis.evict_refs();
-                    b.map(|b| (b, seeds))
-                } else {
-                    None
+        let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<FreshEntry>();
+        let persist = conn.is_some();
+        let strip = persist && eviction_enabled();
+        let writer_conn = conn;
+        let pack_index_writer = Arc::clone(&pack_index);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let Some(conn) = writer_conn.as_ref() else {
+                    while fresh_rx.recv().is_ok() {}
+                    return;
                 };
-                let arc = Arc::new(analysis);
-                pack_index.register_symbols(path.clone(), arc.clone());
-                fresh.lock().unwrap().push((canon.clone(), arc, blob));
-                total.fetch_add(1, Ordering::Relaxed);
-                // Residency: this file's merged/expanded macro tables are a
-                // one-shot build input, now dead weight for the rest of the
-                // bulk index (they'd otherwise accumulate to ~1.6 GB of
-                // per-file duplicates on abseil). Drop them the moment the
-                // analysis is built; the shared `header_cache` stays warm so
-                // an on-edit re-gather is a header-BFS, not a cold gather.
-                // Keyed by the same path analyze got, plus its canonical form.
-                let mut drop_set = std::collections::HashSet::with_capacity(2);
-                drop_set.insert(path.clone());
-                drop_set.insert(canon);
-                crate::cpp_reparse::evict_gather_caches_keep_headers(&drop_set);
-            }
-        });
-
-        // WRITE the fresh analyses back (keyed by canonical path). The blob
-        // was pre-encoded from the FULL analysis; `deps_stamp` derives from the
-        // pinned `include_closure` (survives eviction), so the persisted row is
-        // byte-identical to `save_to_db`'s from the full struct.
-        if let Some(ref conn) = conn {
-            // Batched: one transaction per chunk keeps the WAL bounded at
-            // Chromium scale while making each file's blob + ref rows land
-            // atomically together.
-            let entries = fresh.into_inner().unwrap();
-            for chunk in entries.chunks(250) {
-                let tx = conn.unchecked_transaction().ok();
-                for (path, arc, payload) in chunk {
-                    if let Some((blob, seeds)) = payload {
+                let mut batch: Vec<FreshEntry> = Vec::new();
+                let mut write_chunk = |batch: &mut Vec<FreshEntry>| {
+                    if batch.is_empty() {
+                        return;
+                    }
+                    let tx = conn.unchecked_transaction().ok();
+                    for (path, arc, blob, seeds, stamp) in batch.iter() {
                         let path_str = path.to_string_lossy();
-                        module_cache::save_blob_to_db(
+                        module_cache::save_blob_to_db_stamped(
                             conn,
                             &path_str,
                             path,
                             &arc.include_closure,
                             blob,
                             "workspace",
+                            *stamp,
                         );
-                        if let Err(e) = module_cache::shred_ref_rows(conn, &path_str, seeds) {
+                        if let Err(e) =
+                            module_cache::shred_ref_rows(conn, &path_str, "workspace", seeds)
+                        {
                             log::warn!("Failed to shred ref rows for {:?}: {}", path, e);
                         }
                     }
+                    if let Some(tx) = tx {
+                        if let Err(e) = tx.commit() {
+                            log::error!(
+                                "Pack persist commit failed ({} files dropped): {}",
+                                batch.len(),
+                                e
+                            );
+                        }
+                    }
+                    // A racing query may have pinned the previous generation
+                    // in the rehydration LRU while this chunk was in flight.
+                    for (path, ..) in batch.iter() {
+                        pack_index_writer.invalidate_bag_cache(path);
+                    }
+                    batch.clear();
+                };
+                while let Ok(entry) = fresh_rx.recv() {
+                    batch.push(entry);
+                    while batch.len() < 128 {
+                        match fresh_rx.try_recv() {
+                            Ok(e) => batch.push(e),
+                            Err(_) => break,
+                        }
+                    }
+                    write_chunk(&mut batch);
                 }
-                if let Some(tx) = tx {
-                    let _ = tx.commit();
+                write_chunk(&mut batch);
+            });
+
+            paths.par_iter().for_each(|path| {
+                // Tick before any early-out so warm-cache skips also advance the
+                // bar — `done` must reach `grand_total`.
+                if let Some(cb) = progress {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    cb(d, grand_total);
                 }
-            }
-        }
+                let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if warmed.contains(&canon) {
+                    return; // valid cache hit
+                }
+                let reg = crate::language_driver::LanguageRegistry::with_enabled();
+                let Some(driver) = reg.for_path(path).filter(|d| d.id() == lang) else { return };
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let stamp = module_cache::file_stamp(path).unwrap_or((0, 0));
+                    let source = std::fs::read_to_string(path).ok()?;
+                    Some((driver.analyze_with_path(&source, Some(path)), stamp))
+                }));
+                if let Ok(Some((mut analysis, stamp))) = res {
+                    // Encode the FULL analysis for the disk write, then strip
+                    // the resident copy — one struct, no clone
+                    // (`docs/adr/memory-slice-2-lru.md`). Strip only when the
+                    // bag/refs are recoverable: persisted and non-degraded
+                    // (`save_*` skip degraded rows, so their bag would be lost).
+                    let payload = if persist && !analysis.degraded {
+                        module_cache::encode_analysis(&analysis).map(|blob| {
+                            let seeds: Vec<_> =
+                                analysis.refs.iter().map(|r| r.row_seed()).collect();
+                            (blob, seeds)
+                        })
+                    } else {
+                        None
+                    };
+                    if payload.is_some() && strip {
+                        analysis.evict_witness_bag();
+                        analysis.evict_refs();
+                    }
+                    let arc = Arc::new(analysis);
+                    pack_index.register_symbols(path.clone(), arc.clone());
+                    if let Some((blob, seeds)) = payload {
+                        let _ = fresh_tx.send((canon.clone(), arc, blob, seeds, stamp));
+                    }
+                    total.fetch_add(1, Ordering::Relaxed);
+                    // Residency: this file's merged/expanded macro tables are a
+                    // one-shot build input, now dead weight for the rest of the
+                    // bulk index (they'd otherwise accumulate to ~1.6 GB of
+                    // per-file duplicates on abseil). Drop them the moment the
+                    // analysis is built; the shared `header_cache` stays warm so
+                    // an on-edit re-gather is a header-BFS, not a cold gather.
+                    // Keyed by the same path analyze got, plus its canonical form.
+                    let mut drop_set = std::collections::HashSet::with_capacity(2);
+                    drop_set.insert(path.clone());
+                    drop_set.insert(canon);
+                    crate::cpp_reparse::evict_gather_caches_keep_headers(&drop_set);
+                }
+            });
+
+            drop(fresh_tx);
+            let _ = writer.join();
+        });
         hub.attach_pack_index(lang, pack_index);
     }
     if std::env::var_os("PERL_LSP_MEM_REPORT").is_some() {
@@ -1245,7 +1386,7 @@ pub fn pack_file_changed(
             module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace");
             if !arc.degraded {
                 let seeds: Vec<_> = arc.refs.iter().map(|r| r.row_seed()).collect();
-                if let Err(e) = module_cache::shred_ref_rows(&conn, &p_str, &seeds) {
+                if let Err(e) = module_cache::shred_ref_rows(&conn, &p_str, "workspace", &seeds) {
                     log::warn!("Failed to shred ref rows for {:?}: {}", p, e);
                 }
             }
