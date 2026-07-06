@@ -179,6 +179,50 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
+/// The rows half of workspace/symbol: fan the query across the hub's Perl
+/// store and every pack sub-index's store. One spelling of the fan-out so
+/// the LSP handler and the CLI verb can never diverge.
+pub fn sym_row_search(
+    idx: &crate::module_index::ModuleIndex,
+    query: &str,
+) -> Vec<crate::module_cache::SymRowHit> {
+    let mut hits = idx.sym_search(query);
+    idx.for_each_pack_index(|_lang, pack| {
+        hits.extend(pack.sym_search(query));
+    });
+    hits
+}
+
+/// `symbol_to_workspace_info`'s row twin — identical kind gate and
+/// hidden/lexical suppressions, sourced from the baked row flags.
+pub fn sym_row_to_workspace_info(
+    hit: &crate::module_cache::SymRowHit,
+) -> Option<SymbolInformation> {
+    use crate::file_analysis::{sym_kind_from_code, SymKind as FaSymKind, SymRowSeed};
+    let kind = sym_kind_from_code(hit.kind)?;
+    match kind {
+        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class => {}
+        _ => return None,
+    }
+    if hit.flags & (SymRowSeed::FLAG_HIDDEN_IN_OUTLINE | SymRowSeed::FLAG_LEXICAL_SUB) != 0 {
+        return None;
+    }
+    let path = std::path::Path::new(&hit.path);
+    let uri = Url::from_file_path(path).ok()?;
+    let span = crate::file_analysis::Span {
+        start: tree_sitter::Point::new(hit.start_row, hit.start_col),
+        end: tree_sitter::Point::new(hit.end_row, hit.end_col),
+    };
+    Some(SymbolInformation {
+        name: hit.name.clone(),
+        kind: fa_sym_kind_to_lsp(&kind),
+        tags: None,
+        deprecated: None,
+        location: Location { uri, range: span_to_range(span) },
+        container_name: hit.container.clone(),
+    })
+}
+
 /// Goto-definition: the forward projection of the resolution CandidateSet,
 /// adapted to LSP types. One location → Scalar; several (stacked handler
 /// registrations) → Array so the editor shows a picker. The LSP handler and
@@ -773,7 +817,8 @@ fn completion_items_native(
                 // the "still indexing" placeholder is a slot affordance
                 // (no entity to gather yet), so it stays adapter-side.
                 return match module_index.get_cached(name) {
-                    Some(cached) => cached
+                    Some(cached) => module_index
+                        .whole_present(&cached)
                         .import_list_candidates()
                         .into_iter()
                         .map(candidate_to_completion_item)
@@ -1159,10 +1204,13 @@ fn render_candidate_hover(
         });
     }
     if let Some(cached) = &found {
-        if let Some(i) = sym_at(&cached.analysis) {
-            let sym = &cached.analysis.symbols[i];
+        let whole = module_index
+            .map(|midx| midx.whole_present(cached))
+            .unwrap_or_else(|| cached.analysis.clone());
+        if let Some(i) = sym_at(&whole) {
+            let sym = &whole.symbols[i];
             let mut out = render_symbol_hover(
-                sym, &text, &sym.span.start, language, &cached.analysis, sym.span.start,
+                sym, &text, &sym.span.start, language, &whole, sym.span.start,
                 module_index,
             );
             out.push_str(&format!("\n\n— `{}`", fname));
@@ -1936,7 +1984,8 @@ fn string_dispatch_signature_for(
     if let Some(idx) = module_index {
         for module_name in idx.modules_with_symbol(handler_name) {
             let Some(cached) = idx.get_cached(&module_name) else { continue };
-            for sym in &cached.analysis.symbols {
+            let whole = idx.whole_present(&cached);
+            for sym in &whole.symbols {
                 if sym.name != handler_name { continue; }
                 push_sig(&mut signatures, sym, Some(module_name.as_str()));
             }

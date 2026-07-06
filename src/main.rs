@@ -1632,8 +1632,16 @@ fn run_one(
                     }));
                 }
             };
+            // Same resident + rows composition as the LSP handler: a
+            // symbols-present copy answers residently; evicted copies are
+            // rows-guaranteed and answer from the store.
+            let mut covered: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
             for entry in ws.workspace_raw().iter() {
                 let file = entry.key().display().to_string();
+                if !entry.value().symbols_are_evicted() {
+                    covered.insert(entry.key().clone());
+                }
                 for sym in &entry.value().symbols {
                     push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
@@ -1643,10 +1651,25 @@ fn run_one(
             // function surfaces in workspace search too.
             idx.for_each_pack_registered_file(&mut |path, analysis| {
                 let file = path.display().to_string();
+                if !analysis.symbols_are_evicted() {
+                    covered.insert(path.to_path_buf());
+                }
                 for sym in &analysis.symbols {
                     push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
             });
+            for hit in symbols::sym_row_search(idx, &q) {
+                let path = std::path::PathBuf::from(&hit.path);
+                if covered.contains(&path) {
+                    continue;
+                }
+                let Some(kind) = file_analysis::sym_kind_from_code(hit.kind) else { continue };
+                let span = file_analysis::Span {
+                    start: tree_sitter::Point::new(hit.start_row, hit.start_col),
+                    end: tree_sitter::Point::new(hit.end_row, hit.end_col),
+                };
+                push(&hit.name, &kind, hit.path.clone(), span);
+            }
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
         "rename" => {
@@ -1979,27 +2002,26 @@ fn cli_dump_package(root: &str, package_name: &str) {
     // the normal startup populated.
     let mut found: Option<(String, Arc<FileAnalysis>)> = None;
     for entry in ws.workspace_raw().iter() {
-        let analysis = entry.value();
+        let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
+            entry.key().clone(),
+            std::sync::Arc::clone(entry.value()),
+        ));
+        let analysis = file_analysis::CrossFileLookup::whole_present(&module_index, &cm);
         let has_package = analysis.symbols.iter().any(|s| {
             matches!(s.kind, SymKind::Package | SymKind::Class)
                 && s.name == package_name
         });
         if has_package {
-            // Index copies are bag/refs-evicted; the dump reads the bag
-            // (params, returns, witness counts), so take the whole view —
-            // an evicted copy would honestly-but-uselessly dump zero facts.
-            let cm = Arc::new(file_analysis::CachedModule::new(
-                entry.key().clone(),
-                Arc::clone(analysis),
-            ));
-            let whole = file_analysis::CrossFileLookup::bag_present(&module_index, &cm);
-            found = Some((entry.key().display().to_string(), whole));
+            // `analysis` is already the whole view — the dump reads the bag
+            // (params, returns, witness counts) and symbols; an evicted copy
+            // would honestly-but-uselessly dump zero facts.
+            found = Some((entry.key().display().to_string(), analysis));
             break;
         }
     }
     if found.is_none() {
         if let Some(cached) = module_index.get_cached(package_name) {
-            let whole = file_analysis::CrossFileLookup::bag_present(&module_index, &cached);
+            let whole = file_analysis::CrossFileLookup::whole_present(&module_index, &cached);
             found = Some((cached.path.display().to_string(), whole));
         }
     }
@@ -2424,7 +2446,7 @@ fn cli_refs_parity(root: &str, sample: Option<usize>) {
             // rehydrated otherwise). Batch-CLI-sized cost, not a query path.
             pack_entries.push((
                 cached.path.clone(),
-                file_analysis::CrossFileLookup::refs_present(pack.as_ref(), cached),
+                file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cached),
                 std::sync::Arc::clone(pack),
             ));
         });
@@ -2443,7 +2465,7 @@ fn cli_refs_parity(root: &str, sample: Option<usize>) {
             ));
             (
                 e.key().clone(),
-                file_analysis::CrossFileLookup::refs_present(&idx, &cm),
+                file_analysis::CrossFileLookup::whole_present(&idx, &cm),
             )
         })
         .collect();
@@ -2608,7 +2630,7 @@ fn cli_heatmap(root: &str, opts: &[String]) {
             // rehydrated otherwise). Batch-CLI-sized cost, not a query path.
             pack_entries.push((
                 cached.path.clone(),
-                file_analysis::CrossFileLookup::refs_present(pack.as_ref(), cached),
+                file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cached),
                 std::sync::Arc::clone(pack),
             ));
         });
@@ -2660,7 +2682,7 @@ fn cli_heatmap(root: &str, opts: &[String]) {
             ));
             (
                 e.key().clone(),
-                file_analysis::CrossFileLookup::refs_present(&idx, &cm),
+                file_analysis::CrossFileLookup::whole_present(&idx, &cm),
             )
         })
         .collect();

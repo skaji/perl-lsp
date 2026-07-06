@@ -35,15 +35,27 @@ pub use crate::file_analysis::{CachedModule, SubInfo};
 
 type InferredTypeOwned = crate::file_analysis::InferredType;
 
-/// Does this cached module declare a `Class`/type named `name`? The cache
-/// slot's rank (Class beats Sub/value) is derived from the occupant rather
-/// than stored alongside it, so the deterministic-winner tie-break in
-/// `register_symbols` can compare ranks order-independently.
-fn module_defines_class(m: &CachedModule, name: &str) -> bool {
-    m.analysis
-        .symbols
-        .iter()
-        .any(|s| matches!(s.kind, SymKind::Class) && s.name == name)
+/// The linkage-visible feed a registration extracts from a WHOLE analysis:
+/// (name, declares-a-Class) per visible symbol. Collected before any strip
+/// so the feeds and tie-breaks never read an emptied `symbols`.
+fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
+    let mut feed: Vec<(String, bool)> = Vec::new();
+    for sym in &analysis.symbols {
+        // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
+        // the same predicate completion gathering uses, so every name
+        // registered here is also offerable and vice versa.
+        if !analysis.is_linkage_visible(sym) {
+            continue;
+        }
+        let is_class = matches!(sym.kind, SymKind::Class);
+        match feed.iter_mut().find(|(n, _)| n == &sym.name) {
+            // A file declaring both a value AND a Class under one name
+            // ranks as a Class.
+            Some((_, c)) => *c |= is_class,
+            None => feed.push((sym.name.clone(), is_class)),
+        }
+    }
+    feed
 }
 
 /// Pick the winner among same-name candidates by the SAME total order
@@ -51,12 +63,16 @@ fn module_defines_class(m: &CachedModule, name: &str) -> bool {
 /// Sub/value, then the smallest canonical path breaks the tie (order-independent
 /// — no reliance on registration order). Factored so the scoped lookup and the
 /// registration winner agree by construction.
-fn best_candidate(cands: &[&Arc<CachedModule>], name: &str) -> Option<Arc<CachedModule>> {
+fn best_candidate<'c>(
+    cands: &[&'c Arc<CachedModule>],
+    name: &str,
+    defines_class: &dyn Fn(&CachedModule, &str) -> bool,
+) -> Option<Arc<CachedModule>> {
     cands
         .iter()
         .copied()
         .max_by(|a, b| {
-            let (ac, bc) = (module_defines_class(a, name), module_defines_class(b, name));
+            let (ac, bc) = (defines_class(a, name), defines_class(b, name));
             // Class beats non-class; then SMALLER path wins (reverse for max_by).
             ac.cmp(&bc).then_with(|| b.path.cmp(&a.path))
         })
@@ -298,6 +314,13 @@ pub struct ModuleIndex {
     /// name-keyed views can't reach those, but whole-project sweeps
     /// (`for_each_cached_file`) must.
     all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
+    /// The linkage-visible (name, declares-a-Class) pairs each file
+    /// registered — the exact inverse list `unregister_file` walks AND the
+    /// class-rank source for the cache-slot tie-break. Recorded at
+    /// registration (pre-strip) because the resident copy's `symbols` may be
+    /// evicted, and rehydration after an edit persists would fetch the NEW
+    /// generation's names.
+    registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
     /// Slice-2 rehydration store — SET ONLY on pack sub-indexes, `None` on the
     /// Perl hub (Perl copies are never bag-evicted). After indexing, each
     /// resident pack `FileAnalysis` has its witness bag evicted; a type query
@@ -368,6 +391,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
+            registered_names: Arc::new(DashMap::new()),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -471,7 +495,7 @@ impl ModuleIndex {
                     .iter()
                     .filter(|c| visible.contains(&c.path.to_string_lossy().into_owned()))
                     .collect();
-                if let Some(best) = best_candidate(&reachable, module_name) {
+                if let Some(best) = best_candidate(&reachable, module_name, &|m, n| self.module_defines_class(m, n)) {
                     return Some(best);
                 }
             }
@@ -505,7 +529,7 @@ impl ModuleIndex {
                 .iter()
                 .filter(|c| c.path.to_str().is_some_and(|p| visible.contains(p)))
                 .collect();
-            if let Some(best) = best_candidate(&reachable, entry.key()) {
+            if let Some(best) = best_candidate(&reachable, entry.key(), &|m, n| self.module_defines_class(m, n)) {
                 out.push((entry.key().clone(), best));
             }
         }
@@ -561,7 +585,8 @@ impl ModuleIndex {
         use std::ops::ControlFlow;
         let mut found = None;
         self.for_each_reexport_module(std::iter::once(entry.to_string()), |cached| {
-            if cached.sub_info(name).is_some() {
+            use crate::file_analysis::CrossFileLookup;
+            if self.whole_present(cached).sub_info_view(name).is_some() {
                 found = Some(Arc::clone(cached));
                 ControlFlow::Break(())
             } else {
@@ -631,9 +656,9 @@ impl ModuleIndex {
         let modules = self.edges.names.get(func_name)?;
         for module_name in modules.value() {
             if let Some(cached) = self.get_cached(module_name) {
-                // Return types resolve through the bag; the resident copy
-                // may be bag-evicted (any persisted tier).
-                let whole = self.bag_present(&cached);
+                // `sub_return_type_local` walks symbols AND resolves through
+                // the bag — two evictable axes, take the whole view.
+                let whole = self.whole_present(&cached);
                 if let Some(ty) = whole.sub_return_type_local(func_name) {
                     return Some(ty.clone());
                 }
@@ -690,11 +715,12 @@ impl ModuleIndex {
         name: &str,
         class: &str,
     ) -> Option<String> {
+        use crate::file_analysis::CrossFileLookup;
         self.modules_with_symbol(name)
             .into_iter()
             .find(|mod_name| {
                 self.get_cached(mod_name)
-                    .map(|c| c.has_sub_in_package(name, class))
+                    .map(|c| self.whole_present(&c).has_sub_in_package(name, class))
                     .unwrap_or(false)
             })
     }
@@ -743,6 +769,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
+            registered_names: Arc::new(DashMap::new()),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -798,6 +825,7 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
+            registered_names: Arc::new(DashMap::new()),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -876,9 +904,11 @@ impl ModuleIndex {
     }
 
     /// The residency half of workspace registration: the path-keyed
-    /// registry, name/edge feeds, and the cache insert. Reads only pinned
-    /// fields, so a refs/bag-stripped copy registers identically to a full
-    /// one. Files without a `package` declaration get only the path entry.
+    /// registry, name/edge feeds, and the cache insert. The name/edge feeds
+    /// read `symbols`, so a symbol-stripped copy must NOT register through
+    /// here — indexers strip via `register_workspace_stripping`, which feeds
+    /// from the whole analysis first. Files without a `package` declaration
+    /// get only the path entry.
     pub fn register_workspace_resident(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
@@ -891,6 +921,41 @@ impl ModuleIndex {
         self.edges.purge_module(&module_name);
         self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
+    }
+
+    /// Registration-owned strip: feed the name/edge registrations from the
+    /// WHOLE analysis, then evict the requested axes, then store the
+    /// stripped arc — so a feed can never read an already-emptied `symbols`
+    /// (the ordering bug a caller-side strip invites). Returns the stored
+    /// arc for the caller's FileStore mirror.
+    pub fn register_workspace_stripping(
+        &self,
+        path: std::path::PathBuf,
+        mut fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> Arc<FileAnalysis> {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let module_name = first_package_name(&fa);
+        if let Some(ref name) = module_name {
+            self.workspace_modules.insert(name.clone(), ());
+            self.edges.purge_module(name);
+            self.edges.feed(name, &fa);
+        }
+        if strip_bag {
+            fa.evict_witness_bag();
+        }
+        if strip_rows {
+            fa.evict_refs();
+            fa.evict_symbols();
+        }
+        let arc = Arc::new(fa);
+        let cached = Arc::new(CachedModule::new(path, arc.clone()));
+        self.all_files.insert(cached.path.clone(), cached.clone());
+        if let Some(name) = module_name {
+            self.cache.insert(name, Some(cached));
+        }
+        arc
     }
 
     /// Remove a deleted workspace file's registrations — the path-keyed
@@ -1008,6 +1073,73 @@ impl ModuleIndex {
         cached.analysis.clone()
     }
 
+    /// Does `m` declare a `Class`/type named `name`? Rank source for the
+    /// cache-slot tie-break and the scoped/survivor re-picks. Reads the
+    /// registration record first — the resident copy's `symbols` may be
+    /// evicted — and falls back to the symbol scan for copies registered
+    /// whole (recovery paths, tests).
+    fn module_defines_class(&self, m: &CachedModule, name: &str) -> bool {
+        if let Some(rec) = self.registered_names.get(&m.path) {
+            return rec.iter().any(|(n, is_class)| n == name && *is_class);
+        }
+        m.analysis
+            .symbols
+            .iter()
+            .any(|s| matches!(s.kind, SymKind::Class) && s.name == name)
+    }
+
+    /// Run `f` against this index's retained read connection to the
+    /// relational row store, opening (or re-opening, if the DB file was
+    /// unlinked/recreated) through the installed opener. `None` when no
+    /// opener is set (tests, no cache dir) or the open fails. One retained
+    /// connection per index so the statement cache amortizes across queries.
+    fn with_rows_conn<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> Option<R> {
+        let opener = self.ref_rows_opener.read().ok().and_then(|g| g.clone())?;
+        fn db_ino(conn: &rusqlite::Connection) -> u64 {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return conn
+                    .path()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.ino())
+                    .unwrap_or(0);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = conn;
+                0
+            }
+        }
+        // Poison-proof: the Option is a pure cache — a panic in some earlier
+        // holder must not permanently disable retrieval.
+        let mut guard = self
+            .ref_rows_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((conn, ino)) = guard.as_ref() {
+            if db_ino(conn) != *ino {
+                *guard = None; // file unlinked/recreated — reopen below
+            }
+        }
+        if guard.is_none() {
+            *guard = opener().map(|c| {
+                let ino = db_ino(&c);
+                (c, ino)
+            });
+        }
+        let (conn, _) = guard.as_ref()?;
+        Some(f(conn))
+    }
+
+    /// Rows-backed workspace/symbol scan over THIS index's store — the
+    /// enumeration surface for symbol-evicted copies. The hub serves Perl
+    /// rows; callers fan out to `pack_index` sub-indexes for pack rows.
+    pub fn sym_search(&self, query: &str) -> Vec<crate::module_cache::SymRowHit> {
+        self.with_rows_conn(|conn| crate::module_cache::sym_rows_matching(conn, query))
+            .unwrap_or_default()
+    }
+
     /// The sub-index for `lang`, if this distribution indexes it.
     pub fn pack_index(&self, lang: &str) -> Option<Arc<ModuleIndex>> {
         self.pack_indexes.get(lang).map(|e| e.value().clone())
@@ -1031,27 +1163,64 @@ impl ModuleIndex {
     /// goto-def lands on the body. Methods need no entry — they resolve
     /// through their class's file.
     pub fn register_symbols(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
-        use crate::file_analysis::SymKind;
+        // Feed source and stored copy are the same whole analysis here;
+        // indexers that strip go through `register_symbols_stripping`.
+        let feed: Vec<(String, bool)> = collect_linkage_feed(&analysis);
+        let specs: Vec<(String, String)> =
+            analysis.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.register_symbols_inner(path, analysis, &feed, &specs);
+    }
+
+    /// Registration-owned strip for the pack bulk index: collect the
+    /// linkage-visible feed from the WHOLE analysis, evict the requested
+    /// axes, then register the stripped arc — the feeds can never read an
+    /// already-emptied `symbols`. Returns the stored arc (the worker sends
+    /// it to the persist writer).
+    pub fn register_symbols_stripping(
+        &self,
+        path: std::path::PathBuf,
+        mut fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> Arc<FileAnalysis> {
+        let feed = collect_linkage_feed(&fa);
+        let specs: Vec<(String, String)> =
+            fa.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        if strip_bag {
+            fa.evict_witness_bag();
+        }
+        if strip_rows {
+            fa.evict_refs();
+            fa.evict_symbols();
+        }
+        let arc = Arc::new(fa);
+        self.register_symbols_inner(path, arc.clone(), &feed, &specs);
+        arc
+    }
+
+    fn register_symbols_inner(
+        &self,
+        path: std::path::PathBuf,
+        analysis: Arc<FileAnalysis>,
+        feed: &[(String, bool)],
+        specializes: &[(String, String)],
+    ) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Unconditional: even a file declaring nothing registrable (an
         // include-only shim) must be reachable by whole-project sweeps.
         self.all_files.insert(cached.path.clone(), cached.clone());
-        for sym in &analysis.symbols {
-            // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
-            // the same predicate completion gathering uses, so every name
-            // registered here is also offerable and vice versa.
-            if !analysis.is_linkage_visible(sym) {
-                continue;
-            }
-            self.workspace_modules.insert(sym.name.clone(), ());
+        for (name, is_class) in feed {
+            let sym_name = name;
+            let incoming_is_class = *is_class;
+            self.workspace_modules.insert(sym_name.clone(), ());
             // Keep EVERY candidate for `name` (not just the winner below), so a
             // scoped query can pick the one reachable from its include closure.
             // Keyed by path: a re-registered file (edit, or prototype→definition)
             // REPLACES its own candidate so the scoped lookup never serves a
             // stale analysis, and duplicate paths never stack.
             {
-                let mut v = self.all_defs.entry(sym.name.clone()).or_default();
+                let mut v = self.all_defs.entry(sym_name.clone()).or_default();
                 match v.iter().position(|c| c.path == cached.path) {
                     Some(i) => v[i] = cached.clone(),
                     None => v.push(cached.clone()),
@@ -1070,9 +1239,8 @@ impl ModuleIndex {
             // per-process (the Rayon index registers in nondeterministic
             // order). Break the tie by the smallest canonical path — a
             // stable, order-independent choice.
-            let incoming_is_class = matches!(sym.kind, SymKind::Class);
             use dashmap::mapref::entry::Entry;
-            match self.cache.entry(sym.name.clone()) {
+            match self.cache.entry(sym_name.clone()) {
                 Entry::Vacant(v) => {
                     v.insert(Some(cached.clone()));
                 }
@@ -1081,7 +1249,7 @@ impl ModuleIndex {
                         None => true,
                         Some(existing) => {
                             let existing_is_class =
-                                module_defines_class(existing, &sym.name);
+                                self.module_defines_class(existing, sym_name);
                             match (incoming_is_class, existing_is_class) {
                                 (true, false) => true,  // Class beats Sub/value
                                 (false, true) => false, // Sub/value never beats a Class
@@ -1096,13 +1264,19 @@ impl ModuleIndex {
                 }
             }
         }
+        // The registration record: `unregister_file`'s exact inverse list
+        // and the tie-break's class-rank source (the stored copy's own
+        // `symbols` may be evicted). MUST land before the loop's tie-breaks
+        // on OTHER files consult it — but self-consults during this loop hit
+        // the fallback scan, which is fine for a whole `feed` source.
+        self.registered_names.insert(cached.path.clone(), feed.to_vec());
         // Specialization family edges: primary → spec NAMES. A spec's Class
         // symbol registered above makes `get_cached(spec_name)` resolve, so
         // the reverse map's values are the same by-name keys the rest of the
         // pack index uses. A stale entry (edited file dropped a spec)
         // self-heals at read: `direct_specializations_of` re-checks the pair
         // against the CURRENT analysis.
-        for (spec, primary) in &analysis.specializes {
+        for (spec, primary) in specializes {
             let mut v = self.edges.specs.entry(primary.clone()).or_default();
             if !v.iter().any(|m| m == spec) {
                 v.push(spec.clone());
@@ -1119,37 +1293,47 @@ impl ModuleIndex {
     /// don't linger).
     pub fn unregister_file(&self, path: &std::path::Path) {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let Some((_, old)) = self.all_files.remove(&canon) else { return };
-        for sym in &old.analysis.symbols {
-            if !old.analysis.is_linkage_visible(sym) {
-                continue;
-            }
-            if let Some(mut v) = self.all_defs.get_mut(&sym.name) {
+        if self.all_files.remove(&canon).is_none() {
+            return;
+        }
+        // Symbols may be evicted on the resident copy, and rehydration
+        // would fetch the WRONG generation after an edit persists — so the
+        // inverse runs on the name list registration recorded, not on
+        // `old.analysis.symbols`.
+        let names = self
+            .registered_names
+            .remove(&canon)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        for (name, _) in &names {
+            if let Some(mut v) = self.all_defs.get_mut(name) {
                 v.retain(|c| c.path != canon);
             }
-            self.all_defs.remove_if(&sym.name, |_, v| v.is_empty());
+            self.all_defs.remove_if(name, |_, v| v.is_empty());
             let survivor = self
                 .all_defs
-                .get(&sym.name)
-                .and_then(|v| best_candidate(&v.iter().collect::<Vec<_>>(), &sym.name));
+                .get(name)
+                .and_then(|v| best_candidate(&v.iter().collect::<Vec<_>>(), name, &|m, n| {
+                    self.module_defines_class(m, n)
+                }));
             // Only touch the cache slot if the departing file held it.
             let held = self
                 .cache
-                .get(&sym.name)
+                .get(name)
                 .map(|e| matches!(e.value(), Some(c) if c.path == canon))
                 .unwrap_or(false);
             if held {
                 match survivor {
                     Some(cand) => {
-                        self.cache.insert(sym.name.clone(), Some(cand));
+                        self.cache.insert(name.clone(), Some(cand));
                     }
                     None => {
-                        self.cache.remove(&sym.name);
+                        self.cache.remove(name);
                     }
                 }
             }
-            if !self.all_defs.contains_key(&sym.name) {
-                self.workspace_modules.remove(&sym.name);
+            if !self.all_defs.contains_key(name) {
+                self.workspace_modules.remove(name);
             }
         }
     }
@@ -1321,9 +1505,14 @@ impl ModuleIndex {
         // file's first `package` can differ.
         mut visit: impl FnMut(&str, &Arc<CachedModule>, &crate::file_analysis::Symbol),
     ) {
+        use crate::file_analysis::CrossFileLookup;
         for mod_name in self.modules_bridging_to(class_name) {
             let Some(cached) = self.get_cached(&mod_name) else { continue };
-            for ns in &cached.analysis.plugin_namespaces {
+            // Entities index into `symbols`, which may be evicted on the
+            // resident copy — resolve them against the whole view (same
+            // generation: the LRU is invalidated on every rewrite).
+            let whole = self.whole_present(&cached);
+            for ns in &whole.plugin_namespaces {
                 let bridges_class = ns.bridges.iter().any(|b|
                     matches!(b, crate::file_analysis::Bridge::Class(c) if c == class_name));
                 if !bridges_class { continue; }
@@ -1335,7 +1524,7 @@ impl ModuleIndex {
                 // per-bridge Method fan-out is needed.
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
-                    let Some(sym) = cached.analysis.symbols.get(idx) else { continue };
+                    let Some(sym) = whole.symbols.get(idx) else { continue };
                     visit(&mod_name, &cached, sym);
                 }
             }
@@ -1414,54 +1603,23 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        if !cached.analysis.refs_are_evicted() && !cached.analysis.bag_is_evicted() {
+        if !cached.analysis.refs_are_evicted()
+            && !cached.analysis.bag_is_evicted()
+            && !cached.analysis.symbols_are_evicted()
+        {
             return cached.analysis.clone();
         }
         self.rehydrate_or_resident(cached)
     }
 
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
-        let Some(opener) = self.ref_rows_opener.read().ok().and_then(|g| g.clone()) else {
-            return Vec::new();
-        };
-        fn db_ino(conn: &rusqlite::Connection) -> u64 {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                return conn
-                    .path()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.ino())
-                    .unwrap_or(0);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = conn;
-                0
-            }
-        }
-        // Poison-proof: the Option is a pure cache — a panic in some earlier
-        // holder must not permanently disable retrieval.
-        let mut guard = self
-            .ref_rows_conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((conn, ino)) = guard.as_ref() {
-            if db_ino(conn) != *ino {
-                *guard = None; // file unlinked/recreated — reopen below
-            }
-        }
-        if guard.is_none() {
-            *guard = opener().map(|c| {
-                let ino = db_ino(&c);
-                (c, ino)
-            });
-        }
-        let Some((conn, _)) = guard.as_ref() else { return Vec::new() };
-        crate::module_cache::ref_candidate_files(conn, keys)
-            .into_iter()
-            .map(std::path::PathBuf::from)
-            .collect()
+        self.with_rows_conn(|conn| {
+            crate::module_cache::ref_candidate_files(conn, keys)
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     fn cached_by_path(&self, path: &std::path::Path) -> Option<Arc<CachedModule>> {

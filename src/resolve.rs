@@ -594,16 +594,17 @@ pub fn resolve_symbol_scoped(
                 None if names_visible_macro(&r.target_name, analysis, module_index) => {
                     Some(None)
                 }
-                None => module_index
-                    .and_then(|idx| idx.get_cached(&r.target_name))
-                    .and_then(|cached| {
-                        cached
-                            .analysis
-                            .symbols
-                            .iter()
-                            .filter(|s| s.name == r.target_name)
-                            .find_map(|s| class_or_value(&cached.analysis, s))
-                    }),
+                None => module_index.and_then(|idx| {
+                    let cached = idx.get_cached(&r.target_name)?;
+                    // Whole view: the class-content / file-scope shape tests
+                    // walk symbols, which the resident copy may have evicted.
+                    let whole = idx.whole_present(&cached);
+                    whole
+                        .symbols
+                        .iter()
+                        .filter(|s| s.name == r.target_name)
+                        .find_map(|s| class_or_value(&whole, s))
+                }),
             };
             match resolved {
                 Some(Some((class, bare))) => {
@@ -1045,8 +1046,10 @@ impl<'a> CandidateSet<'a> {
                 if matches!(sym.kind, SymKind::Class) {
                     let enum_name = sym.name.clone();
                     idx.for_each_cached_file(&mut |cached| {
-                        for span in cached
-                            .analysis
+                        // `resolve_enumerator_enum`'s local arm reads the
+                        // copy's own symbols — take the whole view.
+                        for span in idx
+                            .whole_present(cached)
                             .field_sites_for_enum(&enum_name, Some(idx))
                         {
                             out.push(RefLocation {
@@ -1138,7 +1141,7 @@ impl<'a> CandidateSet<'a> {
         // Class-keyed cached module — the fast path when `class` names a
         // struct/class/enum that is itself a cache key.
         if let Some(cached) = idx.get_cached(class) {
-            if let Some(span) = member_span_in(&cached.analysis) {
+            if let Some(span) = member_span_in(&idx.whole_present(&cached)) {
                 return loc_of(&cached, span);
             }
         }
@@ -1160,7 +1163,7 @@ impl<'a> CandidateSet<'a> {
                 if !connected(&cached) {
                     continue;
                 }
-                if let Some(span) = member_span_in(&cached.analysis) {
+                if let Some(span) = member_span_in(&idx.whole_present(&cached)) {
                     return loc_of(&cached, span);
                 }
             }
@@ -1177,7 +1180,9 @@ impl<'a> CandidateSet<'a> {
             if !connected(cached) || Url::from_file_path(&cached.path).is_err() {
                 return;
             }
-            if let Some(span) = member_span_in(&cached.analysis) {
+            // Broad scan, cold tail only (both keyed lookups missed) — the
+            // rehydration LRU bounds the per-file cost for evicted copies.
+            if let Some(span) = member_span_in(&idx.whole_present(cached)) {
                 let p = cached.path.to_string_lossy().into_owned();
                 if hit.as_ref().is_none_or(|(hp, _)| p < *hp) {
                     hit = Some((p, span));
@@ -1298,12 +1303,8 @@ impl<'a> CandidateSet<'a> {
                         continue;
                     }
                     let key = FileKey::Path(cached.path.clone());
-                    for s in cached
-                        .analysis
-                        .symbols
-                        .iter()
-                        .filter(|s| cand_is_def(&cached.analysis, s))
-                    {
+                    let whole = idx.whole_present(&cached);
+                    for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
                         push(&mut defs, &key, s.selection_span);
                     }
                 }
@@ -1423,13 +1424,14 @@ impl<'a> CandidateSet<'a> {
         if let Some(p) = &pkg {
             if let Some(cached) = idx.get_cached(p) {
                 let key = FileKey::Path(cached.path.clone());
-                for s in cached.analysis.symbols.iter().filter(|s| {
+                let whole = idx.whole_present(&cached);
+                for s in whole.symbols.iter().filter(|s| {
                     s.name == name
                         && matches!(s.kind, SymKind::Sub | SymKind::Method)
                         && pkg_ok(s.package.as_deref())
                 }) {
                     let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
-                    push(owner_matched(s.package.as_deref()), fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                    push(owner_matched(s.package.as_deref()), fit, has_body(&whole, s), false, &key, s.selection_span, &mut cands);
                 }
             }
         }
@@ -1451,13 +1453,14 @@ impl<'a> CandidateSet<'a> {
                     continue;
                 }
                 let key = FileKey::Path(cached.path.clone());
-                for s in cached.analysis.symbols.iter().filter(|s| {
+                let whole = idx.whole_present(&cached);
+                for s in whole.symbols.iter().filter(|s| {
                     s.name == name
                         && matches!(s.kind, SymKind::Sub | SymKind::Method)
                         && pkg_ok(s.package.as_deref())
                 }) {
                     let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
-                    push(owner_matched(s.package.as_deref()), fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                    push(owner_matched(s.package.as_deref()), fit, has_body(&whole, s), false, &key, s.selection_span, &mut cands);
                 }
             }
         }
@@ -1761,7 +1764,9 @@ impl<'a> CandidateSet<'a> {
                         // name. One hop to it whenever known: landing on the
                         // consumer's `use` line was never the goal.
                         let def_line = defining.and_then(|cached| {
-                            cached.sub_info(&remote_name).map(|s| s.def_line())
+                            idx.whole_present(&cached)
+                                .sub_info_view(&remote_name)
+                                .map(|s| s.def_line())
                         });
                         if let Some(line) = def_line {
                             return vec![line_loc(module_path, line)];
@@ -1785,7 +1790,11 @@ impl<'a> CandidateSet<'a> {
                     let bare = r.unqualified_target_name();
                     if let Some(cached) = idx.get_cached(pkg) {
                         if Url::from_file_path(&cached.path).is_ok() {
-                            match cached.sub_info(bare).map(|s| s.def_line()) {
+                            match idx
+                                .whole_present(&cached)
+                                .sub_info_view(bare)
+                                .map(|s| s.def_line())
+                            {
                                 Some(line) => return vec![line_loc(cached.path.clone(), line)],
                                 // Fail safe for a pack `Scope::member` miss: the
                                 // owner-anchored member lookup already ran (and
@@ -1813,7 +1822,9 @@ impl<'a> CandidateSet<'a> {
             if let Some((pkg, name)) = r.qualified_var_target() {
                 if let Some(cached) = idx.get_cached(pkg) {
                     if Url::from_file_path(&cached.path).is_ok() {
-                        if let Some(def_line) = cached.package_var_def_line(&name, pkg) {
+                        if let Some(def_line) =
+                            idx.whole_present(&cached).package_var_def_line(&name, pkg)
+                        {
                             return vec![line_loc(cached.path.clone(), def_line)];
                         }
                     }
@@ -1831,8 +1842,8 @@ impl<'a> CandidateSet<'a> {
             if matches!(r.kind, RefKind::PackageRef) {
                 if let Some(cached) = idx.get_cached(&r.target_name) {
                     if Url::from_file_path(&cached.path).is_ok() {
-                        let span = cached
-                            .analysis
+                        let whole = idx.whole_present(&cached);
+                        let span = whole
                             .symbols
                             .iter()
                             .find(|s| {
@@ -1849,10 +1860,10 @@ impl<'a> CandidateSet<'a> {
                             // file top. Pack-only structural gates; Perl module
                             // lookups keep the file-top fallback.
                             .or_else(|| {
-                                cached.analysis.symbols.iter().find(|s| {
+                                whole.symbols.iter().find(|s| {
                                     s.name == r.target_name
-                                        && (cached.analysis.symbol_is_class_content(s)
-                                            || cached.analysis.symbol_is_file_scope_value(s))
+                                        && (whole.symbol_is_class_content(s)
+                                            || whole.symbol_is_file_scope_value(s))
                                 })
                             })
                             .map(|s| s.selection_span)
@@ -1916,7 +1927,8 @@ impl<'a> CandidateSet<'a> {
                         // either way.
                         let module = def_module.as_deref().unwrap_or(class);
                         if let Some(cached) = idx.get_cached(module) {
-                            if let Some(sub_info) = cached.sub_info(method) {
+                            let whole = idx.whole_present(&cached);
+                            if let Some(sub_info) = whole.sub_info_view(method) {
                                 if Url::from_file_path(&cached.path).is_ok() {
                                     return vec![line_loc(
                                         cached.path.clone(),
@@ -1926,13 +1938,13 @@ impl<'a> CandidateSet<'a> {
                             }
                             // cpp data field (or enum constant): a
                             // Variable/Field/Enumerator member, not a sub.
-                            if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                            if let Some(sym) = whole.symbols.iter().find(|s| {
                                 matches!(
                                     s.kind,
                                     SymKind::Variable | SymKind::Field | SymKind::Enumerator
                                 ) && s.name == method
                                     && s.package.as_deref() == Some(class.as_str())
-                                    && cached.analysis.symbol_is_class_content(s)
+                                    && whole.symbol_is_class_content(s)
                             }) {
                                 if Url::from_file_path(&cached.path).is_ok() {
                                     return vec![RefLocation {
@@ -1967,7 +1979,8 @@ impl<'a> CandidateSet<'a> {
             if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
                 let name = r.unqualified_target_name();
                 if let Some(cached) = idx.get_cached(name) {
-                    if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                    let whole = idx.whole_present(&cached);
+                    if let Some(sym) = whole.symbols.iter().find(|s| {
                         s.name == name
                             && matches!(s.kind, SymKind::Sub | SymKind::Variable | SymKind::Enumerator)
                     }) {
@@ -1982,7 +1995,7 @@ impl<'a> CandidateSet<'a> {
                                     rewritable: true,
                                     label: None,
                                 },
-                                &cached.analysis,
+                                &whole,
                             );
                         }
                     }
@@ -2021,8 +2034,8 @@ impl<'a> CandidateSet<'a> {
             return Some(self.origin_decl(sym.selection_span));
         }
         let cached = idx.get_cached(type_name)?;
-        let sym = cached
-            .analysis
+        let whole = idx.whole_present(&cached);
+        let sym = whole
             .symbols
             .iter()
             .find(|s| s.name == type_name && wanted(&s.kind))?;
@@ -2090,13 +2103,15 @@ impl<'a> CandidateSet<'a> {
                         self.origin.include_closure.iter().map(|a| a.as_ref().to_owned()).collect();
                     for (name, cached) in idx.visible_defs_with_prefix(prefix, &visible) {
                         // Only linkage-visible defs (a TU-static never
-                        // completes elsewhere).
-                        let Some(sym) = cached
-                            .analysis
+                        // completes elsewhere). Symbol detail (kind, parent
+                        // enum) reads the whole view — the resident copy may
+                        // be symbol-evicted.
+                        let whole = idx.whole_present(&cached);
+                        let Some(sym) = whole
                             .symbols_named(&name)
                             .iter()
-                            .map(|id| cached.analysis.symbol(*id))
-                            .find(|s| cached.analysis.is_linkage_visible(s))
+                            .map(|id| whole.symbol(*id))
+                            .find(|s| whole.is_linkage_visible(s))
                         else {
                             continue;
                         };
@@ -2329,7 +2344,10 @@ impl<'a> CandidateSet<'a> {
                     }
                     let header =
                         cached.path.file_name().map(|f| f.to_string_lossy().into_owned());
-                    gather(&cached.analysis, header.as_deref(), &mut seen, &mut out);
+                    // The gather reads symbols — closure-connected copies may
+                    // be symbol-evicted; the LRU bounds the rehydration.
+                    let whole = module_index.whole_present(cached);
+                    gather(&whole, header.as_deref(), &mut seen, &mut out);
                 });
             }
         }
@@ -2413,8 +2431,9 @@ fn import_candidates(
                     continue;
                 }
 
-                let rt_prefix = cached
-                    .sub_info(name)
+                let rt_prefix = idx
+                    .whole_present(cached)
+                    .sub_info_view(name)
                     .and_then(|s| s.return_type(None))
                     .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
                     .unwrap_or_default();
@@ -2539,7 +2558,8 @@ fn dispatch_handler_locations(
     let mut locs: Vec<RefLocation> = Vec::new();
     for module_name in module_index.modules_with_symbol(name) {
         let Some(cached) = module_index.get_cached(&module_name) else { continue };
-        for sym in &cached.analysis.symbols {
+        let whole = module_index.whole_present(&cached);
+        for sym in &whole.symbols {
             if sym.name != name {
                 continue;
             }
@@ -3144,7 +3164,9 @@ pub fn refs_to(
                 if !gate(&cached.analysis, &file_str) {
                     continue;
                 }
-                let full = idx.refs_present(&cached);
+                // The matcher reads refs (usage sites) AND symbols
+                // (declaration sites) — take the whole view.
+                let full = idx.whole_present(&cached);
                 collect_from_analysis(
                     &key, &full, target, &aliases, module_index, &file_str, &mut out,
                 );
@@ -3183,7 +3205,11 @@ pub fn refs_to(
                 if !gate(&cached.analysis, &file_str) {
                     return;
                 }
-                collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &file_str, &mut out);
+                // Rows-off fallback sweep: copies here may still be
+                // symbol-evicted (rows exist, retrieval switched off) —
+                // the matcher needs symbols, so take the whole view.
+                let full = idx.whole_present(cached);
+                collect_from_analysis(&key, &full, target, &aliases, module_index, &file_str, &mut out);
             });
         }
     }
@@ -3255,7 +3281,7 @@ pub fn implementations_of(
         } else {
             for m in idx.modules_with_symbol(pkg) {
                 if let Some(c) = idx.get_cached(&m) {
-                    let declares = c.analysis.symbols.iter().any(|s| {
+                    let declares = idx.whole_present(&c).symbols.iter().any(|s| {
                         matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
                     });
                     if declares {
@@ -3273,7 +3299,8 @@ pub fn implementations_of(
             if is_marker {
                 continue;
             }
-            for s in &cached.analysis.symbols {
+            let whole = idx.whole_present(&cached);
+            for s in &whole.symbols {
                 if s.name == target.name
                     && matches!(s.kind, SymKind::Sub | SymKind::Method)
                     && s.package.as_deref() == Some(pkg.as_str())
@@ -3333,7 +3360,8 @@ fn specialization_family(
         // keys everything on — every file defining this spec spelling.
         let Some(idx) = module_index else { continue };
         for cached in idx.def_candidates(spec) {
-            for s in &cached.analysis.symbols {
+            let whole = idx.whole_present(&cached);
+            for s in &whole.symbols {
                 if &s.name == spec && matches!(s.kind, SymKind::Class) {
                     out.push(RefLocation {
                         key: FileKey::Path(cached.path.clone()),
@@ -3769,9 +3797,10 @@ fn pack_symbol_def_location(
         if !seen_paths.insert(cached.path.clone()) {
             continue;
         }
-        for sym in cached.analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+        let whole = module_index.whole_present(&cached);
+        for sym in whole.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
             candidates.push((
-                has_body(&cached.analysis, sym),
+                has_body(&whole, sym),
                 false,
                 cached.path.clone(),
                 sym.selection_span.start.row,

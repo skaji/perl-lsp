@@ -2191,14 +2191,25 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
         let mut results = Vec::new();
+        // Paths a symbols-present resident copy already answered — the rows
+        // pass skips these (open docs and un-evicted copies are fresher than
+        // their persisted rows; evicted copies are rows-guaranteed).
+        let mut covered: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
 
         self.files.for_each_analysis(|key, analysis| {
             let uri = match key {
                 FileKey::Url(u) => u,
                 FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
-                    Url::parse(&format!("file://{}", p.display())).unwrap()
+                    Url::parse(&format!("file://{}", p.display()))
+                        .unwrap()
                 }),
             };
+            if !analysis.symbols_are_evicted() {
+                if let Ok(p) = uri.to_file_path() {
+                    covered.insert(p);
+                }
+            }
             for sym in &analysis.symbols {
                 if sym.name.to_lowercase().contains(&query) {
                     if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
@@ -2221,6 +2232,9 @@ impl LanguageServer for Backend {
         // the FileStore — sweep them so a C typedef/class/free function shows in
         // workspace search alongside Perl packages.
         self.module_index.for_each_pack_registered_file(&mut |path, analysis| {
+            if !analysis.symbols_are_evicted() {
+                covered.insert(path.to_path_buf());
+            }
             let uri = Url::from_file_path(path).unwrap_or_else(|_| {
                 Url::parse(&format!("file://{}", path.display())).unwrap()
             });
@@ -2232,6 +2246,20 @@ impl LanguageServer for Backend {
                 }
             }
         });
+
+        // Rows pass: symbol-evicted copies (Perl workspace + @INC + every
+        // pack tier) answer from the relational store — the resident sweep
+        // above saw empty vecs for them. Same containment test, same
+        // kind/visibility filters as `symbol_to_workspace_info`.
+        for hit in symbols::sym_row_search(&self.module_index, &query) {
+            let path = std::path::PathBuf::from(&hit.path);
+            if covered.contains(&path) {
+                continue;
+            }
+            if let Some(info) = symbols::sym_row_to_workspace_info(&hit) {
+                results.push(info);
+            }
+        }
 
         if results.is_empty() {
             Ok(None)

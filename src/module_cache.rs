@@ -129,7 +129,7 @@ pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Opt
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
 /// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the
 /// next warm re-shreds rows from the already-decoded analyses for free.
-const REF_ROWS_VERSION: &str = "3";
+const REF_ROWS_VERSION: &str = "4";
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -814,6 +814,66 @@ pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
 
 /// Row count for one match key — the count-first surface for hot-name
 /// capping (`docs/adr/relational-ref-index.md`).
+/// The rows-backed workspace/symbol scan: every symbol row whose name
+/// contains `query` (ASCII-case-insensitive, SQLite LIKE semantics — the
+/// same containment test the resident sweep applies). Returns
+/// (path, name, kind_code, span rows/cols, container, flags); the caller
+/// applies the adapter's kind/flag filters and skips paths a fresher
+/// resident copy already answered.
+pub struct SymRowHit {
+    pub path: String,
+    pub name: String,
+    pub kind: u8,
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
+    pub container: Option<String>,
+    pub flags: u8,
+}
+
+pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT f.path, n.s, y.kind, y.start_row, y.start_col, y.end_row, y.end_col,
+                c.s, y.flags
+           FROM syms y
+           JOIN files f ON f.file_id = y.file_id
+           JOIN strings n ON n.str_id = y.name_id
+           LEFT JOIN strings c ON c.str_id = y.container_id
+          WHERE n.s LIKE '%' || ?1 || '%' ESCAPE '\\'",
+    ) else {
+        return out;
+    };
+    // LIKE wildcards in the user's query are literals, not patterns.
+    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let rows = stmt.query_map(params![escaped], |row| {
+        Ok(SymRowHit {
+            path: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get::<_, i64>(2)? as u8,
+            start_row: row.get::<_, i64>(3)? as usize,
+            start_col: row.get::<_, i64>(4)? as usize,
+            end_row: row.get::<_, i64>(5)? as usize,
+            end_col: row.get::<_, i64>(6)? as usize,
+            container: row.get(7)?,
+            flags: row.get::<_, i64>(8)? as u8,
+        })
+    });
+    if let Ok(rows) = rows {
+        for r in rows {
+            match r {
+                Ok(hit) => out.push(hit),
+                Err(e) => {
+                    log::warn!("sym row scan aborted mid-iteration: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
     conn.query_row(
         "SELECT COUNT(*) FROM refs

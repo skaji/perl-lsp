@@ -777,17 +777,31 @@ pub fn index_workspace_with_index(
                 if let Some(idx) = module_index {
                     idx.record_workspace_projections(&path, &fa);
                 }
-                if eviction_enabled() {
-                    fa.evict_witness_bag();
-                    if rows_ok {
-                        fa.evict_refs();
+                // Registration-owned strip: the name/edge feeds read the
+                // WHOLE analysis, then the requested axes evict, then the
+                // stripped arc is stored (feeds must never see an emptied
+                // `symbols`).
+                let strip_bag = eviction_enabled();
+                let strip_rows = strip_bag && rows_ok;
+                let arc = match module_index {
+                    Some(idx) => idx.register_workspace_stripping(
+                        path.clone(),
+                        fa,
+                        strip_bag,
+                        strip_rows,
+                    ),
+                    None => {
+                        if strip_bag {
+                            fa.evict_witness_bag();
+                        }
+                        if strip_rows {
+                            fa.evict_refs();
+                            fa.evict_symbols();
+                        }
+                        std::sync::Arc::new(fa)
                     }
-                }
-                let arc = std::sync::Arc::new(fa);
-                files.insert_workspace_arc(path.clone(), arc.clone());
-                if let Some(idx) = module_index {
-                    idx.register_workspace_resident(path.clone(), arc);
-                }
+                };
+                files.insert_workspace_arc(path.clone(), arc);
                 count.fetch_add(1, Ordering::Relaxed);
                 warmed.insert(path);
             });
@@ -990,6 +1004,7 @@ pub fn index_workspace_with_index(
                     if let Some(idx) = module_index {
                         idx.record_workspace_projections(&canon, &analysis);
                     }
+                    let mut do_strip = false;
                     if persist && !analysis.degraded {
                         if let Some(blob) = module_cache::encode_analysis(&analysis) {
                             let seeds: Vec<_> =
@@ -998,17 +1013,27 @@ pub fn index_workspace_with_index(
                             let closure = analysis.include_closure.clone();
                             let _ = fresh_tx
                                 .send((canon.clone(), blob, seeds, sym_seeds, closure, stamp));
-                            if strip {
-                                analysis.evict_witness_bag();
-                                analysis.evict_refs();
-                            }
+                            do_strip = strip;
                         }
                     }
-                    let arc = std::sync::Arc::new(analysis);
-                    files.insert_workspace_arc(canon.clone(), arc.clone());
-                    if let Some(idx) = module_index {
-                        idx.register_workspace_resident(canon.clone(), arc);
-                    }
+                    // Registration-owned strip — feeds read the whole copy.
+                    let arc = match module_index {
+                        Some(idx) => idx.register_workspace_stripping(
+                            canon.clone(),
+                            analysis,
+                            do_strip,
+                            do_strip,
+                        ),
+                        None => {
+                            if do_strip {
+                                analysis.evict_witness_bag();
+                                analysis.evict_refs();
+                                analysis.evict_symbols();
+                            }
+                            std::sync::Arc::new(analysis)
+                        }
+                    };
+                    files.insert_workspace_arc(canon.clone(), arc);
                     count.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(None) => { /* parse failed, skip */ }
@@ -1214,13 +1239,14 @@ pub fn index_pack_languages(
                         fa.sym_row_seeds(),
                     ));
                 }
-                if eviction_enabled() {
-                    fa.evict_witness_bag();
-                    if rows_ok {
-                        fa.evict_refs();
-                    }
-                }
-                pack_index.register_symbols(path.clone(), Arc::new(fa));
+                // Registration-owned strip (feeds read the whole copy).
+                let strip_bag = eviction_enabled();
+                let _ = pack_index.register_symbols_stripping(
+                    path.clone(),
+                    fa,
+                    strip_bag,
+                    strip_bag && rows_ok,
+                );
                 warmed.insert(path);
             });
             for chunk in pending_backfill.chunks(128) {
@@ -1396,12 +1422,14 @@ pub fn index_pack_languages(
                     } else {
                         None
                     };
-                    if payload.is_some() && strip {
-                        analysis.evict_witness_bag();
-                        analysis.evict_refs();
-                    }
-                    let arc = Arc::new(analysis);
-                    pack_index.register_symbols(path.clone(), arc.clone());
+                    // Registration-owned strip (feeds read the whole copy).
+                    let do_strip = payload.is_some() && strip;
+                    let arc = pack_index.register_symbols_stripping(
+                        path.clone(),
+                        analysis,
+                        do_strip,
+                        do_strip,
+                    );
                     if let Some((blob, seeds, sym_seeds)) = payload {
                         let _ = fresh_tx.send((canon.clone(), arc, blob, seeds, sym_seeds, stamp));
                     }
@@ -1547,10 +1575,8 @@ pub fn pack_file_changed(
         for (p, arc) in &results {
             pack.unregister_file(p);
             if persisted && !arc.degraded && eviction_enabled() {
-                let mut resident = (**arc).clone();
-                resident.evict_witness_bag();
-                resident.evict_refs();
-                pack.register_symbols(p.clone(), Arc::new(resident));
+                // Registration-owned strip (feeds read the whole copy).
+                let _ = pack.register_symbols_stripping((*p).clone(), (**arc).clone(), true, true);
             } else {
                 pack.register_symbols(p.clone(), arc.clone());
             }

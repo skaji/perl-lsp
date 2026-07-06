@@ -159,6 +159,45 @@ eviction), (B) query-time readers needing full Symbol structs (rehydrate),
   index copies; chromium warm floor and wall both drop (target: floor
   ≲ 3.5 GB, wall well under the 9 m decode-everything pass).
 
+## Phase B — landed, measured
+
+Eviction is REGISTRATION-OWNED (`register_symbols_stripping` /
+`register_workspace_stripping`): the name/edge feeds, the class-rank
+record, and the unregister inverse list all extract from the WHOLE
+analysis, then the axes evict, then the stripped arc is stored — a
+caller-side strip would feed registration from an emptied `symbols`
+(exactly the ordering bug the first cut hit). The cache-slot tie-break's
+class rank moved onto the recorded `registered_names` pairs because
+`module_defines_class` on a stripped occupant misjudged every existing
+Class as a value.
+
+The routing fan-out was the predicted risk and the gold net caught what
+the unit suite couldn't: 18 cpp rows regressed on the first eviction flip.
+The recurring miss was MIXED-VIEW expressions — a scan routed to the whole
+view whose inner predicate (`symbol_is_class_content`, resolving the
+owning container through `symbols_named`) still ran on the evicted copy.
+The fixed sites beyond the planned list: the `has_member` ancestor gate,
+`visible_defs_with_prefix`'s detail projection, `type_def_location`'s
+word-resolve tail, the use-site target-minting lane in `resolve()`
+(enum-constant references/rename), `preferred_definitions`' candidate
+scan, and the two closure gathers. Verified: gold 413/16/0/0/0 identical
+cold + warm (cpp build), `--refs-parity` 0 mismatches (bugzilla exhaustive
+5,854 + abseil sampled), abseil `string_view` references byte-identical
+(7,737), workspace/symbol rows-vs-resident set-identical (order differs —
+rows append after the resident sweeps).
+
+Measured (same box, same method):
+
+| | before (PR #108 tip) | phase B |
+|---|---|---|
+| abseil resident payload | 46.1 MB (symbols 21.7, rebuilt 4.9) | **20.2 MB** (symbols 0.0, rebuilt 0.7) |
+| abseil cold / warm RSS | 179 / 69 MB | 158 / **46 MB** |
+| bugzilla cold / warm RSS | 124 / 83 MB | 110 / **72 MB** |
+| references (7,737 sites) | 3.4 s | 5.1 s (rehydrates symbols too; LRU-bound) |
+
+`include_closure` is now 53% of the abseil remainder — the representation
+fork (see `docs/open-forks.md`).
+
 ## Risks
 
 - **Fan-out of symbol readers.** Symbols have far more consumers than refs

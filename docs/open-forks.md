@@ -18,6 +18,49 @@ Format per entry:
 
 ---
 
+## Unregister inverse under symbol eviction: recorded name list vs self-healing candidates — 2026-07-06 — OPEN
+- **Context:** symbols-relational phase B. `unregister_file` walked
+  `old.analysis.symbols` to remove name registrations; under symbol
+  eviction that vec is empty, and rehydrating after an edit persists
+  fetches the NEW generation's names (wrong inverse).
+- **Options:** A — record the registered (name, is-class) pairs per path
+  at registration time (a side map, ~pointers + names). B — make
+  `all_defs`/`cache` self-healing at read (validate candidates against
+  `all_files` membership/Arc identity; registration appends only). C —
+  read the syms rows for the OLD generation before shredding the new one
+  (couples unregister ordering to persistence).
+- **Picked:** A (`ModuleIndex.registered_names`). Exact inverse by
+  construction, no read-path cost, and it doubles as the class-rank
+  source for the cache-slot tie-break (which also read evicted symbols).
+  Cost: one Vec<(String, bool)> per registered file — ~tens of MB at
+  chromium scale, bounded and measured into the floor.
+- **Undo cost:** small — the map is private to `module_index.rs`; B can
+  replace it without touching call sites outside registration/unregister.
+- **Discussion needed:** if the floor budget tightens further, B removes
+  the per-file name copies entirely at the price of lazy consistency
+  (stale candidates until next read).
+
+---
+
+## include_closure representation: interned path pointers vs file-id arrays — 2026-07-06 — OPEN
+- **Context:** chromium warm heap dump post-refs/symbols eviction:
+  `include_closure` is the largest resident bucket — 2,827 MB / 41% at
+  132K files (16-byte `Arc<str>` per closure entry × deep header
+  closures). It is read on hot paths (the refs_to visibility gate, per
+  candidate) so relocation to rows would thrash; this is a REPRESENTATION
+  problem.
+- **Options:** A — global path table + per-file sorted `Arc<[u32]>`
+  (4 bytes/entry, ~4× smaller; gate becomes a binary search over ids).
+  B — dedupe identical closure SETS across files (headers within one
+  subtree share suffixes; measure hit rate first). C — roaring bitmaps
+  over the global file table (best compression, new dep).
+- **Picked:** nothing yet — out of scope for the symbols phase; logged
+  because the measurement moved it to #1.
+- **Undo cost:** n/a (unpicked).
+- **Discussion needed:** whether closure membership checks can move
+  behind a small trait so the representation can change without touching
+  the gates (same seam discipline as the present-views).
+
 ## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — RATIFIED + RENAME LANDED (veesh, 2026-07-05)
 - **Context:** hitlist-3 Family A+I slice. The implicit-member pass is
   gated by the pack's `implicit_this_members` capability. The sibling-CALL

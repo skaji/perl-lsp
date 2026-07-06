@@ -488,3 +488,44 @@ fn edit_swap_drops_names_the_new_version_lost() {
     assert!(idx.get_cached("helper").is_none(), "dropped function gone");
     assert!(idx.get_cached("Crate").is_some(), "new class registered");
 }
+
+/// Symbols relational (phase B): registration-owned strip — the name/edge
+/// feeds and the class-rank record are extracted from the WHOLE analysis
+/// before `symbols` evicts, so lookups, tie-breaks, and the unregister
+/// inverse all survive a symbol-stripped resident copy.
+#[test]
+fn register_symbols_stripping_feeds_before_evict() {
+    use crate::pack_bag_cache::PackBagCache;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let full_syms = full.analysis.symbols.len();
+    assert!(full_syms > 0);
+    let path = full.path.clone();
+
+    let idx = ModuleIndex::new_for_cli();
+    let arc = idx.register_symbols_stripping((*path).to_path_buf(), (*full.analysis).clone(), true, true);
+    assert!(arc.symbols_are_evicted() && arc.symbols.is_empty(), "stored copy is stripped");
+    assert!(arc.refs_are_evicted());
+
+    // Name lookups still resolve — the feed ran on the whole copy. (`make`
+    // is a Sub — C-linkage-visible; a Perl Package symbol is not part of
+    // the pack feed, so the sub name is the right probe here.)
+    let hit = idx.get_cached("make").expect("sub name registered pre-strip");
+    assert_eq!(hit.path, path);
+    assert!(!idx.def_candidates("make").is_empty(), "candidate table fed pre-strip");
+
+    // whole_present rehydrates symbols through the LRU.
+    let full_for_loader = full.analysis.clone();
+    let cache = std::sync::Arc::new(PackBagCache::new(1024 * 1024, move |_p| {
+        Some((*full_for_loader).clone())
+    }));
+    let idx2 = ModuleIndex::new_for_cli().with_bag_cache(cache);
+    let whole = idx2.whole_present(&hit);
+    assert!(!whole.symbols_are_evicted());
+    assert_eq!(whole.symbols.len(), full_syms);
+
+    // The unregister inverse walks the recorded names, not the evicted vec.
+    idx.unregister_file(&path);
+    assert!(idx.get_cached("make").is_none(), "cache slot removed");
+    assert!(idx.def_candidates("make").is_empty(), "candidates removed");
+}
