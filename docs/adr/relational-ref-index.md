@@ -327,10 +327,26 @@ Consequences baked into the design:
    invalidates a changed file's persisted generation and the resident sweep
    covers its fresh full copy).
 
-Deferred, designed to land on the same seam: **symbols relational** (the
-`symbols`/`all_defs` shred — unpins the now-largest resident bucket and
-gives warm start a register-from-tables path that never decodes unqueried
-blobs) and the row-level matcher fast path above.
+4. **Symbols relational** (LANDED — `docs/prompt-symbols-relational.md`):
+   `syms` rows (name, kind, selection span, container, flags) join the
+   derived generation; `evict_symbols` is the third eviction axis;
+   candidate discovery UNIONs syms so declaration-only files are
+   backward-walk candidates; workspace/symbol composes resident sweeps +
+   the workspace-tier rows scan; registration is REGISTRATION-OWNED-strip
+   (feeds + name records extracted pre-strip; stripped fresh copies
+   register in the persist writer post-COMMIT).
+5. **Closure representation** (LANDED): `path_intern::ClosureList` —
+   sorted `Arc<[u32]>` over a process-global path-id table (4 B/entry,
+   membership by id binary-search; blob shape unchanged).
+
+Measured after 4+5 (abseil): resident payload 46.1 → **11.2 MB**
+(symbols 21.7 → 0.0, closures 10.8 → 1.8), warm RSS 69 → **47 MB**;
+bugzilla warm 83 → 75 MB. By the chromium bucket shares this projects the
+6.9 GB warm floor to roughly **1.5–2 GB**.
+
+Deferred, designed to land on the same seam: the register-from-store warm
+start (rides the storage-engine Surface — `docs/prompt-storage-engine.md`)
+and the row-level matcher fast path above.
 
 **Whole-tree Chromium, measured (all three phases, 4-core/15 GB box):**
 the run the baseline could not finish — killed at 20 GB having indexed
