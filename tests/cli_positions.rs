@@ -1,28 +1,39 @@
-//! CLI position-rendering contract: `--references` / `--definition` print
-//! 1-based line:col where col is a **character** column (not a byte offset).
+//! CLI cursor-coordinate contract: **output matches input dialect**.
 //!
-//! Regression guard for the bug where `--references` emitted raw 0-based
-//! tree-sitter `Point`s while `--definition` emitted 1-based, and both used
-//! byte columns — so a token after multi-byte UTF-8 reported a phantom column
-//! past its visible position. The fixture deliberately puts a call site after a
-//! unicode string literal on its line.
+//! Two input forms select two output dialects (the fix for the recurring
+//! 0-based-vs-1-based foot-gun):
+//!   * positional `<file> <line> <col>`      → 0-based line, byte column (engine)
+//!   * `--at <file>:<line>:<col>`            → 1-based line, char column (editor)
+//! The editor form's `path:line:col` output round-trips straight back into the
+//! next query's `--at`. The fixtures deliberately put a call site after a
+//! unicode string literal so byte≠char is exercised on the multibyte line.
 
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_perl-lsp");
 
-/// `(file, 1-based-line, 1-based-char-col)` of every reported reference.
-fn run_references(root: &std::path::Path, file: &str, line: usize, col: usize) -> Vec<(String, u64, u64)> {
-    let mut cache = root.to_path_buf();
-    cache.push(".test-cache");
-    let out = Command::new(BIN)
-        .args(["--references", root.to_str().unwrap(), file, &line.to_string(), &col.to_string()])
-        .current_dir(root)
-        .env("XDG_CACHE_HOME", &cache)
-        .output()
-        .expect("run perl-lsp --references");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+/// Line layout (1-based display lines) shared by these tests:
+///   1: package Greeter;
+///   2: (blank)
+///   3: sub greet { return "hi" }
+///   4: (blank)
+///   5: my $msg = "héllo wörld→"; greet();
+///   6: greet();
+/// Line 5 has multi-byte UTF-8 (é, ö, →) BEFORE the `greet()` call.
+const SRC: &str = "package Greeter;\n\nsub greet { return \"hi\" }\n\nmy $msg = \"héllo wörld→\"; greet();\ngreet();\n";
+
+fn write_fixture(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("perl-lsp-cli-pos-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let lib = dir.join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("Greeter.pm"), SRC).unwrap();
+    dir
+}
+
+/// `(file, line, col)` of every reported reference (as rendered by the tool).
+fn parse_refs(stdout: &str) -> Vec<(String, u64, u64)> {
+    let parsed: serde_json::Value = serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("references JSON parse ({e}): {stdout}"));
     parsed
         .as_array()
@@ -39,65 +50,174 @@ fn run_references(root: &std::path::Path, file: &str, line: usize, col: usize) -
 }
 
 #[test]
-fn references_and_definition_print_one_based_char_columns() {
-    let dir = std::env::temp_dir().join(format!("perl-lsp-cli-pos-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let lib = dir.join("lib");
-    std::fs::create_dir_all(&lib).unwrap();
+fn positional_references_render_zero_based_byte_columns() {
+    let dir = write_fixture("posref");
+    let mut cache = dir.clone();
+    cache.push(".test-cache");
 
-    // Line layout (1-based display lines):
-    //   1: package Greeter;
-    //   2: (blank)
-    //   3: sub greet { return "hi" }
-    //   4: (blank)
-    //   5: my $msg = "héllo wörld→"; greet();
-    //   6: greet();
-    // Line 5 has multi-byte UTF-8 (é, ö, →) BEFORE the `greet()` call, so a
-    // byte-offset column would over-count. We assert the *character* column.
-    let src = "package Greeter;\n\nsub greet { return \"hi\" }\n\nmy $msg = \"héllo wörld→\"; greet();\ngreet();\n";
-    let file = lib.join("Greeter.pm");
-    std::fs::write(&file, src).unwrap();
+    // Positional cursor on the `greet` def name: row 2 (0-based), byte col 4.
+    let out = Command::new(BIN)
+        .args(["--references", dir.to_str().unwrap(), "lib/Greeter.pm", "2", "4"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("run perl-lsp --references");
+    let refs = parse_refs(&String::from_utf8(out.stdout).expect("utf8 stdout"));
 
-    // Cursor on the `greet` def name: line 2 (0-based), col 4 (0-based byte).
-    let refs = run_references(&dir, "lib/Greeter.pm", 2, 4);
-
-    // Ground truth, computed the same way an editor would: 1-based line,
-    // 1-based character column of each `greet` occurrence.
-    let expected: Vec<(u64, u64)> = src
+    // Ground truth in ENGINE coordinates: 0-based row, BYTE column of each hit.
+    let expected: Vec<(u64, u64)> = SRC
         .lines()
         .enumerate()
         .flat_map(|(row, line)| {
             let mut hits = Vec::new();
-            let mut search_from = 0usize;
-            while let Some(byte_idx) = line[search_from..].find("greet") {
-                let abs = search_from + byte_idx;
-                let char_col = line[..abs].chars().count() + 1;
-                hits.push(((row + 1) as u64, char_col as u64));
-                search_from = abs + "greet".len();
+            let mut from = 0usize;
+            while let Some(bi) = line[from..].find("greet") {
+                let abs = from + bi;
+                hits.push((row as u64, abs as u64)); // 0-based row, byte col
+                from = abs + "greet".len();
             }
             hits
         })
         .collect();
 
-    let got: Vec<(u64, u64)> = {
-        let mut v: Vec<(u64, u64)> = refs.iter().map(|(_, l, c)| (*l, *c)).collect();
-        v.sort();
-        v
-    };
+    let mut got: Vec<(u64, u64)> = refs.iter().map(|(_, l, c)| (*l, *c)).collect();
+    got.sort();
     let mut want = expected.clone();
     want.sort();
+    assert_eq!(got, want, "positional input must render 0-based/byte output");
 
-    assert_eq!(got, want, "reported positions must match true token line:col");
-
-    // Specifically pin the unicode line: the `greet()` call on display line 5
-    // starts after `my $msg = "héllo wörld→"; ` — 26 characters → 1-based col 27.
-    // A byte-column renderer would report 31 here (é/ö 2 bytes, → 3 bytes),
-    // past the visible token.
-    let unicode_call = refs.iter().find(|(_, l, _)| *l == 5);
+    // Pin the unicode line: the `greet()` call is at BYTE offset 30 on row 4
+    // (é/ö are 2 bytes, → is 3) — the engine column, not the char column (26).
+    let unicode = refs.iter().find(|(_, l, _)| *l == 4);
     assert_eq!(
-        unicode_call.map(|(_, _, c)| *c),
+        unicode.map(|(_, _, c)| *c),
+        Some(30),
+        "positional output is the byte column on the multibyte line"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn editor_at_references_render_one_based_char_columns() {
+    let dir = write_fixture("atref");
+    let mut cache = dir.clone();
+    cache.push(".test-cache");
+
+    // `--at` cursor on the `greet` def name: editor line 3, char col 5
+    // (`sub greet` → the `g` of greet is the 5th character, 1-based).
+    let out = Command::new(BIN)
+        .args(["--references", dir.to_str().unwrap(), "--at", "lib/Greeter.pm:3:5"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("run perl-lsp --references --at");
+    let refs = parse_refs(&String::from_utf8(out.stdout).expect("utf8 stdout"));
+
+    // Ground truth in EDITOR coordinates: 1-based line, 1-based CHAR column.
+    let expected: Vec<(u64, u64)> = SRC
+        .lines()
+        .enumerate()
+        .flat_map(|(row, line)| {
+            let mut hits = Vec::new();
+            let mut from = 0usize;
+            while let Some(bi) = line[from..].find("greet") {
+                let abs = from + bi;
+                let char_col = line[..abs].chars().count() + 1;
+                hits.push(((row + 1) as u64, char_col as u64));
+                from = abs + "greet".len();
+            }
+            hits
+        })
+        .collect();
+
+    let mut got: Vec<(u64, u64)> = refs.iter().map(|(_, l, c)| (*l, *c)).collect();
+    got.sort();
+    let mut want = expected.clone();
+    want.sort();
+    assert_eq!(got, want, "--at input must render 1-based/char output");
+
+    // The unicode-line call is char col 27 (byte 30 would be wrong).
+    let unicode = refs.iter().find(|(_, l, _)| *l == 5);
+    assert_eq!(
+        unicode.map(|(_, _, c)| *c),
         Some(27),
-        "unicode-line call site must be a character column, not a byte offset"
+        "--at output is the character column on the multibyte line"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tool's own `--definition` `path:line:col` output must paste straight
+/// back into a `--at` query and resolve to the same definition — the headline
+/// round-trip AX win.
+#[test]
+fn definition_output_round_trips_into_at() {
+    let dir = write_fixture("roundtrip");
+    let mut cache = dir.clone();
+    cache.push(".test-cache");
+
+    // Goto-def from the call on editor line 6, char col 1.
+    let def = Command::new(BIN)
+        .args(["--definition", dir.to_str().unwrap(), "--at", "lib/Greeter.pm:6:1"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("run perl-lsp --definition --at");
+    let def_out = String::from_utf8(def.stdout).expect("utf8 stdout");
+    let def_line = def_out.trim();
+    // `sub greet` name → 1-based line 3, char col 5.
+    assert!(def_line.ends_with(":3:5"), "definition (editor dialect) should be 3:5, got {def_line:?}");
+
+    // Feed the ABSOLUTE `path:line:col` straight back into `--at`.
+    let round = Command::new(BIN)
+        .args(["--definition", dir.to_str().unwrap(), "--at", def_line])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("run perl-lsp --definition --at <prev output>");
+    let round_out = String::from_utf8(round.stdout).expect("utf8 stdout");
+    assert!(
+        round_out.trim().ends_with(":3:5"),
+        "pasting --definition output into --at must resolve to the same def, got {round_out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The `[pos]` annotation (stderr) names the dialect, the internal 0-based
+/// point, and the landed token — for both a hit and a whitespace miss.
+#[test]
+fn pos_annotation_reports_dialect_and_landed_token() {
+    let dir = write_fixture("annot");
+    let mut cache = dir.clone();
+    cache.push(".test-cache");
+
+    // Editor form, landing on `greet`.
+    let hit = Command::new(BIN)
+        .args(["--references", dir.to_str().unwrap(), "--at", "lib/Greeter.pm:3:5"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("run");
+    let hit_err = String::from_utf8(hit.stderr).expect("utf8 stderr");
+    assert!(hit_err.contains("read as EDITOR (1-based, char col)"), "annot dialect: {hit_err}");
+    assert!(hit_err.contains("internal 2:4"), "annot internal point: {hit_err}");
+    assert!(hit_err.contains("landed on token: \"greet\""), "annot token: {hit_err}");
+
+    // Positional form landing on whitespace (row 1 is blank) → loud hint that
+    // names the OTHER base.
+    let miss = Command::new(BIN)
+        .args(["--references", dir.to_str().unwrap(), "lib/Greeter.pm", "1", "0"])
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", &cache)
+        .output()
+        .expect("run");
+    let miss_err = String::from_utf8(miss.stderr).expect("utf8 stderr");
+    assert!(miss_err.contains("read as POSITIONAL (0-based, byte col)"), "annot dialect: {miss_err}");
+    assert!(
+        miss_err.contains("whitespace / no token") && miss_err.contains("--at lib/Greeter.pm:2:1"),
+        "whitespace miss must hint the 1-based --at form: {miss_err}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -209,9 +329,9 @@ fn mojo_helper_named_sub_first_param_is_controller() {
 }
 
 #[test]
-fn definition_matches_references_def_site() {
-    // The def site appears in --references output; --definition must agree on
-    // its line:col (both route through one renderer now).
+fn positional_definition_renders_engine_coordinates() {
+    // Positional input → 0-based/byte output, so the def-name coordinates match
+    // the engine point the positional cursor also speaks.
     let dir = std::env::temp_dir().join(format!("perl-lsp-cli-def-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let lib = dir.join("lib");
@@ -222,7 +342,7 @@ fn definition_matches_references_def_site() {
     let mut cache = dir.clone();
     cache.push(".test-cache");
 
-    // Goto-def from the call on line 5 (0-based line 4), cursor on `greet`.
+    // Goto-def from the call on row 4 (0-based), byte col 0, cursor on `greet`.
     let out = Command::new(BIN)
         .args(["--definition", dir.to_str().unwrap(), "lib/Greeter.pm", "4", "0"])
         .current_dir(&dir)
@@ -231,11 +351,11 @@ fn definition_matches_references_def_site() {
         .expect("run perl-lsp --definition");
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
 
-    // The def `sub greet` — name `greet` at 1-based line 3, char col 5.
+    // `sub greet` — name `greet` at engine row 2, byte col 4.
     let trimmed = stdout.trim();
     assert!(
-        trimmed.ends_with(":3:5"),
-        "definition should print 1-based line:col 3:5, got {trimmed:?}"
+        trimmed.ends_with(":2:4"),
+        "positional definition should print 0-based/byte 2:4, got {trimmed:?}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

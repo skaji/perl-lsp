@@ -99,55 +99,50 @@ async fn main() {
             cli_outline(&args[2]);
             return;
         }
-        // `--hover <root> <file> <line> <col>` enables cross-file hover (same
-        // setup as the server); the legacy `--hover <file> <line> <col>` form
-        // stays single-file. Disambiguated by arg count.
+        // `--hover <root> <file> <line> <col>` / `<root> --at <f:l:c>` enables
+        // cross-file hover (same setup as the server); the legacy
+        // `--hover <file> <line> <col>` form stays single-file. The cross-file
+        // form is disambiguated by a leading `--at` or a 4th positional arg.
+        Some("--hover") if args.len() >= 5 && args.get(3).map(|s| s == "--at").unwrap_or(false) => {
+            cli_cursor("hover", &args[2], &args[3..]);
+            return;
+        }
         Some("--hover") if args.len() >= 6 => {
-            cli_hover(Some(&args[2]), &args[3], &args[4], &args[5]);
+            cli_cursor("hover", &args[2], &args[3..6]);
             return;
         }
         Some("--hover") if args.len() == 5 => {
-            cli_hover(None, &args[2], &args[3], &args[4]);
+            cli_hover_single_file(&args[2], &args[3], &args[4]);
             return;
         }
         Some("--type-at") if args.len() >= 5 => {
             cli_type_at(&args[2], &args[3], &args[4]);
             return;
         }
-        Some("--definition") if args.len() >= 6 => {
-            cli_definition(&args[2], &args[3], &args[4], &args[5]);
-            return;
-        }
-        Some("--references") if args.len() >= 6 => {
-            cli_references(&args[2], &args[3], &args[4], &args[5]);
-            return;
-        }
-        Some("--implementations") if args.len() >= 6 => {
-            cli_implementations(&args[2], &args[3], &args[4], &args[5]);
-            return;
-        }
-        Some("--completion") if args.len() >= 6 => {
-            cli_completion(&args[2], &args[3], &args[4], &args[5]);
-            return;
-        }
-        Some("--signature-help") if args.len() >= 6 => {
-            cli_signature_help(&args[2], &args[3], &args[4], &args[5]);
+        // The uniform cursor queries: `<root>` then either `<file> <line> <col>`
+        // (positional, 0-based/byte) or `--at <file>:<line>:<col>` (editor,
+        // 1-based/char). Flag names map 1:1 to the `run_one` query string.
+        Some(
+            flag @ ("--definition" | "--references" | "--implementations" | "--completion"
+            | "--signature-help" | "--document-highlight" | "--linked-editing"),
+        ) if args.len() >= 4 => {
+            cli_cursor(&flag[2..], &args[2], &args[3..]);
             return;
         }
         Some("--semantic-tokens") if args.len() >= 4 => {
             cli_semantic_tokens(&args[2], &args[3]);
             return;
         }
-        Some("--document-highlight") if args.len() >= 6 => {
-            cli_document_highlight(&args[2], &args[3], &args[4], &args[5]);
-            return;
-        }
-        Some("--linked-editing") if args.len() >= 6 => {
-            cli_linked_editing(&args[2], &args[3], &args[4], &args[5]);
+        // `--rename <root> <file> <line> <col> <new>` or
+        // `--rename <root> --at <file>:<line>:<col> <new>`.
+        Some("--rename")
+            if args.len() == 6 && args.get(3).map(|s| s == "--at").unwrap_or(false) =>
+        {
+            cli_rename(&args[2], &args[3..5], &args[5]);
             return;
         }
         Some("--rename") if args.len() == 7 => {
-            cli_rename(&args[2], &args[3], &args[4], &args[5], &args[6]);
+            cli_rename(&args[2], &args[3..6], &args[6]);
             return;
         }
         Some("--workspace-symbol") if args.len() >= 4 => {
@@ -433,13 +428,21 @@ fn print_usage() {
     eprintln!("USAGE:");
     eprintln!("  perl-lsp                                              Start LSP server (stdio)");
     eprintln!();
-    eprintln!("  Positions: <line> <col> input is 0-based (col = byte offset);");
-    eprintln!("             printed line:col output is 1-based (col = character).");
-    eprintln!("             EXCEPTION: --outline's \"line\"/\"col\" JSON fields are");
-    eprintln!("             0-based, matching input — unlike --definition/--references/");
-    eprintln!("             --rename/--workspace-symbol JSON, which follow the 1-based");
-    eprintln!("             output rule above. Existing fixtures pin both forms; this is");
-    eprintln!("             documented, not (yet) unified.");
+    eprintln!("  Cursor position — two input forms, output MATCHES the form you use:");
+    eprintln!("    positional  <file> <line> <col>       0-based line, byte column (engine-native)");
+    eprintln!("                                          -> output renders 0-based / byte too");
+    eprintln!("    editor      --at <file>:<line>:<col>  1-based line, character column (editor-native,");
+    eprintln!("                                          matches grep -n and this tool's own");
+    eprintln!("                                          path:line:col output) -> output renders");
+    eprintln!("                                          1-based / char, so it round-trips straight");
+    eprintln!("                                          back into the next query's --at");
+    eprintln!("    e.g.  perl-lsp --definition <root> lib/Foo.pm 12 4");
+    eprintln!("          perl-lsp --references <root> --at lib/Foo.pm:13:5");
+    eprintln!("    Each cursor query prints a [pos] annotation to stderr showing how the");
+    eprintln!("    input was read, the internal 0-based point, and the landed token.");
+    eprintln!("    --rename accepts both forms too (its edit spans follow the same rule).");
+    eprintln!("    NOTE: --workspace-symbol / --outline JSON always emit engine coordinates");
+    eprintln!("          (0-based / byte); the --batch protocol keeps its established output.");
     eprintln!();
     eprintln!("ANALYSIS:");
     eprintln!("  perl-lsp --check [<root>] [--severity error|warning]    Batch diagnostics (CI)");
@@ -719,51 +722,235 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
-fn span_to_json(span: file_analysis::Span, text: String) -> serde_json::Value {
+/// Which coordinate dialect the CLI renders location output in. Threaded from
+/// input parsing into every location a query emits so **output speaks the same
+/// dialect as the input** — the fix for the 0-based-vs-1-based foot-gun. The
+/// tool's own `path:line:col` output then round-trips straight back into the
+/// next query's `--at`.
+///
+/// - `ZeroBasedByte` — tree-sitter native: 0-based line, byte column. The
+///   dialect of the positional `<file> <line> <col>` form (and the batch/gold
+///   protocol's JSONL input).
+/// - `EditorOneBasedChar` — editor convention: 1-based line, character column.
+///   The dialect of the `--at file:line:col` form, and what the `--batch`
+///   path renders (gold fixtures encode these values — do NOT change it).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoordFmt {
+    ZeroBasedByte,
+    EditorOneBasedChar,
+}
+
+impl CoordFmt {
+    /// Render a tree-sitter `(row, byte_col)` in this dialect. `line_src` is the
+    /// full text of `row` (when available) — needed only to convert byte→char
+    /// for the editor dialect; rows past EOF fall back to the byte column.
+    fn render(self, row: usize, byte_col: usize, line_src: Option<&str>) -> (usize, usize) {
+        match self {
+            CoordFmt::ZeroBasedByte => (row, byte_col),
+            CoordFmt::EditorOneBasedChar => {
+                let char_col = line_src
+                    .map(|line| line.get(..byte_col.min(line.len())).unwrap_or(line).chars().count())
+                    .unwrap_or(byte_col);
+                (row + 1, char_col + 1)
+            }
+        }
+    }
+
+    /// Render an LSP `Position` (already 0-based **character**-counted) in this
+    /// dialect — no byte→char step. Used for the handful of sites that hand back
+    /// an lsp `Location`/`Range` (cpp `#include` goto-def) instead of a raw span.
+    fn render_pos(self, row0: usize, char0: usize) -> (usize, usize) {
+        match self {
+            CoordFmt::ZeroBasedByte => (row0, char0),
+            CoordFmt::EditorOneBasedChar => (row0 + 1, char0 + 1),
+        }
+    }
+}
+
+/// Encode one rename edit's span as JSON in the caller's coordinate dialect.
+/// `sources` supplies per-file text for the byte→char step (editor dialect).
+fn span_to_json(
+    sources: &mut SourceCache,
+    path: &str,
+    span: file_analysis::Span,
+    text: String,
+) -> serde_json::Value {
+    let (line, col) = sources.display(path, span.start.row, span.start.column);
+    let (end_line, end_col) = sources.display(path, span.end.row, span.end.column);
     serde_json::json!({
-        "line": span.start.row, "col": span.start.column,
-        "end_line": span.end.row, "end_col": span.end.column,
+        "line": line, "col": col,
+        "end_line": end_line, "end_col": end_col,
         "new_text": text
     })
 }
 
-/// One-based, character-counted `(line, col)` for human/editor-facing CLI
-/// output. Tree-sitter `Point.column` is a 0-based **byte** offset within the
-/// line; an editor shows a 1-based **character** column. Without the byte→char
-/// step a line with multi-byte UTF-8 before the token reports a column past the
-/// visible position (the "phantom column" QA saw on unicode lines). `source` is
-/// the file's full text; rows past its end fall back to byte+1 (best effort).
-fn display_line_col(source: &str, row: usize, byte_col: usize) -> (usize, usize) {
-    let char_col = source
-        .lines()
-        .nth(row)
-        .map(|line| {
-            let upto = line.get(..byte_col.min(line.len())).unwrap_or(line);
-            upto.chars().count()
-        })
-        .unwrap_or(byte_col);
-    (row + 1, char_col + 1)
+/// Per-file source cache for coordinate rendering — references can fan out
+/// across many files; read each at most once. Carries the `CoordFmt` so every
+/// `display` call renders in one dialect. Misses (unreadable file) degrade to
+/// the raw byte column via `CoordFmt::render`'s fallback.
+struct SourceCache {
+    fmt: CoordFmt,
+    files: std::collections::HashMap<String, Option<String>>,
 }
 
-/// Per-file source cache for `display_line_col` — references can fan out across
-/// many files; read each at most once. Misses (unreadable file) degrade to the
-/// raw byte column via `display_line_col`'s fallback.
-struct SourceCache(std::collections::HashMap<String, Option<String>>);
-
 impl SourceCache {
-    fn new() -> Self {
-        SourceCache(std::collections::HashMap::new())
+    fn new(fmt: CoordFmt) -> Self {
+        SourceCache { fmt, files: std::collections::HashMap::new() }
     }
 
     fn display(&mut self, path: &str, row: usize, byte_col: usize) -> (usize, usize) {
         let src = self
-            .0
+            .files
             .entry(path.to_string())
             .or_insert_with(|| std::fs::read_to_string(path).ok());
-        match src {
-            Some(s) => display_line_col(s, row, byte_col),
-            None => (row + 1, byte_col + 1),
+        let line_src = src.as_deref().and_then(|s| s.lines().nth(row));
+        self.fmt.render(row, byte_col, line_src)
+    }
+}
+
+// ---- Cursor-input parsing (positional vs `--at`) ----
+
+/// A parsed cursor target for a single-mode CLI query: the file, the internal
+/// tree-sitter point (always 0-based / byte column), the `CoordFmt` matching
+/// the input dialect (so output round-trips), and the raw spelling the user
+/// typed (for the `[pos]` self-documenting annotation).
+struct CursorTarget {
+    file: String,
+    point: tree_sitter::Point,
+    fmt: CoordFmt,
+    raw: String,
+}
+
+/// Split a `--at` spec `file:line:col` into its parts. The two rightmost
+/// `:`-fields are line and col; everything before is the file (paths rarely
+/// contain `:`, and taking the last two fields tolerates the ones that do,
+/// e.g. a Windows drive prefix). Returns `(file, line_1based, col_1based)`.
+fn split_at_spec(spec: &str) -> Option<(String, usize, usize)> {
+    let mut it = spec.rsplitn(3, ':');
+    let col: usize = it.next()?.parse().ok()?;
+    let line: usize = it.next()?.parse().ok()?;
+    let file = it.next()?.to_string();
+    if file.is_empty() {
+        return None;
+    }
+    Some((file, line, col))
+}
+
+/// Convert an editor `(line_1based, char_col_1based)` to an internal 0-based
+/// tree-sitter point with a **byte** column — the exact inverse of
+/// `CoordFmt::EditorOneBasedChar` rendering. `source` is the target file's text
+/// (for the char→byte step); without it, the char column is used as the byte
+/// column (best effort, correct for ASCII).
+fn editor_to_internal_point(source: Option<&str>, line1: usize, col1: usize) -> tree_sitter::Point {
+    let row = line1.saturating_sub(1);
+    let char_col = col1.saturating_sub(1);
+    let byte_col = source
+        .and_then(|s| s.lines().nth(row))
+        .map(|line| {
+            line.char_indices()
+                .nth(char_col)
+                .map(|(b, _)| b)
+                .unwrap_or(line.len())
+        })
+        .unwrap_or(char_col);
+    tree_sitter::Point::new(row, byte_col)
+}
+
+/// Parse the cursor arguments that follow `<root>` for a single-mode query.
+/// Two forms, disambiguated by the leading `--at`:
+///   positional:  `<file> <line> <col>`      → 0-based, byte column (engine)
+///   editor:      `--at <file>:<line>:<col>` → 1-based, char column (editor)
+/// The chosen `CoordFmt` rides along so the query's output renders in the same
+/// dialect the input used.
+fn parse_cursor_target(rest: &[String]) -> Option<CursorTarget> {
+    match rest {
+        [flag, spec] if flag == "--at" => {
+            let (file, line1, col1) = split_at_spec(spec)?;
+            let source = std::fs::read_to_string(&file).ok();
+            let point = editor_to_internal_point(source.as_deref(), line1, col1);
+            Some(CursorTarget { file, point, fmt: CoordFmt::EditorOneBasedChar, raw: spec.clone() })
         }
+        [file, line, col] => {
+            let row: usize = line.parse().ok()?;
+            let column: usize = col.parse().ok()?;
+            Some(CursorTarget {
+                file: file.clone(),
+                point: tree_sitter::Point::new(row, column),
+                fmt: CoordFmt::ZeroBasedByte,
+                raw: format!("{} {} {}", file, line, col),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The maximal identifier token containing (or ending just before) `byte_col`
+/// on `line`. Word = alphanumeric or `_`; a cursor sitting one past a token's
+/// end (a common editor placement) still reports that token. `None` means the
+/// cursor landed on whitespace / punctuation — the loud-hint case.
+fn token_at_byte(line: &str, byte_col: usize) -> Option<String> {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    let word_span = |anchor: usize| -> Option<(usize, usize)> {
+        let idx = chars
+            .iter()
+            .position(|&(b, c)| b <= anchor && anchor < b + c.len_utf8())?;
+        if !is_word(chars[idx].1) {
+            return None;
+        }
+        let mut lo = idx;
+        while lo > 0 && is_word(chars[lo - 1].1) {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi + 1 < chars.len() && is_word(chars[hi + 1].1) {
+            hi += 1;
+        }
+        Some((chars[lo].0, chars[hi].0 + chars[hi].1.len_utf8()))
+    };
+    let (s, e) = word_span(byte_col)
+        .or_else(|| byte_col.checked_sub(1).and_then(word_span))?;
+    Some(line[s..e].to_string())
+}
+
+/// Self-documenting `[pos]` annotation (stderr — stdout stays the stable
+/// machine format). Prints exactly how the cursor input was interpreted, the
+/// internal 0-based point, the landed token, and the source line — so the
+/// 0-based/1-based trap announces itself instead of silently mislanding.
+fn emit_pos_annotation(target: &CursorTarget) {
+    let (label, dialect) = match target.fmt {
+        CoordFmt::EditorOneBasedChar => ("EDITOR", "1-based, char col"),
+        CoordFmt::ZeroBasedByte => ("POSITIONAL", "0-based, byte col"),
+    };
+    let row = target.point.row;
+    let bc = target.point.column;
+    eprintln!(
+        "[pos] input {}  read as {} ({})  ->  internal {}:{}",
+        target.raw, label, dialect, row, bc
+    );
+    let source = std::fs::read_to_string(&target.file).ok();
+    match source.as_deref().and_then(|s| s.lines().nth(row)) {
+        Some(line) => {
+            match token_at_byte(line, bc) {
+                Some(tok) => eprintln!("      landed on token: {:?}", tok),
+                None => {
+                    // Whitespace / no token — name the likely fix in the OTHER base.
+                    let hint = match target.fmt {
+                        CoordFmt::EditorOneBasedChar => format!(
+                            "if these are 0-based engine coords, drop --at and pass: {} {} {}",
+                            target.file, row, bc
+                        ),
+                        CoordFmt::ZeroBasedByte => format!(
+                            "if these are 1-based editor coords, use: --at {}:{}:{}",
+                            target.file, row + 1, bc + 1
+                        ),
+                    };
+                    eprintln!("      landed on whitespace / no token — {}", hint);
+                }
+            }
+            eprintln!("      line {}: {}", row + 1, line);
+        }
+        None => eprintln!("      (line {} is past the end of {})", row + 1, target.file),
     }
 }
 
@@ -849,58 +1036,43 @@ fn cli_outline(file: &str) {
     println!("{}", outline_json(&analysis));
 }
 
-/// --hover [<root>] <file> <line> <col> — Type info and docs.
-/// With `root`, runs full startup so hover resolves cross-file (imported
-/// types, inherited + plugin-bridged methods); without it, single-file.
-fn cli_hover(root: Option<&str>, file: &str, line_str: &str, col_str: &str) {
+/// --hover <file> <line> <col> — single-file type info and docs (no index).
+/// The cross-file form (`--hover <root> ...`) routes through `cli_cursor` so it
+/// can never drift from `--batch`; this no-root form has no index, so it keeps
+/// its own path.
+fn cli_hover_single_file(file: &str, line_str: &str, col_str: &str) {
     let point = parse_point(line_str, col_str);
-    // Root form is cross-file: delegate to the single `run_one` path so it can
-    // never drift from `--batch`. The no-root single-file form has no index, so
-    // it keeps its own path (run_one always carries an idx).
-    match root {
-        Some(r) => {
-            let (ws, idx) = cli_full_startup(r);
-            let req = BatchReq {
-                id: String::new(), q: "hover".into(),
-                file: file.to_string(), line: point.row, col: point.column,
-                query: None, newname: None,
-            };
-            print_run_one(&ws, &idx, &req);
+    let (source, _tree, analysis) = parse_file(file);
+    // Pack languages get the language-agnostic renderer (matches the LSP); no
+    // index here, so cross-file function hover is unavailable in this form (use
+    // the root form for that). Perl keeps hover_info.
+    let reg = language_driver::LanguageRegistry::with_enabled();
+    let pack_lang = reg
+        .for_path_sniffed(std::path::Path::new(file), &source)
+        .map(|d| d.id())
+        .filter(|id| *id != "perl");
+    let markdown = match pack_lang {
+        Some(lang) => {
+            let files = file_store::FileStore::new();
+            let cs = resolve::resolve(
+                &files,
+                &analysis,
+                file_store::FileKey::Path(std::path::PathBuf::from(file)),
+                point,
+                None,
+                resolve::OverrideScope::default(),
+            )
+            .with_source(&source)
+            .pack_routed();
+            symbols::pack_hover_markdown(&cs, lang)
         }
-        None => {
-            let (source, _tree, analysis) = parse_file(file);
-            // Pack languages get the language-agnostic renderer (matches the
-            // LSP); no index here, so cross-file function hover is unavailable
-            // in this form (use the root form for that). Perl keeps hover_info.
-            let reg = language_driver::LanguageRegistry::with_enabled();
-            let pack_lang = reg
-                .for_path_sniffed(std::path::Path::new(file), &source)
-                .map(|d| d.id())
-                .filter(|id| *id != "perl");
-            let markdown = match pack_lang {
-                Some(lang) => {
-                    let files = file_store::FileStore::new();
-                    let cs = resolve::resolve(
-                        &files,
-                        &analysis,
-                        file_store::FileKey::Path(std::path::PathBuf::from(file)),
-                        point,
-                        None,
-                        resolve::OverrideScope::default(),
-                    )
-                    .with_source(&source)
-                    .pack_routed();
-                    symbols::pack_hover_markdown(&cs, lang)
-                }
-                None => analysis.hover_info(point, &source, None),
-            };
-            if let Some(markdown) = markdown {
-                println!("{}", markdown);
-            } else {
-                eprintln!("No hover info at {}:{}", line_str, col_str);
-                std::process::exit(1);
-            }
-        }
+        None => analysis.hover_info(point, &source, None),
+    };
+    if let Some(markdown) = markdown {
+        println!("{}", markdown);
+    } else {
+        eprintln!("No hover info at {}:{}", line_str, col_str);
+        std::process::exit(1);
     }
 }
 
@@ -928,21 +1100,16 @@ fn cli_type_at(file: &str, line_str: &str, col_str: &str) {
     std::process::exit(1);
 }
 
-/// Build a cursor `BatchReq` for the single-mode wrappers that share `run_one`.
-fn cursor_req(q: &str, file: &str, line_str: &str, col_str: &str) -> BatchReq {
-    let point = parse_point(line_str, col_str);
-    BatchReq {
-        id: String::new(), q: q.to_string(),
-        file: file.to_string(), line: point.row, col: point.column,
-        query: None, newname: None,
-    }
-}
-
 /// Run `run_one` and reproduce the single-mode contract: `Ok` to stdout,
 /// `Err` to stderr with exit-1 (preserves the "miss → exit 1" behavior every
-/// single-mode command had).
-fn print_run_one(ws: &file_store::FileStore, idx: &module_index::ModuleIndex, req: &BatchReq) {
-    match run_one(ws, idx, req) {
+/// single-mode command had). `fmt` selects the output coordinate dialect.
+fn print_run_one(
+    ws: &file_store::FileStore,
+    idx: &module_index::ModuleIndex,
+    req: &BatchReq,
+    fmt: CoordFmt,
+) {
+    match run_one(ws, idx, req, fmt) {
         Ok(s) => println!("{}", s),
         Err(e) => {
             eprintln!("{}", e);
@@ -951,54 +1118,49 @@ fn print_run_one(ws: &file_store::FileStore, idx: &module_index::ModuleIndex, re
     }
 }
 
-/// --definition <root> <file> <line> <col> — Cross-file goto-def
-fn cli_definition(root: &str, file: &str, line_str: &str, col_str: &str) {
+/// Every uniform cursor query (`--definition` / `--references` /
+/// `--implementations` / `--completion` / `--signature-help` /
+/// `--document-highlight` / `--linked-editing` / cross-file `--hover`). `q` is
+/// the `run_one` query string; `rest` is the cursor args after `<root>` (either
+/// positional `<file> <line> <col>` or `--at <file>:<line>:<col>`). The input
+/// dialect selects the output `CoordFmt`, and a `[pos]` annotation goes to
+/// stderr so the 0-vs-1-based interpretation is never silent.
+fn cli_cursor(q: &str, root: &str, rest: &[String]) {
+    let target = parse_cursor_target(rest).unwrap_or_else(|| {
+        eprintln!(
+            "perl-lsp --{q}: expected `<root> <file> <line> <col>` or `<root> --at <file>:<line>:<col>`"
+        );
+        std::process::exit(2);
+    });
+    emit_pos_annotation(&target);
     let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("definition", file, line_str, col_str));
-}
-
-/// --references <root> <file> <line> <col> — Cross-file find-refs
-fn cli_references(root: &str, file: &str, line_str: &str, col_str: &str) {
-    let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("references", file, line_str, col_str));
-}
-
-/// --implementations <root> <file> <line> <col> — descendant defs of a
-/// method target (role-requires composers, subclass overrides).
-fn cli_implementations(root: &str, file: &str, line_str: &str, col_str: &str) {
-    let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("implementations", file, line_str, col_str));
-}
-
-/// --completion <root> <file> <line> <col> — completion items at point.
-fn cli_completion(root: &str, file: &str, line_str: &str, col_str: &str) {
-    let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("completion", file, line_str, col_str));
-}
-
-/// --signature-help <root> <file> <line> <col> — signature help at point.
-fn cli_signature_help(root: &str, file: &str, line_str: &str, col_str: &str) {
-    let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("signature-help", file, line_str, col_str));
-}
-
-/// --document-highlight <root> <file> <line> <col> — in-file occurrences with
-/// read/write classification.
-fn cli_document_highlight(root: &str, file: &str, line_str: &str, col_str: &str) {
-    let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("document-highlight", file, line_str, col_str));
-}
-
-/// --linked-editing <root> <file> <line> <col> — the co-edit occurrence set.
-fn cli_linked_editing(root: &str, file: &str, line_str: &str, col_str: &str) {
-    let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("linked-editing", file, line_str, col_str));
+    let req = BatchReq {
+        id: String::new(),
+        q: q.to_string(),
+        file: target.file.clone(),
+        line: target.point.row,
+        col: target.point.column,
+        query: None,
+        newname: None,
+    };
+    print_run_one(&ws, &idx, &req, target.fmt);
 }
 
 /// --semantic-tokens <root> <file> — token classification for the file.
 fn cli_semantic_tokens(root: &str, file: &str) {
     let (ws, idx) = cli_full_startup(root);
-    print_run_one(&ws, &idx, &cursor_req("semantic-tokens", file, "1", "0"));
+    let req = BatchReq {
+        id: String::new(),
+        q: "semantic-tokens".into(),
+        file: file.to_string(),
+        line: 0,
+        col: 0,
+        query: None,
+        newname: None,
+    };
+    // semantic-tokens output is independent of the coordinate seam; the batch
+    // dialect keeps it unchanged.
+    print_run_one(&ws, &idx, &req, CoordFmt::EditorOneBasedChar);
 }
 
 /// Build an open `Document` (tree + analysis + stable_outline) and enrich it
@@ -1121,6 +1283,7 @@ fn run_one(
     ws: &file_store::FileStore,
     idx: &module_index::ModuleIndex,
     req: &BatchReq,
+    fmt: CoordFmt,
 ) -> Result<String, String> {
     use tower_lsp::lsp_types::Position;
     let file = req.file.as_str();
@@ -1156,7 +1319,9 @@ fn run_one(
                 if let Some(loc) = symbols::pack_include_definition(&analysis, point, Some(abs.as_path())) {
                     let path = loc.uri.to_file_path().map(|p| p.display().to_string())
                         .unwrap_or_else(|_| loc.uri.to_string());
-                    return Ok(format!("{}:{}:{}", path, loc.range.start.line + 1, loc.range.start.character + 1));
+                    let (line, col) = fmt.render_pos(
+                        loc.range.start.line as usize, loc.range.start.character as usize);
+                    return Ok(format!("{}:{}:{}", path, line, col));
                 }
             }
             let _ = &uri;
@@ -1178,7 +1343,7 @@ fn run_one(
             }
             let locs = cs.definitions();
             if !locs.is_empty() {
-                let mut sources = SourceCache::new();
+                let mut sources = SourceCache::new(fmt);
                 let mut lines = Vec::new();
                 for loc in locs {
                     let path = match &loc.key {
@@ -1201,7 +1366,7 @@ fn run_one(
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
-            let mut sources = SourceCache::new();
+            let mut sources = SourceCache::new(fmt);
             let mut results = Vec::new();
             // Pack languages route through their sub-index (matches goto-def
             // and the LSP server) — the hub only knows Perl modules, so
@@ -1259,7 +1424,7 @@ fn run_one(
             analysis.enrich_imported_types_with_keys(Some(idx));
             let file_path = std::path::Path::new(file).canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
-            let mut sources = SourceCache::new();
+            let mut sources = SourceCache::new(fmt);
             let mut results = Vec::new();
             // Same pack routing as the LSP handler, declared at construction,
             // so the CLI mirror can't diverge: the domain bridge (enum def →
@@ -1399,7 +1564,7 @@ fn run_one(
         "document-highlight" => {
             let doc = cli_open_document(file, idx);
             let highlights = symbols::document_highlights(&doc.analysis, pos, Some(idx));
-            let mut sources = SourceCache::new();
+            let mut sources = SourceCache::new(fmt);
             let path = std::fs::canonicalize(file).map(|p| p.display().to_string())
                 .unwrap_or_else(|_| file.to_string());
             let mut out = String::new();
@@ -1419,7 +1584,7 @@ fn run_one(
                 .unwrap_or_else(|_| file.to_string());
             match symbols::linked_editing_ranges(&doc.analysis, pos, Some(idx)) {
                 Some(ranges) => {
-                    let mut sources = SourceCache::new();
+                    let mut sources = SourceCache::new(fmt);
                     let mut out = String::new();
                     for r in &ranges {
                         let (line, col) = sources.display(&path, r.start.line as usize, r.start.character as usize);
@@ -1480,7 +1645,12 @@ fn run_one(
         }
         "rename" => {
             let new_name = req.newname.clone().unwrap_or_else(|| "RENAMED".to_string());
-            run_rename(ws, idx, file, point, &new_name)
+            // Rename edits are a machine-applied blob keyed on spans, not a
+            // location round-tripped into `--at`, so the batch path emits them
+            // in engine coordinates (0-based / byte) — the historical shape the
+            // gold fixtures encode. The single-mode `--rename` wrapper calls
+            // `run_rename` directly and passes the input dialect instead.
+            run_rename(ws, idx, file, point, &new_name, CoordFmt::ZeroBasedByte)
         }
         "diagnostics" => Ok(batch_diagnostics(ws, idx)),
         other => Err(format!("unknown query: {}", other)),
@@ -1585,6 +1755,7 @@ fn run_rename(
     file: &str,
     point: tree_sitter::Point,
     new_name: &str,
+    fmt: CoordFmt,
 ) -> Result<String, String> {
     use std::collections::HashMap;
     if !resolve::is_valid_rename_name(new_name) {
@@ -1617,6 +1788,7 @@ fn run_rename(
     if cs.resolution().is_none() {
         return Err(format!("Nothing renameable at {}:{}", point.row, point.column));
     }
+    let mut sources = SourceCache::new(fmt);
     let mut all_edits: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     for (loc, text) in cs.rename_edits(new_name)? {
         let path = match &loc.key {
@@ -1624,7 +1796,8 @@ fn run_rename(
             file_store::FileKey::Url(u) => u.to_file_path()
                 .map(|p| p.display().to_string()).unwrap_or_else(|_| u.to_string()),
         };
-        all_edits.entry(path).or_default().push(span_to_json(loc.span, text));
+        let edit = span_to_json(&mut sources, &path, loc.span, text);
+        all_edits.entry(path).or_default().push(edit);
     }
     Ok(serde_json::to_string_pretty(&serde_json::json!(all_edits)).unwrap())
 }
@@ -1727,7 +1900,11 @@ fn cli_batch(root: &str) {
                 .get_or_insert_with(|| batch_diagnostics(&ws, &idx))
                 .clone())
         } else {
-            run_one(&ws, &idx, &req)
+            // The batch protocol's input is engine-native (0-based/byte) and its
+            // output dialect is fixed to what gold fixtures encode: the location
+            // modes render 1-based/char (this fmt), while rename/workspace-symbol
+            // stay engine-coordinated within `run_one` itself.
+            run_one(&ws, &idx, &req, CoordFmt::EditorOneBasedChar)
         };
         let resp = match result {
             Ok(s)  => serde_json::json!({"id": req.id, "ok": true,  "out": s}),
@@ -1738,13 +1915,22 @@ fn cli_batch(root: &str) {
     }
 }
 
-/// --rename <root> <file> <line> <col> <new_name> — Cross-file rename
-fn cli_rename(root: &str, file: &str, line_str: &str, col_str: &str, new_name: &str) {
-    let point = parse_point(line_str, col_str);
+/// --rename <root> <file> <line> <col> <new> (positional, 0-based/byte) or
+/// --rename <root> --at <file>:<line>:<col> <new> (editor, 1-based/char).
+/// `cursor` is the args between `<root>` and `<new>`. Output edit coordinates
+/// match the input dialect.
+fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
+    let target = parse_cursor_target(cursor).unwrap_or_else(|| {
+        eprintln!(
+            "perl-lsp --rename: expected `<root> <file> <line> <col> <new>` or `<root> --at <file>:<line>:<col> <new>`"
+        );
+        std::process::exit(2);
+    });
+    emit_pos_annotation(&target);
     // Full startup so workspace files are built with the same plugins, type
     // inference, and enrichment that the LSP backend would use.
     let (ws, idx) = cli_full_startup(root);
-    match run_rename(&ws, &idx, file, point, new_name) {
+    match run_rename(&ws, &idx, &target.file, target.point, new_name, target.fmt) {
         Ok(s) => println!("{}", s),
         Err(e) => {
             eprintln!("{}", e);
@@ -2019,7 +2205,9 @@ fn cli_workspace_symbol(root: &str, query: &str) {
         file: String::new(), line: 0, col: 0,
         query: Some(query.to_string()), newname: None,
     };
-    print_run_one(&ws, &idx, &req);
+    // workspace-symbol emits engine-coordinated spans (0-based/byte) directly,
+    // independent of the location seam; the dialect here is nominal.
+    print_run_one(&ws, &idx, &req, CoordFmt::ZeroBasedByte);
 }
 
 /// Which symbols a usage heatmap lists: nameable callables and packages.
@@ -2263,7 +2451,8 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     };
     let scope = override_scope_from_env();
 
-    let mut sources = SourceCache::new();
+    // Heatmap output keeps its established 1-based/char coordinates.
+    let mut sources = SourceCache::new(CoordFmt::EditorOneBasedChar);
     let mut symbol_rows: Vec<serde_json::Value> = Vec::new();
     let mut dead_rows: Vec<serde_json::Value> = Vec::new();
 
@@ -2590,4 +2779,94 @@ fn cli_parse(path: &str, lang: Option<&str>) {
     }
     walk(tree.root_node(), None, 0, color);
     println!();
+}
+
+#[cfg(test)]
+mod coord_tests {
+    use super::*;
+
+    #[test]
+    fn zero_based_byte_renders_engine_native() {
+        // row/byte passed straight through; source line ignored.
+        assert_eq!(CoordFmt::ZeroBasedByte.render(4, 30, Some("anything")), (4, 30));
+        // No source line still yields the raw byte column.
+        assert_eq!(CoordFmt::ZeroBasedByte.render(0, 7, None), (0, 7));
+    }
+
+    #[test]
+    fn editor_one_based_char_converts_bytes_on_multibyte_line() {
+        // `my $msg = "héllo wörld→"; greet();` — the `greet` call starts at byte
+        // 30 (é/ö are 2 bytes, → is 3) but character column 26 (0-based) → 27
+        // (1-based). A byte renderer would over-count to 31.
+        let line = "my $msg = \"héllo wörld→\"; greet();";
+        assert_eq!(
+            CoordFmt::EditorOneBasedChar.render(4, 30, Some(line)),
+            (5, 27),
+            "byte 30 on the multibyte line is 1-based char col 27"
+        );
+        // Fallback (no source) uses the byte column directly, 1-based.
+        assert_eq!(CoordFmt::EditorOneBasedChar.render(4, 30, None), (5, 31));
+    }
+
+    #[test]
+    fn editor_input_round_trips_to_internal_and_back() {
+        // Single-line source: editor line 1, char col 27 → internal row 0, byte
+        // 30 (the `g` of greet, after é/ö/→ — char index 26 but byte 30).
+        let source = "my $msg = \"héllo wörld→\"; greet();";
+        let p = editor_to_internal_point(Some(source), 1, 27);
+        assert_eq!((p.row, p.column), (0, 30));
+        // Rendering that internal point back in editor dialect returns 1:27.
+        let line0 = source.lines().next().unwrap();
+        assert_eq!(CoordFmt::EditorOneBasedChar.render(p.row, p.column, Some(line0)), (1, 27));
+    }
+
+    #[test]
+    fn split_at_spec_takes_last_two_colon_fields() {
+        assert_eq!(
+            split_at_spec("absl/mutex.h:163:48"),
+            Some(("absl/mutex.h".to_string(), 163, 48))
+        );
+        // A path with no colons still needs both line and col.
+        assert_eq!(split_at_spec("foo.pm:12"), None);
+        assert_eq!(split_at_spec("foo.pm"), None);
+        // Extra colons (drive prefix) fold into the file part.
+        assert_eq!(
+            split_at_spec("C:/src/x.h:9:3"),
+            Some(("C:/src/x.h".to_string(), 9, 3))
+        );
+    }
+
+    #[test]
+    fn token_at_byte_finds_word_and_flags_whitespace() {
+        let line = "class ABSL_LOCKABLE Mutex {";
+        // On the `M` of Mutex (byte 20).
+        assert_eq!(token_at_byte(line, 20).as_deref(), Some("Mutex"));
+        // One past the end of `Mutex` (the space) still reports it.
+        assert_eq!(token_at_byte(line, 25).as_deref(), Some("Mutex"));
+        // On the `{` — punctuation, no word.
+        assert_eq!(token_at_byte(line, 26), None);
+        // Multibyte: on `greet` after a unicode prefix.
+        let uni = "my $msg = \"héllo wörld→\"; greet();";
+        assert_eq!(token_at_byte(uni, 30).as_deref(), Some("greet"));
+    }
+
+    #[test]
+    fn parse_cursor_target_picks_dialect_from_form() {
+        // Positional → engine dialect.
+        let pos = parse_cursor_target(&[
+            "f.pm".to_string(), "2".to_string(), "4".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(pos.fmt, CoordFmt::ZeroBasedByte);
+        assert_eq!((pos.point.row, pos.point.column), (2, 4));
+        // `--at` (missing file on disk) → editor dialect, char col used as byte.
+        let at = parse_cursor_target(&[
+            "--at".to_string(), "does/not/exist.pm:6:1".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(at.fmt, CoordFmt::EditorOneBasedChar);
+        assert_eq!((at.point.row, at.point.column), (5, 0));
+        // Malformed → None.
+        assert!(parse_cursor_target(&["only-one".to_string()]).is_none());
+    }
 }
