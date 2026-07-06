@@ -1013,7 +1013,7 @@ impl Backend {
         }
         let cached = idx.get_cached(word)?;
         let text = std::fs::read_to_string(&cached.path).ok()?;
-        let (span, line) = pick(&cached.analysis, &text)?;
+        let (span, line) = pick(&idx.whole_present(&cached), &text)?;
         Some((Url::from_file_path(&cached.path).ok(), span, line))
     }
 
@@ -2207,6 +2207,12 @@ impl LanguageServer for Backend {
             };
             if !analysis.symbols_are_evicted() {
                 if let Ok(p) = uri.to_file_path() {
+                    // Claim the canonical spelling too: rows are keyed
+                    // canonical, and an open doc reached through a symlinked
+                    // root must shadow its own persisted rows.
+                    if let Ok(canon) = std::fs::canonicalize(&p) {
+                        covered.insert(canon);
+                    }
                     covered.insert(p);
                 }
             }

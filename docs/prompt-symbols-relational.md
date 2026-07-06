@@ -207,6 +207,67 @@ Measured (same box, same method):
 `include_closure` is now 53% of the abseil remainder — the representation
 fork (see `docs/open-forks.md`).
 
+## Hardening round (8-angle review, applied)
+
+Confirmed and fixed:
+
+- **The edge-index rebuild clobber** (the round's worst): `rebuild_reverse_
+  index*` cleared the edge maps and re-fed them from cache copies — now
+  symbol-evicted — wiping every workspace module's Sub/Method/Package names
+  from `modules_with_symbol`/`find_exporters` on each CLI startup and (racily)
+  in the server. `ModuleEdgeIndexes::feed` is now eviction-aware: it records
+  each module's indexable-name list at whole-copy feed time and replays the
+  record for a stripped copy; `clear()` keeps the records. The local gold net
+  missed this because the rows that exercise it (DateTime typeglobs) skip on
+  this box's archname.
+- **Declaration-only candidate loss**: row retrieval named only files with
+  matching REF rows, so a file that declares `helper` but never mentions it
+  had no candidacy and the workspace sweep saw its evicted (empty) symbols —
+  references/rename silently dropped the def site (reproduced on an FQ-call
+  fixture; NO_EVICT found it, default eviction didn't). `ref_candidate_files`
+  now UNIONs the syms table: declarations are row-discoverable.
+- **Eviction-before-commit**: fresh stripped copies were registered while
+  their blob sat in the writer's queue — a query in that window rehydrated
+  nothing and answered wrong-empty. Stripped fresh entries now register in
+  the writer AFTER their chunk commits (feed halves computed pre-strip ride
+  the channel); until then the file reads as "not yet indexed". This also
+  removes the recovery-clobber (the worker no longer re-registers over the
+  writer's whole-copy self-heal) and the stale-LRU pin (invalidate now
+  precedes registration, here and in `pack_file_changed`).
+- **Tie-break race**: `registered_names` landed after the registration loop,
+  so a concurrent registration's class-rank probe could scan a stripped
+  occupant's empty symbols and let a value steal a Class's cache slot
+  nondeterministically. The record now lands first, and class rank is
+  visibility-independent (matching the old occupant-scan semantics).
+- **Import-tier leak + Unicode divergence in workspace/symbol rows**:
+  `sym_rows_matching` gained the `files.source='workspace'` filter (the
+  resident sweeps never enumerated @INC) and a Rust-side containment
+  fallback for non-ASCII queries (SQLite LIKE is ASCII-only case-insensitive).
+- **Missed raw readers**: `references_mask_for` (EDITABLE silently degraded
+  to VISIBLE on warm runs — now row-filtered + rehydrate-the-few),
+  `pack_xfile_word_at`, the DBIC column gate's projection read, role-requires
+  `provides_method_*`, `resolve_field_group`'s cross-file arms, handler-name
+  completion, plus covered-set canonicalization in both workspace/symbol
+  surfaces.
+- **Efficiency**: `ClosureList::contains_id` + one-per-query id resolution in
+  the backward walk's visibility gate (was a global RwLock read per candidate
+  per def_path); per-request whole-view memo in pack completion; O(n) feed
+  dedup (was O(n²) string scans); commutative closure stamp (was a per-file
+  sort per warm row).
+- **Dead weight**: the superseded `Arc<str>` pool + its serde module and the
+  four `CachedModule` convenience wrappers (each documented "don't call me")
+  are gone; `is_fully_resident()` is the whole-present gate so the next
+  eviction axis extends one conjunction; one `workspace_search_visible`
+  predicate serves both workspace/symbol twins.
+
+Still deferred, deliberately: unifying the two writer-thread pipelines and
+the two backfill loops (one more format change should force it); hoisting the
+workspace/symbol resident+rows composition into one shared fn; a
+`scan_rows` helper owning the step-error policy; row-probing the
+`has_member` ancestor gate instead of rehydrating; borrowing `SymRowSeed`
+transport on same-thread shreds; privatizing `symbols` behind a
+debug-asserting accessor (the structural tripwire — see `docs/open-forks.md`).
+
 ## Risks
 
 - **Fan-out of symbol readers.** Symbols have far more consumers than refs

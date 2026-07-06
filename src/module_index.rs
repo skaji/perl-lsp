@@ -39,6 +39,7 @@ type InferredTypeOwned = crate::file_analysis::InferredType;
 /// (name, declares-a-Class) per visible symbol. Collected before any strip
 /// so the feeds and tie-breaks never read an emptied `symbols`.
 fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut feed: Vec<(String, bool)> = Vec::new();
     for sym in &analysis.symbols {
         // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
@@ -48,11 +49,24 @@ fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
             continue;
         }
         let is_class = matches!(sym.kind, SymKind::Class);
-        match feed.iter_mut().find(|(n, _)| n == &sym.name) {
+        match index.get(sym.name.as_str()) {
             // A file declaring both a value AND a Class under one name
             // ranks as a Class.
-            Some((_, c)) => *c |= is_class,
-            None => feed.push((sym.name.clone(), is_class)),
+            Some(&i) => feed[i].1 |= is_class,
+            None => {
+                index.insert(sym.name.as_str(), feed.len());
+                feed.push((sym.name.clone(), is_class));
+            }
+        }
+    }
+    // Class rank is visibility-INDEPENDENT (the old occupant scan matched
+    // any Class symbol): a non-linkage-visible Class sharing a visible
+    // value's name still ranks the file as declaring that Class.
+    for sym in &analysis.symbols {
+        if matches!(sym.kind, SymKind::Class) {
+            if let Some(&i) = index.get(sym.name.as_str()) {
+                feed[i].1 = true;
+            }
         }
     }
     feed
@@ -139,6 +153,14 @@ pub struct ModuleEdgeIndexes {
     /// `FileAnalysis.specializes`). The `Specializes` family edge's
     /// cross-file half; member resolution never reads it.
     specs: DashMap<String, Vec<String>>,
+    /// The indexable-name list each module last fed — the symbols-derived
+    /// half of `feed`, recorded from the WHOLE analysis so a rebuild over
+    /// symbol-EVICTED cache copies (`rebuild_reverse_index*` after the
+    /// workspace indexer strips) replays the names instead of reading empty
+    /// vecs and silently blinding `modules_with_symbol`/`find_exporters`
+    /// for every workspace module. `clear()` keeps it (rebuilds are exactly
+    /// when it's needed); `purge_module` drops it with the edges.
+    name_records: DashMap<String, Vec<String>>,
 }
 
 impl ModuleEdgeIndexes {
@@ -148,14 +170,31 @@ impl ModuleEdgeIndexes {
             bridges: DashMap::new(),
             children: DashMap::new(),
             specs: DashMap::new(),
+            name_records: DashMap::new(),
         }
     }
 
     /// Register every edge `analysis` contributes under `module_name`.
     /// The ONLY write path besides `purge_module`/`clear` — new edge
-    /// maps get their extraction added here and nowhere else.
+    /// maps get their extraction added here and nowhere else. Eviction-
+    /// aware: a symbol-stripped copy replays its recorded name list; a
+    /// whole copy recomputes and re-records it.
     pub fn feed(&self, module_name: &str, analysis: &FileAnalysis) {
-        for name in Self::indexable_names(analysis) {
+        let names: Vec<String> = if analysis.symbols_are_evicted() {
+            match self.name_records.get(module_name) {
+                Some(rec) => rec.clone(),
+                // No record (a stripped copy fed without ever being fed
+                // whole — shouldn't happen, but degrade to the pinned
+                // export names rather than nothing).
+                None => Self::indexable_names(analysis),
+            }
+        } else {
+            let names = Self::indexable_names(analysis);
+            self.name_records
+                .insert(module_name.to_string(), names.clone());
+            names
+        };
+        for name in names {
             self.names
                 .entry(name)
                 .or_default()
@@ -191,8 +230,12 @@ impl ModuleEdgeIndexes {
                 !mods.is_empty()
             });
         }
+        self.name_records.remove(module_name);
     }
 
+    /// Wipe the edge maps for a rebuild. Deliberately KEEPS `name_records`
+    /// — the rebuild re-feeds from cache copies that may be symbol-evicted,
+    /// and the records are their only complete name source.
     pub fn clear(&self) {
         self.names.clear();
         self.bridges.clear();
@@ -923,11 +966,45 @@ impl ModuleIndex {
         self.cache.insert(module_name, Some(cached));
     }
 
+    /// The name/edge feed half of workspace registration, run on the WHOLE
+    /// analysis BEFORE any strip (a stripped copy's `symbols` is empty and
+    /// would blind the feeds). Returns the module name the residency half
+    /// keys the cache slot on.
+    pub(crate) fn workspace_feed_prestrip(&self, fa: &FileAnalysis) -> Option<String> {
+        let module_name = first_package_name(fa);
+        if let Some(ref name) = module_name {
+            self.workspace_modules.insert(name.clone(), ());
+            self.edges.purge_module(name);
+            self.edges.feed(name, fa);
+        }
+        module_name
+    }
+
+    /// The residency half: the path-keyed registry + the cache slot. For a
+    /// STRIPPED copy this must run only after its blob+rows are COMMITTED —
+    /// an evicted copy registered before its persistence exists rehydrates
+    /// to nothing and answers wrong-empty instead of "not yet indexed".
+    pub(crate) fn register_workspace_residency(
+        &self,
+        path: std::path::PathBuf,
+        arc: Arc<FileAnalysis>,
+        module_name: Option<String>,
+    ) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let cached = Arc::new(CachedModule::new(path, arc));
+        self.all_files.insert(cached.path.clone(), cached.clone());
+        if let Some(name) = module_name {
+            self.cache.insert(name, Some(cached));
+        }
+    }
+
     /// Registration-owned strip: feed the name/edge registrations from the
     /// WHOLE analysis, then evict the requested axes, then store the
     /// stripped arc — so a feed can never read an already-emptied `symbols`
     /// (the ordering bug a caller-side strip invites). Returns the stored
-    /// arc for the caller's FileStore mirror.
+    /// arc for the caller's FileStore mirror. Synchronous-persistence
+    /// callers only (the warm path — the blob already exists on disk);
+    /// the bulk fresh path splits the halves around the writer's COMMIT.
     pub fn register_workspace_stripping(
         &self,
         path: std::path::PathBuf,
@@ -935,13 +1012,7 @@ impl ModuleIndex {
         strip_bag: bool,
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let module_name = first_package_name(&fa);
-        if let Some(ref name) = module_name {
-            self.workspace_modules.insert(name.clone(), ());
-            self.edges.purge_module(name);
-            self.edges.feed(name, &fa);
-        }
+        let module_name = self.workspace_feed_prestrip(&fa);
         if strip_bag {
             fa.evict_witness_bag();
         }
@@ -950,11 +1021,7 @@ impl ModuleIndex {
             fa.evict_symbols();
         }
         let arc = Arc::new(fa);
-        let cached = Arc::new(CachedModule::new(path, arc.clone()));
-        self.all_files.insert(cached.path.clone(), cached.clone());
-        if let Some(name) = module_name {
-            self.cache.insert(name, Some(cached));
-        }
+        self.register_workspace_residency(path, arc.clone(), module_name);
         arc
     }
 
@@ -1176,6 +1243,18 @@ impl ModuleIndex {
     /// axes, then register the stripped arc — the feeds can never read an
     /// already-emptied `symbols`. Returns the stored arc (the worker sends
     /// it to the persist writer).
+    /// The pack feed half, computed on the WHOLE analysis pre-strip: the
+    /// linkage-visible (name, is-class) pairs plus the specialization
+    /// edges, in the exact shape `register_symbols_inner` consumes.
+    pub(crate) fn prepare_pack_feed(
+        fa: &FileAnalysis,
+    ) -> (Vec<(String, bool)>, Vec<(String, String)>) {
+        let feed = collect_linkage_feed(fa);
+        let specs: Vec<(String, String)> =
+            fa.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        (feed, specs)
+    }
+
     pub fn register_symbols_stripping(
         &self,
         path: std::path::PathBuf,
@@ -1198,7 +1277,7 @@ impl ModuleIndex {
         arc
     }
 
-    fn register_symbols_inner(
+    pub(crate) fn register_symbols_inner(
         &self,
         path: std::path::PathBuf,
         analysis: Arc<FileAnalysis>,
@@ -1207,6 +1286,12 @@ impl ModuleIndex {
     ) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        // The registration record FIRST — before all_files/all_defs/cache
+        // publish this (possibly symbol-stripped) copy: a concurrent
+        // registration's tie-break consults the record via
+        // `module_defines_class`, and the fallback symbol scan on a
+        // stripped copy misjudges every Class as a value.
+        self.registered_names.insert(cached.path.clone(), feed.to_vec());
         // Unconditional: even a file declaring nothing registrable (an
         // include-only shim) must be reachable by whole-project sweeps.
         self.all_files.insert(cached.path.clone(), cached.clone());
@@ -1264,12 +1349,6 @@ impl ModuleIndex {
                 }
             }
         }
-        // The registration record: `unregister_file`'s exact inverse list
-        // and the tie-break's class-rank source (the stored copy's own
-        // `symbols` may be evicted). MUST land before the loop's tie-breaks
-        // on OTHER files consult it — but self-consults during this loop hit
-        // the fallback scan, which is fine for a whole `feed` source.
-        self.registered_names.insert(cached.path.clone(), feed.to_vec());
         // Specialization family edges: primary → spec NAMES. A spec's Class
         // symbol registered above makes `get_cached(spec_name)` resolve, so
         // the reverse map's values are the same by-name keys the rest of the
@@ -1603,10 +1682,7 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        if !cached.analysis.refs_are_evicted()
-            && !cached.analysis.bag_is_evicted()
-            && !cached.analysis.symbols_are_evicted()
-        {
+        if cached.analysis.is_fully_resident() {
             return cached.analysis.clone();
         }
         self.rehydrate_or_resident(cached)

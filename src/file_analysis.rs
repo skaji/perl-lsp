@@ -24,39 +24,11 @@ impl CachedModule {
         CachedModule { path, analysis }
     }
 
-    /// Look up metadata for a sub/method in this module.
-    ///
-    /// Returns a lightweight view into the full `FileAnalysis`. Works for
-    /// any declared sub — exported or not.
-    pub fn sub_info(&self, name: &str) -> Option<SubInfo<'_>> {
-        // NOTE: views minted from an index copy read ITS bag — consumers of
-        // the bag-backed accessors (`return_type`, `param_inferred_type`)
-        // must mint from `idx.bag_present(&cached)` via `sub_info_view`
-        // instead, or an evicted copy silently answers "no type".
-        self.analysis.sub_info_view(name)
-    }
-
-    /// Locate a package-global variable declaration — see
-    /// `FileAnalysis::package_var_def_line`. NOTE: reads THIS copy's
-    /// symbols; index copies may be symbol-evicted — call the sibling on a
-    /// `whole_present` view instead.
-    pub fn package_var_def_line(&self, name: &str, package: &str) -> Option<u32> {
-        self.analysis.package_var_def_line(name, package)
-    }
-
-    /// See `FileAnalysis::import_list_candidates`. NOTE: reads THIS copy's
-    /// symbols + bag; index copies may be evicted — call the sibling on a
-    /// `whole_present` view instead.
-    pub fn import_list_candidates(&self) -> Vec<CompletionCandidate> {
-        self.analysis.import_list_candidates()
-    }
-
-    /// See `FileAnalysis::has_sub_in_package`. NOTE: reads THIS copy's
-    /// symbols; index copies may be symbol-evicted — call the sibling on a
-    /// `whole_present` view instead.
-    pub fn has_sub_in_package(&self, name: &str, package: &str) -> bool {
-        self.analysis.has_sub_in_package(name, package)
-    }
+    // Symbol/bag readers deliberately do NOT live on CachedModule: an index
+    // copy may be evicted on any axis, so consumers mint the sibling on a
+    // present view (`idx.whole_present(&cached).sub_info_view(..)` etc.) —
+    // a convenience wrapper here would compile everywhere and silently
+    // answer empty at scale.
 }
 
 /// A view into a module's metadata for a named sub/method.
@@ -292,57 +264,7 @@ impl<'a> SubInfo<'a> {
 /// (file × path). Serialized form stays a plain string sequence — blob
 /// layout unchanged, interning happens on the way in.
 pub mod path_intern {
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    static POOL: OnceLock<Mutex<HashSet<Arc<str>>>> = OnceLock::new();
-
-    pub fn intern(s: &str) -> Arc<str> {
-        let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
-        let mut g = pool.lock().unwrap();
-        intern_locked(&mut g, s)
-    }
-
-    /// Intern a whole closure under ONE lock acquisition — Rayon parse
-    /// workers intern thousands of entries per file; per-element locking
-    /// serializes the pool across every worker.
-    pub fn intern_all<'a>(items: impl Iterator<Item = &'a str>) -> Vec<Arc<str>> {
-        let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
-        let mut g = pool.lock().unwrap();
-        items.map(|s| intern_locked(&mut g, s)).collect()
-    }
-
-    fn intern_locked(g: &mut HashSet<Arc<str>>, s: &str) -> Arc<str> {
-        if let Some(a) = g.get(s) {
-            return a.clone();
-        }
-        let a: Arc<str> = Arc::from(s);
-        g.insert(a.clone());
-        a
-    }
-
-    /// `#[serde(with = "path_intern::vec")]` — a `Vec<Arc<str>>` that reads
-    /// and writes as `Vec<String>` (unchanged on-disk shape), interning each
-    /// element on deserialize.
-    pub mod vec {
-        use super::intern;
-        use std::sync::Arc;
-
-        pub fn serialize<S: serde::Serializer>(
-            v: &[Arc<str>],
-            s: S,
-        ) -> Result<S::Ok, S::Error> {
-            s.collect_seq(v.iter().map(|a| a.as_ref()))
-        }
-
-        pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-            d: D,
-        ) -> Result<Vec<Arc<str>>, D::Error> {
-            use serde::Deserialize;
-            let raw = Vec::<String>::deserialize(d)?;
-            Ok(super::intern_all(raw.iter().map(|s| s.as_str())))
-        }
-    }
+    use std::sync::{Arc, OnceLock};
 
     // ---- Global path-id table (the ClosureList substrate) ----
     //
@@ -410,6 +332,13 @@ pub mod path_intern {
         (g.by_id.len(), bytes)
     }
 
+    /// The id for `s` if any closure has interned it — `None` means no
+    /// closure anywhere contains it. The one-per-query half of the
+    /// `contains_id` fast path.
+    pub fn lookup_id(s: &str) -> Option<u32> {
+        id_lookup(s)
+    }
+
     /// A file's `#include` closure as sorted path-ids over the global
     /// table. Semantically a set of path strings; consumers ask membership
     /// (`contains`) or iterate the strings — the representation is private
@@ -431,6 +360,13 @@ pub mod path_intern {
                 Some(id) => self.0.binary_search(&id).is_ok(),
                 None => false,
             }
+        }
+
+        /// Membership by pre-resolved id — hot loops (the backward walk's
+        /// visibility gate runs once per candidate file) resolve the query
+        /// string to an id ONCE via `lookup_id` and test lock-free here.
+        pub fn contains_id(&self, id: u32) -> bool {
+            self.0.binary_search(&id).is_ok()
         }
 
         pub fn is_empty(&self) -> bool {
@@ -461,8 +397,7 @@ pub mod path_intern {
 
     impl<'de> serde::Deserialize<'de> for ClosureList {
         fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            use serde::Deserialize;
-            let raw = Vec::<String>::deserialize(d)?;
+            let raw = <Vec<String> as serde::Deserialize>::deserialize(d)?;
             Ok(ClosureList::from_iter(raw.iter().map(|s| s.as_str())))
         }
     }
@@ -1709,12 +1644,12 @@ impl Ref {
 }
 
 /// One symbol's projection into the relational store — the enumeration
-/// surface (`docs/prompt-symbols-relational.md`): workspace/symbol answers
-/// from these rows, and the phase-C registration feed reads name + kind +
-/// the linkage flag. Full `Symbol` detail (SymbolDetail, deref stacks,
-/// attributes, full span) stays blob-only and rehydrates. Kind/flag
-/// discriminants are row-format contract: changing them bumps
-/// `REF_ROWS_VERSION`.
+/// surface: workspace/symbol answers from these rows, declaration-only
+/// files become backward-walk candidates through them, and a future
+/// register-from-store warm start reads name + kind + the linkage flag.
+/// Full `Symbol` detail (SymbolDetail, deref stacks, attributes, full
+/// span) stays blob-only and rehydrates. Kind/flag discriminants are
+/// row-format contract: changing them bumps `REF_ROWS_VERSION`.
 #[derive(Debug, Clone)]
 pub struct SymRowSeed {
     pub name: String,
@@ -4538,6 +4473,14 @@ impl FileAnalysis {
     /// "on disk, not resident", never "no symbols".
     pub fn symbols_are_evicted(&self) -> bool {
         self.symbols_evicted
+    }
+
+    /// Whole on EVERY evictable axis — the property `whole_present` gates
+    /// on. New eviction axes extend THIS conjunction (and their `evict_*`
+    /// setter), so multi-axis consumers stay whole-covered by construction
+    /// instead of each spelling its own flag list.
+    pub fn is_fully_resident(&self) -> bool {
+        !self.bag_evicted && !self.refs_evicted && !self.symbols_evicted
     }
 
     pub(crate) fn finalize_post_walk(&mut self) {
@@ -8902,13 +8845,14 @@ impl FileAnalysis {
                         // A class defining its OWN `sub <verb>` overrode DBIC's
                         // verb — the call isn't column-keyed (same gate as the
                         // builder's `user_shadows_verb`).
-                        let shadows = idx.whole_present(&c).symbols.iter().any(|s| {
+                        let whole = idx.whole_present(&c);
+                        let shadows = whole.symbols.iter().any(|s| {
                             matches!(s.kind, SymKind::Sub | SymKind::Method)
                                 && s.name == verb
                                 && s.package.as_deref() == Some(class.as_str())
                         });
                         !shadows
-                            && c.analysis
+                            && whole
                                 .field_projections_named(&key_ref.target_name, &class)
                                 // ONLY a real `Class`-owned column (DBIC /
                                 // Class::Accessor). A Moo/Corinna attr is also a
@@ -10698,9 +10642,11 @@ impl FileAnalysis {
                 let mut provided = false;
                 self.for_each_ancestor_class(pkg, module_index, |a| {
                     let here = self.class_provides_method(a, &name)
-                        || module_index
-                            .and_then(|idx| idx.get_cached(a))
-                            .is_some_and(|c| c.analysis.provides_method_anywhere(&name))
+                        || module_index.is_some_and(|idx| {
+                            idx.get_cached(a).is_some_and(|c| {
+                                idx.whole_present(&c).provides_method_anywhere(&name)
+                            })
+                        })
                         || module_index.is_some_and(|idx| {
                             // Cross-package typeglob installs + plugin
                             // bridges (mirrors `method_resolution_on_class`
@@ -10712,7 +10658,7 @@ impl FileAnalysis {
                             idx.module_declaring_method_in_package(&name, a)
                                 .and_then(|home| idx.get_cached(&home))
                                 .is_some_and(|c| {
-                                    c.analysis.provides_method_in_package(&name, a)
+                                    idx.whole_present(&c).provides_method_in_package(&name, a)
                                 }) || {
                                 let mut hit = false;
                                 idx.for_each_entity_bridged_to(a, &mut |_m, _c, sym| {
@@ -11811,7 +11757,7 @@ pub enum MethodResolution {
     /// plugin BRIDGE (the synthesized symbol lives in bridging module `m`, not
     /// in `class`'s own module); `None` for a real method in `class`'s module.
     /// Every consumer resolves location/signature the same way —
-    /// `get_cached(def_module.unwrap_or(class)).sub_info(method)` — so bridged
+    /// `whole_present(get_cached(def_module.unwrap_or(class))).sub_info_view(method)` — so bridged
     /// helpers and real inherited methods share one code path.
     CrossFile { class: String, def_module: Option<String> },
 }

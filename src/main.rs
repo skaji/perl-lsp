@@ -1640,6 +1640,9 @@ fn run_one(
             for entry in ws.workspace_raw().iter() {
                 let file = entry.key().display().to_string();
                 if !entry.value().symbols_are_evicted() {
+                    if let Ok(canon) = std::fs::canonicalize(entry.key()) {
+                        covered.insert(canon);
+                    }
                     covered.insert(entry.key().clone());
                 }
                 for sym in &entry.value().symbols {

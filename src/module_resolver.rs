@@ -841,14 +841,26 @@ pub fn index_workspace_with_index(
     // racing the bulk index sees each file's rows as soon as its chunk
     // commits. Parse-time stamps ride along so a mid-index edit invalidates
     // the row by construction.
-    type WsFresh = (
-        PathBuf,
-        Vec<u8>,
-        Vec<crate::file_analysis::RefRowSeed>,
-        Vec<crate::file_analysis::SymRowSeed>,
-        crate::file_analysis::path_intern::ClosureList,
-        (i64, i64),
-    );
+    // Entries whose resident copy was STRIPPED defer their residency
+    // registration to the writer (post-COMMIT): an evicted copy registered
+    // before its blob exists rehydrates to nothing and serves wrong-empty.
+    struct WsFresh {
+        path: PathBuf,
+        /// The copy to register on `deferred` entries (stripped; the feed
+        /// half already ran on the whole analysis).
+        arc: std::sync::Arc<crate::file_analysis::FileAnalysis>,
+        /// Cache-slot key from the pre-strip feed half (`None` for
+        /// packageless entrypoint scripts — they get only the path entry).
+        module_name: Option<String>,
+        /// Register + mirror in the writer after COMMIT. `false` = the
+        /// worker already registered a WHOLE copy (NO_EVICT); persist only.
+        deferred: bool,
+        blob: Vec<u8>,
+        seeds: Vec<crate::file_analysis::RefRowSeed>,
+        sym_seeds: Vec<crate::file_analysis::SymRowSeed>,
+        closure: crate::file_analysis::path_intern::ClosureList,
+        stamp: (i64, i64),
+    }
     let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
     let timing = crate::timings::is_enabled();
 
@@ -870,49 +882,66 @@ pub fn index_workspace_with_index(
                 // that reads before writing can hit an unretryable
                 // SQLITE_BUSY_SNAPSHOT against the resolver thread's writes.
                 let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
-                for (path, blob, seeds, sym_seeds, closure, stamp) in batch.iter() {
-                    let path_str = path.to_string_lossy();
+                for e in batch.iter() {
+                    let path_str = e.path.to_string_lossy();
                     module_cache::save_blob_to_db_stamped(
-                        conn, &path_str, path, closure, blob, "workspace", *stamp,
+                        conn, &path_str, &e.path, &e.closure, &e.blob, "workspace", e.stamp,
                     );
-                    if let Err(e) = module_cache::shred_derived_rows(
-                        conn, &path_str, "workspace", seeds, sym_seeds,
+                    if let Err(err) = module_cache::shred_derived_rows(
+                        conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
                     ) {
-                        log::warn!("Failed to shred derived rows for {:?}: {}", path, e);
+                        log::warn!("Failed to shred derived rows for {:?}: {}", e.path, err);
                     }
                 }
-                if txn_open {
-                    if let Err(e) = conn.execute_batch("COMMIT") {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        // The chunk rolled back but resident copies were
-                        // already stripped. The blob in hand IS the whole
-                        // analysis — un-strip by re-registering full copies,
-                        // so nothing is lost beyond the persistence itself
-                        // (disk full / lock storm stays loud AND self-heals).
-                        log::error!(
-                            "Workspace persist commit failed ({} files, re-registering whole copies): {}",
-                            batch.len(),
-                            e
-                        );
-                        for (path, blob, ..) in batch.iter() {
-                            if let Some(fa) = module_cache::decode_analysis(blob) {
-                                let arc = std::sync::Arc::new(fa);
-                                files.insert_workspace_arc(path.clone(), arc.clone());
-                                if let Some(idx) = module_index {
-                                    idx.register_workspace_resident(path.clone(), arc);
-                                }
+                let committed = txn_open
+                    && match conn.execute_batch("COMMIT") {
+                        Ok(()) => true,
+                        Err(err) => {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            log::error!(
+                                "Workspace persist commit failed ({} files, registering whole copies): {}",
+                                batch.len(),
+                                err
+                            );
+                            false
+                        }
+                    };
+                if committed {
+                    for e in batch.drain(..) {
+                        if let Some(idx) = module_index {
+                            // Clear any stale LRU pin BEFORE the stripped
+                            // copy becomes reachable, so its first
+                            // rehydration reads the just-committed blob.
+                            idx.invalidate_bag_cache(&e.path);
+                        }
+                        if e.deferred {
+                            files.insert_workspace_arc(e.path.clone(), e.arc.clone());
+                            if let Some(idx) = module_index {
+                                idx.register_workspace_residency(
+                                    e.path, e.arc, e.module_name,
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    // The chunk never landed but the copies were stripped
+                    // for it. The blob in hand IS the whole analysis —
+                    // register full copies instead, so nothing is lost
+                    // beyond the persistence itself (disk full / lock storm
+                    // stays loud AND self-heals).
+                    for e in batch.drain(..) {
+                        if let Some(idx) = module_index {
+                            idx.invalidate_bag_cache(&e.path);
+                        }
+                        if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                            let arc = std::sync::Arc::new(fa);
+                            files.insert_workspace_arc(e.path.clone(), arc.clone());
+                            if let Some(idx) = module_index {
+                                idx.register_workspace_resident(e.path.clone(), arc);
                             }
                         }
                     }
                 }
-                // A racing query may have pinned the previous generation in
-                // the rehydration LRU while this chunk was in flight.
-                if let Some(idx) = module_index {
-                    for (path, ..) in batch.iter() {
-                        idx.invalidate_bag_cache(path);
-                    }
-                }
-                batch.clear();
             };
             // A panic anywhere in a chunk must not kill the writer (workers
             // keep stripping copies whose sends would silently fail) — treat
@@ -923,19 +952,18 @@ pub fn index_workspace_with_index(
                 }));
                 if r.is_err() {
                     log::error!(
-                        "workspace writer chunk panicked ({} files) — re-registering whole copies",
+                        "workspace writer chunk panicked ({} files) — registering whole copies",
                         batch.len()
                     );
-                    for (path, blob, ..) in batch.iter() {
-                        if let Some(fa) = module_cache::decode_analysis(blob) {
+                    for e in batch.drain(..) {
+                        if let Some(fa) = module_cache::decode_analysis(&e.blob) {
                             let arc = std::sync::Arc::new(fa);
-                            files.insert_workspace_arc(path.clone(), arc.clone());
+                            files.insert_workspace_arc(e.path.clone(), arc.clone());
                             if let Some(idx) = module_index {
-                                idx.register_workspace_resident(path.clone(), arc);
+                                idx.register_workspace_resident(e.path.clone(), arc);
                             }
                         }
                     }
-                    batch.clear();
                 }
             };
             while let Ok(entry) = fresh_rx.recv() {
@@ -1004,36 +1032,68 @@ pub fn index_workspace_with_index(
                     if let Some(idx) = module_index {
                         idx.record_workspace_projections(&canon, &analysis);
                     }
-                    let mut do_strip = false;
-                    if persist && !analysis.degraded {
-                        if let Some(blob) = module_cache::encode_analysis(&analysis) {
+                    let payload = if persist && !analysis.degraded {
+                        module_cache::encode_analysis(&analysis).map(|blob| {
                             let seeds: Vec<_> =
                                 analysis.refs.iter().map(|r| r.row_seed()).collect();
                             let sym_seeds = analysis.sym_row_seeds();
                             let closure = analysis.include_closure.clone();
-                            let _ = fresh_tx
-                                .send((canon.clone(), blob, seeds, sym_seeds, closure, stamp));
-                            do_strip = strip;
-                        }
-                    }
-                    // Registration-owned strip — feeds read the whole copy.
-                    let arc = match module_index {
-                        Some(idx) => idx.register_workspace_stripping(
-                            canon.clone(),
-                            analysis,
-                            do_strip,
-                            do_strip,
-                        ),
-                        None => {
-                            if do_strip {
-                                analysis.evict_witness_bag();
-                                analysis.evict_refs();
-                                analysis.evict_symbols();
-                            }
-                            std::sync::Arc::new(analysis)
-                        }
+                            (blob, seeds, sym_seeds, closure)
+                        })
+                    } else {
+                        None
                     };
-                    files.insert_workspace_arc(canon.clone(), arc);
+                    if strip && payload.is_some() {
+                        // Stripped copy: feed half now (whole analysis),
+                        // residency + FileStore mirror in the writer AFTER
+                        // its chunk commits. Until then the file reads as
+                        // "not yet indexed" — never wrong-empty.
+                        let module_name =
+                            module_index.and_then(|idx| idx.workspace_feed_prestrip(&analysis));
+                        analysis.evict_witness_bag();
+                        analysis.evict_refs();
+                        analysis.evict_symbols();
+                        let arc = std::sync::Arc::new(analysis);
+                        let (blob, seeds, sym_seeds, closure) = payload.unwrap();
+                        let _ = fresh_tx.send(WsFresh {
+                            path: canon.clone(),
+                            arc,
+                            module_name,
+                            deferred: true,
+                            blob,
+                            seeds,
+                            sym_seeds,
+                            closure,
+                            stamp,
+                        });
+                    } else {
+                        // Whole copy (no persistence, degraded, or NO_EVICT):
+                        // safe to register immediately; still persist when a
+                        // blob exists.
+                        let arc = std::sync::Arc::new(analysis);
+                        if let Some(idx) = module_index {
+                            let module_name = idx.workspace_feed_prestrip(&arc);
+                            idx.register_workspace_residency(
+                                canon.clone(),
+                                arc.clone(),
+                                module_name,
+                            );
+                        }
+                        if let Some((blob, seeds, sym_seeds, closure)) = payload {
+                            let _ = fresh_tx.send(WsFresh {
+                                path: canon.clone(),
+                                arc: arc.clone(),
+                                module_name: None,
+                                deferred: false,
+                                blob,
+                                seeds,
+                                sym_seeds,
+                                closure,
+                                stamp,
+                            });
+                        }
+                        files.insert_workspace_arc(canon.clone(), arc);
+                    }
                     count.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(None) => { /* parse failed, skip */ }
@@ -1288,14 +1348,22 @@ pub fn index_pack_languages(
         // whenever a DB exists; only the resident STRIP obeys the eviction
         // switch (the bag/refs are stripped only when recoverable — persisted
         // and non-degraded).
-        type FreshEntry = (
-            PathBuf,
-            Arc<crate::file_analysis::FileAnalysis>,
-            Vec<u8>,
-            Vec<crate::file_analysis::RefRowSeed>,
-            Vec<crate::file_analysis::SymRowSeed>,
-            (i64, i64),
-        );
+        // Stripped fresh entries defer registration to the writer (post-
+        // COMMIT) — same rationale as the workspace indexer's WsFresh. The
+        // feed rides along (computed pre-strip); `deferred: false` means the
+        // worker registered a whole copy (NO_EVICT) and the writer only
+        // persists.
+        struct FreshEntry {
+            path: PathBuf,
+            arc: Arc<crate::file_analysis::FileAnalysis>,
+            feed: Vec<(String, bool)>,
+            specs: Vec<(String, String)>,
+            deferred: bool,
+            blob: Vec<u8>,
+            seeds: Vec<crate::file_analysis::RefRowSeed>,
+            sym_seeds: Vec<crate::file_analysis::SymRowSeed>,
+            stamp: (i64, i64),
+        }
         let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<FreshEntry>();
         let persist = conn.is_some();
         let strip = persist && eviction_enabled();
@@ -1314,45 +1382,56 @@ pub fn index_pack_languages(
                     }
                     // IMMEDIATE — same snapshot rationale as the workspace writer.
                     let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
-                    for (path, arc, blob, seeds, sym_seeds, stamp) in batch.iter() {
-                        let path_str = path.to_string_lossy();
+                    for e in batch.iter() {
+                        let path_str = e.path.to_string_lossy();
                         module_cache::save_blob_to_db_stamped(
                             conn,
                             &path_str,
-                            path,
-                            &arc.include_closure,
-                            blob,
+                            &e.path,
+                            &e.arc.include_closure,
+                            &e.blob,
                             "workspace",
-                            *stamp,
+                            e.stamp,
                         );
-                        if let Err(e) = module_cache::shred_derived_rows(
-                            conn, &path_str, "workspace", seeds, sym_seeds,
+                        if let Err(err) = module_cache::shred_derived_rows(
+                            conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
                         ) {
-                            log::warn!("Failed to shred derived rows for {:?}: {}", path, e);
+                            log::warn!("Failed to shred derived rows for {:?}: {}", e.path, err);
                         }
                     }
-                    if txn_open {
-                        if let Err(e) = conn.execute_batch("COMMIT") {
-                            let _ = conn.execute_batch("ROLLBACK");
-                            log::error!(
-                                "Pack persist commit failed ({} files, re-registering whole copies): {}",
-                                batch.len(),
-                                e
-                            );
-                            for (path, _arc, blob, ..) in batch.iter() {
-                                if let Some(fa) = module_cache::decode_analysis(blob) {
-                                    pack_index_writer
-                                        .register_symbols(path.clone(), Arc::new(fa));
-                                }
+                    let committed = txn_open
+                        && match conn.execute_batch("COMMIT") {
+                            Ok(()) => true,
+                            Err(err) => {
+                                let _ = conn.execute_batch("ROLLBACK");
+                                log::error!(
+                                    "Pack persist commit failed ({} files, registering whole copies): {}",
+                                    batch.len(),
+                                    err
+                                );
+                                false
+                            }
+                        };
+                    if committed {
+                        for e in batch.drain(..) {
+                            // Stale-pin clear BEFORE the stripped copy is
+                            // reachable, so its first rehydration reads the
+                            // just-committed blob.
+                            pack_index_writer.invalidate_bag_cache(&e.path);
+                            if e.deferred {
+                                pack_index_writer.register_symbols_inner(
+                                    e.path, e.arc, &e.feed, &e.specs,
+                                );
+                            }
+                        }
+                    } else {
+                        for e in batch.drain(..) {
+                            pack_index_writer.invalidate_bag_cache(&e.path);
+                            if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                                pack_index_writer.register_symbols(e.path, Arc::new(fa));
                             }
                         }
                     }
-                    // A racing query may have pinned the previous generation
-                    // in the rehydration LRU while this chunk was in flight.
-                    for (path, ..) in batch.iter() {
-                        pack_index_writer.invalidate_bag_cache(path);
-                    }
-                    batch.clear();
                 };
                 let mut safe_chunk = |batch: &mut Vec<FreshEntry>| {
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1360,15 +1439,14 @@ pub fn index_pack_languages(
                     }));
                     if r.is_err() {
                         log::error!(
-                            "pack writer chunk panicked ({} files) — re-registering whole copies",
+                            "pack writer chunk panicked ({} files) — registering whole copies",
                             batch.len()
                         );
-                        for (path, _arc, blob, ..) in batch.iter() {
-                            if let Some(fa) = module_cache::decode_analysis(blob) {
-                                pack_index_writer.register_symbols(path.clone(), Arc::new(fa));
+                        for e in batch.drain(..) {
+                            if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                                pack_index_writer.register_symbols(e.path, Arc::new(fa));
                             }
                         }
-                        batch.clear();
                     }
                 };
                 while let Ok(entry) = fresh_rx.recv() {
@@ -1422,16 +1500,45 @@ pub fn index_pack_languages(
                     } else {
                         None
                     };
-                    // Registration-owned strip (feeds read the whole copy).
-                    let do_strip = payload.is_some() && strip;
-                    let arc = pack_index.register_symbols_stripping(
-                        path.clone(),
-                        analysis,
-                        do_strip,
-                        do_strip,
-                    );
-                    if let Some((blob, seeds, sym_seeds)) = payload {
-                        let _ = fresh_tx.send((canon.clone(), arc, blob, seeds, sym_seeds, stamp));
+                    if strip && payload.is_some() {
+                        // Stripped copy: compute the feed pre-strip, hand
+                        // BOTH to the writer — it registers after the chunk
+                        // COMMITS, so an evicted copy is never reachable
+                        // before its blob can rehydrate it.
+                        let (feed, specs) =
+                            crate::module_index::ModuleIndex::prepare_pack_feed(&analysis);
+                        analysis.evict_witness_bag();
+                        analysis.evict_refs();
+                        analysis.evict_symbols();
+                        let arc = Arc::new(analysis);
+                        let (blob, seeds, sym_seeds) = payload.unwrap();
+                        let _ = fresh_tx.send(FreshEntry {
+                            path: canon.clone(),
+                            arc,
+                            feed,
+                            specs,
+                            deferred: true,
+                            blob,
+                            seeds,
+                            sym_seeds,
+                            stamp,
+                        });
+                    } else {
+                        let arc = Arc::new(analysis);
+                        pack_index.register_symbols(path.clone(), arc.clone());
+                        if let Some((blob, seeds, sym_seeds)) = payload {
+                            let _ = fresh_tx.send(FreshEntry {
+                                path: canon.clone(),
+                                arc,
+                                feed: Vec::new(),
+                                specs: Vec::new(),
+                                deferred: false,
+                                blob,
+                                seeds,
+                                sym_seeds,
+                                stamp,
+                            });
+                        }
                     }
                     total.fetch_add(1, Ordering::Relaxed);
                     // Residency: this file's merged/expanded macro tables are a
@@ -1580,13 +1687,17 @@ pub fn pack_file_changed(
     if let Some(ref pack) = pack {
         for (p, arc) in &results {
             pack.unregister_file(p);
+            // Drop the stale LRU pin BEFORE the new stripped copy becomes
+            // reachable — a query racing this re-register must not
+            // rehydrate the pre-edit generation against the new
+            // registration (the blob+rows committed above).
+            pack.invalidate_bag_cache(p);
             if persisted && !arc.degraded && eviction_enabled() {
                 // Registration-owned strip (feeds read the whole copy).
                 let _ = pack.register_symbols_stripping((*p).clone(), (**arc).clone(), true, true);
             } else {
                 pack.register_symbols(p.clone(), arc.clone());
             }
-            pack.invalidate_bag_cache(p);
         }
     }
 }

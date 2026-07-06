@@ -489,10 +489,10 @@ fn edit_swap_drops_names_the_new_version_lost() {
     assert!(idx.get_cached("Crate").is_some(), "new class registered");
 }
 
-/// Symbols relational (phase B): registration-owned strip — the name/edge
-/// feeds and the class-rank record are extracted from the WHOLE analysis
-/// before `symbols` evicts, so lookups, tie-breaks, and the unregister
-/// inverse all survive a symbol-stripped resident copy.
+/// Registration-owned strip: the name/edge feeds and the class-rank record
+/// are extracted from the WHOLE analysis before `symbols` evicts, so
+/// lookups, tie-breaks, and the unregister inverse all survive a
+/// symbol-stripped resident copy.
 #[test]
 fn register_symbols_stripping_feeds_before_evict() {
     use crate::pack_bag_cache::PackBagCache;

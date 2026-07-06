@@ -515,21 +515,22 @@ fn closure_stamp(
     if closure.is_empty() {
         return 0;
     }
-    // Deterministic member order: the id-list iterates in global mint
-    // order, which varies run-to-run (Rayon interning races) — an
-    // order-sensitive hash would invalidate every warm row. Sort the
-    // strings.
-    let mut members: Vec<std::sync::Arc<str>> = closure.iter_strs().collect();
-    members.sort();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for p in members {
+    // Commutative fold: the id-list iterates in global mint order, which
+    // varies run-to-run (Rayon interning races) — an order-sensitive hash
+    // would invalidate every warm row every session, and sorting per file
+    // per warm row is n·log n string compares on the path the stamp exists
+    // to make cheap. Hash each member independently, fold order-free.
+    let mut acc: u64 = 0;
+    for p in closure.iter_strs() {
         let stamp = *stat_memo
             .entry(p.as_ref().to_owned())
             .or_insert_with(|| file_stamp(std::path::Path::new(p.as_ref())).unwrap_or((0, -1)));
+        let mut h = std::collections::hash_map::DefaultHasher::new();
         p.as_ref().hash(&mut h);
         stamp.hash(&mut h);
+        acc = acc.wrapping_add(h.finish());
     }
-    h.finish() as i64
+    acc as i64
 }
 
 /// Serialize FileAnalysis via bincode then compress with zstd.
@@ -786,10 +787,18 @@ pub fn has_ref_rows(conn: &Connection, path: &str) -> bool {
 /// SQL arms rehydrate and run the (unchanged) matcher over.
 pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
     let mut out = Vec::new();
+    // Usage candidacy comes from ref rows; DECLARATION candidacy from sym
+    // rows — a file that declares `helper` but never mentions it again has
+    // no matching ref row, and without the union the backward walk's
+    // matcher (whose declaration half reads symbols) never rehydrates it.
     let Ok(mut stmt) = conn.prepare_cached(
         "SELECT DISTINCT f.path FROM refs r
            JOIN files f ON f.file_id = r.file_id
-          WHERE r.name_id = (SELECT str_id FROM strings WHERE s = ?1)",
+          WHERE r.name_id = (SELECT str_id FROM strings WHERE s = ?1)
+         UNION
+         SELECT DISTINCT f.path FROM syms y
+           JOIN files f ON f.file_id = y.file_id
+          WHERE y.name_id = (SELECT str_id FROM strings WHERE s = ?1)",
     ) else {
         return out;
     };
@@ -818,14 +827,9 @@ pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
     out
 }
 
-/// Row count for one match key — the count-first surface for hot-name
-/// capping (`docs/adr/relational-ref-index.md`).
-/// The rows-backed workspace/symbol scan: every symbol row whose name
-/// contains `query` (ASCII-case-insensitive, SQLite LIKE semantics — the
-/// same containment test the resident sweep applies). Returns
-/// (path, name, kind_code, span rows/cols, container, flags); the caller
-/// applies the adapter's kind/flag filters and skips paths a fresher
-/// resident copy already answered.
+/// One workspace/symbol row hit: (path, name, kind code, selection span,
+/// container, flags). The caller applies the adapter's kind/flag filters
+/// and skips paths a fresher resident copy already answered.
 pub struct SymRowHit {
     pub path: String,
     pub name: String,
@@ -838,8 +842,61 @@ pub struct SymRowHit {
     pub flags: u8,
 }
 
+/// The rows-backed workspace/symbol scan: every WORKSPACE-tier symbol row
+/// whose name contains `query`, case-insensitively — the same containment
+/// test the resident sweep applies. The `files.source` filter keeps the
+/// import tier (@INC deps) out: the resident sweeps never enumerated it,
+/// and folding it in would flood project searches with CPAN internals.
 pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
     let mut out = Vec::new();
+    // SQLite LIKE is case-insensitive for ASCII only; the resident sweep
+    // lowercases with full Unicode semantics. ASCII queries (the hot path)
+    // stay an indexed-ish LIKE; a non-ASCII query walks the name strings
+    // with the SAME Rust containment test so an evicted file's `sub Übung`
+    // matches exactly like a resident one.
+    if !query.is_ascii() {
+        let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT f.path, n.s, y.kind, y.start_row, y.start_col, y.end_row, y.end_col,
+                    c.s, y.flags
+               FROM syms y
+               JOIN files f ON f.file_id = y.file_id
+               JOIN strings n ON n.str_id = y.name_id
+               LEFT JOIN strings c ON c.str_id = y.container_id
+              WHERE f.source = 'workspace'",
+        ) else {
+            return out;
+        };
+        let q = query.to_lowercase();
+        let rows = stmt.query_map([], |row| {
+            Ok(SymRowHit {
+                path: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get::<_, i64>(2)? as u8,
+                start_row: row.get::<_, i64>(3)? as usize,
+                start_col: row.get::<_, i64>(4)? as usize,
+                end_row: row.get::<_, i64>(5)? as usize,
+                end_col: row.get::<_, i64>(6)? as usize,
+                container: row.get(7)?,
+                flags: row.get::<_, i64>(8)? as u8,
+            })
+        });
+        if let Ok(rows) = rows {
+            for r in rows {
+                match r {
+                    Ok(hit) => {
+                        if hit.name.to_lowercase().contains(&q) {
+                            out.push(hit);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("sym row scan aborted mid-iteration: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+        return out;
+    }
     let Ok(mut stmt) = conn.prepare_cached(
         "SELECT f.path, n.s, y.kind, y.start_row, y.start_col, y.end_row, y.end_col,
                 c.s, y.flags
@@ -847,7 +904,8 @@ pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
            JOIN files f ON f.file_id = y.file_id
            JOIN strings n ON n.str_id = y.name_id
            LEFT JOIN strings c ON c.str_id = y.container_id
-          WHERE n.s LIKE '%' || ?1 || '%' ESCAPE '\\'",
+          WHERE f.source = 'workspace'
+            AND n.s LIKE '%' || ?1 || '%' ESCAPE '\\'",
     ) else {
         return out;
     };
@@ -880,6 +938,8 @@ pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
     out
 }
 
+/// Row count for one match key — the count-first surface for hot-name
+/// capping (`docs/adr/relational-ref-index.md`).
 pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
     conn.query_row(
         "SELECT COUNT(*) FROM refs

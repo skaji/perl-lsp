@@ -149,21 +149,24 @@ pub fn plugin_namespace_to_workspace_info(
 }
 
 #[allow(deprecated)]
-pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+/// The ONE workspace-search visibility rule, shared by the resident sweep
+/// (`symbol_to_workspace_info`) and the rows twin — a kind added to one
+/// gate cannot silently diverge the other.
+fn workspace_search_visible(kind: &crate::file_analysis::SymKind, hidden: bool, lexical: bool) -> bool {
     use crate::file_analysis::SymKind as FaSymKind;
-    // Only include significant symbols (subs, methods, packages, classes)
-    match sym.kind {
-        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class => {}
-        _ => return None,
-    }
-    // The detail's hide_in_outline covers the workspace list too —
-    // anon subs and plugin DSL imports are resolvable, not browsable.
-    // Lexical subs likewise: document symbols show them (in-file
-    // structure), workspace search does not (not addressable outside
-    // their block).
-    if sym.hidden_in_outline()
-        || matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { lexical: true, .. })
-    {
+    matches!(
+        kind,
+        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class
+    ) && !hidden
+        && !lexical
+}
+
+pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+    if !workspace_search_visible(
+        &sym.kind,
+        sym.hidden_in_outline(),
+        matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { lexical: true, .. }),
+    ) {
         return None;
     }
     Some(SymbolInformation {
@@ -198,13 +201,13 @@ pub fn sym_row_search(
 pub fn sym_row_to_workspace_info(
     hit: &crate::module_cache::SymRowHit,
 ) -> Option<SymbolInformation> {
-    use crate::file_analysis::{sym_kind_from_code, SymKind as FaSymKind, SymRowSeed};
+    use crate::file_analysis::{sym_kind_from_code, SymRowSeed};
     let kind = sym_kind_from_code(hit.kind)?;
-    match kind {
-        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class => {}
-        _ => return None,
-    }
-    if hit.flags & (SymRowSeed::FLAG_HIDDEN_IN_OUTLINE | SymRowSeed::FLAG_LEXICAL_SUB) != 0 {
+    if !workspace_search_visible(
+        &kind,
+        hit.flags & SymRowSeed::FLAG_HIDDEN_IN_OUTLINE != 0,
+        hit.flags & SymRowSeed::FLAG_LEXICAL_SUB != 0,
+    ) {
         return None;
     }
     let path = std::path::Path::new(&hit.path);
@@ -1807,7 +1810,8 @@ fn dispatch_target_items_for(
         emit(sym);
     }
     module_index.for_each_cached(|_, cached| {
-        for sym in cached.analysis.handlers_for_owner(owner_class, dispatcher_names) {
+        let whole = module_index.whole_present(cached);
+        for sym in whole.handlers_for_owner(owner_class, dispatcher_names) {
             emit(sym);
         }
     });
