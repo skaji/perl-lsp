@@ -239,7 +239,7 @@ fn on_use(ctx) {
     out
 }
 
-// ── on_method_call: component accessors + action dispatch ─────────────
+// ── context_call pattern: component accessors + action dispatch ───────
 //
 // `$c->model('Foo')`, `$c->view('Foo')`, `$c->controller('Foo')`:
 // Each emits a MethodCallRef pointing at the component class so gd on
@@ -249,78 +249,88 @@ fn on_use(ctx) {
 // `$c->forward('/Controller/action')` / `$c->detach(...)` /
 // `$c->visit(...)`: the path string is treated as a dispatch target.
 // DispatchCall ref so gd/gr pair the forward site with action Handler defs.
-fn on_method_call(ctx) {
+fn patterns() {
+    [
+        #{
+            name: "context_call",
+            query: `
+(method_call_expression
+  invocant: (_) @recv
+  method: (_) @verb
+  (#any-of? @verb "model" "view" "controller" "forward" "detach" "visit")
+  arguments: [
+    (list_expression . (_) @target)
+    (string_literal) @target
+    (interpolated_string_literal) @target
+    (scalar) @target
+    (bareword) @target
+  ]
+) @call
+`,
+            projections: #{
+                recv: ["ty"],
+                target: ["str", "content_span"],
+            },
+            expect: [
+                #{ src: "$c->model('DB::User');", matches: 1, captures: #{ verb: "model" } },
+                #{ src: "$c->forward('/root/index');", matches: 1 },
+                #{ src: "$c->stash->{x} = 1;", matches: 0 },
+            ],
+        },
+    ]
+}
+
+fn on_match(pattern, m) {
     let out = [];
-    let m = ctx.method_name;
-    if m == () { return out; }
+    let verb = m.captures.verb.text;
 
     // Gate on receiver being Catalyst-typed when we can confirm it.
     // When unknown (unresolved $c), still fire — Catalyst method names
     // are distinctive enough and the trigger already narrowed us to
     // Catalyst-flavored packages.
-    let rtype = ctx.receiver_type;
+    let rtype = m.captures.recv.ty;
     let receiver_is_catalyst = rtype == ()
         || (rtype.contains("ClassName")
             && (rtype.ClassName == "Catalyst"
                 || rtype.ClassName.starts_with("Catalyst::")));
-
     if !receiver_is_catalyst { return out; }
 
-    let args = ctx.args;
+    let target = m.captures.target;
+    if target == () { return out; }
+    let name = target.str;
+    if name == () || name == "" { return out; }
+    // Prefer the content_span (inside quotes) if available.
+    let span = target.content_span;
+    if span == () { span = target.span; }
 
     // ── Component accessors ──────────────────────────────────────────
-    // `$c->model('Foo')` / `$c->view('Foo')` / `$c->controller('Foo')`
-    // The string arg is a component name. We emit a MethodCallRef so
-    // the string is a real reference to the component class — gd on
-    // `'Foo'` in `$c->model('Foo')` should navigate to `MyApp::Model::Foo`.
-    // The invocant for the MethodCallRef is the component class name
-    // itself (we treat the string as a class name, not a method name —
-    // using `new` as a synthetic anchor for "the class exists").
-    let is_component_accessor = m == "model" || m == "view" || m == "controller";
-    if is_component_accessor && args.len() >= 1 {
-        let component_name = args[0].string_value;
-        if component_name != () && component_name != "" {
-            // Emit a MethodCallRef whose method_name is `new` and whose
-            // invocant IS the component class string. This is the same
-            // pattern as mojo-routes `->to('Controller#action')` — we
-            // treat the string as a direct class reference, not a method.
-            // Prefer the content_span (inside quotes) if available.
-            let name_span = args[0].content_span;
-            if name_span == () { name_span = args[0].span; }
-            out += #{
-                MethodCallRef: #{
-                    method_name: "new",
-                    invocant: component_name,
-                    span: name_span,
-                    invocant_span: name_span,
-                }
-            };
-        }
+    // Emit a MethodCallRef whose method_name is `new` and whose
+    // invocant IS the component class string. This is the same
+    // pattern as mojo-routes `->to('Controller#action')` — we
+    // treat the string as a direct class reference, not a method.
+    if verb == "model" || verb == "view" || verb == "controller" {
+        out += #{
+            MethodCallRef: #{
+                method_name: "new",
+                invocant: name,
+                span: span,
+                invocant_span: span,
+            }
+        };
+        return out;
     }
 
-    // ── Action dispatch verbs ─────────────────────────────────────────
-    // `$c->forward('/Root/index')` / `$c->detach(...)` / `$c->visit(...)`
-    // The path string references an action. Emit DispatchCall so gr on
-    // action definitions finds dispatch sites.
-    let is_dispatch = m == "forward" || m == "detach" || m == "visit";
-    if is_dispatch && args.len() >= 1 {
-        let action_path = args[0].string_value;
-        if action_path != () && action_path != "" {
-            let path_span = args[0].content_span;
-            if path_span == () { path_span = args[0].span; }
-            // Owner: Catalyst (the context class). All actions share one
-            // dispatch table regardless of which controller defines them.
-            out += #{
-                DispatchCall: #{
-                    name: action_path,
-                    dispatcher: m,
-                    owner: #{ Class: "Catalyst" },
-                    span: path_span,
-                    var_text: if ctx.receiver_text == () { "" } else { ctx.receiver_text },
-                }
-            };
+    // ── Action dispatch verbs (forward / detach / visit) ─────────────
+    // Owner: Catalyst (the context class). All actions share one
+    // dispatch table regardless of which controller defines them.
+    out += #{
+        DispatchCall: #{
+            name: name,
+            dispatcher: verb,
+            owner: #{ Class: "Catalyst" },
+            span: span,
+            var_text: m.captures.recv.text,
         }
-    }
-
+    };
     out
 }

@@ -89,31 +89,65 @@ fn triggers() {
     ]
 }
 
-// Extract the task name and tight name-span from a method call. Returns
-// () when the call isn't eligible (dynamic name).
-//
-// We deliberately do NOT gate on the receiver class. A name-prefix match
-// (`== "Minion" || starts_with("Minion::")`) is the rule-#10 antipattern:
-// a real subclass like `Clove::Minion` (`use Mojo::Base 'Minion'`, often
-// overriding `enqueue`) isa Minion but fails the string test, so its
-// dispatch sites silently emit no ref. The cross-file ancestry that would
-// answer "isa Minion?" isn't resolved at emit time, and mojo-events takes
-// the same no-allowlist stance. The trigger filter (file uses Minion / is
-// a Mojo app or plugin) + the dispatcher method-name set + a string-literal
-// first arg are the signal. Owner is the global Minion task registry, not
-// the receiver's class, so every add_task / enqueue site pairs regardless
-// of which $minion instance (or subclass) it was called on.
-fn resolve_task(ctx) {
-    let args = ctx.args;
-    if args.len() < 1 { return (); }
+// The task-call capture. We deliberately do NOT gate on the receiver
+// class. A name-prefix match (`== "Minion" || starts_with("Minion::")`)
+// is the rule-#10 antipattern: a real subclass like `Clove::Minion`
+// (`use Mojo::Base 'Minion'`, often overriding `enqueue`) isa Minion but
+// fails the string test, so its dispatch sites silently emit no ref. The
+// cross-file ancestry that would answer "isa Minion?" isn't resolved at
+// emit time, and mojo-events takes the same no-allowlist stance. The
+// trigger filter (file uses Minion / is a Mojo app or plugin) + the
+// dispatcher method-name set + a string-literal first arg are the
+// signal. Owner is the global Minion task registry, not the receiver's
+// class, so every add_task / enqueue site pairs regardless of which
+// $minion instance (or subclass) it was called on.
+fn patterns() {
+    [
+        #{
+            name: "task_call",
+            query: `
+(method_call_expression
+  invocant: (_) @recv
+  method: (_) @verb
+  (#any-of? @verb "add_task" "enqueue" "enqueue_p"
+                  "perform_jobs" "perform_jobs_in_foreground" "foreground")
+  arguments: [
+    (list_expression . (_) @task . (_)? @callback)
+    (string_literal) @task
+    (interpolated_string_literal) @task
+    (scalar) @task
+    (bareword) @task
+  ]
+) @call
+`,
+            projections: #{
+                task: ["str"],
+                callback: ["sub_params"],
+            },
+            expect: [
+                #{ src: "$minion->add_task(send_email => sub { my ($job) = @_; });", matches: 1,
+                   captures: #{ verb: "add_task", task: "send_email" } },
+                #{ src: "$minion->enqueue('send_email', ['x']);", matches: 1 },
+                #{ src: "$minion->perform_jobs;", matches: 0 },
+                #{ src: "$minion->stats;", matches: 0 },
+            ],
+        },
+    ]
+}
 
-    let name = args[0].string_value;
+// Extract the task name and name-span from the match. Returns () when
+// the call isn't eligible (dynamic name). The span is the whole first
+// arg (quotes included) — matches the pre-pattern behavior.
+fn resolve_task(m) {
+    let task = m.captures.task;
+    if task == () { return (); }
+    let name = task.str;
     if name == () { return (); }
 
     #{
         name: name,
         owner: #{ Class: "Minion" },
-        name_span: args[0].span,
+        name_span: task.span,
     }
 }
 
@@ -144,18 +178,13 @@ fn enqueue_option_defs(anchor_span) {
     out
 }
 
-fn on_method_call(ctx) {
+fn on_match(pattern, m) {
     let out = [];
-    let m = ctx.method_name;
-    if m == () { return out; }
+    let verb = m.captures.verb.text;
 
-    let is_register = m == "add_task";
-    let is_dispatch = m == "enqueue" || m == "enqueue_p"
-        || m == "perform_jobs" || m == "perform_jobs_in_foreground"
-        || m == "foreground";
-    if !is_register && !is_dispatch { return out; }
+    let is_register = verb == "add_task";
 
-    let task = resolve_task(ctx);
+    let task = resolve_task(m);
     if task == () { return out; }
 
     // Every call-site is a reference — both registration and enqueue
@@ -163,28 +192,29 @@ fn on_method_call(ctx) {
     out += #{
         DispatchCall: #{
             name: task.name,
-            dispatcher: m,
+            dispatcher: verb,
             owner: task.owner,
             span: task.name_span,
-            var_text: if ctx.receiver_text == () { "" } else { ctx.receiver_text },
+            var_text: m.captures.recv.text,
         }
     };
 
     // Surface the options-hash keys whenever we see an enqueue call.
     // The builder de-dupes HashKeyDefs by (name, owner) at add_symbol
     // time, so multiple enqueue sites don't stack duplicates.
-    if is_dispatch {
+    if !is_register {
         out += enqueue_option_defs(task.name_span);
     }
 
     // `->add_task(NAME, sub { ... })` stamps the Handler def.
     if is_register {
+        let cb = m.captures.callback;
         let params = [];
-        if ctx.args.len() >= 2 {
+        if cb != () {
             // Minion passes the job object as the callback's first
             // positional, then the enqueue array's elements after.
             // `as_invocant_params` flags position 0 only.
-            params = as_invocant_params(ctx.args[1].sub_params);
+            params = as_invocant_params(cb.sub_params);
         }
 
         out += #{
@@ -203,7 +233,7 @@ fn on_method_call(ctx) {
                 // Extent covers the whole `add_task(name => sub {…})` so the
                 // outline node encloses the task body — editor sticky-scroll /
                 // breadcrumb pin the task while the cursor is inside it.
-                span: ctx.call_span,
+                span: m.span,
                 selection_span: task.name_span,
                 // Tasks render as Function, not Event — you don't
                 // subscribe to them, you enqueue calls. Matches how
@@ -240,11 +270,11 @@ fn on_method_call(ctx) {
         // Type the callback's `$job` (or whatever the user named it)
         // as Minion::Job so `$job->fail`, `->finish`, `->note`,
         // `->retry` complete inside the task body.
-        if params.len() >= 1 && ctx.args.len() >= 2 {
+        if params.len() >= 1 && cb != () {
             out += #{
                 VarType: #{
                     variable: params[0].name,
-                    at: ctx.args[1].span,
+                    at: cb.span,
                     inferred_type: #{ ClassName: "Minion::Job" },
                 }
             };

@@ -657,6 +657,20 @@ covers it.
   trap), runs the expect snippets against the real grammar (mismatches
   are errors), and warns on patterns that ship no expects.
 
+### Round 4: catalyst + minion — the verb-plugin sweep complete
+
+Every simple verb-shaped plugin is now on patterns: **mojo-events,
+dbic-resultddl, dbic, catalyst, minion**. catalyst's receiver-flavor
+check (`Catalyst`-prefixed or unknown → fire) and minion's
+deliberately-ungated dispatch stance both moved verbatim into
+`on_match` — the pattern absorbs only the syntax, per the ring split.
+minion's `dispatch_verbs()` manifest and both its query hooks stay
+untouched (different seams), and its end-to-end builder tests passed
+unchanged. Still on legacy call hooks: `moo` (needs `pairs`/`isa`, and
+retires `arg_name_verbs` with it) and the stateful Mojo trio
+(`mojo-helpers` / `mojo-routes` / `mojo-lite`, phase 3's topic-route
+replay).
+
 Deliberately not spiked (unchanged design claims): the `pairs` /
 `isa` / `args` / `route_defaults` projections, per-language merged
 queries (the spike compiles one query per pattern spec), the
