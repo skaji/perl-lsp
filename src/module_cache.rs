@@ -192,7 +192,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS stubs (
             path TEXT PRIMARY KEY,
             stub BLOB NOT NULL
-        );",
+        );
+        CREATE INDEX IF NOT EXISTS idx_modules_path ON modules(path);",
     )?;
     // Row-format generation for the derived tables (see REF_ROWS_VERSION).
     let rows_version: Option<String> = conn
