@@ -470,3 +470,33 @@ Deferred:
 - **In-flight dedup**: two threads missing on one path both pay the
   deep-copy (last insert wins). Bounded waste; revisit if profiling
   shows it.
+
+## @INC stripping arc — closed — 2026-07-07 (Claude)
+
+Landed across four commits: the cold-path strip (persist-first,
+strip gated on the blob landing, memo unpinned), generation-coherence
+fixes (NULL-blob rows report unpersisted; shred gated on persist), the
+`mark_long_lived` gate (R4 enriched retries + the warm @INC strip run
+only where a process amortizes them — the server; one-shot CLI skips
+both), lifecycle fixes (resolver stale-pin clears, memo-None parity,
+warm sentinel None-over-Some guard, `load_one` prefers the workspace
+generation), and `idx_modules_path`.
+
+The wall saga, for the record: warm gold 40s (NO_EVICT) vs 442-547s
+(default) decomposed into (a) the R4 retries in one-shot processes
+(bisected 374→790s; now gated off there), and (b) `load_one` full table
+scans — modules had NO path index, so every rehydration since the
+eviction axes landed scanned blob-bearing rows (sys-time storms). The
+index took warm gold 547→162s (sys 227→7.6s). Residual 162s vs 40s =
+per-row cold-LRU rehydration in one-shot processes — the accepted
+profile; the long-lived server amortizes it.
+
+Measured: warm-harness RSS 615→348MB (default vs NO_EVICT); warm
+SERVER sessions additionally strip warm-loaded @INC copies (CLI keeps
+them whole — RAM dies with the process; wall matters more there).
+
+Deferred: @INC registration generations for the enrichment key (the
+Arc-pointer token stands for that tier); the 162s one-shot rehydration
+profile if CI minutes ever matter (options: per-process blob-decode
+memo, or NO_EVICT in the harness at the cost of blinding the eviction
+nets).
