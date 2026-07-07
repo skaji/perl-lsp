@@ -580,4 +580,21 @@ fn enriched_snapshot_caches_and_invalidates_on_provider_change() {
         !Arc::ptr_eq(&snap1, &snap3),
         "provider surface changed: the stale snapshot must not be served"
     );
+
+    // BODY edit to the consumer itself: the surface fingerprint stands,
+    // but the rebuilt analysis is a NEW Arc — the snapshot must derive
+    // from it (spans/refs moved even though the contract didn't).
+    let consumer_v2 = parse_source_to_cached(
+        "package App;\nuse Lib 'make';\nsub go { my $x = make();\n    return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(
+        consumer_v2.path.to_path_buf(),
+        Arc::clone(&consumer_v2.analysis),
+    );
+    let snap4 = idx.enriched_snapshot(&consumer_v2).expect("snapshot");
+    assert!(
+        !Arc::ptr_eq(&snap3, &snap4),
+        "body edit: the snapshot must derive from the rebuilt analysis"
+    );
 }

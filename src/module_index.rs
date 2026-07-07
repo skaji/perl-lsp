@@ -1065,7 +1065,7 @@ impl ModuleIndex {
     ) -> Option<Arc<FileAnalysis>> {
         const ENRICHED_CAP: usize = 64;
         let path = &cached.path;
-        let key = self.enrichment_key(path);
+        let key = self.enrichment_key(cached);
         if let Some(e) = self.enriched.get(path) {
             if e.0 == key {
                 return Some(e.1.clone());
@@ -1094,20 +1094,88 @@ impl ModuleIndex {
         Some(arc)
     }
 
-    /// The overlay's validity key: this file's surface fingerprint plus
-    /// each declared provider's, in the (sorted) dep order the freshness
-    /// record keeps. Unresolvable providers hash as 0 — their later
-    /// appearance changes the key and recomputes.
-    fn enrichment_key(&self, path: &std::path::Path) -> u64 {
+    /// The overlay's validity key — it must cover EVERYTHING
+    /// `enrich_imported_types_with_keys` reads, or a stale snapshot gets
+    /// served silently. The read set and its key coverage:
+    ///
+    /// - the file's own analysis → the source Arc's identity (a body edit
+    ///   keeps the span-free fingerprint still, but every re-registration
+    ///   mints a new Arc);
+    /// - the file's own surface fingerprint (defense in depth alongside
+    ///   the Arc identity);
+    /// - every TRANSITIVELY reachable provider (imports ∪ parents ∪
+    ///   bridges, then THEIR deps — enrichment walks ancestor chains, so a
+    ///   grandparent's contract change must move the key): its freshness
+    ///   fingerprint when recorded, else the provider analysis's Arc
+    ///   identity (the @INC tier has no surface records; re-resolution
+    ///   mints a new Arc). Unresolved providers hash as a distinct
+    ///   discriminant so their later appearance recomputes;
+    /// - the loader-config shapes (a REVERSE edge: caller files feed the
+    ///   shapes this file's enrichment bakes) — hashed wholesale, so any
+    ///   shape change over-invalidates rather than under.
+    ///
+    /// Extending enrichment with a new cross-file read means extending
+    /// this key.
+    fn enrichment_key(&self, cached: &Arc<CachedModule>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.freshness.fingerprint_of(path).unwrap_or(0).hash(&mut h);
-        for dep in self.freshness.deps_of_names(path) {
-            dep.hash(&mut h);
-            self.get_cached(&dep)
-                .and_then(|cm| self.freshness.fingerprint_of(&cm.path))
-                .unwrap_or(0)
-                .hash(&mut h);
+        (Arc::as_ptr(&cached.analysis) as usize).hash(&mut h);
+        self.freshness.fingerprint_of(&cached.path).unwrap_or(0).hash(&mut h);
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut frontier: Vec<String> = self.freshness.deps_of_names(&cached.path);
+        frontier.sort_unstable();
+        frontier.dedup();
+        // Same bound as `resolve_method_in_ancestors` — enrichment's own
+        // walks stop there too.
+        for _depth in 0..20 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<String> = Vec::new();
+            for dep in frontier {
+                if !seen.insert(dep.clone()) {
+                    continue;
+                }
+                dep.hash(&mut h);
+                match self.get_cached(&dep) {
+                    None => 0u8.hash(&mut h),
+                    Some(cm) => match self.freshness.fingerprint_of(&cm.path) {
+                        Some(fp) => {
+                            1u8.hash(&mut h);
+                            fp.hash(&mut h);
+                            next.extend(self.freshness.deps_of_names(&cm.path));
+                        }
+                        None => {
+                            2u8.hash(&mut h);
+                            (Arc::as_ptr(&cm.analysis) as usize).hash(&mut h);
+                            // Recordless tier: no deps_of record; its
+                            // parents ride the analysis itself.
+                            for parents in cm.analysis.package_parents.values() {
+                                next.extend(parents.iter().cloned());
+                            }
+                        }
+                    },
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            frontier = next;
+        }
+        let mut shapes: Vec<(String, Vec<u8>)> = self
+            .loader_config_shapes
+            .iter()
+            .map(|e| {
+                let mut buf = Vec::new();
+                for pair in e.value() {
+                    buf.extend(bincode::serialize(pair).unwrap_or_default());
+                }
+                (e.key().clone(), buf)
+            })
+            .collect();
+        shapes.sort();
+        for (name, buf) in shapes {
+            name.hash(&mut h);
+            buf.hash(&mut h);
         }
         h.finish()
     }
