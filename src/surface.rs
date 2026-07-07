@@ -502,6 +502,20 @@ impl FreshnessIndex {
         verdict
     }
 
+    /// The last-recorded fingerprint for `path` — the enrichment overlay's
+    /// validity key half (a consumer's enriched copy is valid only while
+    /// its own AND every dep's fingerprint stand).
+    pub fn fingerprint_of(&self, path: &std::path::Path) -> Option<u64> {
+        self.surfaces.get(path).map(|r| r.fingerprint)
+    }
+
+    /// The provider names `path` last declared edges to (sorted, deduped)
+    /// — the other half of the overlay key: enrichment reads exactly
+    /// these providers' surfaces.
+    pub fn deps_of_names(&self, path: &std::path::Path) -> Vec<String> {
+        self.deps_of.get(path).map(|v| v.clone()).unwrap_or_default()
+    }
+
     /// Drop a deleted file's record and edges.
     pub fn remove(&self, path: &std::path::Path) {
         self.surfaces.remove(path);

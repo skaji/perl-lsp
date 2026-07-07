@@ -1836,11 +1836,11 @@ fn run_rename(
 }
 
 /// Whole-tree diagnostics with enrichment parity: each workspace entry
-/// is deep-copied (bincode — `FileAnalysis` isn't `Clone`) and enriched
-/// with imported types before `collect_diagnostics` — the same pass
-/// `publish_diagnostics` runs on open docs, so cross-file-typed shapes
-/// hint here too. A file whose roundtrip fails degrades to its
-/// unenriched analysis rather than vanishing.
+/// goes through the hub's enrichment overlay (`enriched_snapshot` — a
+/// derived, fingerprint-keyed copy; the same pass `publish_diagnostics`
+/// runs on open docs), so cross-file-typed shapes hint here too. A file
+/// whose snapshot fails degrades to its unenriched whole view rather
+/// than vanishing.
 fn enriched_tree_diagnostics(
     ws: &file_store::FileStore,
     idx: &module_index::ModuleIndex,
@@ -1849,29 +1849,20 @@ fn enriched_tree_diagnostics(
     let mut all = Vec::new();
     for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
-        // Index copies may be refs/bag-evicted; diagnostics read refs
-        // (unresolved calls) AND the bag (types), so take the whole-on-both-
-        // axes view — resident when whole, rehydrated otherwise. `refs_present`
-        // alone would serve a bag-evicted copy when rows survived but the bag
-        // didn't, silently dropping the invocant types diagnostics gate on.
-        let whole = file_analysis::CrossFileLookup::whole_present(
-            idx,
-            &std::sync::Arc::new(file_analysis::CachedModule::new(
-                entry.key().clone(),
-                std::sync::Arc::clone(entry.value()),
-            )),
-        );
-        let enriched = bincode::serialize(&*whole)
-            .ok()
-            .and_then(|bin| bincode::deserialize::<file_analysis::FileAnalysis>(&bin).ok())
-            .map(|mut fa| {
-                fa.after_deserialize();
-                fa.enrich_imported_types_with_keys(Some(idx));
-                fa
-            });
-        let diags = match &enriched {
-            Some(fa) => symbols::collect_diagnostics(fa, idx, options),
-            None => symbols::collect_diagnostics(&whole, idx, options),
+        let cached = std::sync::Arc::new(file_analysis::CachedModule::new(
+            entry.key().clone(),
+            std::sync::Arc::clone(entry.value()),
+        ));
+        let diags = match idx.enriched_snapshot(&cached) {
+            Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
+            None => {
+                // Index copies may be refs/bag-evicted; diagnostics read
+                // refs AND the bag, so degrade to the whole-on-both-axes
+                // view, not the resident copy.
+                let whole =
+                    file_analysis::CrossFileLookup::whole_present(idx, &cached);
+                symbols::collect_diagnostics(&whole, idx, options)
+            }
         };
         for d in diags {
             all.push((file.clone(), d));

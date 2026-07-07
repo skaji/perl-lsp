@@ -529,3 +529,55 @@ fn register_symbols_stripping_feeds_before_evict() {
     assert!(idx.get_cached("make").is_none(), "cache slot removed");
     assert!(idx.def_candidates("make").is_empty(), "candidates removed");
 }
+
+/// The enrichment overlay (R4): a snapshot is cached while its
+/// fingerprint key stands (same Arc back), recomputes when a PROVIDER's
+/// surface changes, and never mutates the shared workspace Arc.
+#[test]
+fn enriched_snapshot_caches_and_invalidates_on_provider_change() {
+    let idx = ModuleIndex::new_for_test();
+    let lib_v1 = parse_source_to_cached(
+        "package Lib;\nour @EXPORT_OK = ('make');\nsub make { my %h = (id => 1); return \\%h }\n1;\n",
+        "Lib",
+    );
+    let consumer = parse_source_to_cached(
+        "package App;\nuse Lib 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(
+        lib_v1.path.to_path_buf(),
+        Arc::clone(&lib_v1.analysis),
+    );
+    idx.register_workspace_module(
+        consumer.path.to_path_buf(),
+        Arc::clone(&consumer.analysis),
+    );
+
+    let shared_witnesses_before = consumer.analysis.witnesses.len();
+    let snap1 = idx.enriched_snapshot(&consumer).expect("snapshot");
+    let snap2 = idx.enriched_snapshot(&consumer).expect("snapshot");
+    assert!(
+        Arc::ptr_eq(&snap1, &snap2),
+        "key unchanged: the cached snapshot is returned, not recomputed"
+    );
+    assert_eq!(
+        consumer.analysis.witnesses.len(),
+        shared_witnesses_before,
+        "the shared workspace Arc is never enriched in place"
+    );
+
+    // Provider contract change → the consumer's key moves → recompute.
+    let lib_v2 = parse_source_to_cached(
+        "package Lib;\nour @EXPORT_OK = ('make', 'other');\nsub make { my %h = (id => 1); return \\%h }\nsub other { return 2 }\n1;\n",
+        "Lib",
+    );
+    idx.register_workspace_module(
+        lib_v2.path.to_path_buf(),
+        Arc::clone(&lib_v2.analysis),
+    );
+    let snap3 = idx.enriched_snapshot(&consumer).expect("snapshot");
+    assert!(
+        !Arc::ptr_eq(&snap1, &snap3),
+        "provider surface changed: the stale snapshot must not be served"
+    );
+}

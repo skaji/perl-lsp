@@ -373,6 +373,11 @@ pub struct ModuleIndex {
     /// rebuilds; `dirty_consumers` names who must re-enrich after a
     /// surface CHANGE, and an Unchanged verdict is the early-cutoff.
     freshness: Arc<crate::surface::FreshnessIndex>,
+    /// The enrichment overlay (R4): derived enriched copies keyed by the
+    /// surface fingerprints of the file + its providers. Bounded FIFO —
+    /// `enriched_order` is the eviction queue.
+    enriched: Arc<DashMap<std::path::PathBuf, (u64, Arc<FileAnalysis>)>>,
+    enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
     /// class-rank source for the cache-slot tie-break. Recorded at
@@ -452,6 +457,8 @@ impl ModuleIndex {
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
+            enriched: Arc::new(DashMap::new()),
+            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -831,6 +838,8 @@ impl ModuleIndex {
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
+            enriched: Arc::new(DashMap::new()),
+            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -888,6 +897,8 @@ impl ModuleIndex {
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
+            enriched: Arc::new(DashMap::new()),
+            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -1040,6 +1051,65 @@ impl ModuleIndex {
         if canon != path {
             self.freshness.remove(path);
         }
+    }
+
+    /// The enrichment overlay (R4): an enriched copy of a workspace file's
+    /// analysis, DERIVED and keyed by the surface fingerprints of the file
+    /// plus its declared providers — never an in-place mutation of the
+    /// shared Arc. Self-validating at read: any provider's surface change
+    /// moves the key and the entry recomputes. Bounded (drop-oldest) so a
+    /// whole-tree sweep churns through without pinning the tree resident.
+    pub fn enriched_snapshot(
+        &self,
+        cached: &Arc<CachedModule>,
+    ) -> Option<Arc<FileAnalysis>> {
+        const ENRICHED_CAP: usize = 64;
+        let path = &cached.path;
+        let key = self.enrichment_key(path);
+        if let Some(e) = self.enriched.get(path) {
+            if e.0 == key {
+                return Some(e.1.clone());
+            }
+        }
+        let whole = crate::file_analysis::CrossFileLookup::whole_present(self, cached);
+        // Deep copy via serde — enrichment must never write through the
+        // shared Arc (the R4 rule the overlay exists to enforce).
+        let mut copy: FileAnalysis = bincode::serialize(&*whole)
+            .ok()
+            .and_then(|bin| bincode::deserialize(&bin).ok())?;
+        copy.after_deserialize();
+        copy.enrich_imported_types_with_keys(Some(self));
+        let arc = Arc::new(copy);
+        self.enriched.insert(path.clone(), (key, arc.clone()));
+        {
+            let mut order = self.enriched_order.lock().unwrap();
+            order.retain(|p| p != path);
+            order.push_back(path.clone());
+            while order.len() > ENRICHED_CAP {
+                if let Some(evictee) = order.pop_front() {
+                    self.enriched.remove(&evictee);
+                }
+            }
+        }
+        Some(arc)
+    }
+
+    /// The overlay's validity key: this file's surface fingerprint plus
+    /// each declared provider's, in the (sorted) dep order the freshness
+    /// record keeps. Unresolvable providers hash as 0 — their later
+    /// appearance changes the key and recomputes.
+    fn enrichment_key(&self, path: &std::path::Path) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.freshness.fingerprint_of(path).unwrap_or(0).hash(&mut h);
+        for dep in self.freshness.deps_of_names(path) {
+            dep.hash(&mut h);
+            self.get_cached(&dep)
+                .and_then(|cm| self.freshness.fingerprint_of(&cm.path))
+                .unwrap_or(0)
+                .hash(&mut h);
+        }
+        h.finish()
     }
 
     /// The transitive consumers of `path`'s last-recorded surface — the
