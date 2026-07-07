@@ -18,7 +18,7 @@ Format per entry:
 
 ---
 
-## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — OPEN (picked hand-rolled first cut)
+## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 - **Context:** storage-engine mission phase 3 (docs/prompt-storage-engine.md;
   eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes
   the engine choice reversible.
@@ -37,7 +37,7 @@ Format per entry:
   workspace enrichment, phase 4 SQL views), revisit whether the dirty-set
   still suffices or Salsa's cancellation/durability earns its costs.
 
-## Unregister inverse under symbol eviction: recorded name list vs self-healing candidates — 2026-07-06 — OPEN
+## Unregister inverse under symbol eviction: recorded name list vs self-healing candidates — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 - **Context:** symbols-relational phase B. `unregister_file` walked
   `old.analysis.symbols` to remove name registrations; under symbol
   eviction that vec is empty, and rehydrating after an edit persists
@@ -61,7 +61,7 @@ Format per entry:
 
 ---
 
-## include_closure representation: interned path pointers vs file-id arrays — 2026-07-06 — OPEN
+## include_closure representation: interned path pointers vs file-id arrays — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 - **Context:** chromium warm heap dump post-refs/symbols eviction:
   `include_closure` is the largest resident bucket — 2,827 MB / 41% at
   132K files (16-byte `Arc<str>` per closure entry × deep header
@@ -288,7 +288,7 @@ Format per entry:
   lie, but Slot::Comparison would be sprawl." A friendly comment on the
   variant acknowledges the stretch (landed in `src/cursor_slot.rs`).
 
-## Warm stubs — separate table vs. blob column — 2026-07-06 — OPEN (Claude, mission 2)
+## Warm stubs — separate table vs. blob column — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 
 - **Context:** register-from-Surface warm start persists a per-file stub
   (registration feed + specialization edges + projected Surface + the
@@ -369,7 +369,7 @@ Deferred, in rough priority order:
   analysis costs); cold-path stub encoding stays (measured cold wall
   unchanged, and it buys the FIRST warm, not the second).
 
-## Session review round — duplication + structural residency — 2026-07-07 — OPEN (Claude)
+## Session review round — duplication + structural residency — 2026-07-07 — TRIAGED (veesh, 2026-07-07)
 
 Landed: `evict_axes` / `prepare_pack_parts` / `prepare_workspace_parts` are
 the only spellers of the reads-whole-before-evict strip; the warm scans
@@ -422,3 +422,19 @@ Deferred, with designs:
   fields, constructible solely via the prepare_* choke points) so a
   feed-from-stripped-copy or whole-arc hookup fails to compile. The
   allowlist test covers the gap until then.
+
+
+## Triage (veesh, 2026-07-07)
+
+- The four architecture picks above: **ratified as-is**, revisit triggers
+  stand as written.
+- Next arcs, in order: **R4 server consumers** (always-enriched closed
+  files through the overlay), then **@INC tier stripping** — both full
+  auto with hardening rounds.
+- Backlog now: **writer-harness + stamp-capture dedup**. Staying
+  laddered: parts-token inner APIs (allowlist test covers the gap),
+  pack provided-names vocabulary (fix when a name-keyed pack dirty walk
+  lands), writer fallback budget (tripwire keeps it visible), watcher
+  persist+re-strip, buffer-vs-disk record provenance, probe
+  serialization (measure first), phase-4 SQL views. Declined micro-opts
+  stay declined.

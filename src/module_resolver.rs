@@ -862,120 +862,60 @@ pub fn index_workspace_with_index(
     let writer_conn = conn;
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || {
-            let Some(conn) = writer_conn.as_ref() else {
-                while fresh_rx.recv().is_ok() {}
-                return;
-            };
-            let mut batch: Vec<WsFresh> = Vec::new();
-            let mut write_chunk = |batch: &mut Vec<WsFresh>| {
-                if batch.is_empty() {
-                    return;
-                }
-                // IMMEDIATE: take the write lock up front — a deferred txn
-                // that reads before writing can hit an unretryable
-                // SQLITE_BUSY_SNAPSHOT against the resolver thread's writes.
-                let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
-                for e in batch.iter() {
-                    let path_str = e.path.to_string_lossy();
-                    module_cache::save_blob_to_db_stamped(
-                        conn, &path_str, &e.path, &e.closure, &e.blob, "workspace", e.stamp,
-                    );
-                    if let Err(err) = module_cache::shred_derived_rows(
-                        conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
-                    ) {
-                        log::warn!("Failed to shred derived rows for {:?}: {}", e.path, err);
-                    }
-                }
-                let committed = txn_open
-                    && match conn.execute_batch("COMMIT") {
-                        Ok(()) => true,
-                        Err(err) => {
-                            let _ = conn.execute_batch("ROLLBACK");
-                            log::error!(
-                                "Workspace persist commit failed ({} files, registering whole copies): {}",
-                                batch.len(),
+            run_persist_writer(
+                fresh_rx,
+                writer_conn.as_ref(),
+                "workspace persist writer",
+                |conn, batch: &[WsFresh]| {
+                    for e in batch {
+                        let path_str = e.path.to_string_lossy();
+                        module_cache::save_blob_to_db_stamped(
+                            conn, &path_str, &e.path, &e.closure, &e.blob, "workspace",
+                            e.stamp,
+                        );
+                        if let Err(err) = module_cache::shred_derived_rows(
+                            conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
+                        ) {
+                            log::warn!(
+                                "Failed to shred derived rows for {:?}: {}",
+                                e.path,
                                 err
                             );
-                            false
-                        }
-                    };
-                if committed {
-                    for e in batch.drain(..) {
-                        if let Some(idx) = module_index {
-                            // Clear any stale LRU pin BEFORE the stripped
-                            // copy becomes reachable, so its first
-                            // rehydration reads the just-committed blob.
-                            idx.invalidate_bag_cache(&e.path);
-                        }
-                        if e.deferred {
-                            files.insert_workspace_arc(e.path.clone(), e.arc.clone());
-                            if let Some(idx) = module_index {
-                                idx.register_workspace_residency(
-                                    e.path, e.arc, e.module_name,
-                                );
-                            }
                         }
                     }
-                } else {
+                },
+                |e: WsFresh| {
+                    if let Some(idx) = module_index {
+                        // Clear any stale LRU pin BEFORE the stripped copy
+                        // becomes reachable, so its first rehydration reads
+                        // the just-committed blob.
+                        idx.invalidate_bag_cache(&e.path);
+                    }
+                    if e.deferred {
+                        files.insert_workspace_arc(e.path.clone(), e.arc.clone());
+                        if let Some(idx) = module_index {
+                            idx.register_workspace_residency(e.path, e.arc, e.module_name);
+                        }
+                    }
+                },
+                |e: WsFresh| {
                     // The chunk never landed but the copies were stripped
                     // for it. The blob in hand IS the whole analysis —
                     // register full copies instead, so nothing is lost
                     // beyond the persistence itself (disk full / lock storm
                     // stays loud AND self-heals).
-                    for e in batch.drain(..) {
+                    if let Some(idx) = module_index {
+                        idx.invalidate_bag_cache(&e.path);
+                    }
+                    if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                        let arc = std::sync::Arc::new(fa);
+                        files.insert_workspace_arc(e.path.clone(), arc.clone());
                         if let Some(idx) = module_index {
-                            idx.invalidate_bag_cache(&e.path);
-                        }
-                        if let Some(fa) = module_cache::decode_analysis(&e.blob) {
-                            let arc = std::sync::Arc::new(fa);
-                            files.insert_workspace_arc(e.path.clone(), arc.clone());
-                            if let Some(idx) = module_index {
-                                idx.register_workspace_resident(e.path.clone(), arc);
-                            }
+                            let _ = idx.register_workspace_resident(e.path.clone(), arc);
                         }
                     }
-                }
-            };
-            // A panic anywhere in a chunk must not kill the writer (workers
-            // keep stripping copies whose sends would silently fail) — treat
-            // it like a failed commit: re-register whole copies and go on.
-            let mut safe_chunk = |batch: &mut Vec<WsFresh>| {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    write_chunk(batch)
-                }));
-                if r.is_err() {
-                    log::error!(
-                        "workspace writer chunk panicked ({} files) — registering whole copies",
-                        batch.len()
-                    );
-                    for e in batch.drain(..) {
-                        // Same stale-pin ordering as the commit-failure arm:
-                        // a query racing this re-register must not rehydrate
-                        // the pre-edit generation.
-                        if let Some(idx) = module_index {
-                            idx.invalidate_bag_cache(&e.path);
-                        }
-                        if let Some(fa) = module_cache::decode_analysis(&e.blob) {
-                            let arc = std::sync::Arc::new(fa);
-                            files.insert_workspace_arc(e.path.clone(), arc.clone());
-                            if let Some(idx) = module_index {
-                                idx.register_workspace_resident(e.path.clone(), arc);
-                            }
-                        }
-                    }
-                }
-            };
-            while let Ok(entry) = fresh_rx.recv() {
-                batch.push(entry);
-                while batch.len() < 128 {
-                    match fresh_rx.try_recv() {
-                        Ok(e) => batch.push(e),
-                        Err(_) => break,
-                    }
-                }
-                safe_chunk(&mut batch);
-            }
-            safe_chunk(&mut batch);
+                },
+            );
         });
 
         paths.par_iter().for_each(|path| {
@@ -991,40 +931,31 @@ pub fn index_workspace_with_index(
                 return;
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                // Stamp BEFORE reading: stamp-after-read can bless a stale
-                // parse with a fresh mtime when the file changes in between.
-                let stamp = module_cache::file_stamp(path).unwrap_or((0, 0));
-                let source = std::fs::read_to_string(path).ok()?;
-                let mut parser = create_parser();
-                let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
-                let tree = parser.parse(&source, None)?;
-                let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
-                let t_build = if timing { Some(std::time::Instant::now()) } else { None };
-                let analysis = crate::builder::build(&tree, source.as_bytes());
-                let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
-                if timing {
-                    crate::timings::record_built(
-                        path.strip_prefix(root).unwrap_or(path).display().to_string(),
-                        parse_dur,
-                        build_dur,
-                    );
-                }
-                Some((analysis, stamp))
+                analyze_stamped(path, || {
+                    let source = std::fs::read_to_string(path).ok()?;
+                    let mut parser = create_parser();
+                    let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
+                    let tree = parser.parse(&source, None)?;
+                    let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
+                    let t_build = if timing { Some(std::time::Instant::now()) } else { None };
+                    let analysis = crate::builder::build(&tree, source.as_bytes());
+                    let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
+                    if timing {
+                        crate::timings::record_built(
+                            path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                            parse_dur,
+                            build_dur,
+                        );
+                    }
+                    Some(analysis)
+                })
             }));
 
             match result {
+                // `analyze_stamped` returning None covers BOTH a failed
+                // read/parse and a changed-under-us stamp — the watcher (or
+                // next warm) owns the fresher truth either way.
                 Ok(Some((mut analysis, stamp))) => {
-                    // The file changed while we parsed: the watcher (or next
-                    // warm) owns the fresher truth — registering this copy
-                    // would overwrite it and re-persist a generation the
-                    // watcher may have just invalidated.
-                    if module_cache::file_stamp(path) != Some(stamp) {
-                        if let Some(cb) = progress {
-                            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                            cb(d, total);
-                        }
-                        return;
-                    }
                     // Projections that read the bag run on the whole
                     // analysis; the persisted generation is encoded whole;
                     // only then is the resident copy stripped.
@@ -1451,106 +1382,60 @@ pub fn index_pack_languages(
         let expected_whole_writer = Arc::clone(&expected_whole);
         std::thread::scope(|scope| {
             let writer = scope.spawn(move || {
-                let Some(conn) = writer_conn.as_ref() else {
-                    while fresh_rx.recv().is_ok() {}
-                    return;
-                };
-                let mut batch: Vec<FreshEntry> = Vec::new();
-                let mut write_chunk = |batch: &mut Vec<FreshEntry>| {
-                    if batch.is_empty() {
-                        return;
-                    }
-                    // IMMEDIATE — same snapshot rationale as the workspace writer.
-                    let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
-                    let stubs_writable = module_cache::stub_version_current(conn);
-                    for e in batch.iter() {
-                        let path_str = e.path.to_string_lossy();
-                        module_cache::save_blob_to_db_stamped(
-                            conn,
-                            &path_str,
-                            &e.path,
-                            &e.arc.include_closure,
-                            &e.blob,
-                            "workspace",
-                            e.stamp,
-                        );
-                        if let Err(err) = module_cache::shred_derived_rows(
-                            conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
-                        ) {
-                            log::warn!("Failed to shred derived rows for {:?}: {}", e.path, err);
-                        }
-                        if let Some(sb) = &e.stub_blob {
-                            if stubs_writable {
-                                module_cache::save_stub(conn, &path_str, sb);
-                            }
-                        }
-                    }
-                    let committed = txn_open
-                        && match conn.execute_batch("COMMIT") {
-                            Ok(()) => true,
-                            Err(err) => {
-                                let _ = conn.execute_batch("ROLLBACK");
-                                log::error!(
-                                    "Pack persist commit failed ({} files, registering whole copies): {}",
-                                    batch.len(),
+                run_persist_writer(
+                    fresh_rx,
+                    writer_conn.as_ref(),
+                    "pack persist writer",
+                    |conn, batch: &[FreshEntry]| {
+                        // Chunk-scoped: a concurrent different-generation
+                        // process may wipe/restamp the stubs table mid-run.
+                        let stubs_writable = module_cache::stub_version_current(conn);
+                        for e in batch {
+                            let path_str = e.path.to_string_lossy();
+                            module_cache::save_blob_to_db_stamped(
+                                conn,
+                                &path_str,
+                                &e.path,
+                                &e.arc.include_closure,
+                                &e.blob,
+                                "workspace",
+                                e.stamp,
+                            );
+                            if let Err(err) = module_cache::shred_derived_rows(
+                                conn, &path_str, "workspace", &e.seeds, &e.sym_seeds,
+                            ) {
+                                log::warn!(
+                                    "Failed to shred derived rows for {:?}: {}",
+                                    e.path,
                                     err
                                 );
-                                false
                             }
-                        };
-                    if committed {
-                        for e in batch.drain(..) {
-                            // Stale-pin clear BEFORE the stripped copy is
-                            // reachable, so its first rehydration reads the
-                            // just-committed blob.
-                            pack_index_writer.invalidate_bag_cache(&e.path);
-                            if e.deferred {
-                                pack_index_writer.register_symbols_inner(
-                                    e.path, e.arc, &e.feed, &e.specs,
-                                );
+                            if let Some(sb) = &e.stub_blob {
+                                if stubs_writable {
+                                    module_cache::save_stub(conn, &path_str, sb);
+                                }
                             }
                         }
-                    } else {
-                        for e in batch.drain(..) {
-                            pack_index_writer.invalidate_bag_cache(&e.path);
-                            if let Some(fa) = module_cache::decode_analysis(&e.blob) {
-                                expected_whole_writer.fetch_add(1, Ordering::Relaxed);
-                                pack_index_writer.register_symbols(e.path, Arc::new(fa));
-                            }
+                    },
+                    |e: FreshEntry| {
+                        // Stale-pin clear BEFORE the stripped copy is
+                        // reachable, so its first rehydration reads the
+                        // just-committed blob.
+                        pack_index_writer.invalidate_bag_cache(&e.path);
+                        if e.deferred {
+                            pack_index_writer.register_symbols_inner(
+                                e.path, e.arc, &e.feed, &e.specs,
+                            );
                         }
-                    }
-                };
-                let mut safe_chunk = |batch: &mut Vec<FreshEntry>| {
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        write_chunk(batch)
-                    }));
-                    if r.is_err() {
-                        log::error!(
-                            "pack writer chunk panicked ({} files) — registering whole copies",
-                            batch.len()
-                        );
-                        for e in batch.drain(..) {
-                            // Same stale-pin ordering as the commit-failure
-                            // arm.
-                            pack_index_writer.invalidate_bag_cache(&e.path);
-                            if let Some(fa) = module_cache::decode_analysis(&e.blob) {
-                                expected_whole_writer.fetch_add(1, Ordering::Relaxed);
-                                pack_index_writer.register_symbols(e.path, Arc::new(fa));
-                            }
+                    },
+                    |e: FreshEntry| {
+                        pack_index_writer.invalidate_bag_cache(&e.path);
+                        if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                            expected_whole_writer.fetch_add(1, Ordering::Relaxed);
+                            pack_index_writer.register_symbols(e.path, Arc::new(fa));
                         }
-                    }
-                };
-                while let Ok(entry) = fresh_rx.recv() {
-                    batch.push(entry);
-                    while batch.len() < 128 {
-                        match fresh_rx.try_recv() {
-                            Ok(e) => batch.push(e),
-                            Err(_) => break,
-                        }
-                    }
-                    safe_chunk(&mut batch);
-                }
-                safe_chunk(&mut batch);
+                    },
+                );
             });
 
             paths.par_iter().for_each(|path| {
@@ -1567,15 +1452,12 @@ pub fn index_pack_languages(
                 let reg = crate::language_driver::LanguageRegistry::with_enabled();
                 let Some(driver) = reg.for_path(path).filter(|d| d.id() == lang) else { return };
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let stamp = module_cache::file_stamp(path).unwrap_or((0, 0));
-                    let source = std::fs::read_to_string(path).ok()?;
-                    Some((driver.analyze_with_path(&source, Some(path)), stamp))
+                    analyze_stamped(path, || {
+                        let source = std::fs::read_to_string(path).ok()?;
+                        Some(driver.analyze_with_path(&source, Some(path)))
+                    })
                 }));
                 if let Ok(Some((mut analysis, stamp))) = res {
-                    // Same changed-under-us guard as the workspace worker.
-                    if module_cache::file_stamp(path) != Some(stamp) {
-                        return;
-                    }
                     // Encode the FULL analysis for the disk write, then strip
                     // the resident copy — one struct, no clone
                     // (`docs/adr/memory-slice-2-lru.md`). Strip only when the
@@ -1696,6 +1578,99 @@ pub fn index_pack_languages(
         );
     }
     total.load(Ordering::Relaxed)
+}
+
+/// Stamp-before-read + re-stat-after-parse: capture the disk stamp, run the
+/// read+analyze, and return None when the file changed underneath — a
+/// write-time stamp would bless a stale parse as the current generation and
+/// every future warm would serve it as valid. Both fresh workers route
+/// their changed-under-us protocol through here.
+fn analyze_stamped<T>(
+    path: &std::path::Path,
+    f: impl FnOnce() -> Option<T>,
+) -> Option<(T, (i64, i64))> {
+    let stamp = module_cache::file_stamp(path).unwrap_or((0, 0));
+    let out = f()?;
+    if module_cache::file_stamp(path) != Some(stamp) {
+        return None;
+    }
+    Some((out, stamp))
+}
+
+/// The persist-writer harness both bulk indexers share: batches entries off
+/// the channel (≤128 per txn), owns BEGIN IMMEDIATE / COMMIT / ROLLBACK
+/// (IMMEDIATE — a deferred txn that reads before writing can hit an
+/// unretryable SQLITE_BUSY_SNAPSHOT against a concurrent writer), and hands
+/// every entry to exactly one of `on_committed` (deferred registration) or
+/// `on_fallback` (commit failure OR chunk panic — the whole-copy self-heal;
+/// a panic must not kill the writer, workers keep stripping copies whose
+/// sends would silently fail). With no Connection the channel drains
+/// unregistered. Registration runs inside the panic guard, mirroring the
+/// txn: entries a mid-batch registration panic leaves behind take the
+/// fallback lane instead of vanishing.
+fn run_persist_writer<E>(
+    rx: std::sync::mpsc::Receiver<E>,
+    conn: Option<&rusqlite::Connection>,
+    label: &str,
+    write_batch: impl Fn(&rusqlite::Connection, &[E]),
+    mut on_committed: impl FnMut(E),
+    mut on_fallback: impl FnMut(E),
+) {
+    let Some(conn) = conn else {
+        while rx.recv().is_ok() {}
+        return;
+    };
+    let mut batch: Vec<E> = Vec::new();
+    let mut process = |batch: &mut Vec<E>| {
+        if batch.is_empty() {
+            return;
+        }
+        let n = batch.len();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let txn_open = conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+            write_batch(conn, batch);
+            let committed = txn_open
+                && match conn.execute_batch("COMMIT") {
+                    Ok(()) => true,
+                    Err(err) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        log::error!(
+                            "{label}: commit failed ({n} files, registering whole copies): {err}"
+                        );
+                        false
+                    }
+                };
+            if committed {
+                for e in batch.drain(..) {
+                    on_committed(e);
+                }
+            } else {
+                for e in batch.drain(..) {
+                    on_fallback(e);
+                }
+            }
+        }));
+        if r.is_err() {
+            // A panic can leave the txn open; roll back defensively so the
+            // NEXT chunk's BEGIN isn't poisoned.
+            let _ = conn.execute_batch("ROLLBACK");
+            log::error!("{label}: chunk panicked ({n} files) — registering whole copies");
+            for e in batch.drain(..) {
+                on_fallback(e);
+            }
+        }
+    };
+    while let Ok(entry) = rx.recv() {
+        batch.push(entry);
+        while batch.len() < 128 {
+            match rx.try_recv() {
+                Ok(e) => batch.push(e),
+                Err(_) => break,
+            }
+        }
+        process(&mut batch);
+    }
+    process(&mut batch);
 }
 
 /// In-session invalidation for a changed (saved/watched) or deleted pack

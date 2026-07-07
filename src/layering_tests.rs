@@ -299,11 +299,11 @@ fn whole_copy_registration_sites_are_allowlisted() {
         (
             "register_symbols",
             vec![
-                // 2 writer fallbacks (commit-fail + panic — bounded by
-                // failure, counted by the residency tripwire), 1 degraded/
-                // unpersisted worker arm (tripwire-counted), 1
-                // pack_file_changed unpersisted fallback (per-edit).
-                ("module_resolver", 4, "failure fallbacks + NO_EVICT arm, tripwire-counted"),
+                // 1 shared writer fallback (commit-fail + panic, via
+                // run_persist_writer — bounded by failure, tripwire-
+                // counted), 1 degraded/unpersisted worker arm (tripwire-
+                // counted), 1 pack_file_changed unpersisted fallback.
+                ("module_resolver", 3, "failure fallbacks + NO_EVICT arm, tripwire-counted"),
             ],
         ),
         (
@@ -325,7 +325,7 @@ fn whole_copy_registration_sites_are_allowlisted() {
             vec![
                 ("backend", 1, "watcher re-register — bounded by external change volume"),
                 ("module_index", 1, "register_workspace_module's residency half"),
-                ("module_resolver", 2, "writer failure fallbacks"),
+                ("module_resolver", 1, "shared writer failure fallback (run_persist_writer)"),
             ],
         ),
         (
