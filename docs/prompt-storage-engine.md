@@ -221,16 +221,34 @@ DELETE+INSERT — the store never rebuilds wholesale after first index.
   projection (decode-dominated warm): 9 min → low minutes; not re-run
   (bucket-share projection per the mission's measurement policy).
 
+- **Hardening round landed** (8 finder angles + adversarial verify).
+  Fixed: free callables absent from the Surface (a C free-function
+  signature change read as Unchanged — the firewall's worst failure
+  mode, caught with a red test); renamed-away providers never dirtied
+  consumers (`stale_provided`); the deleted pack file's caches leaked
+  (deletion semantically invisible); open-doc surfaces recorded
+  POST-enrichment (verdict flap); the Unchanged gate skipped consumer
+  deps-stamp refresh (restart cold storm) — `refresh_deps_stamp`;
+  watcher dropped verdicts (stale open consumers after git pull);
+  stub-lane blob-presence guard; stamp-guarded stub backfill;
+  parent-canonicalize on deleted paths; full-equality method dedup;
+  `prepare_pack_parts` as the one strip-ordering speller; lazy warm-row
+  access; streamed fingerprints. REFUTED empirically: consumer-held
+  spans into an edited header (locations are per-scanned-file by
+  construction). Deferred items in `docs/open-forks.md` ("Mission-2
+  hardening round").
+- **R4 first slice landed**: `ModuleIndex::enriched_snapshot` — the
+  enrichment overlay (derived serde copy, keyed by own + provider
+  surface fingerprints, self-validating, bounded FIFO). First consumer:
+  the `--check` sweep.
+
 Next, in order:
 
-1. **Hardening round** over the whole mission diff (surface + gates +
-   stub lane).
-2. **Workspace-tier always-enriched (R4)**: enriched results as an
-   overlay cache keyed by (file, dep-surface fingerprint), invalidated
-   by the dirty walk — never in-place mutation of shared Arcs. The
-   `--check` sweep (deep-copy + re-enrich per file per run) is the
-   first consumer; hover/completion on closed files follow.
-3. The phase-4 materialized SQL views if the budget allows.
+1. **R4 follow-on consumers**: hover/completion on closed workspace
+   files through `enriched_snapshot` (behavior change — richer answers;
+   verify with gold before/after), and the `--watch`-style repeated
+   sweeps where the overlay's caching pays.
+2. The phase-4 materialized SQL views if the budget allows.
 
 ## Honest boundaries / risks
 
