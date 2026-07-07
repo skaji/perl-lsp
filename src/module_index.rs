@@ -1071,6 +1071,28 @@ impl ModuleIndex {
         &self,
         cached: &Arc<CachedModule>,
     ) -> Option<Arc<FileAnalysis>> {
+        // Cycle guard: enriching A runs type queries whose cross-file chase
+        // may ask for enriched(B), and B's enrichment may ask for
+        // enriched(A) (mutual imports). A re-entrant request for a path
+        // already enriching ON THIS THREAD answers None — the caller's
+        // fallback serves the raw bag, the cycle breaks, and the outer
+        // enrichment completes with the unenriched view of its cyclic dep.
+        thread_local! {
+            static ENRICHING: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> =
+                Default::default();
+        }
+        struct Entered(std::path::PathBuf);
+        impl Drop for Entered {
+            fn drop(&mut self) {
+                ENRICHING.with(|s| {
+                    s.borrow_mut().remove(&self.0);
+                });
+            }
+        }
+        if !ENRICHING.with(|s| s.borrow_mut().insert(cached.path.clone())) {
+            return None;
+        }
+        let _entered = Entered(cached.path.clone());
         // BYTE-bounded first (enriched copies are whole analyses — 64 of a
         // tree's biggest generated modules would quietly re-pin the
         // gigabytes the eviction axes stripped), entry-bounded second.
@@ -1999,6 +2021,10 @@ impl CrossFileLookup for ModuleIndex {
         })
     }
 
+    fn enriched_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        self.enriched_snapshot(cached)
+            .unwrap_or_else(|| self.bag_present(cached))
+    }
     fn bag_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         // Never-evicted copy (open docs, degraded files kept whole): a cheap
         // Arc bump, no I/O.

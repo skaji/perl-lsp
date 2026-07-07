@@ -1816,31 +1816,45 @@ impl ReducerRegistry {
                         // Rehydrate the target file's bag if its resident copy
                         // was Slice-2-evicted; the cross-file chase reads its
                         // witnesses (`docs/adr/memory-slice-2-lru.md`).
+                        let mut attempt =
+                            |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>,
+                             state: &mut _| {
+                                let cached_ctx = BagContext {
+                                    scopes: &full.scopes,
+                                    package_framework: &full.package_framework,
+                                    module_index: Some(idx),
+                                    package_parents: &full.package_parents,
+                                    app_surface_consumers: &full.app_surface_consumers,
+                                };
+                                let sub_q = ReducerQuery {
+                                    attachment: q.attachment,
+                                    point: q.point,
+                                    framework: q.framework,
+                                    arity_hint: q.arity_hint,
+                                    receiver: q.receiver.clone(),
+                                    args: q.args.clone(),
+                                    context: Some(&cached_ctx),
+                                };
+                                (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
+                            };
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
-                            let cached_ctx = BagContext {
-                                scopes: &full.scopes,
-                                package_framework: &full.package_framework,
-                                module_index: Some(idx),
-                                package_parents: &full.package_parents,
-                                app_surface_consumers: &full.app_surface_consumers,
-                            };
-                            let sub_q = ReducerQuery {
-                                attachment: q.attachment,
-                                point: q.point,
-                                framework: q.framework,
-                                arity_hint: q.arity_hint,
-                                receiver: q.receiver.clone(),
-                                args: q.args.clone(),
-                                context: Some(&cached_ctx),
-                            };
-                            let v = self.query_rec(
-                                &full.witnesses,
-                                &sub_q,
-                                state,
-                            );
-                            if *v != ReducedValue::None {
-                                return (*v).clone();
+                            let v = attempt(&full, state);
+                            if v != ReducedValue::None {
+                                return v;
+                            }
+                            // Fallback-on-miss (R4): the class file's method
+                            // return may chain through ITS OWN imports —
+                            // invisible to the raw bag, present in the
+                            // enriched overlay.
+                            let enriched = idx.enriched_present(&cached);
+                            if !std::sync::Arc::ptr_eq(&enriched, &full)
+                                && !std::ptr::eq(bag, &enriched.witnesses)
+                            {
+                                let v = attempt(&enriched, state);
+                                if v != ReducedValue::None {
+                                    return v;
+                                }
                             }
                         }
                     }
@@ -2386,36 +2400,53 @@ pub fn query_sub_return_type(
         if let Some(idx) = ctx.module_index {
             for module_name in idx.find_exporters(sub_name) {
                 let Some(cached) = idx.get_cached(&module_name) else { continue };
+                let try_in = |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>|
+                 -> Option<InferredType> {
+                    let sym = full.symbols.iter().find(|s| {
+                        s.name == sub_name
+                            && matches!(
+                                s.kind,
+                                crate::file_analysis::SymKind::Sub
+                                    | crate::file_analysis::SymKind::Method
+                            )
+                    })?;
+                    let cached_ctx = BagContext {
+                        scopes: &full.scopes,
+                        package_framework: &full.package_framework,
+                        module_index: Some(idx),
+                        package_parents: &full.package_parents,
+                        app_surface_consumers: &full.app_surface_consumers,
+                    };
+                    let att = WitnessAttachment::Symbol(sym.id);
+                    let q = ReducerQuery {
+                        attachment: &att,
+                        point: None,
+                        framework: FrameworkFact::Plain,
+                        arity_hint,
+                        receiver: receiver.clone(),
+                        args: Vec::new(),
+                        context: Some(&cached_ctx),
+                    };
+                    match reg.query(&full.witnesses, &q) {
+                        ReducedValue::Type(t) => Some(t),
+                        _ => None,
+                    }
+                };
                 let full = idx.bag_present(&cached);
-                let Some(sym) = full.symbols.iter().find(|s| {
-                    s.name == sub_name
-                        && matches!(
-                            s.kind,
-                            crate::file_analysis::SymKind::Sub
-                                | crate::file_analysis::SymKind::Method
-                        )
-                }) else {
-                    continue;
-                };
-                let cached_ctx = BagContext {
-                    scopes: &full.scopes,
-                    package_framework: &full.package_framework,
-                    module_index: Some(idx),
-                    package_parents: &full.package_parents,
-                    app_surface_consumers: &full.app_surface_consumers,
-                };
-                let att = WitnessAttachment::Symbol(sym.id);
-                let q = ReducerQuery {
-                    attachment: &att,
-                    point: None,
-                    framework: FrameworkFact::Plain,
-                    arity_hint,
-                    receiver: receiver.clone(),
-                    args: Vec::new(),
-                    context: Some(&cached_ctx),
-                };
-                if let ReducedValue::Type(t) = reg.query(&full.witnesses, &q) {
+                if let Some(t) = try_in(&full) {
                     return Some(t);
+                }
+                // Fallback-on-miss (R4): the raw bag dead-ends when the
+                // closed file's sub return chains through ITS OWN imports
+                // (the walker pins no edge for imported calls) — the
+                // enriched overlay fills exactly that. Only pay when the
+                // raw answer was None and the overlay produced a distinct
+                // copy.
+                let enriched = idx.enriched_present(&cached);
+                if !std::sync::Arc::ptr_eq(&enriched, &full) {
+                    if let Some(t) = try_in(&enriched) {
+                        return Some(t);
+                    }
                 }
             }
             // Pack cross-file: a call whose callee is defined in an INCLUDED

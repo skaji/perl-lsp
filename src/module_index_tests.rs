@@ -598,3 +598,60 @@ fn enriched_snapshot_caches_and_invalidates_on_provider_change() {
         "body edit: the snapshot must derive from the rebuilt analysis"
     );
 }
+
+/// The R4 always-enriched seams: a closed dep whose answer chains through
+/// ITS OWN imports is a raw-bag dead end (the walker pins no edge for
+/// imported calls); the fallback-on-miss retry through the enrichment
+/// overlay fills it. Two seams, one fixture: B::make's return binds
+/// through B's import of C.
+#[test]
+fn closed_dep_return_type_resolves_through_enriched_overlay() {
+    // C: exports thing() with a concrete blessed return.
+    let c = parse_source_to_cached(
+        "package C;\nour @EXPORT_OK = ('thing');\nsub thing { return bless {}, 'Widget' }\n1;\n",
+        "C",
+    );
+    // B: make()'s return type exists only through B's OWN import of C.
+    let b = parse_source_to_cached(
+        "package B;\nuse C 'thing';\nour @EXPORT_OK = ('make');\nsub make { my $x = thing(); return $x }\n1;\n",
+        "B",
+    );
+    // A: the querying consumer, imports make from B.
+    let a = parse_source_to_cached(
+        "package A;\nuse B 'make';\nsub go { my $m = make(); return $m }\n1;\n",
+        "A",
+    );
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(c.path.to_path_buf(), Arc::clone(&c.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+
+    // Precondition: B's RAW bag alone can't answer (else the seam proves
+    // nothing) — thing() is imported, no local edge.
+    assert_eq!(
+        b.analysis.sub_return_type_at_arity("make", None),
+        None,
+        "fixture must dead-end without the index (raw bag)"
+    );
+
+    // Seam 1: the imported-sub recursion from A dead-ends on B's raw bag,
+    // retries through the enrichment overlay, and resolves Widget.
+    let t = a
+        .analysis
+        .sub_return_type_at_arity_ctx("make", None, Some(&idx))
+        .expect("enriched overlay must fill the closed-dep chain");
+    assert_eq!(
+        t.class_name().as_deref(),
+        Some("Widget"),
+        "resolved through B's OWN import of C: {t:?}"
+    );
+
+    // Seam 2: the MethodOnClass cross-file primary — B::make as a method
+    // call target.
+    let t2 = a
+        .analysis
+        .find_method_return_type("B", "make", Some(&idx), None)
+        .expect("MethodOnClass chase must fill through the overlay");
+    assert_eq!(t2.class_name().as_deref(), Some("Widget"));
+}

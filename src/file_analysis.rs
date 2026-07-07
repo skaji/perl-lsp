@@ -450,6 +450,20 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
     }
+    /// A cached WORKSPACE module's analysis with cross-file ENRICHMENT
+    /// applied (`docs/prompt-storage-engine.md` R4, the always-enriched
+    /// tier): imported return types propagated, synthetic hash-key defs
+    /// injected — derived through the overlay, never in-place. Consumers
+    /// are FALLBACK-ON-MISS: call this only after the raw bag answered
+    /// None (a miss pays one deep-copy+enrich, then the overlay caches by
+    /// dep-surface fingerprint). Default: the bag-present view — impls
+    /// without an overlay answer unenriched, never wrongly.
+    fn enriched_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        self.bag_present(cached)
+    }
     /// A cached module's analysis whole on EVERY evictable axis — bag, refs,
     /// AND symbols present. Consumers that read more than one axis from the
     /// same copy (the diagnostics sweep, the `refs_to` matcher, `sub_info`
@@ -634,6 +648,14 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     ) -> std::sync::Arc<FileAnalysis> {
         // Same delegation rule as `bag_present` — the inner index owns the LRU.
         self.inner.refs_present(cached)
+    }
+    fn enriched_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the
+        // enrichment overlay.
+        self.inner.enriched_present(cached)
     }
     fn whole_present(
         &self,

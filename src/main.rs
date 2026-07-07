@@ -1995,7 +1995,7 @@ fn cli_dump_package(root: &str, package_name: &str) {
     // Find a FileAnalysis whose package matches. Workspace first; fall
     // back to cached @INC modules. No bespoke discovery — only what
     // the normal startup populated.
-    let mut found: Option<(String, Arc<FileAnalysis>)> = None;
+    let mut found: Option<(String, Arc<file_analysis::CachedModule>)> = None;
     for entry in ws.workspace_raw().iter() {
         let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
             entry.key().clone(),
@@ -2007,32 +2007,29 @@ fn cli_dump_package(root: &str, package_name: &str) {
                 && s.name == package_name
         });
         if has_package {
-            // `analysis` is already the whole view — the dump reads the bag
-            // (params, returns, witness counts) and symbols; an evicted copy
-            // would honestly-but-uselessly dump zero facts.
-            found = Some((entry.key().display().to_string(), analysis));
+            found = Some((entry.key().display().to_string(), cm));
             break;
         }
     }
     if found.is_none() {
         if let Some(cached) = module_index.get_cached(package_name) {
-            let whole = file_analysis::CrossFileLookup::whole_present(&module_index, &cached);
-            found = Some((cached.path.display().to_string(), whole));
+            found = Some((cached.path.display().to_string(), cached));
         }
     }
 
-    let Some((path, analysis_ro)) = found else {
+    let Some((path, cached)) = found else {
         eprintln!("Package '{}' not found in workspace or module cache.", package_name);
         eprintln!("(Run the LSP against this workspace once to populate cached @INC modules.)");
         std::process::exit(1);
     };
 
-    // Deep-copy via bincode (FileAnalysis isn't Clone) and enrich the
-    // private copy with imported types so cross-file return inferences
-    // are visible — same pass the LSP runs in publish_diagnostics.
-    let bin = bincode::serialize(&*analysis_ro).expect("bincode FileAnalysis");
-    let mut analysis: FileAnalysis = bincode::deserialize(&bin).expect("bincode FileAnalysis roundtrip");
-    analysis.enrich_imported_types_with_keys(Some(&module_index));
+    // The enrichment overlay (R4): the same derived, fingerprint-keyed
+    // enriched copy the diagnostics sweep reads — imported return types
+    // visible, shared Arc untouched. Degrade to the whole view when the
+    // overlay declines (cycle guard).
+    let analysis = module_index
+        .enriched_snapshot(&cached)
+        .unwrap_or_else(|| file_analysis::CrossFileLookup::whole_present(&module_index, &cached));
 
     // Collect subs/methods declared inside this package.
     let mut subs: Vec<&file_analysis::Symbol> = analysis
