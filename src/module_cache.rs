@@ -1491,7 +1491,10 @@ pub fn save_to_db(
         params![module_name, path_str, mtime, size, source, analysis_blob, EXTRACT_VERSION, deps_stamp],
     );
     let ok = match r {
-        Ok(_) => true,
+        // A row whose blob failed to ENCODE landed as NULL — not a
+        // recoverable generation; stripping against it would lose the bag.
+        // (Negative sentinels have no blob by design and nothing to strip.)
+        Ok(_) => result.is_none() || analysis_blob.is_some(),
         Err(e) => {
             log::warn!("Failed to save module cache for '{}': {}", module_name, e);
             false

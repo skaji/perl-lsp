@@ -1115,6 +1115,12 @@ fn save_module_generation(
         }
     }
     let persisted = module_cache::save_to_db(conn, module_name, result, "import");
+    if !persisted {
+        // Blob didn't land (busy/encode failure): shredding rows now would
+        // pair a NEW generation's rows with an OLD (or absent) blob —
+        // "blob + rows describe one generation" is the write invariant.
+        return false;
+    }
     if let Some(m) = result {
         if !m.analysis.degraded {
             let seeds: Vec<_> = m.analysis.refs.iter().map(|r| r.row_seed()).collect();
