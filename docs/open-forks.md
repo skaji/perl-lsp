@@ -438,3 +438,35 @@ Deferred, with designs:
   persist+re-strip, buffer-vs-disk record provenance, probe
   serialization (measure first), phase-4 SQL views. Declined micro-opts
   stay declined.
+
+## R4 hardening round — 2026-07-07 — OPEN (Claude)
+
+Fixed: retries only ever use RETAINED overlay copies (an unretained copy
+gave the seams fresh bag pointers per recursion level — unbounded mints
+to the 512-depth cap on byte-cap giants, and memo entries keyed on freed
+addresses); declines (giant/cycle-taint) are CACHED under the key, so
+repeat queries skip the deep copy; the exporter loop is two-pass (raw
+answers can never be shadowed by an earlier exporter's enriched answer;
+symbol-less exporters never trigger a retry); QueryState pins enriched
+Arcs for memo-address validity; the overlay is LRU (was FIFO);
+enrichment keys use monotonic REGISTRATION GENERATIONS instead of Arc
+pointers (ABA-proof; also covers body-dependent provider facts the
+span-free fingerprint deliberately ignores); --dump-package warns on
+overlay decline. Cycle policy: tainted builds decline deterministically
+— cyclic files answer raw everywhere, never a query-order-dependent
+half-enriched cache.
+
+Deferred:
+- **Unwired seams** (same fallback-on-miss pattern, wire next):
+  bridged-plugin-entity chase (witnesses.rs ~1916 — bridged methods
+  resolve unenriched while plain methods now resolve enriched),
+  enrichment's own import scan (file_analysis.rs ~5809 — makes
+  enrichment transitive; the cycle guard's real customer), SlotType
+  primary (~1938). TypeName chase: skip (pack aliases, no Perl win).
+- **@INC providers keep the Arc-pointer freshness token** (no
+  registration gen — the resolver thread inserts without the hub map);
+  ABA-prone in principle. Fold into the @INC-stripping arc: route
+  insert_into_cache through a hub-owned seam that bumps generations.
+- **In-flight dedup**: two threads missing on one path both pay the
+  deep-copy (last insert wins). Bounded waste; revisit if profiling
+  shows it.

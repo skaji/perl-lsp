@@ -655,3 +655,98 @@ fn closed_dep_return_type_resolves_through_enriched_overlay() {
         .expect("MethodOnClass chase must fill through the overlay");
     assert_eq!(t2.class_name().as_deref(), Some("Widget"));
 }
+
+/// Mutual imports terminate: the thread-local cycle guard declines the
+/// re-entrant enrich, the tainted build is remembered as a DECLINE (never
+/// cached as a degraded copy, never rebuilt per query), and the acyclic
+/// leg still resolves through the raw bag.
+#[test]
+fn enrichment_cycle_terminates_and_declines_deterministically() {
+    let a = parse_source_to_cached(
+        "package CycA;\nuse CycB 'bfn';\nour @EXPORT_OK = ('afn');\nsub afn { return bless {}, 'AObj' }\n1;\n",
+        "CycA",
+    );
+    let b = parse_source_to_cached(
+        "package CycB;\nuse CycA 'afn';\nour @EXPORT_OK = ('bfn');\nsub bfn { my $y = afn(); return $y }\n1;\n",
+        "CycB",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+
+    // Terminates (no hang / overflow); B's enrichment resolves afn through
+    // A's RAW bag (afn's return is local to A — no cycle needed for it).
+    let snap = idx.enriched_snapshot(&b);
+    assert!(snap.is_some(), "acyclic leg enriches");
+    // And a consumer's query through the seam answers AObj.
+    let consumer = parse_source_to_cached(
+        "package Cons;\nuse CycB 'bfn';\nsub go { my $r = bfn(); return $r }\n1;\n",
+        "Cons",
+    );
+    let t = consumer
+        .analysis
+        .sub_return_type_at_arity_ctx("bfn", None, Some(&idx))
+        .expect("cycle must not block the resolvable leg");
+    assert_eq!(t.class_name().as_deref(), Some("AObj"));
+}
+
+/// The trait DEFAULT stays unenriched-but-correct: an overlay-less impl
+/// answers the raw bag view, so the seams' fallback is a no-op there.
+#[test]
+fn enriched_present_default_is_the_raw_bag() {
+    struct Bare(Arc<CachedModule>);
+    impl crate::file_analysis::CrossFileLookup for Bare {
+        fn get_cached(&self, _m: &str) -> Option<Arc<CachedModule>> {
+            Some(Arc::clone(&self.0))
+        }
+        fn parents_cached(&self, _m: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn modules_with_symbol(&self, _n: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn find_exporters(&self, _n: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn defining_module_cached(
+            &self,
+            _entry: &str,
+            _name: &str,
+        ) -> Option<Arc<CachedModule>> {
+            None
+        }
+        fn module_declaring_method_in_package(
+            &self,
+            _p: &str,
+            _m: &str,
+        ) -> Option<String> {
+            None
+        }
+        fn for_each_cached(&self, _f: &mut dyn FnMut(&str, &Arc<CachedModule>)) {}
+        fn for_each_reexport_module(
+            &self,
+            _start: Vec<String>,
+            _visit: &mut dyn FnMut(&Arc<CachedModule>) -> std::ops::ControlFlow<()>,
+        ) {
+        }
+        fn for_each_entity_bridged_to(
+            &self,
+            _c: &str,
+            _f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::file_analysis::Symbol),
+        ) {
+        }
+        fn direct_children_of(&self, _p: &str) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn for_each_loader_shape(
+            &self,
+            _f: &mut dyn FnMut(&str, &crate::file_analysis::InferredType),
+        ) {
+        }
+    }
+    let cm = parse_source_to_cached("package P;\nsub f { return 1 }\n1;\n", "P");
+    let lk = Bare(Arc::clone(&cm));
+    let e = crate::file_analysis::CrossFileLookup::enriched_present(&lk, &cm);
+    let b = crate::file_analysis::CrossFileLookup::bag_present(&lk, &cm);
+    assert!(Arc::ptr_eq(&e, &b), "default enriched view IS the raw bag view");
+}

@@ -1533,6 +1533,10 @@ type VisitedSet = std::collections::HashSet<VisitedKey>;
 /// queries whose context (scopes / module_index / framework) differs.
 struct QueryState {
     visited: VisitedSet,
+    /// Enriched copies consulted during this query — pinned so memo
+    /// entries keyed on their bag ADDRESSES stay valid even if the
+    /// overlay's eviction drops its own reference mid-query.
+    pins: Vec<std::sync::Arc<crate::file_analysis::FileAnalysis>>,
     // `Arc` so a memo store/hit clones one heap pointer, not the
     // (String-bearing) `ReducedValue`. `HashMap::new()` pre-allocates
     // no buckets, so a shallow query that never re-reaches a node (the
@@ -1545,6 +1549,7 @@ impl QueryState {
     fn new() -> Self {
         QueryState {
             visited: std::collections::HashSet::new(),
+            pins: Vec::new(),
             memo: std::collections::HashMap::new(),
         }
     }
@@ -1851,6 +1856,7 @@ impl ReducerRegistry {
                             if !std::sync::Arc::ptr_eq(&enriched, &full)
                                 && !std::ptr::eq(bag, &enriched.witnesses)
                             {
+                                state.pins.push(std::sync::Arc::clone(&enriched));
                                 let v = attempt(&enriched, state);
                                 if v != ReducedValue::None {
                                     return v;
@@ -2398,53 +2404,64 @@ pub fn query_sub_return_type(
     // overrides, and fold rules; only the bag and symbols change.
     if let Some(ctx) = context {
         if let Some(idx) = ctx.module_index {
+            let try_in = |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>|
+             -> Option<Option<InferredType>> {
+                // Outer None = no matching symbol (an enriched retry can't
+                // help — enrichment adds no symbols of these kinds);
+                // Some(None) = symbol present, type unresolved (retryable).
+                let sym = full.symbols.iter().find(|s| {
+                    s.name == sub_name
+                        && matches!(
+                            s.kind,
+                            crate::file_analysis::SymKind::Sub
+                                | crate::file_analysis::SymKind::Method
+                        )
+                })?;
+                let cached_ctx = BagContext {
+                    scopes: &full.scopes,
+                    package_framework: &full.package_framework,
+                    module_index: Some(idx),
+                    package_parents: &full.package_parents,
+                    app_surface_consumers: &full.app_surface_consumers,
+                };
+                let att = WitnessAttachment::Symbol(sym.id);
+                let q = ReducerQuery {
+                    attachment: &att,
+                    point: None,
+                    framework: FrameworkFact::Plain,
+                    arity_hint,
+                    receiver: receiver.clone(),
+                    args: Vec::new(),
+                    context: Some(&cached_ctx),
+                };
+                match reg.query(&full.witnesses, &q) {
+                    ReducedValue::Type(t) => Some(Some(t)),
+                    _ => Some(None),
+                }
+            };
+            // Two passes so the R4 retry can never SHADOW a later
+            // exporter's raw answer: every exporter answers from its raw
+            // bag first; only when ALL raw bags miss do the retryable ones
+            // consult the enrichment overlay (fallback-on-miss — the raw
+            // bag dead-ends when the closed file's sub return chains
+            // through ITS OWN imports; the walker pins no edge for
+            // imported calls).
+            let mut retryable: Vec<std::sync::Arc<crate::file_analysis::CachedModule>> =
+                Vec::new();
             for module_name in idx.find_exporters(sub_name) {
                 let Some(cached) = idx.get_cached(&module_name) else { continue };
-                let try_in = |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>|
-                 -> Option<InferredType> {
-                    let sym = full.symbols.iter().find(|s| {
-                        s.name == sub_name
-                            && matches!(
-                                s.kind,
-                                crate::file_analysis::SymKind::Sub
-                                    | crate::file_analysis::SymKind::Method
-                            )
-                    })?;
-                    let cached_ctx = BagContext {
-                        scopes: &full.scopes,
-                        package_framework: &full.package_framework,
-                        module_index: Some(idx),
-                        package_parents: &full.package_parents,
-                        app_surface_consumers: &full.app_surface_consumers,
-                    };
-                    let att = WitnessAttachment::Symbol(sym.id);
-                    let q = ReducerQuery {
-                        attachment: &att,
-                        point: None,
-                        framework: FrameworkFact::Plain,
-                        arity_hint,
-                        receiver: receiver.clone(),
-                        args: Vec::new(),
-                        context: Some(&cached_ctx),
-                    };
-                    match reg.query(&full.witnesses, &q) {
-                        ReducedValue::Type(t) => Some(t),
-                        _ => None,
-                    }
-                };
                 let full = idx.bag_present(&cached);
-                if let Some(t) = try_in(&full) {
-                    return Some(t);
+                match try_in(&full) {
+                    Some(Some(t)) => return Some(t),
+                    Some(None) => retryable.push(cached),
+                    None => {}
                 }
-                // Fallback-on-miss (R4): the raw bag dead-ends when the
-                // closed file's sub return chains through ITS OWN imports
-                // (the walker pins no edge for imported calls) — the
-                // enriched overlay fills exactly that. Only pay when the
-                // raw answer was None and the overlay produced a distinct
-                // copy.
+            }
+            for cached in retryable {
+                let full = idx.bag_present(&cached);
                 let enriched = idx.enriched_present(&cached);
                 if !std::sync::Arc::ptr_eq(&enriched, &full) {
-                    if let Some(t) = try_in(&enriched) {
+                    if let Some(Some(t)) = try_in(&enriched) {
                         return Some(t);
                     }
                 }

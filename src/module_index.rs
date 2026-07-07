@@ -384,7 +384,16 @@ pub struct ModuleIndex {
     /// The enrichment overlay (R4): derived enriched copies keyed by the
     /// surface fingerprints of the file + its providers. Bounded FIFO —
     /// `enriched_order` is the eviction queue.
-    enriched: Arc<DashMap<std::path::PathBuf, (u64, Arc<FileAnalysis>, usize)>>,
+    /// `None` payload = a DECLINED build (byte-cap giant / cycle-tainted)
+    /// at this key: repeat queries skip the deep-copy entirely until a
+    /// provider change moves the key.
+    enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
+    /// Monotonic per-path registration generation — the ABA-proof identity
+    /// token `enrichment_key` hashes (an Arc pointer can be freed and its
+    /// address reused; a counter can't run backwards). Bumped by every
+    /// registration front door.
+    registration_gen: Arc<DashMap<std::path::PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
@@ -466,6 +475,8 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
+            registration_gen: Arc::new(DashMap::new()),
+            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
@@ -847,6 +858,8 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
+            registration_gen: Arc::new(DashMap::new()),
+            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
@@ -906,6 +919,8 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
+            registration_gen: Arc::new(DashMap::new()),
+            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
@@ -999,6 +1014,7 @@ impl ModuleIndex {
         analysis: Arc<FileAnalysis>,
     ) -> crate::surface::SurfaceVerdict {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.bump_registration_gen(&path);
         let verdict = self.record_surface(&path, &analysis);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Path-keyed registry first: the relational retrieval resolves
@@ -1042,6 +1058,21 @@ impl ModuleIndex {
         self.freshness.record(&canon, surface)
     }
 
+    /// Every registration bumps this — the enrichment key's freshness
+    /// token for the file itself and for providers whose facts aren't
+    /// surface-covered (a body edit re-registers with a new generation,
+    /// where a surface fingerprint deliberately stands still).
+    pub(crate) fn bump_registration_gen(&self, path: &std::path::Path) {
+        let g = self
+            .gen_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.registration_gen.insert(path.to_path_buf(), g);
+    }
+
+    fn registration_gen_of(&self, path: &std::path::Path) -> u64 {
+        self.registration_gen.get(path).map(|g| *g).unwrap_or(0)
+    }
+
     /// Drop `path`'s recorded surface and its dep edges (file deleted).
     /// A deleted file can't canonicalize, but the record was keyed under
     /// the RESOLVED path while it existed — resolve the parent and rejoin
@@ -1081,6 +1112,9 @@ impl ModuleIndex {
             static ENRICHING: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> =
                 Default::default();
         }
+        thread_local! {
+            static DECLINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
         struct Entered(std::path::PathBuf);
         impl Drop for Entered {
             fn drop(&mut self) {
@@ -1090,9 +1124,11 @@ impl ModuleIndex {
             }
         }
         if !ENRICHING.with(|s| s.borrow_mut().insert(cached.path.clone())) {
+            DECLINED.with(|c| c.set(c.get() + 1));
             return None;
         }
         let _entered = Entered(cached.path.clone());
+        let declined_before = DECLINED.with(|c| c.get());
         // BYTE-bounded first (enriched copies are whole analyses — 64 of a
         // tree's biggest generated modules would quietly re-pin the
         // gigabytes the eviction axes stripped), entry-bounded second.
@@ -1102,7 +1138,16 @@ impl ModuleIndex {
         let key = self.enrichment_key(cached);
         if let Some(e) = self.enriched.get(path) {
             if e.0 == key {
-                return Some(e.1.clone());
+                let hit = e.1.clone();
+                drop(e);
+                // LRU touch — a FIFO would let any sweep evict the hot dep
+                // entries the witness seams lean on, in insertion order.
+                let mut order = self.enriched_order.lock().unwrap();
+                order.retain(|p| p != path);
+                order.push_back(path.clone());
+                // `None` = a remembered DECLINE (giant / cycle-tainted):
+                // repeat queries skip the deep-copy until the key moves.
+                return hit;
             }
         }
         let whole = crate::file_analysis::CrossFileLookup::whole_present(self, cached);
@@ -1114,13 +1159,24 @@ impl ModuleIndex {
         copy.after_deserialize();
         copy.enrich_imported_types_with_keys(Some(self));
         let arc = Arc::new(copy);
+        // Cycle-tainted: some dep declined mid-enrich (mutual imports), so
+        // this copy baked a RAW view of that dep. Caching it would serve
+        // the degraded answer until an unrelated surface change; serving
+        // it unretained would let the witness seams mint fresh copies per
+        // recursion level (unbounded). Answer None — cyclic files honestly
+        // degrade to their raw bags, deterministically.
+        let tainted = DECLINED.with(|c| c.get()) != declined_before;
         let bytes = arc.heap_estimate().total();
-        // A single entry past the cap is served but never retained — the
-        // sweep must churn through giants, not pin them.
-        if bytes > ENRICHED_BYTE_CAP {
-            return Some(arc);
-        }
-        self.enriched.insert(path.clone(), (key, arc.clone(), bytes));
+        // Past the byte cap the copy can't be RETAINED, and an unretained
+        // copy must never leave this function: the seams' termination and
+        // memo validity both key on overlay-held Arc identity. Giants and
+        // cycle-tainted builds honestly answer unenriched — and the
+        // decline is CACHED so repeat queries don't rebuild the copy just
+        // to re-decline it.
+        let stored: Option<Arc<FileAnalysis>> =
+            if tainted || bytes > ENRICHED_BYTE_CAP { None } else { Some(arc) };
+        let entry_bytes = if stored.is_some() { bytes } else { 0 };
+        self.enriched.insert(path.clone(), (key, stored.clone(), entry_bytes));
         {
             let mut order = self.enriched_order.lock().unwrap();
             order.retain(|p| p != path);
@@ -1140,7 +1196,7 @@ impl ModuleIndex {
                 }
             }
         }
-        Some(arc)
+        stored
     }
 
     /// The overlay's validity key — it must cover EVERYTHING
@@ -1168,7 +1224,7 @@ impl ModuleIndex {
     fn enrichment_key(&self, cached: &Arc<CachedModule>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        (Arc::as_ptr(&cached.analysis) as usize).hash(&mut h);
+        self.registration_gen_of(&cached.path).hash(&mut h);
         self.freshness.fingerprint_of(&cached.path).unwrap_or(0).hash(&mut h);
         let mut seen: std::collections::HashSet<String> = Default::default();
         let mut frontier: Vec<String> = self.freshness.deps_of_names(&cached.path);
@@ -1188,22 +1244,38 @@ impl ModuleIndex {
                 dep.hash(&mut h);
                 match self.get_cached(&dep) {
                     None => 0u8.hash(&mut h),
-                    Some(cm) => match self.freshness.fingerprint_of(&cm.path) {
-                        Some(fp) => {
-                            1u8.hash(&mut h);
-                            fp.hash(&mut h);
-                            next.extend(self.freshness.deps_of_names(&cm.path));
-                        }
-                        None => {
-                            2u8.hash(&mut h);
-                            (Arc::as_ptr(&cm.analysis) as usize).hash(&mut h);
-                            // Recordless tier: no deps_of record; its
-                            // parents ride the analysis itself.
-                            for parents in cm.analysis.package_parents.values() {
-                                next.extend(parents.iter().cloned());
+                    Some(cm) => {
+                        // Generation ALWAYS on the key, fingerprint too when
+                        // recorded: enrichment's ctx-ful passes bake
+                        // BODY-dependent provider facts the span-free
+                        // fingerprint deliberately ignores, so a provider
+                        // re-registration must move every consumer's key
+                        // (over-invalidation, never staleness).
+                        self.registration_gen_of(&cm.path).hash(&mut h);
+                        match self.freshness.fingerprint_of(&cm.path) {
+                            Some(fp) => {
+                                1u8.hash(&mut h);
+                                fp.hash(&mut h);
+                                next.extend(self.freshness.deps_of_names(&cm.path));
+                            }
+                            None => {
+                                2u8.hash(&mut h);
+                                // @INC tier: no registration gen (the
+                                // resolver thread inserts without the hub's
+                                // gen map) — the Arc pointer is the residual
+                                // freshness token (ABA-prone in principle;
+                                // ledgered).
+                                if self.registration_gen_of(&cm.path) == 0 {
+                                    (Arc::as_ptr(&cm.analysis) as usize).hash(&mut h);
+                                }
+                                // Recordless tier: no deps_of record; its
+                                // parents ride the analysis itself.
+                                for parents in cm.analysis.package_parents.values() {
+                                    next.extend(parents.iter().cloned());
+                                }
                             }
                         }
-                    },
+                    }
                 }
             }
             next.sort_unstable();
@@ -1264,6 +1336,7 @@ impl ModuleIndex {
         module_name: Option<String>,
     ) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, arc));
         self.all_files.insert(cached.path.clone(), cached.clone());
         if let Some(name) = module_name {
@@ -1576,6 +1649,7 @@ impl ModuleIndex {
         specializes: &[(String, String)],
     ) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // The registration record FIRST — before all_files/all_defs/cache
         // publish this (possibly symbol-stripped) copy: a concurrent

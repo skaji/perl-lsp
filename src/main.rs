@@ -2027,9 +2027,16 @@ fn cli_dump_package(root: &str, package_name: &str) {
     // enriched copy the diagnostics sweep reads — imported return types
     // visible, shared Arc untouched. Degrade to the whole view when the
     // overlay declines (cycle guard).
-    let analysis = module_index
-        .enriched_snapshot(&cached)
-        .unwrap_or_else(|| file_analysis::CrossFileLookup::whole_present(&module_index, &cached));
+    let analysis = module_index.enriched_snapshot(&cached).unwrap_or_else(|| {
+        // Overlay declined (serde break / byte-cap giant / cycle taint):
+        // dump unenriched, LOUDLY — silent degrade here looks exactly like
+        // the inference bug the user is debugging.
+        eprintln!(
+            "warning: enrichment overlay declined for {path}; cross-file return \
+             types will be missing from this dump"
+        );
+        file_analysis::CrossFileLookup::whole_present(&module_index, &cached)
+    });
 
     // Collect subs/methods declared inside this package.
     let mut subs: Vec<&file_analysis::Symbol> = analysis
