@@ -1458,19 +1458,21 @@ pub fn warm_cache(
     (count, stale_names)
 }
 
+/// Returns whether the modules row landed — stripping a resident copy is
+/// only legal when its blob is actually recoverable.
 pub fn save_to_db(
     conn: &Connection,
     module_name: &str,
     result: &Option<Arc<CachedModule>>,
     source: &str,
-) {
+) -> bool {
     let (path_str, mtime, size, analysis_blob, deps_stamp) = match result {
         Some(cached) => {
             // Degraded analyses (parse/extract failure, skipped gather) must
             // not be persisted: the row would validate on the source file's
             // stamp alone and re-serve the degraded blob every session (H8).
             if cached.analysis.degraded {
-                return;
+                return false;
             }
             let (mtime, size) = file_stamp(&cached.path).unwrap_or((0, 0));
             let blob = encode_analysis(&cached.analysis);
@@ -1488,13 +1490,18 @@ pub fn save_to_db(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![module_name, path_str, mtime, size, source, analysis_blob, EXTRACT_VERSION, deps_stamp],
     );
-    if let Err(e) = r {
-        log::warn!("Failed to save module cache for '{}': {}", module_name, e);
-    }
+    let ok = match r {
+        Ok(_) => true,
+        Err(e) => {
+            log::warn!("Failed to save module cache for '{}': {}", module_name, e);
+            false
+        }
+    };
     if !path_str.is_empty() {
         // Same stale-stub guard as `save_blob_to_db_stamped`.
         delete_stub(conn, &path_str);
     }
+    ok
 }
 
 /// Drop the modules table when the driver's external analysis inputs (the

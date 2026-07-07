@@ -175,11 +175,16 @@ pub fn spawn_resolver(
                         ),
                         None => log::info!("No exports found for '{}'", module_name),
                     }
-                    insert_into_cache(&cache, &edges, &module_name, result.clone());
-
-                    if let Some(ref conn) = db {
-                        save_module_generation(conn, &module_name, &result);
-                    }
+                    let persisted = db
+                        .as_ref()
+                        .map(|conn| save_module_generation(conn, &module_name, &result))
+                        .unwrap_or(false);
+                    let stored =
+                        strip_import_copy(&result, persisted, eviction_enabled());
+                    // The memo would otherwise pin the WHOLE closure for the
+                    // thread's lifetime — a second copy of the tier.
+                    parse_memo.insert(module_name.clone(), stored.clone());
+                    insert_into_cache(&cache, &edges, &module_name, stored);
 
                     // Descend into the module's own dependencies so the
                     // chain keeps resolving beyond the open doc's direct
@@ -374,10 +379,14 @@ pub fn spawn_test_resolver(
                     }
 
                     let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
-                    insert_into_cache(&cache, &edges, &module_name, result.clone());
-                    if let Some(ref conn) = db {
-                        save_module_generation(conn, &module_name, &result);
-                    }
+                    let persisted = db
+                        .as_ref()
+                        .map(|conn| save_module_generation(conn, &module_name, &result))
+                        .unwrap_or(false);
+                    let stored =
+                        strip_import_copy(&result, persisted, eviction_enabled());
+                    parse_memo.insert(module_name.clone(), stored.clone());
+                    insert_into_cache(&cache, &edges, &module_name, stored);
                     stale_modules.remove(&module_name);
                     let _g = resolved.mu.lock().unwrap();
                     resolved.cv.notify_all();
@@ -408,6 +417,27 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 }
 
 /// Insert a resolved module into the cache and update the edge indexes.
+/// The @INC tier's registration-owned strip: once the blob is persisted,
+/// the resident copy drops its witness bag (the dominant share of a CPAN
+/// module's payload; `bag_present` rehydrates through the hub's LRU).
+/// Symbols and refs stay resident this slice — their reader routing for
+/// the import tier is the follow-up in `docs/open-forks.md`. Degraded
+/// analyses keep the bag (their rows never persist).
+fn strip_import_copy(
+    result: &Option<Arc<CachedModule>>,
+    persisted: bool,
+    strip: bool,
+) -> Option<Arc<CachedModule>> {
+    match result {
+        Some(m) if persisted && strip && !m.analysis.degraded => {
+            let mut fa = (*m.analysis).clone();
+            fa.evict_axes(true, false);
+            Some(Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa))))
+        }
+        _ => result.clone(),
+    }
+}
+
 fn insert_into_cache(
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
     edges: &ModuleEdgeIndexes,
@@ -1071,12 +1101,20 @@ fn eviction_enabled() -> bool {
 /// together (`docs/adr/relational-ref-index.md` — rows and blob describe the
 /// same analysis or neither exists). `save_to_db` skips degraded analyses;
 /// mirror that here so no rows exist for an unpersisted blob.
+/// Returns whether the blob row landed (the strip-legality signal).
 fn save_module_generation(
     conn: &rusqlite::Connection,
     module_name: &str,
     result: &Option<Arc<CachedModule>>,
-) {
-    module_cache::save_to_db(conn, module_name, result, "import");
+) -> bool {
+    if let Some(m) = result {
+        // A bag-evicted copy IS the already-persisted generation —
+        // re-encoding it would overwrite the good blob with a bagless one.
+        if m.analysis.bag_is_evicted() {
+            return true;
+        }
+    }
+    let persisted = module_cache::save_to_db(conn, module_name, result, "import");
     if let Some(m) = result {
         if !m.analysis.degraded {
             let seeds: Vec<_> = m.analysis.refs.iter().map(|r| r.row_seed()).collect();
@@ -1092,6 +1130,7 @@ fn save_module_generation(
             }
         }
     }
+    persisted
 }
 
 pub fn index_pack_languages(

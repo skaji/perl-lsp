@@ -277,3 +277,30 @@ fn pack_file_changed_surface_gate_skips_consumers_on_body_edit() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The @INC registration-owned strip: a persisted, non-degraded module's
+/// resident copy drops its bag (rehydratable via the hub LRU); unpersisted
+/// or eviction-off copies stay whole (the bag would be unrecoverable).
+#[test]
+fn import_tier_strip_gates_on_persistence() {
+    let source = "package Strip;\nsub go { my $s = shift; return bless {}, 'X' }\n1;\n";
+    let mut parser = create_parser();
+    let tree = parser.parse(source, None).unwrap();
+    let fa = crate::builder::build(&tree, source.as_bytes());
+    assert!(!fa.witnesses.is_empty());
+    let cm = Some(Arc::new(CachedModule::new(
+        PathBuf::from("/inc/Strip.pm"),
+        Arc::new(fa),
+    )));
+
+    let stripped = strip_import_copy(&cm, true, true).unwrap();
+    assert!(stripped.analysis.bag_is_evicted(), "persisted + eviction → bag drops");
+    assert!(!stripped.analysis.symbols_are_evicted(), "symbols stay resident this slice");
+    assert!(!stripped.analysis.refs_are_evicted(), "refs stay resident this slice");
+
+    let whole = strip_import_copy(&cm, false, true).unwrap();
+    assert!(!whole.analysis.bag_is_evicted(), "unpersisted → bag unrecoverable → keep");
+    let whole2 = strip_import_copy(&cm, true, false).unwrap();
+    assert!(!whole2.analysis.bag_is_evicted(), "NO_EVICT → keep");
+    assert!(strip_import_copy(&None, true, true).is_none());
+}
