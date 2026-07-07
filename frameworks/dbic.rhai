@@ -11,8 +11,10 @@
 // relationship installs an accessor whose return names the related shape:
 // has_many / many_to_many → a ResultSet, belongs_to / has_one / might_have → row.
 //
-// Core feeds the flat arg names in `ctx.arg_names`; this plugin owns the verb
-// vocabulary. `ClassIsa("DBIx::Class")` scopes synthesis to result classes at
+// The declarator verbs live in the pattern's #any-of?; the flat arg
+// names arrive via the `list` projection on the @args capture (the
+// pattern-era `arg_names`). This plugin owns the verb vocabulary.
+// `ClassIsa("DBIx::Class")` scopes synthesis to result classes at
 // any depth. `load_components` parent registration stays core (generic mixin
 // machinery). `fluent_verbs` carry a resultset through `$rs->search`, so
 // `RowOf`/`find` compose a `$rs->find->col` chain; relationship typing is plain.
@@ -23,10 +25,39 @@ fn triggers() {
     [ #{ ClassIsa: "DBIx::Class" } ]
 }
 
-// The verbs whose args core should flatten into `ctx.arg_names`.
-fn arg_name_verbs() {
-    ["add_columns", "add_column", "has_many", "many_to_many",
-     "belongs_to", "has_one", "might_have"]
+fn patterns() {
+    [
+        #{
+            name: "class_decl",
+            // Any receiver matches syntactically; the class-level-call
+            // gate (`__PACKAGE__->…` / `CurrentClass->…`, never a
+            // runtime `$rs->add_columns({...})`) is the
+            // `is_package_receiver` projection checked in on_match —
+            // "receiver is the current package" isn't expressible in
+            // a pattern.
+            query: `
+(method_call_expression
+  invocant: (_) @recv
+  method: (_) @verb
+  (#any-of? @verb "add_columns" "add_column" "has_many" "many_to_many"
+                  "belongs_to" "has_one" "might_have")
+  arguments: (_) @args
+) @call
+`,
+            projections: #{
+                recv: ["is_package_receiver"],
+                args: ["list"],
+            },
+            expect: [
+                #{ src: "__PACKAGE__->add_columns(qw/id name/);", matches: 1 },
+                #{ src: "__PACKAGE__->has_many(comments => 'Schema::Result::Comment', 'post_id');", matches: 1 },
+                // A runtime call still MATCHES (receiver gating is
+                // on_match's job); the search verb never does.
+                #{ src: "$rs->add_columns({ x => 1 });", matches: 1 },
+                #{ src: "$rs->search({ x => 1 });", matches: 0 },
+            ],
+        },
+    ]
 }
 
 // Resultset/row verbs whose FIRST hashref arg is keyed by COLUMN names — the
@@ -112,23 +143,25 @@ fn relationship_method(name, span, ret) {
     }
 }
 
-fn on_method_call(ctx) {
+fn on_match(pattern, m) {
     let out = [];
-    let verb = ctx.method_name;
-    if verb == () { return out; }
+    let verb = m.captures.verb.text;
 
     // Class-level declaration only: `__PACKAGE__->add_columns(...)`, never a
     // runtime `$rs->add_columns({...})` (a query op, not a column decl).
-    if !ctx.receiver_is_package { return out; }
+    let recv = m.captures.recv;
+    if recv == () || recv.is_package_receiver != true { return out; }
 
-    let names = ctx.arg_names;
+    let args = m.captures.args;
+    if args == () { return out; }
+    let names = args.list;
     if names == () || names.len() < 1 { return out; }
 
     if verb == "add_columns" || verb == "add_column" {
         // Every flattened name is a column (the hashref option values
-        // carry no name and never reach `arg_names`).
+        // carry no name and never reach the `list` projection).
         for pair in names {
-            out += column_actions(pair[0], pair[1], ctx.current_package);
+            out += column_actions(pair[0], pair[1], m["package"]);
         }
         return out;
     }

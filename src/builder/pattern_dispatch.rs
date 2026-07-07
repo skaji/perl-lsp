@@ -121,10 +121,9 @@ fn cached_pattern_query(source: &str) -> Result<&'static Query, String> {
 /// declared capture texts. This is the pattern author's guard against
 /// the query medium's silent-match-nothing failure mode (field names
 /// that print in the CST but don't match in the query engine, anchor
-/// subtleties, …). Driven by tests today; `--plugin-check` is the
-/// intended production home.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn verify_pattern_expects(spec: &PatternSpec) -> Result<(), String> {
+/// subtleties, …). Run by `--plugin-check` and by
+/// `bundled_pattern_expects_hold` over every bundled pattern.
+pub(crate) fn verify_pattern_expects(spec: &PatternSpec) -> Result<(), String> {
     if spec.language != "perl" {
         return Ok(());
     }
@@ -263,6 +262,17 @@ impl<'a> Builder<'a> {
                             }
                         }
                     }
+                    // Raw counts recorded on the FIRST round only (later
+                    // rounds re-run the same query over the same tree);
+                    // zero-match runs record too so a never-matching
+                    // pattern shows up at 0 in the stats report.
+                    if round == 0 {
+                        crate::timings::record_pattern_matches(
+                            p.id(),
+                            &spec.name,
+                            collected.len(),
+                        );
+                    }
                     for (pattern_index, caps) in collected {
                         let mspan = union_span(&caps);
                         let key = (p.id().to_string(), spec.name.clone(), mspan);
@@ -281,6 +291,7 @@ impl<'a> Builder<'a> {
                         }
                         dispatched.insert(key);
                         progressed = true;
+                        crate::timings::record_pattern_dispatch(p.id(), &spec.name);
                         // Projections that consult package-relative walk
                         // state (constant folds via the current package,
                         // `__PACKAGE__` receivers) see the match site's
@@ -443,6 +454,8 @@ impl<'a> Builder<'a> {
             value_shape: None,
             sub_params: Vec::new(),
             callable_return_edge: None,
+            list: Vec::new(),
+            is_package_receiver: None,
         };
         if wants("str")
             || wants("strs")
@@ -473,6 +486,18 @@ impl<'a> Builder<'a> {
         }
         if wants("ty") {
             data.inferred_type = self.invocant_type_at_node(node);
+        }
+        if wants("list") {
+            data.list = self.extract_arg_name_list(node);
+        }
+        if wants("is_package_receiver") {
+            // Same rule as the emit-hook path's `is_pkg_call`:
+            // `__PACKAGE__` (any spelling conventions certifies) or a
+            // bareword naming the match site's own package.
+            let is_pkg = crate::conventions::is_current_package_token(&data.text)
+                || (node.kind() == "package"
+                    && Some(data.text.as_str()) == self.current_package.as_deref());
+            data.is_package_receiver = Some(is_pkg);
         }
         data
     }

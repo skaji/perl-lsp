@@ -487,6 +487,7 @@ fn check_plugin_file(path: &Path) -> CheckReport {
             // Hooks are inferred from the source listing — RhaiPlugin
             // doesn't expose them publicly. Scan for `fn on_*`.
             for hook in &[
+                "on_match",
                 "on_function_call",
                 "on_method_call",
                 "on_use",
@@ -496,6 +497,22 @@ fn check_plugin_file(path: &Path) -> CheckReport {
                 let needle = format!("fn {}", hook);
                 if source.contains(&needle) {
                     report.hooks.push(hook.to_string());
+                }
+            }
+            // Pattern verification: compile each declared pattern
+            // (rejects the zero-capture / dead-predicate trap) and run
+            // its expect snippets against the real grammar. A pattern
+            // without expects can silently match nothing — warn.
+            for spec in p.patterns() {
+                if spec.expect.is_empty() {
+                    report.warnings.push(format!(
+                        "pattern `{}` has no expect snippets — add self-verification \
+                         (src + expected match count)",
+                        spec.name
+                    ));
+                }
+                if let Err(e) = crate::builder::pattern_dispatch::verify_pattern_expects(spec) {
+                    report.errors.push(e);
                 }
             }
         }

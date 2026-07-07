@@ -621,11 +621,46 @@ covers it.
      `capture_quantifiers` all-Zero) is rejected with a message naming
      the fix. Plugin authors cannot ship a dead filter.
 
+### Round 3: `list` projection, `dbic` port, telemetry
+
+- **`list` and `is_package_receiver` projections landed.** `list` is
+  `extract_arg_name_list` (the `cst::string_list` wrapper) behind a
+  capture name; `is_package_receiver` replicates the emit-hook path's
+  `is_pkg_call` rule against the match site's package.
+- **`dbic` ported** — the first `arg_names` consumer. Its
+  `arg_name_verbs()` manifest entry is GONE: the verbs live in the
+  pattern's `#any-of?` and the flat names arrive via `list` on the
+  `@args` capture, computed only for actual declarator matches (today
+  core probes `wants_arg_names` per call site for every registered
+  verb). The class-level-call gate stays in `on_match` — "receiver is
+  the current package" is not expressible in a pattern, and the
+  expects document that a runtime `$rs->add_columns(...)` still
+  *matches* while emitting nothing. `column_keyed_verbs` /
+  `fluent_verbs` manifests stay (not capture). `moo` is now the sole
+  `arg_name_verbs` consumer; the manifest retires with its port.
+- **Match telemetry landed** (`PERL_LSP_PLUGIN_STATS`, through
+  `timings.rs`, reported after `--check`'s timing table). Live run
+  over `test_files/`:
+
+  ```
+  === plugin pattern stats (3 patterns) ===
+     matched  dispatched  plugin:pattern
+          28          28  mojo-events:event_call
+          13          13  dbic:class_decl
+           0           0  dbic-resultddl:ddl_decl  <- never matched
+  ```
+
+  Zero-match runs are recorded too, so a never-matching pattern is
+  visible in one run — the §7 story's third leg.
+- **`--plugin-check` expects wiring landed** — the fourth §7 leg. The
+  check compiles every declared pattern (rejecting the dead-predicate
+  trap), runs the expect snippets against the real grammar (mismatches
+  are errors), and warns on patterns that ship no expects.
+
 Deliberately not spiked (unchanged design claims): the `pairs` /
-`list` / `isa` / `args` / `route_defaults` projections, per-language
-merged queries (the spike compiles one query per pattern spec), match
-telemetry, `--plugin-check` expects wiring, the topic-route replay,
-and the phase-4 pre-capture retirement.
+`isa` / `args` / `route_defaults` projections, per-language merged
+queries (the spike compiles one query per pattern spec), the
+topic-route replay, and the phase-4 pre-capture retirement.
 
 ## 14. Open questions (deliberately deferred)
 

@@ -952,6 +952,8 @@ mod tests {
             value_shape: None,
             sub_params: Vec::new(),
             callable_return_edge: None,
+            list: Vec::new(),
+            is_package_receiver: None,
         }
     }
 
@@ -1110,17 +1112,7 @@ mod tests {
             "mojo-events should declare the event_call pattern"
         );
 
-        let cap = |text: &str, span: Span| CaptureData {
-            text: text.into(),
-            span,
-            string_value: None,
-            string_values: Vec::new(),
-            content_span: None,
-            inferred_type: None,
-            value_shape: None,
-            sub_params: Vec::new(),
-            callable_return_edge: None,
-        };
+        let cap = mcap;
 
         let evt_span = sp(3, 15, 3, 23);
         let cb_span = sp(3, 25, 3, 40);

@@ -978,6 +978,7 @@ fn cli_check(args: &[String]) {
     // Dump the per-module breakdown before diagnostics output so the table
     // isn't buried under (and the early `exit(1)` below doesn't swallow it).
     timings::report();
+    timings::report_pattern_stats();
 
     let mut all_diagnostics = Vec::new();
 

@@ -33,8 +33,9 @@ mod narrowing;
 /// Query-declared plugin capture (SPIKE, `docs/prompt-plugin-queries.md`):
 /// runs plugin-declared tree-sitter patterns post-walk and dispatches
 /// `on_match`. Child module for the same private-field reason as
-/// `narrowing` — still driven by `build()` (rule #1).
-mod pattern_dispatch;
+/// `narrowing` — still driven by `build()` (rule #1). `pub(crate)` so
+/// `--plugin-check` can run `verify_pattern_expects`.
+pub(crate) mod pattern_dispatch;
 
 /// Single CST walk that powers the post-walk `ChainTypingReducer`.
 /// Indexes the node sets the reducer needs:

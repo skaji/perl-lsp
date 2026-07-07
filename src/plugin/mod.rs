@@ -783,6 +783,18 @@ pub struct CaptureData {
     /// this callable's return when invoked.
     #[serde(rename = "callable_edge", default)]
     pub callable_return_edge: Option<crate::witnesses::WitnessAttachment>,
+    /// Projection `list` — the node's flat `(name, span)` string list
+    /// (string-literal content, barewords, autoquoted keys, `qw` words,
+    /// foldable constants; hashrefs/coderefs carry no name). The
+    /// pattern-era replacement for `CallContext.arg_names` /
+    /// `arg_name_verbs`.
+    #[serde(default)]
+    pub list: Vec<(String, Span)>,
+    /// Projection `is_package_receiver` — this node is the current
+    /// package itself (`__PACKAGE__->m(...)` / `CurrentClass->m(...)`),
+    /// the class-level-call fact declaration DSLs gate on.
+    #[serde(default)]
+    pub is_package_receiver: Option<bool>,
 }
 
 /// A capture's value in a match: scalar for `One`/`ZeroOrOne`
