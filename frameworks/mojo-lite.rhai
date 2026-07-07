@@ -183,87 +183,175 @@ fn on_use(ctx) {
     out
 }
 
-fn on_function_call(ctx) {
+fn patterns() {
+    [
+        // `plugin 'Thing'` — goto-def on the name lands on the plugin
+        // class's `register`. Same machinery as go-to-controller: the
+        // MethodCallRef's invocant token camelizes and tail-matches
+        // workspace modules, with ownership of the action (`register` —
+        // every Mojolicious plugin has one) as the disambiguator.
+        // Namespace-agnostic, so app-specific plugin namespaces
+        // (Clove::App::Plugin::*) resolve the same as Mojolicious::Plugin::*.
+        #{
+            name: "plugin_load",
+            query: `
+([
+  (function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @name . (_)? @config)) @call
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @name . (_)? @config)) @call
+  (function_call_expression
+    function: (_) @verb
+    arguments: [(string_literal) (interpolated_string_literal) (scalar) (bareword)] @name) @call
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: [(string_literal) (interpolated_string_literal) (scalar) (bareword)] @name) @call
+]
+(#eq? @verb "plugin"))
+`,
+            projections: #{
+                name: ["str", "strs", "content_span"],
+            },
+            expect: [
+                #{ src: "plugin 'Minion';", matches: 1, captures: #{ name: "'Minion'" } },
+                #{ src: "plugin Minion => { Pg => $url };", matches: 1 },
+                #{ src: "plugin($_) for qw/A B/;", matches: 1 },
+                #{ src: "plugins('x');", matches: 0 },
+            ],
+        },
+        // Route-declaration verbs. `under` is a middleware-ish route
+        // wrapper; `websocket` registers a WS handler. Both behave like
+        // handler registrations for our purposes.
+        #{
+            name: "route_decl",
+            query: `
+([
+  (function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @path . (_)? @handler)) @call
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @path . (_)? @handler)) @call
+  (function_call_expression
+    function: (_) @verb
+    arguments: [(string_literal) (interpolated_string_literal) (scalar)] @path) @call
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: [(string_literal) (interpolated_string_literal) (scalar)] @path) @call
+]
+(#any-of? @verb "get" "post" "put" "del" "patch" "any" "under" "websocket"))
+`,
+            projections: #{
+                path: ["str"],
+                handler: ["sub_params"],
+            },
+            expect: [
+                #{ src: "get '/users/profile' => sub { my $c = shift; };", matches: 1 },
+                #{ src: "under '/admin';", matches: 1 },
+                #{ src: "put('/x', sub {});", matches: 1 },
+                #{ src: "getter '/x';", matches: 0 },
+            ],
+        },
+        // Dispatchers that take a URL string and resolve to a Lite
+        // route. `url_for` generates a URL for a named route;
+        // `redirect_to` issues a 302 to the given path. Both make the
+        // string argument a real reference to the route's Handler.
+        #{
+            name: "url_dispatch",
+            query: `
+(method_call_expression
+  method: (_) @verb
+  (#any-of? @verb "url_for" "redirect_to")
+  arguments: [
+    (list_expression . (_) @path)
+    (string_literal) @path
+    (interpolated_string_literal) @path
+    (scalar) @path
+  ]
+) @call
+`,
+            projections: #{
+                path: ["str"],
+            },
+            expect: [
+                #{ src: "$c->redirect_to('/login');", matches: 1 },
+                #{ src: "$c->url_for('user_show');", matches: 1 },
+                #{ src: "$c->render(text => 'x');", matches: 0 },
+            ],
+        },
+    ]
+}
+
+fn on_match(pattern, m) {
+    if pattern == "plugin_load" { return plugin_load_emissions(m); }
+    if pattern == "url_dispatch" { return url_dispatch_emissions(m); }
+    route_decl_emissions(m)
+}
+
+fn plugin_load_emissions(m) {
     let out = [];
-
-    // `plugin 'Thing'` — goto-def on the name lands on the plugin
-    // class's `register`. Same machinery as go-to-controller: the
-    // MethodCallRef's invocant token camelizes and tail-matches
-    // workspace modules, with ownership of the action (`register` —
-    // every Mojolicious plugin has one) as the disambiguator.
-    // Namespace-agnostic, so app-specific plugin namespaces
-    // (Clove::App::Plugin::*) resolve the same as Mojolicious::Plugin::*.
-    if ctx.function_name == "plugin" {
-        let args = ctx.args;
-        if args.len() >= 1 {
-            let name = args[0].string_value;
-            if name != () && name != "" {
-                let span = args[0].content_span;
-                if span == () { span = args[0].span; }
-                out += #{
-                    MethodCallRef: #{
-                        method_name: "register",
-                        invocant: camelize(name),
-                        span: span,
-                        invocant_span: (),
-                        bridged: "tail",
-                    }
-                };
-                // "You loaded it" — make the resolver pull the plugin in
-                // so its helpers register. Default namespace guess only;
-                // app-custom namespaces (Clove::App::Plugin::*) are
-                // workspace modules and already indexed.
-                if !name.contains("::") {
-                    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
-                }
-                // Multi-value: a lite `plugin($_) for qw/A B/` and a
-                // folded constant both surface in `string_values`
-                // (the const-folding machinery), so record every name.
-                let cfg = ();
-                if args.len() >= 2 { cfg = args[1].span; }
-                for nm in args[0].string_values {
-                    out += #{ "PluginLoad": #{ "name": nm, "config_span": cfg }};
-                }
-            }
+    let name_cap = m.captures.name;
+    if name_cap == () { return out; }
+    let name = name_cap.str;
+    if name == () || name == "" { return out; }
+    let span = name_cap.content_span;
+    if span == () { span = name_cap.span; }
+    out += #{
+        MethodCallRef: #{
+            method_name: "register",
+            invocant: camelize(name),
+            span: span,
+            invocant_span: (),
+            bridged: "tail",
         }
-        return out;
+    };
+    // "You loaded it" — make the resolver pull the plugin in
+    // so its helpers register. Default namespace guess only;
+    // app-custom namespaces (Clove::App::Plugin::*) are
+    // workspace modules and already indexed.
+    if !name.contains("::") {
+        out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
     }
-
-    // Route-declaration verbs. `under` is a middleware-ish route
-    // wrapper; `websocket` registers a WS handler. Both behave like
-    // handler registrations for our purposes.
-    let verbs = [
-        "get", "post", "put", "del", "patch", "any", "under", "websocket",
-    ];
-    let fname = ctx.function_name;
-    if fname == () { return out; }
-    let is_route_verb = false;
-    for v in verbs {
-        if v == fname { is_route_verb = true; break; }
+    // Multi-value: a lite `plugin($_) for qw/A B/` and a
+    // folded constant both surface in `strs`
+    // (the const-folding machinery), so record every name.
+    let cfg = ();
+    let config_cap = m.captures.config;
+    if config_cap != () { cfg = config_cap.span; }
+    for nm in name_cap.strs {
+        out += #{ "PluginLoad": #{ "name": nm, "config_span": cfg }};
     }
-    if !is_route_verb { return out; }
+    out
+}
 
-    let args = ctx.args;
-    if args.len() < 1 { return out; }
+fn route_decl_emissions(m) {
+    let out = [];
+    let fname = m.captures.verb.text;
+
+    let path_cap = m.captures.path;
+    if path_cap == () { return out; }
 
     // Path is the first literal string. Dynamic patterns skip.
-    let path = args[0].string_value;
+    let path = path_cap.str;
     if path == () { return out; }
 
     // Owner: the current package is the Lite app's namespace (often
     // `main` for Lite scripts). That's what url_for resolves against
     // at the framework level.
-    let owner_class = ctx.current_package;
+    let owner_class = m["package"];
     if owner_class == () { return out; }
 
     // Find the handler sub arg. In Lite syntax `get '/x' => sub {...}`
-    // the sub is args[1]; but other forms (e.g. `get '/x' => 'Ctrl#act'`
-    // with string target) are handled by mojo-routes — skip here.
+    // the sub is the @handler capture; other forms (e.g. `get '/x' =>
+    // 'Ctrl#act'` with string target) are handled by mojo-routes.
     // The route handler's first positional is always the Mojolicious
     // controller; flag it so the call-site display drops it.
+    let handler = m.captures.handler;
     let params = [];
-    if args.len() >= 2 {
-        params = as_invocant_params(args[1].sub_params);
+    if handler != () {
+        params = as_invocant_params(handler.sub_params);
     }
 
     // Lite routes are framework-synthesized URL callables. The
@@ -287,8 +375,8 @@ fn on_function_call(ctx) {
             // node encloses the route body — editor sticky-scroll / breadcrumb
             // pin the route while the cursor is inside it. Selection stays the
             // path string for a precise goto anchor.
-            span: ctx.call_span,
-            selection_span: args[0].span,
+            span: m.span,
+            selection_span: path_cap.span,
             display: "Route",
             hide_in_outline: false,
             outline_label: fname.to_upper() + " " + path,
@@ -307,18 +395,18 @@ fn on_function_call(ctx) {
             kind: "routes",
             bridges: [ #{ Class: "Mojolicious::Controller" } ],
             entity_names: [path],
-            decl_span: args[0].span,
+            decl_span: path_cap.span,
         }
     };
 
     // Type the route-handler's first positional as Mojolicious::Controller
     // so `$c->...` inside `get '/path' => sub { my $c = shift; $c->... }`
     // resolves to controller methods + helpers.
-    if params.len() >= 1 && args.len() >= 2 {
+    if params.len() >= 1 && handler != () {
         out += #{
             VarType: #{
                 variable: params[0].name,
-                at: args[1].span,
+                at: handler.span,
                 inferred_type: #{ ClassName: "Mojolicious::Controller" },
             }
         };
@@ -327,35 +415,20 @@ fn on_function_call(ctx) {
     out
 }
 
-// Dispatchers that take a URL string and resolve to a Lite route.
-// `url_for` generates a URL for a named route; `redirect_to` issues
-// a 302 to the given path. Both make the string argument a real
-// reference to the route's Handler — gd/gr/hover all compose.
-fn on_method_call(ctx) {
+fn url_dispatch_emissions(m) {
     let out = [];
-    let mname = ctx.method_name;
-    if mname == () { return out; }
+    let mname = m.captures.verb.text;
 
-    // Rhai: top-level `const` arrays don't hoist into fn scope
-    // reliably; keep the list inline here.
-    let dispatchers = ["url_for", "redirect_to"];
-    let is_url_dispatch = false;
-    for d in dispatchers {
-        if d == mname { is_url_dispatch = true; break; }
-    }
-    if !is_url_dispatch { return out; }
-
-    let args = ctx.args;
-    if args.len() < 1 { return out; }
-
-    let path = args[0].string_value;
+    let path_cap = m.captures.path;
+    if path_cap == () { return out; }
+    let path = path_cap.str;
     if path == () { return out; }
 
     // Owner: routes are registered under the Lite app's own package.
-    // `current_package` at the call site is usually `main` (Lite) or
-    // whichever controller is calling back into url_for — either way,
-    // the Handlers we're pointing at live under the calling package.
-    let owner_class = ctx.current_package;
+    // The match-site package is usually `main` (Lite) or whichever
+    // controller is calling back into url_for — either way, the
+    // Handlers we're pointing at live under the calling package.
+    let owner_class = m["package"];
     if owner_class == () { return out; }
 
     out += #{
@@ -363,7 +436,7 @@ fn on_method_call(ctx) {
             name: path,
             dispatcher: mname,
             owner: #{ Class: owner_class },
-            span: args[0].span,
+            span: path_cap.span,
             var_text: "",
         }
     };

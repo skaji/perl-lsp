@@ -275,13 +275,13 @@ fn route_emissions(controller, action, span, current_package) {
 // route-name registration. If the user happens to call `.name()` on
 // something that isn't a route, url_for completion will offer an
 // extra name — minor false positive, not a regression.
-fn emit_route_name(ctx, name, span) {
+fn emit_route_name(m, name, span) {
     // Handler owned by Mojolicious::Controller (same reasoning as
     // route_emissions): url_for/redirect_to are Controller methods
     // that hit a global routes table, so the Handler belongs on the
     // shared base, not the declaring package.
     let owner_class = "Mojolicious::Controller";
-    let decl_pkg = if ctx.current_package == () { "main" } else { ctx.current_package };
+    let decl_pkg = if m["package"] == () { "main" } else { m["package"] };
     let items = [];
     items += #{
         Handler: #{
@@ -350,61 +350,121 @@ fn route_keyvals(args, start) {
     #{ controller: controller, action: action, action_span: action_span }
 }
 
-fn on_method_call(ctx) {
+// The `plugin` / `name` method arms live on the pattern seam; ONLY the
+// `->to(...)` arm stays on the legacy hook below — it reads the
+// receiver's route BRAND (`receiver_route_defaults`, fold-derived) and
+// participates in the post-fold re-dispatch, which the pattern
+// dispatcher doesn't model yet (phase 3: post-fold dispatch round +
+// `route_defaults` projection + topic-stack replay).
+fn patterns() {
+    [
+        // `$app->plugin('Thing')` — the OO spelling of the lite
+        // `plugin` verb; same register-anchored resolution (mojo-lite
+        // owns the bare-DSL spelling).
+        #{
+            name: "plugin_load",
+            query: `
+(method_call_expression
+  method: (_) @verb (#eq? @verb "plugin")
+  arguments: [
+    (list_expression . (_) @name)
+    (string_literal) @name
+    (interpolated_string_literal) @name
+    (scalar) @name
+    (bareword) @name
+  ]
+) @call
+`,
+            projections: #{
+                name: ["str", "content_span"],
+            },
+            expect: [
+                #{ src: "$app->plugin('Minion');", matches: 1 },
+                #{ src: "$self->plugin(Config => { file => 'app.conf' });", matches: 1 },
+                #{ src: "$app->plugins;", matches: 0 },
+            ],
+        },
+        // `->name('users_list')` — a route-name registration. Exactly
+        // one arg (the bare alternatives can't match a list), matching
+        // the old `args.len() != 1` gate structurally.
+        #{
+            name: "route_name",
+            query: `
+(method_call_expression
+  method: (_) @verb (#eq? @verb "name")
+  arguments: [
+    (string_literal) @rname
+    (interpolated_string_literal) @rname
+    (scalar) @rname
+    (bareword) @rname
+  ]
+) @call
+`,
+            projections: #{
+                rname: ["str", "content_span"],
+            },
+            expect: [
+                #{ src: "$r->get('/x')->name('users_list');", matches: 1 },
+                #{ src: "$r->name('a', 'b');", matches: 0 },
+            ],
+        },
+    ]
+}
+
+fn on_match(pattern, m) {
     let out = [];
 
-    // `$app->plugin('Thing')` — the OO spelling of the lite `plugin`
-    // verb; same register-anchored resolution (see mojo-lite).
-    if ctx.method_name == "plugin" {
-        let args = ctx.args;
-        if args.len() >= 1 {
-            let name = args[0].string_value;
-            if name != () && name != "" {
-                let span = args[0].content_span;
-                if span == () { span = args[0].span; }
-                out += #{
-                    MethodCallRef: #{
-                        method_name: "register",
-                        invocant: camelize(name),
-                        span: span,
-                        invocant_span: (),
-                        bridged: "tail",
-                    }
-                };
-                // "You loaded it" — same as the lite arm: record the
-                // load so the resolver pulls the plugin AND the
-                // entrypoint-scan lint sees the load fact. Default
-                // namespace guess for short names; the lint
-                // tail-matches, so app-custom namespaces
-                // (Clove::App::Plugin::*) count as loaded too.
-                if !name.contains("::") {
-                    out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
-                } else {
-                    out += #{ "SyntheticUse": #{ "module": name, "args": [], "imports": [], "span": span }};
-                }
-                // The load FACT (PluginLoad) is recorded core-side,
-                // trigger-independently: the nested-plugin cascade runs
-                // in Mojolicious::Plugin files this hook never sees. See
-                // `load_verbs()` + `Builder::record_plugin_loads`.
+    if pattern == "plugin_load" {
+        let name_cap = m.captures.name;
+        if name_cap == () { return out; }
+        let name = name_cap.str;
+        if name == () || name == "" { return out; }
+        let span = name_cap.content_span;
+        if span == () { span = name_cap.span; }
+        out += #{
+            MethodCallRef: #{
+                method_name: "register",
+                invocant: camelize(name),
+                span: span,
+                invocant_span: (),
+                bridged: "tail",
             }
+        };
+        // "You loaded it" — same as the lite arm: record the
+        // load so the resolver pulls the plugin AND the
+        // entrypoint-scan lint sees the load fact. Default
+        // namespace guess for short names; the lint
+        // tail-matches, so app-custom namespaces
+        // (Clove::App::Plugin::*) count as loaded too.
+        if !name.contains("::") {
+            out += #{ "SyntheticUse": #{ "module": "Mojolicious::Plugin::" + name, "args": [], "imports": [], "span": span }};
+        } else {
+            out += #{ "SyntheticUse": #{ "module": name, "args": [], "imports": [], "span": span }};
         }
+        // The load FACT (PluginLoad) is recorded core-side,
+        // trigger-independently: the nested-plugin cascade runs
+        // in Mojolicious::Plugin files no Mojo trigger sees. See
+        // `load_verbs()` + `Builder::record_plugin_loads`.
         return out;
     }
 
-    if ctx.method_name == "name" {
-        let args = ctx.args;
-        if args.len() != 1 { return out; }
-        let name = args[0].string_value;
-        if name == () || name == "" { return out; }
-        // Use the string_content span — captured by the builder from
-        // the `string_content` tree node, so it's already quote-free
-        // regardless of literal flavor (`'x'`, `"x"`, `q{x}`, `qq!x!`,
-        // heredoc). `content_span` is `()` when the arg isn't a string
-        // literal or is empty; fall back to full span in that case.
-        let inner_span = args[0].content_span;
-        if inner_span == () { inner_span = args[0].span; }
-        return emit_route_name(ctx, name, inner_span);
-    }
+    // route_name
+    let name_cap = m.captures.rname;
+    if name_cap == () { return out; }
+    let name = name_cap.str;
+    if name == () || name == "" { return out; }
+    // Use the string_content span — captured from the `string_content`
+    // tree node, so it's already quote-free regardless of literal
+    // flavor (`'x'`, `"x"`, `q{x}`, `qq!x!`, heredoc). `content_span`
+    // is `()` when the arg isn't a string literal or is empty; fall
+    // back to full span in that case.
+    let inner_span = name_cap.content_span;
+    if inner_span == () { inner_span = name_cap.span; }
+    emit_route_name(m, name, inner_span)
+}
+
+fn on_method_call(ctx) {
+    let out = [];
 
     if ctx.method_name != "to" { return out; }
 

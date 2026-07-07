@@ -713,11 +713,41 @@ results. The pattern path therefore needs a second, post-fold dispatch
 round plus the `route_defaults` projection and the span-ordered stack
 replay — exactly phase 3 as designed, not more.
 
+### Round 6: the route pair — everything portable is ported
+
+- **`mojo-lite` fully ported** (three patterns: `plugin_load`,
+  `route_decl`, `url_dispatch`). The route-verb arm turned out to be
+  stateless — the topic-stack coupling lives entirely in core (the
+  `lite_brand` stack) and in mojo-routes' `to` arm, not in the verb
+  declarations themselves. `on_use` and `topic_route_dsl()` stay, as
+  designed.
+- **`mojo-routes` is the first HYBRID plugin**: `plugin` and `name`
+  arms on patterns, the `->to(...)` arm alone still on
+  `on_method_call`. This is a migration-story datapoint in its own
+  right — patterns and a legacy hook coexist in one plugin with no
+  interference, so per-arm incremental porting works.
+- The `route_name` pattern encodes the old `args.len() != 1` gate
+  STRUCTURALLY: bare single-arg alternatives can't match an argument
+  list, so `->name('a', 'b')` is filtered by the pattern, not by code.
+
+**End state: of the nine call-shaped hook consumers, 8.5 are on
+patterns** (12 patterns across 8 plugins). The single remaining legacy
+arm is mojo-routes' `->to(...)`: it reads the fold-derived route BRAND
+off the receiver (`receiver_route_defaults`), writes `SetRouteBase`
+into the walk's topic stack, and participates in the post-fold
+re-dispatch (`resolve_route_brands` re-runs it with `BrandedRoute`
+receivers after chain typing settles). Retiring it needs the phase-3
+machinery and nothing else: a post-fold dispatch round in the pattern
+driver, the `route_defaults` projection, and the span-ordered
+topic-stack replay. Once it moves, `dispatch_method_call_plugins` /
+`dispatch_function_call_plugins`, `base_call_context`'s eager
+pre-capture, and the dead `arg_name_verbs` machinery all delete
+(phase 4).
+
 Deliberately not spiked (unchanged design claims): the `pairs` /
 `route_defaults` projections, per-language merged queries (the spike
 compiles one query per pattern spec), the topic-route replay + the
-post-fold dispatch round, and the phase-4 pre-capture retirement
-(now including the dead `arg_name_verbs` machinery).
+post-fold dispatch round, and the phase-4 pre-capture retirement.
 
 ## 14. Open questions (deliberately deferred)
 
