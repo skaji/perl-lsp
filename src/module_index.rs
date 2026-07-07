@@ -312,6 +312,14 @@ pub(crate) struct PackRegistrationParts {
     pub surface: crate::surface::Surface,
 }
 
+/// What `prepare_workspace_parts` hands back — the Perl twin of
+/// `PackRegistrationParts`.
+pub(crate) struct WorkspaceRegistrationParts {
+    pub arc: Arc<FileAnalysis>,
+    pub module_name: Option<String>,
+    pub surface: crate::surface::Surface,
+}
+
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
@@ -376,7 +384,7 @@ pub struct ModuleIndex {
     /// The enrichment overlay (R4): derived enriched copies keyed by the
     /// surface fingerprints of the file + its providers. Bounded FIFO —
     /// `enriched_order` is the eviction queue.
-    enriched: Arc<DashMap<std::path::PathBuf, (u64, Arc<FileAnalysis>)>>,
+    enriched: Arc<DashMap<std::path::PathBuf, (u64, Arc<FileAnalysis>, usize)>>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
@@ -1063,7 +1071,11 @@ impl ModuleIndex {
         &self,
         cached: &Arc<CachedModule>,
     ) -> Option<Arc<FileAnalysis>> {
+        // BYTE-bounded first (enriched copies are whole analyses — 64 of a
+        // tree's biggest generated modules would quietly re-pin the
+        // gigabytes the eviction axes stripped), entry-bounded second.
         const ENRICHED_CAP: usize = 64;
+        const ENRICHED_BYTE_CAP: usize = 128 * 1024 * 1024;
         let path = &cached.path;
         let key = self.enrichment_key(cached);
         if let Some(e) = self.enriched.get(path) {
@@ -1080,12 +1092,27 @@ impl ModuleIndex {
         copy.after_deserialize();
         copy.enrich_imported_types_with_keys(Some(self));
         let arc = Arc::new(copy);
-        self.enriched.insert(path.clone(), (key, arc.clone()));
+        let bytes = arc.heap_estimate().total();
+        // A single entry past the cap is served but never retained — the
+        // sweep must churn through giants, not pin them.
+        if bytes > ENRICHED_BYTE_CAP {
+            return Some(arc);
+        }
+        self.enriched.insert(path.clone(), (key, arc.clone(), bytes));
         {
             let mut order = self.enriched_order.lock().unwrap();
             order.retain(|p| p != path);
             order.push_back(path.clone());
-            while order.len() > ENRICHED_CAP {
+            let total_bytes = |order: &std::collections::VecDeque<std::path::PathBuf>| {
+                order
+                    .iter()
+                    .filter_map(|p| self.enriched.get(p))
+                    .map(|e| e.2)
+                    .sum::<usize>()
+            };
+            while order.len() > 1
+                && (order.len() > ENRICHED_CAP || total_bytes(&order) > ENRICHED_BYTE_CAP)
+            {
                 if let Some(evictee) = order.pop_front() {
                     self.enriched.remove(&evictee);
                 }
@@ -1232,22 +1259,14 @@ impl ModuleIndex {
     pub fn register_workspace_stripping(
         &self,
         path: std::path::PathBuf,
-        mut fa: FileAnalysis,
+        fa: FileAnalysis,
         strip_bag: bool,
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
-        let module_name = self.workspace_feed_prestrip(&fa);
-        let _ = self.record_surface(&path, &fa);
-        if strip_bag {
-            fa.evict_witness_bag();
-        }
-        if strip_rows {
-            fa.evict_refs();
-            fa.evict_symbols();
-        }
-        let arc = Arc::new(fa);
-        self.register_workspace_residency(path, arc.clone(), module_name);
-        arc
+        let parts = self.prepare_workspace_parts(fa, strip_bag, strip_rows);
+        let _ = self.record_surface_value(&path, parts.surface);
+        self.register_workspace_residency(path, parts.arc.clone(), parts.module_name);
+        parts.arc
     }
 
     /// Remove a deleted workspace file's registrations — the path-keyed
@@ -1459,9 +1478,7 @@ impl ModuleIndex {
         // Feed source and stored copy are the same whole analysis here;
         // indexers that strip go through `register_symbols_stripping`.
         let _ = self.record_surface(&path, &analysis);
-        let feed: Vec<(String, bool)> = collect_linkage_feed(&analysis);
-        let specs: Vec<(String, String)> =
-            analysis.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let (feed, specs) = Self::prepare_pack_feed(&analysis);
         self.register_symbols_inner(path, analysis, &feed, &specs);
     }
 
@@ -1482,6 +1499,23 @@ impl ModuleIndex {
         (feed, specs)
     }
 
+    /// The Perl-workspace twin of `prepare_pack_parts`: the name feed and
+    /// the surface project from the WHOLE analysis, THEN the requested axes
+    /// evict, then the arc is minted. `register_workspace_stripping` and the
+    /// fresh workspace worker both route here so the reads-whole-before-
+    /// evict ordering has one speller per tier.
+    pub(crate) fn prepare_workspace_parts(
+        &self,
+        mut fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> WorkspaceRegistrationParts {
+        let module_name = self.workspace_feed_prestrip(&fa);
+        let surface = crate::surface::Surface::project(&fa);
+        fa.evict_axes(strip_bag, strip_rows);
+        WorkspaceRegistrationParts { arc: Arc::new(fa), module_name, surface }
+    }
+
     /// The ONE speller of the pack strip ordering: feed + specs + surface
     /// project from the WHOLE analysis, THEN the requested axes evict, then
     /// the arc is minted. Every pack registration that strips (bulk warm,
@@ -1495,13 +1529,7 @@ impl ModuleIndex {
     ) -> PackRegistrationParts {
         let (feed, specs) = Self::prepare_pack_feed(&fa);
         let surface = crate::surface::Surface::project(&fa);
-        if strip_bag {
-            fa.evict_witness_bag();
-        }
-        if strip_rows {
-            fa.evict_refs();
-            fa.evict_symbols();
-        }
+        fa.evict_axes(strip_bag, strip_rows);
         PackRegistrationParts { arc: Arc::new(fa), feed, specs, surface }
     }
 
@@ -1661,6 +1689,22 @@ impl ModuleIndex {
     /// Every file registered via `register_symbols` — the reverse-dependency
     /// sweep surface (a changed header's consumers are the registered files
     /// whose `include_closure` contains it).
+    /// The residency tripwire's observable: fully-resident registered
+    /// copies. After a bulk index with eviction on, every one of these must
+    /// be accounted for by a deliberate whole-copy site (writer fallback,
+    /// degraded/unpersisted analysis) — an unexplained count means a
+    /// registration path is silently pinning whole analyses (the RAM
+    /// regression no functional test can see).
+    pub fn count_fully_resident(&self) -> usize {
+        let mut n = 0usize;
+        self.for_each_registered_file(&mut |cm| {
+            if cm.analysis.is_fully_resident() {
+                n += 1;
+            }
+        });
+        n
+    }
+
     pub fn for_each_registered_file(&self, f: &mut dyn FnMut(&Arc<CachedModule>)) {
         for entry in self.all_files.iter() {
             f(entry.value());

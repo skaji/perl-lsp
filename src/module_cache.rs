@@ -1106,14 +1106,13 @@ pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
 /// (valid_rows_seen, stale_names) like `warm_cache`.
 pub fn warm_cache_streaming(
     conn: &Connection,
-    source_filter: Option<&str>,
+    source: &str,
     each: &mut dyn FnMut(String, PathBuf, FileAnalysis),
 ) -> (usize, Vec<String>) {
-    let sql = match source_filter {
-        Some(_) => "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules WHERE source = ?1",
-        None => "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules",
-    };
-    let mut stmt = match conn.prepare(sql) {
+    let mut stmt = match conn.prepare(
+        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp \
+         FROM modules WHERE source = ?1",
+    ) {
         Ok(s) => s,
         Err(_) => return (0, Vec::new()),
     };
@@ -1128,11 +1127,7 @@ pub fn warm_cache_streaming(
             row.get::<_, i64>(6)?,
         ))
     };
-    let rows = match source_filter {
-        Some(f) => stmt.query_map(params![f], map_row),
-        None => stmt.query_map([], map_row),
-    };
-    let rows = match rows {
+    let rows = match stmt.query_map(params![source], map_row) {
         Ok(r) => r,
         Err(_) => return (0, Vec::new()),
     };
@@ -1148,18 +1143,19 @@ pub fn warm_cache_streaming(
         r
     }).flatten() {
         let (module_name, path_str, cached_mtime, cached_size, analysis_blob, row_extract_version, row_deps_stamp) = row;
-        if path_str.is_empty() {
-            continue; // negative sentinel — no pack consumer
-        }
-        let path = PathBuf::from(&path_str);
-        match file_stamp(&path) {
-            Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
-            _ => continue, // changed or deleted on disk
-        }
-        if row_extract_version < EXTRACT_VERSION {
-            stale_names.push(module_name);
-            continue; // stale rows re-analyze; don't register the old shape
-        }
+        let path = match classify_row_generation(
+            &path_str,
+            cached_mtime,
+            cached_size,
+            row_extract_version,
+        ) {
+            RowGeneration::Current(p) => p,
+            RowGeneration::VersionStale => {
+                stale_names.push(module_name);
+                continue; // stale rows re-analyze; don't register the old shape
+            }
+            RowGeneration::Sentinel | RowGeneration::StampStale => continue,
+        };
         let Some(blob) = analysis_blob.filter(|b| !b.is_empty()) else {
             continue;
         };
@@ -1174,6 +1170,70 @@ pub fn warm_cache_streaming(
         each(module_name, path, fa);
     }
     (count, stale_names)
+}
+
+/// One persisted row's generation verdict — the shared first half of every
+/// warm scan's validity check (the second half, the closure stamp, runs
+/// after decode on whichever struct is in hand). A new validity axis goes
+/// HERE, not into one loop.
+pub(crate) enum RowGeneration {
+    /// Sentinel/negative row — no warm consumer.
+    Sentinel,
+    /// The file changed or vanished on disk — skip silently.
+    StampStale,
+    /// Blob shape predates EXTRACT_VERSION — the caller decides between
+    /// skip (workspace tiers re-analyze from the walk) and queue-for-
+    /// re-resolve (the name-keyed @INC tier).
+    VersionStale,
+    Current(PathBuf),
+}
+
+pub(crate) fn classify_row_generation(
+    path_str: &str,
+    cached_mtime: i64,
+    cached_size: i64,
+    row_extract_version: i64,
+) -> RowGeneration {
+    if path_str.is_empty() {
+        return RowGeneration::Sentinel;
+    }
+    let path = PathBuf::from(path_str);
+    match file_stamp(&path) {
+        Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
+        _ => return RowGeneration::StampStale,
+    }
+    if row_extract_version < EXTRACT_VERSION {
+        return RowGeneration::VersionStale;
+    }
+    RowGeneration::Current(path)
+}
+
+/// Deferred-write chunking: N items per `BEGIN IMMEDIATE`…`COMMIT`, the
+/// SQLITE_BUSY_SNAPSHOT-safe shape every post-scan backfill shares (writing
+/// inside a streaming SELECT's snapshot turns a concurrent commit into an
+/// unretried BUSY_SNAPSHOT abort). A failed txn OPEN abandons the remaining
+/// queue (the writer is likely gone); a failed COMMIT rolls back and keeps
+/// going — later chunks may land.
+pub fn write_in_chunks<T>(
+    conn: &Connection,
+    items: &[T],
+    chunk_size: usize,
+    label: &str,
+    per_item: impl Fn(&Connection, &T),
+) {
+    for chunk in items.chunks(chunk_size) {
+        if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+            log::error!("{label}: txn open failed; remaining items defer to next warm");
+            break;
+        }
+        for item in chunk {
+            per_item(conn, item);
+        }
+        if let Err(e) = conn.execute_batch("COMMIT") {
+            log::error!("{label}: commit failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+    }
 }
 
 /// Every path that currently has shredded derived rows — the bulk twin of
@@ -1191,20 +1251,37 @@ pub fn paths_with_ref_rows(conn: &Connection) -> std::collections::HashSet<Strin
     out
 }
 
+/// One admitted warm row, in the lane the store could serve it from.
+pub enum WarmPayload {
+    /// The compact stub decoded and validated — register from it.
+    Stub(WarmStub),
+    /// The full analysis (stub absent/declined/disabled) — the
+    /// one-transient-decode lane. Carries the row's module_name.
+    Full(String, FileAnalysis),
+}
+
+/// The consumer's answer for a `WarmPayload::Stub`: `NeedFull` re-serves
+/// the same row through the blob lane (e.g. derived rows are missing and
+/// re-shredding needs the whole analysis). Ignored for `Full`.
+#[derive(PartialEq, Eq)]
+pub enum WarmDirective {
+    Handled,
+    NeedFull,
+}
+
 /// The register-from-Surface warm scan: stream row METADATA (never the
 /// `analysis` column — its overflow pages are what the 9-minute wall is
-/// made of), validate stamps/version, and serve each valid file from its
-/// stub when one decodes and `each_stub` accepts it (returns true).
-/// Otherwise fall back to a point-decode of that one file's full blob →
-/// `each_full` — the same one-transient-decode bound as
-/// `warm_cache_streaming`. Closure-stamp validation runs on whichever
-/// struct is in hand (stub skeleton or full analysis); both carry the
-/// pinned `include_closure`.
+/// made of), validate stamps/version, and serve each valid file through
+/// ONE consumer callback, stub lane first. `admit` runs BEFORE any blob
+/// or stub bytes are touched — rejected paths (dead rows) cost only the
+/// metadata read, and the caller records them inside the predicate.
+/// Closure-stamp validation runs on whichever struct is in hand (stub
+/// skeleton or full analysis); both carry the pinned `include_closure`.
 pub fn warm_pack_stream_with_stubs(
     conn: &Connection,
     use_stubs: bool,
-    each_stub: &mut dyn FnMut(PathBuf, WarmStub) -> bool,
-    each_full: &mut dyn FnMut(String, PathBuf, FileAnalysis),
+    admit: &mut dyn FnMut(&std::path::Path) -> bool,
+    each: &mut dyn FnMut(PathBuf, WarmPayload) -> WarmDirective,
 ) -> usize {
     // Cheap integer/text columns first; the stub BLOB is column 6 and is
     // only accessed AFTER the stamp/version checks pass (lazy row access —
@@ -1237,22 +1314,25 @@ pub fn warm_pack_stream_with_stubs(
             }
         };
         let Ok(path_str) = row.get::<_, String>(1) else { continue };
-        if path_str.is_empty() {
-            continue; // negative sentinel — no pack consumer
+        if !path_str.is_empty() && !admit(std::path::Path::new(&path_str)) {
+            continue;
         }
         let (Ok(cached_mtime), Ok(cached_size)) =
             (row.get::<_, i64>(2), row.get::<_, i64>(3))
         else {
             continue;
         };
-        let path = PathBuf::from(&path_str);
-        match file_stamp(&path) {
-            Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
-            _ => continue, // changed or deleted on disk
-        }
-        if row.get::<_, i64>(4).map(|v| v < EXTRACT_VERSION).unwrap_or(true) {
-            continue; // stale rows re-analyze; don't register the old shape
-        }
+        let Ok(row_extract_version) = row.get::<_, i64>(4) else { continue };
+        let path = match classify_row_generation(
+            &path_str,
+            cached_mtime,
+            cached_size,
+            row_extract_version,
+        ) {
+            RowGeneration::Current(p) => p,
+            // Workspace tier: stale rows re-analyze from the walk.
+            _ => continue,
+        };
         let Ok(row_deps_stamp) = row.get::<_, i64>(5) else { continue };
         let blob_len = row.get::<_, Option<i64>>(7).ok().flatten().unwrap_or(0);
         if use_stubs && blob_len > 0 {
@@ -1263,12 +1343,12 @@ pub fn warm_pack_stream_with_stubs(
                 {
                     continue;
                 }
-                if each_stub(path.clone(), stub) {
+                if each(path.clone(), WarmPayload::Stub(stub)) == WarmDirective::Handled {
                     count += 1;
                     continue;
                 }
-                // Declined (e.g. derived rows missing — the full analysis is
-                // needed to re-shred): fall through to the blob.
+                // NeedFull (e.g. derived rows missing — the full analysis
+                // is needed to re-shred): fall through to the blob.
             }
         }
         let module_name = row.get::<_, String>(0).unwrap_or_default();
@@ -1277,7 +1357,7 @@ pub fn warm_pack_stream_with_stubs(
             continue;
         }
         count += 1;
-        each_full(module_name, path, fa);
+        let _ = each(path, WarmPayload::Full(module_name, fa));
     }
     count
 }
@@ -1324,28 +1404,27 @@ pub fn warm_cache(
     }).flatten() {
         let (module_name, path_str, cached_mtime, cached_size, analysis_blob, row_extract_version, row_deps_stamp) = row;
 
-        // Negative sentinel: empty path + NULL blob.
-        if path_str.is_empty() {
-            cache.insert(module_name, None);
-            count += 1;
-            continue;
-        }
-
-        let path = PathBuf::from(&path_str);
-
-        // Validate mtime — skip entries where the file changed on disk.
-        if let Some((disk_mtime, disk_size)) = file_stamp(&path) {
-            if disk_mtime != cached_mtime || disk_size != cached_size {
+        let path = match classify_row_generation(
+            &path_str,
+            cached_mtime,
+            cached_size,
+            row_extract_version,
+        ) {
+            // Negative sentinel: empty path + NULL blob — a remembered miss.
+            RowGeneration::Sentinel => {
+                cache.insert(module_name, None);
+                count += 1;
                 continue;
             }
-        } else {
-            continue; // file deleted
-        }
-
-        // Check extract version — stale entries are still loaded but queued for re-resolve.
-        if row_extract_version < EXTRACT_VERSION {
-            stale_names.push(module_name.clone());
-        }
+            RowGeneration::StampStale => continue,
+            // @INC tier policy: stale entries still load, queued for
+            // priority re-resolve.
+            RowGeneration::VersionStale => {
+                stale_names.push(module_name.clone());
+                PathBuf::from(&path_str)
+            }
+            RowGeneration::Current(p) => p,
+        };
 
         match analysis_blob {
             Some(blob) if !blob.is_empty() => {

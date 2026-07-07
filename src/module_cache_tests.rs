@@ -684,11 +684,17 @@ fn warm_stub_roundtrip_and_lane_selection() {
         warm_pack_stream_with_stubs(
             conn,
             true,
-            &mut |_p, _s| {
-                stubs += 1;
-                accept
+            &mut |_p| true,
+            &mut |_p, payload| match payload {
+                WarmPayload::Stub(_) => {
+                    stubs += 1;
+                    if accept { WarmDirective::Handled } else { WarmDirective::NeedFull }
+                }
+                WarmPayload::Full(..) => {
+                    fulls += 1;
+                    WarmDirective::Handled
+                }
             },
-            &mut |_n, _p, _fa| fulls += 1,
         );
         (stubs, fulls)
     };
@@ -698,7 +704,13 @@ fn warm_stub_roundtrip_and_lane_selection() {
     assert_eq!(run(&conn, false), (1, 1));
     // use_stubs=false (NO_EVICT): straight to the full lane.
     let (mut stubs, mut fulls) = (0usize, 0usize);
-    warm_pack_stream_with_stubs(&conn, false, &mut |_p, _s| { stubs += 1; true }, &mut |_n, _p, _fa| fulls += 1);
+    warm_pack_stream_with_stubs(&conn, false, &mut |_p| true, &mut |_p, payload| {
+        match payload {
+            WarmPayload::Stub(_) => stubs += 1,
+            WarmPayload::Full(..) => fulls += 1,
+        }
+        WarmDirective::Handled
+    });
     assert_eq!((stubs, fulls), (0, 1));
 
     // A rewritten modules row must orphan the stub (stale-skeleton guard).

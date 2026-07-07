@@ -1053,6 +1053,16 @@ impl Backend {
             return;
         }
         let dirty = self.module_index.dirty_consumers(canon);
+        self.republish_open_docs_in(&dirty).await;
+    }
+
+    /// Re-enrich + republish every OPEN doc in a dirty closure — the one
+    /// speller of the membership rule (canonical-path match), shared by
+    /// the in-editor verdict path and the watcher's aggregated closure.
+    async fn republish_open_docs_in(
+        &self,
+        dirty: &std::collections::HashSet<std::path::PathBuf>,
+    ) {
         if dirty.is_empty() {
             return;
         }
@@ -2439,21 +2449,7 @@ impl LanguageServer for Backend {
         })
         .await
         .unwrap_or_default();
-        if dirty.is_empty() {
-            return;
-        }
-        let mut to_refresh: Vec<Url> = Vec::new();
-        self.files.for_each_open(|u, _doc| {
-            if let Ok(p) = u.to_file_path() {
-                let c = std::fs::canonicalize(&p).unwrap_or(p);
-                if dirty.contains(&c) {
-                    to_refresh.push(u.clone());
-                }
-            }
-        });
-        for u in to_refresh {
-            self.publish_diagnostics(&u).await;
-        }
+        self.republish_open_docs_in(&dirty).await;
     }
 
     async fn range_formatting(

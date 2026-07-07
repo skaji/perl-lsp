@@ -4483,6 +4483,22 @@ impl FileAnalysis {
         !self.bag_evicted && !self.refs_evicted && !self.symbols_evicted
     }
 
+    /// The ONE speller of the registration strip: `strip_bag` drops the
+    /// witness bag; `strip_rows` drops the row-backed axes (refs AND
+    /// symbols — they persist as one generation and evict as one). Every
+    /// registration path routes here so a new eviction axis is added in
+    /// exactly one place; a site spelling `evict_*` calls directly is
+    /// re-stating this pairing by convention.
+    pub fn evict_axes(&mut self, strip_bag: bool, strip_rows: bool) {
+        if strip_bag {
+            self.evict_witness_bag();
+        }
+        if strip_rows {
+            self.evict_refs();
+            self.evict_symbols();
+        }
+    }
+
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
         // Fill HashKeyAccess owners that are resolvable in-file

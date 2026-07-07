@@ -368,3 +368,57 @@ Deferred, in rough priority order:
   in `record_surface_value` stays (correctness guard; ~µs against per-file
   analysis costs); cold-path stub encoding stays (measured cold wall
   unchanged, and it buys the FIRST warm, not the second).
+
+## Session review round — duplication + structural residency — 2026-07-07 — OPEN (Claude)
+
+Landed: `evict_axes` / `prepare_pack_parts` / `prepare_workspace_parts` are
+the only spellers of the reads-whole-before-evict strip; the warm scans
+share `classify_row_generation` + `write_in_chunks` + a single-callback
+`WarmPayload` API (RefCell dance gone; dead rows rejected pre-decode);
+`register_symbols` feeds through `prepare_pack_feed`; the watcher and
+editor paths share `republish_open_docs_in`; the writers' PANIC arms now
+drop stale LRU pins like their commit-fail arms (live bug, both tiers);
+the enrichment overlay is byte-capped (128 MiB + 64 entries, per-entry
+`heap_estimate` stored); `whole_copy_registration_sites_are_allowlisted`
+(layering_tests) makes every whole-copy registration call site declare its
+residency bound; a post-bulk-index residency tripwire counts
+fully-resident pack copies against the deliberate whole-copy sites and
+`log::error` + debug-asserts on unexplained pins.
+
+Deferred, with designs:
+
+- **@INC/'import' tier is never stripped** — the largest remaining
+  unbounded residency (a Moose/Mojo/DBIC dep closure is 1500+ whole
+  modules for the session). The lanes exist (blobs persisted, hub bag
+  LRU, `whole_present`, DEP rows shredded); the work is routing
+  `insert_into_cache` through a registration-owned strip after
+  `save_module_generation` commits, then a gold cold/warm round — the
+  import tier feeds enrichment and inheritance walks, so this needs its
+  own verification pass.
+- **Watcher re-registration never re-strips** — whole copies pinned until
+  restart; a big `git pull` is an unbounded resident delta. Design:
+  persist (blob+rows) in the watcher's blocking task, then
+  `register_workspace_stripping` on commit, whole-copy fallback only on
+  persist failure.
+- **Writer fallback budget** — a persistently failing writer (disk full)
+  falls back to whole copies for the ENTIRE tree; the tripwire now makes
+  it visible but nothing bounds it. Design: byte-accounted fallback
+  budget shared per index run.
+- **Rows-missing re-strip after backfill** — after a REF_ROWS_VERSION
+  bump, refs+symbols stay resident for one session (self-healing at next
+  restart; never trips the fully-resident wire). Re-registering post-
+  backfill needs a surface-PRESERVING residency-only lane (re-projecting
+  from a bag-evicted copy would corrupt the freshness record) — build it
+  on `register_workspace_residency`/`register_symbols_inner` with the
+  original parts, not the stripped copy.
+- **Writer-thread harness dedup** — WsFresh and FreshEntry writers share
+  the whole chunk/txn/fallback scaffold shape; a generic harness would
+  make fixes land in both by construction. Moderate refactor; the panic
+  fix above is the drift it would have prevented.
+- **Stamp-capture helper** — the stamp-before-read + re-stat-after-parse
+  protocol is spelled in both fresh workers.
+- **Parts-token-only inner registration** — make `register_symbols_inner`
+  / `register_workspace_residency` accept only the parts structs (private
+  fields, constructible solely via the prepare_* choke points) so a
+  feed-from-stripped-copy or whole-arc hookup fails to compile. The
+  allowlist test covers the gap until then.
