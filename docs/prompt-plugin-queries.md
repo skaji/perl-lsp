@@ -371,7 +371,7 @@ is real (`variables:` on `variable_declaration` prints in the CST and
 works via `child_by_field_name` but matches **zero** in the query
 engine; cost in the spike: 45% of variable recall, silently). A plugin
 system built on queries without a verification story would be strictly
-worse than today. Three mandatory mitigations:
+worse than today. Four mandatory mitigations:
 
 1. **Self-verifying patterns.** The `expect` list on each
    `PatternSpec`: source snippets with expected match counts and
@@ -379,11 +379,19 @@ worse than today. Three mandatory mitigations:
    snippet with the target grammar and asserts. A pattern with no
    expects gets a `--plugin-check` warning. This catches the trap class
    at author time, not in production.
-2. **Match telemetry.** Per-pattern match counts, routed through
+2. **Statically detectable trap classes are compile errors.** A query
+   containing a zero-capture pattern (all `capture_quantifiers`
+   entries Zero) is rejected at pattern compile: it is the
+   top-level-predicate trap — `[alts] (#pred …)` attaches the
+   predicate to nothing and the alternation runs unfiltered; the
+   correct spelling is the group form `([alts] (#pred …))`. Found by
+   the spike; it had already shipped as a production bug in
+   `cpanfile_requires`.
+3. **Match telemetry.** Per-pattern match counts, routed through
    `timings.rs` (`PERL_LSP_PLUGIN_STATS`, same gate-read-once
    discipline). One workspace index run answers "which of my patterns
    never fired."
-3. **The trap library.** `PLUGIN_AUTHORING.md` grows a "query traps"
+4. **The trap library.** `PLUGIN_AUTHORING.md` grows a "query traps"
    section: field queryability must be probed per node kind
    (`perl-lsp --parse` is the probe), anchor (`.`) semantics, hidden
    nodes, quantifier capture cardinality. The existing snapshot harness
@@ -579,10 +587,43 @@ gold harness against the pinned substrate — FAIL 0, XPASS 0, CRASH 0
 now counts `on_match`). e2e needs nvim, absent in the sandbox — CI
 covers it.
 
-Deliberately not spiked (unchanged design claims): deferred host
-predicates (`#receiver-isa?` → `ReceiverGated`), the `pairs` / `list`
-/ `isa` / `args` / `route_defaults` projections, per-language merged
-queries (the spike compiles one query per pattern spec), match
+### Round 2: `#receiver-isa?` + the second port
+
+- **`#receiver-isa?` landed** (§4.4 as designed). The driver reads it
+  from `Query::general_predicates` — never a match-time filter — and
+  routes the match's `DispatchCall` emissions into
+  `provisional_dispatches` as `ReceiverGated` candidates, with the
+  build-time receiver type as the hint (`record_provisional_dispatch`
+  parity). Tests pin both directions: a receiver typed as the gate
+  class resolves through `applicable_dispatches` at query time with NO
+  `DispatchCall` ref materialized at build; a foreign receiver class
+  records the candidate but never unlocks it.
+- **`dbic-resultddl` ported** — the function-call DSL shape
+  (paren-less `col name => …` is `ambiguous_function_call_expression`).
+  A new end-to-end test covers the whole chain (UsesModule gating →
+  pattern → `str` projection → accessor symbol) that previously had
+  unit-only coverage.
+- **THE trap of the round — a top-level predicate after a bracketed
+  alternation attaches to NOTHING.** `[pat1 pat2] (#eq? …)` compiles
+  fine, but the predicate becomes its own degenerate zero-capture
+  pattern (matching everywhere) and the alternation runs UNFILTERED.
+  The correct spelling is the group form `([pat1 pat2] (#eq? …))`.
+  Three consequences:
+  1. The expects harness caught it in the fresh dbic-resultddl pattern
+     within one test run (10 matches where 1 was expected) — §7
+     working exactly as designed, on its second outing.
+  2. **It was a live production bug**: `query_cache::cpanfile_requires`
+     shipped the broken spelling, so `recommends` / `suggests` /
+     `conflicts` cpanfile lines were silently extracted as requires.
+     Fixed + regression test (`only_requires_lines_are_extracted`).
+  3. The trap is now a **pattern-compile error**: a query containing a
+     zero-capture pattern (detectable statically via
+     `capture_quantifiers` all-Zero) is rejected with a message naming
+     the fix. Plugin authors cannot ship a dead filter.
+
+Deliberately not spiked (unchanged design claims): the `pairs` /
+`list` / `isa` / `args` / `route_defaults` projections, per-language
+merged queries (the spike compiles one query per pattern spec), match
 telemetry, `--plugin-check` expects wiring, the topic-route replay,
 and the phase-4 pre-capture retirement.
 

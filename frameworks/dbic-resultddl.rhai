@@ -18,11 +18,15 @@
 // `add_columns` / `has_many` METHOD-call form; the ResultDDL barewords
 // are invisible to it, so `$row->text` doesn't resolve without this.
 //
-// We synthesize the accessor symbol (the name is `args[0]`, autoquoted
-// by the fat comma) so `$row->NAME` completes, hovers, and gotos-def
-// back to the DSL line. Column return types (text → Str, integer → Int,
-// …) and relationship target classes are a deliberate follow-up — the
-// accessor existing is the load-bearing 80%.
+// We synthesize the accessor symbol (the name is the first arg,
+// autoquoted by the fat comma) so `$row->NAME` completes, hovers, and
+// gotos-def back to the DSL line. Column return types (text → Str,
+// integer → Int, …) and relationship target classes are a deliberate
+// follow-up — the accessor existing is the load-bearing 80%.
+//
+// PORTED to the query-declared capture seam (docs/prompt-plugin-queries.md):
+// the verb set lives in the pattern's #any-of?, and the name arg is the
+// @name capture with a `str` projection — no positional arg digging.
 
 fn id() { "dbic-resultddl" }
 
@@ -34,39 +38,70 @@ fn triggers() {
     [ #{ UsesModule: "DBIx::Class::ResultDDL" } ]
 }
 
-// The relationship declarators. Each takes the accessor name as its
-// first (autoquoted) arg, exactly like `col`.
-fn is_relationship(name) {
-    let rels = ["has_many", "belongs_to", "has_one", "might_have", "many_to_many"];
-    let hit = false;
-    for r in rels { if r == name { hit = true; break; } }
-    hit
+fn patterns() {
+    [
+        #{
+            name: "ddl_decl",
+            // DSL calls are usually paren-less (`col text => text;` →
+            // ambiguous_function_call_expression); the paren form also
+            // occurs. Multi-arg calls wrap a list_expression; a lone
+            // name-shaped arg sits directly under `arguments:`.
+            // NOTE the group wrap `([…] (#any-of? …))`: a predicate
+            // written top-level after a bracketed alternation attaches
+            // to NOTHING (the alternation runs unfiltered). The core
+            // rejects that spelling at pattern-compile time.
+            query: `
+([
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @name)) @call
+  (function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @name)) @call
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: [(autoquoted_bareword) (bareword) (string_literal)] @name) @call
+  (function_call_expression
+    function: (_) @verb
+    arguments: [(autoquoted_bareword) (bareword) (string_literal)] @name) @call
+]
+(#any-of? @verb "col" "has_many" "belongs_to" "has_one" "might_have" "many_to_many"))
+`,
+            projections: #{
+                name: ["str"],
+            },
+            expect: [
+                #{ src: "col text => text;", matches: 1, captures: #{ name: "text" } },
+                #{ src: "has_many searches => { text => 'SearchTerm.text' };", matches: 1,
+                   captures: #{ name: "searches" } },
+                #{ src: "belongs_to product => 'My::Schema::Result::Product';", matches: 1 },
+                #{ src: "col('paren_form', text);", matches: 1 },
+                #{ src: "table 'embeddings';", matches: 0 },
+                #{ src: "primary_key qw/text/;", matches: 0 },
+            ],
+        },
+    ]
 }
 
-fn on_function_call(ctx) {
+fn on_match(pattern, m) {
     let out = [];
-    let fname = ctx.function_name;
-    if fname == () { return out; }
+    let verb = m.captures.verb.text;
+    let name_cap = m.captures.name;
+    if name_cap == () { return out; }
 
-    let is_col = fname == "col";
-    let is_rel = is_relationship(fname);
-    if !is_col && !is_rel { return out; }
-
-    if ctx.args.len() < 1 { return out; }
-    let arg0 = ctx.args[0];
-    let name = arg0.string_value;
+    let name = name_cap.str;
     if name == () { return out; }   // dynamic name — can't synthesize
 
     // Columns read as fields of the row (the table's structure);
     // relationships read as methods. The distinction only affects the
     // outline/completion icon — both are real accessors on the class.
-    let display = if is_col { "Field" } else { () };
+    let display = if verb == "col" { "Field" } else { () };
 
     out += #{
         Method: #{
             name: name,
-            span: arg0.span,
-            selection_span: arg0.span,
+            span: name_cap.span,
+            selection_span: name_cap.span,
             params: [],
             is_method: true,
             return_type: (),

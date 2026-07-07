@@ -207,3 +207,162 @@ fn pattern_dispatch_gates_per_package() {
         "the emission lands in the firing package"
     );
 }
+
+/// End-to-end through the bundled registry: the ResultDDL DSL's
+/// paren-less `col`/relationship calls synthesize accessors via the
+/// ported pattern (UsesModule gating + ambiguous-call shape + `str`
+/// projection, all through the real dispatcher).
+#[test]
+fn resultddl_pattern_synthesizes_accessors_end_to_end() {
+    let fa = build_fa(
+        "package My::Schema::Result::Thing;\n\
+         use DBIx::Class::ResultDDL -V2;\n\
+         table 'things';\n\
+         col text => text;\n\
+         has_many searches => { text => 'SearchTerm.text' };\n",
+    );
+    let ddl_syms: Vec<&str> = fa
+        .symbols
+        .iter()
+        .filter(|s| {
+            matches!(&s.namespace, crate::file_analysis::Namespace::Framework { id } if id == "dbic-resultddl")
+        })
+        .map(|s| s.name.as_str())
+        .collect();
+    assert!(
+        ddl_syms.contains(&"text") && ddl_syms.contains(&"searches"),
+        "col + has_many accessors expected; got {:?}",
+        ddl_syms
+    );
+    assert!(
+        !ddl_syms.contains(&"things"),
+        "`table` is not a declarator verb; got {:?}",
+        ddl_syms
+    );
+}
+
+// ---- #receiver-isa? deferred predicate ----
+//
+// The gate is NOT a match-time filter: it routes DispatchCall
+// emissions onto the ReceiverGated query-time seam
+// (docs/adr/receiver-gated-dispatch.md), same as dispatch_verbs().
+
+struct QueuePlugin {
+    triggers: Vec<Trigger>,
+    patterns: Vec<PatternSpec>,
+}
+
+impl QueuePlugin {
+    fn new() -> Self {
+        Self {
+            triggers: vec![Trigger::Always],
+            patterns: vec![PatternSpec {
+                name: "enqueue".into(),
+                language: "perl".into(),
+                query: r#"
+                    (method_call_expression
+                      invocant: (_) @recv
+                      method: (_) @verb (#eq? @verb "enqueue_thing")
+                      (#receiver-isa? @recv "Widget::Queue")
+                      arguments: [
+                        (list_expression . (_) @task)
+                        (string_literal) @task
+                      ]
+                    ) @call
+                "#
+                .into(),
+                projections: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("task".to_string(), vec!["str".to_string()]);
+                    m
+                },
+                expect: vec![],
+            }],
+        }
+    }
+}
+
+impl FrameworkPlugin for QueuePlugin {
+    fn id(&self) -> &str {
+        "test-queue"
+    }
+    fn triggers(&self) -> &[Trigger] {
+        &self.triggers
+    }
+    fn patterns(&self) -> &[PatternSpec] {
+        &self.patterns
+    }
+    fn on_match(&self, _pattern: &str, m: &MatchContext) -> Vec<EmitAction> {
+        let Some(crate::plugin::CaptureValue::One(task)) = m.captures.get("task") else {
+            return vec![];
+        };
+        let Some(name) = task.string_value.clone() else {
+            return vec![];
+        };
+        vec![EmitAction::DispatchCall {
+            name,
+            dispatcher: "enqueue_thing".into(),
+            owner: crate::file_analysis::HandlerOwner::Class("Widget::Queue".into()),
+            span: task.span,
+            var_text: String::new(),
+        }]
+    }
+}
+
+fn build_queue_fa(source: &str) -> FileAnalysis {
+    let mut reg = PluginRegistry::new();
+    reg.register(Box::new(QueuePlugin::new()));
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(source, None).unwrap();
+    crate::builder::build_with_plugins(&tree, source.as_bytes(), Arc::new(reg))
+}
+
+#[test]
+fn receiver_isa_gate_defers_dispatch_to_query_time() {
+    let fa = build_queue_fa(
+        "package P;\nmy $q = Widget::Queue->new;\n$q->enqueue_thing('resize');\n",
+    );
+
+    // The DispatchCall was NOT applied directly — no ref exists yet.
+    assert!(
+        !fa.refs.iter().any(|r| matches!(
+            &r.kind,
+            crate::file_analysis::RefKind::DispatchCall { .. }
+        )),
+        "a gated match's DispatchCall must not materialize at build time"
+    );
+    // It landed as a ReceiverGated candidate instead.
+    assert_eq!(
+        fa.provisional_dispatches.len(),
+        1,
+        "one provisional dispatch candidate expected"
+    );
+    assert_eq!(fa.provisional_dispatches[0].gate(), "Widget::Queue");
+    // The receiver types as exactly the gate class, so query-time
+    // resolution applies it (local walk, no module index needed).
+    let applied = fa.applicable_dispatches(None);
+    assert_eq!(
+        applied.len(),
+        1,
+        "receiver isa gate should resolve at query time; got {:?}",
+        applied
+    );
+    assert_eq!(applied[0].name, "resize");
+}
+
+#[test]
+fn receiver_isa_gate_blocks_foreign_receiver() {
+    let fa = build_queue_fa(
+        "package P;\nmy $q = My::Other->new;\n$q->enqueue_thing('resize');\n",
+    );
+    // Candidate recorded (build time never judges) …
+    assert_eq!(fa.provisional_dispatches.len(), 1);
+    // … but a receiver typed as an unrelated class never unlocks it.
+    assert!(
+        fa.applicable_dispatches(None).is_empty(),
+        "a foreign receiver class must not unlock the gated payload"
+    );
+}

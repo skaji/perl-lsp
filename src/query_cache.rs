@@ -33,13 +33,21 @@ fn perl_language() -> tree_sitter::Language {
 /// Matches both explicit `requires('Foo')` and ambiguous `requires 'Foo'` forms,
 /// with single args and multi-args (version constraints). The `.` anchor on
 /// `list_expression` ensures only the first string (module name) matches.
+///
+/// The alternation + predicate are wrapped in a GROUP `([…] (#eq? …))`.
+/// A predicate written top-level after a bracketed alternation does NOT
+/// attach to it — it silently becomes its own degenerate pattern and the
+/// alternation runs unfiltered (this query shipped that way: `recommends`
+/// / `suggests` lines were extracted as requires). The group form is the
+/// only spelling where the predicate provably filters; pinned by
+/// `only_requires_lines_are_extracted`.
 pub fn cpanfile_requires() -> &'static Query {
     static QUERY: OnceLock<Query> = OnceLock::new();
     QUERY.get_or_init(|| {
         Query::new(
             &perl_language(),
             r#"
-            [
+            ([
               (function_call_expression
                 function: (_) @fn
                 (string_literal (string_content) @module))
@@ -53,7 +61,7 @@ pub fn cpanfile_requires() -> &'static Query {
                 function: (_) @fn
                 (list_expression . (string_literal (string_content) @module)))
             ]
-            (#eq? @fn "requires")
+            (#eq? @fn "requires"))
             "#,
         )
         .expect("cpanfile_requires query should compile")

@@ -14,12 +14,60 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
-use tree_sitter::{CaptureQuantifier, Node, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{
+    CaptureQuantifier, Node, Query, QueryCursor, QueryPredicateArg, StreamingIterator,
+};
 
-use crate::file_analysis::Span;
+use crate::file_analysis::{DispatchCandidate, HandlerOwner, InferredType, ReceiverGated, Span};
 use crate::plugin::{self, CaptureData, CaptureValue, MatchContext, PatternSpec};
 
 use super::{node_to_span, Builder};
+
+/// A `#receiver-isa?` deferred predicate on a pattern: NOT a match-time
+/// filter (receiver isa is a cross-file, query-time question — see
+/// `docs/adr/receiver-gated-dispatch.md`). It tags the match so its
+/// `DispatchCall` emissions are recorded as `ReceiverGated` candidates
+/// instead of applied directly; `FileAnalysis::applicable_dispatches`
+/// resolves them against the receiver's actual class at query time,
+/// exactly like the `dispatch_verbs()` manifest path.
+struct ReceiverGate {
+    capture_index: u32,
+    target_class: String,
+}
+
+/// Extract a pattern's `#receiver-isa? @cap "Class"` predicate, if any.
+/// Unknown predicate names land in `general_predicates` unevaluated —
+/// the binding's reservation this tier is built on.
+fn receiver_gate_for(query: &Query, pattern_index: usize) -> Option<ReceiverGate> {
+    for p in query.general_predicates(pattern_index) {
+        if &*p.operator != "receiver-isa?" {
+            continue;
+        }
+        let mut cap = None;
+        let mut class = None;
+        for a in &p.args {
+            match a {
+                QueryPredicateArg::Capture(ix) => cap = Some(*ix),
+                QueryPredicateArg::String(s) => class = Some(s.to_string()),
+            }
+        }
+        match (cap, class) {
+            (Some(capture_index), Some(target_class)) => {
+                return Some(ReceiverGate {
+                    capture_index,
+                    target_class,
+                })
+            }
+            _ => {
+                log::error!(
+                    "#receiver-isa? needs a capture and a class string; got {:?}",
+                    p.args
+                );
+            }
+        }
+    }
+    None
+}
 
 /// Compile a pattern query once per unique source text, process-wide.
 /// `Query::new` is expensive; patterns are static per plugin load, so
@@ -40,11 +88,30 @@ fn cached_pattern_query(source: &str) -> Result<&'static Query, String> {
     }
     let language: tree_sitter::Language = ts_parser_perl::LANGUAGE.into();
     let compiled: Result<&'static Query, String> = Query::new(&language, source)
-        .map(|q| {
+        .map_err(|e| e.to_string())
+        .and_then(|q| {
+            // A pattern with zero captures is the top-level-predicate
+            // trap: `[alts] (#pred …)` does NOT attach the predicate to
+            // the alternation — it becomes its own degenerate pattern
+            // (matching everywhere, capturing nothing) and the
+            // alternation runs UNFILTERED. Hard error so the author
+            // fixes the spelling to `([alts] (#pred …))` instead of
+            // shipping a dead filter. (This exact trap shipped in
+            // `query_cache::cpanfile_requires`.)
+            for i in 0..q.pattern_count() {
+                let quants = q.capture_quantifiers(i);
+                if quants.iter().all(|qt| matches!(qt, CaptureQuantifier::Zero)) {
+                    return Err(format!(
+                        "pattern #{} captures nothing — a predicate after a bracketed \
+                         alternation attaches to NOTHING (the alternation runs \
+                         unfiltered). Wrap them in a group: ([…] (#pred …))",
+                        i
+                    ));
+                }
+            }
             let leaked: &'static Query = Box::leak(Box::new(q));
-            leaked
-        })
-        .map_err(|e| e.to_string());
+            Ok(leaked)
+        });
     cache.lock().unwrap().insert(key, compiled.clone());
     compiled
 }
@@ -231,6 +298,22 @@ impl<'a> Builder<'a> {
                             parents,
                         );
                         let actions = p.on_match(&spec.name, &mctx);
+                        // A #receiver-isa? gate defers DispatchCall
+                        // emissions to query time. The build-time
+                        // receiver type is a HINT on the candidate
+                        // (same role as record_provisional_dispatch's),
+                        // never the verdict.
+                        let gate = receiver_gate_for(query, pattern_index);
+                        let receiver_hint = gate.as_ref().and_then(|g| {
+                            let node = caps
+                                .iter()
+                                .find(|(ix, _)| *ix == g.capture_index)
+                                .map(|(_, n)| *n)?;
+                            match self.invocant_type_at_node(node) {
+                                Some(InferredType::ClassName(c)) => Some(c),
+                                _ => None,
+                            }
+                        });
                         // Emissions attach to the scope AND package open
                         // at the match site — the same context a
                         // walk-time hook emission would have gotten
@@ -240,6 +323,31 @@ impl<'a> Builder<'a> {
                         let match_scope = self.scope_at_point(mspan.start);
                         self.scope_stack.push(match_scope);
                         for a in actions {
+                            if let (
+                                Some(g),
+                                plugin::EmitAction::DispatchCall {
+                                    name,
+                                    dispatcher,
+                                    owner,
+                                    span,
+                                    ..
+                                },
+                            ) = (&gate, &a)
+                            {
+                                let HandlerOwner::Class(owner_class) = owner;
+                                self.provisional_dispatches.push(ReceiverGated::new(
+                                    g.target_class.clone(),
+                                    DispatchCandidate {
+                                        name: name.clone(),
+                                        span: *span,
+                                        dispatcher: dispatcher.clone(),
+                                        owner_class: owner_class.clone(),
+                                        receiver_class: receiver_hint.clone(),
+                                        call_span: mspan,
+                                    },
+                                ));
+                                continue;
+                            }
                             self.apply_emit_action(p.id().to_string(), a);
                         }
                         self.scope_stack.pop();

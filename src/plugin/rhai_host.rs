@@ -939,6 +939,26 @@ mod tests {
         Span { start: Point::new(r1, c1), end: Point::new(r2, c2) }
     }
 
+    /// Bare capture for hand-built `MatchContext`s — text + span only,
+    /// projections filled by struct-update at the call site.
+    fn mcap(text: &str, span: Span) -> crate::plugin::CaptureData {
+        crate::plugin::CaptureData {
+            text: text.into(),
+            span,
+            string_value: None,
+            string_values: Vec::new(),
+            content_span: None,
+            inferred_type: None,
+            value_shape: None,
+            sub_params: Vec::new(),
+            callable_return_edge: None,
+        }
+    }
+
+    fn one(d: crate::plugin::CaptureData) -> crate::plugin::CaptureValue {
+        crate::plugin::CaptureValue::One(Box::new(d))
+    }
+
     #[test]
     fn minimal_plugin_loads_and_dispatches() {
         let src = r#"
@@ -1164,7 +1184,7 @@ mod tests {
 
     #[test]
     fn bundled_dbic_resultddl_synthesizes_accessors() {
-        use crate::plugin::{ArgInfo, CallKind};
+        use crate::plugin::MatchContext;
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
@@ -1172,42 +1192,35 @@ mod tests {
             .into_iter()
             .find(|p| p.id() == "dbic-resultddl")
             .expect("dbic-resultddl is bundled");
+        assert!(
+            plugin.patterns().iter().any(|p| p.name == "ddl_decl"),
+            "dbic-resultddl should declare the ddl_decl pattern"
+        );
 
         // `col text => text;` and `has_many searches => {...};` each install
         // an accessor named by the (autoquoted) first arg.
         let cases = [("col", "text"), ("has_many", "searches"), ("belongs_to", "product")];
         for (func, accessor) in cases {
             let name_span = sp(1, 4, 1, 8);
-            let ctx = CallContext {
-                call_kind: CallKind::Function,
-                function_name: Some(func.into()),
-                method_name: None,
-                receiver_text: None,
-                receiver_call_name: None,
-                receiver_type: None,
-                receiver_route_defaults: Vec::new(),
-                args: vec![ArgInfo {
-                    text: accessor.into(),
+            let mut captures = std::collections::HashMap::new();
+            captures.insert("verb".to_string(), one(mcap(func, sp(1, 0, 1, 3))));
+            captures.insert(
+                "name".to_string(),
+                one(crate::plugin::CaptureData {
                     string_value: Some(accessor.into()),
-                    string_values: Vec::new(),
-                    span: name_span,
-                    content_span: None,
-                    inferred_type: Some(InferredType::String),
-                    sub_params: vec![],
-                    callable_return_edge: None,
-                    ref_sub_name: None, value_shape: Default::default(),
-                }],
-                call_span: sp(1, 0, 1, 20),
-                selection_span: sp(1, 0, 1, 3),
-                current_package: Some("My::Schema::Result::Thing".into()),
-                current_package_parents: vec![],
-                current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
-                has_options: None,
-                arg_names: Vec::new(),
-                receiver_is_package: false,
+                    ..mcap(accessor, name_span)
+                }),
+            );
+            let m = MatchContext {
+                pattern: "ddl_decl".into(),
+                span: sp(1, 0, 1, 20),
+                package: Some("My::Schema::Result::Thing".into()),
+                package_parents: vec![],
+                package_uses: vec!["DBIx::Class::ResultDDL".into()],
+                captures,
             };
 
-            let emissions = plugin.on_function_call(&ctx);
+            let emissions = plugin.on_match("ddl_decl", &m);
             let has_method = emissions.iter().any(|e| {
                 matches!(e, EmitAction::Method { name, is_method, .. }
                     if name == accessor && *is_method)
@@ -1218,53 +1231,34 @@ mod tests {
     }
 
     #[test]
-    fn dbic_resultddl_skips_dynamic_and_non_dsl() {
-        use crate::plugin::{ArgInfo, CallKind};
+    fn dbic_resultddl_skips_dynamic_name() {
+        use crate::plugin::MatchContext;
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
         let plugin = bundled.into_iter().find(|p| p.id() == "dbic-resultddl").unwrap();
 
-        let mk = |func: &str, string_value: Option<String>| CallContext {
-            call_kind: CallKind::Function,
-            function_name: Some(func.into()),
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args: vec![ArgInfo {
-                text: "x".into(),
-                string_value,
-                string_values: Vec::new(),
-                span: sp(1, 4, 1, 8),
-                content_span: None,
-                inferred_type: None,
-                sub_params: vec![],
-                callable_return_edge: None,
-                ref_sub_name: None, value_shape: Default::default(),
-            }],
-            call_span: sp(1, 0, 1, 20),
-            selection_span: sp(1, 0, 1, 3),
-            current_package: Some("My::Schema::Result::Thing".into()),
-            current_package_parents: vec![],
-            current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        // Dynamic column name (`col $field => ...`) — no fold, nothing to
+        // synthesize. (The non-DSL-verb case — `table 'embeddings';` — is
+        // filtered by the PATTERN now, pinned by its expects.)
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("verb".to_string(), one(mcap("col", sp(1, 0, 1, 3))));
+        captures.insert("name".to_string(), one(mcap("$field", sp(1, 4, 1, 10))));
+        let m = MatchContext {
+            pattern: "ddl_decl".into(),
+            span: sp(1, 0, 1, 20),
+            package: Some("My::Schema::Result::Thing".into()),
+            package_parents: vec![],
+            package_uses: vec!["DBIx::Class::ResultDDL".into()],
+            captures,
         };
-
-        // Dynamic column name (`col $field => ...`) — nothing to synthesize.
-        assert!(plugin.on_function_call(&mk("col", None)).is_empty(),
+        assert!(plugin.on_match("ddl_decl", &m).is_empty(),
             "dynamic col name must be skipped");
-        // A non-DSL function with a string arg is not our concern.
-        assert!(plugin.on_function_call(&mk("table", Some("embeddings".into()))).is_empty(),
-            "`table` declares no accessor and must emit nothing");
     }
 
     #[test]
     fn mojo_events_skips_dynamic_event_name() {
-        use crate::plugin::{ArgInfo, CallKind};
+        use crate::plugin::MatchContext;
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
@@ -1273,44 +1267,29 @@ mod tests {
             .find(|p| p.id() == "mojo-events")
             .unwrap();
 
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("on".into()),
-            receiver_text: Some("$self".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("Foo".into())),
-            receiver_route_defaults: Vec::new(),
-            args: vec![
-                // Dynamic name — string_value is None, so plugin must skip.
-                ArgInfo {
-                    text: "$name".into(),
-                    string_value: None,
-                    string_values: Vec::new(),
-                    span: sp(0, 0, 0, 5),
-                    content_span: None,
-                    inferred_type: None, sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-                ArgInfo {
-                    text: "sub {}".into(),
-                    string_value: None,
-                    string_values: Vec::new(),
-                    span: sp(0, 6, 0, 12),
-                    content_span: None,
-                    inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(0, 0, 0, 15),
-            selection_span: sp(0, 0, 0, 2),
-            current_package: Some("Foo".into()),
-            current_package_parents: vec!["Mojo::EventEmitter".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        // Dynamic name — no `str` fold on the event capture, so the
+        // plugin must decline (references still see it, rename skips it).
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("verb".to_string(), one(mcap("on", sp(0, 7, 0, 9))));
+        captures.insert(
+            "recv".to_string(),
+            one(crate::plugin::CaptureData {
+                inferred_type: Some(InferredType::ClassName("Foo".into())),
+                ..mcap("$self", sp(0, 0, 0, 5))
+            }),
+        );
+        captures.insert("event".to_string(), one(mcap("$name", sp(0, 10, 0, 15))));
+        captures.insert("callback".to_string(), one(mcap("sub {}", sp(0, 17, 0, 23))));
+        let m = MatchContext {
+            pattern: "event_call".into(),
+            span: sp(0, 0, 0, 25),
+            package: Some("Foo".into()),
+            package_parents: vec!["Mojo::EventEmitter".into()],
+            package_uses: vec![],
+            captures,
         };
 
-        let emissions = plugin.on_method_call(&ctx);
+        let emissions = plugin.on_match("event_call", &m);
         assert!(emissions.is_empty(), "dynamic name must not emit");
     }
 
