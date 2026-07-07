@@ -954,6 +954,9 @@ mod tests {
             callable_return_edge: None,
             list: Vec::new(),
             is_package_receiver: None,
+            args: Vec::new(),
+            isa: None,
+            ref_sub_name: None,
         }
     }
 

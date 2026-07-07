@@ -795,6 +795,21 @@ pub struct CaptureData {
     /// the class-level-call fact declaration DSLs gate on.
     #[serde(default)]
     pub is_package_receiver: Option<bool>,
+    /// Projection `args` — the node's flattened call arguments as full
+    /// `ArgInfo`s. The TRANSITION projection: ported plugins keep
+    /// `classified_pairs`-style bodies verbatim, then slim down onto
+    /// the narrower projections.
+    #[serde(default)]
+    pub args: Vec<ArgInfo>,
+    /// Projection `ref_sub_name` — the referenced sub name when this
+    /// node is a refgen of a named sub (`\&foo`, `\&Foo::bar`).
+    #[serde(default)]
+    pub ref_sub_name: Option<String>,
+    /// Projection `isa` — the resolved `isa` option type in a
+    /// `has`-style option tail (string vocabulary via the framework
+    /// mode, constructor calls via the `type_constraint_*` fold).
+    #[serde(default)]
+    pub isa: Option<InferredType>,
 }
 
 /// A capture's value in a match: scalar for `One`/`ZeroOrOne`

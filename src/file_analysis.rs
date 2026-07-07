@@ -10718,8 +10718,32 @@ impl FileAnalysis {
         // not as navigation targets — users look for the
         // helpers/routes/tasks themselves, which already render flat
         // with their `<word>` kind prefix.
-        let flat = self.outline_children_of(ScopeId(0));
-        self.nest_under_packages(flat)
+        let mut flat = self.outline_children_of(ScopeId(0));
+        // Siblings render in DOCUMENT order, not symbol-table order.
+        // The walk emits in position order so this used to hold for
+        // free, but post-walk emission phases (pattern dispatch)
+        // append later — the outline is a navigation view, so position
+        // is the invariant, not emission time. Stable sort: symbols
+        // sharing an anchor (a `has` line's synthesized family) keep
+        // their emission order.
+        Self::sort_outline_by_position(&mut flat);
+        let mut nested = self.nest_under_packages(flat);
+        for c in &mut nested {
+            Self::sort_outline_by_position(&mut c.children);
+        }
+        nested
+    }
+
+    fn sort_outline_by_position(list: &mut [OutlineSymbol]) {
+        list.sort_by_key(|s| {
+            (
+                s.selection_span.start.row,
+                s.selection_span.start.column,
+            )
+        });
+        for s in list {
+            Self::sort_outline_by_position(&mut s.children);
+        }
     }
 
     /// Fold file-scope siblings into the package/class they belong to so the

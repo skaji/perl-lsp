@@ -36,12 +36,44 @@ fn role_makers() {
     ["Moo::Role", "Moose::Role", "Mouse::Role", "Role::Tiny"]
 }
 
-// The verbs core resolves `has_options` (the attr-name + isa head) for, and
-// flattens the arg list of so `classified_pairs` can pair the accessor-option
-// tail. Declaring them here keeps core from hardcoding `has`/`option` — the
-// vocabulary lives with the plugin.
-fn arg_name_verbs() {
-    ["has", "option"]
+// The `has`/`option` declaration shape, query-declared. The attr-name
+// head arrives via the `list` projection on @attrs (covers `has 'x'`,
+// `has [qw/a b/]`, `has \@attrs` through the constant fold); the option
+// tail arrives as full ArgInfos via the `args` transition projection so
+// the shared `classified_pairs` host fn keeps pairing it; `isa` is the
+// one Moo-semantic resolution core performs (string vocabulary +
+// constraint-constructor fold). A bare `has 'x';` (no option tail, no
+// list_expression) doesn't match — nothing to synthesize beyond the
+// native accessor.
+fn patterns() {
+    [
+        #{
+            name: "has_decl",
+            query: `
+([
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @attrs) @args) @call
+  (function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @attrs) @args) @call
+]
+(#any-of? @verb "has" "option"))
+`,
+            projections: #{
+                attrs: ["list"],
+                args: ["args", "isa"],
+            },
+            expect: [
+                #{ src: "has token => (is => 'ro', predicate => 1);", matches: 1,
+                   captures: #{ verb: "has", attrs: "token" } },
+                #{ src: "has '_secret', is => 'ro', clearer => 1;", matches: 1 },
+                #{ src: "option verbose => (is => 'ro', format => 'i');", matches: 1 },
+                #{ src: "has 'plain';", matches: 0 },
+                #{ src: "$obj->has('x', 1);", matches: 0 },
+            ],
+        },
+    ]
 }
 
 fn triggers() {
@@ -134,21 +166,26 @@ fn handles_pairs(val) {
     out
 }
 
-fn on_function_call(ctx) {
+fn on_match(pattern, m) {
     let out = [];
-    // `option` (MooX::Options) shares `has`'s accessor-option vocabulary.
-    if ctx.function_name != "has" && ctx.function_name != "option" { return out; }
-    let opts = ctx.has_options;
-    if opts == () { return out; }
+    let attrs_cap = m.captures.attrs;
+    let args_cap = m.captures.args;
+    if attrs_cap == () || args_cap == () { return out; }
 
-    let cls = isa_class(opts.isa_type);
+    let attr_names = attrs_cap.list;
+    if attr_names == () || attr_names.len() < 1 { return out; }
+
+    let cls = isa_class(args_cap.isa);
     // The accessor options are the keyval tail after the attr-name head
     // (always one arg — a name or `[qw/…/]`), paired by the shared host fn
     // over the flattened arg list. Each `opt.value` is a `value_shape`.
-    let pairs = classified_pairs(ctx.args, 1);
+    let pairs = classified_pairs(args_cap.args, 1);
 
-    for attr_pair in opts.attr_names {
+    for attr_pair in attr_names {
         let attr = attr_pair[0];
+        // `+attr` modifies a parent-declared attribute — its options
+        // apply to the parent's attr; don't mint methods under `+x`.
+        if attr.starts_with("+") { continue; }
         let span = attr_pair[1];
 
         for opt in pairs {

@@ -671,10 +671,53 @@ retires `arg_name_verbs` with it) and the stateful Mojo trio
 (`mojo-helpers` / `mojo-routes` / `mojo-lite`, phase 3's topic-route
 replay).
 
+### Round 5: moo + mojo-helpers — seven of nine ported
+
+- **`args` (the transition projection), `isa`, and `ref_sub_name`
+  landed.** `isa` is the option-tail scan extracted from
+  `extract_has_options` (`Builder::isa_type_in_option_tail`), with a
+  Moo-mode fallback for packages whose `has` is Moo-backed without a
+  recorded framework mode (`Dancer2::Plugin` / `MooX::Options`).
+- **`moo` ported.** The attr head arrives via `list` on the `@attrs`
+  capture (covers `has [qw/a b/]` and `\@attrs` through the constant
+  fold); the option tail keeps its `classified_pairs` body verbatim
+  over the `args` projection; `HasOptions` is no longer read by any
+  plugin. `arg_name_verbs` now has ZERO declarers — the manifest and
+  the `wants_arg_names`-gated pre-capture are dead code awaiting the
+  phase-4 deletion. The entire framework-accessor test battery passed
+  unchanged on the first run.
+- **`mojo-helpers` ported** — the heaviest single plugin: one pattern
+  covers all three registration spellings (method call, Lite bare-DSL
+  ambiguous call, parenthesized), `strs` carries the loop-registration
+  fan-out (the DefaultHelpers self-discovery path), `callable_edge` the
+  lazy return type, `ref_sub_name` the named-sub form. Validated
+  against real CPAN Mojolicious by the gold harness (FAIL 0) — the
+  dotted-proxy chains and app-surface bridging resolve identically
+  through pattern dispatch.
+- **New invariant: outline siblings sort by document position.** The
+  outline used to be position-ordered only because the walk emits in
+  position order; post-walk dispatch appends later and one pinned
+  outline test caught helpers rendering after positionally-later
+  items. Fixed generally (`document_symbols` sorts recursively by
+  selection-span, stable so same-anchor families keep emission order)
+  — not by re-pinning the test. Any future post-walk emission phase
+  inherits the fix.
+
+**Remaining on legacy hooks: `mojo-routes` + `mojo-lite` only.** Their
+coupling is now precisely mapped: (1) the walk-interleaved topic-route
+stack (`lite_brand`) feeding `receiver_route_defaults`, and (2) a
+POST-FOLD re-dispatch — `resolve_route_brands` re-runs the route
+plugin's method-call hook with `BrandedRoute`-typed receivers after
+chain typing settles, so `->to('#action')` sites resolve against fold
+results. The pattern path therefore needs a second, post-fold dispatch
+round plus the `route_defaults` projection and the span-ordered stack
+replay — exactly phase 3 as designed, not more.
+
 Deliberately not spiked (unchanged design claims): the `pairs` /
-`isa` / `args` / `route_defaults` projections, per-language merged
-queries (the spike compiles one query per pattern spec), the
-topic-route replay, and the phase-4 pre-capture retirement.
+`route_defaults` projections, per-language merged queries (the spike
+compiles one query per pattern spec), the topic-route replay + the
+post-fold dispatch round, and the phase-4 pre-capture retirement
+(now including the dead `arg_name_verbs` machinery).
 
 ## 14. Open questions (deliberately deferred)
 

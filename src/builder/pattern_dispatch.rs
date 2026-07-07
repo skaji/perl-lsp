@@ -456,6 +456,9 @@ impl<'a> Builder<'a> {
             callable_return_edge: None,
             list: Vec::new(),
             is_package_receiver: None,
+            args: Vec::new(),
+            isa: None,
+            ref_sub_name: None,
         };
         if wants("str")
             || wants("strs")
@@ -463,6 +466,7 @@ impl<'a> Builder<'a> {
             || wants("sub_params")
             || wants("callable_edge")
             || wants("shape")
+            || wants("ref_sub_name")
         {
             let ai = self.arg_info_for(node);
             if wants("str") {
@@ -483,12 +487,22 @@ impl<'a> Builder<'a> {
             if wants("shape") {
                 data.value_shape = Some(ai.value_shape);
             }
+            if wants("ref_sub_name") {
+                data.ref_sub_name = ai.ref_sub_name;
+            }
         }
         if wants("ty") {
             data.inferred_type = self.invocant_type_at_node(node);
         }
         if wants("list") {
             data.list = self.extract_arg_name_list(node);
+        }
+        if wants("args") {
+            let flat = self.flat_call_args(vec![node]);
+            data.args = flat.iter().map(|n| self.arg_info_for(*n)).collect();
+        }
+        if wants("isa") {
+            data.isa = self.isa_type_in_option_tail(node);
         }
         if wants("is_package_receiver") {
             // Same rule as the emit-hook path's `is_pkg_call`:

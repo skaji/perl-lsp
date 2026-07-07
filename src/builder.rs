@@ -10122,6 +10122,55 @@ impl<'a> Builder<'a> {
         Some(plugin::HasOptions { attr_names, isa_type })
     }
 
+    /// The `isa` option's resolved type in a `has`-style option tail —
+    /// the projection-era slice of `extract_has_options` (same key scan,
+    /// same string-vocabulary + constraint-fold resolution), taking the
+    /// ARGUMENTS node directly so the pattern dispatcher can project it
+    /// per matched capture. Falls back to `Moo` when the match-site
+    /// package has no recorded framework mode (a `Dancer2::Plugin` /
+    /// `MooX::Options` package whose `has` is still Moo-backed).
+    pub(crate) fn isa_type_in_option_tail(&mut self, args_node: Node<'a>) -> Option<InferredType> {
+        let mode = self
+            .current_package
+            .as_ref()
+            .and_then(|p| self.framework_modes.get(p))
+            .copied()
+            .unwrap_or(FrameworkMode::Moo);
+        if mode == FrameworkMode::MojoBase {
+            return None;
+        }
+        let args_children: Vec<Node<'a>> = if matches!(
+            args_node.kind(),
+            "list_expression" | "parenthesized_expression"
+        ) {
+            (0..args_node.child_count())
+                .filter_map(|i| args_node.child(i))
+                .collect()
+        } else {
+            vec![args_node]
+        };
+        let first = args_children.iter().position(|c| c.is_named())?;
+        for (k_node, v_node) in self.has_option_pair_nodes(&args_children[first + 1..]) {
+            let Some(key) = self.extract_node_string(k_node) else {
+                continue;
+            };
+            if key != "isa" {
+                continue;
+            }
+            return self
+                .extract_node_string(v_node)
+                .as_deref()
+                .and_then(|s| self.map_isa_to_type(s, mode))
+                .or_else(|| {
+                    self.emit_expr_witness(v_node);
+                    self.bag_query_expr_span(node_to_span(v_node))?
+                        .constrained_inner()
+                        .cloned()
+                });
+        }
+        None
+    }
+
     /// Collect a call's option-tail fat-comma pairs as `(key_node, value_node)`,
     /// regardless of surface form — `has 'n' => (k => v)` (one nested list) or
     /// `has 'n', k => v` (flat siblings). Owned Vec so the caller can run

@@ -49,34 +49,60 @@ fn app_surface_consumers() {
 // action. We emit on both entry points; the shared proxy prefix means
 // dotted helpers only pay the fan-out once per leaf.
 
-// Lite scripts register helpers with the bare DSL verb —
-// `helper(frontend_version => sub {…})` — no `$app->` in sight. Same
-// emissions as the method spelling, same fan-out.
-fn on_function_call(ctx) {
-    if ctx.function_name != "helper" { return []; }
-    helper_call_emissions(ctx)
+// One pattern covers all three registration spellings: the method call
+// (`$app->helper(...)`), the Lite bare-DSL verb (`helper(name => sub)`,
+// an ambiguous call), and the parenthesized function form. The callback
+// capture is REQUIRED — a one-arg `helper($x)` isn't a registration.
+fn patterns() {
+    [
+        #{
+            name: "helper_reg",
+            query: `
+([
+  (method_call_expression
+    method: (_) @verb
+    arguments: (list_expression . (_) @name . (_) @callback)) @call
+  (function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @name . (_) @callback)) @call
+  (ambiguous_function_call_expression
+    function: (_) @verb
+    arguments: (list_expression . (_) @name . (_) @callback)) @call
+]
+(#eq? @verb "helper"))
+`,
+            projections: #{
+                name: ["str", "strs"],
+                callback: ["sub_params", "callable_edge", "ref_sub_name"],
+            },
+            expect: [
+                #{ src: "$app->helper(current_user => sub { my ($c) = @_; });", matches: 1,
+                   captures: #{ verb: "helper" } },
+                #{ src: "helper frontend_version => sub { '1.0' };", matches: 1 },
+                #{ src: "$app->helper(greet => \\&_greet);", matches: 1 },
+                #{ src: "$app->helper($_ => sub {}) for qw(a b);", matches: 1 },
+                #{ src: "$c->helper;", matches: 0 },
+            ],
+        },
+    ]
 }
 
-fn on_method_call(ctx) {
-    if ctx.method_name != "helper" { return []; }
-    helper_call_emissions(ctx)
-}
-
-fn helper_call_emissions(ctx) {
+fn on_match(pattern, m) {
     let out = [];
 
-    let args = ctx.args;
-    if args.len() < 2 { return out; }
+    let name_cap = m.captures.name;
+    let cb = m.captures.callback;
+    if name_cap == () || cb == () { return out; }
 
     // Loop registrations expand: `$app->helper($name => …) for/foreach`
     // folds the loop variable (or the postfix `$_` topic) over its
-    // literal list, and `string_values` carries every candidate — this
+    // literal list, and `strs` carries every candidate — this
     // is what discovers DefaultHelpers' own registrations from source,
     // with no hardcoded helper list anywhere.
-    let names = args[0].string_values;
+    let names = name_cap.strs;
     if names == () { names = []; }
     if names.len() == 0 {
-        let single = args[0].string_value;
+        let single = name_cap.str;
         if single == () { return out; }
         names = [single];
     }
@@ -84,8 +110,8 @@ fn helper_call_emissions(ctx) {
     // `$app->helper(NAME => sub { my ($c, @rest) = @_; ... })` — the
     // helper's first positional is the Mojolicious controller. Flag
     // it so sig help / hover / outline don't show `$c` at call sites.
-    let params = as_invocant_params(args[1].sub_params);
-    let name_span = args[0].span;
+    let params = as_invocant_params(cb.sub_params);
+    let name_span = name_cap.span;
 
     // Type the first positional inside the callback body as
     // Mojolicious::Controller — lets `$c->...` inside the callback
@@ -96,7 +122,7 @@ fn helper_call_emissions(ctx) {
         out += #{
             VarType: #{
                 variable: params[0].name,
-                at: args[1].span,
+                at: cb.span,
                 inferred_type: #{ ClassName: "Mojolicious::Controller" },
             }
         };
@@ -108,10 +134,10 @@ fn helper_call_emissions(ctx) {
     // sub name and the builder types that sub's first positional the same
     // way (deferred, so a forward-declared `_greet` resolves too). Same
     // first-param-is-the-controller rule, just keyed by name.
-    if args[1].ref_sub_name != () {
+    if cb.ref_sub_name != () {
         out += #{
             NamedSubParamType: #{
-                sub_name: args[1].ref_sub_name,
+                sub_name: cb.ref_sub_name,
                 param_index: 0,
                 inferred_type: #{ ClassName: "Mojolicious::Controller" },
             }
@@ -122,14 +148,14 @@ fn helper_call_emissions(ctx) {
         // Unfolded dynamics (`$_` that didn't fold, interpolations)
         // are honest misses, not helpers named "$_".
         if name.contains("$") { continue; }
-        out += helper_emissions(ctx, name, params, name_span, args[1].callable_return_edge);
+        out += helper_emissions(m, name, params, name_span, cb.callable_edge);
     }
     return out;
 }
 
 // Everything one registered helper NAME emits — split out so a loop
 // registration fans out N times over the same callback/spans.
-fn helper_emissions(ctx, name, params, name_span, ret_edge) {
+fn helper_emissions(m, name, params, name_span, ret_edge) {
     let out = [];
     // Split on '.' — single-segment names are the common case and
     // produce exactly one Method. Dotted names chain.
@@ -150,10 +176,10 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
     // core, so the existing ancestor walk + bridge resolution finds the
     // helper from `$app->h` AND `$c->h` — one bridge target, open
     // consumer set. Entity names accumulate per app namespace.
-    let app_ns_id = if ctx.current_package == () {
+    let app_ns_id = if m["package"] == () {
         "mojo-app:main"
     } else {
-        "mojo-app:" + ctx.current_package
+        "mojo-app:" + m["package"]
     };
     let app_surface = "Mojolicious::_AppSurface";
     let app_bridges = [
@@ -182,7 +208,7 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
                 // lets editor sticky-scroll / breadcrumb pin the helper while
                 // the cursor is inside it. `selection_span` stays the name so
                 // goto-def / highlight anchor precisely.
-                span: ctx.call_span,
+                span: m.span,
                 selection_span: name_span,
                 params: params,
                 is_method: true,
@@ -203,7 +229,7 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
                 kind: "app",
                 bridges: app_bridges,
                 entity_names: [name],
-                decl_span: ctx.call_span,
+                decl_span: m.span,
             }
         };
         // Anchor a MethodCallRef at the name span so gr/hover on the
@@ -291,7 +317,7 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
             name: leaf,
             // Body-enclosing extent for sticky-scroll / breadcrumb (see the
             // single-segment helper above); name stays the goto anchor.
-            span: ctx.call_span,
+            span: m.span,
             selection_span: name_span,
             params: params,
             is_method: true,
@@ -321,7 +347,7 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
             kind: "app",
             bridges: app_bridges,
             entity_names: [first_seg],
-            decl_span: ctx.call_span,
+            decl_span: m.span,
         }
     };
 
@@ -337,7 +363,7 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
                 kind: "proxy",
                 bridges: [#{ Class: current_proxy }],
                 entity_names: [seg],
-                decl_span: ctx.call_span,
+                decl_span: m.span,
             }
         };
         current_proxy = current_proxy + "::" + seg;
@@ -349,7 +375,7 @@ fn helper_emissions(ctx, name, params, name_span, ret_edge) {
             kind: "proxy",
             bridges: [#{ Class: current_proxy }],
             entity_names: [segments[n - 1]],
-            decl_span: ctx.call_span,
+            decl_span: m.span,
         }
     };
 
