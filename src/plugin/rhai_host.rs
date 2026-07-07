@@ -193,8 +193,10 @@ pub struct RhaiPlugin {
     fluent_verbs: Vec<String>,
     arg_name_verbs: Vec<String>,
     topic_route_dsl: Option<crate::plugin::TopicRouteDsl>,
+    patterns: Vec<crate::plugin::PatternSpec>,
     engine: Arc<Engine>,
     ast: Arc<AST>,
+    has_on_match: bool,
     has_on_function_call: bool,
     has_type_constraint_inner: bool,
     has_on_method_call: bool,
@@ -462,6 +464,28 @@ impl RhaiPlugin {
             }
         }
 
+        // `patterns()` — query-declared capture manifest; same
+        // optional, fail-safe contract as overrides (a bad entry is
+        // dropped, the rest of the plugin still loads).
+        let mut patterns: Vec<crate::plugin::PatternSpec> = Vec::new();
+        if signatures.iter().any(|n| n == "patterns") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "patterns", ()) {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<crate::plugin::PatternSpec>(&d) {
+                            Ok(p) => patterns.push(p),
+                            Err(e) => log::error!(
+                                "plugin `{}` patterns() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` patterns() failed: {}", id, e),
+            }
+        }
+
         // `topic_route_dsl()` — optional manifest map; bad shapes log
         // and disable rather than fail the plugin.
         let mut topic_route_dsl: Option<crate::plugin::TopicRouteDsl> = None;
@@ -476,6 +500,7 @@ impl RhaiPlugin {
         }
 
         Ok(Self {
+            has_on_match: signatures.iter().any(|n| n == "on_match"),
             has_on_function_call: signatures.iter().any(|n| n == "on_function_call"),
             has_type_constraint_inner: signatures.iter().any(|n| n == "type_constraint_inner"),
             has_on_method_call: signatures.iter().any(|n| n == "on_method_call"),
@@ -496,6 +521,7 @@ impl RhaiPlugin {
             fluent_verbs,
             arg_name_verbs,
             topic_route_dsl,
+            patterns,
             engine,
             ast: Arc::new(ast),
         })
@@ -531,8 +557,14 @@ impl RhaiPlugin {
     }
 
     fn dispatch(&self, fn_name: &str, arg: Dynamic) -> Vec<EmitAction> {
+        self.dispatch_args(fn_name, (arg,))
+    }
+
+    /// The N-ary sibling of `dispatch` — `on_match` takes
+    /// `(pattern_name, ctx)`. Same fail-safe emission decoding.
+    fn dispatch_args(&self, fn_name: &str, args: impl rhai::FuncArgs) -> Vec<EmitAction> {
         let out: Result<Array, _> =
-            self.engine.call_fn(&mut rhai::Scope::new(), &self.ast, fn_name, (arg,));
+            self.engine.call_fn(&mut rhai::Scope::new(), &self.ast, fn_name, args);
         let arr = match out {
             Ok(a) => a,
             Err(e) => {
@@ -648,6 +680,23 @@ impl FrameworkPlugin for RhaiPlugin {
                     e
                 );
                 None
+            }
+        }
+    }
+
+    fn patterns(&self) -> &[crate::plugin::PatternSpec] {
+        &self.patterns
+    }
+
+    fn on_match(&self, pattern: &str, m: &crate::plugin::MatchContext) -> Vec<EmitAction> {
+        if !self.has_on_match {
+            return Vec::new();
+        }
+        match to_dynamic(m) {
+            Ok(d) => self.dispatch_args("on_match", (pattern.to_string(), d)),
+            Err(e) => {
+                log::warn!("plugin `{}`: match ctx serialize: {}", self.id, e);
+                Vec::new()
             }
         }
     }
@@ -1024,7 +1073,7 @@ mod tests {
 
     #[test]
     fn bundled_mojo_events_loads_and_emits() {
-        use crate::plugin::{ArgInfo, CallKind};
+        use crate::plugin::{CaptureData, CaptureValue, MatchContext};
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
@@ -1033,45 +1082,61 @@ mod tests {
             .find(|p| p.id() == "mojo-events")
             .expect("mojo-events is bundled");
 
-        let evt_span = sp(3, 15, 3, 23);
-        let cb_span = sp(3, 25, 3, 40);
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("on".into()),
-            receiver_text: Some("$self".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("My::Emitter".into())),
-            receiver_route_defaults: Vec::new(),
-            args: vec![
-                ArgInfo {
-                    text: "'connect'".into(),
-                    string_value: Some("connect".into()),
-                    string_values: Vec::new(),
-                    span: evt_span,
-                    content_span: None,
-                    inferred_type: Some(InferredType::String), sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-                ArgInfo {
-                    text: "sub { ... }".into(),
-                    string_value: None,
-                    string_values: Vec::new(),
-                    span: cb_span,
-                    content_span: None,
-                    inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(3, 4, 3, 45),
-            selection_span: sp(3, 10, 3, 12),
-            current_package: Some("My::Emitter".into()),
-            current_package_parents: vec!["Mojo::EventEmitter".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        // mojo-events rides the query-declared capture seam: it must
+        // declare a pattern manifest and answer on_match with the same
+        // emissions the old CallContext hook produced.
+        assert!(
+            plugin.patterns().iter().any(|p| p.name == "event_call"),
+            "mojo-events should declare the event_call pattern"
+        );
+
+        let cap = |text: &str, span: Span| CaptureData {
+            text: text.into(),
+            span,
+            string_value: None,
+            string_values: Vec::new(),
+            content_span: None,
+            inferred_type: None,
+            value_shape: None,
+            sub_params: Vec::new(),
+            callable_return_edge: None,
         };
 
-        let emissions = plugin.on_method_call(&ctx);
+        let evt_span = sp(3, 15, 3, 23);
+        let cb_span = sp(3, 25, 3, 40);
+        let mut captures = std::collections::HashMap::new();
+        captures.insert(
+            "verb".to_string(),
+            CaptureValue::One(Box::new(cap("on", sp(3, 10, 3, 12)))),
+        );
+        captures.insert(
+            "recv".to_string(),
+            CaptureValue::One(Box::new(CaptureData {
+                inferred_type: Some(InferredType::ClassName("My::Emitter".into())),
+                ..cap("$self", sp(3, 4, 3, 9))
+            })),
+        );
+        captures.insert(
+            "event".to_string(),
+            CaptureValue::One(Box::new(CaptureData {
+                string_value: Some("connect".into()),
+                ..cap("'connect'", evt_span)
+            })),
+        );
+        captures.insert(
+            "callback".to_string(),
+            CaptureValue::One(Box::new(cap("sub { ... }", cb_span))),
+        );
+        let m = MatchContext {
+            pattern: "event_call".into(),
+            span: sp(3, 4, 3, 45),
+            package: Some("My::Emitter".into()),
+            package_parents: vec!["Mojo::EventEmitter".into()],
+            package_uses: vec![],
+            captures,
+        };
+
+        let emissions = plugin.on_match("event_call", &m);
         // DispatchCall (ref) + Handler (def) + PluginNamespace (bridge).
         assert_eq!(emissions.len(), 3,
             "dispatch call + handler + namespace; got: {:?}", emissions);

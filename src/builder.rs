@@ -30,6 +30,12 @@ pub use crate::plugin::default_plugin_registry;
 /// while the code lives in its own file (rule #1: still driven by `build()`).
 mod narrowing;
 
+/// Query-declared plugin capture (SPIKE, `docs/prompt-plugin-queries.md`):
+/// runs plugin-declared tree-sitter patterns post-walk and dispatches
+/// `on_match`. Child module for the same private-field reason as
+/// `narrowing` — still driven by `build()` (rule #1).
+mod pattern_dispatch;
+
 /// Single CST walk that powers the post-walk `ChainTypingReducer`.
 /// Indexes the node sets the reducer needs:
 ///
@@ -356,6 +362,15 @@ fn build_with_plugins_inner(
     // the synthesized symbols attach to the file scope, like every other
     // top-level sub.
     b.synthesize_autoloader_data_subs(tree);
+
+    // Query-declared plugin capture (SPIKE): dispatch plugin patterns
+    // against the finished tree. Post-walk so package ranges, uses,
+    // and constant folds are complete; still inside the file scope
+    // (emissions need an open scope stack) and BEFORE the VarType /
+    // named-sub flushes below so pattern emissions ride the same
+    // machinery as walk-interleaved hook emissions.
+    bphase!("pattern_dispatch", b.dispatch_pattern_plugins(tree.root_node()));
+
     b.pop_scope();
     let _ = file_scope;
 

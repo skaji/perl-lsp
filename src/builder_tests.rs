@@ -15301,6 +15301,9 @@ fn plugin_loads_recorded_trigger_independent_and_multivalue() {
 #[path = "builder/narrowing_tests.rs"]
 mod narrowing;
 
+#[path = "builder/pattern_dispatch_tests.rs"]
+mod pattern_dispatch;
+
 #[test]
 fn list_assign_literal_types_each_slot() {
     // `my ($a, $b) = (10, "str")` types BOTH slots (was first-var-only/None).

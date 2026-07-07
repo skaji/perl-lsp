@@ -11,6 +11,13 @@
 // model (not HashKey-overloaded), so every downstream LSP feature
 // (hover, sig help, ref, rename, workspace symbol) composes without
 // any mojo-events-specific branching.
+//
+// PORTED to the query-declared capture seam (docs/prompt-plugin-queries.md):
+// the verb set and the arg shape live in the `patterns()` query; the
+// core only computes the projections this pattern declares, and only
+// for actual matches. `on_match` carries the same semantics the old
+// `on_method_call` body had, minus the verb if-chain and positional
+// arg digging.
 
 fn id() { "mojo-events" }
 
@@ -22,42 +29,83 @@ fn triggers() {
         // `register`). The plugin package isn't itself an EventEmitter, so
         // this trigger opens the door there. `resolve_event` does NOT gate on
         // receiver class — it takes the receiver's class as the handler's
-        // owner (falling back to `current_package`), the same no-allowlist
-        // stance as minion: the `on`/`emit`/`subscribe` verb + a string first
-        // arg is the signal. A stray `$x->on('e', sub)` in such a file thus
-        // registers an owner-scoped handler; harmless (owner won't match an
-        // unrelated `emit`).
+        // owner (falling back to the match-site package), the same
+        // no-allowlist stance as minion: the `on`/`emit`/`subscribe` verb +
+        // a string first arg is the signal. A stray `$x->on('e', sub)` in
+        // such a file thus registers an owner-scoped handler; harmless
+        // (owner won't match an unrelated `emit`).
         #{ ClassIsa: "Mojolicious::Plugin" },
+    ]
+}
+
+fn patterns() {
+    [
+        #{
+            name: "event_call",
+            // A single-arg call carries the literal directly under
+            // `arguments:`; multi-arg calls wrap a `list_expression` —
+            // hence the alternation. The bare-arg alternatives
+            // enumerate name-shaped kinds only, so `->catch(sub {…})`
+            // stays unmatched (same decline as the old hook's
+            // string_value check).
+            query: `
+(method_call_expression
+  invocant: (_) @recv
+  method: (_) @verb
+  (#any-of? @verb "on" "once" "subscribe"
+                  "emit" "unsubscribe" "has_subscribers" "catch")
+  arguments: [
+    (list_expression . (_) @event . (_)? @callback)
+    (string_literal) @event
+    (interpolated_string_literal) @event
+    (scalar) @event
+    (bareword) @event
+  ]
+) @call
+`,
+            projections: #{
+                recv: ["ty"],
+                event: ["str", "content_span"],
+                callback: ["sub_params"],
+            },
+            expect: [
+                #{ src: "$e->on('ready', sub { my ($s) = @_; });", matches: 1 },
+                #{ src: "$e->emit('ready');", matches: 1 },
+                #{ src: "$e->emit(ready => 1);", matches: 1 },
+                #{ src: "$e->off('x');", matches: 0 },
+            ],
+        },
     ]
 }
 
 // Shared resolver: name + owner class + tight span around the name
 // argument. Returns () when the call isn't eligible (dynamic name,
 // no owner class, etc.).
-fn resolve_event(ctx) {
-    let args = ctx.args;
-    if args.len() < 1 { return (); }
+fn resolve_event(m) {
+    let ev = m.captures.event;
+    if ev == () { return (); }
 
-    let name = args[0].string_value;
+    let name = ev.str;
     if name == () { return (); }
 
     let owner_class = ();
-    let rtype = ctx.receiver_type;
+    let rtype = m.captures.recv.ty;
     if rtype != () && rtype.contains("ClassName") {
         owner_class = rtype.ClassName;
     }
     if owner_class == () {
-        owner_class = ctx.current_package;
+        // `package` is a Rhai reserved word — bracket access required.
+        owner_class = m["package"];
     }
     if owner_class == () { return (); }
 
     // Prefer the string-content span (inside the quotes) so rename rewrites
     // just `connect`, not `'connect'` (a bareword replacement would strip the
-    // quotes). A const-folded name (`$evt`) has no content span; its arg span
-    // is the variable token — `refs_to` flags that site non-rewritable so
+    // quotes). A const-folded name (`$evt`) has no content span; its capture
+    // span is the variable token — `refs_to` flags that site non-rewritable so
     // rename skips it (no literal to rewrite) while references still sees it.
-    let nspan = args[0].content_span;
-    if nspan == () { nspan = args[0].span; }
+    let nspan = ev.content_span;
+    if nspan == () { nspan = ev.span; }
 
     #{
         name: name,
@@ -66,17 +114,13 @@ fn resolve_event(ctx) {
     }
 }
 
-fn on_method_call(ctx) {
+fn on_match(pattern, m) {
     let out = [];
-    let m = ctx.method_name;
+    let verb = m.captures.verb.text;
 
-    let is_register = m == "on" || m == "once" || m == "subscribe";
-    let is_access = m == "emit" || m == "unsubscribe"
-        || m == "has_subscribers" || m == "catch";
+    let is_register = verb == "on" || verb == "once" || verb == "subscribe";
 
-    if !is_register && !is_access { return out; }
-
-    let ev = resolve_event(ctx);
+    let ev = resolve_event(m);
     if ev == () { return out; }
 
     // Every call-site is a reference — emit and unsubscribe sites as well
@@ -84,24 +128,25 @@ fn on_method_call(ctx) {
     out += #{
         DispatchCall: #{
             name: ev.name,
-            dispatcher: m,
+            dispatcher: verb,
             owner: ev.owner,
             span: ev.name_span,
-            var_text: if ctx.receiver_text == () { "" } else { ctx.receiver_text },
+            var_text: m.captures.recv.text,
         }
     };
 
     // Registering verbs stamp a Handler def. Handler params come from
-    // the handler sub's signature (extracted by the builder — sig syntax
-    // or `my (...) = @_` — and surfaced in ArgInfo.sub_params).
+    // the handler sub's signature (the `sub_params` projection on the
+    // callback capture — sig syntax or `my (...) = @_`).
     if is_register {
         let params = [];
-        if ctx.args.len() >= 2 {
+        let cb = m.captures.callback;
+        if cb != () {
             // Mojo::EventEmitter passes the emitter as the callback's
             // first positional. The param list is otherwise verbatim
             // from the handler sub; `as_invocant_params` flags just
             // position 0 so sig help drops it at display time.
-            params = as_invocant_params(ctx.args[1].sub_params);
+            params = as_invocant_params(cb.sub_params);
         }
 
         out += #{
@@ -113,7 +158,7 @@ fn on_method_call(ctx) {
                 // Extent covers the whole `on(name => sub {…})` so the outline
                 // node encloses the handler body — editor sticky-scroll /
                 // breadcrumb pin the event while the cursor is inside it.
-                span: ctx.call_span,
+                span: m.span,
                 selection_span: ev.name_span,
             }
         };
@@ -136,11 +181,11 @@ fn on_method_call(ctx) {
         // Type the callback's first positional as the emitter class
         // so the user can ->-complete on it inside the handler body.
         // `ev.owner` is a Class map — project back to the string.
-        if params.len() >= 1 && ctx.args.len() >= 2 {
+        if params.len() >= 1 && cb != () {
             out += #{
                 VarType: #{
                     variable: params[0].name,
-                    at: ctx.args[1].span,
+                    at: cb.span,
                     inferred_type: #{ ClassName: ev.owner.Class },
                 }
             };

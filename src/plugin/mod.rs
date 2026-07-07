@@ -705,6 +705,112 @@ pub enum EmitAction {
     },
 }
 
+// ---- Query-declared capture (patterns) ----
+//
+// SPIKE of docs/prompt-plugin-queries.md: a plugin declares the shapes
+// it cares about as tree-sitter queries; core runs them post-walk and
+// hands each match to `on_match` with only the projections that
+// pattern asked for. The emit vocabulary (`EmitAction`) is unchanged.
+
+/// A self-verification snippet for a pattern — `--plugin-check` (and
+/// unit tests) parse `src` with the pattern's grammar and assert the
+/// match count (and, optionally, capture texts). The answer to the
+/// query medium's silent-match-nothing failure mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternExpect {
+    pub src: String,
+    pub matches: usize,
+    #[serde(default)]
+    pub captures: std::collections::HashMap<String, String>,
+}
+
+/// A plugin-declared item of interest: a tree-sitter query plus, per
+/// capture name, the projections (decision-ready views) the plugin
+/// wants computed for matched nodes. `text` and `span` are always
+/// included; everything else is opt-in so cost tracks declared need.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternSpec {
+    pub name: String,
+    /// Which grammar this query targets. Default "perl".
+    #[serde(default = "default_pattern_language")]
+    pub language: String,
+    /// Tree-sitter query source. Standard text predicates (`#eq?`,
+    /// `#match?`, `#any-of?`, …) are evaluated by the query engine at
+    /// match time; unknown predicate names are ignored at match time
+    /// (reserved for deferred host predicates like `#receiver-isa?`).
+    pub query: String,
+    /// capture name → projection names (see `CaptureData` fields).
+    #[serde(default)]
+    pub projections: std::collections::HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub expect: Vec<PatternExpect>,
+}
+
+fn default_pattern_language() -> String {
+    "perl".to_string()
+}
+
+/// One captured node, projected. `text` + `span` are always present;
+/// the rest are populated only when the pattern declared the matching
+/// projection (undeclared fields serialize as unit on the Rhai side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureData {
+    pub text: String,
+    pub span: Span,
+    /// Projection `str` — constant-folded string value (literals,
+    /// barewords, `constant_strings`-resolved vars).
+    #[serde(rename = "str", default)]
+    pub string_value: Option<String>,
+    /// Projection `strs` — every fold candidate (loop/`qw` fan-out).
+    #[serde(rename = "strs", default)]
+    pub string_values: Vec<String>,
+    /// Projection `content_span` — inside-the-quotes span of a string
+    /// literal.
+    #[serde(default)]
+    pub content_span: Option<Span>,
+    /// Projection `ty` — the node's resolved type (receiver typing:
+    /// same dispatch as `CallContext.receiver_type`). Named `ty`, not
+    /// `type`, to stay clear of Rhai reserved words.
+    #[serde(rename = "ty", default)]
+    pub inferred_type: Option<InferredType>,
+    /// Projection `shape` — one-level value-shape classification.
+    #[serde(rename = "shape", default)]
+    pub value_shape: Option<ValueShape>,
+    /// Projection `sub_params` — anon-sub param list.
+    #[serde(default)]
+    pub sub_params: Vec<EmittedParam>,
+    /// Projection `callable_edge` — witness attachment whose type IS
+    /// this callable's return when invoked.
+    #[serde(rename = "callable_edge", default)]
+    pub callable_return_edge: Option<crate::witnesses::WitnessAttachment>,
+}
+
+/// A capture's value in a match: scalar for `One`/`ZeroOrOne`
+/// quantifier positions, an array under `*`/`+` quantifiers. The
+/// cardinality comes from `Query::capture_quantifiers` — statically
+/// known per pattern, so plugins never branch on it at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CaptureValue {
+    Many(Vec<CaptureData>),
+    One(Box<CaptureData>),
+}
+
+/// What `on_match` sees: the pattern that fired, the match extent, the
+/// enclosing package context at the match site, and the projected
+/// captures. No node access — rule #1 holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchContext {
+    pub pattern: String,
+    /// Union of the match's capture spans — for a pattern with a root
+    /// capture (`… ) @call`), this is that node's span.
+    pub span: Span,
+    pub package: Option<String>,
+    pub package_parents: Vec<String>,
+    pub package_uses: Vec<String>,
+    pub captures: std::collections::HashMap<String, CaptureValue>,
+}
+
 // ---- Plugin trait ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1008,6 +1114,21 @@ pub trait FrameworkPlugin: Send + Sync {
         params: &[ConstraintParam],
     ) -> Option<InferredType> {
         None
+    }
+
+    /// Query-declared capture patterns — see `PatternSpec` and
+    /// `docs/prompt-plugin-queries.md`. Read once at plugin load;
+    /// compiled once per process. Default empty.
+    fn patterns(&self) -> &[PatternSpec] {
+        &[]
+    }
+
+    /// Called once per (pattern, match) after the live walk, with the
+    /// projections that pattern declared. Same contract as the emit
+    /// hooks: pure function, returns emissions.
+    #[allow(unused_variables)]
+    fn on_match(&self, pattern: &str, m: &MatchContext) -> Vec<EmitAction> {
+        Vec::new()
     }
 
     // ---- Emit hooks (parse time) ----
@@ -1375,21 +1496,30 @@ impl PluginRegistry {
         let uses = query.package_uses.to_vec();
         let parents = query.package_parents.to_vec();
         self.plugins.iter().filter_map(move |p| {
-            let fires = p.triggers().iter().any(|t| match t {
-                Trigger::Always => true,
-                Trigger::UsesModule(m) => uses.iter().any(|u| u == m),
-                Trigger::ClassIsa(prefix) => parents.iter().any(|parent| {
-                    parent == prefix
-                        || parent.starts_with(&format!("{}::", prefix))
-                }),
-            });
-            if fires {
+            let q = TriggerQuery {
+                package_uses: &uses,
+                package_parents: &parents,
+            };
+            if trigger_fires(p.triggers(), &q) {
                 Some(p.as_ref())
             } else {
                 None
             }
         })
     }
+}
+
+/// Does any of `triggers` fire for the given package context? The one
+/// trigger-matching implementation — `applicable()` and the pattern
+/// dispatch's per-match-site gating both route through it.
+pub fn trigger_fires(triggers: &[Trigger], q: &TriggerQuery<'_>) -> bool {
+    triggers.iter().any(|t| match t {
+        Trigger::Always => true,
+        Trigger::UsesModule(m) => q.package_uses.iter().any(|u| u == m),
+        Trigger::ClassIsa(prefix) => q.package_parents.iter().any(|parent| {
+            parent == prefix || parent.starts_with(&format!("{}::", prefix))
+        }),
+    })
 }
 
 /// Thin view over per-package state used for trigger matching.

@@ -560,7 +560,7 @@ fn lint_source(source: &str, report: &mut CheckReport) {
         report.warnings.push("no `fn triggers()` defined".to_string());
     }
     // No emit or query hook present at all → plugin does nothing.
-    let has_any_hook = ["on_function_call", "on_method_call", "on_use", "on_signature_help", "on_completion"]
+    let has_any_hook = ["on_match", "on_function_call", "on_method_call", "on_use", "on_signature_help", "on_completion"]
         .iter()
         .any(|h| source.contains(&format!("fn {}", h)));
     if !has_any_hook {

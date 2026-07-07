@@ -221,11 +221,15 @@ An unmatched optional capture is `()` on the Rhai side.
 
 Two tiers:
 
-**Match-time text predicates** — evaluated by core during the query
-pass (the Rust binding does not auto-evaluate them; core implements
-these once, in the dispatch runner): `#eq?`, `#not-eq?`, `#match?`,
+**Match-time text predicates** — `#eq?`, `#not-eq?`, `#match?`,
 `#not-match?`, `#any-of?`, `#not-any-of?`. These operate on capture
-*text* — ring-1 facts only.
+*text* — ring-1 facts only. The tree-sitter Rust binding evaluates
+them itself when `QueryCursor::matches` is given the source text
+(verified by the spike, and already load-bearing in
+`query_cache::cpanfile_requires`'s `#eq?`), so core implements
+nothing here. Unknown predicate names are NOT match-time filters —
+the binding surfaces them via `Query::general_predicates`, which is
+exactly the reservation the deferred tier needs.
 
 **Deferred host predicates** — conditions that *cannot* be answered at
 match time and must not pretend to be. The motivating case is receiver
@@ -334,9 +338,10 @@ sanctioned sense — tree access stays inside `build()`'s call graph):
   ~400ms for the Perl skeleton — is why per-file compilation is
   forbidden). A source-offset map recovers per-plugin error positions
   from merged-query compile errors.
-- **Run.** In the dispatch phase: one `QueryCursor` over the tree;
-  evaluate text predicates; group by pattern; drop matches whose
-  `(plugin, package)` gate is false this round; sort; project; convert
+- **Run.** In the dispatch phase: one `QueryCursor` over the tree
+  (text predicates evaluated by the binding); group by pattern; drop
+  matches whose `(plugin, package)` gate is false this round; sort;
+  project; convert
   `MatchContext` → Rhai `Dynamic` (mirroring today's `CallContext`
   serde path in `rhai_host.rs`); call `on_match`; apply emissions via
   the existing `apply_emit_action` (namespace tagging, provenance —
@@ -502,7 +507,86 @@ framework shapes on top of it, both feeding the same engine through
 data. No pack work is in scope here beyond keeping the `language` field
 honest.
 
-## 13. Open questions (deliberately deferred)
+## 13. Spike findings (phase 0 + phase 1, landed on this branch)
+
+The infrastructure and the first port were spiked to test the design's
+load-bearing claims. What landed:
+
+- `src/plugin/mod.rs` — `PatternSpec` / `PatternExpect` / `CaptureData`
+  / `CaptureValue` / `MatchContext`, trait methods `patterns()` +
+  `on_match()`, and `trigger_fires` (the single trigger-matching
+  implementation, now shared by `applicable()` and per-match gating).
+- `src/plugin/rhai_host.rs` — `patterns()` manifest loading (same
+  fail-safe contract as `overrides()`), `on_match` dispatch.
+- `src/builder/pattern_dispatch.rs` — the driver: per-source compiled
+  query cache, post-walk dispatch with fixed-point gating, projection
+  engine (`str`/`strs`/`content_span`/`shape`/`sub_params`/
+  `callable_edge`/`ty` — all routed through `arg_info_for` /
+  `invocant_type_at_node`), and `verify_pattern_expects` (the expects
+  runner, test-driven pending `--plugin-check` wiring).
+- `frameworks/mojo-events.rhai` — ported end-to-end. The verb if-chain
+  and positional arg digging became the pattern; `on_match` keeps the
+  old hook's body semantics. All 6 existing mojo-events builder tests
+  pass unchanged, as does the full suite (1312 unit + integration).
+- `src/builder/pattern_dispatch_tests.rs` — bundled-expects
+  verification (every declared pattern must ship expects and they must
+  hold), the fixed-point gating round-trip (a `PackageParent` emission
+  from an Always plugin enabling a `ClassIsa`-gated plugin's match in
+  round 2), and per-package gating (same verb in a non-firing package
+  stays silent, and the emission lands in the firing package).
+
+Claims confirmed:
+
+- **Text predicates come free.** The Rust binding evaluates
+  `#eq?`/`#any-of?` when `matches()` gets the source text. §4.4's
+  original claim that core must implement them was wrong; corrected.
+- **The port is a real simplification.** The pattern absorbs the verb
+  set and the arg positions; the projections declared are exactly the
+  three the plugin reads (`ty` on the receiver, `str`+`content_span`
+  on the event, `sub_params` on the callback). No `CallContext` field
+  is touched.
+- **Fixed-point gating works** and terminates via dedup + monotone
+  inputs, as designed.
+
+Traps found (now encoded in the driver, and belonging in the trap
+library):
+
+- **Emissions need the match site's walk context restored.** Two real
+  bugs during the spike: `apply_emit_action` panics on an empty scope
+  stack (dispatch must run inside the file scope, before the final
+  `pop_scope`), and symbols get stamped with the walk-stale
+  `current_package` unless it's swapped to the match site's package
+  for the whole emission application, not just for projections. The
+  driver now pushes `scope_at_point(match)` and swaps
+  `current_package` around `on_match` + emission application.
+- **Placement is load-bearing**: dispatch must precede the deferred
+  `VarType` / named-sub-param flushes or those emission kinds are
+  silently dropped. The build-pipeline phase list must name this
+  ordering when the phase lands for real.
+- **Grammar shape, not design flaw**: single-argument method calls
+  carry the literal directly under `arguments:`; multi-arg calls wrap
+  a `list_expression`. Patterns over call args need the alternation
+  (see mojo-events' `event_call`). The expects mechanism caught the
+  gap immediately — which is the §7 story working as intended.
+- **`package` is a Rhai reserved word** — `MatchContext.package` must
+  be read as `m["package"]`, same footgun family as `ctx["call"]`.
+
+Verification: full `cargo test` green (1312 unit + integration,
+including the 6 pre-existing mojo-events behavior tests, unchanged);
+gold harness against the pinned substrate — FAIL 0, XPASS 0, CRASH 0
+(DateTime rows dropped for a sandbox substrate artifact, unrelated);
+`--plugin-check frameworks/mojo-events.rhai` ok (its hook detection
+now counts `on_match`). e2e needs nvim, absent in the sandbox — CI
+covers it.
+
+Deliberately not spiked (unchanged design claims): deferred host
+predicates (`#receiver-isa?` → `ReceiverGated`), the `pairs` / `list`
+/ `isa` / `args` / `route_defaults` projections, per-language merged
+queries (the spike compiles one query per pattern spec), match
+telemetry, `--plugin-check` expects wiring, the topic-route replay,
+and the phase-4 pre-capture retirement.
+
+## 14. Open questions (deliberately deferred)
 
 - Per-pattern trigger overrides (`when:` on a `PatternSpec`) — wanted
   eventually (mojo-events' two-trigger split is really per-pattern),

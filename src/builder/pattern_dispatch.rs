@@ -1,0 +1,371 @@
+//! Post-walk query-pattern dispatch — SPIKE of `docs/prompt-plugin-queries.md`.
+//!
+//! Plugins declare their items of interest as tree-sitter queries
+//! (`FrameworkPlugin::patterns`); this driver runs them once per file
+//! after the live walk, gates each match by the plugin's triggers at
+//! the match site's package, computes the declared projections for
+//! actual matches only, and dispatches `on_match`. Emissions flow
+//! through the same `apply_emit_action` path as the emit hooks.
+//!
+//! Runs post-walk (scopes, package ranges, constant folds complete) but
+//! BEFORE the deferred `VarType` / named-sub-param flushes, so pattern
+//! emissions land in the same downstream machinery as hook emissions.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+use tree_sitter::{CaptureQuantifier, Node, Query, QueryCursor, StreamingIterator};
+
+use crate::file_analysis::Span;
+use crate::plugin::{self, CaptureData, CaptureValue, MatchContext, PatternSpec};
+
+use super::{node_to_span, Builder};
+
+/// Compile a pattern query once per unique source text, process-wide.
+/// `Query::new` is expensive; patterns are static per plugin load, so
+/// the leak is bounded (one per distinct pattern source). Compile
+/// errors are cached too — a broken pattern logs once per build, not
+/// once per match attempt.
+fn cached_pattern_query(source: &str) -> Result<&'static Query, String> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Result<&'static Query, String>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        source.hash(&mut h);
+        h.finish()
+    };
+    if let Some(q) = cache.lock().unwrap().get(&key) {
+        return q.clone();
+    }
+    let language: tree_sitter::Language = ts_parser_perl::LANGUAGE.into();
+    let compiled: Result<&'static Query, String> = Query::new(&language, source)
+        .map(|q| {
+            let leaked: &'static Query = Box::leak(Box::new(q));
+            leaked
+        })
+        .map_err(|e| e.to_string());
+    cache.lock().unwrap().insert(key, compiled.clone());
+    compiled
+}
+
+/// Verify a pattern's `expect` snippets against the real grammar:
+/// parse each snippet, run the query, assert the match count and any
+/// declared capture texts. This is the pattern author's guard against
+/// the query medium's silent-match-nothing failure mode (field names
+/// that print in the CST but don't match in the query engine, anchor
+/// subtleties, …). Driven by tests today; `--plugin-check` is the
+/// intended production home.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn verify_pattern_expects(spec: &PatternSpec) -> Result<(), String> {
+    if spec.language != "perl" {
+        return Ok(());
+    }
+    let query = cached_pattern_query(&spec.query)
+        .map_err(|e| format!("pattern `{}`: query compile failed: {}", spec.name, e))?;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .map_err(|e| e.to_string())?;
+    for ex in &spec.expect {
+        let tree = parser
+            .parse(&ex.src, None)
+            .ok_or_else(|| format!("pattern `{}` expect `{}`: parse failed", spec.name, ex.src))?;
+        let mut count = 0usize;
+        let mut texts: HashMap<String, String> = HashMap::new();
+        {
+            let mut cursor = QueryCursor::new();
+            let mut it = cursor.matches(query, tree.root_node(), ex.src.as_bytes());
+            while let Some(m) = it.next() {
+                count += 1;
+                for c in m.captures {
+                    let name = query.capture_names()[c.index as usize];
+                    texts.insert(
+                        name.to_string(),
+                        c.node.utf8_text(ex.src.as_bytes()).unwrap_or("").to_string(),
+                    );
+                }
+            }
+        }
+        if count != ex.matches {
+            return Err(format!(
+                "pattern `{}` expect `{}`: {} matches, expected {}",
+                spec.name, ex.src, count, ex.matches
+            ));
+        }
+        for (cap, want) in &ex.captures {
+            match texts.get(cap) {
+                Some(got) if got == want => {}
+                other => {
+                    return Err(format!(
+                        "pattern `{}` expect `{}`: capture @{} = {:?}, expected {:?}",
+                        spec.name, ex.src, cap, other, want
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Union of the match's capture spans — the match extent handed to the
+/// plugin. A pattern with a root capture (`… ) @call`) gets that node's
+/// span, since it encloses every other capture.
+fn union_span(caps: &[(u32, Node<'_>)]) -> Span {
+    let mut it = caps.iter().map(|(_, n)| node_to_span(*n));
+    let first = it.next().expect("non-empty capture list");
+    it.fold(first, |acc, s| Span {
+        start: acc.start.min(s.start),
+        end: acc.end.max(s.end),
+    })
+}
+
+impl<'a> Builder<'a> {
+    /// Innermost package at a point, from the walk's `package_ranges`
+    /// (latest-starting containing range wins — same rule as
+    /// `FileAnalysis::package_at`), defaulting to the implicit `main`
+    /// before any explicit package statement.
+    fn package_at_point(&self, point: tree_sitter::Point) -> String {
+        let mut best: Option<&crate::file_analysis::PackageRange> = None;
+        for r in &self.package_ranges {
+            if !crate::file_analysis::contains_point(&r.span, point) {
+                continue;
+            }
+            let win = match best {
+                None => true,
+                Some(prev) => {
+                    (r.span.start.row, r.span.start.column)
+                        > (prev.span.start.row, prev.span.start.column)
+                }
+            };
+            if win {
+                best = Some(r);
+            }
+        }
+        best.map(|r| r.package.clone())
+            .unwrap_or_else(|| "main".to_string())
+    }
+
+    /// Run every plugin's declared patterns over the tree and dispatch
+    /// matches. Fixed point over trigger gating: emissions can add
+    /// package parents / uses that make more gates true, so rounds
+    /// repeat until nothing new dispatches. Monotone gate inputs +
+    /// per-(plugin, pattern, span) dedup ⇒ termination; the cap is a
+    /// debug-only net, mirroring the worklist fold's discipline.
+    pub(super) fn dispatch_pattern_plugins(&mut self, root: Node<'a>) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        let plugins = self.plugins.clone();
+        let mut dispatched: HashSet<(String, String, Span)> = HashSet::new();
+        for round in 0..16 {
+            debug_assert!(round < 15, "pattern dispatch failed to reach a fixed point");
+            let mut progressed = false;
+            for p in plugins.all() {
+                for spec in p.patterns() {
+                    if spec.language != "perl" {
+                        continue;
+                    }
+                    let query = match cached_pattern_query(&spec.query) {
+                        Ok(q) => q,
+                        Err(e) => {
+                            log::error!(
+                                "plugin `{}` pattern `{}`: query compile failed: {}",
+                                p.id(),
+                                spec.name,
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    // Collect matches first: the cursor borrows the tree
+                    // immutably, the projection pass needs `&mut self`.
+                    // Text predicates (#eq?, #any-of?, …) are evaluated
+                    // by the query engine here, since `matches` gets the
+                    // source text; unknown predicate names pass through
+                    // unfiltered (the deferred-predicate reservation).
+                    let mut collected: Vec<(usize, Vec<(u32, Node<'a>)>)> = Vec::new();
+                    {
+                        let mut cursor = QueryCursor::new();
+                        let mut it = cursor.matches(query, root, self.source);
+                        while let Some(m) = it.next() {
+                            let caps: Vec<(u32, Node<'a>)> =
+                                m.captures.iter().map(|c| (c.index, c.node)).collect();
+                            if !caps.is_empty() {
+                                collected.push((m.pattern_index, caps));
+                            }
+                        }
+                    }
+                    for (pattern_index, caps) in collected {
+                        let mspan = union_span(&caps);
+                        let key = (p.id().to_string(), spec.name.clone(), mspan);
+                        if dispatched.contains(&key) {
+                            continue;
+                        }
+                        let pkg = self.package_at_point(mspan.start);
+                        let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
+                        let parents = self.transitive_parents(&pkg);
+                        let tq = plugin::TriggerQuery {
+                            package_uses: &uses,
+                            package_parents: &parents,
+                        };
+                        if !plugin::trigger_fires(p.triggers(), &tq) {
+                            continue;
+                        }
+                        dispatched.insert(key);
+                        progressed = true;
+                        // Projections that consult package-relative walk
+                        // state (constant folds via the current package,
+                        // `__PACKAGE__` receivers) see the match site's
+                        // package, exactly as the walk would have.
+                        let saved =
+                            std::mem::replace(&mut self.current_package, Some(pkg.clone()));
+                        let mctx = self.build_match_context(
+                            spec,
+                            query,
+                            pattern_index,
+                            &caps,
+                            mspan,
+                            pkg,
+                            uses,
+                            parents,
+                        );
+                        let actions = p.on_match(&spec.name, &mctx);
+                        // Emissions attach to the scope AND package open
+                        // at the match site — the same context a
+                        // walk-time hook emission would have gotten
+                        // (apply_emit_action stamps `current_package`
+                        // onto symbols, so it must still be the match
+                        // site's package here).
+                        let match_scope = self.scope_at_point(mspan.start);
+                        self.scope_stack.push(match_scope);
+                        for a in actions {
+                            self.apply_emit_action(p.id().to_string(), a);
+                        }
+                        self.scope_stack.pop();
+                        self.current_package = saved;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_match_context(
+        &mut self,
+        spec: &PatternSpec,
+        query: &Query,
+        pattern_index: usize,
+        caps: &[(u32, Node<'a>)],
+        span: Span,
+        package: String,
+        package_uses: Vec<String>,
+        package_parents: Vec<String>,
+    ) -> MatchContext {
+        let names = query.capture_names();
+        let quants = query.capture_quantifiers(pattern_index);
+        // Group nodes per capture index, preserving first-seen order.
+        let mut order: Vec<u32> = Vec::new();
+        let mut grouped: HashMap<u32, Vec<Node<'a>>> = HashMap::new();
+        for (idx, node) in caps {
+            if !grouped.contains_key(idx) {
+                order.push(*idx);
+            }
+            grouped.entry(*idx).or_default().push(*node);
+        }
+        let mut captures = HashMap::new();
+        for idx in order {
+            let nodes = &grouped[&idx];
+            let Some(name) = names.get(idx as usize) else {
+                continue;
+            };
+            let projections: &[String] = spec
+                .projections
+                .get(*name)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let datas: Vec<CaptureData> = nodes
+                .iter()
+                .map(|n| self.project_capture(*n, projections))
+                .collect();
+            let many = matches!(
+                quants.get(idx as usize),
+                Some(CaptureQuantifier::ZeroOrMore) | Some(CaptureQuantifier::OneOrMore)
+            );
+            let value = if many {
+                CaptureValue::Many(datas)
+            } else {
+                // Scalar position: last node wins (there is normally
+                // exactly one). An optional capture that didn't match
+                // simply isn't present in the map — Rhai reads `()`.
+                match datas.into_iter().next_back() {
+                    Some(d) => CaptureValue::One(Box::new(d)),
+                    None => continue,
+                }
+            };
+            captures.insert((*name).to_string(), value);
+        }
+        MatchContext {
+            pattern: spec.name.clone(),
+            span,
+            package: Some(package),
+            package_parents,
+            package_uses,
+            captures,
+        }
+    }
+
+    /// Compute the declared projections for one captured node. `text`
+    /// and `span` are free and always present; everything else routes
+    /// through the SAME extractors the emit-hook pre-capture uses
+    /// (`arg_info_for`, `invocant_type_at_node`) — laziness comes from
+    /// only being here for actual matches.
+    fn project_capture(&mut self, node: Node<'a>, projections: &[String]) -> CaptureData {
+        let wants = |k: &str| projections.iter().any(|p| p == k);
+        let mut data = CaptureData {
+            text: node.utf8_text(self.source).unwrap_or("").to_string(),
+            span: node_to_span(node),
+            string_value: None,
+            string_values: Vec::new(),
+            content_span: None,
+            inferred_type: None,
+            value_shape: None,
+            sub_params: Vec::new(),
+            callable_return_edge: None,
+        };
+        if wants("str")
+            || wants("strs")
+            || wants("content_span")
+            || wants("sub_params")
+            || wants("callable_edge")
+            || wants("shape")
+        {
+            let ai = self.arg_info_for(node);
+            if wants("str") {
+                data.string_value = ai.string_value;
+            }
+            if wants("strs") {
+                data.string_values = ai.string_values;
+            }
+            if wants("content_span") {
+                data.content_span = ai.content_span;
+            }
+            if wants("sub_params") {
+                data.sub_params = ai.sub_params;
+            }
+            if wants("callable_edge") {
+                data.callable_return_edge = ai.callable_return_edge;
+            }
+            if wants("shape") {
+                data.value_shape = Some(ai.value_shape);
+            }
+        }
+        if wants("ty") {
+            data.inferred_type = self.invocant_type_at_node(node);
+        }
+        data
+    }
+}
