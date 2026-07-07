@@ -36,6 +36,8 @@ pub fn spawn_resolver(
     workspace_root: Arc<WorkspaceRootChannel>,
     client: Client,
     on_resolved: OnResolved,
+    long_lived: Arc<std::sync::atomic::AtomicBool>,
+    bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
 ) {
     let handle = tokio::runtime::Handle::current();
 
@@ -90,6 +92,11 @@ pub fn spawn_resolver(
                 }
                 // Build reverse index from warmed cache.
                 rebuild_reverse_index(&cache, &edges);
+                if long_lived.load(std::sync::atomic::Ordering::Relaxed)
+                    && eviction_enabled()
+                {
+                    strip_warm_import_copies(&cache);
+                }
             }
 
             // Track which extract version each module was resolved at.
@@ -182,8 +189,26 @@ pub fn spawn_resolver(
                     let stored =
                         strip_import_copy(&result, persisted, eviction_enabled());
                     // The memo would otherwise pin the WHOLE closure for the
-                    // thread's lifetime — a second copy of the tier.
-                    parse_memo.insert(module_name.clone(), stored.clone());
+                    // thread's lifetime — a second copy of the tier. Failed
+                    // resolves are NOT memoized (pre-existing semantics: the
+                    // parent-fallback re-probes, catching mid-session
+                    // installs).
+                    match &stored {
+                        Some(_) => {
+                            parse_memo.insert(module_name.clone(), stored.clone());
+                        }
+                        None => {
+                            parse_memo.remove(&module_name);
+                        }
+                    }
+                    // Stale-pin clear BEFORE the new copy is reachable — a
+                    // re-resolve replaced the blob; a query racing this
+                    // insert must not rehydrate the prior generation.
+                    if let Some(ref m) = stored {
+                        if let Some(bc) = bag_cache.read().ok().and_then(|g| g.clone()) {
+                            bc.invalidate(&m.path);
+                        }
+                    }
                     insert_into_cache(&cache, &edges, &module_name, stored);
 
                     // Descend into the module's own dependencies so the
@@ -417,6 +442,28 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 }
 
 /// Insert a resolved module into the cache and update the edge indexes.
+/// The warm twin of `strip_import_copy`: warm_cache loads whole @INC
+/// copies (the blob just decoded IS the recoverable generation); in a
+/// long-lived process the sweep re-registers them bag-stripped so warm
+/// sessions get the residency win too. One-shot CLI processes skip it —
+/// the rehydration cost never amortizes there.
+fn strip_warm_import_copies(cache: &DashMap<String, Option<Arc<CachedModule>>>) {
+    let names: Vec<String> = cache.iter().map(|e| e.key().clone()).collect();
+    for name in names {
+        if let Some(mut entry) = cache.get_mut(&name) {
+            let replacement = match entry.value() {
+                Some(m) if !m.analysis.bag_is_evicted() && !m.analysis.degraded => {
+                    let mut fa = (*m.analysis).clone();
+                    fa.evict_axes(true, false);
+                    Some(Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa))))
+                }
+                _ => continue,
+            };
+            *entry.value_mut() = replacement;
+        }
+    }
+}
+
 /// The @INC tier's registration-owned strip: once the blob is persisted,
 /// the resident copy drops its witness bag (the dominant share of a CPAN
 /// module's payload; `bag_present` rehydrates through the hub's LRU).

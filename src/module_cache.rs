@@ -675,7 +675,12 @@ pub fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
 pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
     let blob: Vec<u8> = conn
         .query_row(
-            "SELECT analysis FROM modules WHERE path = ?1",
+            // A dual-homed project-lib file has TWO rows for one path
+            // (name-keyed import + path-keyed workspace); the workspace
+            // generation is the one the watcher/indexer keeps fresh, so it
+            // wins deterministically instead of by scan order.
+            "SELECT analysis FROM modules WHERE path = ?1 \
+             ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END LIMIT 1",
             params![path],
             |row| row.get::<_, Option<Vec<u8>>>(0),
         )
@@ -1411,8 +1416,13 @@ pub fn warm_cache(
             row_extract_version,
         ) {
             // Negative sentinel: empty path + NULL blob — a remembered miss.
+            // Never over a Some: the workspace indexer may have registered
+            // this name concurrently (the insert_into_cache guard's warm
+            // twin — a clobber here answers "no such module" all session).
             RowGeneration::Sentinel => {
-                cache.insert(module_name, None);
+                if !matches!(cache.get(&module_name).as_deref(), Some(Some(_))) {
+                    cache.insert(module_name, None);
+                }
                 count += 1;
                 continue;
             }
@@ -1448,8 +1458,11 @@ pub fn warm_cache(
                 }
             }
             _ => {
-                // Blob missing / empty — treat as negative sentinel.
-                cache.insert(module_name, None);
+                // Blob missing / empty — treat as negative sentinel (same
+                // None-over-Some guard as above).
+                if !matches!(cache.get(&module_name).as_deref(), Some(Some(_))) {
+                    cache.insert(module_name, None);
+                }
                 count += 1;
             }
         }

@@ -394,6 +394,14 @@ pub struct ModuleIndex {
     /// registration front door.
     registration_gen: Arc<DashMap<std::path::PathBuf, u64>>,
     gen_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// The witness seams' fallback-on-miss enriched retries only pay off
+    /// when the process lives long enough to amortize the overlay (each
+    /// miss is a whole-analysis deep copy + enrich). Off by default; the
+    /// SERVER enables it at initialize. One-shot CLI query modes leave it
+    /// off — the bisected cost was 2x warm-gold wall for answers no
+    /// one-shot invocation reuses. (`--check`/`--dump-package` consume
+    /// `enriched_snapshot` directly and are unaffected by this gate.)
+    long_lived: Arc<std::sync::atomic::AtomicBool>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
@@ -407,7 +415,7 @@ pub struct ModuleIndex {
     /// resident pack `FileAnalysis` has its witness bag evicted; a type query
     /// reaching into an evicted file rehydrates the exact persisted bag through
     /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
-    bag_cache: std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
+    bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
     /// Read-connection opener for the relational ref index
     /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
     /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
@@ -451,6 +459,10 @@ impl ModuleIndex {
 
         let refresh = Arc::new(on_diagnostics_refresh);
         let refresh_clone = Arc::clone(&refresh);
+        let long_lived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bag_cache: Arc<
+            std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
+        > = Arc::new(std::sync::RwLock::new(None));
 
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
@@ -463,6 +475,8 @@ impl ModuleIndex {
             Arc::clone(&workspace_root),
             client,
             Box::new(move || refresh_clone()),
+            Arc::clone(&long_lived),
+            Arc::clone(&bag_cache),
         );
 
         ModuleIndex {
@@ -477,8 +491,9 @@ impl ModuleIndex {
             enriched: Arc::new(DashMap::new()),
             registration_gen: Arc::new(DashMap::new()),
             gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            long_lived,
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
-            bag_cache: std::sync::RwLock::new(None),
+            bag_cache,
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -860,8 +875,9 @@ impl ModuleIndex {
             enriched: Arc::new(DashMap::new()),
             registration_gen: Arc::new(DashMap::new()),
             gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
-            bag_cache: std::sync::RwLock::new(None),
+            bag_cache: Arc::new(std::sync::RwLock::new(None)),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -874,6 +890,16 @@ impl ModuleIndex {
             workspace_root,
             refresh_diagnostics: Arc::new(|| {}),
         }
+    }
+
+    /// Mark this process LONG-LIVED (the server): the witness seams'
+    /// enriched retries turn on (the overlay amortizes them; one-shot CLI
+    /// modes never recoup the deep-copies — bisected at 2x warm-harness
+    /// wall), and the resolver strips warm-loaded @INC copies (their
+    /// rehydration cost amortizes the same way).
+    pub fn mark_long_lived(&self) {
+        self.long_lived
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ---- Test-only methods ----
@@ -909,7 +935,7 @@ impl ModuleIndex {
             Arc::clone(&workspace_root),
         );
 
-        ModuleIndex {
+        let idx = ModuleIndex {
             cache,
             edges,
             loaded_modules: Arc::new(DashMap::new()),
@@ -921,8 +947,9 @@ impl ModuleIndex {
             enriched: Arc::new(DashMap::new()),
             registration_gen: Arc::new(DashMap::new()),
             gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
-            bag_cache: std::sync::RwLock::new(None),
+            bag_cache: Arc::new(std::sync::RwLock::new(None)),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -934,7 +961,11 @@ impl ModuleIndex {
             resolved,
             workspace_root,
             refresh_diagnostics: Arc::new(|| {}),
-        }
+        };
+        // Unit nets exercise the seams' retries; production defaults OFF
+        // (the server enables at initialize).
+        idx.mark_long_lived();
+        idx
     }
 
     /// Test-only: seed the builtins map directly (bypasses SQLite +
@@ -2096,6 +2127,9 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn enriched_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if !self.long_lived.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.bag_present(cached);
+        }
         self.enriched_snapshot(cached)
             .unwrap_or_else(|| self.bag_present(cached))
     }

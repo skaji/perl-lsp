@@ -1216,6 +1216,11 @@ impl LanguageServer for Backend {
                     .and_then(|f| f.first())
                     .map(|f| f.uri.as_str())
             });
+        // Long-lived process: the overlay + rehydration LRU amortize here
+        // (one-shot CLI modes leave both off — bisected at 2x warm-harness
+        // wall). BEFORE set_workspace_root: the resolver wakes on the root
+        // and reads the flag at warm time.
+        self.module_index.mark_long_lived();
         self.module_index.set_workspace_root(root);
         // Same root drives repo-local `.perl-lsp/` plugin discovery, so the
         // plugin set and the per-project cache key can't disagree.
