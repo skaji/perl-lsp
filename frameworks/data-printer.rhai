@@ -36,6 +36,64 @@
 
 fn id() { "data-printer" }
 
+// ---- Debug-left-in lint (pluggable diagnostics via patterns)
+//
+// A `p $x` / `np(...)` call is a DEV-time inspection aid; one left in
+// committed code prints to STDERR in production. The pattern selects
+// every p/np call site; on_match gates on the file actually importing
+// Data::Printer/DDP (the plugin's trigger is `Always` for the
+// completion hook, so the gate lives here) and emits an info-severity
+// diagnostic through `EmitAction::Diagnostic` — the same emission
+// pipeline as symbols/refs, rendered by `collect_diagnostics` with
+// this plugin's id as the source.
+fn patterns() {
+    [
+        #{
+            name: "debug_call",
+            query: `
+([
+  (function_call_expression
+    function: (_) @fname
+    arguments: (_)) @call
+  (ambiguous_function_call_expression
+    function: (_) @fname
+    arguments: (_)) @call
+]
+(#any-of? @fname "p" "np"))
+`,
+            projections: #{},
+            expect: [
+                #{ src: "p $x;", matches: 1, captures: #{ fname: "p" } },
+                #{ src: "np($data);", matches: 1 },
+                #{ src: "print $x;", matches: 0 },
+                #{ src: "$obj->p($x);", matches: 0 },
+            ],
+        },
+    ]
+}
+
+fn uses_ddp(m) {
+    for u in m.package_uses {
+        if u == "DDP" || u == "Data::Printer" { return true; }
+    }
+    false
+}
+
+fn on_match(pattern, m) {
+    let out = [];
+    if !uses_ddp(m) { return out; }
+    let verb = m.captures.fname.text;
+    out += #{
+        Diagnostic: #{
+            message: "Data::Printer debug call (`" + verb + "`) left in code",
+            span: m.span,
+            severity: "info",
+            code: "ddp-debug-left",
+        }
+    };
+    out
+}
+
 // `Always` so the plugin appears in `applicable()` for every
 // completion query — `on_completion` then filters internally on
 // `ctx.current_use_module`. (`on_use` separately bypasses the

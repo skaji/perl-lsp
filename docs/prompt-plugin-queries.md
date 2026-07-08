@@ -744,10 +744,83 @@ topic-stack replay. Once it moves, `dispatch_method_call_plugins` /
 pre-capture, and the dead `arg_name_verbs` machinery all delete
 (phase 4).
 
-Deliberately not spiked (unchanged design claims): the `pairs` /
-`route_defaults` projections, per-language merged queries (the spike
-compiles one query per pattern spec), the topic-route replay + the
-post-fold dispatch round, and the phase-4 pre-capture retirement.
+### Round 7: phase 3 landed — 9 of 9, zero legacy call hooks
+
+The fold-phase machinery is real and the last arm moved:
+
+- **`PatternSpec.phase: "walk" | "fold"`.** Fold patterns dispatch
+  after the worklist fold's PostFold pass — chain typing settled, so
+  projections read fold-derived state. The fold round's contract
+  differs from the walk round deliberately: matches from all fold
+  patterns dispatch in DOCUMENT order (earlier matches' emissions feed
+  later matches' projections), and there is no gating fixed point
+  (fold emissions don't grow trigger inputs today).
+- **The topic-route replay.** The walk records group-scope spans
+  (`topic_group_spans`); the fold round replays the base stack in span
+  order — a base set inside a `group { }` restores at the group's end,
+  exactly the walk-stack semantics. `SetRouteBase` emissions from
+  fold-phase matches update the REPLAY base (the driver intercepts
+  them; the walk stack is stale by then).
+- **`route_defaults` + `call_name` projections.** `route_defaults`
+  flattens the fold-settled `BrandedRoute` brand and falls back to the
+  replayed topic base for topic-DSL verb-call receivers — the same two
+  sources the legacy `CallContext` fill had, now split correctly
+  across fold state and replay state. `call_name` is
+  `invocant_call_name` behind a capture name (the `under` check).
+- **`mojo-routes`' `->to(...)` arm ported** as the one fold-phase
+  pattern. The dedicated pinning test
+  (`lite_group_under_route_inheritance`: under → group → partial-`to`
+  inheritance with correct group-frame restore) passed on the first
+  full-suite run, as did the gold harness over real Mojolicious.
+- **End state: NO bundled plugin defines `on_function_call` or
+  `on_method_call`.** The legacy dispatchers, `base_call_context`'s
+  eager pre-capture, `emit_partial_route_targets`' re-dispatch, and
+  the `arg_name_verbs` machinery are now exercised by nothing bundled
+  — phase 4 is pure deletion plus the timings comparison.
+
+Fold-phase caveat recorded: the deferred `VarType` / named-sub-param
+flushes run long before the fold round, so fold patterns must not emit
+those actions (walk-phase patterns keep them).
+
+### Round 7b: pluggable diagnostics — the same seam, a new verb
+
+Diagnostics turned out to be a *small* extension, which is itself the
+finding — the capture/decide/emit split already carries them:
+
+- **`EmitAction::Diagnostic { message, span, severity, code }`.** The
+  plugin id is stamped on at application and surfaces as the LSP
+  diagnostic source (`perl-lsp/<plugin>`). Severity is an open string
+  (`error`/`warning`/`info`, anything else renders HINT) — the
+  vocabulary is the plugin's, core maps at render time only.
+- **`FileAnalysis.plugin_diagnostics`** (serde-default, rides the
+  cache blob — workspace `--check` sees plugin lints on cached files;
+  `EXTRACT_VERSION` bumped). `collect_diagnostics` renders them
+  alongside the native channels; no publish-path special-casing.
+- **Demo: the data-printer debug-left-in lint.** A pattern selects
+  every `p`/`np` call; `on_match` gates on the file importing
+  DDP/Data::Printer (the plugin's trigger is `Always` for its
+  completion hook, so the import check is plugin logic — exactly the
+  ring-3 division) and emits `info[ddp-debug-left]`. Live:
+
+  ```
+  demo.pl:3:1: info[ddp-debug-left] Data::Printer debug call (`p`) left in code
+  ```
+
+  (`--check`'s default `--severity warning` filter hides info-level
+  lints, as it should — `--severity hint` surfaces them.)
+- Tests pin the emission end-to-end (two lints for two calls, none
+  for `print`, none without the DDP import) and the render half
+  (source + severity mapping through `collect_diagnostics`).
+
+Design note for the production round: a diagnostics-flavored pattern
+wants the same `expect` discipline, and per-code opt-in/opt-out should
+join the `DiagnosticOptions` schema rather than growing a parallel
+config surface (`docs/prompt-config-schema.md`).
+
+Deliberately not spiked (unchanged design claims): the `pairs`
+projection, per-language merged queries (the spike compiles one query
+per pattern spec), and the phase-4 deletion of the legacy dispatch
+machinery.
 
 ## 14. Open questions (deliberately deferred)
 

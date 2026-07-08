@@ -957,6 +957,8 @@ mod tests {
             args: Vec::new(),
             isa: None,
             ref_sub_name: None,
+            call_name: None,
+            route_defaults: Vec::new(),
         }
     }
 

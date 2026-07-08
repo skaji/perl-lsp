@@ -627,6 +627,22 @@ pub enum ScopeKind {
 
 // ---- Package context ----
 
+/// One plugin-emitted diagnostic — the payload of
+/// `EmitAction::Diagnostic`, stamped with the emitting plugin's id.
+/// `severity` is an open string (`"error"` / `"warning"` / `"info"` /
+/// anything else renders as hint) — the vocabulary is the plugin's,
+/// core only maps it to the LSP enum at render time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDiagnostic {
+    pub message: String,
+    pub span: Span,
+    pub severity: String,
+    /// Diagnostic code shown in the editor (e.g. `"ddp-debug-left"`).
+    pub code: String,
+    /// Emitting plugin id — surfaced as the diagnostic source.
+    pub plugin_id: String,
+}
+
 /// Flat per-file record of which `package`/`class` declaration governs a
 /// byte range. Independent of the lexical scope tree — `package Foo;` is
 /// not a lexical boundary in Perl, so collapsing the two concepts would
@@ -3376,6 +3392,13 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub package_ranges: Vec<PackageRange>,
 
+    /// Plugin-emitted diagnostics (`EmitAction::Diagnostic` from a
+    /// pattern's `on_match`). `collect_diagnostics` converts them to
+    /// LSP diagnostics alongside the native channels; provenance rides
+    /// on `plugin_id` (surfaced as the diagnostic source).
+    #[serde(default)]
+    pub plugin_diagnostics: Vec<PluginDiagnostic>,
+
     /// The language's method-RECEIVER param names (Python `self`/`cls`),
     /// from the LangPack. A receiver is lexically inside the class so the
     /// sticky context tags it, but it is NOT a member — member completion
@@ -3732,6 +3755,7 @@ pub struct FileAnalysisParts {
     pub package_uses: HashMap<String, Vec<String>>,
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
     pub package_ranges: Vec<PackageRange>,
+    pub plugin_diagnostics: Vec<PluginDiagnostic>,
     pub app_surface_consumers: Vec<String>,
     pub witnesses: crate::witnesses::WitnessBag,
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
@@ -3920,6 +3944,7 @@ impl FileAnalysis {
             package_uses,
             type_provenance,
             package_ranges,
+            plugin_diagnostics,
             app_surface_consumers,
             mut witnesses,
             package_framework,
@@ -3957,6 +3982,7 @@ impl FileAnalysis {
             call_bindings,
             method_call_bindings,
             package_ranges,
+            plugin_diagnostics,
             package_parents,
             app_surface_consumers,
             package_uses,

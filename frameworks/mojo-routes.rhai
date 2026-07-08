@@ -308,13 +308,16 @@ fn emit_route_name(m, name, span) {
 }
 
 // Read the inherited controller from the receiver's route brand.
-// The builder flattens `InferredType::BrandedRoute` into
-// `ctx.receiver_route_defaults` as `[[key, value], ...]`; `controller`
-// is the distinguished key. `()` when the receiver carries no brand
+// The `route_defaults` projection flattens the fold-settled
+// `InferredType::BrandedRoute` into `[[key, value], ...]` (plus the
+// replayed topic base for lite verb-call receivers); `controller` is
+// the distinguished key. `()` when the receiver carries no brand
 // (plain `ClassName(Route)` root, or non-route receiver) — partials on
 // an unbranded receiver degrade quietly (no controller, no emission).
-fn inherited_controller(ctx) {
-    let defs = ctx.receiver_route_defaults;
+fn inherited_controller(m) {
+    let recv = m.captures.recv;
+    if recv == () { return (); }
+    let defs = recv.route_defaults;
     if defs == () { return (); }
     for pair in defs {
         if pair[0] == "controller" { return pair[1]; }
@@ -350,14 +353,35 @@ fn route_keyvals(args, start) {
     #{ controller: controller, action: action, action_span: action_span }
 }
 
-// The `plugin` / `name` method arms live on the pattern seam; ONLY the
-// `->to(...)` arm stays on the legacy hook below — it reads the
-// receiver's route BRAND (`receiver_route_defaults`, fold-derived) and
-// participates in the post-fold re-dispatch, which the pattern
-// dispatcher doesn't model yet (phase 3: post-fold dispatch round +
-// `route_defaults` projection + topic-stack replay).
+// All three arms live on the pattern seam. `plugin` / `name` are
+// walk-phase; `to_route` is FOLD-phase — its `route_defaults`
+// projection reads the receiver's route BRAND, which only settles
+// after chain typing, and its `SetRouteBase` emissions feed the
+// replayed topic-route base that later matches' projections read
+// (document-order dispatch is the fold phase's contract).
 fn patterns() {
     [
+        #{
+            name: "to_route",
+            phase: "fold",
+            query: `
+(method_call_expression
+  invocant: (_) @recv
+  method: (_) @verb (#eq? @verb "to")
+  arguments: (_) @args
+) @call
+`,
+            projections: #{
+                recv: ["route_defaults", "call_name"],
+                args: ["args"],
+            },
+            expect: [
+                #{ src: "$r->get('/users')->to('users#list');", matches: 1 },
+                #{ src: "get('/x')->to('#partial');", matches: 1 },
+                #{ src: "$r->to(controller => 'Users', action => 'list');", matches: 1 },
+                #{ src: "$r->to;", matches: 0 },
+            ],
+        },
         // `$app->plugin('Thing')` — the OO spelling of the lite
         // `plugin` verb; same register-anchored resolution (mojo-lite
         // owns the bare-DSL spelling).
@@ -414,6 +438,8 @@ fn patterns() {
 fn on_match(pattern, m) {
     let out = [];
 
+    if pattern == "to_route" { return to_route_emissions(m); }
+
     if pattern == "plugin_load" {
         let name_cap = m.captures.name;
         if name_cap == () { return out; }
@@ -463,12 +489,12 @@ fn on_match(pattern, m) {
     emit_route_name(m, name, inner_span)
 }
 
-fn on_method_call(ctx) {
+fn to_route_emissions(m) {
     let out = [];
 
-    if ctx.method_name != "to" { return out; }
-
-    let args = ctx.args;
+    let args_cap = m.captures.args;
+    if args_cap == () { return out; }
+    let args = args_cap.args;
     if args.len() < 1 { return out; }
 
     // Short form: `'Controller#action'`. Narrow the MethodCallRef span
@@ -498,7 +524,7 @@ fn on_method_call(ctx) {
             // it off `receiver_route_defaults`. `route_emissions`
             // still early-returns if BOTH stay empty (unresolvable).
             if controller == "" {
-                let inh = inherited_controller(ctx);
+                let inh = inherited_controller(m);
                 if inh != () { controller = inh; }
             }
             let base = args[0].content_span;
@@ -521,11 +547,11 @@ fn on_method_call(ctx) {
                     }
                     if kv.controller != () { controller = kv.controller; }
                 }
-                let ems = route_emissions(controller, action, action_span, ctx.current_package);
+                let ems = route_emissions(controller, action, action_span, m["package"]);
                 // Lite `under(...)->to('ctrl#…')` also WRITES the topic
                 // base following sibling routes inherit. The receiver's
                 // call name is a generic core fact; "under" is ours.
-                if ctx.receiver_call_name == "under" && controller != "" {
+                if m.captures.recv.call_name == "under" && controller != "" {
                     ems += #{ "SetRouteBase": #{ "controller": controller } };
                 }
                 return ems;
@@ -542,10 +568,10 @@ fn on_method_call(ctx) {
         // Same inheritance as the short form: a long-form target with
         // an `action` but no `controller` reads the inherited one.
         if controller == "" {
-            let inh = inherited_controller(ctx);
+            let inh = inherited_controller(m);
             if inh != () { controller = inh; }
         }
-        return route_emissions(controller, kv.action, kv.action_span, ctx.current_package);
+        return route_emissions(controller, kv.action, kv.action_span, m["package"]);
     }
 
     out

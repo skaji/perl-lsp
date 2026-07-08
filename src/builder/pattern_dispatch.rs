@@ -229,7 +229,7 @@ impl<'a> Builder<'a> {
             let mut progressed = false;
             for p in plugins.all() {
                 for spec in p.patterns() {
-                    if spec.language != "perl" {
+                    if spec.language != "perl" || spec.phase != "walk" {
                         continue;
                     }
                     let query = match cached_pattern_query(&spec.query) {
@@ -307,6 +307,7 @@ impl<'a> Builder<'a> {
                             pkg,
                             uses,
                             parents,
+                            None,
                         );
                         let actions = p.on_match(&spec.name, &mctx);
                         // A #receiver-isa? gate defers DispatchCall
@@ -372,6 +373,186 @@ impl<'a> Builder<'a> {
         }
     }
 
+
+    /// Fold-phase dispatch: patterns declared `phase: "fold"` run after
+    /// the worklist fold's PostFold pass, when chain typing has settled
+    /// (route brands, resolved invocants). Differences from the walk
+    /// phase, all deliberate:
+    ///
+    ///   - Matches from ALL fold patterns dispatch in DOCUMENT order,
+    ///     because `SetRouteBase` emissions from earlier matches feed
+    ///     later matches' `route_defaults` projections.
+    ///   - The topic-route base is REPLAYED: the walk recorded group
+    ///     scopes (`topic_group_spans`); a base set inside a group
+    ///     restores when the replay passes the group's end — same
+    ///     semantics the walk's `lite_brand` stack had.
+    ///   - `SetRouteBase` emissions update the replay base instead of
+    ///     the (stale) walk stack.
+    ///   - Single pass, no gating fixed point: fold emissions don't
+    ///     grow trigger inputs today. Revisit if one ever does.
+    ///
+    /// The deferred `VarType` / named-sub-param flushes ran long before
+    /// this phase — fold patterns must not emit those actions.
+    pub(super) fn dispatch_pattern_plugins_fold(&mut self, root: Node<'a>) {
+        if self.plugins.is_empty() {
+            return;
+        }
+        let plugins = self.plugins.clone();
+        type Collected<'p, 'a> = (
+            &'p dyn plugin::FrameworkPlugin,
+            &'p PatternSpec,
+            &'static Query,
+            usize,
+            Vec<(u32, Node<'a>)>,
+            Span,
+        );
+        let mut collected: Vec<Collected<'_, 'a>> = Vec::new();
+        for p in plugins.all() {
+            for spec in p.patterns() {
+                if spec.language != "perl" || spec.phase != "fold" {
+                    continue;
+                }
+                let query = match cached_pattern_query(&spec.query) {
+                    Ok(q) => q,
+                    Err(e) => {
+                        log::error!(
+                            "plugin `{}` pattern `{}`: query compile failed: {}",
+                            p.id(),
+                            spec.name,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let mut count = 0usize;
+                {
+                    let mut cursor = QueryCursor::new();
+                    let mut it = cursor.matches(query, root, self.source);
+                    while let Some(m) = it.next() {
+                        let caps: Vec<(u32, Node<'a>)> =
+                            m.captures.iter().map(|c| (c.index, c.node)).collect();
+                        if !caps.is_empty() {
+                            let span = union_span(&caps);
+                            collected.push((p, spec, query, m.pattern_index, caps, span));
+                            count += 1;
+                        }
+                    }
+                }
+                crate::timings::record_pattern_matches(p.id(), &spec.name, count);
+            }
+        }
+        collected.sort_by_key(|(_, _, _, _, _, s)| (s.start.row, s.start.column));
+
+        let groups = self.topic_group_spans.clone();
+        let mut gi = 0usize;
+        let mut base_stack: Vec<(Span, Option<String>)> = Vec::new();
+        let mut current_base: Option<String> = None;
+        let mut dispatched: HashSet<(String, String, Span)> = HashSet::new();
+
+        for (p, spec, query, pattern_index, caps, mspan) in collected {
+            let point = mspan.start;
+            // Leave group frames the replay has passed (inner frames
+            // sit on top, so inner-first restore order is automatic).
+            while let Some((gspan, _)) = base_stack.last() {
+                if (point.row, point.column) > (gspan.end.row, gspan.end.column) {
+                    let (_, saved) = base_stack.pop().expect("checked non-empty");
+                    current_base = saved;
+                } else {
+                    break;
+                }
+            }
+            // Enter group frames that contain this match.
+            while gi < groups.len() {
+                let g = groups[gi];
+                if (g.start.row, g.start.column) > (point.row, point.column) {
+                    break;
+                }
+                if crate::file_analysis::contains_point(&g, point) {
+                    base_stack.push((g, current_base.clone()));
+                }
+                gi += 1;
+            }
+
+            let key = (p.id().to_string(), spec.name.clone(), mspan);
+            if dispatched.contains(&key) {
+                continue;
+            }
+            let pkg = self.package_at_point(point);
+            let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
+            let parents = self.transitive_parents(&pkg);
+            let tq = plugin::TriggerQuery {
+                package_uses: &uses,
+                package_parents: &parents,
+            };
+            if !plugin::trigger_fires(p.triggers(), &tq) {
+                continue;
+            }
+            dispatched.insert(key);
+            crate::timings::record_pattern_dispatch(p.id(), &spec.name);
+
+            let saved = std::mem::replace(&mut self.current_package, Some(pkg.clone()));
+            let mctx = self.build_match_context(
+                spec,
+                query,
+                pattern_index,
+                &caps,
+                mspan,
+                pkg,
+                uses,
+                parents,
+                current_base.as_deref(),
+            );
+            let actions = p.on_match(&spec.name, &mctx);
+            let gate = receiver_gate_for(query, pattern_index);
+            let receiver_hint = gate.as_ref().and_then(|g| {
+                let node = caps
+                    .iter()
+                    .find(|(ix, _)| *ix == g.capture_index)
+                    .map(|(_, n)| *n)?;
+                match self.invocant_type_at_node(node) {
+                    Some(InferredType::ClassName(c)) => Some(c),
+                    _ => None,
+                }
+            });
+            let match_scope = self.scope_at_point(mspan.start);
+            self.scope_stack.push(match_scope);
+            for a in actions {
+                if let plugin::EmitAction::SetRouteBase { controller } = &a {
+                    current_base = Some(controller.clone());
+                    continue;
+                }
+                if let (
+                    Some(g),
+                    plugin::EmitAction::DispatchCall {
+                        name,
+                        dispatcher,
+                        owner,
+                        span,
+                        ..
+                    },
+                ) = (&gate, &a)
+                {
+                    let HandlerOwner::Class(owner_class) = owner;
+                    self.provisional_dispatches.push(ReceiverGated::new(
+                        g.target_class.clone(),
+                        DispatchCandidate {
+                            name: name.clone(),
+                            span: *span,
+                            dispatcher: dispatcher.clone(),
+                            owner_class: owner_class.clone(),
+                            receiver_class: receiver_hint.clone(),
+                            call_span: mspan,
+                        },
+                    ));
+                    continue;
+                }
+                self.apply_emit_action(p.id().to_string(), a);
+            }
+            self.scope_stack.pop();
+            self.current_package = saved;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_match_context(
         &mut self,
@@ -383,6 +564,7 @@ impl<'a> Builder<'a> {
         package: String,
         package_uses: Vec<String>,
         package_parents: Vec<String>,
+        topic_base: Option<&str>,
     ) -> MatchContext {
         let names = query.capture_names();
         let quants = query.capture_quantifiers(pattern_index);
@@ -408,7 +590,7 @@ impl<'a> Builder<'a> {
                 .unwrap_or(&[]);
             let datas: Vec<CaptureData> = nodes
                 .iter()
-                .map(|n| self.project_capture(*n, projections))
+                .map(|n| self.project_capture(*n, projections, topic_base))
                 .collect();
             let many = matches!(
                 quants.get(idx as usize),
@@ -442,7 +624,12 @@ impl<'a> Builder<'a> {
     /// through the SAME extractors the emit-hook pre-capture uses
     /// (`arg_info_for`, `invocant_type_at_node`) — laziness comes from
     /// only being here for actual matches.
-    fn project_capture(&mut self, node: Node<'a>, projections: &[String]) -> CaptureData {
+    fn project_capture(
+        &mut self,
+        node: Node<'a>,
+        projections: &[String],
+        topic_base: Option<&str>,
+    ) -> CaptureData {
         let wants = |k: &str| projections.iter().any(|p| p == k);
         let mut data = CaptureData {
             text: node.utf8_text(self.source).unwrap_or("").to_string(),
@@ -459,6 +646,8 @@ impl<'a> Builder<'a> {
             args: Vec::new(),
             isa: None,
             ref_sub_name: None,
+            call_name: None,
+            route_defaults: Vec::new(),
         };
         if wants("str")
             || wants("strs")
@@ -503,6 +692,37 @@ impl<'a> Builder<'a> {
         }
         if wants("isa") {
             data.isa = self.isa_type_in_option_tail(node);
+        }
+        if wants("call_name") {
+            data.call_name = self.invocant_call_name(node);
+        }
+        if wants("route_defaults") {
+            // Same flattening as the legacy CallContext fill: the
+            // fold-settled brand's stash + controller, then — for a
+            // topic-DSL verb CALL receiver still missing a controller
+            // — the replayed topic base (`under(...)->to('ctrl#')`'s
+            // SetRouteBase, scoped by group frames).
+            let mut defaults: Vec<(String, String)> = Vec::new();
+            if let Some(InferredType::BrandedRoute { controller, stash, .. }) =
+                self.invocant_type_at_node(node)
+            {
+                defaults = stash;
+                if let Some(c) = controller {
+                    defaults.push(("controller".to_string(), c));
+                }
+            }
+            if defaults.iter().all(|(k, _)| k != "controller") {
+                if let (Some(dsl), Some(callee)) =
+                    (self.active_topic_dsl(), self.invocant_call_name(node))
+                {
+                    if dsl.verbs.iter().any(|v| *v == callee) {
+                        if let Some(c) = topic_base {
+                            defaults.push(("controller".to_string(), c.to_string()));
+                        }
+                    }
+                }
+            }
+            data.route_defaults = defaults;
         }
         if wants("is_package_receiver") {
             // Same rule as the emit-hook path's `is_pkg_call`:

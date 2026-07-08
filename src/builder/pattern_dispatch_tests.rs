@@ -57,6 +57,7 @@ impl BridgePlugin {
             patterns: vec![PatternSpec {
                 name: "make".into(),
                 language: "perl".into(),
+                phase: "walk".into(),
                 query: r#"
                     (method_call_expression
                       method: (_) @verb (#eq? @verb "make_widget")
@@ -102,6 +103,7 @@ impl WidgetPlugin {
             patterns: vec![PatternSpec {
                 name: "finish".into(),
                 language: "perl".into(),
+                phase: "walk".into(),
                 query: r#"
                     (method_call_expression
                       method: (_) @verb (#eq? @verb "finish_widget")
@@ -241,6 +243,60 @@ fn resultddl_pattern_synthesizes_accessors_end_to_end() {
     );
 }
 
+/// Pluggable diagnostics: a pattern selects the sites, on_match
+/// decides, `EmitAction::Diagnostic` rides `FileAnalysis` into the
+/// publish path. The data-printer debug-left-in lint is the demo.
+#[test]
+fn plugin_diagnostic_lint_end_to_end() {
+    let fa = build_fa("use DDP;\nmy $x = { a => 1 };\np $x;\nnp($x);\nprint $x;\n");
+    let codes: Vec<(&str, &str)> = fa
+        .plugin_diagnostics
+        .iter()
+        .map(|d| (d.code.as_str(), d.plugin_id.as_str()))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("ddp-debug-left", "data-printer"),
+            ("ddp-debug-left", "data-printer")
+        ],
+        "one lint per p/np call, none for print; got {:?}",
+        fa.plugin_diagnostics
+    );
+    assert_eq!(fa.plugin_diagnostics[0].severity, "info");
+    assert!(fa.plugin_diagnostics[0].message.contains("`p`"));
+
+    // The gate: same calls in a file that never imports DDP stay silent
+    // (the plugin's trigger is Always for its completion hook, so the
+    // import check lives in on_match).
+    let fa = build_fa("my $x = 1;\np $x;\n");
+    assert!(
+        fa.plugin_diagnostics.is_empty(),
+        "no DDP import, no lint; got {:?}",
+        fa.plugin_diagnostics
+    );
+}
+
+/// The render half: plugin diagnostics come out of `collect_diagnostics`
+/// with the plugin id as source and the severity mapped.
+#[test]
+fn plugin_diagnostics_render_through_collect() {
+    let fa = build_fa("use DDP;\np $x;\n");
+    let idx = crate::module_index::ModuleIndex::new_for_test();
+    let diags = crate::symbols::collect_diagnostics(&fa, &idx, Default::default());
+    let lint = diags
+        .iter()
+        .find(|d| {
+            matches!(&d.code, Some(tower_lsp::lsp_types::NumberOrString::String(c)) if c == "ddp-debug-left")
+        })
+        .expect("ddp lint should render");
+    assert_eq!(lint.source.as_deref(), Some("perl-lsp/data-printer"));
+    assert_eq!(
+        lint.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION)
+    );
+}
+
 // ---- #receiver-isa? deferred predicate ----
 //
 // The gate is NOT a match-time filter: it routes DispatchCall
@@ -259,6 +315,7 @@ impl QueuePlugin {
             patterns: vec![PatternSpec {
                 name: "enqueue".into(),
                 language: "perl".into(),
+                phase: "walk".into(),
                 query: r#"
                     (method_call_expression
                       invocant: (_) @recv

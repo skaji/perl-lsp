@@ -297,6 +297,8 @@ fn build_with_plugins_inner(
         role_maker_modules: std::collections::HashSet::new(),
         role_packages: std::collections::HashSet::new(),
         lite_brand: vec![None],
+        topic_group_spans: Vec::new(),
+        plugin_diagnostics: Vec::new(),
         topic_dsls,
         reassigned_scalars: std::collections::HashSet::new(),
         key_writes: Vec::new(),
@@ -521,6 +523,14 @@ fn build_with_plugins_inner(
     // `docs/adr/route-branding.md`.
     bphase!("emit_partial_route_tgts", b.emit_partial_route_targets(&chain_idx));
 
+    // Fold-phase pattern dispatch: patterns declared `phase: "fold"`
+    // run HERE — after PostFold, so their projections read settled
+    // chain typing (route brands, resolved invocants). Matches
+    // dispatch in document order with the topic-route base replayed
+    // from the walk's recorded group spans; `SetRouteBase` emissions
+    // update the replay base instead of the (stale) walk stack.
+    bphase!("pattern_dispatch_fold", b.dispatch_pattern_plugins_fold(tree.root_node()));
+
     // Test-only: re-run the worklist fold one more time to pin
     // idempotency. Production callers always pass `false`; only
     // `build_with_plugins_extra_re_fold` flips this on. Re-running
@@ -575,6 +585,7 @@ fn build_with_plugins_inner(
         package_uses: b.package_uses,
         type_provenance: b.type_provenance,
         package_ranges: b.package_ranges,
+        plugin_diagnostics: b.plugin_diagnostics,
         app_surface_consumers: b.app_surface_consumers,
         witnesses: b.bag,
         package_framework: b.package_framework,
@@ -1627,6 +1638,13 @@ struct Builder<'a> {
     /// for the brand to ride; this stack IS the receiver for
     /// `->to('#action')` partials on declared verb calls.
     lite_brand: Vec<Option<String>>,
+    /// Spans of topic-DSL group-scope calls (`group { … }` in lite),
+    /// recorded during the walk so the fold-phase pattern dispatch can
+    /// replay the topic-route base stack in document order.
+    topic_group_spans: Vec<crate::file_analysis::Span>,
+    /// Plugin-emitted diagnostics (`EmitAction::Diagnostic`), flushed
+    /// onto `FileAnalysis.plugin_diagnostics`.
+    plugin_diagnostics: Vec<crate::file_analysis::PluginDiagnostic>,
 
     /// Topic-route DSL manifests collected from the plugin registry —
     /// see `plugin::TopicRouteDsl`.
@@ -3234,6 +3252,21 @@ impl<'a> Builder<'a> {
                 if let Some(frame) = self.lite_brand.last_mut() {
                     *frame = Some(controller);
                 }
+            }
+            plugin::EmitAction::Diagnostic {
+                message,
+                span,
+                severity,
+                code,
+            } => {
+                self.plugin_diagnostics
+                    .push(crate::file_analysis::PluginDiagnostic {
+                        message,
+                        span,
+                        severity,
+                        code,
+                        plugin_id: plugin_id.clone(),
+                    });
             }
             plugin::EmitAction::Method {
                 name,
@@ -8120,6 +8153,7 @@ impl<'a> Builder<'a> {
         if lite_group {
             let cur = self.lite_brand.last().cloned().flatten();
             self.lite_brand.push(cur);
+            self.topic_group_spans.push(node_to_span(node));
         }
         self.visit_children(node);
         if lite_group {

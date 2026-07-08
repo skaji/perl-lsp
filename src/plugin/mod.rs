@@ -526,6 +526,21 @@ pub enum EmitAction {
         #[serde(default)]
         bridged: Option<crate::conventions::BridgedMatch>,
     },
+    /// Emit a diagnostic at a span — the pluggable-lint channel. A
+    /// pattern selects the sites, `on_match` decides, and the
+    /// diagnostic rides `FileAnalysis.plugin_diagnostics` into the
+    /// same publish path as native diagnostics (cache-durable, so
+    /// workspace `--check` sees plugin lints on cached files too).
+    /// `severity`: `"error"` / `"warning"` / `"info"`, anything else
+    /// renders as hint. `code` is the editor-visible diagnostic code;
+    /// the emitting plugin's id becomes the diagnostic source.
+    Diagnostic {
+        message: String,
+        span: Span,
+        #[serde(default = "default_diag_severity")]
+        severity: String,
+        code: String,
+    },
     /// Full control: emit an arbitrary Symbol.
     ///
     /// `return_type` lives at the action level (not on the
@@ -734,6 +749,15 @@ pub struct PatternSpec {
     /// Which grammar this query targets. Default "perl".
     #[serde(default = "default_pattern_language")]
     pub language: String,
+    /// When this pattern dispatches. `"walk"` (default) = post-walk,
+    /// pre-fold — the slot for declaration shapes. `"fold"` = after
+    /// the worklist fold's PostFold pass, when chain typing has
+    /// settled — the slot for patterns whose projections read
+    /// fold-derived state (route brands, resolved invocants). Fold
+    /// matches dispatch in document order with the topic-route base
+    /// replayed, so `SetRouteBase` emissions scope correctly.
+    #[serde(default = "default_pattern_phase")]
+    pub phase: String,
     /// Tree-sitter query source. Standard text predicates (`#eq?`,
     /// `#match?`, `#any-of?`, …) are evaluated by the query engine at
     /// match time; unknown predicate names are ignored at match time
@@ -748,6 +772,14 @@ pub struct PatternSpec {
 
 fn default_pattern_language() -> String {
     "perl".to_string()
+}
+
+fn default_pattern_phase() -> String {
+    "walk".to_string()
+}
+
+fn default_diag_severity() -> String {
+    "warning".to_string()
 }
 
 /// One captured node, projected. `text` + `span` are always present;
@@ -805,6 +837,18 @@ pub struct CaptureData {
     /// node is a refgen of a named sub (`\&foo`, `\&Foo::bar`).
     #[serde(default)]
     pub ref_sub_name: Option<String>,
+    /// Projection `call_name` — when this node is itself a CALL
+    /// (`get('/x')->to(...)`'s receiver), the called function's name.
+    /// A generic syntax fact; plugins match their own DSL verbs.
+    #[serde(default)]
+    pub call_name: Option<String>,
+    /// Projection `route_defaults` — route defaults inherited by this
+    /// node's value, flattened to `[[key, value], …]` (`controller` is
+    /// the distinguished key). Fold-phase patterns only: reads the
+    /// fold-settled `BrandedRoute` brand, falling back to the replayed
+    /// topic-route base for topic-DSL verb-call receivers.
+    #[serde(default)]
+    pub route_defaults: Vec<(String, String)>,
     /// Projection `isa` — the resolved `isa` option type in a
     /// `has`-style option tail (string vocabulary via the framework
     /// mode, constructor calls via the `type_constraint_*` fold).
