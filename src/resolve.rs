@@ -3104,7 +3104,7 @@ pub fn refs_to(
                 covered_paths.insert(p);
             }
             // The walk applies visibility: role mask picked the tier, the
-            // closure gate decides per file (`file_sees_target`); the
+            // closure gate decides per file (`file_sees_target_ids`); the
             // matcher below only matches.
             let key = FileKey::Url(url);
             let file_str = canonical_file_str(&key);
@@ -4314,21 +4314,6 @@ fn collect_package_var(
             });
         }
     }
-}
-
-/// The closure-connectivity half of the visibility axis (RoleMask is the
-/// role half): may `analysis` — living at canonical `file_str` — see one of
-/// the target's defining files? A scanned file whose closure reaches none of
-/// them can't be referring to the target: its same-named tokens resolve (or
-/// would resolve) to something else entirely (an unrelated TU's static,
-/// another header's same-named struct/enum, a Perl `croak` half a workspace
-/// away). Empty `def_paths` (every Perl target, unscoped callers) = no gate.
-/// Applied by the WALK driver (`refs_to`) before a file is scanned — decls
-/// included, so two same-named statics never cross-list — which is what
-/// makes every projection that walks inherit it (arc-review C1's fix, owned
-/// by the seam, not the matcher).
-fn file_sees_target(target: &TargetRef, analysis: &FileAnalysis, file_str: &str) -> bool {
-    file_sees_target_ids(target, &def_path_ids(target), analysis, file_str)
 }
 
 /// The per-query half of the visibility gate: each def_path's global path

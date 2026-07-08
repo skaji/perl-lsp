@@ -387,14 +387,12 @@ fully-resident pack copies against the deliberate whole-copy sites and
 
 Deferred, with designs:
 
-- **@INC/'import' tier is never stripped** — the largest remaining
-  unbounded residency (a Moose/Mojo/DBIC dep closure is 1500+ whole
-  modules for the session). The lanes exist (blobs persisted, hub bag
-  LRU, `whole_present`, DEP rows shredded); the work is routing
-  `insert_into_cache` through a registration-owned strip after
-  `save_module_generation` commits, then a gold cold/warm round — the
-  import tier feeds enrichment and inheritance walks, so this needs its
-  own verification pass.
+- **@INC/'import' tier is never stripped** — LANDED 2026-07-07 (see
+  "@INC stripping arc — closed" below): cold-path strip via
+  `strip_import_copy`, warm strip at insert inside `warm_cache` for
+  long-lived processes. Residuals: CLI one-shot keeps whole warm copies
+  (deliberate — wall over RAM there), registration-generation keys for
+  the tier.
 - **Watcher re-registration never re-strips** — whole copies pinned until
   restart; a big `git pull` is an unbounded resident delta. Design:
   persist (blob+rows) in the watcher's blocking task, then

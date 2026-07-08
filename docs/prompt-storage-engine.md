@@ -237,18 +237,26 @@ DELETE+INSERT — the store never rebuilds wholesale after first index.
   spans into an edited header (locations are per-scanned-file by
   construction). Deferred items in `docs/open-forks.md` ("Mission-2
   hardening round").
-- **R4 first slice landed**: `ModuleIndex::enriched_snapshot` — the
-  enrichment overlay (derived serde copy, keyed by own + provider
-  surface fingerprints, self-validating, bounded FIFO). First consumer:
-  the `--check` sweep.
+- **R4 landed in full**: `ModuleIndex::enriched_snapshot` — the
+  enrichment overlay (derived serde copy, byte-capped LRU with cached
+  declines, keyed by registration generations + provider surface
+  fingerprints, cycle-guarded) — consumed by the `--check` sweep,
+  `--dump-package`, and the witness seams' fallback-on-miss retries
+  (`query_sub_return_type` imported recursion + the `MethodOnClass`
+  cross-file primary), gated by `mark_long_lived` (server on; one-shot
+  CLI off — bisected at 2x warm-harness wall; `PERL_LSP_LONG_LIVED=1`
+  is the harness lane). Its hardening round: retained-only retries,
+  generation keys (Arc pointers are ABA-unsound), deterministic cycle
+  declines.
+- **@INC tier stripping landed**: persisted dep bags evict on the cold
+  resolve path AND at warm insert in long-lived processes; the parse
+  memo is unpinned; `idx_modules_path` (rehydration was a full table
+  scan — warm gold 547→162 s). Wall/RSS saga: `docs/open-forks.md`
+  "@INC stripping arc — closed".
 
-Next, in order:
-
-1. **R4 follow-on consumers**: hover/completion on closed workspace
-   files through `enriched_snapshot` (behavior change — richer answers;
-   verify with gold before/after), and the `--watch`-style repeated
-   sweeps where the overlay's caching pays.
-2. The phase-4 materialized SQL views if the budget allows.
+Next: the phase-4 materialized SQL views if the budget allows; the
+unwired R4 seams (bridged-entity, transitive-enrichment, SlotType) per
+the R4-hardening ledger entry.
 
 ## Honest boundaries / risks
 

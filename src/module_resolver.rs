@@ -79,7 +79,9 @@ pub fn spawn_resolver(
                     }
                     Err(e) => log::warn!("Builtins hydrate failed: {}", e),
                 }
-                let (n, stale_names) = module_cache::warm_cache(conn, &cache);
+                let strip_warm = long_lived.load(std::sync::atomic::Ordering::Relaxed)
+                    && eviction_enabled();
+                let (n, stale_names) = module_cache::warm_cache(conn, &cache, strip_warm);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
                 // Queue stale modules for priority re-resolution.
                 for name in &stale_names {
@@ -92,11 +94,6 @@ pub fn spawn_resolver(
                 }
                 // Build reverse index from warmed cache.
                 rebuild_reverse_index(&cache, &edges);
-                if long_lived.load(std::sync::atomic::Ordering::Relaxed)
-                    && eviction_enabled()
-                {
-                    strip_warm_import_copies(&cache);
-                }
             }
 
             // Track which extract version each module was resolved at.
@@ -380,7 +377,7 @@ pub fn spawn_test_resolver(
                     conn,
                     &crate::plugin::rhai_host::plugin_fingerprint(),
                 );
-                let (_, stale_names) = module_cache::warm_cache(conn, &cache);
+                let (_, stale_names) = module_cache::warm_cache(conn, &cache, false);
                 for name in stale_names {
                     stale_modules.insert(name, ());
                 }
@@ -442,28 +439,6 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 }
 
 /// Insert a resolved module into the cache and update the edge indexes.
-/// The warm twin of `strip_import_copy`: warm_cache loads whole @INC
-/// copies (the blob just decoded IS the recoverable generation); in a
-/// long-lived process the sweep re-registers them bag-stripped so warm
-/// sessions get the residency win too. One-shot CLI processes skip it —
-/// the rehydration cost never amortizes there.
-fn strip_warm_import_copies(cache: &DashMap<String, Option<Arc<CachedModule>>>) {
-    let names: Vec<String> = cache.iter().map(|e| e.key().clone()).collect();
-    for name in names {
-        if let Some(mut entry) = cache.get_mut(&name) {
-            let replacement = match entry.value() {
-                Some(m) if !m.analysis.bag_is_evicted() && !m.analysis.degraded => {
-                    let mut fa = (*m.analysis).clone();
-                    fa.evict_axes(true, false);
-                    Some(Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa))))
-                }
-                _ => continue,
-            };
-            *entry.value_mut() = replacement;
-        }
-    }
-}
-
 /// The @INC tier's registration-owned strip: once the blob is persisted,
 /// the resident copy drops its witness bag (the dominant share of a CPAN
 /// module's payload; `bag_present` rehydrates through the hub's LRU).
@@ -1140,7 +1115,7 @@ pub fn index_workspace_with_index(
 /// Slice-2 eviction off-switch: `PERL_LSP_NO_EVICT` keeps every resident pack
 /// bag in memory (the pre-Slice-2 footprint) — an emergency knob and the A/B
 /// lever for isolating an eviction-caused regression.
-fn eviction_enabled() -> bool {
+pub(crate) fn eviction_enabled() -> bool {
     std::env::var_os("PERL_LSP_NO_EVICT").is_none()
 }
 
@@ -1549,7 +1524,7 @@ pub fn index_pack_languages(
                         Some(driver.analyze_with_path(&source, Some(path)))
                     })
                 }));
-                if let Ok(Some((mut analysis, stamp))) = res {
+                if let Ok(Some((analysis, stamp))) = res {
                     // Encode the FULL analysis for the disk write, then strip
                     // the resident copy — one struct, no clone
                     // (`docs/adr/memory-slice-2-lru.md`). Strip only when the

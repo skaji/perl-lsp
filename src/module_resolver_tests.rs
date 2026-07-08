@@ -305,25 +305,3 @@ fn import_tier_strip_gates_on_persistence() {
     assert!(strip_import_copy(&None, true, true).is_none());
 }
 
-/// The warm twin: whole warm-loaded @INC copies strip in place (bag only);
-/// degraded and sentinel entries are untouched.
-#[test]
-fn warm_import_copies_strip_in_place() {
-    let source = "package WarmStrip;\nsub go { my $s = shift; return bless {}, 'Y' }\n1;\n";
-    let mut parser = create_parser();
-    let tree = parser.parse(source, None).unwrap();
-    let fa = crate::builder::build(&tree, source.as_bytes());
-    let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
-    cache.insert(
-        "WarmStrip".into(),
-        Some(Arc::new(CachedModule::new(PathBuf::from("/inc/WarmStrip.pm"), Arc::new(fa)))),
-    );
-    cache.insert("Miss".into(), None);
-
-    strip_warm_import_copies(&cache);
-    let m = cache.get("WarmStrip").unwrap();
-    let m = m.as_ref().unwrap();
-    assert!(m.analysis.bag_is_evicted(), "warm copy strips");
-    assert!(!m.analysis.symbols_are_evicted(), "symbols stay");
-    assert!(cache.get("Miss").unwrap().is_none(), "sentinel untouched");
-}

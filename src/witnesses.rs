@@ -1821,7 +1821,7 @@ impl ReducerRegistry {
                         // Rehydrate the target file's bag if its resident copy
                         // was Slice-2-evicted; the cross-file chase reads its
                         // witnesses (`docs/adr/memory-slice-2-lru.md`).
-                        let mut attempt =
+                        let attempt =
                             |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>,
                              state: &mut _| {
                                 let cached_ctx = BagContext {

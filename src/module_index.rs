@@ -902,6 +902,19 @@ impl ModuleIndex {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// `PERL_LSP_LONG_LIVED=1` forces the long-lived behaviors in one-shot
+    /// CLI processes — the harness lane that keeps the server-only paths
+    /// (enriched retries, warm @INC strip) under a regression net.
+    pub fn is_long_lived(&self) -> bool {
+        self.long_lived.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mark_long_lived_from_env(&self) {
+        if std::env::var("PERL_LSP_LONG_LIVED").as_deref() == Ok("1") {
+            self.mark_long_lived();
+        }
+    }
+
     // ---- Test-only methods ----
 
     #[cfg(test)]
@@ -1415,6 +1428,7 @@ impl ModuleIndex {
         }
     }
 
+    #[cfg(test)]
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         // Loaded-module tracking feeds the entrypoint-scan lint and must
         // run BEFORE the packageless early-return: Mojolicious::Lite

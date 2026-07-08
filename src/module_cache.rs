@@ -81,6 +81,19 @@ pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connect
             match init_schema(&conn) {
                 Ok(()) => Some(conn),
                 Err(e) => {
+                    // BUSY/LOCKED is contention (a sibling writer mid-init,
+                    // e.g. the one-time idx_modules_path build) — deleting
+                    // the live DB under its feet loses every blob the other
+                    // writer stripped against. Only recreate on real
+                    // corruption/shape failures.
+                    if matches!(
+                        e.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy)
+                            | Some(rusqlite::ErrorCode::DatabaseLocked)
+                    ) {
+                        log::warn!("Cache DB busy during init; running without cache: {}", e);
+                        return None;
+                    }
                     log::warn!("Cache DB schema init failed: {}. Recreating.", e);
                     drop(conn);
                     let _ = std::fs::remove_file(&db_path);
@@ -674,42 +687,43 @@ pub fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
 /// No mtime/closure validation: the caller (`PackBagCache`) invalidates its
 /// entry on file change, and the row's shape is EXTRACT_VERSION-pinned.
 pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
-    let blob: Vec<u8> = conn
-        .query_row(
-            // A dual-homed project-lib file has TWO rows for one path
-            // (name-keyed import + path-keyed workspace); the workspace
-            // generation is the one the watcher/indexer keeps fresh, so it
-            // wins deterministically instead of by scan order.
-            "SELECT analysis FROM modules WHERE path = ?1 \
-             ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END LIMIT 1",
-            params![path],
-            |row| row.get::<_, Option<Vec<u8>>>(0),
+    // A dual-homed project-lib file has TWO rows for one path (name-keyed
+    // import + path-keyed workspace). Prefer a row whose stamp matches the
+    // disk (one tier's persist may have failed or lagged, leaving a stale
+    // generation); workspace-first is only the tiebreak. Single-row paths
+    // deliberately skip stamp validation — the registered generation may
+    // legitimately predate an unsaved edit, and the caller invalidates the
+    // LRU on file change.
+    let mut stmt = conn
+        .prepare(
+            "SELECT analysis, mtime_secs, file_size FROM modules WHERE path = ?1 \
+             ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END",
         )
-        .ok()
-        .flatten()?;
-    if blob.is_empty() {
-        return None;
-    }
-    decode_analysis(&blob)
+        .ok()?;
+    let rows: Vec<(Option<Vec<u8>>, i64, i64)> = stmt
+        .query_map(params![path], |row| {
+            Ok((
+                row.get::<_, Option<Vec<u8>>>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .ok()?
+        .flatten()
+        .collect();
+    let pick = |require_stamp: bool| -> Option<&Vec<u8>> {
+        rows.iter().find_map(|(blob, m, sz)| {
+            let blob = blob.as_ref().filter(|b| !b.is_empty())?;
+            if require_stamp && file_stamp(std::path::Path::new(path)) != Some((*m, *sz)) {
+                return None;
+            }
+            Some(blob)
+        })
+    };
+    let blob = pick(rows.len() > 1).or_else(|| pick(false))?;
+    decode_analysis(blob)
 }
 
-/// Persist a PRE-ENCODED analysis blob (the full witness bag serialized before
-/// the resident copy was bag-evicted). The blob is authored by
-/// `encode_analysis` while the bag is still present; this only writes the row,
-/// stamping mtime/size from `path` and `deps_stamp` from `include_closure`
-/// (pinned — it survives eviction), so the stored generation is byte-identical
-/// to what `save_to_db` would have written from the full analysis.
-pub fn save_blob_to_db(
-    conn: &Connection,
-    module_name: &str,
-    path: &std::path::Path,
-    include_closure: &crate::file_analysis::path_intern::ClosureList,
-    blob: &[u8],
-    source: &str,
-) {
-    let stamp = file_stamp(path).unwrap_or((0, 0));
-    save_blob_to_db_stamped(conn, module_name, path, include_closure, blob, source, stamp)
-}
 
 /// `save_blob_to_db` with a caller-captured `file_stamp` — the bulk drains
 /// persist analyses parsed earlier, and stamping at WRITE time would blesses
@@ -924,6 +938,7 @@ pub fn delete_ref_rows(conn: &Connection, path: &str) {
 
 /// Has `path` been shredded into the relational index? (`files` presence is
 /// the marker — `shred_derived_rows` upserts it even for empty files.)
+#[cfg(test)]
 pub fn has_ref_rows(conn: &Connection, path: &str) -> bool {
     conn.query_row(
         "SELECT 1 FROM files WHERE path = ?1",
@@ -1091,6 +1106,7 @@ pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
 
 /// Row count for one match key — the count-first surface for hot-name
 /// capping (`docs/adr/relational-ref-index.md`).
+#[cfg(test)]
 pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
     conn.query_row(
         "SELECT COUNT(*) FROM refs
@@ -1368,9 +1384,29 @@ pub fn warm_pack_stream_with_stubs(
     count
 }
 
+/// None-over-Some, atomically: the workspace registrar may register this
+/// name concurrently, and a sentinel clobber answers "no such module" all
+/// session. The entry API holds the shard lock across check+insert.
+fn insert_sentinel_guarded(
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    module_name: String,
+) {
+    match cache.entry(module_name) {
+        dashmap::mapref::entry::Entry::Occupied(mut o) => {
+            if o.get().is_none() {
+                o.insert(None);
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(None);
+        }
+    }
+}
+
 pub fn warm_cache(
     conn: &Connection,
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    strip: bool,
 ) -> (usize, Vec<String>) {
     // Name-keyed warm serves the @INC tier only; 'workspace' rows are
     // path-keyed and stream through `warm_cache_streaming` — loading them
@@ -1421,9 +1457,7 @@ pub fn warm_cache(
             // this name concurrently (the insert_into_cache guard's warm
             // twin — a clobber here answers "no such module" all session).
             RowGeneration::Sentinel => {
-                if !matches!(cache.get(&module_name).as_deref(), Some(Some(_))) {
-                    cache.insert(module_name, None);
-                }
+                insert_sentinel_guarded(cache, module_name);
                 count += 1;
                 continue;
             }
@@ -1440,12 +1474,20 @@ pub fn warm_cache(
         match analysis_blob {
             Some(blob) if !blob.is_empty() => {
                 match decode_analysis(&blob) {
-                    Some(fa) => {
+                    Some(mut fa) => {
                         // A pack file's analysis bakes its headers (splices,
                         // witnesses, closure): the row is valid only while the
                         // whole closure is unchanged, not just the file itself.
                         if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
                             continue;
+                        }
+                        // Strip AT INSERT (long-lived processes): the blob
+                        // just decoded IS the recoverable generation, and
+                        // stripping here (not a post-hoc sweep) can never
+                        // touch a copy some OTHER path registered
+                        // whole-for-a-reason (writer fallback, watcher).
+                        if strip && !fa.degraded {
+                            fa.evict_axes(true, false);
                         }
                         cache.insert(
                             module_name,
@@ -1459,10 +1501,14 @@ pub fn warm_cache(
                 }
             }
             _ => {
-                // Blob missing / empty — treat as negative sentinel (same
-                // None-over-Some guard as above).
-                if !matches!(cache.get(&module_name).as_deref(), Some(Some(_))) {
-                    cache.insert(module_name, None);
+                // Blob missing / empty on a NON-sentinel row (a legacy
+                // NULL-blob write): re-resolve rather than remember a miss —
+                // a sentinel here would be a terminal cross-session false
+                // negative for a real module.
+                if path_str.is_empty() {
+                    insert_sentinel_guarded(cache, module_name);
+                } else {
+                    stale_names.push(module_name);
                 }
                 count += 1;
             }
@@ -1490,6 +1536,16 @@ pub fn save_to_db(
             }
             let (mtime, size) = file_stamp(&cached.path).unwrap_or((0, 0));
             let blob = encode_analysis(&cached.analysis);
+            if blob.is_none() {
+                // Encode failure: leave the PREVIOUS row intact — replacing
+                // it with a NULL blob would destroy a good generation and
+                // warm as a terminal negative sentinel across sessions.
+                log::warn!(
+                    "Failed to encode analysis for '{}'; keeping prior row",
+                    module_name
+                );
+                return false;
+            }
             let deps = closure_stamp(
                 &cached.analysis.include_closure,
                 &mut std::collections::HashMap::new(),

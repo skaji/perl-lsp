@@ -344,8 +344,8 @@ Measured after 4+5 (abseil): resident payload 46.1 → **11.2 MB**
 bugzilla warm 83 → 75 MB. By the chromium bucket shares this projects the
 6.9 GB warm floor to roughly **1.5–2 GB**.
 
-Deferred, designed to land on the same seam: the register-from-store warm
-start (rides the storage-engine Surface — `docs/prompt-storage-engine.md`)
+LANDED since (the warm-stub lane, `warm_pack_stream_with_stubs`): the
+register-from-store warm start (rides the storage-engine Surface — `docs/prompt-storage-engine.md`)
 and the row-level matcher fast path above.
 
 **Whole-tree Chromium, measured (all three phases, 4-core/15 GB box):**
@@ -355,7 +355,7 @@ the run the baseline could not finish — killed at 20 GB having indexed
 baseline's 0.51 MB/file slope, ~67 GB projected). The store lands at
 6.1 GB (`modules-cpp.db`): 34.8 M ref rows over 2.16 M interned strings.
 The remaining resident floor is the stripped analyses' symbols/outline
-buckets — the deferred symbols shred is what moves it next.
+buckets — the symbols shred (phase 4, landed) moved it next.
 
 ## Migration net
 

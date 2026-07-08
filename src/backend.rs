@@ -1898,7 +1898,7 @@ impl LanguageServer for Backend {
         let pack = (language != "perl")
             .then(|| self.module_index.pack_index(language))
             .flatten();
-        let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+        let _base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
             None => &*self.module_index,
         };

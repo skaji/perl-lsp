@@ -600,6 +600,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // Indexing without the index (bridge-less) is what forced callers to
     // hand-roll their own `index_workspace_with_index`, and they drifted.
     let module_index = module_index::ModuleIndex::new_for_cli();
+    module_index.mark_long_lived_from_env();
     // Wake the headless resolver: it blocks on this channel for the
     // @INC scan + SQLite warm.
     module_index.set_workspace_root(Some(root_uri.as_str()));
@@ -641,7 +642,11 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             conn,
             &plugin::rhai_host::plugin_fingerprint(),
         );
-        let (warmed, stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
+        let (warmed, stale) = module_cache::warm_cache(
+            conn,
+            &module_index.cache_raw(),
+            module_index.is_long_lived() && module_resolver::eviction_enabled(),
+        );
         if warmed > 0 {
             eprintln!("Cache: {} modules loaded from disk", warmed);
         }
@@ -1988,7 +1993,7 @@ fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
 /// a glance whether the bag has anything to say.
 fn cli_dump_package(root: &str, package_name: &str) {
     use std::sync::Arc;
-    use file_analysis::{FileAnalysis, SymKind, SymbolDetail};
+    use file_analysis::{SymKind, SymbolDetail};
 
     let (ws, module_index) = cli_full_startup(root);
 
