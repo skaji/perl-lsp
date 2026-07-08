@@ -498,3 +498,22 @@ Arc-pointer token stands for that tier); the 162s one-shot rehydration
 profile if CI minutes ever matter (options: per-process blob-decode
 memo, or NO_EVICT in the harness at the cost of blinding the eviction
 nets).
+
+## Intermittent cold-start flake — 2026-07-07 — OPEN (investigation)
+
+Twice this branch, a COLD gold run misbehaved and was clean on
+immediate rerun: once 3 FAILs, once 372 PASS / 41 FAIL / 5 XPASS with an
+impossibly fast wall (88s vs ~300-500s) — the "inputs vanished,
+absence-as-answer" signature (diagnostics XPASS = typeless sweep). Both
+occurrences ran immediately after (or concurrent with) heavy build/test
+activity on the same box; 4 deliberate cold passes after the second
+occurrence were all clean, as were all committed-gate colds. Suspects:
+the two-writer startup window (resolver thread + workspace indexer on
+one modules.db) under load — a busy-timeout expiry making one writer
+run cache-less that session (post-hygiene this is a clean None, but the
+session's strips then key on the OTHER writer's rows), or a
+strip-before-persist window the tripwire doesn't cover on the Perl
+tier. Next probe: cold gold under artificial CPU/IO load with
+PERL_LSP_TIMINGS + a Perl-tier residency tripwire; the harness could
+also assert per-fixture wall lower bounds so a too-fast cold fails
+loudly instead of scoring wrong answers.
