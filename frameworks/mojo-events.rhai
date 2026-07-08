@@ -12,11 +12,10 @@
 // (hover, sig help, ref, rename, workspace symbol) composes without
 // any mojo-events-specific branching.
 //
-// PORTED to the query-declared capture seam (docs/prompt-plugin-queries.md):
-// the verb set and the arg shape live in the `patterns()` query; the
-// core only computes the projections this pattern declares, and only
-// for actual matches. `on_match` carries the same semantics the old
-// `on_method_call` body had, minus the verb if-chain and positional
+// The verb set and the arg shape live in the `patterns()` query
+// (docs/prompt-plugin-queries.md); the core only computes the
+// projections this pattern declares, and only for actual matches.
+// `on_match` owns the semantics — no verb if-chain, no positional
 // arg digging.
 
 fn id() { "mojo-events" }

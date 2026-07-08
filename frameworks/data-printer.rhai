@@ -97,8 +97,8 @@ fn on_match(pattern, m) {
 // `Always` so the plugin appears in `applicable()` for every
 // completion query — `on_completion` then filters internally on
 // `ctx.current_use_module`. (`on_use` separately bypasses the
-// trigger filter, so it'd fire either way.) The plugin defines
-// no `on_method_call` / `on_function_call`, so unconditional
+// trigger filter, so it'd fire either way.) The debug-call pattern
+// gates on the DDP import inside on_match, so unconditional
 // triggering costs nothing for non-DDP code.
 fn triggers() {
     [ #{ Always: () } ]
