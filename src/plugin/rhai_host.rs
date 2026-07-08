@@ -1,7 +1,7 @@
 //! Rhai-scripted plugin support.
 //!
 //! A `RhaiPlugin` wraps a compiled Rhai script that exposes top-level
-//! functions: `id()`, `triggers()`, `on_function_call(ctx)`, `on_method_call(ctx)`,
+//! functions: `id()`, `triggers()`, `patterns()` + `on_match(pattern, m)`,
 //! and/or `on_use(ctx)`. Each callback returns an array of emission object-maps
 //! that convert back into strongly-typed `EmitAction` values.
 //!
@@ -20,7 +20,7 @@ use crate::file_analysis::{HashKeyOwner, InferredType, Span};
 use tree_sitter::Point;
 
 use super::{
-    AttributeMacro, CallContext, CompletionQueryContext, ConstraintParam, DispatchVerb, EmitAction,
+    AttributeMacro, CompletionQueryContext, ConstraintParam, DispatchVerb, EmitAction,
     FrameworkPlugin, ParamType, PluginCompletionAnswer, PluginSigHelpAnswer, SigHelpQueryContext,
     Trigger, TypeOverride, UseContext,
 };
@@ -191,15 +191,12 @@ pub struct RhaiPlugin {
     role_makers: Vec<String>,
     column_keyed_verbs: Vec<String>,
     fluent_verbs: Vec<String>,
-    arg_name_verbs: Vec<String>,
     topic_route_dsl: Option<crate::plugin::TopicRouteDsl>,
     patterns: Vec<crate::plugin::PatternSpec>,
     engine: Arc<Engine>,
     ast: Arc<AST>,
     has_on_match: bool,
-    has_on_function_call: bool,
     has_type_constraint_inner: bool,
-    has_on_method_call: bool,
     has_on_use: bool,
     has_on_signature_help: bool,
     has_on_completion: bool,
@@ -443,27 +440,6 @@ impl RhaiPlugin {
             }
         }
 
-        // `arg_name_verbs()` — call verbs wanting flat-arg-name
-        // extraction; same optional, fail-safe array-of-strings shape.
-        let mut arg_name_verbs: Vec<String> = Vec::new();
-        if signatures.iter().any(|n| n == "arg_name_verbs") {
-            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "arg_name_verbs", ()) {
-                Ok(arr) => {
-                    for d in arr {
-                        match from_dynamic::<String>(&d) {
-                            Ok(s) => arg_name_verbs.push(s),
-                            Err(e) => log::error!(
-                                "plugin `{}` arg_name_verbs() bad entry: {}",
-                                id,
-                                e
-                            ),
-                        }
-                    }
-                }
-                Err(e) => log::error!("plugin `{}` arg_name_verbs() failed: {}", id, e),
-            }
-        }
-
         // `patterns()` — query-declared capture manifest; same
         // optional, fail-safe contract as overrides (a bad entry is
         // dropped, the rest of the plugin still loads).
@@ -501,9 +477,7 @@ impl RhaiPlugin {
 
         Ok(Self {
             has_on_match: signatures.iter().any(|n| n == "on_match"),
-            has_on_function_call: signatures.iter().any(|n| n == "on_function_call"),
             has_type_constraint_inner: signatures.iter().any(|n| n == "type_constraint_inner"),
-            has_on_method_call: signatures.iter().any(|n| n == "on_method_call"),
             has_on_use: signatures.iter().any(|n| n == "on_use"),
             has_on_signature_help: signatures.iter().any(|n| n == "on_signature_help"),
             has_on_completion: signatures.iter().any(|n| n == "on_completion"),
@@ -519,7 +493,6 @@ impl RhaiPlugin {
             role_makers,
             column_keyed_verbs,
             fluent_verbs,
-            arg_name_verbs,
             topic_route_dsl,
             patterns,
             engine,
@@ -638,10 +611,6 @@ impl FrameworkPlugin for RhaiPlugin {
         &self.fluent_verbs
     }
 
-    fn arg_name_verbs(&self) -> &[String] {
-        &self.arg_name_verbs
-    }
-
     fn topic_route_dsl(&self) -> Option<crate::plugin::TopicRouteDsl> {
         self.topic_route_dsl.clone()
     }
@@ -696,32 +665,6 @@ impl FrameworkPlugin for RhaiPlugin {
             Ok(d) => self.dispatch_args("on_match", (pattern.to_string(), d)),
             Err(e) => {
                 log::warn!("plugin `{}`: match ctx serialize: {}", self.id, e);
-                Vec::new()
-            }
-        }
-    }
-
-    fn on_function_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
-        if !self.has_on_function_call {
-            return Vec::new();
-        }
-        match to_dynamic(ctx) {
-            Ok(d) => self.dispatch("on_function_call", d),
-            Err(e) => {
-                log::warn!("plugin `{}`: ctx serialize: {}", self.id, e);
-                Vec::new()
-            }
-        }
-    }
-
-    fn on_method_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
-        if !self.has_on_method_call {
-            return Vec::new();
-        }
-        match to_dynamic(ctx) {
-            Ok(d) => self.dispatch("on_method_call", d),
-            Err(e) => {
-                log::warn!("plugin `{}`: ctx serialize: {}", self.id, e);
                 Vec::new()
             }
         }
@@ -968,17 +911,27 @@ mod tests {
 
     #[test]
     fn minimal_plugin_loads_and_dispatches() {
+        use crate::plugin::MatchContext;
+
         let src = r#"
             fn id() { "demo" }
             fn triggers() { [ #{ UsesModule: "Demo" } ] }
-            fn on_function_call(ctx) {
-                if ctx.function_name == "greet" {
+            fn patterns() {
+                [
+                    #{
+                        name: "greet_call",
+                        query: "(function_call_expression) @call",
+                    }
+                ]
+            }
+            fn on_match(pattern, m) {
+                if pattern == "greet_call" {
                     return [
                         #{
                             Method: #{
                                 name: "hello",
-                                span: ctx.call_span,
-                                selection_span: ctx.selection_span,
+                                span: m.span,
+                                selection_span: m.span,
                                 params: [],
                                 is_method: true,
                                 return_type: (),
@@ -995,27 +948,20 @@ mod tests {
         let plugin = RhaiPlugin::from_source(src, engine).expect("compiles");
         assert_eq!(plugin.id(), "demo");
         assert_eq!(plugin.triggers().len(), 1);
+        assert!(plugin.patterns().iter().any(|p| p.name == "greet_call"));
 
-        let ctx = CallContext {
-            call_kind: super::super::CallKind::Function,
-            function_name: Some("greet".into()),
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args: vec![],
-            call_span: sp(0, 0, 0, 5),
-            selection_span: sp(0, 0, 0, 5),
-            current_package: Some("Demo::App".into()),
-            current_package_parents: vec![],
-            current_package_uses: vec!["Demo".into()],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("call".to_string(), one(mcap("greet('x')", sp(0, 0, 0, 10))));
+        let m = MatchContext {
+            pattern: "greet_call".into(),
+            span: sp(0, 0, 0, 10),
+            package: Some("Demo::App".into()),
+            package_parents: vec![],
+            package_uses: vec!["Demo".into()],
+            captures,
         };
 
-        let emissions = plugin.on_function_call(&ctx);
+        let emissions = plugin.on_match("greet_call", &m);
         assert_eq!(emissions.len(), 1);
         match &emissions[0] {
             EmitAction::Method { name, is_method, .. } => {
@@ -1110,8 +1056,8 @@ mod tests {
             .expect("mojo-events is bundled");
 
         // mojo-events rides the query-declared capture seam: it must
-        // declare a pattern manifest and answer on_match with the same
-        // emissions the old CallContext hook produced.
+        // declare a pattern manifest and answer on_match with the
+        // dispatch-call + handler + namespace emissions.
         assert!(
             plugin.patterns().iter().any(|p| p.name == "event_call"),
             "mojo-events should declare the event_call pattern"
@@ -1525,36 +1471,33 @@ mod tests {
     }
 
     #[test]
-    fn non_matching_function_returns_empty() {
+    fn non_matching_on_match_returns_empty() {
+        use crate::plugin::MatchContext;
+
         let src = r#"
             fn id() { "demo2" }
             fn triggers() { [ #{ Always: () } ] }
-            fn on_function_call(ctx) {
-                if ctx.function_name == "wanted" { return [#{ FrameworkImport: #{ keyword: "ok" } }]; }
+            fn patterns() {
+                [ #{ name: "wanted_call", query: "(function_call_expression) @call" } ]
+            }
+            fn on_match(pattern, m) {
+                if pattern == "wanted_call" { return [#{ FrameworkImport: #{ keyword: "ok" } }]; }
                 []
             }
         "#;
         let engine = Arc::new(make_engine());
         let plugin = RhaiPlugin::from_source(src, engine).unwrap();
 
-        let ctx = CallContext {
-            call_kind: super::super::CallKind::Function,
-            function_name: Some("unrelated".into()),
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args: vec![],
-            call_span: sp(0, 0, 0, 0),
-            selection_span: sp(0, 0, 0, 0),
-            current_package: None,
-            current_package_parents: vec![],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("call".to_string(), one(mcap("f()", sp(0, 0, 0, 3))));
+        let m = MatchContext {
+            pattern: "other_call".into(),
+            span: sp(0, 0, 0, 3),
+            package: None,
+            package_parents: vec![],
+            package_uses: vec![],
+            captures,
         };
-        assert!(plugin.on_function_call(&ctx).is_empty());
+        assert!(plugin.on_match("other_call", &m).is_empty());
     }
 }

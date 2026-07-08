@@ -83,9 +83,9 @@ struct ChainTypingIndex<'a> {
     return_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
     invocant_nodes: std::collections::HashMap<(Point, Point), Node<'a>>,
     method_call_args: std::collections::HashMap<(Point, Point), Node<'a>>,
-    /// Every `method_call_expression` node. The partial-route pass
-    /// (`emit_partial_route_targets`) filters this to `->to(...)`
-    /// calls post-fold, when the receiver's brand has resolved.
+    /// Every `method_call_expression` node. `emit_route_brand_witnesses`
+    /// reads it post-fold to attach resolved `BrandedRoute` witnesses to
+    /// each call's `Expression(refidx)`.
     method_call_nodes: Vec<Node<'a>>,
     /// `hash_element_expression` nodes whose container is itself a
     /// method-call result (`$obj->get_config->{host}`). The container
@@ -296,7 +296,6 @@ fn build_with_plugins_inner(
         dynamic_dispatch_sites: 0,
         role_maker_modules: std::collections::HashSet::new(),
         role_packages: std::collections::HashSet::new(),
-        lite_brand: vec![None],
         topic_group_spans: Vec::new(),
         plugin_diagnostics: Vec::new(),
         topic_dsls,
@@ -515,13 +514,6 @@ fn build_with_plugins_inner(
     // (`invocant_type_at_node`) is the single structure-discovery site;
     // this pass records its answer.
     bphase!("emit_invocant_expr_witns", b.emit_invocant_expr_witnesses(&chain_idx));
-
-    // Partial Mojo route targets (`->to('#action')`) inherit their
-    // controller from a parent `->to('ctrl#')` via the route value's
-    // brand, which only settles after the fold. Re-dispatch the route
-    // plugins now that the brand is resolved. See
-    // `docs/adr/route-branding.md`.
-    bphase!("emit_partial_route_tgts", b.emit_partial_route_targets(&chain_idx));
 
     // Fold-phase pattern dispatch: patterns declared `phase: "fold"`
     // run HERE — after PostFold, so their projections read settled
@@ -1632,12 +1624,6 @@ struct Builder<'a> {
     /// set, never re-derives from use lists.
     role_packages: std::collections::HashSet<String>,
 
-    /// Topic-route implicit base — the controller default the current
-    /// base-setter established, scoped by the DSL's group function
-    /// (push on entry, pop on exit). Topic-DSL routes have no variable
-    /// for the brand to ride; this stack IS the receiver for
-    /// `->to('#action')` partials on declared verb calls.
-    lite_brand: Vec<Option<String>>,
     /// Spans of topic-DSL group-scope calls (`group { … }` in lite),
     /// recorded during the walk so the fold-phase pattern dispatch can
     /// replay the topic-route base stack in document order.
@@ -1669,10 +1655,10 @@ struct Builder<'a> {
     parametric_emitted_refs: std::collections::HashSet<usize>,
 
     /// Dedup for plugin-emitted `MethodCallRef`s, keyed by
-    /// `(span, method_name)`. The partial-route post-fold re-dispatch
-    /// (`emit_partial_route_targets`) re-runs `->to(...)` plugins after
-    /// the receiver brand resolves; this set keeps the walk-time
-    /// emission (full forms) from being duplicated by the re-run.
+    /// `(span, method_name)`. The fold-phase pattern dispatch re-runs
+    /// `->to(...)` route patterns after the receiver brand resolves;
+    /// this set keeps a walk-phase full-form emission at the same span
+    /// from being duplicated by that fold-phase re-run.
     method_call_ref_dedup: std::collections::HashSet<(Point, Point, String)>,
 
     /// Refs whose `Expression(refidx)` carries a `route_brand`
@@ -2477,9 +2463,9 @@ impl<'a> Builder<'a> {
 
     /// Type any expression node in invocant position. Single
     /// kind-dispatch shared between `resolve_invocant_class_tree`
-    /// (which projects to a class name string) and
-    /// `receiver_type_for` (which uses the InferredType directly for
-    /// plugin trigger matching). Routes everything through the bag
+    /// (which projects to a class name string) and the manifest
+    /// recorders / `type` projection (which use the InferredType
+    /// directly). Routes everything through the bag
     /// where the bag has the answer; falls back to walk-time
     /// canonical sources (TCs, current_package) only where the bag
     /// can't (variable invocants whose TC mirror happens post-walk).
@@ -2949,17 +2935,6 @@ impl<'a> Builder<'a> {
         }
         None
     }
-    /// Walk-time helper for plugin emit hooks that need the
-    /// receiver's type to decide whether to fire (mojo-events'
-    /// `on_method_call` only matches `$emitter->on(...)` when
-    /// `$emitter` types as a Mojo::EventEmitter subclass, etc.).
-    ///
-    /// Thin wrapper over `invocant_type_at_node`. Same node-kind
-    /// dispatch the post-walk chain typer uses — variable arms read
-    /// TCs (canonical at walk time, mirrored to the bag post-walk),
-    /// bareword arms query the local Symbol's return, method-call arms
-    /// query Expression(refidx), shift / `$_[0]` / `__PACKAGE__` use
-    /// current_package. One function, one dispatch.
     /// The active topic-route DSL, when a plugin declared one whose
     /// gating module is in scope. Core knows no names — the plugin
     /// manifest carries the module, the verbs, and the scope function.
@@ -2972,7 +2947,7 @@ impl<'a> Builder<'a> {
     }
 
     /// The called function's name when `inv` is a call — the generic
-    /// syntax fact `CallContext.receiver_call_name` carries to plugins.
+    /// syntax fact the `call_name` projection carries to plugins.
     fn invocant_call_name(&self, inv: Node<'a>) -> Option<String> {
         if !matches!(
             inv.kind(),
@@ -2984,10 +2959,6 @@ impl<'a> Builder<'a> {
             .utf8_text(self.source)
             .ok()
             .map(str::to_string)
-    }
-
-    fn receiver_type_for(&self, invocant_node: Option<Node<'a>>) -> Option<InferredType> {
-        self.invocant_type_at_node(invocant_node?)
     }
 
     /// Transitive parent walk within the current file. Depth-limited like
@@ -3014,45 +2985,6 @@ impl<'a> Builder<'a> {
         out
     }
 
-    /// Build the read-only snapshot plugins see, minus the call-shape bits
-    /// that only method-call vs function-call callers know.
-    fn base_call_context(
-        &mut self,
-        args_raw: Vec<Node<'a>>,
-        call_span: Span,
-        selection_span: Span,
-    ) -> plugin::CallContext {
-        let args_flat = self.flat_call_args(args_raw);
-        let args: Vec<plugin::ArgInfo> = args_flat.iter().map(|n| self.arg_info_for(*n)).collect();
-        let parents = self.current_package.as_ref()
-            .map(|p| self.transitive_parents(p))
-            .unwrap_or_default();
-        let uses = self.current_package.as_ref()
-            .and_then(|p| self.package_uses.get(p))
-            .cloned()
-            .unwrap_or_default();
-        plugin::CallContext {
-            call_kind: plugin::CallKind::Function,
-            function_name: None,
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args,
-            call_span,
-            selection_span,
-            current_package: self.current_package.clone(),
-            current_package_parents: parents,
-            current_package_uses: uses,
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
-        }
-    }
-
-    /// Run every applicable plugin's `on_method_call` hook and apply each
-    /// returned `EmitAction`.
     /// Run every applicable plugin's `on_use` hook. Used for
     /// `use` statements that autoimport a fixed verb set (Mojolicious::Lite,
     /// Dancer2, etc.) — plugins emit `FrameworkImport` actions per
@@ -3077,59 +3009,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Run every applicable plugin's `on_function_call` hook. Used for
-    /// top-level calls (`get '/path' => sub {}`, `has 'attr' => ...`)
-    /// that aren't method calls. Mirrors dispatch_method_call_plugins.
-    fn dispatch_function_call_plugins(&mut self, ctx: plugin::CallContext) {
-        if self.plugins.is_empty() { return; }
-        let parents = self.current_package.as_ref()
-            .map(|p| self.transitive_parents(p))
-            .unwrap_or_default();
-        let uses = self.current_package.as_ref()
-            .and_then(|p| self.package_uses.get(p))
-            .cloned()
-            .unwrap_or_default();
-        let query = plugin::TriggerQuery {
-            package_uses: &uses,
-            package_parents: &parents,
-        };
-        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
-            .applicable(&query)
-            .flat_map(|p| {
-                let id = p.id().to_string();
-                p.on_function_call(&ctx).into_iter().map(move |a| (id.clone(), a))
-            })
-            .collect();
-        for (plugin_id, action) in actions {
-            self.apply_emit_action(plugin_id, action);
-        }
-    }
-
-    fn dispatch_method_call_plugins(&mut self, ctx: plugin::CallContext) {
-        if self.plugins.is_empty() { return; }
-        let parents = self.current_package.as_ref()
-            .map(|p| self.transitive_parents(p))
-            .unwrap_or_default();
-        let uses = self.current_package.as_ref()
-            .and_then(|p| self.package_uses.get(p))
-            .cloned()
-            .unwrap_or_default();
-        let query = plugin::TriggerQuery {
-            package_uses: &uses,
-            package_parents: &parents,
-        };
-        let actions: Vec<(String, plugin::EmitAction)> = self.plugins
-            .applicable(&query)
-            .flat_map(|p| {
-                let id = p.id().to_string();
-                p.on_method_call(&ctx).into_iter().map(move |a| (id.clone(), a))
-            })
-            .collect();
-        for (plugin_id, action) in actions {
-            self.apply_emit_action(plugin_id, action);
-        }
-    }
-
     /// Record a provisional dispatch when a method call matches a plugin
     /// `dispatch_verbs()` declaration. The receiver isa check happens later,
     /// at enrichment, against the cross-file-resolved receiver class — here
@@ -3137,18 +3016,26 @@ impl<'a> Builder<'a> {
     /// class hint, if any). Trigger-independent: keyed off the global verb
     /// manifest, not the file's `use`s, so a `$minion->enqueue('T')` in a
     /// plain class is captured the same as one in a Mojo app.
-    fn record_provisional_dispatch(&mut self, method: &str, ctx: &plugin::CallContext) {
-        let Some(spec) = self.dispatch_manifest.get(method) else { return };
-        let Some(arg) = ctx.args.get(spec.name_arg_index) else { return };
-        let Some(name) = arg.string_value.clone() else { return };
+    fn record_provisional_dispatch(
+        &mut self,
+        method: &str,
+        node: Node<'a>,
+        invocant_node: Option<Node<'a>>,
+    ) {
+        let Some(spec) = self.dispatch_manifest.get(method).cloned() else { return };
+        let args_flat = self.flat_call_args(self.extract_call_args(node));
+        let Some(arg_node) = args_flat.get(spec.name_arg_index).copied() else { return };
+        let info = self.arg_info_for(arg_node);
+        let Some(name) = info.string_value else { return };
         if name.is_empty() {
             return;
         }
-        let span = arg.span;
-        let receiver_class = match &ctx.receiver_type {
-            Some(InferredType::ClassName(c)) => Some(c.clone()),
+        let span = info.span;
+        let receiver_class = match invocant_node.and_then(|n| self.invocant_type_at_node(n)) {
+            Some(InferredType::ClassName(c)) => Some(c),
             _ => None,
         };
+        let call_span = node_to_span(node);
         // Gate the candidate on the verb's `target_class`: the inner
         // payload is unreadable until a receiver isa-resolves at query time.
         self.provisional_dispatches.push(crate::file_analysis::ReceiverGated::new(
@@ -3159,7 +3046,7 @@ impl<'a> Builder<'a> {
                 dispatcher: method.to_string(),
                 owner_class: spec.owner_class.clone(),
                 receiver_class,
-                call_span: ctx.call_span,
+                call_span,
             },
         ));
     }
@@ -3180,29 +3067,46 @@ impl<'a> Builder<'a> {
     /// silent); the verb-name specificity + workspace-only + tail-match
     /// bound any false suppression. config_span (arg i+1) rides through
     /// for loader-config `$conf` typing.
-    fn record_plugin_loads(&mut self, method: &str, ctx: &plugin::CallContext) {
-        let Some(spec) = self.load_manifest.get(method) else { return };
-        let Some(arg) = ctx.args.get(spec.name_arg_index) else { return };
-        let names = arg.string_values.clone();
+    fn record_plugin_loads(
+        &mut self,
+        method: &str,
+        node: Node<'a>,
+        invocant_node: Option<Node<'a>>,
+    ) {
+        let Some(spec) = self.load_manifest.get(method).cloned() else { return };
+        let args_flat = self.flat_call_args(self.extract_call_args(node));
+        let Some(arg_node) = args_flat.get(spec.name_arg_index).copied() else { return };
+        let names = self.arg_info_for(arg_node).string_values;
         if names.is_empty() {
             return;
         }
         // Skip a load on a receiver KNOWN to be a different concrete
         // class — the only confident negative we have at walk time
         // (the app receiver is param-typed, hence None here).
-        if let Some(InferredType::ClassName(c)) = &ctx.receiver_type {
-            if c != &spec.receiver_class
-                && !self.package_isa_local(c, &spec.receiver_class)
+        if let Some(InferredType::ClassName(c)) =
+            invocant_node.and_then(|n| self.invocant_type_at_node(n))
+        {
+            if c != spec.receiver_class
+                && !self.package_isa_local(&c, &spec.receiver_class)
             {
                 // an untyped/None receiver still records; a confirmed
                 // foreign class does not. cross-file isa isn't available
                 // at build, so this only fires on a locally-known class.
-                if self.package_parents.contains_key(c) {
+                if self.package_parents.contains_key(&c) {
                     return;
                 }
             }
         }
-        let config_span = ctx.args.get(spec.name_arg_index + 1).map(|a| a.span);
+        // Emit the config value's Expr witness so a cross-file
+        // `expr_type_at_span(config_span)` (the loader-config `$conf`
+        // join in `record_loader_shapes`) resolves the value's shape.
+        let config_span = match args_flat.get(spec.name_arg_index + 1) {
+            Some(&cfg) => {
+                self.emit_expr_witness(cfg);
+                Some(node_to_span(cfg))
+            }
+            None => None,
+        };
         for n in names {
             if n.is_empty() {
                 continue;
@@ -3245,14 +3149,12 @@ impl<'a> Builder<'a> {
     fn apply_emit_action(&mut self, plugin_id: String, action: plugin::EmitAction) {
         let ns = Namespace::framework(plugin_id.clone());
         match action {
-            // Topic-route base write: the plugin parsed its own
-            // `->to('ctrl#…')` on its declared base-setter verb; core
-            // just stores the result on the innermost open frame.
-            plugin::EmitAction::SetRouteBase { controller } => {
-                if let Some(frame) = self.lite_brand.last_mut() {
-                    *frame = Some(controller);
-                }
-            }
+            // SetRouteBase is meaningful only in the fold-phase pattern
+            // dispatch, where the driver intercepts it before
+            // `apply_emit_action` to update the replayed topic base; a
+            // walk-phase SetRouteBase has no live stack to write and is
+            // ignored.
+            plugin::EmitAction::SetRouteBase { .. } => {}
             plugin::EmitAction::Diagnostic {
                 message,
                 span,
@@ -6014,7 +5916,7 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// Flatten a DSL call's args to `(name, span)` for `CallContext::arg_names`.
+    /// Flatten a DSL call's args to `(name, span)` for the `list` projection.
     /// Like `cst::string_list` but with a DSL-arg fold: an `autoquoted_bareword`
     /// is a grammar-certified fat-comma key (its value IS its text, never a
     /// constant lookup); a plain `bareword` / `@array` is a genuine value and
@@ -8093,55 +7995,13 @@ impl<'a> Builder<'a> {
                         _ => {}
                     }
                 }
-
-                // Framework plugin dispatch for function calls. Mirrors
-                // the method-call path so plugins (e.g. Mojolicious::Lite
-                // routes: `get '/path' => sub {}`) get the same
-                // trigger/ctx/EmitAction flow as method-call plugins.
-                if !self.plugins.is_empty() {
-                    let args_raw = self.extract_call_args(node);
-                    let func_name_span = node_to_span(func_node);
-                    let mut ctx = self.base_call_context(
-                        args_raw,
-                        node_to_span(node),
-                        func_name_span,
-                    );
-                    ctx.call_kind = plugin::CallKind::Function;
-                    ctx.function_name = Some(name.to_string());
-                    // The verb vocabulary is the plugin's (`arg_name_verbs`),
-                    // not core's: when an applicable plugin registered this
-                    // name, hand over the flat `cst::string_list` of args.
-                    let wants_names = {
-                        let query = plugin::TriggerQuery {
-                            package_uses: &ctx.current_package_uses,
-                            package_parents: &ctx.current_package_parents,
-                        };
-                        self.plugins.wants_arg_names(&query, name)
-                    };
-                    if wants_names {
-                        ctx.arg_names = self.extract_arg_name_list(node
-                            .child_by_field_name("arguments")
-                            .unwrap_or(node));
-                        // Moo/Moose `has`/`option`: `has_options` carries the
-                        // non-pair head (attr names + resolved isa). The plugin
-                        // pairs the option tail itself via `classified_pairs`
-                        // over the flattened args. Scoped by framework mode.
-                        if let Some(mode) = self.current_package.as_ref()
-                            .and_then(|pkg| self.framework_modes.get(pkg).copied())
-                        {
-                            if let Some(opts) = self.extract_has_options(node, mode) {
-                                ctx.has_options = Some(opts);
-                            }
-                        }
-                    }
-                    self.dispatch_function_call_plugins(ctx);
-                }
             }
         }
         // A topic-route DSL's scope function (`group { … }` in lite)
-        // brackets the implicit base: push a copy of the current frame,
-        // restore after the block — a base set inside applies only
-        // within. The function's NAME comes from the plugin manifest.
+        // brackets the implicit base. The span is recorded so the
+        // fold-phase pattern dispatch replays the topic-route base
+        // stack in document order. The function's NAME comes from the
+        // plugin manifest.
         let lite_group = self
             .active_topic_dsl()
             .map(|d| d.group_fn.clone())
@@ -8151,14 +8011,9 @@ impl<'a> Builder<'a> {
                     == Some(g.as_str())
             });
         if lite_group {
-            let cur = self.lite_brand.last().cloned().flatten();
-            self.lite_brand.push(cur);
             self.topic_group_spans.push(node_to_span(node));
         }
         self.visit_children(node);
-        if lite_group {
-            self.lite_brand.pop();
-        }
         // If `modifier_invocant_pos` wasn't consumed by a nested `visit_anonymous_sub`
         // (malformed or modifier-without-sub-body code), clear it so it doesn't leak
         // to the next anonymous sub in the file.
@@ -10060,107 +9915,11 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Walk a `has` call into its non-pair head — the `HasOptions` the moo
-    /// plugin reads (attr name(s) + resolved `isa` type). The accessor
-    /// options are read by the plugin itself via `classified_pairs` over the
-    /// flattened args; core only resolves `isa` here. Core owns the node walk
-    /// (rule #1); the plugin owns the keyword vocabulary. `isa` is the one
-    /// type-semantic field core still resolves (roadmapped to move out); the
-    /// default accessor / isa / constructor-key synthesis stays native in
-    /// `visit_has_call`.
-    fn extract_has_options(
-        &mut self,
-        node: Node<'a>,
-        mode: FrameworkMode,
-    ) -> Option<plugin::HasOptions> {
-        // Mojo::Base has no accessor-option vocabulary — its `has` is just
-        // getter/setter + default value, all native.
-        if mode == FrameworkMode::MojoBase {
-            return None;
-        }
-        let args = node.child_by_field_name("arguments")?;
-        let args_children: Vec<Node> = if matches!(args.kind(), "list_expression" | "parenthesized_expression") {
-            (0..args.child_count()).filter_map(|i| args.child(i)).collect()
-        } else {
-            vec![args]
-        };
-
-        let mut attr_names: Vec<(String, Span)> = Vec::new();
-        let mut first_named_idx: Option<usize> = None;
-        for (idx, child) in args_children.iter().enumerate() {
-            if !child.is_named() { continue; }
-            first_named_idx = Some(idx);
-            match child.kind() {
-                "string_literal" | "interpolated_string_literal" => {
-                    if let Some(text) = self.extract_string_content(*child) {
-                        if !text.starts_with('+') {
-                            attr_names.push((text, self.string_content_span(*child)));
-                        }
-                    }
-                }
-                "bareword" | "autoquoted_bareword" => {
-                    if let Ok(text) = child.utf8_text(self.source) {
-                        attr_names.push((text.to_string(), node_to_span(*child)));
-                    }
-                }
-                // Literal arrayref (`has ['a','b']`) or a ref to a constant
-                // array (`has \@attrs` where `my @attrs = qw/.../`) flatten
-                // through the constant-fold seam: `extract_array_attr_names`
-                // → `string_list` resolves `\@attrs` against the constant table.
-                // NOT a bare `has @attrs` — that SPLATS the array into the call
-                // (`has 'a', 'b', is => …`), a different declaration entirely,
-                // so the `array` node is intentionally excluded. A non-constant
-                // arrayref folds to nothing and stays unclaimed.
-                "anonymous_array_expression" | "refgen_expression" => {
-                    self.extract_array_attr_names(*child, &mut attr_names);
-                }
-                _ => {}
-            }
-            break;
-        }
-
-        if attr_names.is_empty() { return None; }
-
-        // Scan the option tail for `isa` — the one Moo-semantic field core
-        // resolves to an `InferredType` (roadmap: move onto the
-        // type_constraint seam). The plugin reads the full option set via the
-        // shared `classified_pairs` over the flattened args. `saw_option`
-        // gates the result: no options → no `has_options` (a bare `has 'x'`
-        // is all native getter).
-        let mut isa_value: Option<String> = None;
-        let mut isa_value_node: Option<Node<'a>> = None;
-        let mut saw_option = false;
-        if let Some(first) = first_named_idx {
-            let rest = &args_children[first + 1..];
-            for (k_node, v_node) in self.has_option_pair_nodes(rest) {
-                let Some(key) = self.extract_node_string(k_node) else { continue };
-                saw_option = true;
-                if key == "isa" {
-                    if isa_value.is_none() { isa_value = self.extract_node_string(v_node); }
-                    if isa_value_node.is_none() { isa_value_node = Some(v_node); }
-                }
-            }
-        }
-
-        if !saw_option { return None; }
-
-        let isa_type = isa_value
-            .as_deref()
-            .and_then(|isa| self.map_isa_to_type(isa, mode))
-            .or_else(|| {
-                let n = isa_value_node?;
-                self.emit_expr_witness(n);
-                self.bag_query_expr_span(node_to_span(n))?.constrained_inner().cloned()
-            });
-
-        Some(plugin::HasOptions { attr_names, isa_type })
-    }
-
-    /// The `isa` option's resolved type in a `has`-style option tail —
-    /// the projection-era slice of `extract_has_options` (same key scan,
-    /// same string-vocabulary + constraint-fold resolution), taking the
-    /// ARGUMENTS node directly so the pattern dispatcher can project it
-    /// per matched capture. Falls back to `Moo` when the match-site
+    /// The `isa` option's resolved type in a `has`-style option tail
+    /// (the `isa` projection): the string-vocabulary + constraint-fold
+    /// resolution over the option pairs, taking the ARGUMENTS node
+    /// directly so the pattern dispatcher can project it per matched
+    /// capture. Falls back to `Moo` when the match-site
     /// package has no recorded framework mode (a `Dancer2::Plugin` /
     /// `MooX::Options` package whose `has` is still Moo-backed).
     pub(crate) fn isa_type_in_option_tail(&mut self, args_node: Node<'a>) -> Option<InferredType> {
@@ -11107,77 +10866,13 @@ impl<'a> Builder<'a> {
         // span; the post-walk pass joins refs to args via that
         // span.
 
-        // Framework plugin dispatch. Runs after native handlers so plugin
-        // emissions are purely additive — a third-party plugin targeting
-        // `->on()` can't accidentally break DBIC `->add_columns()`.
-        if !self.plugins.is_empty() {
-            if let Some(ref name) = method_name {
-                let mut ctx = self.base_call_context(
-                    args.clone(),
-                    node_to_span(node),
-                    method_name_span,
-                );
-                ctx.call_kind = plugin::CallKind::Method;
-                ctx.method_name = Some(name.clone());
-                // The class-level-call fact declaration DSLs gate on.
-                ctx.receiver_is_package = is_pkg_call;
-                ctx.receiver_text = invocant_text.clone();
-                ctx.receiver_type = self.receiver_type_for(invocant_node);
-                // The receiver's call name is a generic syntax fact —
-                // set unconditionally so plugins can match their own
-                // DSL verbs (mojo-routes' base-setter) whatever the
-                // receiver's type resolved to.
-                if let Some(inv) = invocant_node {
-                    ctx.receiver_call_name = self.invocant_call_name(inv);
-                }
-                if let Some(InferredType::BrandedRoute { controller, stash, .. }) =
-                    &ctx.receiver_type
-                {
-                    let mut defaults: Vec<(String, String)> = stash.clone();
-                    if let Some(c) = controller {
-                        defaults.push(("controller".to_string(), c.clone()));
-                    }
-                    ctx.receiver_route_defaults = defaults;
-                }
-                // Topic-route spelling: the receiver is a DSL verb CALL
-                // (`get('/x')->to('#action')`) — no variable, so the
-                // implicit base lives on the walk's stack. Fills the
-                // controller default only when the brand didn't carry
-                // one; which names count is the plugin manifest's call.
-                if ctx
-                    .receiver_route_defaults
-                    .iter()
-                    .all(|(k, _)| k != "controller")
-                {
-                    if let (Some(dsl), Some(callee)) =
-                        (self.active_topic_dsl(), ctx.receiver_call_name.as_deref())
-                    {
-                        if dsl.verbs.iter().any(|v| v == callee) {
-                            if let Some(c) = self.lite_brand.last().cloned().flatten() {
-                                ctx.receiver_route_defaults
-                                    .push(("controller".to_string(), c));
-                            }
-                        }
-                    }
-                }
-                // Flat arg-names for registered verbs (the DBIC plugin
-                // reads columns/relationship names off `ctx.arg_names`).
-                let wants_names = {
-                    let query = plugin::TriggerQuery {
-                        package_uses: &ctx.current_package_uses,
-                        package_parents: &ctx.current_package_parents,
-                    };
-                    self.plugins.wants_arg_names(&query, name)
-                };
-                if wants_names {
-                    if let Some(args_node) = node.child_by_field_name("arguments") {
-                        ctx.arg_names = self.extract_arg_name_list(args_node);
-                    }
-                }
-                self.record_provisional_dispatch(name, &ctx);
-                self.record_plugin_loads(name, &ctx);
-                self.dispatch_method_call_plugins(ctx);
-            }
+        // Trigger-independent manifest recording (dispatch verbs,
+        // module loads). Runs for every method call, gated cheaply by
+        // the per-verb manifest probe inside each recorder — no arg
+        // extraction happens for non-manifest verbs.
+        if let Some(ref name) = method_name {
+            self.record_provisional_dispatch(name, node, invocant_node);
+            self.record_plugin_loads(name, node, invocant_node);
         }
 
         self.visit_children(node);
@@ -13109,89 +12804,6 @@ impl<'a> Builder<'a> {
                 self.method_call_invocant.insert(i, class);
             }
         }
-    }
-
-    /// Post-fold: re-dispatch the route plugins for every `->to(...)`
-    /// call now that the receiver's `BrandedRoute` has resolved.
-    ///
-    /// Walk-time plugin dispatch can't resolve a partial
-    /// `->to('#action')` — the inherited controller rides the chain
-    /// brand, which only settles during the worklist fold (variable
-    /// TCs, chained-method types). So the partial emits NOTHING at walk
-    /// time and we re-run the route `on_method_call` here with the
-    /// brand flattened into `ctx.receiver_route_defaults`. Full forms
-    /// (`->to('ctrl#act')`) already emitted at walk time and are kept
-    /// out by `method_call_ref_dedup` / the Handler dedup, so the
-    /// re-run is purely additive for the partials it newly resolves.
-    ///
-    /// This is the consumer side of the brand-on-the-value design
-    /// (`docs/adr/route-branding.md`). The
-    /// brand itself is produced in `invocant_type_at_node`'s route
-    /// arm; this pass turns a resolved brand into the cross-file
-    /// MethodCallRef a partial target needs.
-    fn emit_partial_route_targets(&mut self, idx: &ChainTypingIndex<'a>) {
-        if self.plugins.is_empty() {
-            return;
-        }
-        // Snapshot the `->to` call nodes first; dispatching borrows
-        // `self` mutably.
-        let to_calls: Vec<Node<'a>> = idx
-            .method_call_nodes
-            .iter()
-            .copied()
-            .filter(|n| {
-                n.child_by_field_name("method")
-                    .and_then(|m| m.utf8_text(self.source).ok())
-                    == Some("to")
-            })
-            .collect();
-
-        // The walk's scope stack is empty post-walk; emission helpers
-        // (`current_scope`) expect one entry. Seed it with the file
-        // root for the whole pass; the per-node scope is set below.
-        let root_scope = self.scopes.first().map(|s| s.id).unwrap_or(ScopeId(0));
-        self.scope_stack.push(root_scope);
-
-        for node in to_calls {
-            let invocant_node = node.child_by_field_name("invocant");
-            // Restore the package + scope context for this node —
-            // post-walk both are stale (the walk left them at the last
-            // package/scope it visited).
-            let saved_pkg = self.current_package.clone();
-            self.current_package = self.package_for_node(node);
-            let node_scope = self.scope_at_point(node.start_position());
-            *self.scope_stack.last_mut().unwrap() = node_scope;
-
-            let recv_ty = self.receiver_type_for(invocant_node);
-            // Only re-dispatch when the receiver actually carries an
-            // inherited brand — a full-form `->to('ctrl#act')` on an
-            // unbranded root has nothing new to add and already
-            // emitted at walk time.
-            if let Some(InferredType::BrandedRoute { controller, stash, .. }) = &recv_ty {
-                let mut defaults: Vec<(String, String)> = stash.clone();
-                if let Some(c) = controller {
-                    defaults.push(("controller".to_string(), c.clone()));
-                }
-                let method_name_span = node
-                    .child_by_field_name("method")
-                    .map(node_to_span)
-                    .unwrap_or_else(|| node_to_span(node));
-                let args_raw = self.extract_call_args(node);
-                let mut ctx =
-                    self.base_call_context(args_raw, node_to_span(node), method_name_span);
-                ctx.call_kind = plugin::CallKind::Method;
-                ctx.method_name = Some("to".to_string());
-                ctx.receiver_text = invocant_node
-                    .and_then(|n| n.utf8_text(self.source).ok())
-                    .map(|s| s.to_string());
-                ctx.receiver_type = recv_ty;
-                ctx.receiver_route_defaults = defaults;
-                self.dispatch_method_call_plugins(ctx);
-            }
-
-            self.current_package = saved_pkg;
-        }
-        self.scope_stack.pop();
     }
 
     /// Post-walk: emit even-position stringy args of every resolved

@@ -5973,8 +5973,8 @@ helper foo => sub {};
 
 /// mojo-lite: top-level route verbs (`get`, `post`, etc.) register
 /// Handlers keyed by URL path, with ["url_for"] as the dispatcher so
-/// `url_for('/users')` can find them. Exercises the on_function_call
-/// plugin hook that mojo-events doesn't use.
+/// `url_for('/users')` can find them. Exercises the function-call
+/// pattern shape that mojo-events doesn't use.
 #[test]
 fn plugin_mojo_lite_registers_handlers_for_routes() {
     let src = r#"

@@ -488,8 +488,6 @@ fn check_plugin_file(path: &Path) -> CheckReport {
             // doesn't expose them publicly. Scan for `fn on_*`.
             for hook in &[
                 "on_match",
-                "on_function_call",
-                "on_method_call",
                 "on_use",
                 "on_signature_help",
                 "on_completion",
@@ -577,11 +575,20 @@ fn lint_source(source: &str, report: &mut CheckReport) {
         report.warnings.push("no `fn triggers()` defined".to_string());
     }
     // No emit or query hook present at all → plugin does nothing.
-    let has_any_hook = ["on_match", "on_function_call", "on_method_call", "on_use", "on_signature_help", "on_completion"]
+    let has_any_hook = ["on_match", "on_use", "on_signature_help", "on_completion"]
         .iter()
         .any(|h| source.contains(&format!("fn {}", h)));
     if !has_any_hook {
         report.warnings.push("no hook function defined — plugin will load but produce no emissions".to_string());
+    }
+    // The legacy per-call-site hooks are no longer dispatched.
+    for legacy in ["on_function_call", "on_method_call"] {
+        if source.contains(&format!("fn {}", legacy)) {
+            report.warnings.push(format!(
+                "fn {legacy} is no longer dispatched — port to patterns() + on_match \
+                 (see docs/prompt-plugin-queries.md)"
+            ));
+        }
     }
 }
 
@@ -841,14 +848,14 @@ mod tests {
             r#"
                 fn id() { "demo" }
                 fn triggers() { [ #{ Always: () } ] }
-                fn on_function_call(ctx) { [] }
+                fn on_use(ctx) { [] }
             "#,
             ".rhai",
         );
         let report = check_plugin_file(&path);
         assert!(report.is_ok(), "expected ok, got errors: {:?}", report.errors);
         assert_eq!(report.plugin_id.as_deref(), Some("demo"));
-        assert!(report.hooks.iter().any(|h| h == "on_function_call"));
+        assert!(report.hooks.iter().any(|h| h == "on_use"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -882,7 +889,7 @@ mod tests {
             r#"
                 fn id() { "demo" }
                 fn triggers() { [] }
-                fn on_function_call(ctx) {
+                fn on_completion(ctx) {
                     let s = ctx.call_span;
                     []
                 }
@@ -916,17 +923,39 @@ mod tests {
             r#"
                 fn id() { "widget" }
                 fn triggers() { [ #{ Always: () } ] }
-                fn on_function_call(ctx) {
-                    if ctx.function_name != "widget" { return []; }
-                    if ctx.args.len() < 1 { return []; }
-                    let arg0 = ctx.args[0];
-                    if arg0.string_value == () { return []; }
+                fn patterns() {
+                    [
+                        #{
+                            name: "widget_call",
+                            query: `
+([
+  (function_call_expression
+    function: (_) @fname
+    arguments: (list_expression . (_) @arg)) @call
+  (function_call_expression
+    function: (_) @fname
+    arguments: [(string_literal) (autoquoted_bareword) (bareword)] @arg) @call
+]
+(#eq? @fname "widget"))
+`,
+                            projections: #{ arg: ["str"] },
+                            expect: [
+                                #{ src: "widget('x');", matches: 1, captures: #{ arg: "x" } },
+                            ],
+                        }
+                    ]
+                }
+                fn on_match(pattern, m) {
+                    let arg = m.captures.arg;
+                    if arg == () { return []; }
+                    let name = arg.str;
+                    if name == () { return []; }
                     [
                         #{
                             Method: #{
-                                name: arg0.string_value,
-                                span: ctx.call_span,
-                                selection_span: ctx.selection_span,
+                                name: name,
+                                span: m.span,
+                                selection_span: m.span,
                                 params: [],
                                 is_method: false,
                                 return_type: (),

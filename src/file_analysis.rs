@@ -2131,7 +2131,7 @@ impl InferredType {
     /// (rule #10): a partial `->to('#action')` consumer asks the
     /// receiver value what controller is in force; it never inspects
     /// the chain shape. The build-time consumer reads the flattened
-    /// `CallContext.receiver_route_defaults`; this is the query-time
+    /// `route_defaults` projection; this is the query-time
     /// surface for cursor-time stash lookups (hover/completion), which
     /// aren't wired yet — hence `allow(dead_code)`.
     #[allow(dead_code)]
@@ -9626,7 +9626,7 @@ impl FileAnalysis {
                 // (locally or via a cross-file import) to a ClassName
                 // return type when called with zero args, treat the
                 // bareword as the call and use that class. Mirrors the
-                // same rule in `receiver_type_for` and
+                // same rule in `invocant_type_at_node` and
                 // `resolve_invocant_class_tree`.
                 let bare = split_qualified(invocant).1;
                 if let Some(InferredType::ClassName(c)) =

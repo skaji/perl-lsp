@@ -335,6 +335,24 @@ impl<'a> Builder<'a> {
                         let match_scope = self.scope_at_point(mspan.start);
                         self.scope_stack.push(match_scope);
                         for a in actions {
+                            // A loader's config value must carry an Expr
+                            // witness at `config_span` so a cross-file
+                            // `expr_type_at_span` (the `$conf` join in
+                            // `record_loader_shapes`) resolves its shape.
+                            // The captured node lives in `caps`; emit for
+                            // it, mirroring the method-form recorder.
+                            if let plugin::EmitAction::PluginLoad {
+                                config_span: Some(cfg),
+                                ..
+                            } = &a
+                            {
+                                if let Some((_, node)) = caps
+                                    .iter()
+                                    .find(|(_, n)| node_to_span(*n) == *cfg)
+                                {
+                                    self.emit_expr_witness(*node);
+                                }
+                            }
                             if let (
                                 Some(g),
                                 plugin::EmitAction::DispatchCall {
@@ -384,8 +402,8 @@ impl<'a> Builder<'a> {
     ///     later matches' `route_defaults` projections.
     ///   - The topic-route base is REPLAYED: the walk recorded group
     ///     scopes (`topic_group_spans`); a base set inside a group
-    ///     restores when the replay passes the group's end — same
-    ///     semantics the walk's `lite_brand` stack had.
+    ///     restores when the replay passes the group's end — the
+    ///     group-scoped push/pop semantics of a topic-DSL base.
     ///   - `SetRouteBase` emissions update the replay base instead of
     ///     the (stale) walk stack.
     ///   - Single pass, no gating fixed point: fold emissions don't

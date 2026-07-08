@@ -817,10 +817,63 @@ wants the same `expect` discipline, and per-code opt-in/opt-out should
 join the `DiagnosticOptions` schema rather than growing a parallel
 config surface (`docs/prompt-config-schema.md`).
 
+### Round 8: phase 4 — the deletion
+
+With every bundled plugin on patterns, the legacy per-call pre-capture
+was exercised by nothing and deleted:
+
+- **Gone from `builder.rs`:** `dispatch_function_call_plugins` /
+  `dispatch_method_call_plugins`, `base_call_context` (the eager
+  per-arg `ArgInfo` build that ran for every call in every file),
+  `extract_has_options`, `receiver_type_for`, `emit_partial_route_targets`
+  (its job is the fold-phase pattern dispatch now), the `lite_brand`
+  topic-base stack, and the two `on_*_call` dispatch blocks in
+  `visit_function_call` / `visit_method_call`. `SetRouteBase` at the
+  walk phase is now a no-op (the fold-phase driver intercepts it).
+- **Gone from `plugin/mod.rs` + `rhai_host.rs`:** the `on_function_call`
+  / `on_method_call` trait methods and their Rhai impls, `CallContext`,
+  `CallKind`, `HasOptions`, the `arg_name_verbs()` manifest, and
+  `PluginRegistry::wants_arg_names`. `ArgInfo` / `ValueShape` stay
+  (the projection engine + `CaptureData` use them).
+- **`plugin_cli.rs`:** `on_function_call` / `on_method_call` dropped
+  from the hook lists; a script still defining them now gets a
+  "no longer dispatched — port to patterns() + on_match" warning.
+
+The recorder refactor: `record_provisional_dispatch` (dispatch verbs)
+and `record_plugin_loads` (module loads) are the two trigger-independent
+manifest paths that survive without `CallContext`. Each now probes its
+manifest FIRST — the cheap gate — and extracts only what it reads
+(the flat arg at `name_arg_index` via `arg_info_for`, the receiver type
+via `invocant_type_at_node(invocant_node)`) only for a manifest hit. No
+arg extraction happens for the ~99.9% of calls whose verb isn't in a
+manifest. The loader's config-value `Expr(span)` witness (read
+cross-file by `record_loader_shapes` via `expr_type_at_span`) — formerly
+a side effect of the eager `base_call_context` per-arg walk — is now
+emitted explicitly where the load is recorded: `record_plugin_loads`
+for the method form, and the pattern driver for the function form
+(mojo-lite's `plugin_load` PluginLoad emission).
+
+Timings (`--check gold-corpus/local/lib/perl5 --timings`, cold cache,
+3443 modules, 3 runs each):
+
+| run | baseline (ms) | after (ms) |
+|-----|--------------:|-----------:|
+| 1   | 38680.1       | 33413.9    |
+| 2   | 34208.8       | 34015.5    |
+| 3   | 34104.1       | 33519.4    |
+| **median** | **34208.8** | **33519.4** |
+
+~2% faster at the median; the pre-capture cost was real but modest
+(one merged query pass already replaced the per-node dispatch
+bookkeeping in phases 0–3, so phase 4 removed the residual per-arg
+`ArgInfo` build, not a dominant cost center). Full `cargo test` green
+(1318 unit + 12 integration), gold harness FAIL 0 / XPASS 0 / CRASH 0,
+`--plugin-check` clean on all bundled plugins, plugin pattern stats
+unchanged.
+
 Deliberately not spiked (unchanged design claims): the `pairs`
-projection, per-language merged queries (the spike compiles one query
-per pattern spec), and the phase-4 deletion of the legacy dispatch
-machinery.
+projection, and per-language merged queries (the spike compiles one
+query per pattern spec).
 
 ## 14. Open questions (deliberately deferred)
 

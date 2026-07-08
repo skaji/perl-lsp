@@ -43,12 +43,6 @@ pub fn default_plugin_registry() -> std::sync::Arc<PluginRegistry> {
 
 // ---- Context snapshots passed to plugins ----
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CallKind {
-    Function,
-    Method,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArgInfo {
     /// Raw source text of the argument node.
@@ -129,86 +123,6 @@ pub struct ArgInfo {
     pub ref_sub_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CallContext {
-    pub call_kind: CallKind,
-    /// For `function_call_expression`: the callee name (e.g. `"has"`,
-    /// `"__PACKAGE__->add_columns"`). For method calls: `None`.
-    pub function_name: Option<String>,
-    /// For method calls: the method identifier (e.g. `"on"`).
-    pub method_name: Option<String>,
-    /// Raw text of receiver (`$self`, `__PACKAGE__`, etc.). Methods only.
-    pub receiver_text: Option<String>,
-    /// When the receiver is itself a CALL (`get('/x')->to(...)`), the
-    /// called function's name — a generic syntax fact, so plugins can
-    /// match their own DSL verbs without core knowing any names.
-    #[serde(default)]
-    pub receiver_call_name: Option<String>,
-    /// Resolved receiver type if inference succeeded.
-    pub receiver_type: Option<InferredType>,
-    /// Route defaults inherited by the receiver value, flattened to a
-    /// `[[key, value], ...]` list the Rhai side can read directly
-    /// (`controller` is the distinguished key). Filled from the
-    /// receiver's `InferredType::BrandedRoute` brand by the builder so
-    /// a partial `->to('#action')` plugin can recover the inherited
-    /// controller without inspecting the enum's serde shape. Empty for
-    /// non-route receivers. See `docs/adr/route-branding.md`.
-    #[serde(default)]
-    pub receiver_route_defaults: Vec<(String, String)>,
-    pub args: Vec<ArgInfo>,
-    pub call_span: Span,
-    pub selection_span: Span,
-    pub current_package: Option<String>,
-    pub current_package_parents: Vec<String>,
-    pub current_package_uses: Vec<String>,
-    /// Structurally-extracted Moo/Moose `has` options, present ONLY on the
-    /// `has` function call. The builder walks the option nodes (rule #1) and
-    /// hands the plugin the decision-ready shape — attribute name(s), the
-    /// resolved `isa` type, and each accessor option keyword with its value
-    /// already classified (shorthand `=> 1` vs explicit name vs `handles`
-    /// delegation pairs). The plugin owns the *vocabulary*: which keyword
-    /// synthesizes which method-name pattern and return behavior. See
-    /// `frameworks/moo.rhai`. `None` for every other call.
-    #[serde(default)]
-    pub has_options: Option<HasOptions>,
-    /// The call's positional args as a flat `(name, span)` string list —
-    /// string-literal content, barewords, autoquoted keys, `qw(...)`
-    /// words, foldable constants; non-string args (hashrefs, coderefs)
-    /// carry no name. Via `cst::string_list` (rule #1), so a list-DSL
-    /// plugin reads its column / export names tree-free. Populated only
-    /// for verbs a plugin registered via [`FrameworkPlugin::arg_name_verbs`].
-    #[serde(default)]
-    pub arg_names: Vec<(String, Span)>,
-    /// True when a method call's receiver is the current package itself
-    /// (`__PACKAGE__->m(...)` / `CurrentClass->m(...)`) — a class-level
-    /// call. Class-declaration DSLs (`add_columns`, `load_components`)
-    /// gate on it: an instance call (`$rs->add_columns(...)`) is a runtime
-    /// op, not a declaration. False for function calls.
-    #[serde(default)]
-    pub receiver_is_package: bool,
-}
-
-/// A Moo/Moose `has` declaration's non-pair head: the attribute name(s)
-/// and the resolved `isa` type. The accessor *options* are read by the
-/// plugin itself via the shared `classified_pairs` over the flattened args.
-///
-/// `isa_type` is the one Moo-semantic field core resolves (`'Str'` →
-/// `String`, `"InstanceOf['X']"` → `InstanceOf`). Moving it onto the
-/// `type_constraint_*` seam — after which this struct dissolves entirely —
-/// is roadmapped.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HasOptions {
-    /// `(attribute_name, name_token_span)` — one per attr (`has [qw/a b/]`
-    /// declares several). The span is the synthesized method's
-    /// selection_span so goto-def lands on the `has` line.
-    pub attr_names: Vec<(String, Span)>,
-    /// The attribute's resolved `isa` type, if any. When this is a
-    /// `ClassName`, a `handles` delegation can edge the delegated method's
-    /// return to the remote method on that class.
-    #[serde(default)]
-    pub isa_type: Option<InferredType>,
-}
-
 /// The classified shape of a fat-comma pair's value — generic, no DSL
 /// vocabulary; the plugin maps `(keyword, shape)` to behavior. Every
 /// variant carries data so it serializes to a single-key map: Rhai reads
@@ -273,7 +187,7 @@ impl From<EmittedParam> for ParamInfo {
     }
 }
 
-/// What a plugin's emit hook can contribute to the builder.
+/// What a plugin's `on_use` / `on_match` hooks can contribute to the builder.
 ///
 /// Two classes of action live in this enum; the distinction matters
 /// when adding a new variant.
@@ -800,9 +714,9 @@ pub struct CaptureData {
     /// literal.
     #[serde(default)]
     pub content_span: Option<Span>,
-    /// Projection `ty` — the node's resolved type (receiver typing:
-    /// same dispatch as `CallContext.receiver_type`). Named `ty`, not
-    /// `type`, to stay clear of Rhai reserved words.
+    /// Projection `ty` — the node's resolved type (receiver typing via
+    /// the bag query at the node's span). Named `ty`, not `type`, to
+    /// stay clear of Rhai reserved words.
     #[serde(rename = "ty", default)]
     pub inferred_type: Option<InferredType>,
     /// Projection `shape` — one-level value-shape classification.
@@ -817,9 +731,8 @@ pub struct CaptureData {
     pub callable_return_edge: Option<crate::witnesses::WitnessAttachment>,
     /// Projection `list` — the node's flat `(name, span)` string list
     /// (string-literal content, barewords, autoquoted keys, `qw` words,
-    /// foldable constants; hashrefs/coderefs carry no name). The
-    /// pattern-era replacement for `CallContext.arg_names` /
-    /// `arg_name_verbs`.
+    /// foldable constants; hashrefs/coderefs carry no name). A list-DSL
+    /// plugin reads its column / export names tree-free.
     #[serde(default)]
     pub list: Vec<(String, Span)>,
     /// Projection `is_package_receiver` — this node is the current
@@ -919,9 +832,9 @@ pub struct TypeOverride {
 }
 
 /// A plugin-declared "this method dispatches a named handler when its
-/// receiver is a `target_class` (or a subclass)" rule. Unlike the
-/// `on_method_call` emit hook — which fires only when the *file*'s
-/// triggers match and can't see cross-file inheritance — a dispatch verb
+/// receiver is a `target_class` (or a subclass)" rule. Unlike a
+/// trigger-gated pattern — which fires only when the *file*'s triggers
+/// match and can't see cross-file inheritance — a dispatch verb
 /// is resolved at **enrichment** time, against the receiver's actual
 /// (cross-file-resolved) class. So `$minion->enqueue('T')` lights up
 /// wherever a `$minion` typed as a Minion subclass is in scope, no matter
@@ -1097,15 +1010,6 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
-    /// Call verbs (method or function names) whose args this plugin wants
-    /// pre-flattened into `CallContext::arg_names` (and, for `has`/`option`,
-    /// `has_options` resolved). Core runs the `cst::string_list` extraction
-    /// only for verbs an applicable plugin registered, so no DSL verb is
-    /// hardcoded in core (rule #10). Default empty. See `frameworks/dbic.rhai`.
-    fn arg_name_verbs(&self) -> &[String] {
-        &[]
-    }
-
     /// Static role-contract parameter-type manifest — see `ParamType`.
     /// Applied at the sub-declaration walk. Default empty.
     fn param_types(&self) -> &[ParamType] {
@@ -1194,29 +1098,23 @@ pub trait FrameworkPlugin: Send + Sync {
         &[]
     }
 
-    /// Called once per (pattern, match) after the live walk, with the
-    /// projections that pattern declared. Same contract as the emit
-    /// hooks: pure function, returns emissions.
+    /// Called once per (pattern, match) after the live walk (or after
+    /// the fold, for `phase: "fold"` patterns), with the projections
+    /// that pattern declared. Pure function, returns emissions.
     #[allow(unused_variables)]
     fn on_match(&self, pattern: &str, m: &MatchContext) -> Vec<EmitAction> {
         Vec::new()
     }
 
-    // ---- Emit hooks (parse time) ----
+    // ---- Use hook (parse time) ----
     //
-    // Plugin observes a CST event and returns facts to push into the
-    // symbol/ref/namespace tables. Declarative.
+    // Plugin observes a `use` statement and returns facts to push into
+    // the symbol/ref/namespace tables. Declarative. Walk-interleaved so
+    // kit expansion (`SyntheticUse`) precedes framework-gated native
+    // behavior; other call/declaration shapes go through `patterns()`.
 
     #[allow(unused_variables)]
     fn on_use(&self, ctx: &UseContext) -> Vec<EmitAction> {
-        Vec::new()
-    }
-    #[allow(unused_variables)]
-    fn on_function_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
-        Vec::new()
-    }
-    #[allow(unused_variables)]
-    fn on_method_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
         Vec::new()
     }
 
@@ -1549,14 +1447,6 @@ impl PluginRegistry {
                 None
             }
         })
-    }
-
-    /// Does an applicable plugin want `verb`'s args pre-flattened? Gates
-    /// the builder's `cst::string_list` extraction to registered verbs in
-    /// packages where the declaring plugin actually fires.
-    pub fn wants_arg_names(&self, query: &TriggerQuery<'_>, verb: &str) -> bool {
-        self.applicable(query)
-            .any(|p| p.arg_name_verbs().iter().any(|v| v == verb))
     }
 
     /// Return plugins whose triggers match the current package context.
