@@ -1,4 +1,4 @@
-//! The span-free cross-file Surface (`docs/prompt-storage-engine.md`).
+//! The span-free cross-file Surface (`docs/adr/storage-engine.md`).
 //!
 //! A position-independent projection of one file's cross-file-VISIBLE facts.
 //! Equality of two Surfaces means "no cross-file-visible change": a body
@@ -10,7 +10,7 @@
 //! - **No spans, no `Point`s, no byte offsets, no `ScopeId`/`SymbolId`/
 //!   `RefIdx`, anywhere.** Every one of those shifts on unrelated edits.
 //!   The equality tests are the regression net; a field addition without an
-//!   equality test is a review reject (`docs/prompt-storage-engine.md`).
+//!   equality test is a review reject (`docs/adr/storage-engine.md`).
 //! - **Typed fields, not display strings** — `Option<InferredType>`, never
 //!   `"returns Foo"` (rule #10's lossy-string form). File-internal
 //!   attachment identities inside a type (a `CodeRef` body edge) are
@@ -419,7 +419,7 @@ fn surface_fingerprint(s: &Surface) -> u64 {
     w.0.finish()
 }
 
-/// The freshness engine (`docs/prompt-storage-engine.md`): per-file
+/// The freshness engine (`docs/adr/storage-engine.md`): per-file
 /// surface records + a name-keyed reverse-dependency index. The
 /// dependency edge is DECLARED
 /// by the consumer's own surface — file F depends on every name in its

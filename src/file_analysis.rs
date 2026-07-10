@@ -451,7 +451,7 @@ pub trait CrossFileLookup {
         cached.analysis.clone()
     }
     /// A cached WORKSPACE module's analysis with cross-file ENRICHMENT
-    /// applied (`docs/prompt-storage-engine.md` R4, the always-enriched
+    /// applied (`docs/adr/storage-engine.md`, the always-enriched
     /// tier): imported return types propagated, synthetic hash-key defs
     /// injected — derived through the overlay, never in-place. Consumers
     /// are FALLBACK-ON-MISS: call this only after the raw bag answered
@@ -3899,7 +3899,7 @@ pub struct FileAnalysis {
     #[serde(skip, default)]
     refs_evicted: bool,
 
-    /// Symbols twin (`docs/prompt-symbols-relational.md`): `evict_symbols`
+    /// Symbols twin (`docs/adr/relational-ref-index.md`): `evict_symbols`
     /// stripped this copy's `symbols` (+ symbol-keyed rebuilt indexes) after
     /// blob + `syms` rows were persisted. Same lifecycle as the other two
     /// axes; enumeration answers from rows, detail reads rehydrate through
@@ -7679,7 +7679,7 @@ impl FileAnalysis {
     }
 
     /// Project every symbol into its relational row seed
-    /// (`docs/prompt-symbols-relational.md`). A method on the analysis (not
+    /// (`docs/adr/relational-ref-index.md`). A method on the analysis (not
     /// on `Symbol`) because the linkage flag needs the owning scope's kind.
     pub fn sym_row_seeds(&self) -> Vec<SymRowSeed> {
         self.symbols

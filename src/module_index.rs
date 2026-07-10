@@ -375,7 +375,7 @@ pub struct ModuleIndex {
     /// name-keyed views can't reach those, but whole-project sweeps
     /// (`for_each_cached_file`) must.
     all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
-    /// The freshness engine (`docs/prompt-storage-engine.md`):
+    /// The freshness engine (`docs/adr/storage-engine.md`):
     /// per-file span-free surface records + the reverse-dependency index.
     /// Fed at registration (whole copy, pre-strip) and on open-doc
     /// rebuilds; `dirty_consumers` names who must re-enrich after a

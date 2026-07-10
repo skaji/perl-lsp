@@ -2424,7 +2424,7 @@ fn heatmap_symbol_row(
 }
 
 /// --refs-parity <root> — the relational-ref-index migration net
-/// (`docs/prompt-relational-ref-index.md`). Mints the CandidateSet at every
+/// (`docs/adr/relational-ref-index.md`). Mints the CandidateSet at every
 /// heatmap-eligible symbol declaration (Perl workspace + pack files) and
 /// projects `references()` twice — resident scan (`PERL_LSP_REF_ROWS=0`) vs
 /// SQL retrieval (`=1`) — asserting identical (file, span, access,

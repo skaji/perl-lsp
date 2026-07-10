@@ -1,10 +1,9 @@
 # ADR: The relational ref index — SQLite is the reverse index
 
-Status: design (measured — synthetic scale benchmarks + abseil calibration).
-Implementation brief: `docs/prompt-relational-ref-index.md`. Motivating
-measurement: `docs/chromium-scale-analysis.md`. Prior residency work:
-`docs/adr/memory-slice-2-lru.md` (the lifecycle template this design reuses),
-`docs/prompt-bounded-memory.md` (the completeness invariant).
+Motivating measurement: `docs/chromium-scale-analysis.md`. Prior residency
+work: `docs/adr/memory-slice-2-lru.md` (the eviction/rehydration lifecycle
+this design reuses, and the completeness invariant this design's residency
+changes must preserve: residency is bounded, coverage never is).
 
 ## Context: refs are the wall, and the scan is the reason they're pinned
 
@@ -127,10 +126,29 @@ arm whose compare key turns out not to fit this shape uses the rehydration
 fallback until it earns a column — never a second table, never a
 kind-branching schema (rule #10: the shape lives on the value).
 
-Symbol declaration sites (the other half of a `references` answer) stay on
-the resident `symbols` + the name-keyed `all_defs`/`names` reverse indexes in
-phase 1 — they are 1–2 orders of magnitude smaller than refs. Phase 2 gives
-them the same treatment (below).
+Symbol declaration sites (the other half of a `references` answer) get the
+same treatment in a sibling table:
+
+```sql
+CREATE TABLE IF NOT EXISTS syms(
+  file_id   INTEGER NOT NULL,       -- REFERENCES files
+  name_id   INTEGER NOT NULL,       -- strings.str_id
+  kind      INTEGER NOT NULL,       -- SymKind discriminant
+  start_row INTEGER NOT NULL, start_col INTEGER NOT NULL,  -- selection_span
+  end_row   INTEGER NOT NULL, end_col   INTEGER NOT NULL,
+  container_id INTEGER,             -- owning package/class (strings); NULL for free symbols
+  flags     INTEGER NOT NULL        -- bit 0: linkage-visible (scope-kind gate baked in at shred time)
+);
+CREATE INDEX IF NOT EXISTS idx_syms_name ON syms(name_id);
+CREATE INDEX IF NOT EXISTS idx_syms_file ON syms(file_id);
+```
+
+`SymbolId` is not a column: row order within a file is the symbol order,
+and identity across the boundary is `(file, name, kind, span)`, same as
+the refs rows. What a query answers *without* rehydration is a column
+(`workspace/symbol`: name, kind, selection span; registration: name, kind,
+linkage flag); everything else (`SymbolDetail`, deref stacks, attributes,
+full span) stays blob-only and rehydrates.
 
 ## The query path
 
@@ -179,31 +197,51 @@ already-decoded analysis — no separate migration pass, no re-parse.
 
 ## Residency: what leaves, what stays
 
-`FileAnalysis::evict_refs()` mirrors `evict_witness_bag()`: clears `refs`
-(and thereby the rebuilt `refs_by_*` maps), sets a `#[serde(skip)]`
-`refs_evicted` flag; called at the same three register seams, always after
-the blob+rows are persisted. The disk blob keeps full refs — rehydration is
-lossless, and single-file consumers (`applicable_dispatches`' dedupe,
-`--dump`-style inspectors, anything unforeseen) route through a
-`refs_present`-style accessor identical in shape to `bag_present`.
+`FileAnalysis` carries three independent eviction axes — bag
+(`evict_witness_bag`, Slice 2), refs (`evict_refs`), symbols
+(`evict_symbols`) — each the same shape: clear the field(s) (and their
+rebuilt indexes), set a `#[serde(skip)]` `*_evicted` flag, called at the
+register seams always AFTER the blob and rows are persisted. The disk
+blob keeps everything, so rehydration is lossless. Single-axis consumers
+route through the axis's accessor (`bag_present`, `refs_present` —
+resident-if-not-evicted, else rehydrate through the shared blob LRU);
+readers needing more than one axis on the same copy take `whole_present`,
+gated by `is_fully_resident()`.
 
-Pinned resident, per file, after this lands: `symbols` (+ name indexes),
-`include_closure`, `package_parents` / `specializes`, `return_types`,
-`provisional_dispatches`, the small header maps. Open documents keep
-everything, always.
+Registration is REGISTRATION-OWNED: every feed that needs symbol/edge data
+(`ModuleEdgeIndexes::feed`, the class-rank tie-break, the unregister
+inverse list) extracts from the WHOLE analysis, then the axes evict, then
+the stripped `Arc` is stored — never the reverse order, which would feed
+registration from an already-emptied copy. `ModuleEdgeIndexes::feed`
+additionally records each module's indexable-name list at whole-copy feed
+time and replays the record for a stripped copy, so eviction can never
+blank the reverse index (`func → modules`, `find_exporters`).
+
+Pinned resident, per file, across all three axes: `include_closure`,
+`package_parents` / `specializes`, `return_types`, `provisional_dispatches`,
+`export`/`export_ok`, `plugin_namespaces`, `scopes`, the small header maps.
+Open documents keep everything, always.
 
 | Query | Served by |
 |---|---|
 | references / rename / heatmap fan-in | SQL retrieval + row matcher (+ bounded rehydrate) |
-| goto-def / workspace-symbol / implementations | resident symbols + name indexes (unchanged) |
+| goto-def / workspace-symbol / implementations | `syms` rows + name indexes (+ bounded rehydrate for detail) |
 | documentHighlight, completion, hover | open-doc resident (unchanged) |
-| type inference cross-file | witness bag LRU (unchanged, Slice 2) |
+| type inference cross-file | witness bag LRU (Slice 2) / enrichment overlay (`docs/adr/storage-engine.md`) |
 | dispatch (`applicable_dispatches`) | resident `provisional_dispatches`; ref-dedupe via rows or rehydrate |
 
-The completeness invariant (`prompt-bounded-memory.md`) holds with the same
-proof shape as Slice 2: the rows are shredded from the identical post-fold
-refs the blob carries, for every indexed file; the matcher is the same
-predicate over the same facts. Residency changes; coverage cannot.
+Candidate-file discovery (`ref_candidate_files`) UNIONs the `refs` and
+`syms` tables, so a file that only *declares* a name (no ref row) is still
+a backward-walk candidate — references/rename/goto-def never silently
+miss a declaration-only file. `workspace/symbol` composes the resident
+sweeps with a `syms`-table scan (`sym_rows_matching`) for the workspace
+tier.
+
+The completeness invariant (`docs/adr/memory-slice-2-lru.md`) holds with
+the same proof shape as Slice 2: the rows are shredded from the identical
+post-fold refs/symbols the blob carries, for every indexed file; the
+matcher is the same predicate over the same facts. Residency changes;
+coverage cannot.
 
 ## Measured: SQLite at Chromium row counts
 
@@ -253,17 +291,11 @@ Consequences baked into the design:
 
 ## What this buys, honestly
 
-- Resident refs (+ their rebuilt maps) go to zero for non-open files. On
-  abseil that is 72% of the post-Slice-2 payload (177.8 of 246.1 MB);
-  scaling the measured 0.51 MB/file RSS by the payload ratio projects
-  **~0.15–0.2 MB/file → whole-tree Chromium ~20–26 GB** (estimate — the
-  RSS-overhead share of the evicted bucket is not exactly proportional).
-  That clears the 20 GB leash for every corpus we've measured *except*
-  whole-tree Chromium itself, which needs the follow-on phases below —
-  next up: `include_closure` interning (now 14% → ~50% of what remains,
-  the `prompt-bounded-memory.md` Problem-3 item) and relational symbols —
-  to fit comfortably on a 32 GB box. This ADR's seam is what makes those
-  phases incremental instead of another redesign.
+- Resident refs and symbols (+ their rebuilt maps) go to zero for non-open
+  files — the bulk of the post-Slice-2 payload. `include_closure` interning
+  and the symbols shred (schema above) carry the remaining buckets down to
+  the whole-tree Chromium numbers below; this ADR's seam is what makes each
+  addition incremental instead of a redesign.
 - `references`/`rename` stop being O(tree) per query: today's whole-tree
   sweep touches every file's refs on every invocation; the indexed lookup
   touches only matching rows. At abseil scale the resident scan was never
@@ -281,13 +313,13 @@ Consequences baked into the design:
 
 ## Rejected alternatives
 
-- **"Slice 3": evict refs to a byte-capped LRU** (the whole-body-LRU sketch
-  from `prompt-bounded-memory.md` Problem 2). An LRU answers *keyed* lookups
-  cheaply; `references` is an *inverted* lookup. Every query would fan the
-  rehydration across all files that might match — for a hot name, that is
-  the whole tree through a blob-decode funnel (~1.7 ms/file × 131K files ≈
-  minutes, repeatedly). The LRU pattern is right for the bag (keyed by file,
-  queried rarely) and wrong for refs (queried by name, across everything).
+- **Evict refs to a byte-capped LRU**, the same lifecycle Slice 2 uses for
+  the witness bag. An LRU answers *keyed* lookups cheaply; `references` is
+  an *inverted* lookup. Every query would fan the rehydration across all
+  files that might match — for a hot name, that is the whole tree through a
+  blob-decode funnel (~1.7 ms/file × 131K files ≈ minutes, repeatedly). The
+  LRU pattern is right for the bag (keyed by file, queried rarely) and wrong
+  for refs (queried by name, across everything).
 - **Port the matcher into SQL.** The predicate reads cross-file state SQL
   can't see (closure gates, receiver isa-walks through `parents_cached`,
   RoleMask policy) and would become a second implementation of resolution
@@ -304,73 +336,59 @@ Consequences baked into the design:
   lifecycle next to SQLite — which we already ship, already key by file,
   already invalidate correctly, and which measures fast enough (above).
 
-## Phases — as landed (re-scoped by the phase-1 heap dump)
+## Scope
 
-1. **Refs relational** (LANDED) — the shred + retrieval + eviction across
-   pack workspace, Perl @INC, and (with phase 3) Perl workspace tiers.
-   v1 retrieval is *candidate-file discovery*: the indexed SELECT names the
-   files holding matching rows; the UNCHANGED matcher runs over the
-   rehydrated analysis. This trades some hot-name latency (bounded by the
-   blob LRU) for parity-by-construction; the row-level fast path (arms
-   decidable from the qual columns alone) remains the designed optimization
-   inside the same seam.
-2. **Closure interning + streaming warm** (LANDED — measurement replaced
-   the planned symbols shred, which was 9% of payload vs the closure's 47%
-   post-phase-1). `include_closure` is `Vec<Arc<str>>` through a
-   process-global interner; the pack warm path streams one row at a time
-   instead of decoding the whole table before stripping.
-3. **Perl workspace persistence** (LANDED) — `index_workspace_with_index`
-   persists blobs + rows to `modules.db` (`source='workspace'`), warm
-   starts skip re-parsing unchanged files, and Perl workspace copies evict
-   refs + bag like every other tier (hub-side blob LRU; registration
-   projections that read the bag run before the strip; the watcher
-   invalidates a changed file's persisted generation and the resident sweep
-   covers its fresh full copy).
+The shred + retrieval + eviction covers the pack workspace, Perl `@INC`,
+and Perl workspace tiers alike. Retrieval is *candidate-file discovery*:
+the indexed `SELECT` names the files holding matching rows; the matcher
+then runs over the rehydrated analysis for rows it can't decide from the
+qual columns alone. This trades some hot-name latency (bounded by the blob
+LRU) for matcher parity by construction between the row path and the
+resident path; a row-level fast path (deciding straight from the qual
+columns, no rehydrate) is the available optimization inside the same seam
+if that latency ever needs to move.
 
-4. **Symbols relational** (LANDED — `docs/prompt-symbols-relational.md`):
-   `syms` rows (name, kind, selection span, container, flags) join the
-   derived generation; `evict_symbols` is the third eviction axis;
-   candidate discovery UNIONs syms so declaration-only files are
-   backward-walk candidates; workspace/symbol composes resident sweeps +
-   the workspace-tier rows scan; registration is REGISTRATION-OWNED-strip
-   (feeds + name records extracted pre-strip; stripped fresh copies
-   register in the persist writer post-COMMIT).
-5. **Closure representation** (LANDED): `path_intern::ClosureList` —
-   sorted `Arc<[u32]>` over a process-global path-id table (4 B/entry,
-   membership by id binary-search; blob shape unchanged).
+`include_closure` rides a process-global path interner
+(`path_intern::ClosureList` — sorted `Arc<[u32]>` over a path-id table,
+4 B/entry; membership is id binary-search; the blob shape is unchanged).
+The pack warm path streams rows one file at a time instead of decoding a
+whole table before stripping. Perl *workspace* files (not just `@INC`
+dependencies) persist blobs + rows to `modules.db` (`source='workspace'`);
+warm starts skip re-parsing unchanged files, and workspace copies evict
+refs + bag + symbols like every other tier — registration projections that
+read the bag run before the strip, and the watcher invalidates a changed
+file's persisted generation while the resident sweep covers its fresh full
+copy.
 
-Measured after 4+5 (abseil): resident payload 46.1 → **11.2 MB**
-(symbols 21.7 → 0.0, closures 10.8 → 1.8), warm RSS 69 → **47 MB**;
-bugzilla warm 83 → 75 MB. By the chromium bucket shares this projects the
-6.9 GB warm floor to roughly **1.5–2 GB**.
+The register-from-store warm start (the warm-stub lane,
+`warm_pack_stream_with_stubs`; rides the storage-engine Surface —
+`docs/adr/storage-engine.md`) and the row-level matcher fast path above are
+the levers available if index-time or query-time latency ever needs to
+move again.
 
-LANDED since (the warm-stub lane, `warm_pack_stream_with_stubs`): the
-register-from-store warm start (rides the storage-engine Surface — `docs/prompt-storage-engine.md`)
-and the row-level matcher fast path above.
+Measured (abseil, 875 files): resident payload **11.2 MB** (symbols
+0.0 MB, closures 1.8 MB — the residual is `include_directives` strings);
+warm RSS **47 MB**. Bugzilla warm RSS: 75 MB.
 
-**Whole-tree Chromium, measured (all three phases, 4-core/15 GB box):**
-the run the baseline could not finish — killed at 20 GB having indexed
-38K files — completes: **132,659 files, cold index 3 h 02 m wall, peak RSS
-7.3 GB; warm start 9 m 01 s, peak 6.7 GB** (0.05 MB/file — 10× under the
-baseline's 0.51 MB/file slope, ~67 GB projected). The store lands at
-6.1 GB (`modules-cpp.db`): 34.8 M ref rows over 2.16 M interned strings.
-The remaining resident floor is the stripped analyses' symbols/outline
-buckets — the symbols shred (phase 4, landed) moved it next.
+**Whole-tree Chromium** (4-core/15 GB box): **132,659 files, cold index
+3 h 02 m wall, peak RSS 7.3 GB; warm start 9 m 01 s, peak 6.7 GB**
+(0.05 MB/file), well inside the 20 GB guard that caps
+`docs/chromium-scale-analysis.md`'s pre-relational baseline at 38K files.
+The store: `modules-cpp.db` 6.1 GB, 34.8 M ref rows over 2.16 M interned
+strings.
 
-## Migration net
+## Regression net
 
-- **Parity harness (the load-bearing gate):** on a real corpus (abseil),
-  run `refs_to` both ways — resident scan vs SQL retrieval — for every
-  symbol the heatmap enumerates; assert identical `(file, span, access,
-  rewritable)` sets. This is executable because phase 1 keeps the resident
-  path compilable behind the eviction flag (`PERL_LSP_NO_EVICT=1` retains
-  refs, exactly as Slice 2's escape hatch retains bags).
-- The Slice-1/2 completeness anchor stays: `--references` on the abseil
-  symbol whose fan-in includes `_test.cc` files clangd misses — same count,
-  same files, refs evicted.
-- Gold + e2e nets unchanged and green; `cargo test` under default and
-  `--features all-langs`.
-- RSS regression: `PERL_LSP_HEAP_DUMP` on abseil must show the `refs` and
-  `rebuilt_indices` buckets ≈ 0 for index copies; peak RSS target on the
-  Chromium stress corpus re-run: complete the whole-tree index inside the
-  20 GB guard that killed it at 38K files.
+- **Parity harness (the load-bearing gate):** `--refs-parity <root>` runs
+  `refs_to` both ways — resident scan vs SQL retrieval — for every symbol
+  the heatmap enumerates, and asserts identical `(file, span, access,
+  rewritable)` sets. `PERL_LSP_NO_EVICT=1` keeps the resident path
+  populated for the comparison.
+- The completeness anchor: `--references` on the abseil symbol whose
+  fan-in includes `_test.cc` files clangd misses returns the same count,
+  same files, with refs evicted.
+- Gold + e2e nets green; `cargo test` under default and `--features
+  all-langs`.
+- RSS: `PERL_LSP_HEAP_DUMP` on abseil shows the `refs`/`symbols`/
+  `rebuilt_indices` buckets ≈ 0 for index copies; the Chromium stress
+  corpus completes inside the 20 GB guard.
