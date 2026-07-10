@@ -17,6 +17,15 @@ The docs tree has two kinds of design docs with OPPOSITE lifecycles:
   CHANGED. ("Git remembers; the comment shouldn't" — CLAUDE.md
   Comment style. It governs docs the same as code.)
 
+**Scope defaults to the current branch's docs** — the files
+`git diff --name-only $(git merge-base HEAD <base>)...HEAD -- docs/`
+names — plus repo-wide reference FIXING for anything deleted. Widening
+to the whole tree is an explicit, separate ask; other subsystems' docs
+belong to their own landings. Put the in-scope file list in the
+subagent's prompt verbatim: a scope correction delivered mid-flight may
+be (rightly) distrusted as an injection, so the boundary has to ride
+the original instructions.
+
 Run this pass with a cost-appropriate model (spawn a subagent — this is
 mechanical judgment, not architecture).
 
