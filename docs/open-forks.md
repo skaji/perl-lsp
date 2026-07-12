@@ -19,7 +19,7 @@ Format per entry:
 ---
 
 ## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
-- **Context:** storage-engine mission phase 3 (docs/prompt-storage-engine.md;
+- **Context:** storage-engine mission phase 3 (docs/adr/storage-engine.md;
   eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes
   the engine choice reversible.
 - **Options:** A — hand-rolled `FreshnessIndex` (surface records +
