@@ -3199,7 +3199,22 @@ pub fn refs_to(
             if !gate(entry.value(), &file_str) {
                 continue;
             }
-            collect_from_analysis(&key, entry.value(), target, &aliases, module_index, &file_str, &mut out);
+            // Same whole-view routing as the sibling sweeps: a workspace
+            // copy with rows persisted is refs+symbols-STRIPPED, and the
+            // matcher reading it raw silently drops the file's matches.
+            let full = match module_index {
+                Some(idx) => {
+                    let cached = std::sync::Arc::new(
+                        crate::file_analysis::CachedModule::new(
+                            entry.key().clone(),
+                            std::sync::Arc::clone(entry.value()),
+                        ),
+                    );
+                    idx.whole_present(&cached)
+                }
+                None => std::sync::Arc::clone(entry.value()),
+            };
+            collect_from_analysis(&key, &full, target, &aliases, module_index, &file_str, &mut out);
         }
     }
 

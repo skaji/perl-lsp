@@ -864,6 +864,22 @@ pub enum ScopeKind {
 
 // ---- Package context ----
 
+/// One plugin-emitted diagnostic — the payload of
+/// `EmitAction::Diagnostic`, stamped with the emitting plugin's id.
+/// `severity` is an open string (`"error"` / `"warning"` / `"info"` /
+/// anything else renders as hint) — the vocabulary is the plugin's,
+/// core only maps it to the LSP enum at render time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDiagnostic {
+    pub message: String,
+    pub span: Span,
+    pub severity: String,
+    /// Diagnostic code shown in the editor (e.g. `"ddp-debug-left"`).
+    pub code: String,
+    /// Emitting plugin id — surfaced as the diagnostic source.
+    pub plugin_id: String,
+}
+
 /// Flat per-file record of which `package`/`class` declaration governs a
 /// byte range. Independent of the lexical scope tree — `package Foo;` is
 /// not a lexical boundary in Perl, so collapsing the two concepts would
@@ -2513,7 +2529,7 @@ impl InferredType {
     /// (rule #10): a partial `->to('#action')` consumer asks the
     /// receiver value what controller is in force; it never inspects
     /// the chain shape. The build-time consumer reads the flattened
-    /// `CallContext.receiver_route_defaults`; this is the query-time
+    /// `route_defaults` projection; this is the query-time
     /// surface for cursor-time stash lookups (hover/completion), which
     /// aren't wired yet — hence `allow(dead_code)`.
     #[allow(dead_code)]
@@ -3774,6 +3790,13 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub package_ranges: Vec<PackageRange>,
 
+    /// Plugin-emitted diagnostics (`EmitAction::Diagnostic` from a
+    /// pattern's `on_match`). `collect_diagnostics` converts them to
+    /// LSP diagnostics alongside the native channels; provenance rides
+    /// on `plugin_id` (surfaced as the diagnostic source).
+    #[serde(default)]
+    pub plugin_diagnostics: Vec<PluginDiagnostic>,
+
     /// The language's method-RECEIVER param names (Python `self`/`cls`),
     /// from the LangPack. A receiver is lexically inside the class so the
     /// sticky context tags it, but it is NOT a member — member completion
@@ -4147,6 +4170,7 @@ pub struct FileAnalysisParts {
     pub package_uses: HashMap<String, Vec<String>>,
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
     pub package_ranges: Vec<PackageRange>,
+    pub plugin_diagnostics: Vec<PluginDiagnostic>,
     pub app_surface_consumers: Vec<String>,
     pub witnesses: crate::witnesses::WitnessBag,
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
@@ -4335,6 +4359,7 @@ impl FileAnalysis {
             package_uses,
             type_provenance,
             package_ranges,
+            plugin_diagnostics,
             app_surface_consumers,
             mut witnesses,
             package_framework,
@@ -4372,6 +4397,7 @@ impl FileAnalysis {
             call_bindings,
             method_call_bindings,
             package_ranges,
+            plugin_diagnostics,
             package_parents,
             app_surface_consumers,
             package_uses,
@@ -10122,7 +10148,7 @@ impl FileAnalysis {
                 // (locally or via a cross-file import) to a ClassName
                 // return type when called with zero args, treat the
                 // bareword as the call and use that class. Mirrors the
-                // same rule in `receiver_type_for` and
+                // same rule in `invocant_type_at_node` and
                 // `resolve_invocant_class_tree`.
                 let bare = split_qualified(invocant).1;
                 if let Some(InferredType::ClassName(c)) =
@@ -11250,8 +11276,32 @@ impl FileAnalysis {
         // not as navigation targets — users look for the
         // helpers/routes/tasks themselves, which already render flat
         // with their `<word>` kind prefix.
-        let flat = self.outline_children_of(ScopeId(0));
-        self.nest_under_packages(flat)
+        let mut flat = self.outline_children_of(ScopeId(0));
+        // Siblings render in DOCUMENT order, not symbol-table order.
+        // The walk emits in position order so this used to hold for
+        // free, but post-walk emission phases (pattern dispatch)
+        // append later — the outline is a navigation view, so position
+        // is the invariant, not emission time. Stable sort: symbols
+        // sharing an anchor (a `has` line's synthesized family) keep
+        // their emission order.
+        Self::sort_outline_by_position(&mut flat);
+        let mut nested = self.nest_under_packages(flat);
+        for c in &mut nested {
+            Self::sort_outline_by_position(&mut c.children);
+        }
+        nested
+    }
+
+    fn sort_outline_by_position(list: &mut [OutlineSymbol]) {
+        list.sort_by_key(|s| {
+            (
+                s.selection_span.start.row,
+                s.selection_span.start.column,
+            )
+        });
+        for s in list {
+            Self::sort_outline_by_position(&mut s.children);
+        }
     }
 
     /// Fold file-scope siblings into the package/class they belong to so the

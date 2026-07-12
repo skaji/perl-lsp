@@ -145,6 +145,95 @@ pub fn report() {
     );
 }
 
+// ── Plugin pattern-match telemetry ─────────────────────────────────────
+//
+// `PERL_LSP_PLUGIN_STATS` turns on per-(plugin, pattern) match/dispatch
+// counters, aggregated across every file the build touches and dumped
+// once via `report_pattern_stats()` (called alongside `report()`). This
+// is the query medium's observability answer: one workspace index run
+// tells you which of your patterns never matched (a wrong pattern
+// matches NOTHING, silently) and which matched but never dispatched
+// (trigger gate never true).
+
+/// Cached `PERL_LSP_PLUGIN_STATS` gate, read once.
+pub fn pattern_stats_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PERL_LSP_PLUGIN_STATS").is_some())
+}
+
+#[derive(Default, Clone, Copy)]
+struct PatternStat {
+    /// Query matches seen (pre-gating), summed across files.
+    matched: u64,
+    /// Matches that passed the trigger gate and dispatched `on_match`.
+    dispatched: u64,
+}
+
+fn pattern_collector() -> &'static Mutex<std::collections::HashMap<(String, String), PatternStat>>
+{
+    static C: OnceLock<Mutex<std::collections::HashMap<(String, String), PatternStat>>> =
+        OnceLock::new();
+    C.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record one file's raw match count for a pattern (called even when
+/// zero, so never-matching patterns appear in the report at 0).
+pub fn record_pattern_matches(plugin: &str, pattern: &str, matched: usize) {
+    if !pattern_stats_enabled() {
+        return;
+    }
+    if let Ok(mut m) = pattern_collector().lock() {
+        m.entry((plugin.to_string(), pattern.to_string()))
+            .or_default()
+            .matched += matched as u64;
+    }
+}
+
+/// Record one dispatched (gate-passing) match for a pattern.
+pub fn record_pattern_dispatch(plugin: &str, pattern: &str) {
+    if !pattern_stats_enabled() {
+        return;
+    }
+    if let Ok(mut m) = pattern_collector().lock() {
+        m.entry((plugin.to_string(), pattern.to_string()))
+            .or_default()
+            .dispatched += 1;
+    }
+}
+
+/// Print the per-pattern counters to stderr. No-op when the gate is off
+/// or nothing was recorded.
+pub fn report_pattern_stats() {
+    if !pattern_stats_enabled() {
+        return;
+    }
+    let entries: Vec<((String, String), PatternStat)> = match pattern_collector().lock() {
+        Ok(mut m) => m.drain().collect(),
+        Err(_) => return,
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let mut entries = entries;
+    entries.sort_by(|a, b| b.1.matched.cmp(&a.1.matched).then(a.0.cmp(&b.0)));
+    eprintln!();
+    eprintln!("=== plugin pattern stats ({} patterns) ===", entries.len());
+    eprintln!("{:>10}  {:>10}  {}", "matched", "dispatched", "plugin:pattern");
+    for ((plugin, pattern), s) in &entries {
+        let flag = if s.matched == 0 {
+            "  <- never matched"
+        } else if s.dispatched == 0 {
+            "  <- never passed the trigger gate"
+        } else {
+            ""
+        };
+        eprintln!(
+            "{:>10}  {:>10}  {}:{}{}",
+            s.matched, s.dispatched, plugin, pattern, flag
+        );
+    }
+}
+
 // ── Fine-grained per-phase timing ──────────────────────────────────────
 //
 // `phase()` wraps a single build() pass or query step; `PERL_LSP_PHASE_TIMING`

@@ -34,29 +34,56 @@ fn id() { "my-helpers" }
 // Required: when does this plugin fire?
 //   - UsesModule(M) — current package has `use M`
 //   - ClassIsa(P)   — current package has parent equal to or under P::
-//   - Always        — every package; filter inside the hooks
+//   - Always        — every package; filter inside on_match
 fn triggers() {
     [ #{ UsesModule: "MyApp::Helpers" } ]
 }
 
-// Optional: react to function calls (top-level barewords). Returns an
-// array of emissions — `[]` means "nothing to contribute here".
-fn on_function_call(ctx) {
-    if ctx.function_name != "register_widget" { return []; }
-    if ctx.args.len() < 1 { return []; }
+// Declare the shapes you care about as tree-sitter queries. Core
+// compiles them once, runs one pass per file, gates each match by your
+// triggers at the match site, computes the projections you declared,
+// and calls `on_match`. The query is the filter (the `#eq?` on the verb
+// replaces a hand-written name check); `projections` is the view you
+// want per capture; `on_match` is the brain.
+fn patterns() {
+    [
+        #{
+            name: "register_widget",
+            query: `
+(function_call_expression
+  function: (_) @fname
+  arguments: [(string_literal) (autoquoted_bareword) (bareword)] @name
+  (#eq? @fname "register_widget")) @call
+`,
+            // Ask core for the constant-folded string value of @name.
+            projections: #{ name: ["str"] },
+            // Self-verification — `--plugin-check` parses these against
+            // the real grammar and asserts the match counts. Without
+            // expects, a wrong query silently matches nothing.
+            expect: [
+                #{ src: "register_widget('gadget');", matches: 1, captures: #{ name: "gadget" } },
+                #{ src: "register_other('gadget');", matches: 0 },
+            ],
+        }
+    ]
+}
 
-    let arg0 = ctx.args[0];
-    if arg0.string_value == () { return []; }   // not a literal — skip
+// Called once per (pattern, match), with only the projections you
+// declared. Returns an array of emissions — `[]` means "nothing here".
+fn on_match(pattern, m) {
+    if pattern != "register_widget" { return []; }
+    let name = m.captures.name.str;
+    if name == () { return []; }   // dynamic name — can't synthesize
 
     // Synthesize a method on the current package whose name comes from
-    // the first string arg. After this, `$obj->arg0_value(...)`
-    // completes, hovers, and gotos-def back to `register_widget`'s span.
+    // the first string arg. After this, `$obj->name(...)` completes,
+    // hovers, and gotos-def back to the match's span.
     [
         #{
             Method: #{
-                name: arg0.string_value,
-                span: arg0.span,
-                selection_span: arg0.span,
+                name: name,
+                span: m.span,
+                selection_span: m.captures.name.span,
                 params: [],
                 is_method: true,
                 return_type: (),
@@ -166,14 +193,21 @@ been processed. Filter on `ctx.module_name` inside the hook.
 
 ### Emit hooks (parse time)
 
-Each returns `Vec<EmitAction>` — see `frameworks/*.rhai` for real-world
+Both return `Vec<EmitAction>` — see `frameworks/*.rhai` for real-world
 shapes, and `src/plugin/mod.rs::EmitAction` for the full enum.
 
 | Hook | Fires on |
 |---|---|
-| `on_function_call(ctx)` | `bar(...)`, `bar 'a', 'b'` (top-level function calls) |
-| `on_method_call(ctx)` | `$x->bar(...)`, `Foo->bar(...)` |
+| `patterns()` + `on_match(pattern, m)` | any shape you declare as a tree-sitter query — call verbs (`bar(...)`, `$x->bar(...)`), declarations, hash literals, chained receivers. The query is the filter; `on_match` returns the emissions. See `docs/prompt-plugin-queries.md`. |
 | `on_use(ctx)` | `use Foo qw(...)` |
+
+`patterns()` replaces the old per-call `on_function_call` / `on_method_call`
+hooks: instead of core pre-capturing a `CallContext` for every call and
+your hook string-comparing the verb, you declare the call shape as a
+query with `#eq?`/`#any-of?` on the verb and the arg positions as
+captures. Core computes only the projections you name, only for actual
+matches. `on_use` stays a hook because kit expansion must precede the
+walk's framework-gated native behavior.
 
 The most common emissions:
 
@@ -226,11 +260,13 @@ Registered on the engine; available in every plugin without import.
 | `subspan_cols(base, start_delta, end_delta)` | narrow a span to a column range — useful for picking the method-name half of `"Ctrl#action"` |
 | `classified_pairs(args, start)` | pair a flat arg list into `[#{ key, value, key_span, value_span, value_content_span }, …]` from `args[start]` on (separator-agnostic); each `value` is a `value_shape`. `start` skips a leading positional head (route target / attr name) |
 
-Each `ctx.args[i]` also carries `value_shape` — the arg classified one
-level deep as `#{ Str }` / `#{ Num }` / `#{ HashPairs }` / `#{ ArrayItems }`
-/ `#{ Other }`. Branch on it for argument-shape-polymorphic slots (a value
-written as a hashref vs arrayref vs string vs pair list); `()` on a variant
-that doesn't match.
+A capture with the `args` projection yields an array of arg views, each
+carrying `value_shape` — the arg classified one level deep as `#{ Str }`
+/ `#{ Num }` / `#{ HashPairs }` / `#{ ArrayItems }` / `#{ Other }`. Branch
+on it for argument-shape-polymorphic slots (a value written as a hashref
+vs arrayref vs string vs pair list); `()` on a variant that doesn't match.
+The `shape` projection surfaces the same classification for a single
+captured node.
 
 ## CLI authoring tools
 
@@ -246,7 +282,7 @@ perl-lsp --plugin-check my-helpers.rhai
 # my-helpers.rhai
 #   id:        my-helpers
 #   triggers:  UsesModule("MyApp::Helpers")
-#   hooks:     on_function_call
+#   hooks:     on_match
 #   ok
 ```
 
@@ -324,7 +360,7 @@ does this plugin emit on this input").
   multiple per call, vary the name (e.g. derive from a string arg).
 - **Span out of bounds.** No bounds check today — a plugin emitting
   `row: 999999` will silently corrupt downstream queries. Always
-  build spans from `ctx.call_span` / `ctx.args[i].span` /
+  build spans from `m.span` / a capture's `.span` /
   `subspan_cols(...)`, never hand-roll row/col numbers.
 - **Kill switch tripped.** Default Rhai operation budget is 1M ops
   per call. Heavy plugins can override with `PERL_LSP_RHAI_MAX_OPS`.
@@ -358,4 +394,4 @@ does this plugin emit on this input").
 - `docs/prompt-plugin-architecture.md` — design rationale, namespace
   semantics, what's intentionally out of scope.
 - `src/plugin/mod.rs` — authoritative type definitions for
-  `EmitAction`, `CallContext`, query-hook answer shapes.
+  `EmitAction`, `PatternSpec` / `MatchContext`, query-hook answer shapes.

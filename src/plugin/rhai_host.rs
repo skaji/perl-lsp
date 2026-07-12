@@ -1,7 +1,7 @@
 //! Rhai-scripted plugin support.
 //!
 //! A `RhaiPlugin` wraps a compiled Rhai script that exposes top-level
-//! functions: `id()`, `triggers()`, `on_function_call(ctx)`, `on_method_call(ctx)`,
+//! functions: `id()`, `triggers()`, `patterns()` + `on_match(pattern, m)`,
 //! and/or `on_use(ctx)`. Each callback returns an array of emission object-maps
 //! that convert back into strongly-typed `EmitAction` values.
 //!
@@ -20,7 +20,7 @@ use crate::file_analysis::{HashKeyOwner, InferredType, Span};
 use tree_sitter::Point;
 
 use super::{
-    AttributeMacro, CallContext, CompletionQueryContext, ConstraintParam, DispatchVerb, EmitAction,
+    AttributeMacro, CompletionQueryContext, ConstraintParam, DispatchVerb, EmitAction,
     FrameworkPlugin, ParamType, PluginCompletionAnswer, PluginSigHelpAnswer, SigHelpQueryContext,
     Trigger, TypeOverride, UseContext,
 };
@@ -191,13 +191,12 @@ pub struct RhaiPlugin {
     role_makers: Vec<String>,
     column_keyed_verbs: Vec<String>,
     fluent_verbs: Vec<String>,
-    arg_name_verbs: Vec<String>,
     topic_route_dsl: Option<crate::plugin::TopicRouteDsl>,
+    patterns: Vec<crate::plugin::PatternSpec>,
     engine: Arc<Engine>,
     ast: Arc<AST>,
-    has_on_function_call: bool,
+    has_on_match: bool,
     has_type_constraint_inner: bool,
-    has_on_method_call: bool,
     has_on_use: bool,
     has_on_signature_help: bool,
     has_on_completion: bool,
@@ -441,24 +440,25 @@ impl RhaiPlugin {
             }
         }
 
-        // `arg_name_verbs()` — call verbs wanting flat-arg-name
-        // extraction; same optional, fail-safe array-of-strings shape.
-        let mut arg_name_verbs: Vec<String> = Vec::new();
-        if signatures.iter().any(|n| n == "arg_name_verbs") {
-            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "arg_name_verbs", ()) {
+        // `patterns()` — query-declared capture manifest; same
+        // optional, fail-safe contract as overrides (a bad entry is
+        // dropped, the rest of the plugin still loads).
+        let mut patterns: Vec<crate::plugin::PatternSpec> = Vec::new();
+        if signatures.iter().any(|n| n == "patterns") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "patterns", ()) {
                 Ok(arr) => {
                     for d in arr {
-                        match from_dynamic::<String>(&d) {
-                            Ok(s) => arg_name_verbs.push(s),
+                        match from_dynamic::<crate::plugin::PatternSpec>(&d) {
+                            Ok(p) => patterns.push(p),
                             Err(e) => log::error!(
-                                "plugin `{}` arg_name_verbs() bad entry: {}",
+                                "plugin `{}` patterns() bad entry: {}",
                                 id,
                                 e
                             ),
                         }
                     }
                 }
-                Err(e) => log::error!("plugin `{}` arg_name_verbs() failed: {}", id, e),
+                Err(e) => log::error!("plugin `{}` patterns() failed: {}", id, e),
             }
         }
 
@@ -476,9 +476,8 @@ impl RhaiPlugin {
         }
 
         Ok(Self {
-            has_on_function_call: signatures.iter().any(|n| n == "on_function_call"),
+            has_on_match: signatures.iter().any(|n| n == "on_match"),
             has_type_constraint_inner: signatures.iter().any(|n| n == "type_constraint_inner"),
-            has_on_method_call: signatures.iter().any(|n| n == "on_method_call"),
             has_on_use: signatures.iter().any(|n| n == "on_use"),
             has_on_signature_help: signatures.iter().any(|n| n == "on_signature_help"),
             has_on_completion: signatures.iter().any(|n| n == "on_completion"),
@@ -494,8 +493,8 @@ impl RhaiPlugin {
             role_makers,
             column_keyed_verbs,
             fluent_verbs,
-            arg_name_verbs,
             topic_route_dsl,
+            patterns,
             engine,
             ast: Arc::new(ast),
         })
@@ -531,8 +530,14 @@ impl RhaiPlugin {
     }
 
     fn dispatch(&self, fn_name: &str, arg: Dynamic) -> Vec<EmitAction> {
+        self.dispatch_args(fn_name, (arg,))
+    }
+
+    /// The N-ary sibling of `dispatch` — `on_match` takes
+    /// `(pattern_name, ctx)`. Same fail-safe emission decoding.
+    fn dispatch_args(&self, fn_name: &str, args: impl rhai::FuncArgs) -> Vec<EmitAction> {
         let out: Result<Array, _> =
-            self.engine.call_fn(&mut rhai::Scope::new(), &self.ast, fn_name, (arg,));
+            self.engine.call_fn(&mut rhai::Scope::new(), &self.ast, fn_name, args);
         let arr = match out {
             Ok(a) => a,
             Err(e) => {
@@ -606,10 +611,6 @@ impl FrameworkPlugin for RhaiPlugin {
         &self.fluent_verbs
     }
 
-    fn arg_name_verbs(&self) -> &[String] {
-        &self.arg_name_verbs
-    }
-
     fn topic_route_dsl(&self) -> Option<crate::plugin::TopicRouteDsl> {
         self.topic_route_dsl.clone()
     }
@@ -652,27 +653,18 @@ impl FrameworkPlugin for RhaiPlugin {
         }
     }
 
-    fn on_function_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
-        if !self.has_on_function_call {
-            return Vec::new();
-        }
-        match to_dynamic(ctx) {
-            Ok(d) => self.dispatch("on_function_call", d),
-            Err(e) => {
-                log::warn!("plugin `{}`: ctx serialize: {}", self.id, e);
-                Vec::new()
-            }
-        }
+    fn patterns(&self) -> &[crate::plugin::PatternSpec] {
+        &self.patterns
     }
 
-    fn on_method_call(&self, ctx: &CallContext) -> Vec<EmitAction> {
-        if !self.has_on_method_call {
+    fn on_match(&self, pattern: &str, m: &crate::plugin::MatchContext) -> Vec<EmitAction> {
+        if !self.has_on_match {
             return Vec::new();
         }
-        match to_dynamic(ctx) {
-            Ok(d) => self.dispatch("on_method_call", d),
+        match to_dynamic(m) {
+            Ok(d) => self.dispatch_args("on_match", (pattern.to_string(), d)),
             Err(e) => {
-                log::warn!("plugin `{}`: ctx serialize: {}", self.id, e);
+                log::warn!("plugin `{}`: match ctx serialize: {}", self.id, e);
                 Vec::new()
             }
         }
@@ -890,19 +882,56 @@ mod tests {
         Span { start: Point::new(r1, c1), end: Point::new(r2, c2) }
     }
 
+    /// Bare capture for hand-built `MatchContext`s — text + span only,
+    /// projections filled by struct-update at the call site.
+    fn mcap(text: &str, span: Span) -> crate::plugin::CaptureData {
+        crate::plugin::CaptureData {
+            text: text.into(),
+            span,
+            string_value: None,
+            string_values: Vec::new(),
+            content_span: None,
+            inferred_type: None,
+            value_shape: None,
+            sub_params: Vec::new(),
+            callable_return_edge: None,
+            list: Vec::new(),
+            is_package_receiver: None,
+            args: Vec::new(),
+            isa: None,
+            ref_sub_name: None,
+            call_name: None,
+            route_defaults: Vec::new(),
+        }
+    }
+
+    fn one(d: crate::plugin::CaptureData) -> crate::plugin::CaptureValue {
+        crate::plugin::CaptureValue::One(Box::new(d))
+    }
+
     #[test]
     fn minimal_plugin_loads_and_dispatches() {
+        use crate::plugin::MatchContext;
+
         let src = r#"
             fn id() { "demo" }
             fn triggers() { [ #{ UsesModule: "Demo" } ] }
-            fn on_function_call(ctx) {
-                if ctx.function_name == "greet" {
+            fn patterns() {
+                [
+                    #{
+                        name: "greet_call",
+                        query: "(function_call_expression) @call",
+                    }
+                ]
+            }
+            fn on_match(pattern, m) {
+                if pattern == "greet_call" {
                     return [
                         #{
                             Method: #{
                                 name: "hello",
-                                span: ctx.call_span,
-                                selection_span: ctx.selection_span,
+                                span: m.span,
+                                selection_span: m.span,
                                 params: [],
                                 is_method: true,
                                 return_type: (),
@@ -919,27 +948,20 @@ mod tests {
         let plugin = RhaiPlugin::from_source(src, engine).expect("compiles");
         assert_eq!(plugin.id(), "demo");
         assert_eq!(plugin.triggers().len(), 1);
+        assert!(plugin.patterns().iter().any(|p| p.name == "greet_call"));
 
-        let ctx = CallContext {
-            call_kind: super::super::CallKind::Function,
-            function_name: Some("greet".into()),
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args: vec![],
-            call_span: sp(0, 0, 0, 5),
-            selection_span: sp(0, 0, 0, 5),
-            current_package: Some("Demo::App".into()),
-            current_package_parents: vec![],
-            current_package_uses: vec!["Demo".into()],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("call".to_string(), one(mcap("greet('x')", sp(0, 0, 0, 10))));
+        let m = MatchContext {
+            pattern: "greet_call".into(),
+            span: sp(0, 0, 0, 10),
+            package: Some("Demo::App".into()),
+            package_parents: vec![],
+            package_uses: vec!["Demo".into()],
+            captures,
         };
 
-        let emissions = plugin.on_function_call(&ctx);
+        let emissions = plugin.on_match("greet_call", &m);
         assert_eq!(emissions.len(), 1);
         match &emissions[0] {
             EmitAction::Method { name, is_method, .. } => {
@@ -1024,7 +1046,7 @@ mod tests {
 
     #[test]
     fn bundled_mojo_events_loads_and_emits() {
-        use crate::plugin::{ArgInfo, CallKind};
+        use crate::plugin::{CaptureData, CaptureValue, MatchContext};
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
@@ -1033,45 +1055,51 @@ mod tests {
             .find(|p| p.id() == "mojo-events")
             .expect("mojo-events is bundled");
 
+        // mojo-events rides the query-declared capture seam: it must
+        // declare a pattern manifest and answer on_match with the
+        // dispatch-call + handler + namespace emissions.
+        assert!(
+            plugin.patterns().iter().any(|p| p.name == "event_call"),
+            "mojo-events should declare the event_call pattern"
+        );
+
+        let cap = mcap;
+
         let evt_span = sp(3, 15, 3, 23);
         let cb_span = sp(3, 25, 3, 40);
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("on".into()),
-            receiver_text: Some("$self".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("My::Emitter".into())),
-            receiver_route_defaults: Vec::new(),
-            args: vec![
-                ArgInfo {
-                    text: "'connect'".into(),
-                    string_value: Some("connect".into()),
-                    string_values: Vec::new(),
-                    span: evt_span,
-                    content_span: None,
-                    inferred_type: Some(InferredType::String), sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-                ArgInfo {
-                    text: "sub { ... }".into(),
-                    string_value: None,
-                    string_values: Vec::new(),
-                    span: cb_span,
-                    content_span: None,
-                    inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(3, 4, 3, 45),
-            selection_span: sp(3, 10, 3, 12),
-            current_package: Some("My::Emitter".into()),
-            current_package_parents: vec!["Mojo::EventEmitter".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        let mut captures = std::collections::HashMap::new();
+        captures.insert(
+            "verb".to_string(),
+            CaptureValue::One(Box::new(cap("on", sp(3, 10, 3, 12)))),
+        );
+        captures.insert(
+            "recv".to_string(),
+            CaptureValue::One(Box::new(CaptureData {
+                inferred_type: Some(InferredType::ClassName("My::Emitter".into())),
+                ..cap("$self", sp(3, 4, 3, 9))
+            })),
+        );
+        captures.insert(
+            "event".to_string(),
+            CaptureValue::One(Box::new(CaptureData {
+                string_value: Some("connect".into()),
+                ..cap("'connect'", evt_span)
+            })),
+        );
+        captures.insert(
+            "callback".to_string(),
+            CaptureValue::One(Box::new(cap("sub { ... }", cb_span))),
+        );
+        let m = MatchContext {
+            pattern: "event_call".into(),
+            span: sp(3, 4, 3, 45),
+            package: Some("My::Emitter".into()),
+            package_parents: vec!["Mojo::EventEmitter".into()],
+            package_uses: vec![],
+            captures,
         };
 
-        let emissions = plugin.on_method_call(&ctx);
+        let emissions = plugin.on_match("event_call", &m);
         // DispatchCall (ref) + Handler (def) + PluginNamespace (bridge).
         assert_eq!(emissions.len(), 3,
             "dispatch call + handler + namespace; got: {:?}", emissions);
@@ -1099,7 +1127,7 @@ mod tests {
 
     #[test]
     fn bundled_dbic_resultddl_synthesizes_accessors() {
-        use crate::plugin::{ArgInfo, CallKind};
+        use crate::plugin::MatchContext;
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
@@ -1107,42 +1135,35 @@ mod tests {
             .into_iter()
             .find(|p| p.id() == "dbic-resultddl")
             .expect("dbic-resultddl is bundled");
+        assert!(
+            plugin.patterns().iter().any(|p| p.name == "ddl_decl"),
+            "dbic-resultddl should declare the ddl_decl pattern"
+        );
 
         // `col text => text;` and `has_many searches => {...};` each install
         // an accessor named by the (autoquoted) first arg.
         let cases = [("col", "text"), ("has_many", "searches"), ("belongs_to", "product")];
         for (func, accessor) in cases {
             let name_span = sp(1, 4, 1, 8);
-            let ctx = CallContext {
-                call_kind: CallKind::Function,
-                function_name: Some(func.into()),
-                method_name: None,
-                receiver_text: None,
-                receiver_call_name: None,
-                receiver_type: None,
-                receiver_route_defaults: Vec::new(),
-                args: vec![ArgInfo {
-                    text: accessor.into(),
+            let mut captures = std::collections::HashMap::new();
+            captures.insert("verb".to_string(), one(mcap(func, sp(1, 0, 1, 3))));
+            captures.insert(
+                "name".to_string(),
+                one(crate::plugin::CaptureData {
                     string_value: Some(accessor.into()),
-                    string_values: Vec::new(),
-                    span: name_span,
-                    content_span: None,
-                    inferred_type: Some(InferredType::String),
-                    sub_params: vec![],
-                    callable_return_edge: None,
-                    ref_sub_name: None, value_shape: Default::default(),
-                }],
-                call_span: sp(1, 0, 1, 20),
-                selection_span: sp(1, 0, 1, 3),
-                current_package: Some("My::Schema::Result::Thing".into()),
-                current_package_parents: vec![],
-                current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
-                has_options: None,
-                arg_names: Vec::new(),
-                receiver_is_package: false,
+                    ..mcap(accessor, name_span)
+                }),
+            );
+            let m = MatchContext {
+                pattern: "ddl_decl".into(),
+                span: sp(1, 0, 1, 20),
+                package: Some("My::Schema::Result::Thing".into()),
+                package_parents: vec![],
+                package_uses: vec!["DBIx::Class::ResultDDL".into()],
+                captures,
             };
 
-            let emissions = plugin.on_function_call(&ctx);
+            let emissions = plugin.on_match("ddl_decl", &m);
             let has_method = emissions.iter().any(|e| {
                 matches!(e, EmitAction::Method { name, is_method, .. }
                     if name == accessor && *is_method)
@@ -1153,53 +1174,34 @@ mod tests {
     }
 
     #[test]
-    fn dbic_resultddl_skips_dynamic_and_non_dsl() {
-        use crate::plugin::{ArgInfo, CallKind};
+    fn dbic_resultddl_skips_dynamic_name() {
+        use crate::plugin::MatchContext;
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
         let plugin = bundled.into_iter().find(|p| p.id() == "dbic-resultddl").unwrap();
 
-        let mk = |func: &str, string_value: Option<String>| CallContext {
-            call_kind: CallKind::Function,
-            function_name: Some(func.into()),
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args: vec![ArgInfo {
-                text: "x".into(),
-                string_value,
-                string_values: Vec::new(),
-                span: sp(1, 4, 1, 8),
-                content_span: None,
-                inferred_type: None,
-                sub_params: vec![],
-                callable_return_edge: None,
-                ref_sub_name: None, value_shape: Default::default(),
-            }],
-            call_span: sp(1, 0, 1, 20),
-            selection_span: sp(1, 0, 1, 3),
-            current_package: Some("My::Schema::Result::Thing".into()),
-            current_package_parents: vec![],
-            current_package_uses: vec!["DBIx::Class::ResultDDL".into()],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        // Dynamic column name (`col $field => ...`) — no fold, nothing to
+        // synthesize. (The non-DSL-verb case — `table 'embeddings';` — is
+        // filtered by the PATTERN now, pinned by its expects.)
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("verb".to_string(), one(mcap("col", sp(1, 0, 1, 3))));
+        captures.insert("name".to_string(), one(mcap("$field", sp(1, 4, 1, 10))));
+        let m = MatchContext {
+            pattern: "ddl_decl".into(),
+            span: sp(1, 0, 1, 20),
+            package: Some("My::Schema::Result::Thing".into()),
+            package_parents: vec![],
+            package_uses: vec!["DBIx::Class::ResultDDL".into()],
+            captures,
         };
-
-        // Dynamic column name (`col $field => ...`) — nothing to synthesize.
-        assert!(plugin.on_function_call(&mk("col", None)).is_empty(),
+        assert!(plugin.on_match("ddl_decl", &m).is_empty(),
             "dynamic col name must be skipped");
-        // A non-DSL function with a string arg is not our concern.
-        assert!(plugin.on_function_call(&mk("table", Some("embeddings".into()))).is_empty(),
-            "`table` declares no accessor and must emit nothing");
     }
 
     #[test]
     fn mojo_events_skips_dynamic_event_name() {
-        use crate::plugin::{ArgInfo, CallKind};
+        use crate::plugin::MatchContext;
 
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
@@ -1208,44 +1210,29 @@ mod tests {
             .find(|p| p.id() == "mojo-events")
             .unwrap();
 
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("on".into()),
-            receiver_text: Some("$self".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("Foo".into())),
-            receiver_route_defaults: Vec::new(),
-            args: vec![
-                // Dynamic name — string_value is None, so plugin must skip.
-                ArgInfo {
-                    text: "$name".into(),
-                    string_value: None,
-                    string_values: Vec::new(),
-                    span: sp(0, 0, 0, 5),
-                    content_span: None,
-                    inferred_type: None, sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-                ArgInfo {
-                    text: "sub {}".into(),
-                    string_value: None,
-                    string_values: Vec::new(),
-                    span: sp(0, 6, 0, 12),
-                    content_span: None,
-                    inferred_type: Some(InferredType::CodeRef { return_edge: None }), sub_params: vec![], callable_return_edge: None, ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(0, 0, 0, 15),
-            selection_span: sp(0, 0, 0, 2),
-            current_package: Some("Foo".into()),
-            current_package_parents: vec!["Mojo::EventEmitter".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        // Dynamic name — no `str` fold on the event capture, so the
+        // plugin must decline (references still see it, rename skips it).
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("verb".to_string(), one(mcap("on", sp(0, 7, 0, 9))));
+        captures.insert(
+            "recv".to_string(),
+            one(crate::plugin::CaptureData {
+                inferred_type: Some(InferredType::ClassName("Foo".into())),
+                ..mcap("$self", sp(0, 0, 0, 5))
+            }),
+        );
+        captures.insert("event".to_string(), one(mcap("$name", sp(0, 10, 0, 15))));
+        captures.insert("callback".to_string(), one(mcap("sub {}", sp(0, 17, 0, 23))));
+        let m = MatchContext {
+            pattern: "event_call".into(),
+            span: sp(0, 0, 0, 25),
+            package: Some("Foo".into()),
+            package_parents: vec!["Mojo::EventEmitter".into()],
+            package_uses: vec![],
+            captures,
         };
 
-        let emissions = plugin.on_method_call(&ctx);
+        let emissions = plugin.on_match("event_call", &m);
         assert!(emissions.is_empty(), "dynamic name must not emit");
     }
 
@@ -1392,10 +1379,43 @@ mod tests {
         assert!(has_log, "missing log → Catalyst::Log override");
     }
 
+    /// Hand-built `context_call` MatchContext for the catalyst plugin:
+    /// verb + typed receiver + a folded target string.
+    fn catalyst_match(
+        verb: &str,
+        receiver_class: &str,
+        target: &str,
+        target_span: Span,
+    ) -> crate::plugin::MatchContext {
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("verb".to_string(), one(mcap(verb, sp(0, 4, 0, 9))));
+        captures.insert(
+            "recv".to_string(),
+            one(crate::plugin::CaptureData {
+                inferred_type: Some(InferredType::ClassName(receiver_class.into())),
+                ..mcap("$c", sp(0, 0, 0, 2))
+            }),
+        );
+        captures.insert(
+            "target".to_string(),
+            one(crate::plugin::CaptureData {
+                string_value: Some(target.into()),
+                content_span: Some(target_span),
+                ..mcap(&format!("'{target}'"), target_span)
+            }),
+        );
+        crate::plugin::MatchContext {
+            pattern: "context_call".into(),
+            span: sp(0, 0, 0, 30),
+            package: Some("MyApp::Controller::Root".into()),
+            package_parents: vec!["Catalyst::Controller".into()],
+            package_uses: vec![],
+            captures,
+        }
+    }
+
     #[test]
     fn catalyst_model_call_emits_method_call_ref() {
-        use crate::plugin::{ArgInfo, CallKind};
-
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
         let plugin = bundled
@@ -1403,39 +1423,8 @@ mod tests {
             .find(|p| p.id() == "catalyst")
             .expect("catalyst is bundled");
 
-        let name_span = sp(5, 20, 5, 23);
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("model".into()),
-            receiver_text: Some("$c".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("Catalyst".into())),
-            receiver_route_defaults: vec![],
-            args: vec![
-                ArgInfo {
-                    text: "'Foo'".into(),
-                    string_value: Some("Foo".into()),
-                    string_values: Vec::new(),
-                    span: name_span,
-                    content_span: Some(name_span),
-                    inferred_type: Some(InferredType::String),
-                    sub_params: vec![],
-                    callable_return_edge: None,
-                    ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(5, 10, 5, 26),
-            selection_span: sp(5, 13, 5, 18),
-            current_package: Some("MyApp::Controller::Root".into()),
-            current_package_parents: vec!["Catalyst::Controller".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
-        };
-
-        let emissions = plugin.on_method_call(&ctx);
+        let m = catalyst_match("model", "Catalyst", "Foo", sp(5, 20, 5, 23));
+        let emissions = plugin.on_match("context_call", &m);
         // A MethodCallRef pointing at Foo::new (the component class).
         let has_ref = emissions.iter().any(|e| {
             matches!(e, EmitAction::MethodCallRef { method_name, invocant, .. }
@@ -1447,8 +1436,6 @@ mod tests {
 
     #[test]
     fn catalyst_forward_emits_dispatch_call() {
-        use crate::plugin::{ArgInfo, CallKind};
-
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
         let plugin = bundled
@@ -1456,39 +1443,8 @@ mod tests {
             .find(|p| p.id() == "catalyst")
             .expect("catalyst is bundled");
 
-        let path_span = sp(7, 20, 7, 38);
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("forward".into()),
-            receiver_text: Some("$c".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("Catalyst".into())),
-            receiver_route_defaults: vec![],
-            args: vec![
-                ArgInfo {
-                    text: "'/Root/index'".into(),
-                    string_value: Some("/Root/index".into()),
-                    string_values: Vec::new(),
-                    span: path_span,
-                    content_span: Some(path_span),
-                    inferred_type: Some(InferredType::String),
-                    sub_params: vec![],
-                    callable_return_edge: None,
-                    ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(7, 10, 7, 40),
-            selection_span: sp(7, 13, 7, 20),
-            current_package: Some("MyApp::Controller::Root".into()),
-            current_package_parents: vec!["Catalyst::Controller".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
-        };
-
-        let emissions = plugin.on_method_call(&ctx);
+        let m = catalyst_match("forward", "Catalyst", "/Root/index", sp(7, 20, 7, 38));
+        let emissions = plugin.on_match("context_call", &m);
         let has_dispatch = emissions.iter().any(|e| {
             matches!(e, EmitAction::DispatchCall { name, dispatcher, .. }
                 if name == "/Root/index" && dispatcher == "forward")
@@ -1499,8 +1455,6 @@ mod tests {
 
     #[test]
     fn catalyst_skips_non_catalyst_receiver() {
-        use crate::plugin::{ArgInfo, CallKind};
-
         let engine = Arc::new(make_engine());
         let bundled = load_bundled(engine);
         let plugin = bundled
@@ -1510,73 +1464,40 @@ mod tests {
 
         // `$schema->model('Foo')` — DBIx::Class::Schema, NOT Catalyst.
         // The plugin must not emit for non-Catalyst receivers.
-        let ctx = CallContext {
-            call_kind: CallKind::Method,
-            function_name: None,
-            method_name: Some("model".into()),
-            receiver_text: Some("$schema".into()),
-            receiver_call_name: None,
-            receiver_type: Some(InferredType::ClassName("DBIx::Class::Schema".into())),
-            receiver_route_defaults: vec![],
-            args: vec![
-                ArgInfo {
-                    text: "'Foo'".into(),
-                    string_value: Some("Foo".into()),
-                    string_values: Vec::new(),
-                    span: sp(0, 0, 0, 5),
-                    content_span: None,
-                    inferred_type: Some(InferredType::String),
-                    sub_params: vec![],
-                    callable_return_edge: None,
-                    ref_sub_name: None, value_shape: Default::default(),
-                },
-            ],
-            call_span: sp(0, 0, 0, 20),
-            selection_span: sp(0, 10, 0, 15),
-            current_package: Some("MyApp::Controller::Root".into()),
-            current_package_parents: vec!["Catalyst::Controller".into()],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
-        };
-
-        let emissions = plugin.on_method_call(&ctx);
+        let m = catalyst_match("model", "DBIx::Class::Schema", "Foo", sp(0, 0, 0, 5));
+        let emissions = plugin.on_match("context_call", &m);
         assert!(emissions.is_empty(),
             "non-Catalyst receiver must not emit; got: {:?}", emissions);
     }
 
     #[test]
-    fn non_matching_function_returns_empty() {
+    fn non_matching_on_match_returns_empty() {
+        use crate::plugin::MatchContext;
+
         let src = r#"
             fn id() { "demo2" }
             fn triggers() { [ #{ Always: () } ] }
-            fn on_function_call(ctx) {
-                if ctx.function_name == "wanted" { return [#{ FrameworkImport: #{ keyword: "ok" } }]; }
+            fn patterns() {
+                [ #{ name: "wanted_call", query: "(function_call_expression) @call" } ]
+            }
+            fn on_match(pattern, m) {
+                if pattern == "wanted_call" { return [#{ FrameworkImport: #{ keyword: "ok" } }]; }
                 []
             }
         "#;
         let engine = Arc::new(make_engine());
         let plugin = RhaiPlugin::from_source(src, engine).unwrap();
 
-        let ctx = CallContext {
-            call_kind: super::super::CallKind::Function,
-            function_name: Some("unrelated".into()),
-            method_name: None,
-            receiver_text: None,
-            receiver_call_name: None,
-            receiver_type: None,
-            receiver_route_defaults: Vec::new(),
-            args: vec![],
-            call_span: sp(0, 0, 0, 0),
-            selection_span: sp(0, 0, 0, 0),
-            current_package: None,
-            current_package_parents: vec![],
-            current_package_uses: vec![],
-            has_options: None,
-            arg_names: Vec::new(),
-            receiver_is_package: false,
+        let mut captures = std::collections::HashMap::new();
+        captures.insert("call".to_string(), one(mcap("f()", sp(0, 0, 0, 3))));
+        let m = MatchContext {
+            pattern: "other_call".into(),
+            span: sp(0, 0, 0, 3),
+            package: None,
+            package_parents: vec![],
+            package_uses: vec![],
+            captures,
         };
-        assert!(plugin.on_function_call(&ctx).is_empty());
+        assert!(plugin.on_match("other_call", &m).is_empty());
     }
 }

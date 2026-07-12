@@ -84,6 +84,37 @@ on test => sub {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: the query's `#eq? @fn "requires"` predicate was
+    /// originally written top-level after the bracketed alternation,
+    /// where it silently attaches to NOTHING (it becomes a degenerate
+    /// extra pattern) — so `recommends` / `suggests` / `conflicts`
+    /// lines were extracted as requires. The grouped spelling
+    /// `([…] (#eq? …))` is the one that filters.
+    #[test]
+    fn only_requires_lines_are_extracted() {
+        let dir = std::env::temp_dir().join("perl_lsp_test_cpanfile_verbs");
+        let _ = std::fs::create_dir_all(&dir);
+        let cpanfile = dir.join("cpanfile");
+        std::fs::write(
+            &cpanfile,
+            r#"requires 'Mojolicious';
+recommends 'Optional::Thing';
+suggests 'Nice::To::Have';
+conflicts 'Broken::Module';
+"#,
+        )
+        .unwrap();
+
+        let modules = parse_cpanfile(&dir);
+        assert_eq!(
+            modules,
+            vec!["Mojolicious".to_string()],
+            "non-requires dependency verbs must not be extracted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_parse_cpanfile_missing() {
         let dir = std::env::temp_dir().join("perl_lsp_test_no_cpanfile");
