@@ -1922,6 +1922,22 @@ impl ReducerRegistry {
                         let full = idx.bag_present(cached);
                         if let Some(t) = full.symbol_return_type_via_bag(sym.id, None) {
                             found = Some(t);
+                            return;
+                        }
+                        // Fallback-on-miss (R4): the bridged Method's return may
+                        // chain through the bridging file's OWN imports — baked
+                        // only into the enriched overlay. `symbol_return_type_via_bag`
+                        // owns its answer (private registry + QueryState), so no
+                        // `state.pins` push is needed. Kept index-less by design:
+                        // a ctx-ful leaf query would spawn a fresh cycle guard per
+                        // bridged hop, so mutual bridges recurse unbounded; the
+                        // ENRICHING-guarded bake is the safe route to the same
+                        // transitive answer.
+                        let enriched = idx.enriched_present(cached);
+                        if !std::sync::Arc::ptr_eq(&enriched, &full) {
+                            if let Some(t) = enriched.symbol_return_type_via_bag(sym.id, None) {
+                                found = Some(t);
+                            }
                         }
                     });
                     if let Some(t) = found {
@@ -1941,27 +1957,52 @@ impl ReducerRegistry {
             if let Some(ctx) = q.context {
                 if let Some(idx) = ctx.module_index {
                     if let Some(cached) = idx.get_cached(class) {
+                        let attempt =
+                            |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>,
+                             state: &mut _| {
+                                let cached_ctx = BagContext {
+                                    scopes: &full.scopes,
+                                    package_framework: &full.package_framework,
+                                    module_index: Some(idx),
+                                    package_parents: &full.package_parents,
+                                    app_surface_consumers: &full.app_surface_consumers,
+                                };
+                                let sub_q = ReducerQuery {
+                                    attachment: q.attachment,
+                                    point: q.point,
+                                    framework: q.framework,
+                                    arity_hint: None,
+                                    receiver: q.receiver.clone(),
+                                    args: q.args.clone(),
+                                    context: Some(&cached_ctx),
+                                };
+                                (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
+                            };
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
-                            let cached_ctx = BagContext {
-                                scopes: &full.scopes,
-                                package_framework: &full.package_framework,
-                                module_index: Some(idx),
-                                package_parents: &full.package_parents,
-                                app_surface_consumers: &full.app_surface_consumers,
-                            };
-                            let sub_q = ReducerQuery {
-                                attachment: q.attachment,
-                                point: q.point,
-                                framework: q.framework,
-                                arity_hint: None,
-                                receiver: q.receiver.clone(),
-                                args: q.args.clone(),
-                                context: Some(&cached_ctx),
-                            };
-                            let v = self.query_rec(&full.witnesses, &sub_q, state);
-                            if *v != ReducedValue::None {
-                                return (*v).clone();
+                            let v = attempt(&full, state);
+                            if v != ReducedValue::None {
+                                return v;
+                            }
+                            // Fallback-on-miss (R4), symmetric with the
+                            // MethodOnClass primary: a slot WRITE typed only in
+                            // C's enriched copy resolves here. Today SlotType
+                            // seeds are build-gated on a resolvable RHS
+                            // (`builder.rs`), so a seed that exists already
+                            // answers on the raw bag and this retry is the
+                            // forward-looking twin — live the moment slot
+                            // seeding emits an unconditional edge. Pin the
+                            // enriched Arc: this chase threads the SHARED
+                            // QueryState, whose memo keys on bag pointers.
+                            let enriched = idx.enriched_present(&cached);
+                            if !std::sync::Arc::ptr_eq(&enriched, &full)
+                                && !std::ptr::eq(bag, &enriched.witnesses)
+                            {
+                                state.pins.push(std::sync::Arc::clone(&enriched));
+                                let v = attempt(&enriched, state);
+                                if v != ReducedValue::None {
+                                    return v;
+                                }
                             }
                         }
                     }
