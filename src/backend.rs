@@ -1030,30 +1030,17 @@ impl Backend {
     /// projection would fingerprint imported types into the record and
     /// flip-flop verdicts against the workspace indexer's pre-enrichment
     /// records (spurious Changed storms on body edits).
-    fn record_open_doc_surface(
-        &self,
-        uri: &Url,
-    ) -> Option<(std::path::PathBuf, crate::surface::SurfaceVerdict)> {
+    /// Records through `record_and_dirty` — the shared record→verdict→dirty
+    /// seam — so the open-doc editor path can't record a surface without the
+    /// dirty consumer set. The caller acts on the returned set (republish).
+    fn record_open_doc_surface(&self, uri: &Url) -> Option<crate::module_index::SurfaceDirty> {
         let path = uri.to_file_path().ok()?;
         let canon = std::fs::canonicalize(&path).unwrap_or(path);
         let doc = self.files.get_open(uri)?;
         if doc.language != "perl" {
             return None;
         }
-        let verdict = self.module_index.record_surface(&canon, &doc.analysis);
-        Some((canon, verdict))
-    }
-
-    async fn refresh_dirty_open_consumers(
-        &self,
-        canon: &std::path::Path,
-        verdict: crate::surface::SurfaceVerdict,
-    ) {
-        if verdict != crate::surface::SurfaceVerdict::Changed {
-            return;
-        }
-        let dirty = self.module_index.dirty_consumers(canon);
-        self.republish_open_docs_in(&dirty).await;
+        Some(self.module_index.record_and_dirty(&canon, &doc.analysis))
     }
 
     /// Re-enrich + republish every OPEN doc in a dirty closure — the one
@@ -1536,10 +1523,10 @@ impl LanguageServer for Backend {
             let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
             // Surface-gated consumer refresh: a body edit stops here
-            // (Unchanged); a contract change republishes the open docs
-            // that can see it.
-            if let Some((canon, verdict)) = recorded {
-                self.refresh_dirty_open_consumers(&canon, verdict).await;
+            // (Unchanged → empty dirty set); a contract change republishes
+            // the open docs that can see it.
+            if let Some(sd) = recorded {
+                self.republish_open_docs_in(&sd.dirty).await;
             }
             return;
         }
@@ -1567,8 +1554,8 @@ impl LanguageServer for Backend {
             }
             let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
-            if let Some((canon, verdict)) = recorded {
-                self.refresh_dirty_open_consumers(&canon, verdict).await;
+            if let Some(sd) = recorded {
+                self.republish_open_docs_in(&sd.dirty).await;
             }
         }
         // The saved bytes are on disk: re-register this file's indexed copy,
@@ -2439,12 +2426,12 @@ impl LanguageServer for Backend {
                                 let arc = Arc::new(analysis);
                                 files.insert_workspace_arc(canon.clone(), arc.clone());
                                 module_index.record_workspace_projections(&canon, &arc);
-                                let verdict = module_index
+                                // register_workspace_resident routes through
+                                // record_and_dirty: the dirty set is bound to
+                                // the record, so a re-register can't drop it.
+                                let sd = module_index
                                     .register_workspace_resident(canon.clone(), arc);
-                                if verdict == crate::surface::SurfaceVerdict::Changed {
-                                    dirty_all
-                                        .extend(module_index.dirty_consumers(&canon));
-                                }
+                                dirty_all.extend(sd.dirty);
                             }
                         }
                     }

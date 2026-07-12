@@ -427,6 +427,19 @@ impl WorkspaceRegistrationParts {
     }
 }
 
+/// The freshness gate's answer: the surface verdict plus, on `Changed`, the
+/// transitive dirty consumer set. Returned by `ModuleIndex::record_and_dirty`
+/// (and by `register_workspace_resident`, which routes through it) so a
+/// caller that records a surface always holds the consumer answer from the
+/// same path.
+pub struct SurfaceDirty {
+    /// Rides the answer for callers that gate on FirstSeen vs Unchanged vs
+    /// Changed; today's consumers act only on `dirty` (empty ⇒ nothing to do).
+    #[allow(dead_code)]
+    pub verdict: crate::surface::SurfaceVerdict,
+    pub dirty: std::collections::HashSet<std::path::PathBuf>,
+}
+
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
@@ -1173,36 +1186,62 @@ impl ModuleIndex {
     /// here — indexers strip via `register_workspace_stripping`, which feeds
     /// from the whole analysis first. Files without a `package` declaration
     /// get only the path entry.
-    /// Returns the surface verdict so re-registration seams (the watcher)
-    /// can act on `Changed` — dropping it leaves open consumers stale
-    /// after an external edit (git pull) to a dep.
+    /// Returns the `SurfaceDirty` outcome (verdict + on-`Changed` dirty
+    /// consumer set) so re-registration seams (the watcher) act on the same
+    /// record→verdict→dirty answer — dropping it leaves open consumers
+    /// stale after an external edit (git pull) to a dep.
     pub fn register_workspace_resident(
         &self,
         path: std::path::PathBuf,
         analysis: Arc<FileAnalysis>,
-    ) -> crate::surface::SurfaceVerdict {
+    ) -> SurfaceDirty {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
-        let verdict = self.record_surface(&path, &analysis);
+        let sd = self.record_and_dirty(&path, &analysis);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Path-keyed registry first: the relational retrieval resolves
         // candidate paths through `cached_by_path`, and packageless files
         // (Mojolicious::Lite entrypoints) exist ONLY here.
         self.all_files.insert(cached.path.clone(), cached.clone());
         let Some(module_name) = first_package_name(&analysis) else {
-            return verdict;
+            return sd;
         };
         self.workspace_modules.insert(module_name.clone(), ());
         self.edges.purge_module(&module_name);
         self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
-        verdict
+        sd
+    }
+
+    /// The freshness gate, single-sourced: record `fa`'s span-free surface
+    /// for `path` and, on a `Changed` verdict, walk its transitive dirty
+    /// consumers (empty otherwise). Binding record → verdict → dirty in one
+    /// seam means a caller cannot record a surface without the consumer
+    /// answer from the same path (the "watcher dropped the verdict" bug
+    /// class). The caller owns the ACT on the outcome (re-enrich open docs /
+    /// accumulate a batch / deps-stamp refresh) — those legitimately differ.
+    /// The pack tier discovers consumers by include-closure, not this walk,
+    /// so it uses `record_surface` directly (a genuinely different axis).
+    pub fn record_and_dirty(
+        &self,
+        path: &std::path::Path,
+        fa: &FileAnalysis,
+    ) -> SurfaceDirty {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let verdict = self.record_surface(&canon, fa);
+        let dirty = match verdict {
+            crate::surface::SurfaceVerdict::Changed => self.dirty_consumers(&canon),
+            _ => Default::default(),
+        };
+        SurfaceDirty { verdict, dirty }
     }
 
     /// Project + record `fa`'s span-free surface for `path` — the
     /// freshness engine's write half. Call with a WHOLE analysis (the
     /// projection reads symbols + the bag). Returns the early-cutoff
     /// verdict; `Changed` means `dirty_consumers(path)` names stale files.
+    /// Prefer `record_and_dirty` when you will act on the consumer set —
+    /// it binds the walk to the record so it can't be forgotten.
     pub fn record_surface(
         &self,
         path: &std::path::Path,
