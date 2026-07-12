@@ -52,7 +52,7 @@
         ]
       },
       "status": "xfail",
-      "note": "codegen'd accessor is_warn at Logger.pm:879 flagged unresolved-method; should be suppressed."
+      "note": "codegen'd accessor is_warn at Logger.pm:879 flagged unresolved-method; should be suppressed. XPASSes only on a cache whose ref-rows migration silently failed (bag-evicted sweep copies drop the invocant type, hiding the FP) — a healthy store still shows the diagnostic."
     },
     {
       "id": "diag-10",
@@ -70,7 +70,7 @@
         ]
       },
       "status": "xfail",
-      "note": "codegen'd method warn at Logger.pm:883 flagged unresolved-method; should be suppressed."
+      "note": "codegen'd method warn at Logger.pm:883 flagged unresolved-method; should be suppressed. XPASSes only on a cache whose ref-rows migration silently failed (bag-evicted sweep copies drop the invocant type, hiding the FP) — a healthy store still shows the diagnostic."
     },
     {
       "id": "diag-13",
@@ -123,7 +123,7 @@
         ]
       },
       "status": "xfail",
-      "note": "GAP: sub _compare { my ($cookie,...)=@_ } is a plain helper in an OO class; $cookie is a Mojo::Cookie, but first-param-self types it as the jar -> false unresolved-method on path/name/domain. The OO-class first-param-self over-reach (vs the -strict case) is unfixed."
+      "note": "GAP: sub _compare { my ($cookie,...)=@_ } is a plain helper in an OO class; $cookie is a Mojo::Cookie, but first-param-self types it as the jar -> false unresolved-method on path/name/domain. The OO-class first-param-self over-reach (vs the -strict case) is unfixed. XPASSes only on a cache whose ref-rows migration silently failed (bag-evicted sweep copies drop the invocant type, hiding the FP) — a healthy store still shows the diagnostic."
     },
     {
       "id": "diag-mojo-daemon-callback-fp",
@@ -141,7 +141,7 @@
         ]
       },
       "status": "xfail",
-      "note": "GAP: `on(request => sub { my $tx = shift; $tx->req })` — $tx is a transaction, but first-param-self leaks into the anonymous callback and types it as the Daemon. Unfixed."
+      "note": "GAP: `on(request => sub { my $tx = shift; $tx->req })` — $tx is a transaction, but first-param-self leaks into the anonymous callback and types it as the Daemon. Unfixed. XPASSes only on a cache whose ref-rows migration silently failed (bag-evicted sweep copies drop the invocant type, hiding the FP) — a healthy store still shows the diagnostic."
     }
   ]
 }

@@ -1533,6 +1533,10 @@ type VisitedSet = std::collections::HashSet<VisitedKey>;
 /// queries whose context (scopes / module_index / framework) differs.
 struct QueryState {
     visited: VisitedSet,
+    /// Enriched copies consulted during this query — pinned so memo
+    /// entries keyed on their bag ADDRESSES stay valid even if the
+    /// overlay's eviction drops its own reference mid-query.
+    pins: Vec<std::sync::Arc<crate::file_analysis::FileAnalysis>>,
     // `Arc` so a memo store/hit clones one heap pointer, not the
     // (String-bearing) `ReducedValue`. `HashMap::new()` pre-allocates
     // no buckets, so a shallow query that never re-reaches a node (the
@@ -1545,6 +1549,7 @@ impl QueryState {
     fn new() -> Self {
         QueryState {
             visited: std::collections::HashSet::new(),
+            pins: Vec::new(),
             memo: std::collections::HashMap::new(),
         }
     }
@@ -1816,31 +1821,46 @@ impl ReducerRegistry {
                         // Rehydrate the target file's bag if its resident copy
                         // was Slice-2-evicted; the cross-file chase reads its
                         // witnesses (`docs/adr/memory-slice-2-lru.md`).
+                        let attempt =
+                            |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>,
+                             state: &mut _| {
+                                let cached_ctx = BagContext {
+                                    scopes: &full.scopes,
+                                    package_framework: &full.package_framework,
+                                    module_index: Some(idx),
+                                    package_parents: &full.package_parents,
+                                    app_surface_consumers: &full.app_surface_consumers,
+                                };
+                                let sub_q = ReducerQuery {
+                                    attachment: q.attachment,
+                                    point: q.point,
+                                    framework: q.framework,
+                                    arity_hint: q.arity_hint,
+                                    receiver: q.receiver.clone(),
+                                    args: q.args.clone(),
+                                    context: Some(&cached_ctx),
+                                };
+                                (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
+                            };
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
-                            let cached_ctx = BagContext {
-                                scopes: &full.scopes,
-                                package_framework: &full.package_framework,
-                                module_index: Some(idx),
-                                package_parents: &full.package_parents,
-                                app_surface_consumers: &full.app_surface_consumers,
-                            };
-                            let sub_q = ReducerQuery {
-                                attachment: q.attachment,
-                                point: q.point,
-                                framework: q.framework,
-                                arity_hint: q.arity_hint,
-                                receiver: q.receiver.clone(),
-                                args: q.args.clone(),
-                                context: Some(&cached_ctx),
-                            };
-                            let v = self.query_rec(
-                                &full.witnesses,
-                                &sub_q,
-                                state,
-                            );
-                            if *v != ReducedValue::None {
-                                return (*v).clone();
+                            let v = attempt(&full, state);
+                            if v != ReducedValue::None {
+                                return v;
+                            }
+                            // Fallback-on-miss (R4): the class file's method
+                            // return may chain through ITS OWN imports —
+                            // invisible to the raw bag, present in the
+                            // enriched overlay.
+                            let enriched = idx.enriched_present(&cached);
+                            if !std::sync::Arc::ptr_eq(&enriched, &full)
+                                && !std::ptr::eq(bag, &enriched.witnesses)
+                            {
+                                state.pins.push(std::sync::Arc::clone(&enriched));
+                                let v = attempt(&enriched, state);
+                                if v != ReducedValue::None {
+                                    return v;
+                                }
                             }
                         }
                     }
@@ -2384,19 +2404,19 @@ pub fn query_sub_return_type(
     // overrides, and fold rules; only the bag and symbols change.
     if let Some(ctx) = context {
         if let Some(idx) = ctx.module_index {
-            for module_name in idx.find_exporters(sub_name) {
-                let Some(cached) = idx.get_cached(&module_name) else { continue };
-                let full = idx.bag_present(&cached);
-                let Some(sym) = full.symbols.iter().find(|s| {
+            let try_in = |full: &std::sync::Arc<crate::file_analysis::FileAnalysis>|
+             -> Option<Option<InferredType>> {
+                // Outer None = no matching symbol (an enriched retry can't
+                // help — enrichment adds no symbols of these kinds);
+                // Some(None) = symbol present, type unresolved (retryable).
+                let sym = full.symbols.iter().find(|s| {
                     s.name == sub_name
                         && matches!(
                             s.kind,
                             crate::file_analysis::SymKind::Sub
                                 | crate::file_analysis::SymKind::Method
                         )
-                }) else {
-                    continue;
-                };
+                })?;
                 let cached_ctx = BagContext {
                     scopes: &full.scopes,
                     package_framework: &full.package_framework,
@@ -2414,8 +2434,36 @@ pub fn query_sub_return_type(
                     args: Vec::new(),
                     context: Some(&cached_ctx),
                 };
-                if let ReducedValue::Type(t) = reg.query(&full.witnesses, &q) {
-                    return Some(t);
+                match reg.query(&full.witnesses, &q) {
+                    ReducedValue::Type(t) => Some(Some(t)),
+                    _ => Some(None),
+                }
+            };
+            // Two passes so the R4 retry can never SHADOW a later
+            // exporter's raw answer: every exporter answers from its raw
+            // bag first; only when ALL raw bags miss do the retryable ones
+            // consult the enrichment overlay (fallback-on-miss — the raw
+            // bag dead-ends when the closed file's sub return chains
+            // through ITS OWN imports; the walker pins no edge for
+            // imported calls).
+            let mut retryable: Vec<std::sync::Arc<crate::file_analysis::CachedModule>> =
+                Vec::new();
+            for module_name in idx.find_exporters(sub_name) {
+                let Some(cached) = idx.get_cached(&module_name) else { continue };
+                let full = idx.bag_present(&cached);
+                match try_in(&full) {
+                    Some(Some(t)) => return Some(t),
+                    Some(None) => retryable.push(cached),
+                    None => {}
+                }
+            }
+            for cached in retryable {
+                let full = idx.bag_present(&cached);
+                let enriched = idx.enriched_present(&cached);
+                if !std::sync::Arc::ptr_eq(&enriched, &full) {
+                    if let Some(Some(t)) = try_in(&enriched) {
+                        return Some(t);
+                    }
                 }
             }
             // Pack cross-file: a call whose callee is defined in an INCLUDED
@@ -2439,11 +2487,7 @@ pub fn query_sub_return_type(
                     // so gate BEFORE rehydrating — an unreachable candidate
                     // never pays a bag decode.
                     let reachable = visible.contains(p.as_ref())
-                        || cached
-                            .analysis
-                            .include_closure
-                            .iter()
-                            .any(|c| c.as_str() == self_str.as_ref());
+                        || cached.analysis.include_closure.contains(self_str.as_ref());
                     if !reachable {
                         continue;
                     }
