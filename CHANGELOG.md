@@ -6,6 +6,61 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.7.0 — 2026-07-12
+
+### C/C++ support (opt-in build feature `cpp`)
+
+perl-lsp now serves C/C++ alongside Perl from one server: goto-definition,
+references (including cross-translation-unit), member and in-scope
+completion, hover, outline, semantic tokens, and `#include` navigation.
+Extraction is query-driven behind a generic language seam, so the same
+machinery hosts experimental Python / R / CMake packs. Default builds
+remain Perl-only; `cargo build --release --features cpp` turns the rest on.
+
+### Storage engine — warm starts, bounded memory
+
+Cross-file analysis now persists per project (SQLite, `~/.cache/perl-lsp`):
+
+- **Relational ref index.** References/rename candidates resolve through
+  indexed rows instead of a full in-memory sweep; `--refs-parity <root>`
+  is the built-in A/B verification harness.
+- **Warm starts.** Workspace and dependency analyses reload from disk —
+  unchanged files are never re-parsed at startup.
+- **Bounded residency.** In-memory copies are stripped once persisted and
+  rehydrate on demand through byte-capped LRUs; a large C++ workspace
+  (abseil) idles around 34 MB warm. Structural tripwires guard against
+  regressions, and `PERL_LSP_STRICT_RESIDENCY=1` turns any would-be
+  silently-degraded answer into a loud failure (the gold harness runs
+  with it on).
+- **Freshness gating.** Edits that don't change a file's cross-file-visible
+  surface no longer trigger dependent re-analysis; open-buffer state is
+  tracked separately from on-disk state so consumers are never refreshed
+  against the wrong baseline.
+- `perl-lsp --clear-cache [<root>]` wipes a project's cache (or all of it).
+
+### Query-declared plugins
+
+Framework plugins (`.rhai`) now declare the syntax they care about as
+tree-sitter query patterns with `on_match` handlers — no more hand-rolled
+capture plumbing — and can publish their own diagnostics. Editing a plugin
+invalidates the affected cache automatically. `--plugin-check` validates a
+plugin bundle, and legacy hook styles are rejected with a porting hint.
+
+### Usage heatmap
+
+`perl-lsp --heatmap <root> [--csv|--html]` reports per-symbol fan-in /
+fan-out, an unreferenced-symbol review queue, and a dead-exports queue
+(exported subs no other file references — sound: a listed export is truly
+unused by consumers). `--html` emits a self-contained offline viewer.
+
+### Cross-file type inference
+
+Closed files now answer type queries with their imports applied
+(previously only open documents did), and that enrichment is transitive
+across module chains (A → B → C). Inheritance-aware method resolution,
+receiver-gated dispatch, and structural hash-shape typing all ride the
+same witness engine.
+
 ## v0.6.0 — 2026-07-05
 
 ### Type narrowing
