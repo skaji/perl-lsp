@@ -89,5 +89,5 @@ this.
 
 Upstream parser improvements that would shrink Layer 1's load (preserve
 `sub`/`use` inside ERROR, prevent `package` from being eaten as an argument)
-are tracked in `docs/prompt-parser-error-recovery-gaps.md`. They're not
+are tracked in `gold-corpus/KNOWN-GAPS.md`. They're not
 blockers — Layer 1 is the right insurance to keep regardless.

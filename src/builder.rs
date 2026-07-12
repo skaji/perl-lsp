@@ -471,7 +471,6 @@ fn build_with_plugins_inner(
     // produced no witness. The walk queued each missing lookup; resolve
     // them now against the final symbol table and push the
     // `Expr(span) → Edge(Symbol(sid))` witness the walk would have.
-    // See `docs/prompt-forward-reference-resolution.md`.
     bphase!("resolve_fwd_expr_witnesses", b.resolve_forward_expr_witnesses());
 
     // Worklist driver: one fixed-point loop over chain typing +
