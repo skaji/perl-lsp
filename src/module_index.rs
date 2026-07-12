@@ -545,12 +545,24 @@ pub struct ModuleIndex {
     /// evicted, and rehydration after an edit persists would fetch the NEW
     /// generation's names.
     registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
-    /// Slice-2 rehydration store — SET ONLY on pack sub-indexes, `None` on the
-    /// Perl hub (Perl copies are never bag-evicted). After indexing, each
-    /// resident pack `FileAnalysis` has its witness bag evicted; a type query
-    /// reaching into an evicted file rehydrates the exact persisted bag through
-    /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
+    /// Slice-2 rehydration store. Pack sub-indexes get theirs at
+    /// construction (keyed to `modules-{lang}.db`); the Perl hub gets its
+    /// own in `set_workspace_root` (keyed to `modules.db` — workspace
+    /// copies are refs/bag-evicted once persisted). A type query reaching
+    /// into an evicted file rehydrates the exact persisted bag through this
+    /// LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
     bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
+    /// The SIBLING tier's rehydration store, for copies this index does not
+    /// own. Sweeps mint `CachedModule`s from FileStore entries and ask
+    /// whatever index the query routed to — a cpp query's workspace sweep
+    /// hands PERL paths to the cpp sub-index, whose own loader (keyed to
+    /// `modules-{lang}.db`) can never serve them. `attach_pack_index`
+    /// shares the hub's `bag_cache` cell here so a foreign path routes to
+    /// its owner instead of degrading to the stripped resident. The hub's
+    /// converse route (a pack path asked of the hub) walks `pack_indexes`.
+    foreign_bag_cache: std::sync::RwLock<
+        Option<Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>>,
+    >,
     /// Read-connection opener for the relational ref index
     /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
     /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
@@ -635,6 +647,7 @@ impl ModuleIndex {
             long_lived,
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache,
+            foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -1023,6 +1036,7 @@ impl ModuleIndex {
             long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -1112,6 +1126,7 @@ impl ModuleIndex {
             long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -1639,6 +1654,12 @@ impl ModuleIndex {
     /// MethodOnClass / member-completion machinery resolves across files.
     /// Attach a per-language sub-index (`"cpp"`, `"python"`, …).
     pub fn attach_pack_index(&self, lang: &str, idx: Arc<ModuleIndex>) {
+        // Share the hub's rehydration CELL (not its current contents — the
+        // cell, so a later `set_workspace_root` install stays visible): the
+        // sub-index can then serve a hub-owned path a sweep misroutes to it.
+        if let Ok(mut g) = idx.foreign_bag_cache.write() {
+            *g = Some(Arc::clone(&self.bag_cache));
+        }
         self.pack_indexes.insert(lang.to_string(), idx);
     }
 
@@ -1709,26 +1730,68 @@ impl ModuleIndex {
     /// panics so a run serving absence-as-answer fails loudly instead of
     /// scoring wrong results.
     fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        let mut stage = "no bag cache installed on this index";
         if let Some(bc) = self.bag_cache_ref() {
             if let Some(full) = bc.bag_for(&cached.path) {
                 return full;
             }
+            stage = "loader returned None (opener failed / no row / decode failed)";
         }
+        // Foreign route: sweeps mint `CachedModule`s from FileStore entries
+        // and ask whatever index the query routed to — this index's own
+        // loader can never serve a path a SIBLING tier persisted. One hop,
+        // sibling's CACHE directly (never its `rehydrate_or_resident` — no
+        // recursion): sub-index → the hub's cell; hub → the pack sibling
+        // that registered the path.
+        if let Some(fa) = self.rehydrate_foreign(&cached.path) {
+            return fa;
+        }
+
         REHYDRATION_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         log::error!(
-            "rehydration miss for evicted copy {:?} — serving stripped resident \
-             (references/types for this file are quietly incomplete this session)",
+            "rehydration miss for evicted copy {:?} ({stage}) — serving stripped \
+             resident (references/types for this file are quietly incomplete this \
+             session)",
             cached.path
         );
         if crate::module_resolver::strict_residency() {
             panic!(
-                "PERL_LSP_STRICT_RESIDENCY: evicted copy {:?} failed to rehydrate — \
-                 its blob is unreadable or vanished post-eviction (writer generation \
-                 clobber / external cache clear). Refusing to serve absence-as-answer.",
+                "PERL_LSP_STRICT_RESIDENCY: evicted copy {:?} failed to rehydrate \
+                 ({stage}). Refusing to serve absence-as-answer.",
                 cached.path
             );
         }
         cached.analysis.clone()
+    }
+
+    /// A whole copy of `path` from the SIBLING tier that owns it — the
+    /// cross-index half of `rehydrate_or_resident`. Exactly one hop, always
+    /// through the sibling's cache (never its miss path), so routing can't
+    /// recurse. `None` when no sibling owns the path — the caller's miss
+    /// handling then applies.
+    fn rehydrate_foreign(&self, path: &std::path::Path) -> Option<Arc<FileAnalysis>> {
+        // Sub-index → the hub's cell (shared at `attach_pack_index`).
+        let hub_cell = self.foreign_bag_cache.read().ok().and_then(|g| g.clone());
+        if let Some(cell) = hub_cell {
+            let hub_cache = cell.read().ok().and_then(|g| g.clone());
+            if let Some(bc) = hub_cache {
+                if let Some(fa) = bc.bag_for(path) {
+                    return Some(fa);
+                }
+            }
+        }
+        // Hub → the pack sibling that registered the path.
+        for entry in self.pack_indexes.iter() {
+            let sub = entry.value();
+            if sub.all_files.contains_key(path) {
+                if let Some(bc) = sub.bag_cache_ref() {
+                    if let Some(fa) = bc.bag_for(path) {
+                        return Some(fa);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Does `m` declare a `Class`/type named `name`? Rank source for the
