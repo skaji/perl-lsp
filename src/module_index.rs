@@ -442,6 +442,24 @@ impl WorkspaceRegistrationParts {
     }
 }
 
+/// Who is recording a surface. While a doc is OPEN, cross-file consumers
+/// read its BUFFER analysis (query priority: open docs shadow the indexed
+/// disk copy), so the freshness baseline must track the buffer: a
+/// `Background` write (bulk indexer, watcher tick, save re-register) for an
+/// open path describes a disk state consumers cannot see and is SUPPRESSED
+/// — otherwise an edit reverting the buffer to the disk state reads
+/// Unchanged against the wrong baseline and skips the consumer refresh.
+/// `did_close` reconciles: consumers flip back to the disk copy, so the
+/// close path re-records it (and refreshes whoever the flip dirtied).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SurfaceWrite {
+    /// The open-doc editor path — owns the record while the doc is open.
+    OpenDoc,
+    /// Everything else (indexers, watcher, warm lanes) — yields to an open
+    /// doc's record, wins otherwise.
+    Background,
+}
+
 /// The freshness gate's answer: the surface verdict plus, on `Changed`, the
 /// transitive dirty consumer set. Returned by `ModuleIndex::record_and_dirty`
 /// (and by `register_workspace_resident`, which routes through it) so a
@@ -498,6 +516,13 @@ pub struct ModuleIndex {
     /// languages. The Perl index is the hub; query routing picks the right
     /// one by the queried file's language. Generic: any pack language.
     pack_indexes: Arc<DashMap<String, Arc<ModuleIndex>>>,
+    /// Canonical paths of currently-open docs whose surface record the
+    /// open-doc path owns (`SurfaceWrite` — background writes yield).
+    /// Marked by the backend on didOpen, cleared + reconciled on didClose.
+    /// Perl hub only today: pack languages have no open-doc surface
+    /// recorder yet, so guarding their background writes would freeze
+    /// records staleward.
+    open_doc_paths: Arc<DashMap<std::path::PathBuf, ()>>,
     /// ALL cross-file candidates per name (not just the single winner in
     /// `cache`) — pack languages only. C linkage is globally flat, so two
     /// unrelated files can each define `class Box`; `cache` picks one
@@ -637,6 +662,7 @@ impl ModuleIndex {
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
+            open_doc_paths: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
@@ -1026,6 +1052,7 @@ impl ModuleIndex {
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
+            open_doc_paths: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
@@ -1116,6 +1143,7 @@ impl ModuleIndex {
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
+            open_doc_paths: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
@@ -1227,7 +1255,7 @@ impl ModuleIndex {
     ) -> SurfaceDirty {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
-        let sd = self.record_and_dirty(&path, &analysis);
+        let sd = self.record_and_dirty(&path, &analysis, SurfaceWrite::Background);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Path-keyed registry first: the relational retrieval resolves
         // candidate paths through `cached_by_path`, and packageless files
@@ -1256,9 +1284,11 @@ impl ModuleIndex {
         &self,
         path: &std::path::Path,
         fa: &FileAnalysis,
+        write: SurfaceWrite,
     ) -> SurfaceDirty {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let verdict = self.record_surface(&canon, fa);
+        let verdict =
+            self.record_surface_write(&canon, crate::surface::Surface::project(fa), write);
         let dirty = match verdict {
             crate::surface::SurfaceVerdict::Changed => self.dirty_consumers(&canon),
             _ => Default::default(),
@@ -1270,6 +1300,7 @@ impl ModuleIndex {
     /// freshness engine's write half. Call with a WHOLE analysis (the
     /// projection reads symbols + the bag). Returns the early-cutoff
     /// verdict; `Changed` means `dirty_consumers(path)` names stale files.
+    /// `Background` provenance — every direct caller is an indexer lane.
     /// Prefer `record_and_dirty` when you will act on the consumer set —
     /// it binds the walk to the record so it can't be forgotten.
     pub fn record_surface(
@@ -1292,7 +1323,45 @@ impl ModuleIndex {
         // lands on one key — a fresh/canon split would make every edit
         // look FirstSeen and the gate never fires.
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.freshness.record(&canon, surface)
+        self.record_surface_write(&canon, surface, SurfaceWrite::Background)
+    }
+
+    /// The ONE freshness write (`canon` pre-canonicalized): applies the
+    /// `SurfaceWrite` provenance rule — a `Background` write on an open
+    /// doc's path is suppressed (Unchanged: consumers read the buffer, and
+    /// what they read didn't move).
+    fn record_surface_write(
+        &self,
+        canon: &std::path::Path,
+        surface: crate::surface::Surface,
+        write: SurfaceWrite,
+    ) -> crate::surface::SurfaceVerdict {
+        if write == SurfaceWrite::Background && self.open_doc_paths.contains_key(canon) {
+            return crate::surface::SurfaceVerdict::Unchanged;
+        }
+        self.freshness.record(canon, surface)
+    }
+
+    /// didOpen: the open-doc path owns `path`'s surface record until
+    /// `mark_doc_closed` (see `SurfaceWrite`).
+    pub fn mark_doc_open(&self, path: &std::path::Path) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.open_doc_paths.insert(canon, ());
+    }
+
+    /// didClose: release the record to background writers and reconcile —
+    /// consumers flip back to reading the indexed DISK copy, so re-record it
+    /// (whole view: the resident copy may be stripped) and hand back whoever
+    /// that flip dirtied. `None` when no indexed copy exists (never indexed,
+    /// or deleted — the watcher's delete arm owns record removal): the
+    /// open-doc record stays as the last truth until a background write
+    /// corrects it.
+    pub fn mark_doc_closed(&self, path: &std::path::Path) -> Option<SurfaceDirty> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.open_doc_paths.remove(&canon);
+        let cm = self.all_files.get(&canon).map(|e| e.value().clone())?;
+        let whole = crate::file_analysis::CrossFileLookup::whole_present(self, &cm);
+        Some(self.record_and_dirty(&canon, &whole, SurfaceWrite::Background))
     }
 
     /// Every registration bumps this — the enrichment key's freshness

@@ -1079,3 +1079,96 @@ fn foreign_path_rehydrates_through_the_owning_sibling() {
         "a foreign-routed answer is a hit, not a residency miss"
     );
 }
+
+/// Build a FileAnalysis from source (whole, never registered).
+fn build_fa(src: &str) -> crate::file_analysis::FileAnalysis {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    crate::builder::build(&tree, src.as_bytes())
+}
+
+/// The buffer-vs-disk provenance rule (`SurfaceWrite`): while a doc is
+/// open, consumers read its BUFFER, so the freshness baseline must track
+/// the open-doc records — a background (disk) re-record must not replace
+/// it. The trap this guards: buffer holds a contract change A', background
+/// re-records disk state A over it, the user REVERTS the buffer to A — and
+/// the revert must read CHANGED (consumers saw A'), not Unchanged against
+/// the smuggled disk baseline.
+#[test]
+fn background_surface_write_yields_to_open_doc_record() {
+    use crate::module_index::SurfaceWrite;
+    use crate::surface::SurfaceVerdict;
+    let idx = ModuleIndex::new_for_test();
+    let path = PathBuf::from("/fake/prov/Widget.pm");
+    let disk = build_fa("package Widget;\nsub base { 1 }\n1;\n");
+    let buffer = build_fa("package Widget;\nsub base { 1 }\nsub extra { 2 }\n1;\n");
+
+    // Indexer records the disk build, then the doc opens.
+    assert_eq!(
+        idx.record_and_dirty(&path, &disk, SurfaceWrite::Background).verdict,
+        SurfaceVerdict::FirstSeen
+    );
+    idx.mark_doc_open(&path);
+
+    // Buffer gains a contract change — consumers refreshed against A'.
+    assert_eq!(
+        idx.record_and_dirty(&path, &buffer, SurfaceWrite::OpenDoc).verdict,
+        SurfaceVerdict::Changed
+    );
+    // A background tick re-records the DISK build: suppressed.
+    assert_eq!(
+        idx.record_and_dirty(&path, &disk, SurfaceWrite::Background).verdict,
+        SurfaceVerdict::Unchanged,
+        "background write on an open path must yield"
+    );
+    // The revert: buffer back to the disk state. Baseline must still be
+    // the buffer record A' — this is CHANGED, the refresh consumers need.
+    assert_eq!(
+        idx.record_and_dirty(&path, &disk, SurfaceWrite::OpenDoc).verdict,
+        SurfaceVerdict::Changed,
+        "revert-to-disk must read Changed against the BUFFER baseline"
+    );
+}
+
+/// didClose reconcile: consumers flip back to the indexed disk copy, so
+/// `mark_doc_closed` re-records it (Changed when the buffer died with an
+/// unsaved contract change) and background writes own the record again.
+#[test]
+fn close_reconciles_the_disk_record() {
+    use crate::module_index::SurfaceWrite;
+    use crate::surface::SurfaceVerdict;
+    let idx = ModuleIndex::new_for_test();
+    let path = PathBuf::from("/fake/prov/Gadget.pm");
+    let disk = build_fa("package Gadget;\nsub base { 1 }\n1;\n");
+    let buffer = build_fa("package Gadget;\nsub base { 1 }\nsub unsaved { 2 }\n1;\n");
+
+    // The indexed disk copy (registration records Background — but the doc
+    // opens first here, so the registration's record is suppressed and the
+    // copy still registers).
+    idx.mark_doc_open(&path);
+    let _ = idx.register_workspace_resident(path.clone(), Arc::new(disk));
+    // Open-doc record: the buffer's unsaved contract change. FirstSeen —
+    // the registration's background record above was suppressed, so this
+    // is the freshness index's first sight of the path.
+    assert_eq!(
+        idx.record_and_dirty(&path, &buffer, SurfaceWrite::OpenDoc).verdict,
+        SurfaceVerdict::FirstSeen
+    );
+
+    // Close: reconcile against the registered disk copy.
+    let sd = idx.mark_doc_closed(&path).expect("indexed copy exists");
+    assert_eq!(
+        sd.verdict,
+        SurfaceVerdict::Changed,
+        "buffer died with an unsaved contract change — the flip to disk is Changed"
+    );
+    // Background writers own the record again: re-recording disk is Unchanged.
+    assert_eq!(
+        idx.record_and_dirty(&path, &build_fa("package Gadget;\nsub base { 1 }\n1;\n"), SurfaceWrite::Background)
+            .verdict,
+        SurfaceVerdict::Unchanged
+    );
+}

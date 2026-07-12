@@ -1040,7 +1040,11 @@ impl Backend {
         if doc.language != "perl" {
             return None;
         }
-        Some(self.module_index.record_and_dirty(&canon, &doc.analysis))
+        Some(self.module_index.record_and_dirty(
+            &canon,
+            &doc.analysis,
+            crate::module_index::SurfaceWrite::OpenDoc,
+        ))
     }
 
     /// Re-enrich + republish every OPEN doc in a dirty closure — the one
@@ -1488,7 +1492,23 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        // The open-doc path now owns this file's surface record (buffer
+        // shadows disk for every cross-file consumer — `SurfaceWrite`).
+        // Recording here also catches an open-after-external-change: the
+        // buffer's surface vs the indexer's record → Changed → refresh.
+        let mut opened_dirty = None;
+        if opened {
+            if let (Ok(path), Some(doc)) = (uri.to_file_path(), self.files.get_open(&uri)) {
+                if doc.language == "perl" {
+                    self.module_index.mark_doc_open(&path);
+                    opened_dirty = self.record_open_doc_surface(&uri);
+                }
+            }
+        }
         self.publish_diagnostics(&uri).await;
+        if let Some(sd) = opened_dirty {
+            self.republish_open_docs_in(&sd.dirty).await;
+        }
         if needs_gather_refresh {
             self.spawn_pack_gather_refresh(uri);
         }
@@ -1568,7 +1588,17 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.files.close(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        self.files.close(&uri);
+        // Release the surface record to background writers and reconcile:
+        // consumers flip back to the indexed DISK copy — if the buffer died
+        // with unsaved contract changes, whoever enriched against it is
+        // stale and gets republished here.
+        if let Ok(path) = uri.to_file_path() {
+            if let Some(sd) = self.module_index.mark_doc_closed(&path) {
+                self.republish_open_docs_in(&sd.dirty).await;
+            }
+        }
     }
 
     async fn document_symbol(

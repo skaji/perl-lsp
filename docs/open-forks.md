@@ -337,13 +337,17 @@ deleted paths; method dedup collapses only FULLY-equal duplicates.
 
 Deferred, in rough priority order:
 
-- **Concurrent surface writers (buffer vs disk)**: a bulk index or watcher
-  tick re-records a DISK build over an open doc's BUFFER record; an edit
-  reverting the buffer to the disk state then reads Unchanged against the
-  wrong baseline and skips a consumer refresh. Needs record provenance
-  (open-doc records outrank background ones while the doc is open) or a
-  doc-open guard on background recording. Rare (requires an unsaved
-  contract change raced by a background re-record), silent when hit.
+- **Concurrent surface writers (buffer vs disk)** — LANDED 2026-07-12.
+  Record provenance (`SurfaceWrite::{OpenDoc, Background}`) at the one
+  freshness write (`record_surface_write`): while a doc is open (didOpen
+  marks, didClose clears), background writes on its path are suppressed —
+  consumers read the buffer, so the baseline must track the buffer.
+  didClose reconciles: re-records the indexed DISK copy (whole view) and
+  republishes whoever the flip dirtied, so a buffer that dies with unsaved
+  contract changes can't leave consumers enriched against a ghost. didOpen
+  now records too (catches open-after-external-change). Perl hub only —
+  pack languages have no open-doc surface recorder yet; guarding their
+  background writes would freeze records staleward (residual below).
 - **Verdict-policy seam** — LANDED 2026-07-12.
   `ModuleIndex::record_and_dirty(path, fa) -> SurfaceDirty {verdict, dirty}`
   binds record → verdict → dirty-consumers in one seam; the open-doc editor
