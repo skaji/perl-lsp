@@ -535,6 +535,21 @@ impl<'a> Builder<'a> {
             let match_scope = self.scope_at_point(mspan.start);
             self.scope_stack.push(match_scope);
             for a in actions {
+                // Same loader-config witness rule as the walk phase: a
+                // PluginLoad's config value must carry an Expr witness at
+                // `config_span` or `record_loader_shapes`' cross-file join
+                // silently loses the shape — the phases must not diverge.
+                if let plugin::EmitAction::PluginLoad {
+                    config_span: Some(cfg),
+                    ..
+                } = &a
+                {
+                    if let Some((_, node)) =
+                        caps.iter().find(|(_, n)| node_to_span(*n) == *cfg)
+                    {
+                        self.emit_expr_witness(*node);
+                    }
+                }
                 if let plugin::EmitAction::SetRouteBase { controller } = &a {
                     current_base = Some(controller.clone());
                     continue;
