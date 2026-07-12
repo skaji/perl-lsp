@@ -891,12 +891,13 @@ pub fn index_workspace_with_index(
     // before its blob exists rehydrates to nothing and serves wrong-empty.
     struct WsFresh {
         path: PathBuf,
-        /// The copy to register on `deferred` entries (stripped; the feed
-        /// half already ran on the whole analysis).
+        /// The copy to mirror into the FileStore on `deferred` entries
+        /// (stripped; the feed half already ran on the whole analysis).
         arc: std::sync::Arc<crate::file_analysis::FileAnalysis>,
-        /// Cache-slot key from the pre-strip feed half (`None` for
-        /// packageless entrypoint scripts — they get only the path entry).
-        module_name: Option<String>,
+        /// `Some` → register the residency token AFTER the chunk commits
+        /// (only when an index exists; `None` covers packageless / no-index
+        /// deferred entries and every persist-only whole copy).
+        parts: Option<crate::module_index::WorkspaceRegistrationParts>,
         /// Register + mirror in the writer after COMMIT. `false` = the
         /// worker already registered a WHOLE copy (NO_EVICT); persist only.
         deferred: bool,
@@ -945,8 +946,8 @@ pub fn index_workspace_with_index(
                     }
                     if e.deferred {
                         files.insert_workspace_arc(e.path.clone(), e.arc.clone());
-                        if let Some(idx) = module_index {
-                            idx.register_workspace_residency(e.path, e.arc, e.module_name);
+                        if let (Some(idx), Some(parts)) = (module_index, e.parts) {
+                            idx.register_workspace_residency(e.path, parts);
                         }
                     }
                 },
@@ -1030,12 +1031,12 @@ pub fn index_workspace_with_index(
                         // residency + FileStore mirror in the writer AFTER
                         // its chunk commits. Until then the file reads as
                         // "not yet indexed" — never wrong-empty.
-                        let (arc, module_name) = match module_index {
+                        let (arc, parts) = match module_index {
                             Some(idx) => {
                                 let parts =
                                     idx.prepare_workspace_parts(analysis, true, true);
-                                let _ = idx.record_surface_value(&canon, parts.surface);
-                                (parts.arc, parts.module_name)
+                                parts.record_surface(idx, &canon);
+                                (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
                             None => {
                                 analysis.evict_axes(true, true);
@@ -1046,7 +1047,7 @@ pub fn index_workspace_with_index(
                         let _ = fresh_tx.send(WsFresh {
                             path: canon.clone(),
                             arc,
-                            module_name,
+                            parts,
                             deferred: true,
                             blob,
                             seeds,
@@ -1056,22 +1057,24 @@ pub fn index_workspace_with_index(
                         });
                     } else {
                         // Whole copy (no persistence, degraded, or NO_EVICT):
-                        // safe to register immediately; still persist when a
-                        // blob exists.
-                        let arc = std::sync::Arc::new(analysis);
-                        if let Some(idx) = module_index {
-                            let module_name = idx.workspace_feed_prestrip(&arc);
-                            idx.register_workspace_residency(
-                                canon.clone(),
-                                arc.clone(),
-                                module_name,
-                            );
-                        }
+                        // register immediately (no strip — the whole-copy door);
+                        // still persist when a blob exists. `false, false` mints
+                        // the token without evicting or recording surface, so
+                        // this path's freshness behavior is unchanged.
+                        let arc = match module_index {
+                            Some(idx) => {
+                                let parts = idx.prepare_workspace_parts(analysis, false, false);
+                                let arc = std::sync::Arc::clone(parts.arc());
+                                idx.register_workspace_residency(canon.clone(), parts);
+                                arc
+                            }
+                            None => std::sync::Arc::new(analysis),
+                        };
                         if let Some((blob, seeds, sym_seeds, closure)) = payload {
                             let _ = fresh_tx.send(WsFresh {
                                 path: canon.clone(),
                                 arc: arc.clone(),
-                                module_name: None,
+                                parts: None,
                                 deferred: false,
                                 blob,
                                 seeds,
@@ -1320,13 +1323,12 @@ pub fn index_pack_languages(
                                 // re-shred needs the full analysis.
                                 return WarmDirective::NeedFull;
                             }
-                            let _ = pack_index.record_surface_value(&path, stub.surface);
-                            pack_index.register_symbols_inner(
-                                path.clone(),
-                                Arc::new(stub.skeleton),
-                                &stub.feed,
-                                &stub.specs,
-                            );
+                            // The stub IS a persisted `prepare_pack_parts`
+                            // output — rehydrate the token, register through it.
+                            let parts =
+                                crate::module_index::PackRegistrationParts::from_warm_stub(stub);
+                            parts.record_surface(&pack_index, &path);
+                            pack_index.register_symbols_inner(path.clone(), parts);
                             warmed.insert(path);
                             return WarmDirective::Handled;
                         }
@@ -1348,22 +1350,17 @@ pub fn index_pack_languages(
                     );
                     if fully_stripped {
                         if let Some(blob) = module_cache::encode_stub(
-                            &parts.feed,
-                            &parts.specs,
-                            &parts.surface,
-                            &parts.arc,
+                            parts.feed(),
+                            parts.specs(),
+                            parts.surface(),
+                            parts.arc(),
                         ) {
                             let stamp = module_cache::file_stamp(&path).unwrap_or((0, 0));
                             pending_stubs.push((path.clone(), blob, stamp));
                         }
                     }
-                    let _ = pack_index.record_surface_value(&path, parts.surface);
-                    pack_index.register_symbols_inner(
-                        path.clone(),
-                        parts.arc,
-                        &parts.feed,
-                        &parts.specs,
-                    );
+                    parts.record_surface(&pack_index, &path);
+                    pack_index.register_symbols_inner(path.clone(), parts);
                     warmed.insert(path);
                     WarmDirective::Handled
                 },
@@ -1424,10 +1421,13 @@ pub fn index_pack_languages(
         // persists.
         struct FreshEntry {
             path: PathBuf,
+            // For persistence (`include_closure`) — always present. For a
+            // deferred entry this is the same arc the token carries.
             arc: Arc<crate::file_analysis::FileAnalysis>,
-            feed: Vec<(String, bool)>,
-            specs: Vec<(String, String)>,
-            deferred: bool,
+            // `Some` → register the token AFTER the chunk commits (stripped
+            // copies). `None` → the worker already registered a whole copy
+            // (NO_EVICT/degraded); the writer only persists.
+            parts: Option<crate::module_index::PackRegistrationParts>,
             blob: Vec<u8>,
             // Warm stub (deferred/stripped entries only) — persisted in the
             // same chunk txn as the blob so the next warm start registers
@@ -1489,10 +1489,8 @@ pub fn index_pack_languages(
                         // reachable, so its first rehydration reads the
                         // just-committed blob.
                         pack_index_writer.invalidate_bag_cache(&e.path);
-                        if e.deferred {
-                            pack_index_writer.register_symbols_inner(
-                                e.path, e.arc, &e.feed, &e.specs,
-                            );
+                        if let Some(parts) = e.parts {
+                            pack_index_writer.register_symbols_inner(e.path, parts);
                         }
                     },
                     |e: FreshEntry| {
@@ -1541,29 +1539,28 @@ pub fn index_pack_languages(
                         None
                     };
                     if strip && payload.is_some() {
-                        // Stripped copy: compute the feed pre-strip, hand
-                        // BOTH to the writer — it registers after the chunk
-                        // COMMITS, so an evicted copy is never reachable
-                        // before its blob can rehydrate it.
+                        // Stripped copy: mint the token pre-strip, hand it to
+                        // the writer — it registers after the chunk COMMITS,
+                        // so an evicted copy is never reachable before its blob
+                        // can rehydrate it.
                         let parts = crate::module_index::ModuleIndex::prepare_pack_parts(
                             analysis, true, true,
                         );
                         let stub_blob = module_cache::encode_stub(
-                            &parts.feed,
-                            &parts.specs,
-                            &parts.surface,
-                            &parts.arc,
+                            parts.feed(),
+                            parts.specs(),
+                            parts.surface(),
+                            parts.arc(),
                         );
                         // Recording before the writer's COMMIT is safe — the
                         // freshness index is session-local.
-                        let _ = pack_index.record_surface_value(&canon, parts.surface);
+                        parts.record_surface(&pack_index, &canon);
                         let (blob, seeds, sym_seeds) = payload.unwrap();
+                        let arc = Arc::clone(parts.arc());
                         let _ = fresh_tx.send(FreshEntry {
                             path: canon.clone(),
-                            arc: parts.arc,
-                            feed: parts.feed,
-                            specs: parts.specs,
-                            deferred: true,
+                            arc,
+                            parts: Some(parts),
                             blob,
                             stub_blob,
                             seeds,
@@ -1581,9 +1578,7 @@ pub fn index_pack_languages(
                             let _ = fresh_tx.send(FreshEntry {
                                 path: canon.clone(),
                                 arc,
-                                feed: Vec::new(),
-                                specs: Vec::new(),
-                                deferred: false,
+                                parts: None,
                                 blob,
                                 stub_blob: None,
                                 seeds,

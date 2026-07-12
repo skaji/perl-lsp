@@ -301,23 +301,96 @@ impl ModuleEdgeIndexes {
 
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
 /// thread populates the cache by parsing `.pm` files in-process.
-#[allow(dead_code)]
-/// What `prepare_pack_parts` hands back: the (possibly stripped) arc to
-/// register plus the whole-analysis halves — feed, specialization edges,
-/// projected surface — extracted BEFORE the strip.
+/// The pack registration TOKEN: the (possibly stripped) arc to register
+/// plus the whole-analysis halves — feed, specialization edges, projected
+/// surface — all extracted BEFORE the strip. Fields are PRIVATE and the
+/// struct is minted ONLY by the choke points in this module
+/// (`prepare_pack_parts` = the reads-whole-before-evict strip, `whole` =
+/// a deliberate whole-copy door, `from_warm_stub` = a persisted token
+/// rehydrated). Holding one is the compile-time proof that a resident
+/// `FileAnalysis` reached registration through one of those seams — a new
+/// caller cannot hand `register_symbols_inner` a loose whole arc.
 pub(crate) struct PackRegistrationParts {
-    pub arc: Arc<FileAnalysis>,
-    pub feed: Vec<(String, bool)>,
-    pub specs: Vec<(String, String)>,
-    pub surface: crate::surface::Surface,
+    arc: Arc<FileAnalysis>,
+    feed: Vec<(String, bool)>,
+    specs: Vec<(String, String)>,
+    surface: crate::surface::Surface,
 }
 
-/// What `prepare_workspace_parts` hands back — the Perl twin of
-/// `PackRegistrationParts`.
+impl PackRegistrationParts {
+    /// The arc registration stores (read for persistence — `include_closure`
+    /// — and for stub encoding).
+    pub(crate) fn arc(&self) -> &Arc<FileAnalysis> {
+        &self.arc
+    }
+    pub(crate) fn feed(&self) -> &[(String, bool)] {
+        &self.feed
+    }
+    pub(crate) fn specs(&self) -> &[(String, String)] {
+        &self.specs
+    }
+    pub(crate) fn surface(&self) -> &crate::surface::Surface {
+        &self.surface
+    }
+
+    /// A whole-copy token minted from an already-`Arc`'d analysis: the feed
+    /// reads the whole `symbols`, the surface projects from the whole bag.
+    /// The deliberate whole-copy front door (`register_symbols`) — bounded,
+    /// tripwire-counted at its call sites.
+    pub(crate) fn whole(arc: Arc<FileAnalysis>) -> Self {
+        let (feed, specs) = ModuleIndex::prepare_pack_feed(&arc);
+        let surface = crate::surface::Surface::project(&arc);
+        PackRegistrationParts { arc, feed, specs, surface }
+    }
+
+    /// Rehydrate a token from a warm stub — the persisted form of a prior
+    /// `prepare_pack_parts` output (`encode_stub` was fed exactly these
+    /// halves). The proof-of-strip is the persistence itself: a stub only
+    /// exists because a fully-stripped copy was written.
+    pub(crate) fn from_warm_stub(stub: crate::module_cache::WarmStub) -> Self {
+        PackRegistrationParts {
+            arc: Arc::new(stub.skeleton),
+            feed: stub.feed,
+            specs: stub.specs,
+            surface: stub.surface,
+        }
+    }
+
+    /// Record this file's span-free surface (the freshness write half).
+    /// Separate from registration so the deferred-writer path can record
+    /// pre-COMMIT (session-local) while the residency half waits for the
+    /// commit; the sync front doors record then register in sequence.
+    pub(crate) fn record_surface(
+        &self,
+        idx: &ModuleIndex,
+        path: &std::path::Path,
+    ) -> crate::surface::SurfaceVerdict {
+        idx.record_surface_value(path, self.surface.clone())
+    }
+}
+
+/// The workspace registration TOKEN — the Perl twin of
+/// `PackRegistrationParts`. Same private-field / choke-point-mint discipline:
+/// minted only by `prepare_workspace_parts` (strip) in this module.
 pub(crate) struct WorkspaceRegistrationParts {
-    pub arc: Arc<FileAnalysis>,
-    pub module_name: Option<String>,
-    pub surface: crate::surface::Surface,
+    arc: Arc<FileAnalysis>,
+    module_name: Option<String>,
+    surface: crate::surface::Surface,
+}
+
+impl WorkspaceRegistrationParts {
+    pub(crate) fn arc(&self) -> &Arc<FileAnalysis> {
+        &self.arc
+    }
+
+    /// See `PackRegistrationParts::record_surface`.
+    pub(crate) fn record_surface(
+        &self,
+        idx: &ModuleIndex,
+        path: &std::path::Path,
+    ) -> crate::surface::SurfaceVerdict {
+        idx.record_surface_value(path, self.surface.clone())
+    }
 }
 
 pub struct ModuleIndex {
@@ -1373,12 +1446,16 @@ impl ModuleIndex {
     /// STRIPPED copy this must run only after its blob+rows are COMMITTED —
     /// an evicted copy registered before its persistence exists rehydrates
     /// to nothing and answers wrong-empty instead of "not yet indexed".
+    /// Consumes a workspace token (minted only via `prepare_workspace_parts`
+    /// in this module) — the same construct-is-proof discipline as
+    /// `register_symbols_inner`. Surface recording is the caller's separate
+    /// concern; the token's `surface` is dropped here.
     pub(crate) fn register_workspace_residency(
         &self,
         path: std::path::PathBuf,
-        arc: Arc<FileAnalysis>,
-        module_name: Option<String>,
+        parts: WorkspaceRegistrationParts,
     ) {
+        let WorkspaceRegistrationParts { arc, module_name, surface: _ } = parts;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, arc));
@@ -1403,9 +1480,10 @@ impl ModuleIndex {
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
         let parts = self.prepare_workspace_parts(fa, strip_bag, strip_rows);
-        let _ = self.record_surface_value(&path, parts.surface);
-        self.register_workspace_residency(path, parts.arc.clone(), parts.module_name);
-        parts.arc
+        parts.record_surface(self, &path);
+        let arc = Arc::clone(parts.arc());
+        self.register_workspace_residency(path, parts);
+        arc
     }
 
     /// Remove a deleted workspace file's registrations — the path-keyed
@@ -1644,9 +1722,11 @@ impl ModuleIndex {
     pub fn register_symbols(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         // Feed source and stored copy are the same whole analysis here;
         // indexers that strip go through `register_symbols_stripping`.
-        let _ = self.record_surface(&path, &analysis);
-        let (feed, specs) = Self::prepare_pack_feed(&analysis);
-        self.register_symbols_inner(path, analysis, &feed, &specs);
+        // `whole` mints the deliberate whole-copy token (feed + surface off
+        // the unstripped arc) — the only door that pins a resident analysis.
+        let parts = PackRegistrationParts::whole(analysis);
+        parts.record_surface(self, &path);
+        self.register_symbols_inner(path, parts);
     }
 
     /// Registration-owned strip for the pack bulk index: collect the
@@ -1708,18 +1788,25 @@ impl ModuleIndex {
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
         let parts = Self::prepare_pack_parts(fa, strip_bag, strip_rows);
-        let _ = self.record_surface_value(&path, parts.surface);
-        self.register_symbols_inner(path, parts.arc.clone(), &parts.feed, &parts.specs);
-        parts.arc
+        parts.record_surface(self, &path);
+        let arc = Arc::clone(parts.arc());
+        self.register_symbols_inner(path, parts);
+        arc
     }
 
+    /// Register a pack file from its token. Consuming the token IS the proof
+    /// the caller went through a mint choke point (`prepare_pack_parts` /
+    /// `whole` / `from_warm_stub`) — a loose resident arc can't reach here.
+    /// Surface recording is the caller's separate concern (the deferred
+    /// writer records pre-COMMIT; the token's `surface` is dropped here).
     pub(crate) fn register_symbols_inner(
         &self,
         path: std::path::PathBuf,
-        analysis: Arc<FileAnalysis>,
-        feed: &[(String, bool)],
-        specializes: &[(String, String)],
+        parts: PackRegistrationParts,
     ) {
+        let PackRegistrationParts { arc: analysis, feed, specs: specializes, surface: _ } = parts;
+        let feed = &feed;
+        let specializes = &specializes;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
