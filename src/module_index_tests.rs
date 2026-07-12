@@ -599,6 +599,50 @@ fn enriched_snapshot_caches_and_invalidates_on_provider_change() {
     );
 }
 
+/// @INC providers carry a real registration generation (minted at
+/// insert/warm), so a re-resolve moves the consumer's enrichment key even
+/// though the provider is a RECORDLESS cache entry (no surface fingerprint —
+/// the `None` arm that used to fall back to the Arc pointer). `insert_cache`
+/// is the CLI/@INC insertion door; each Some insert mints a fresh gen.
+#[test]
+fn inc_provider_reresolve_moves_enrichment_key() {
+    let idx = ModuleIndex::new_for_test();
+    // Consumer imports from an @INC-tier provider inserted name-keyed (no
+    // surface record → the recordless enrichment-key arm).
+    let consumer = parse_source_to_cached(
+        "package App;\nuse Ext::Lib 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(consumer.path.to_path_buf(), Arc::clone(&consumer.analysis));
+
+    let prov_v1 = parse_source_to_cached(
+        "package Ext::Lib;\nour @EXPORT_OK = ('make');\nsub make { return bless {}, 'W1' }\n1;\n",
+        "Ext::Lib",
+    );
+    idx.insert_cache("Ext::Lib", Some(prov_v1));
+
+    let snap1 = idx.enriched_snapshot(&consumer).expect("snapshot v1");
+    let snap1b = idx.enriched_snapshot(&consumer).expect("snapshot v1 cached");
+    assert!(
+        Arc::ptr_eq(&snap1, &snap1b),
+        "key stable across queries: the cached snapshot is returned"
+    );
+
+    // Re-resolve the provider (content changed): a new generation must move
+    // the consumer's key even for a recordless @INC entry.
+    let prov_v2 = parse_source_to_cached(
+        "package Ext::Lib;\nour @EXPORT_OK = ('make', 'other');\nsub make { return bless {}, 'W2' }\nsub other { return 2 }\n1;\n",
+        "Ext::Lib",
+    );
+    idx.insert_cache("Ext::Lib", Some(prov_v2));
+
+    let snap2 = idx.enriched_snapshot(&consumer).expect("snapshot v2");
+    assert!(
+        !Arc::ptr_eq(&snap1, &snap2),
+        "@INC provider re-resolve (gen bump) must move the enrichment key"
+    );
+}
+
 /// The R4 always-enriched seams: a closed dep whose answer chains through
 /// ITS OWN imports is a raw-bag dead end (the walker pins no edge for
 /// imported calls); the fallback-on-miss retry through the enrichment

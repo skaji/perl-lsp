@@ -38,6 +38,12 @@ pub fn spawn_resolver(
     on_resolved: OnResolved,
     long_lived: Arc<std::sync::atomic::AtomicBool>,
     bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
+    // The enrichment-key generation maps, threaded the same way as
+    // `long_lived`/`bag_cache`: the resolver thread mints a generation for
+    // every @INC provider it warms or (re-)resolves so `enrichment_key` reads
+    // a real, ABA-proof token instead of an Arc pointer.
+    registration_gen: Arc<DashMap<PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let handle = tokio::runtime::Handle::current();
 
@@ -83,6 +89,11 @@ pub fn spawn_resolver(
                     && eviction_enabled();
                 let (n, stale_names) = module_cache::warm_cache(conn, &cache, strip_warm);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
+                // Stamp generations for the warm-loaded @INC providers (they
+                // landed in the cache without a registration front door).
+                crate::module_index::stamp_missing_import_gens(
+                    &cache, &registration_gen, &gen_counter,
+                );
                 // Queue stale modules for priority re-resolution.
                 for name in &stale_names {
                     stale_modules.insert(name.clone(), ());
@@ -205,6 +216,11 @@ pub fn spawn_resolver(
                         if let Some(bc) = bag_cache.read().ok().and_then(|g| g.clone()) {
                             bc.invalidate(&m.path);
                         }
+                        // Mint a fresh generation: a re-resolve (content
+                        // changed) moves every consumer's enrichment key.
+                        crate::module_index::mint_registration_gen(
+                            &registration_gen, &gen_counter, &m.path,
+                        );
                     }
                     insert_into_cache(&cache, &edges, &module_name, stored);
 
@@ -355,6 +371,8 @@ pub fn spawn_test_resolver(
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
+    registration_gen: Arc<DashMap<PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     std::thread::Builder::new()
         .name("module-resolver-test".into())
@@ -378,6 +396,9 @@ pub fn spawn_test_resolver(
                     &crate::plugin::rhai_host::plugin_fingerprint(),
                 );
                 let (_, stale_names) = module_cache::warm_cache(conn, &cache, false);
+                crate::module_index::stamp_missing_import_gens(
+                    &cache, &registration_gen, &gen_counter,
+                );
                 for name in stale_names {
                     stale_modules.insert(name, ());
                 }
@@ -408,6 +429,11 @@ pub fn spawn_test_resolver(
                     let stored =
                         strip_import_copy(&result, persisted, eviction_enabled());
                     parse_memo.insert(module_name.clone(), stored.clone());
+                    if let Some(ref m) = stored {
+                        crate::module_index::mint_registration_gen(
+                            &registration_gen, &gen_counter, &m.path,
+                        );
+                    }
                     insert_into_cache(&cache, &edges, &module_name, stored);
                     stale_modules.remove(&module_name);
                     let _g = resolved.mu.lock().unwrap();

@@ -35,6 +35,40 @@ pub use crate::file_analysis::{CachedModule, SubInfo};
 
 type InferredTypeOwned = crate::file_analysis::InferredType;
 
+/// Mint a fresh monotonic registration generation for `path`. The enrichment
+/// key's ABA-proof identity token: a re-registration (or an @INC re-resolve)
+/// bumps the gen, moving every consumer's key — where a bare Arc pointer
+/// could be freed and its address reused. The resolver THREAD holds the raw
+/// Arcs (not a `&ModuleIndex`), so this is a free fn both the thread and the
+/// `ModuleIndex` methods route through.
+pub(crate) fn mint_registration_gen(
+    registration_gen: &DashMap<std::path::PathBuf, u64>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+    path: &std::path::Path,
+) {
+    let g = gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    registration_gen.insert(path.to_path_buf(), g);
+}
+
+/// Stamp a generation for every name-keyed cache entry that lacks one. The
+/// @INC warm scan (`warm_cache`) writes blobs straight into the cache
+/// without a registration front door, so those providers would otherwise
+/// read gen 0 in `enrichment_key`. `or_insert` so a warm entry racing a
+/// workspace front-door registration keeps the front-door generation.
+pub(crate) fn stamp_missing_import_gens(
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    registration_gen: &DashMap<std::path::PathBuf, u64>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+) {
+    for entry in cache.iter() {
+        if let Some(ref cm) = *entry.value() {
+            registration_gen.entry(cm.path.clone()).or_insert_with(|| {
+                gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
+    }
+}
+
 /// The linkage-visible feed a registration extracts from a WHOLE analysis:
 /// (name, declares-a-Class) per visible symbol. Collected before any strip
 /// so the feeds and tie-breaks never read an emptied `symbols`.
@@ -536,6 +570,10 @@ impl ModuleIndex {
         let bag_cache: Arc<
             std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
         > = Arc::new(std::sync::RwLock::new(None));
+        // Hoisted before the spawn so the resolver thread stamps @INC
+        // generations on the SAME maps the enrichment key reads.
+        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
+        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
@@ -550,6 +588,8 @@ impl ModuleIndex {
             Box::new(move || refresh_clone()),
             Arc::clone(&long_lived),
             Arc::clone(&bag_cache),
+            Arc::clone(&registration_gen),
+            Arc::clone(&gen_counter),
         );
 
         ModuleIndex {
@@ -562,8 +602,8 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen: Arc::new(DashMap::new()),
-            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            registration_gen,
+            gen_counter,
             long_lived,
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache,
@@ -926,6 +966,8 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
+        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
+        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
             Arc::clone(&edges),
@@ -934,6 +976,8 @@ impl ModuleIndex {
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
+            Arc::clone(&registration_gen),
+            Arc::clone(&gen_counter),
         );
 
         ModuleIndex {
@@ -946,8 +990,8 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen: Arc::new(DashMap::new()),
-            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            registration_gen,
+            gen_counter,
             long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
@@ -1011,6 +1055,8 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
+        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
+        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
             Arc::clone(&edges),
@@ -1019,6 +1065,8 @@ impl ModuleIndex {
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
+            Arc::clone(&registration_gen),
+            Arc::clone(&gen_counter),
         );
 
         let idx = ModuleIndex {
@@ -1031,8 +1079,8 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen: Arc::new(DashMap::new()),
-            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            registration_gen,
+            gen_counter,
             long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
@@ -1072,6 +1120,9 @@ impl ModuleIndex {
         if let Some(ref m) = cached {
             self.edges.feed(module_name, &m.analysis);
             self.record_loader_shapes(module_name, &m.analysis);
+            // A CLI-resolved @INC provider: mint its generation so the
+            // enrichment key reads a real token, and a re-resolve moves it.
+            self.mint_import_gen(&m.path);
         }
         self.cache.insert(module_name.to_string(), cached);
     }
@@ -1180,10 +1231,21 @@ impl ModuleIndex {
     /// surface-covered (a body edit re-registers with a new generation,
     /// where a surface fingerprint deliberately stands still).
     pub(crate) fn bump_registration_gen(&self, path: &std::path::Path) {
-        let g = self
-            .gen_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.registration_gen.insert(path.to_path_buf(), g);
+        mint_registration_gen(&self.registration_gen, &self.gen_counter, path);
+    }
+
+    /// Mint a generation for an @INC provider the CLI resolved directly
+    /// (main.rs's `insert_cache`) — the resolver THREAD mints through the
+    /// free `mint_registration_gen` on its own Arcs.
+    pub(crate) fn mint_import_gen(&self, path: &std::path::Path) {
+        mint_registration_gen(&self.registration_gen, &self.gen_counter, path);
+    }
+
+    /// Stamp a generation for every name-keyed cache entry that lacks one —
+    /// the warm scan loads @INC blobs straight into the cache without a
+    /// registration front door. See `stamp_missing_import_gens`.
+    pub(crate) fn stamp_import_generations(&self) {
+        stamp_missing_import_gens(&self.cache, &self.registration_gen, &self.gen_counter);
     }
 
     fn registration_gen_of(&self, path: &std::path::Path) -> u64 {
@@ -1377,16 +1439,12 @@ impl ModuleIndex {
                             }
                             None => {
                                 2u8.hash(&mut h);
-                                // @INC tier: no registration gen (the
-                                // resolver thread inserts without the hub's
-                                // gen map) — the Arc pointer is the residual
-                                // freshness token (ABA-prone in principle;
-                                // ledgered).
-                                if self.registration_gen_of(&cm.path) == 0 {
-                                    (Arc::as_ptr(&cm.analysis) as usize).hash(&mut h);
-                                }
-                                // Recordless tier: no deps_of record; its
-                                // parents ride the analysis itself.
+                                // @INC/recordless tier: its registration
+                                // generation (minted at insert/warm by the
+                                // resolver thread + `insert_cache`) already
+                                // rode the key above — a re-resolve bumps it.
+                                // No deps_of record; its parents ride the
+                                // analysis itself.
                                 for parents in cm.analysis.package_parents.values() {
                                     next.extend(parents.iter().cloned());
                                 }

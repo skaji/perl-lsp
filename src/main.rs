@@ -647,6 +647,10 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             &module_index.cache_raw(),
             module_index.is_long_lived() && module_resolver::eviction_enabled(),
         );
+        // Stamp generations for the warm-loaded @INC providers (the warm
+        // scan bypasses the registration front doors) so `enrichment_key`
+        // reads a real token for every provider.
+        module_index.stamp_import_generations();
         if warmed > 0 {
             eprintln!("Cache: {} modules loaded from disk", warmed);
         }
