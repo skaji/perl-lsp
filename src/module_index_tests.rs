@@ -750,3 +750,201 @@ fn enriched_present_default_is_the_raw_bag() {
     let b = crate::file_analysis::CrossFileLookup::bag_present(&lk, &cm);
     assert!(Arc::ptr_eq(&e, &b), "default enriched view IS the raw bag view");
 }
+
+/// Build a `FileAnalysis` and cache it under `module_name` with a plugin
+/// namespace bridging to `bridge_class`, its entity being the named sub.
+/// Exercises the bridged-entity hop of the `MethodOnClass` fallback.
+fn cache_bridged(
+    idx: &ModuleIndex,
+    module_name: &str,
+    source: &str,
+    entity_sub: &str,
+    bridge_class: &str,
+) {
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(source, None).unwrap();
+    let mut fa = crate::builder::build(&tree, source.as_bytes());
+    let entity_id = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == entity_sub)
+        .map(|s| s.id)
+        .expect("entity sub must exist");
+    fa.plugin_namespaces.push(crate::file_analysis::PluginNamespace {
+        id: format!("test:{module_name}"),
+        plugin_id: "test".into(),
+        kind: "emitter".into(),
+        entities: vec![entity_id],
+        bridges: vec![crate::file_analysis::Bridge::Class(bridge_class.into())],
+        decl_span: crate::file_analysis::Span {
+            start: tree_sitter::Point { row: 0, column: 0 },
+            end: tree_sitter::Point { row: 0, column: 0 },
+        },
+    });
+    idx.insert_cache(
+        module_name,
+        Some(Arc::new(CachedModule::new(
+            PathBuf::from(format!("/fake/{}.pm", module_name.replace("::", "/"))),
+            Arc::new(fa),
+        ))),
+    );
+}
+
+/// Seam (a): a plugin-bridged entity whose return type materializes ONLY
+/// after the bridging file is itself enriched. The `MethodOnClass` bridged
+/// hop queries the bridging file's RAW bag first (dead-ends — `render`'s
+/// value chains through the bridging file's import of C), then falls back to
+/// the enriched overlay copy, which resolves it.
+#[test]
+fn bridged_entity_return_resolves_through_enriched_overlay() {
+    let idx = ModuleIndex::new_for_test();
+    // C exports thing() → Widget.
+    let c = parse_source_to_cached(
+        "package C;\nour @EXPORT_OK = ('thing');\nsub thing { return bless {}, 'Widget' }\n1;\n",
+        "C",
+    );
+    idx.register_workspace_module(c.path.to_path_buf(), Arc::clone(&c.analysis));
+    // Br bridges its `render` entity to class `Painter`; render's return type
+    // exists only through Br's OWN import of C.
+    let br_src = "package Br;\nuse C 'thing';\nsub render { my $x = thing(); return $x }\n1;\n";
+    cache_bridged(&idx, "Br", br_src, "render", "Painter");
+
+    // Precondition: Br's RAW bag alone can't type render (thing() imported,
+    // no local edge) — else the enriched fallback proves nothing.
+    let br = idx.get_cached("Br").expect("Br cached");
+    let render_id = br
+        .analysis
+        .symbols
+        .iter()
+        .find(|s| s.name == "render")
+        .map(|s| s.id)
+        .unwrap();
+    assert_eq!(
+        br.analysis.symbol_return_type_via_bag(render_id, None),
+        None,
+        "fixture must dead-end on the raw bag"
+    );
+
+    // MethodOnClass{Painter, render}: hop (1)/(2) find nothing (no Painter
+    // module, no parents); the bridged hop (3) retries through the enriched
+    // overlay and resolves Widget.
+    let t = idx_find_method_return(&idx, "Painter", "render");
+    assert_eq!(
+        t.as_ref().and_then(|t| t.class_name()).as_deref(),
+        Some("Widget"),
+        "bridged entity resolved through Br's enriched overlay: {t:?}"
+    );
+}
+
+/// Route a `MethodOnClass{class, name}` query from a throwaway consumer FA
+/// through the index (the bridged hop needs a `BagContext` with the index).
+fn idx_find_method_return(
+    idx: &ModuleIndex,
+    class: &str,
+    method: &str,
+) -> Option<InferredType> {
+    let consumer = parse_source_to_cached("package Q;\nsub noop { 1 }\n1;\n", "Q");
+    consumer
+        .analysis
+        .find_method_return_type(class, method, Some(idx), None)
+}
+
+/// Seam (b), primary (hop 1): the cross-file `SlotType{class, key}` primary —
+/// a typed slot WRITE in the class's OWN file, read from a consumer, resolves
+/// through the extracted `attempt` closure. (The enriched-retry twin of this
+/// hop is dormant today: SlotType seeds are build-gated on a resolvable RHS,
+/// so a seed that exists already answers on the raw bag. The retry is wired
+/// for symmetry with the MethodOnClass primary; this test guards the refactor
+/// that extracted its `attempt` closure.)
+#[test]
+fn cross_file_slot_type_primary_resolves_hop1() {
+    let idx = ModuleIndex::new_for_test();
+    let store = parse_source_to_cached(
+        "package Store;\nsub init {\n    my $self = shift;\n    $self->{conn} = Conn->new;\n}\n1;\n",
+        "Store",
+    );
+    idx.register_workspace_module(store.path.to_path_buf(), Arc::clone(&store.analysis));
+
+    let app_src =
+        "package App;\nsub run {\n    my $s = Store->new;\n    my $c = $s->{conn};\n}\n1;\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(app_src, None).unwrap();
+    let fa = crate::builder::build(&tree, app_src.as_bytes());
+
+    // `$c` rode `Edge(Expr($s->{conn}))`, which drilled `SlotType{Store, conn}`
+    // into Store's own file (hop 1) and found the `Conn->new` slot write.
+    let t = fa.inferred_type_via_bag_ctx(
+        "$c",
+        tree_sitter::Point { row: 4, column: 0 },
+        Some(&idx),
+    );
+    assert_eq!(
+        t.as_ref().and_then(|t| t.class_name()).as_deref(),
+        Some("Conn"),
+        "read narrows via Store's own slot write (cross-file SlotType primary): {t:?}"
+    );
+}
+
+/// Seam (c): enrichment is TRANSITIVE through the overlay. A imports `make`
+/// from B; B's `make` types only through B's import of C. Enriching A must
+/// bake `make → Widget` into A's OWN bag — which requires A's import scan to
+/// fall back to B's ENRICHED copy (B's raw bag dead-ends on the imported
+/// `thing()`).
+#[test]
+fn enrichment_is_transitive_through_the_overlay() {
+    let c = parse_source_to_cached(
+        "package C;\nour @EXPORT_OK = ('thing');\nsub thing { return bless {}, 'Widget' }\n1;\n",
+        "C",
+    );
+    let b = parse_source_to_cached(
+        "package B;\nuse C 'thing';\nour @EXPORT_OK = ('make');\nsub make { my $x = thing(); return $x }\n1;\n",
+        "B",
+    );
+    let a = parse_source_to_cached(
+        "package A;\nuse B 'make';\nsub go { my $m = make(); return $m }\n1;\n",
+        "A",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(c.path.to_path_buf(), Arc::clone(&c.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+
+    // Precondition: A's RAW bag can't type go (make imported, no index).
+    assert_eq!(a.analysis.sub_return_type_at_arity("go", None), None);
+
+    // Enrich A through the overlay; its OWN bag must now answer go → Widget
+    // WITHOUT an index, proving enrichment baked the A→B→C transitive type.
+    let enriched_a = idx.enriched_snapshot(&a).expect("A enriches");
+    let t = enriched_a
+        .sub_return_type_at_arity("go", None)
+        .expect("enrichment must bake make's C-derived return into A");
+    assert_eq!(t.class_name().as_deref(), Some("Widget"), "{t:?}");
+}
+
+/// Seam (c), cycle: mutual imports whose exports type only through each
+/// other exercise the ENRICHING re-entrant guard (enrichment's own import
+/// scan is its first customer). The re-entrant enrich declines to the raw
+/// bag, the cyclic build is tainted → answered as a DECLINE, and the tainted
+/// copy is never cached — so a repeat query re-declines identically and the
+/// call terminates (no hang / stack overflow).
+#[test]
+fn transitive_enrichment_mutual_import_terminates_without_poison() {
+    let a = parse_source_to_cached(
+        "package CycA;\nuse CycB 'bfn';\nour @EXPORT_OK = ('afn');\nsub afn { my $x = bfn(); return $x }\n1;\n",
+        "CycA",
+    );
+    let b = parse_source_to_cached(
+        "package CycB;\nuse CycA 'afn';\nour @EXPORT_OK = ('bfn');\nsub bfn { my $y = afn(); return $y }\n1;\n",
+        "CycB",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+
+    // Terminates: the guard declines the re-entrant enrich, the tainted build
+    // answers as a decline (None), never a cached degraded copy.
+    let snap = idx.enriched_snapshot(&a);
+    assert!(snap.is_none(), "mutually-cyclic enrich declines deterministically");
+    // Deterministic + no poison: a second call re-declines identically.
+    assert!(idx.enriched_snapshot(&a).is_none());
+}
