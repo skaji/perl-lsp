@@ -437,7 +437,19 @@ Deferred, with designs:
   serialization (measure first), phase-4 SQL views. Declined micro-opts
   stay declined.
 
-## R4 hardening round — 2026-07-07 — OPEN (Claude)
+## Phase-4 SQL views — CLOSED 2026-07-12 (Claude)
+
+The one triaged-"build" view landed: unused-exports
+(`unused_exported_syms` + `SymRowSeed::FLAG_EXPORTED`,
+`REF_ROWS_VERSION` 5), wired into `--heatmap` as a dead-export queue
+plus a sound pre-prune of the fan-in walk. The row-backed verdict
+substitutes only for skipped walks (provably equal there); a running
+projection always decides — candidate rows over-approximate, so a row
+"maybe used" could mask a dead export whose every candidate the matcher
+rejects. Parked/declined views and the full contract:
+`docs/adr/relational-ref-index.md` ("Further relational views").
+
+## R4 hardening round — 2026-07-07 — CLOSED 2026-07-12 (Claude)
 
 Fixed: retries only ever use RETAINED overlay copies (an unretained copy
 gave the seams fresh bag pointers per recursion level — unbounded mints
@@ -454,17 +466,19 @@ overlay decline. Cycle policy: tainted builds decline deterministically
 — cyclic files answer raw everywhere, never a query-order-dependent
 half-enriched cache.
 
-Deferred:
-- **Unwired seams** (same fallback-on-miss pattern, wire next):
-  bridged-plugin-entity chase (witnesses.rs ~1916 — bridged methods
-  resolve unenriched while plain methods now resolve enriched),
-  enrichment's own import scan (file_analysis.rs ~5809 — makes
-  enrichment transitive; the cycle guard's real customer), SlotType
-  primary (~1938). TypeName chase: skip (pack aliases, no Perl win).
-- **@INC providers keep the Arc-pointer freshness token** (no
-  registration gen — the resolver thread inserts without the hub map);
-  ABA-prone in principle. Fold into the @INC-stripping arc: route
-  insert_into_cache through a hub-owned seam that bumps generations.
+The unwired seams landed 2026-07-12: bridged-plugin-entity chase
+(index-less by design — a ctx-ful leaf query would spawn a fresh cycle
+guard per bridged hop, so mutual bridges could recurse unbounded; the
+ENRICHING-guarded bake reaches the same transitive answer), SlotType
+primary (dormant twin of the MethodOnClass retry — SlotType seeds are
+build-gated on a resolvable RHS, so it goes live the moment slot
+seeding emits an unconditional edge), and enrichment's own import scan
+(enrichment is now transitive A→B→C; the cycle guard's first real
+customer — mutual imports decline to raw deterministically, tainted
+copies never cached). TypeName chase stays raw (pack aliases, no Perl
+win). Gold: 432/17/0/0/0 cold+warm, warm RSS flat.
+
+Still deferred:
 - **In-flight dedup**: two threads missing on one path both pay the
   deep-copy (last insert wins). Bounded waste; revisit if profiling
   shows it.
