@@ -1592,6 +1592,33 @@ impl ModuleIndex {
             .unwrap_or_default()
     }
 
+    /// The unused-exports view over THIS index's row store — exported syms
+    /// with zero cross-file reference rows (`docs/adr/relational-ref-index.md`).
+    /// `None` when the row store is unavailable (opener absent, cold cache);
+    /// the caller degrades to the references projection.
+    pub fn unused_exported_syms(&self) -> Option<Vec<crate::module_cache::DeadExportRow>> {
+        self.with_rows_conn(crate::module_cache::unused_exported_syms)
+    }
+
+    /// The `--heatmap` pre-prune index: the DISTINCT ref-name-key set plus the
+    /// shredded-path set (coverage witness). `None` when the row store is
+    /// unavailable. The name set answers "could any file reference this name";
+    /// the path set lets the caller verify the store actually covers the files
+    /// its projection would scan before trusting an "absent ⇒ zero" verdict.
+    pub fn ref_prune_index(
+        &self,
+    ) -> Option<(
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    )> {
+        self.with_rows_conn(|conn| {
+            (
+                crate::module_cache::names_with_ref_rows(conn),
+                crate::module_cache::paths_with_ref_rows(conn),
+            )
+        })
+    }
+
     /// The sub-index for `lang`, if this distribution indexes it.
     pub fn pack_index(&self, lang: &str) -> Option<Arc<ModuleIndex>> {
         self.pack_indexes.get(lang).map(|e| e.value().clone())

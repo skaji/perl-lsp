@@ -142,7 +142,7 @@ pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Opt
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
 /// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the
 /// next warm re-shreds rows from the already-decoded analyses for free.
-const REF_ROWS_VERSION: &str = "4";
+const REF_ROWS_VERSION: &str = "5";
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -1268,6 +1268,94 @@ pub fn paths_with_ref_rows(conn: &Connection) -> std::collections::HashSet<Strin
     if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
         for p in rows.flatten() {
             out.insert(p);
+        }
+    }
+    out
+}
+
+/// Every DISTINCT name key present in the `refs` table. The general
+/// pre-prune set for `--heatmap`'s per-declaration references projection: a
+/// declaration whose name key is ABSENT here has no reference row in any
+/// indexed file, so — because rows over-approximate references — the
+/// projection is provably empty and the walk can be skipped. Retrieval only;
+/// the caller owns the coverage decision (trust "absent ⇒ zero references"
+/// only when the store actually covers the files the walk would scan).
+pub fn names_with_ref_rows(conn: &Connection) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT s.s FROM refs r JOIN strings s ON s.str_id = r.name_id")
+    else {
+        return out;
+    };
+    if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+        for n in rows.flatten() {
+            out.insert(n);
+        }
+    }
+    out
+}
+
+/// One unused-exported symbol row: an `@EXPORT`/`@EXPORT_OK` name with no
+/// reference row in any OTHER file. Carries the identity the caller matches a
+/// reported symbol against — path + name + the selection-span start.
+pub struct DeadExportRow {
+    pub path: String,
+    pub name: String,
+    pub start_row: usize,
+    pub start_col: usize,
+}
+
+/// The unused-exports view (`docs/adr/relational-ref-index.md`): every
+/// WORKSPACE-tier symbol row flagged exported (`SymRowSeed::FLAG_EXPORTED`)
+/// whose name key has ZERO ref rows in any OTHER file. Same-file refs are
+/// excluded on purpose — a module calling its own exported sub does not make
+/// that export live for a *consumer*.
+///
+/// The result is SOUND IN EXACTLY ONE DIRECTION, and the asymmetry is the
+/// point. Ref rows are name-match CANDIDATES — an over-approximation of real
+/// references, since the per-`RefKind` matcher still runs per row — so:
+///   * zero cross-file candidate rows ⇒ no cross-file reference can exist ⇒
+///     the export is TRULY unused by any consumer (a sound "dead export").
+///   * one or more candidate rows ⇒ UNKNOWN: a candidate may or may not
+///     survive the matcher. Never read this as "used".
+/// The right polarity for a dead-export review queue: it never fabricates a
+/// dead export; at worst it MISSES one whose sole consumer's candidate row
+/// would not have survived the matcher.
+pub fn unused_exported_syms(conn: &Connection) -> Vec<DeadExportRow> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT f.path, n.s, y.start_row, y.start_col
+           FROM syms y
+           JOIN files f ON f.file_id = y.file_id
+           JOIN strings n ON n.str_id = y.name_id
+          WHERE f.source = 'workspace'
+            AND (y.flags & ?1) != 0
+            AND NOT EXISTS (
+                  SELECT 1 FROM refs r
+                   WHERE r.name_id = y.name_id
+                     AND r.file_id != y.file_id
+                )",
+    ) else {
+        return out;
+    };
+    let flag = crate::file_analysis::SymRowSeed::FLAG_EXPORTED as i64;
+    let rows = stmt.query_map(params![flag], |row| {
+        Ok(DeadExportRow {
+            path: row.get(0)?,
+            name: row.get(1)?,
+            start_row: row.get::<_, i64>(2)? as usize,
+            start_col: row.get::<_, i64>(3)? as usize,
+        })
+    });
+    if let Ok(rows) = rows {
+        for r in rows {
+            match r {
+                Ok(hit) => out.push(hit),
+                Err(e) => {
+                    log::warn!("unused-exports scan aborted mid-iteration: {}", e);
+                    break;
+                }
+            }
         }
     }
     out
