@@ -2303,8 +2303,11 @@ fn heatmap_symbol_eligible(sym: &file_analysis::Symbol) -> bool {
 /// The pre-prune may only ever assert PROVABLY-EMPTY, never a substituted
 /// count — `None` runs the full projection, and every computed fan-in still
 /// comes from `references()`. `dead_export_override` is the row-backed
-/// unused-exports verdict (`Some(true/false)`); `None` derives dead-export
-/// from the projection (exported with zero cross-file references).
+/// unused-exports verdict, passed ONLY alongside a skipped walk (where it is
+/// provably equal to what the projection would derive); whenever the
+/// projection runs, `None` lets it decide (exported with zero cross-file
+/// references) — strictly more accurate than candidate rows, which
+/// over-approximate real references.
 #[allow(clippy::too_many_arguments)]
 fn heatmap_symbol_row(
     ws: &file_store::FileStore,
@@ -2811,17 +2814,29 @@ fn cli_heatmap(root: &str, opts: &[String]) {
                     } else {
                         Some(0usize) // no reference row anywhere → provably empty
                     };
-                    let is_callable =
-                        matches!(sym.kind, file_analysis::SymKind::Sub | file_analysis::SymKind::Method);
-                    let sel = sym.selection_span.start;
-                    let de = is_callable
-                        && dead_keys.contains(&(
-                            path.to_string_lossy().to_string(),
-                            sym.name.clone(),
-                            sel.row,
-                            sel.column,
-                        ));
-                    (forced, Some(de))
+                    // The row verdict substitutes ONLY for a skipped walk,
+                    // where it's provably equal to what the projection would
+                    // derive (no ref rows at all ⇒ no cross-file references).
+                    // When the walk runs, the projection decides: a candidate
+                    // row is an over-approximation, so the rows can say
+                    // "maybe used" for an export whose every candidate the
+                    // matcher rejects — a real dead export the row verdict
+                    // would mask.
+                    let de = forced.map(|_| {
+                        let is_callable = matches!(
+                            sym.kind,
+                            file_analysis::SymKind::Sub | file_analysis::SymKind::Method
+                        );
+                        let sel = sym.selection_span.start;
+                        is_callable
+                            && dead_keys.contains(&(
+                                path.to_string_lossy().to_string(),
+                                sym.name.clone(),
+                                sel.row,
+                                sel.column,
+                            ))
+                    });
+                    (forced, de)
                 }
                 _ => (None, None),
             };
