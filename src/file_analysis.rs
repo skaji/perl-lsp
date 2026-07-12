@@ -5833,6 +5833,13 @@ impl FileAnalysis {
                 // copy may be bag-evicted (workspace tier included), so take
                 // the bag-present view for the whole scan.
                 let whole = idx.bag_present(&cached);
+                // Fetched on the first return-type MISS (fallback-on-miss): the
+                // exporter's own return may chain through ITS imports (A→B→C),
+                // materialized only after the exporter is itself enriched — the
+                // transitive-enrichment case. `enriched_present` is ENRICHING-
+                // guarded, so a mutual A↔B import declines to the raw bag rather
+                // than looping, and the tainted copy is never cached.
+                let mut enriched: Option<std::sync::Arc<FileAnalysis>> = None;
                 for sym in &whole.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                         continue;
@@ -5841,7 +5848,15 @@ impl FileAnalysis {
                         continue;
                     }
                     if matches!(sym.detail, SymbolDetail::Sub { .. }) {
-                        if let Some(ty) = whole.symbol_return_type_via_bag(sym.id, None) {
+                        let mut ty = whole.symbol_return_type_via_bag(sym.id, None);
+                        if ty.is_none() {
+                            let en = enriched
+                                .get_or_insert_with(|| idx.enriched_present(&cached));
+                            if !std::sync::Arc::ptr_eq(en, &whole) {
+                                ty = en.symbol_return_type_via_bag(sym.id, None);
+                            }
+                        }
+                        if let Some(ty) = ty {
                             imported_returns.insert(sym.name.clone(), ty);
                         }
                     }
