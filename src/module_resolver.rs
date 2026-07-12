@@ -941,6 +941,8 @@ pub fn index_workspace_with_index(
     let writer_conn = conn;
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || {
+            // Same failure-bounded whole-copy budget as the pack writer.
+            let mut fallback_bytes = 0usize;
             run_persist_writer(
                 fresh_rx,
                 writer_conn.as_ref(),
@@ -982,11 +984,25 @@ pub fn index_workspace_with_index(
                     // for it. The blob in hand IS the whole analysis —
                     // register full copies instead, so nothing is lost
                     // beyond the persistence itself (disk full / lock storm
-                    // stays loud AND self-heals).
+                    // stays loud AND self-heals) — up to the budget.
                     if let Some(idx) = module_index {
                         idx.invalidate_bag_cache(&e.path);
                     }
                     if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                        let bytes = fa.heap_estimate().total();
+                        if fallback_bytes.saturating_add(bytes) > FALLBACK_WHOLE_BYTE_CAP {
+                            // Over budget: DROP (the chunk didn't commit, so a
+                            // stripped copy has no blob to rehydrate from —
+                            // honest absence, re-indexed next run).
+                            log::warn!(
+                                "workspace persist writer: fallback budget ({} MiB) exceeded — \
+                                 dropping resident copy for {:?}; re-indexes next run",
+                                FALLBACK_WHOLE_BYTE_CAP / (1024 * 1024),
+                                e.path,
+                            );
+                            return;
+                        }
+                        fallback_bytes += bytes;
                         let arc = std::sync::Arc::new(fa);
                         files.insert_workspace_arc(e.path.clone(), arc.clone());
                         if let Some(idx) = module_index {
@@ -1475,6 +1491,10 @@ pub fn index_pack_languages(
         let expected_whole_writer = Arc::clone(&expected_whole);
         std::thread::scope(|scope| {
             let writer = scope.spawn(move || {
+                // Byte budget for the whole copies a failed chunk retains
+                // (see FALLBACK_WHOLE_BYTE_CAP). Per-writer accumulator — the
+                // fallback lane is single-threaded (this writer thread).
+                let mut fallback_bytes = 0usize;
                 run_persist_writer(
                     fresh_rx,
                     writer_conn.as_ref(),
@@ -1522,8 +1542,26 @@ pub fn index_pack_languages(
                     |e: FreshEntry| {
                         pack_index_writer.invalidate_bag_cache(&e.path);
                         if let Some(fa) = module_cache::decode_analysis(&e.blob) {
-                            expected_whole_writer.fetch_add(1, Ordering::Relaxed);
-                            pack_index_writer.register_symbols(e.path, Arc::new(fa));
+                            let bytes = fa.heap_estimate().total();
+                            if fallback_bytes.saturating_add(bytes) <= FALLBACK_WHOLE_BYTE_CAP {
+                                fallback_bytes += bytes;
+                                // Tripwire-accounted: this whole copy is a
+                                // DELIBERATE (failure-bounded) pin.
+                                expected_whole_writer.fetch_add(1, Ordering::Relaxed);
+                                pack_index_writer.register_symbols(e.path, Arc::new(fa));
+                            } else {
+                                // Over budget: DROP the resident copy. The
+                                // chunk didn't commit, so a stripped copy
+                                // would rehydrate to wrong-empty; leaving it
+                                // unregistered is honest absence that the next
+                                // index/warm re-registers.
+                                log::warn!(
+                                    "pack persist writer: fallback budget ({} MiB) exceeded — \
+                                     dropping resident copy for {:?}; re-indexes next run",
+                                    FALLBACK_WHOLE_BYTE_CAP / (1024 * 1024),
+                                    e.path,
+                                );
+                            }
                         }
                     },
                 );
@@ -1684,6 +1722,21 @@ fn analyze_stamped<T>(
     }
     Some((out, stamp))
 }
+
+/// Byte budget for whole `FileAnalysis` copies the persist writer retains
+/// when a chunk fails to commit (disk full) or panics. The strip is licensed
+/// only by a landed blob, so a fallback keeps copies WHOLE — and a
+/// persistently failing writer would otherwise pin the ENTIRE tree resident
+/// (the docs/open-forks.md "writer fallback budget" residual). Past the cap
+/// we DROP the resident copy rather than register a stripped one: the chunk
+/// didn't commit, so a stripped copy's blob isn't on disk and could only
+/// rehydrate to wrong-empty. Dropping is honest absence — the file reads as
+/// "not indexed this session" and the next index/warm re-registers it; it
+/// never serves wrong data and never leaves an evicted copy unrehydratable
+/// (nothing is evicted — nothing is registered). Byte-accounted like the
+/// enrichment overlay (`ENRICHED_BYTE_CAP`); 128 MiB per writer thread — a
+/// transient failure degrades gracefully, a permanent one can't OOM.
+const FALLBACK_WHOLE_BYTE_CAP: usize = 128 * 1024 * 1024;
 
 /// The persist-writer harness both bulk indexers share: batches entries off
 /// the channel (≤128 per txn), owns BEGIN IMMEDIATE / COMMIT / ROLLBACK

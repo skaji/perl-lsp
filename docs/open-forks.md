@@ -344,11 +344,15 @@ Deferred, in rough priority order:
   (open-doc records outrank background ones while the doc is open) or a
   doc-open guard on background recording. Rare (requires an unsaved
   contract change raced by a background re-record), silent when hit.
-- **Verdict-policy seam**: the record→gate→act sequence is spelled in
-  three places now (open-doc edits, the watcher, `pack_file_changed`).
-  A `FreshnessIndex`-owned policy hook (or a `record_and_dirty` that
-  returns the closure) would make the next registration path inherit the
-  gate by construction instead of by remembering.
+- **Verdict-policy seam** — LANDED 2026-07-12.
+  `ModuleIndex::record_and_dirty(path, fa) -> SurfaceDirty {verdict, dirty}`
+  binds record → verdict → dirty-consumers in one seam; the open-doc editor
+  path and the watcher (via `register_workspace_resident`, which routes
+  through it) both consume it, so a caller can't record a surface without
+  the consumer answer. The ACT arms stay separate (open-doc republish vs
+  watcher batch). `pack_file_changed` is NOT forced through it: the pack
+  tier discovers consumers by include-closure, a genuinely different axis,
+  so it keeps `record_surface` (verdict only) — the honest residual.
 - **Probe serialization in `pack_file_changed`** (Changed case): the
   changed file's probe runs serially before the parallel consumer fan-out
   (~one header-analysis of added latency per save while actively editing
@@ -398,10 +402,18 @@ Deferred, with designs:
   persist (blob+rows) in the watcher's blocking task, then
   `register_workspace_stripping` on commit, whole-copy fallback only on
   persist failure.
-- **Writer fallback budget** — a persistently failing writer (disk full)
-  falls back to whole copies for the ENTIRE tree; the tripwire now makes
-  it visible but nothing bounds it. Design: byte-accounted fallback
-  budget shared per index run.
+- **Writer fallback budget** — LANDED 2026-07-12. `FALLBACK_WHOLE_BYTE_CAP`
+  (128 MiB, byte-accounted via `FileAnalysis::heap_estimate` like the
+  enrichment overlay) bounds the whole copies each persist writer retains
+  on commit-fail/panic. Past the cap the fallback DROPS the resident copy
+  (does not register a stripped one — the chunk didn't commit, so a
+  stripped copy's blob isn't on disk and could only rehydrate to
+  wrong-empty): honest absence, re-indexed next run, never wrong data,
+  never an unrehydratable evicted copy. Under-cap pack fallbacks stay
+  tripwire-accounted (`expected_whole`). Residual: the budget is
+  per-writer-thread (per pack language / the workspace writer), not a
+  single index-wide atomic — bounds total to (writers × 128 MiB), fine at
+  the 1-2 pack languages the corpus has.
 - **Rows-missing re-strip after backfill** — after a REF_ROWS_VERSION
   bump, refs+symbols stay resident for one session (self-healing at next
   restart; never trips the fully-resident wire). Re-registering post-
@@ -415,11 +427,17 @@ Deferred, with designs:
   fix above is the drift it would have prevented.
 - **Stamp-capture helper** — the stamp-before-read + re-stat-after-parse
   protocol is spelled in both fresh workers.
-- **Parts-token-only inner registration** — make `register_symbols_inner`
-  / `register_workspace_residency` accept only the parts structs (private
-  fields, constructible solely via the prepare_* choke points) so a
-  feed-from-stripped-copy or whole-arc hookup fails to compile. The
-  allowlist test covers the gap until then.
+- **Parts-token-only inner registration** — LANDED 2026-07-12.
+  `register_symbols_inner` / `register_workspace_residency` now consume a
+  `PackRegistrationParts` / `WorkspaceRegistrationParts` token whose fields
+  are private and minted only by the choke points in module_index.rs
+  (`prepare_pack_parts` / `prepare_workspace_parts`, plus
+  `PackRegistrationParts::whole` for the deliberate whole-copy front door
+  and `from_warm_stub` for a persisted token). Constructing the argument is
+  the compile-time proof of reads-whole-before-evict; the writer channels
+  carry the token instead of raw pieces. Allowlist counts unchanged (a
+  type-level change, not a call-site collapse); the allowlist test still
+  polices the whole-copy front doors.
 
 
 ## Triage (veesh, 2026-07-07)
@@ -478,6 +496,16 @@ customer — mutual imports decline to raw deterministically, tainted
 copies never cached). TypeName chase stays raw (pack aliases, no Perl
 win). Gold: 432/17/0/0/0 cold+warm, warm RSS flat.
 
+The @INC Arc-pointer freshness token also landed 2026-07-12: the
+generation maps (`registration_gen` + `gen_counter`) are threaded into
+`spawn_resolver` / `spawn_test_resolver` (like `long_lived` /
+`bag_cache`); the resolver thread mints a generation for every @INC
+provider it (re-)resolves and stamps warm-loaded providers after
+`warm_cache` (the CLI main-thread path mirrors this in `insert_cache` +
+a post-warm stamp). Every provider now has a real, monotonic
+generation, so the Arc-pointer fallback arm in `enrichment_key` is
+deleted (ABA-proof).
+
 Still deferred:
 - **In-flight dedup**: two threads missing on one path both pay the
   deep-copy (last insert wins). Bounded waste; revisit if profiling
@@ -507,8 +535,9 @@ Measured: warm-harness RSS 615→348MB (default vs NO_EVICT); warm
 SERVER sessions additionally strip warm-loaded @INC copies (CLI keeps
 them whole — RAM dies with the process; wall matters more there).
 
-Deferred: @INC registration generations for the enrichment key (the
-Arc-pointer token stands for that tier); the 162s one-shot rehydration
+Deferred: @INC registration generations for the enrichment key — LANDED
+2026-07-12 (threaded into the resolver thread; the Arc-pointer fallback is
+gone, see the R4 hardening round's entry above); the 162s one-shot rehydration
 profile if CI minutes ever matter (options: per-process blob-decode
 memo, or NO_EVICT in the harness at the cost of blinding the eviction
 nets).
