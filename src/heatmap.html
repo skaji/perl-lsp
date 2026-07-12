@@ -115,6 +115,7 @@
     <button class="tab active" data-view="treemap">Treemap</button>
     <button class="tab" data-view="butterfly">Butterfly</button>
     <button class="tab" data-view="dead">Dead code</button>
+    <button class="tab" data-view="deadexports">Dead exports</button>
   </div>
   <div class="search"><input id="q" type="search" placeholder="filter by name or package…" autocomplete="off"></div>
   <div class="legend">
@@ -127,6 +128,7 @@
   <div class="view active" data-view="treemap"><div id="treemap"></div></div>
   <div class="view" data-view="butterfly"><div id="butterfly"></div></div>
   <div class="view" data-view="dead"><div id="dead"></div></div>
+  <div class="view" data-view="deadexports"><div id="deadexports"></div></div>
 </main>
 
 <div class="tooltip" id="tip"></div>
@@ -138,6 +140,7 @@
 const REPORT = JSON.parse(document.getElementById("report").textContent);
 const SYMBOLS = REPORT.symbols || [];
 const DEAD = REPORT.dead_code_candidates || [];
+const DEAD_EXPORTS = REPORT.dead_exports || [];
 const MAX_FAN_IN = Math.max(1, ...SYMBOLS.map(s => s.fan_in || 0));
 const MAX_FAN_OUT = Math.max(1, ...SYMBOLS.map(s => s.fan_out || 0));
 const $ = id => document.getElementById(id);
@@ -152,6 +155,7 @@ $("stats").innerHTML = [
   chip(REPORT.files_indexed ?? "?", "files"),
   chip((REPORT.summary && REPORT.summary.symbols_reported) ?? SYMBOLS.length, "symbols"),
   chip(DEAD.length, "dead candidates", DEAD.length > 0),
+  chip(DEAD_EXPORTS.length, "dead exports", DEAD_EXPORTS.length > 0),
   chip(REPORT.dynamic_dispatch_sites ?? 0, "dynamic dispatch"),
   chip(REPORT.include_deps ? "deps" : "editable", "scope"),
 ].join("");
@@ -339,6 +343,37 @@ function renderDead() {
 }
 function shortFile(f) { if (!f) return ""; const root = REPORT.root || ""; return f.startsWith(root) ? f.slice(root.length).replace(/^\//, "") : f.split("/").slice(-2).join("/"); }
 
+// ---- dead exports table ----------------------------------------------------
+let deadExpSort = { key: "name", dir: 1 };
+function renderDeadExports() {
+  const host = $("deadexports");
+  if (!DEAD_EXPORTS.length) { host.innerHTML = '<div class="empty">No dead exports. Every exported sub is referenced from another file.</div>'; return; }
+  const rows = DEAD_EXPORTS.slice().sort((a, b) => {
+    const k = deadExpSort.key;
+    let av = a[k], bv = b[k];
+    if (typeof av === "string") return deadExpSort.dir * av.localeCompare(bv);
+    return deadExpSort.dir * (((av ?? 0)) - ((bv ?? 0)));
+  });
+  const head = (k, lbl, cls = "") =>
+    `<th data-k="${k}" class="${cls}">${lbl}${deadExpSort.key === k ? (deadExpSort.dir < 0 ? " ▾" : " ▴") : ""}</th>`;
+  let html = `<p style="color:var(--muted);font-size:12px;max-width:90ch">${esc(REPORT.dead_export_label || "Exported subs never referenced from another file — a review queue for shrinking export surface. Fan-in counts any same-file use.")} Click a row to copy its <code>file:line</code>.</p><table><thead><tr>` +
+    head("name", "Symbol") + head("kind", "Kind") + head("package", "Package") + head("fan_in", "Fan-in", "num") + `<th>Location</th></tr></thead><tbody>`;
+  for (const s of rows) {
+    html += `<tr data-loc="${attr((s.file || "") + ":" + s.line + ":" + s.col)}">` +
+      `<td class="mono">${esc(s.name)}</td><td>${esc(s.kind)}</td><td class="mono">${esc(s.package || "")}</td>` +
+      `<td class="num">${s.fan_in == null ? "·" : s.fan_in}</td>` +
+      `<td class="mono" style="color:var(--muted)">${esc(shortFile(s.file))}:${s.line}</td></tr>`;
+  }
+  html += "</tbody></table>";
+  host.innerHTML = html;
+  host.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => {
+    const k = th.dataset.k;
+    if (deadExpSort.key === k) deadExpSort.dir *= -1; else deadExpSort = { key: k, dir: k === "fan_in" ? -1 : 1 };
+    renderDeadExports();
+  });
+  host.querySelectorAll("tr[data-loc]").forEach(tr => tr.onclick = () => copy(tr.dataset.loc));
+}
+
 // ---- filter / interaction --------------------------------------------------
 function attr(s) { return String(s).replace(/"/g, "&quot;"); }
 function filterKey(s) { return ((s.name || "") + " " + (s.package || "")).toLowerCase(); }
@@ -367,6 +402,7 @@ $("treemap").addEventListener("mousemove", e => {
     (s.exported ? " · <b>exported</b>" : "") + `</div>` +
     (s.dead_code_candidate ? `<div class="row deadtag">⚠ dead-code candidate</div>`
       : s.reachable_guard ? `<div class="row">guard: <b>${esc(s.reachable_guard)}</b></div>` : "") +
+    (s.dead_export ? `<div class="row deadtag">⚠ dead export (no cross-file use)</div>` : "") +
     `<div class="path">${esc(shortFile(s.file))}:${s.line}:${s.col}</div>`;
   tip.style.display = "block";
   const pad = 14, tw = tip.offsetWidth, th = tip.offsetHeight;
@@ -391,7 +427,7 @@ function copy(str) {
 
 // ---- tabs / resize ---------------------------------------------------------
 let current = "treemap";
-const renderers = { treemap: renderTreemap, butterfly: renderButterfly, dead: renderDead };
+const renderers = { treemap: renderTreemap, butterfly: renderButterfly, dead: renderDead, deadexports: renderDeadExports };
 document.querySelectorAll(".tab").forEach(tab => tab.onclick = () => {
   current = tab.dataset.view;
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t === tab));
