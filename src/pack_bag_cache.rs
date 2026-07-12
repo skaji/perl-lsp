@@ -41,6 +41,12 @@ pub struct PackBagCache {
     bytes: AtomicUsize,
     /// `maxCacheMb * 1 MiB`. `0` ⇒ never retain (rehydrate-and-drop).
     cap_bytes: usize,
+    /// Per-path invalidation generation: `invalidate` bumps, a loading
+    /// `bag_for` records the value BEFORE its decode and only retains when
+    /// it is unchanged after — otherwise a decode racing a writer's
+    /// commit+invalidate would insert the PREVIOUS generation just after
+    /// the invalidate fired, pinning stale spans until the next edit.
+    generation: DashMap<PathBuf, u64>,
     /// Keyed single-file decode (opens the pack SQLite conn on demand).
     loader: Loader,
 }
@@ -56,6 +62,7 @@ impl PackBagCache {
             clock: AtomicU64::new(0),
             bytes: AtomicUsize::new(0),
             cap_bytes,
+            generation: DashMap::new(),
             loader: Box::new(loader),
         }
     }
@@ -75,9 +82,18 @@ impl PackBagCache {
             self.recency.insert(path.to_path_buf(), self.tick());
             return Some(arc);
         }
+        let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
         let fa = Arc::new((self.loader)(path)?);
         if self.cap_bytes == 0 {
             return Some(fa); // rehydrate-and-drop
+        }
+        // Retain only if no invalidation landed during the decode — the
+        // decoded copy may be the generation the invalidate was erasing.
+        // The caller still gets it (best answer available right now); it
+        // just must not be pinned.
+        let gen_after = self.generation.get(path).map(|g| *g).unwrap_or(0);
+        if gen_after != gen_before {
+            return Some(fa);
         }
         let sz = fa.heap_estimate().total();
         self.entries.insert(path.to_path_buf(), fa.clone());
@@ -111,6 +127,7 @@ impl PackBagCache {
     /// Drop `path`'s retained bag (a changed/saved file's bag is stale) so the
     /// next type query rehydrates the fresh blob.
     pub fn invalidate(&self, path: &Path) {
+        *self.generation.entry(path.to_path_buf()).or_insert(0) += 1;
         self.recency.remove(path);
         if let Some((_, fa)) = self.entries.remove(path) {
             let sz = fa.heap_estimate().total();
@@ -177,6 +194,30 @@ mod tests {
         assert!(cache.entries.contains_key(&b));
         assert!(!cache.entries.contains_key(&a));
         assert!(cache.bytes.load(Ordering::Relaxed) <= one);
+    }
+
+    #[test]
+    fn invalidate_during_load_is_not_pinned() {
+        // An invalidate landing between the loader's decode and the insert
+        // must prevent retention (the decode may be the erased generation).
+        // Simulate by invalidating from INSIDE the loader.
+        let cache = Arc::new(std::sync::OnceLock::<PackBagCache>::new());
+        let c2 = cache.clone();
+        let p = PathBuf::from("/x/racy.h");
+        let p2 = p.clone();
+        let built = PackBagCache::new(128 * 1024 * 1024, move |_p| {
+            if let Some(c) = c2.get() {
+                c.invalidate(&p2);
+            }
+            Some(empty_fa())
+        });
+        let _ = cache.set(built);
+        let c = cache.get().unwrap();
+        assert!(c.bag_for(&p).is_some(), "caller still gets the decode");
+        assert!(
+            !c.entries.contains_key(&p),
+            "a decode overlapped by an invalidate must not be retained"
+        );
     }
 
     #[test]

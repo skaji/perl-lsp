@@ -24,24 +24,35 @@ impl CachedModule {
         CachedModule { path, analysis }
     }
 
-    /// Look up metadata for a sub/method in this module.
-    ///
-    /// Returns a lightweight view into the full `FileAnalysis`. Works for
-    /// any declared sub — exported or not.
-    pub fn sub_info(&self, name: &str) -> Option<SubInfo<'_>> {
+    // Symbol/bag readers deliberately do NOT live on CachedModule: an index
+    // copy may be evicted on any axis, so consumers mint the sibling on a
+    // present view (`idx.whole_present(&cached).sub_info_view(..)` etc.) —
+    // a convenience wrapper here would compile everywhere and silently
+    // answer empty at scale.
+}
+
+/// A view into a module's metadata for a named sub/method.
+///
+/// Composed of a primary symbol plus any additional symbols with the same
+/// name (for rw accessor setter overloads).
+impl FileAnalysis {
+    /// The `SubInfo` view over THIS analysis — mint it from a bag-present
+    /// copy (`idx.bag_present(&cached)`) when the bag-backed accessors will
+    /// be read; an evicted index copy answers those with `None`.
+    pub fn sub_info_view(&self, name: &str) -> Option<SubInfo<'_>> {
         // Prefer the first matching Sub/Method symbol. Builder may emit several
         // when rw accessors exist (getter + setter); overloads are collected as
         // additional symbols with the same name.
-        let mut syms = self.analysis.symbols.iter().filter(|s| {
-            s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method)
-        });
+        let mut syms = self
+            .symbols
+            .iter()
+            .filter(|s| s.name == name && matches!(s.kind, SymKind::Sub | SymKind::Method));
         let primary = syms.next()?;
         let overloads: Vec<&Symbol> = syms.collect();
 
         // Keys are owned by `Sub { package: primary.package, name }` — the
         // sub's hash keys live under the same package as the sub itself.
         let hash_keys: Vec<String> = self
-            .analysis
             .hash_key_defs_for_owner(&HashKeyOwner::Sub {
                 package: primary.package.clone(),
                 name: name.to_string(),
@@ -50,12 +61,7 @@ impl CachedModule {
             .map(|s| s.name.clone())
             .collect();
 
-        Some(SubInfo {
-            analysis: &self.analysis,
-            primary,
-            overloads,
-            hash_keys,
-        })
+        Some(SubInfo { analysis: self, primary, overloads, hash_keys })
     }
 
     /// Locate a package-global variable declaration (`our $x` / `our @arr`
@@ -64,8 +70,7 @@ impl CachedModule {
     /// `name` includes the sigil (`$x`, `@arr`, `%h`) to match how variable
     /// symbols are keyed.
     pub fn package_var_def_line(&self, name: &str, package: &str) -> Option<u32> {
-        self.analysis
-            .symbols
+        self.symbols
             .iter()
             .find(|s| {
                 matches!(s.kind, SymKind::Variable | SymKind::Field)
@@ -73,6 +78,21 @@ impl CachedModule {
                     && s.package.as_deref() == Some(package)
             })
             .map(|s| s.span.start.row as u32)
+    }
+
+    /// True if a sub/method with this name is declared in this module
+    /// *attributed to `package`* — not merely declared somewhere in the
+    /// file. Cross-package typeglob installs
+    /// (`*{'DateTime::'.$sub} = …` inside `package DateTime::PP`)
+    /// synthesize a symbol whose `package` (DateTime) differs from the
+    /// file's own module name (DateTime::PP), so a class-keyed method
+    /// lookup must ask by package, not by module-name match.
+    pub fn has_sub_in_package(&self, name: &str, package: &str) -> bool {
+        self.symbols.iter().any(|s| {
+            s.name == name
+                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                && s.package.as_deref() == Some(package)
+        })
     }
 
     /// Completion candidates for `use Module qw(|)` — this module's export
@@ -83,10 +103,10 @@ impl CachedModule {
     pub fn import_list_candidates(&self) -> Vec<CompletionCandidate> {
         let mut items = Vec::new();
         let mut seen = HashSet::new();
-        for name in &self.analysis.export {
+        for name in &self.export {
             if seen.insert(name.clone()) {
                 let detail = self
-                    .sub_info(name)
+                    .sub_info_view(name)
                     .and_then(|s| s.return_type(None))
                     .map(|rt| format!("@EXPORT → {}", format_inferred_type(&rt)))
                     .or_else(|| Some("@EXPORT".to_string()));
@@ -102,10 +122,10 @@ impl CachedModule {
                 });
             }
         }
-        for name in &self.analysis.export_ok {
+        for name in &self.export_ok {
             if seen.insert(name.clone()) {
                 let detail = self
-                    .sub_info(name)
+                    .sub_info_view(name)
                     .and_then(|s| s.return_type(None))
                     .map(|rt| format!("→ {}", format_inferred_type(&rt)));
                 items.push(CompletionCandidate {
@@ -122,27 +142,8 @@ impl CachedModule {
         }
         items
     }
-
-    /// True if a sub/method with this name is declared in this module
-    /// *attributed to `package`* — not merely declared somewhere in the
-    /// file. Cross-package typeglob installs
-    /// (`*{'DateTime::'.$sub} = …` inside `package DateTime::PP`)
-    /// synthesize a symbol whose `package` (DateTime) differs from the
-    /// file's own module name (DateTime::PP), so a class-keyed method
-    /// lookup must ask by package, not by module-name match.
-    pub fn has_sub_in_package(&self, name: &str, package: &str) -> bool {
-        self.analysis.symbols.iter().any(|s| {
-            s.name == name
-                && matches!(s.kind, SymKind::Sub | SymKind::Method)
-                && s.package.as_deref() == Some(package)
-        })
-    }
 }
 
-/// A view into a module's metadata for a named sub/method.
-///
-/// Composed of a primary symbol plus any additional symbols with the same
-/// name (for rw accessor setter overloads).
 pub struct SubInfo<'a> {
     analysis: &'a FileAnalysis,
     primary: &'a Symbol,
@@ -256,6 +257,152 @@ impl<'a> SubInfo<'a> {
 ///
 /// Object-safe by design: a `&dyn CrossFileLookup` rides
 /// `witnesses::BagContext`, hence the `&mut dyn FnMut` callback params.
+/// Process-global path interner (`docs/adr/relational-ref-index.md`,
+/// residency phases): closure paths repeat across nearly every file in a
+/// tree (abseil shares ~90% of its header universe per TU), so resident
+/// copies share ONE allocation per unique path instead of one per
+/// (file × path). Serialized form stays a plain string sequence — blob
+/// layout unchanged, interning happens on the way in.
+pub mod path_intern {
+    use std::sync::{Arc, OnceLock};
+
+    // ---- Global path-id table (the ClosureList substrate) ----
+    //
+    // Closures at scale are the largest resident bucket as 16-byte
+    // `Arc<str>` pointer vecs (chromium: 2.8 GB / 41% of the floor). A
+    // sorted `Arc<[u32]>` over one process-global id table is 4× smaller
+    // per entry and turns the hot membership gate into id-compare binary
+    // search. IDs are process-local (never serialized — the blob keeps
+    // `Vec<String>`), so the table only ever grows within a session.
+
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    struct PathIds {
+        by_str: HashMap<Arc<str>, u32>,
+        by_id: Vec<Arc<str>>,
+    }
+
+    static IDS: OnceLock<RwLock<PathIds>> = OnceLock::new();
+
+    fn ids() -> &'static RwLock<PathIds> {
+        IDS.get_or_init(|| {
+            RwLock::new(PathIds { by_str: HashMap::new(), by_id: Vec::new() })
+        })
+    }
+
+    /// The id for `s`, minting one if unseen.
+    fn id_intern(s: &str) -> u32 {
+        {
+            let g = ids().read().unwrap();
+            if let Some(&id) = g.by_str.get(s) {
+                return id;
+            }
+        }
+        let mut g = ids().write().unwrap();
+        if let Some(&id) = g.by_str.get(s) {
+            return id;
+        }
+        let a: Arc<str> = Arc::from(s);
+        let id = g.by_id.len() as u32;
+        g.by_id.push(a.clone());
+        g.by_str.insert(a, id);
+        id
+    }
+
+    /// The id for `s` ONLY if some closure already interned it — a miss
+    /// means no closure can contain it (lookups must not grow the table).
+    fn id_lookup(s: &str) -> Option<u32> {
+        ids().read().unwrap().by_str.get(s).copied()
+    }
+
+    fn str_of(id: u32) -> Arc<str> {
+        ids().read().unwrap().by_id[id as usize].clone()
+    }
+
+    /// Process-wide table cost (counted ONCE, not per file): unique paths
+    /// and their string bytes across both the Arc pool and the id table.
+    pub fn table_stats() -> (usize, usize) {
+        let g = ids().read().unwrap();
+        let bytes: usize = g
+            .by_id
+            .iter()
+            .map(|a| a.len() + std::mem::size_of::<Arc<str>>() * 2 + 8)
+            .sum();
+        (g.by_id.len(), bytes)
+    }
+
+    /// The id for `s` if any closure has interned it — `None` means no
+    /// closure anywhere contains it. The one-per-query half of the
+    /// `contains_id` fast path.
+    pub fn lookup_id(s: &str) -> Option<u32> {
+        id_lookup(s)
+    }
+
+    /// A file's `#include` closure as sorted path-ids over the global
+    /// table. Semantically a set of path strings; consumers ask membership
+    /// (`contains`) or iterate the strings — the representation is private
+    /// so it can keep shrinking (`docs/open-forks.md`, closure
+    /// representation fork).
+    #[derive(Debug, Clone, Default)]
+    pub struct ClosureList(Arc<[u32]>);
+
+    impl ClosureList {
+        pub fn from_iter<'a>(items: impl Iterator<Item = &'a str>) -> Self {
+            let mut v: Vec<u32> = items.map(id_intern).collect();
+            v.sort_unstable();
+            v.dedup();
+            ClosureList(v.into())
+        }
+
+        pub fn contains(&self, s: &str) -> bool {
+            match id_lookup(s) {
+                Some(id) => self.0.binary_search(&id).is_ok(),
+                None => false,
+            }
+        }
+
+        /// Membership by pre-resolved id — hot loops (the backward walk's
+        /// visibility gate runs once per candidate file) resolve the query
+        /// string to an id ONCE via `lookup_id` and test lock-free here.
+        pub fn contains_id(&self, id: u32) -> bool {
+            self.0.binary_search(&id).is_ok()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// The member paths as shared strings (save path, visibility sets).
+        pub fn iter_strs(&self) -> impl Iterator<Item = Arc<str>> + '_ {
+            self.0.iter().map(|&id| str_of(id))
+        }
+
+        /// Per-file resident bytes (the id array; the global table is
+        /// counted once process-wide, not per file).
+        pub fn heap_bytes(&self) -> usize {
+            self.0.len() * std::mem::size_of::<u32>()
+        }
+    }
+
+    impl serde::Serialize for ClosureList {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.collect_seq(self.iter_strs().map(|a| a.as_ref().to_owned()))
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for ClosureList {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let raw = <Vec<String> as serde::Deserialize>::deserialize(d)?;
+            Ok(ClosureList::from_iter(raw.iter().map(|s| s.as_str())))
+        }
+    }
+}
+
 pub trait CrossFileLookup {
     fn get_cached(&self, module_name: &str) -> Option<std::sync::Arc<CachedModule>>;
     /// `get_cached` scoped to a querying file's VISIBILITY set (its own path +
@@ -291,6 +438,62 @@ pub trait CrossFileLookup {
         cached: &std::sync::Arc<CachedModule>,
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
+    }
+    /// A cached module's analysis with its `refs` GUARANTEED present — the
+    /// refs twin of `bag_present` (`docs/adr/relational-ref-index.md`).
+    /// Resident index copies have refs evicted after persist; the backward
+    /// walk rehydrates the exact persisted analysis for candidate files.
+    /// Default (never-evicted impls): a cheap `Arc` bump.
+    fn refs_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        cached.analysis.clone()
+    }
+    /// A cached WORKSPACE module's analysis with cross-file ENRICHMENT
+    /// applied (`docs/adr/storage-engine.md`, the always-enriched
+    /// tier): imported return types propagated, synthetic hash-key defs
+    /// injected — derived through the overlay, never in-place. Consumers
+    /// are FALLBACK-ON-MISS: call this only after the raw bag answered
+    /// None (a miss pays one deep-copy+enrich, then the overlay caches by
+    /// dep-surface fingerprint). Default: the bag-present view — impls
+    /// without an overlay answer unenriched, never wrongly.
+    fn enriched_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        self.bag_present(cached)
+    }
+    /// A cached module's analysis whole on EVERY evictable axis — bag, refs,
+    /// AND symbols present. Consumers that read more than one axis from the
+    /// same copy (the diagnostics sweep, the `refs_to` matcher, `sub_info`
+    /// readers, heatmap/parity enumeration) route here: a single-axis view
+    /// returns the resident copy when its own axis survived but a sibling
+    /// was evicted (the shred-failure degradation path), silently dropping
+    /// the other axis's answers.
+    fn whole_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        cached.analysis.clone()
+    }
+    /// Every indexed file holding at least one ref row keyed by one of
+    /// `keys` — the relational reverse index's candidate-file retrieval
+    /// (`SELECT DISTINCT path … WHERE name_id IN keys`). The backward walk
+    /// rehydrates these and runs the one matcher over them. Default: empty
+    /// (impls without a row store contribute no candidates; the resident
+    /// sweep still covers their files).
+    fn ref_candidate_paths(&self, _keys: &[String]) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+    /// Path-keyed cached-module lookup — the retrieval above hands back
+    /// paths; this maps them onto the resident registration (for the
+    /// visibility gate + `refs_present`). Default `None`.
+    fn cached_by_path(
+        &self,
+        _path: &std::path::Path,
+    ) -> Option<std::sync::Arc<CachedModule>> {
+        None
     }
     fn parents_cached(&self, module_name: &str) -> Vec<String>;
     fn modules_with_symbol(&self, name: &str) -> Vec<String>;
@@ -398,11 +601,11 @@ impl<'a> ScopedLookup<'a> {
     /// the self path so it matches the candidates' canonical `CachedModule.path`.
     pub fn new(
         inner: &'a dyn CrossFileLookup,
-        include_closure: &[String],
+        include_closure: &path_intern::ClosureList,
         self_path: Option<&std::path::Path>,
     ) -> Self {
         let mut visible: std::collections::HashSet<String> =
-            include_closure.iter().cloned().collect();
+            include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
         let self_path = self_path.map(|p| {
             let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
             visible.insert(canon.to_string_lossy().into_owned());
@@ -438,6 +641,40 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // hit the trait default and read the evicted bag — silent Slice-2
         // type regressions while goto/refs stay green.
         self.inner.bag_present(cached)
+    }
+    fn refs_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the LRU.
+        self.inner.refs_present(cached)
+    }
+    fn enriched_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the
+        // enrichment overlay.
+        self.inner.enriched_present(cached)
+    }
+    fn whole_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the LRU.
+        self.inner.whole_present(cached)
+    }
+    fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
+        // Unscoped by design, like `def_candidates`: the backward walk applies
+        // its own per-file closure gate; pre-narrowing here would hide sites
+        // in files the textual-inclusion extension admits.
+        self.inner.ref_candidate_paths(keys)
+    }
+    fn cached_by_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<std::sync::Arc<CachedModule>> {
+        self.inner.cached_by_path(path)
     }
     fn parents_cached(&self, module_name: &str) -> Vec<String> {
         self.inner.parents_cached(module_name)
@@ -1316,6 +1553,24 @@ pub fn split_qualified(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The relational ref index's shared key function: rows are keyed by
+/// `name_match_key(ref.target_name)`, retrieval probes
+/// `name_match_key(target.name)` — one function on both sides, so a row can
+/// never be missed by a spelling the matcher would accept (arms compare
+/// exact names or their unqualified tails; equal names have equal tails).
+/// Sigil variables keep the sigil on the tail (`$Foo::x` → `$x`) because
+/// variable identities carry it.
+pub fn name_match_key(name: &str) -> String {
+    let mut chars = name.chars();
+    if let Some(sigil) = chars.next() {
+        if matches!(sigil, '$' | '@' | '%') {
+            let (_, base) = split_qualified(chars.as_str());
+            return format!("{sigil}{base}");
+        }
+    }
+    split_qualified(name).1.to_string()
+}
+
 impl Ref {
     /// The unqualified callable name for a `FunctionCall` ref. A
     /// fully-qualified call (`Foo::Bar::baz(...)`) keeps the whole path in
@@ -1327,6 +1582,18 @@ impl Ref {
     /// `Foo`.
     pub fn unqualified_target_name(&self) -> &str {
         split_qualified(&self.target_name).1
+    }
+
+    /// The name key this ref is retrievable under in the relational ref
+    /// index (`docs/adr/relational-ref-index.md`). One function serves both
+    /// sides: rows are keyed by `match_key(ref)`, queries probe
+    /// `match_key`-shaped spellings of the target name — so retrieval can
+    /// never miss a ref any matcher arm could match (arms compare either the
+    /// exact `target_name` or its unqualified tail; equal full names have
+    /// equal tails). Sigil variables keep their sigil on the tail because
+    /// variable symbols key with it (`$x`, not `x`).
+    pub fn match_key(&self) -> String {
+        name_match_key(&self.target_name)
     }
 
     /// For a fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`,
@@ -1345,6 +1612,137 @@ impl Ref {
         }
         let (pkg, base) = split_qualified(chars.as_str());
         pkg.map(|p| (p, format!("{sigil}{base}")))
+    }
+}
+
+/// One ref's projection into the relational ref index
+/// (`docs/adr/relational-ref-index.md`) — pure data, no storage types.
+/// Minted post-fold (the qual columns carry the baked verdicts), consumed
+/// by `module_cache::shred_derived_rows`. Kind/qual discriminants are the row
+/// format's contract: changing them means bumping `REF_ROWS_VERSION`.
+#[derive(Debug, Clone)]
+pub struct RefRowSeed {
+    /// Retrieval key — `Ref::match_key()`.
+    pub key: String,
+    pub kind: u8,
+    pub span: Span,
+    pub access: u8,
+    pub flags: u8,
+    pub qual_kind: u8,
+    pub qual: Option<String>,
+    pub arg_count: Option<i64>,
+}
+
+impl Ref {
+    pub fn row_seed(&self) -> RefRowSeed {
+        let kind = match &self.kind {
+            RefKind::Variable => 0,
+            RefKind::FunctionCall { .. } => 1,
+            RefKind::MethodCall { .. } => 2,
+            RefKind::PackageRef => 3,
+            RefKind::HashKeyAccess { .. } => 4,
+            RefKind::ContainerAccess => 5,
+            RefKind::DispatchCall { .. } => 6,
+        };
+        let (qual_kind, qual): (u8, Option<String>) = match &self.kind {
+            RefKind::FunctionCall { resolved_package } => {
+                (1, resolved_package.clone())
+            }
+            RefKind::MethodCall { .. } => (
+                2,
+                self.resolved_method_target
+                    .as_ref()
+                    .map(|t| t.invocant_class().to_string()),
+            ),
+            RefKind::DispatchCall { dispatcher, .. } => (3, Some(dispatcher.clone())),
+            RefKind::HashKeyAccess { owner, .. } => match owner {
+                Some(HashKeyOwner::Class(c)) => (4, Some(c.clone())),
+                Some(HashKeyOwner::Sub { name, .. }) => (5, Some(name.clone())),
+                _ => (0, None),
+            },
+            _ => (0, None),
+        };
+        let flags = u8::from(self.folded_from.is_some())
+            | (u8::from(self.resolves_to.is_some()) << 1);
+        RefRowSeed {
+            key: self.match_key(),
+            kind,
+            span: self.span,
+            access: match self.access {
+                AccessKind::Read => 0,
+                AccessKind::Write => 1,
+                AccessKind::Declaration => 2,
+            },
+            flags,
+            qual_kind,
+            qual,
+            arg_count: self.arg_count.map(|c| c as i64),
+        }
+    }
+}
+
+/// One symbol's projection into the relational store — the enumeration
+/// surface: workspace/symbol answers from these rows, declaration-only
+/// files become backward-walk candidates through them, and a future
+/// register-from-store warm start reads name + kind + the linkage flag.
+/// Full `Symbol` detail (SymbolDetail, deref stacks, attributes, full
+/// span) stays blob-only and rehydrates. Kind/flag discriminants are
+/// row-format contract: changing them bumps `REF_ROWS_VERSION`.
+#[derive(Debug, Clone)]
+pub struct SymRowSeed {
+    pub name: String,
+    pub kind: u8,
+    /// `selection_span` — the landing site workspace/symbol reports.
+    pub span: Span,
+    pub container: Option<String>,
+    /// bit 0: linkage-visible (the `is_linkage_visible` scope-kind gate,
+    /// baked at shred time so the registration feed never needs scopes).
+    /// bit 1: hidden-in-outline; bit 2: lexical sub — the two
+    /// `symbol_to_workspace_info` suppressions, baked so the rows-backed
+    /// workspace/symbol filters identically to the resident sweep.
+    pub flags: u8,
+}
+
+impl SymRowSeed {
+    pub const FLAG_LINKAGE_VISIBLE: u8 = 1;
+    pub const FLAG_HIDDEN_IN_OUTLINE: u8 = 1 << 1;
+    pub const FLAG_LEXICAL_SUB: u8 = 1 << 2;
+}
+
+/// Inverse of `sym_kind_code` — rehydrating a row's kind for consumers
+/// (workspace/symbol) that project it back into LSP kinds.
+pub fn sym_kind_from_code(code: u8) -> Option<SymKind> {
+    Some(match code {
+        0 => SymKind::Variable,
+        1 => SymKind::Sub,
+        2 => SymKind::Method,
+        3 => SymKind::Package,
+        4 => SymKind::Class,
+        5 => SymKind::Module,
+        6 => SymKind::Field,
+        7 => SymKind::Enumerator,
+        8 => SymKind::HashKeyDef,
+        9 => SymKind::Handler,
+        10 => SymKind::Namespace,
+        _ => return None,
+    })
+}
+
+/// Stable row-format discriminant for `SymKind` (explicit, not `as u8` —
+/// enum reordering must not silently re-key persisted rows).
+pub fn sym_kind_code(k: &SymKind) -> u8 {
+    match k {
+        SymKind::Variable => 0,
+        SymKind::Sub => 1,
+        SymKind::Method => 2,
+        SymKind::Package => 3,
+        SymKind::Class => 4,
+        SymKind::Module => 5,
+        SymKind::Field => 6,
+        SymKind::Enumerator => 7,
+        SymKind::HashKeyDef => 8,
+        SymKind::Handler => 9,
+        SymKind::Namespace => 10,
     }
 }
 
@@ -3515,6 +3913,23 @@ pub struct FileAnalysis {
     #[serde(skip, default)]
     bag_evicted: bool,
 
+    /// Refs twin of `bag_evicted` (`docs/adr/relational-ref-index.md`):
+    /// `evict_refs` stripped this resident copy's `refs` after the blob +
+    /// relational rows were persisted. `#[serde(skip)]` — a rehydrated
+    /// analysis is refs-present. Consumers that would read a foreign file's
+    /// refs route through `CrossFileLookup::refs_present` when set; an empty
+    /// `refs` here is "on disk", never "no references".
+    #[serde(skip, default)]
+    refs_evicted: bool,
+
+    /// Symbols twin (`docs/adr/relational-ref-index.md`): `evict_symbols`
+    /// stripped this copy's `symbols` (+ symbol-keyed rebuilt indexes) after
+    /// blob + `syms` rows were persisted. Same lifecycle as the other two
+    /// axes; enumeration answers from rows, detail reads rehydrate through
+    /// `CrossFileLookup::whole_present`.
+    #[serde(skip, default)]
+    symbols_evicted: bool,
+
     /// Witness-bag baseline — `enrich_imported_types_with_keys`
     /// truncates back to this length before re-deriving so repeat
     /// calls stay idempotent.
@@ -3680,7 +4095,7 @@ pub struct FileAnalysis {
     /// "the include-closure lie"). Pack-language only; Perl leaves it empty, so
     /// the ranking is a no-op there (empty closure → global winner unchanged).
     #[serde(default)]
-    pub include_closure: Vec<String>,
+    pub include_closure: path_intern::ClosureList,
 
     /// This analysis was produced from degraded inputs — a parse/extract
     /// failure, or a skipped cross-file macro gather (the on-open
@@ -3995,6 +4410,8 @@ impl FileAnalysis {
             type_provenance,
             witnesses,
             bag_evicted: false,
+            refs_evicted: false,
+            symbols_evicted: false,
             package_framework,
             base_symbol_count: 0,
             base_witness_count: 0,
@@ -4024,7 +4441,7 @@ impl FileAnalysis {
             // Populated post-construction: `include_directives` from the skeleton,
             // `include_closure` by the driver (it holds the resolving file path).
             include_directives: Vec::new(),
-            include_closure: Vec::new(),
+            include_closure: path_intern::ClosureList::default(),
             degraded: false,
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
@@ -4064,6 +4481,70 @@ impl FileAnalysis {
     /// here means "on disk, not resident", not "no type facts".
     pub fn bag_is_evicted(&self) -> bool {
         self.bag_evicted
+    }
+
+    /// Strip the resident `refs` (and the ref-keyed rebuilt indexes) from an
+    /// index copy whose blob + relational rows are persisted — the refs twin
+    /// of `evict_witness_bag`. Lossless: the on-disk analysis keeps the full
+    /// vec; the backward walk retrieves candidates from the relational index
+    /// and rehydrates through `refs_present`. Touches no other pinned field.
+    /// Idempotent.
+    pub fn evict_refs(&mut self) {
+        self.refs = Vec::new();
+        self.refs_by_name = std::collections::HashMap::new();
+        self.refs_by_target = std::collections::HashMap::new();
+        self.call_ref_by_start = std::collections::HashMap::new();
+        self.refs_evicted = true;
+    }
+
+    /// True when `evict_refs` stripped this copy's refs: empty means "on
+    /// disk, not resident", never "no references".
+    pub fn refs_are_evicted(&self) -> bool {
+        self.refs_evicted
+    }
+
+    /// Strip the resident `symbols` (and the symbol-keyed rebuilt indexes)
+    /// from an index copy whose blob + `syms` rows are persisted — the third
+    /// eviction axis. Lossless: the on-disk analysis keeps the full vec;
+    /// enumeration (workspace/symbol) reads rows, detail reads rehydrate.
+    /// Registration feeds were extracted BEFORE this runs. Touches no other
+    /// pinned field (`export`/`export_ok`/`export_lookup` derive from export
+    /// lists, not symbols, and stay). Idempotent.
+    pub fn evict_symbols(&mut self) {
+        self.symbols = Vec::new();
+        self.symbols_by_name = std::collections::HashMap::new();
+        self.symbols_by_scope = std::collections::HashMap::new();
+        self.symbols_evicted = true;
+    }
+
+    /// True when `evict_symbols` stripped this copy's symbols: empty means
+    /// "on disk, not resident", never "no symbols".
+    pub fn symbols_are_evicted(&self) -> bool {
+        self.symbols_evicted
+    }
+
+    /// Whole on EVERY evictable axis — the property `whole_present` gates
+    /// on. New eviction axes extend THIS conjunction (and their `evict_*`
+    /// setter), so multi-axis consumers stay whole-covered by construction
+    /// instead of each spelling its own flag list.
+    pub fn is_fully_resident(&self) -> bool {
+        !self.bag_evicted && !self.refs_evicted && !self.symbols_evicted
+    }
+
+    /// The ONE speller of the registration strip: `strip_bag` drops the
+    /// witness bag; `strip_rows` drops the row-backed axes (refs AND
+    /// symbols — they persist as one generation and evict as one). Every
+    /// registration path routes here so a new eviction axis is added in
+    /// exactly one place; a site spelling `evict_*` calls directly is
+    /// re-stating this pairing by convention.
+    pub fn evict_axes(&mut self, strip_bag: bool, strip_rows: bool) {
+        if strip_bag {
+            self.evict_witness_bag();
+        }
+        if strip_rows {
+            self.evict_refs();
+            self.evict_symbols();
+        }
     }
 
     pub(crate) fn finalize_post_walk(&mut self) {
@@ -5348,19 +5829,23 @@ impl FileAnalysis {
         if let Some(idx) = module_index {
             for import in &self.imports {
                 let Some(cached) = idx.get_cached(&import.module_name) else { continue };
-                for sym in &cached.analysis.symbols {
+                // Return-shape reads go through the bag — the resident index
+                // copy may be bag-evicted (workspace tier included), so take
+                // the bag-present view for the whole scan.
+                let whole = idx.bag_present(&cached);
+                for sym in &whole.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                         continue;
                     }
-                    if !cached.analysis.exports_name(&sym.name) {
+                    if !whole.exports_name(&sym.name) {
                         continue;
                     }
                     if matches!(sym.detail, SymbolDetail::Sub { .. }) {
-                        if let Some(ty) = cached.analysis.symbol_return_type_via_bag(sym.id, None) {
+                        if let Some(ty) = whole.symbol_return_type_via_bag(sym.id, None) {
                             imported_returns.insert(sym.name.clone(), ty);
                         }
                     }
-                    if let Some(sub_info) = cached.sub_info(&sym.name) {
+                    if let Some(sub_info) = whole.sub_info_view(&sym.name) {
                         let hk = sub_info.hash_keys();
                         if !hk.is_empty() {
                             imported_hash_keys
@@ -5484,7 +5969,8 @@ impl FileAnalysis {
                         continue;
                     }
                     let Some(cached) = idx.get_cached(parent) else { continue };
-                    for sym in &cached.analysis.symbols {
+                    let whole = idx.whole_present(&cached);
+                    for sym in &whole.symbols {
                         if sym.package.as_deref() != Some(parent.as_str()) {
                             continue;
                         }
@@ -6367,7 +6853,7 @@ impl FileAnalysis {
             // (methods already cross via collect_ancestor_methods).
             if let Some(mi) = module_index {
                 if let Some(cached) = mi.get_cached(cls) {
-                    cached.analysis.collect_class_fields(
+                    mi.whole_present(&cached).collect_class_fields(
                         cls, &mut candidates, &mut seen, requesting_class,
                     );
                 }
@@ -6413,8 +6899,8 @@ impl FileAnalysis {
                 let idx = module_index?;
                 let cached = idx.get_cached(&class)?;
                 // `render` reads the field's flow type from its OWNING bag —
-                // rehydrate if the resident pack copy was Slice-2-evicted.
-                let full = idx.bag_present(&cached);
+                // the symbol scan needs symbols too; take the whole view.
+                let full = idx.whole_present(&cached);
                 let sym = full.symbols.iter().find(|s| {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
@@ -6487,9 +6973,9 @@ impl FileAnalysis {
             MethodResolution::CrossFile { class, .. } => {
                 let idx = module_index?;
                 let cached = idx.get_cached(&class)?;
-                // The field's type lives in the OWNING file's bag; rehydrate
-                // it if the resident pack copy was bag-evicted (Slice 2).
-                let full = idx.bag_present(&cached);
+                // The field's type lives in the OWNING file's bag; the symbol
+                // scan needs symbols too; take the whole view.
+                let full = idx.whole_present(&cached);
                 let sym = full.symbols.iter().find(|s| {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
@@ -6523,8 +7009,8 @@ impl FileAnalysis {
                 let idx = module_index?;
                 let cached = idx.get_cached(&class)?;
                 // `type_name_edge_of` reads the field's `Edge(TypeName(_))`
-                // witness — rehydrate the owning file's bag if evicted.
-                let full = idx.bag_present(&cached);
+                // witness — plus the symbol scan; take the whole view.
+                let full = idx.whole_present(&cached);
                 let sym = full.symbols.iter().find(|s| {
                     matches!(s.kind, SymKind::Variable | SymKind::Field)
                         && s.name == field
@@ -6565,8 +7051,9 @@ impl FileAnalysis {
         if let Some(p) = packaged(self) {
             return Some(p);
         }
-        let cached = module_index?.get_cached(value)?;
-        packaged(&cached.analysis)
+        let idx = module_index?;
+        let cached = idx.get_cached(value)?;
+        packaged(&idx.whole_present(&cached))
     }
 
     /// The canonical, language-generic `Field{owner, name}` subject for a
@@ -6804,8 +7291,10 @@ impl FileAnalysis {
             return local;
         }
         module_index
-            .and_then(|idx| idx.get_cached(enum_name))
-            .map(|cached| collect(&cached.analysis))
+            .and_then(|idx| {
+                idx.get_cached(enum_name)
+                    .map(|cached| collect(&idx.whole_present(&cached)))
+            })
             .unwrap_or_default()
     }
 
@@ -6985,7 +7474,8 @@ impl FileAnalysis {
             }
             // (2) Real methods on class_name's own cached module.
             if let Some(cached) = idx.get_cached(class_name) {
-                for sym in &cached.analysis.symbols {
+                let whole = idx.whole_present(&cached);
+                for sym in &whole.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
                     if sym.package.as_deref() != Some(class_name) { continue; }
                     if seen_names.contains(&sym.name) { continue; }
@@ -7212,6 +7702,34 @@ impl FileAnalysis {
                 .is_some_and(|s| matches!(s.kind, ScopeKind::File)),
             _ => false,
         }
+    }
+
+    /// Project every symbol into its relational row seed
+    /// (`docs/adr/relational-ref-index.md`). A method on the analysis (not
+    /// on `Symbol`) because the linkage flag needs the owning scope's kind.
+    pub fn sym_row_seeds(&self) -> Vec<SymRowSeed> {
+        self.symbols
+            .iter()
+            .map(|s| {
+                let mut flags = 0u8;
+                if self.is_linkage_visible(s) {
+                    flags |= SymRowSeed::FLAG_LINKAGE_VISIBLE;
+                }
+                if s.hidden_in_outline() {
+                    flags |= SymRowSeed::FLAG_HIDDEN_IN_OUTLINE;
+                }
+                if matches!(&s.detail, SymbolDetail::Sub { lexical: true, .. }) {
+                    flags |= SymRowSeed::FLAG_LEXICAL_SUB;
+                }
+                SymRowSeed {
+                    name: s.name.clone(),
+                    kind: sym_kind_code(&s.kind),
+                    span: s.selection_span,
+                    container: s.package.clone(),
+                    flags,
+                }
+            })
+            .collect()
     }
 
     /// Find all symbols in a given scope.
@@ -7699,7 +8217,8 @@ impl FileAnalysis {
                                             // inherited method in `class`'s own module.
                                             let module = def_module.as_deref().unwrap_or(class.as_str());
                                             if let Some(cached) = idx.get_cached(module) {
-                                                if let Some(sub_info) = cached.sub_info(mname) {
+                                                let whole = idx.bag_present(&cached);
+                                                if let Some(sub_info) = whole.sub_info_view(mname) {
                                                     let sig = format_cross_file_signature(mname, &sub_info);
                                                     let mut text = format!("```perl\n{}\n```\n\n*class {} — resolved from `{}`*", sig, class, r.target_name);
                                                     if let Some(rt) = sub_info.return_type(Some(idx)) {
@@ -7747,7 +8266,8 @@ impl FileAnalysis {
                                 .find(|s| s.local_name == r.target_name);
                             let Some(is) = matched else { continue };
                             let Some(cached) = idx.get_cached(&import.module_name) else { continue };
-                            let Some(sub_info) = cached.sub_info(is.remote()) else { continue };
+                            let whole = idx.whole_present(&cached);
+                            let Some(sub_info) = whole.sub_info_view(is.remote()) else { continue };
 
                             let sig_params = sub_info.params().iter()
                                 .map(|p| p.name.as_str())
@@ -7808,7 +8328,8 @@ impl FileAnalysis {
                                     // inherited method in `class`'s own module.
                                     let module = def_module.as_deref().unwrap_or(class.as_str());
                                     if let Some(cached) = idx.get_cached(module) {
-                                        if let Some(sub_info) = cached.sub_info(method) {
+                                        let whole = idx.bag_present(&cached);
+                                        if let Some(sub_info) = whole.sub_info_view(method) {
                                             let class_label = if class != cn {
                                                 format!("{} (from {})", cn, class)
                                             } else {
@@ -8388,13 +8909,14 @@ impl FileAnalysis {
                         // A class defining its OWN `sub <verb>` overrode DBIC's
                         // verb — the call isn't column-keyed (same gate as the
                         // builder's `user_shadows_verb`).
-                        let shadows = c.analysis.symbols.iter().any(|s| {
+                        let whole = idx.whole_present(&c);
+                        let shadows = whole.symbols.iter().any(|s| {
                             matches!(s.kind, SymKind::Sub | SymKind::Method)
                                 && s.name == verb
                                 && s.package.as_deref() == Some(class.as_str())
                         });
                         !shadows
-                            && c.analysis
+                            && whole
                                 .field_projections_named(&key_ref.target_name, &class)
                                 // ONLY a real `Class`-owned column (DBIC /
                                 // Class::Accessor). A Moo/Corinna attr is also a
@@ -9890,7 +10412,8 @@ impl FileAnalysis {
                 // would let an unrelated same-named member hijack
                 // the walk at `cls` and stop it before the true ancestor.
                 // Re-exports fall through, same as the local arm.
-                let has_member = cached.analysis.symbols.iter().any(|s| {
+                let whole = idx.whole_present(&cached);
+                let has_member = whole.symbols.iter().any(|s| {
                     s.name == method_name
                         && s.package.as_deref() == Some(cls)
                         && !s.is_reexport()
@@ -9898,7 +10421,11 @@ impl FileAnalysis {
                             || (matches!(
                                 s.kind,
                                 SymKind::Variable | SymKind::Field | SymKind::Enumerator
-                            ) && cached.analysis.symbol_is_class_content(s)))
+                                // On the WHOLE view: the class-content test
+                                // resolves the owning container through
+                                // `symbols_named`, which the evicted copy
+                                // answers empty.
+                            ) && whole.symbol_is_class_content(s)))
                 });
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
@@ -10061,12 +10588,13 @@ impl FileAnalysis {
         // bridge-classify by the providing module's own declaration.
         let idx = module_index?;
         let cached = idx.get_cached(&module)?;
-        let is_bridge = cached.analysis.plugin_namespaces.iter().any(|ns| {
+        let whole = idx.whole_present(&cached);
+        let is_bridge = whole.plugin_namespaces.iter().any(|ns| {
             ns.bridges
                 .iter()
                 .any(|b| matches!(b, Bridge::Class(c) if c == &on_class))
                 && ns.entities.iter().any(|sid| {
-                    cached.analysis.symbols.get(sid.0 as usize).is_some_and(|s| {
+                    whole.symbols.get(sid.0 as usize).is_some_and(|s| {
                         matches!(s.kind, SymKind::Sub | SymKind::Method) && s.name == name
                     })
                 })
@@ -10178,9 +10706,11 @@ impl FileAnalysis {
                 let mut provided = false;
                 self.for_each_ancestor_class(pkg, module_index, |a| {
                     let here = self.class_provides_method(a, &name)
-                        || module_index
-                            .and_then(|idx| idx.get_cached(a))
-                            .is_some_and(|c| c.analysis.provides_method_anywhere(&name))
+                        || module_index.is_some_and(|idx| {
+                            idx.get_cached(a).is_some_and(|c| {
+                                idx.whole_present(&c).provides_method_anywhere(&name)
+                            })
+                        })
                         || module_index.is_some_and(|idx| {
                             // Cross-package typeglob installs + plugin
                             // bridges (mirrors `method_resolution_on_class`
@@ -10192,7 +10722,7 @@ impl FileAnalysis {
                             idx.module_declaring_method_in_package(&name, a)
                                 .and_then(|home| idx.get_cached(&home))
                                 .is_some_and(|c| {
-                                    c.analysis.provides_method_in_package(&name, a)
+                                    idx.whole_present(&c).provides_method_in_package(&name, a)
                                 }) || {
                                 let mut hit = false;
                                 idx.for_each_entity_bridged_to(a, &mut |_m, _c, sym| {
@@ -10379,7 +10909,8 @@ impl FileAnalysis {
         if let Some(idx) = module_index {
             for module_name in idx.modules_with_symbol(name) {
                 let Some(cached) = idx.get_cached(&module_name) else { continue };
-                for sym in &cached.analysis.symbols {
+                let whole = idx.whole_present(&cached);
+                for sym in &whole.symbols {
                     if sym.name != name { continue; }
                     if let SymbolDetail::Handler { owner: o, params, .. } = &sym.detail {
                         if o == owner {
@@ -10420,7 +10951,8 @@ impl FileAnalysis {
             if let Some(idx) = module_index {
                 for module_name in idx.modules_with_symbol(name) {
                     let Some(cached) = idx.get_cached(&module_name) else { continue };
-                    for sym in &cached.analysis.symbols {
+                    let whole = idx.whole_present(&cached);
+                    for sym in &whole.symbols {
                         if sym.name != name { continue; }
                         if let SymbolDetail::Handler { owner: o, dispatchers: ds, .. } = &sym.detail {
                             if o == owner { dispatchers.extend(ds.clone()); }
@@ -11313,7 +11845,7 @@ pub enum MethodResolution {
     /// plugin BRIDGE (the synthesized symbol lives in bridging module `m`, not
     /// in `class`'s own module); `None` for a real method in `class`'s module.
     /// Every consumer resolves location/signature the same way —
-    /// `get_cached(def_module.unwrap_or(class)).sub_info(method)` — so bridged
+    /// `whole_present(get_cached(def_module.unwrap_or(class))).sub_info_view(method)` — so bridged
     /// helpers and real inherited methods share one code path.
     CrossFile { class: String, def_module: Option<String> },
 }
@@ -11607,11 +12139,12 @@ impl FileAnalysis {
     ) -> Option<(Option<String>, Vec<String>)> {
         for import in &self.imports {
             let Some(cached) = module_index.get_cached(&import.module_name) else { continue };
-            for sym in &cached.analysis.symbols {
+            let whole = module_index.whole_present(&cached);
+            for sym in &whole.symbols {
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
                 if sym.name != sub_name { continue; }
-                if !cached.analysis.exports_name(&sym.name) { continue; }
-                if let Some(sub_info) = cached.sub_info(&sym.name) {
+                if !whole.exports_name(&sym.name) { continue; }
+                if let Some(sub_info) = whole.sub_info_view(&sym.name) {
                     let hk = sub_info.hash_keys();
                     if !hk.is_empty() {
                         return Some((sym.package.clone(), hk.to_vec()));
@@ -12045,7 +12578,8 @@ impl FileAnalysis {
                 Some(MethodResolution::CrossFile { ref class, .. }) => {
                     if let Some(idx) = module_index {
                         if let Some(cached) = idx.get_cached(class) {
-                            if let Some(sub_info) = cached.sub_info(name) {
+                            let whole = idx.bag_present(&cached);
+                            if let Some(sub_info) = whole.sub_info_view(name) {
                                 return Some(cross_file_resolved(&sub_info));
                             }
                         }
@@ -12080,7 +12614,8 @@ impl FileAnalysis {
                         // or in a module it re-exports. `defining_module_cached`
                         // chases the same re-export edges (seen-set bounded).
                         if let Some(cached) = idx.defining_module_cached(&import.module_name, remote) {
-                            if let Some(sub_info) = cached.sub_info(remote) {
+                            let whole = idx.bag_present(&cached);
+                            if let Some(sub_info) = whole.sub_info_view(remote) {
                                 return Some(cross_file_resolved(&sub_info));
                             }
                         }
@@ -12734,8 +13269,9 @@ impl FileAnalysis {
         h.witness_index = wi;
 
         // include closure — the shared-header-path duplication.
-        h.include = vcap(&self.include_closure)
-            + strcaps(self.include_closure.iter())
+        // Sorted path-ids over the global table: 4 bytes per entry; the
+        // table's string bytes are process-wide, counted once, not per file.
+        h.include = self.include_closure.heap_bytes()
             + vcap(&self.include_directives)
             + self
                 .include_directives

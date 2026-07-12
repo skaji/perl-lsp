@@ -117,9 +117,13 @@ impl FileStore {
             None => return,
         };
         if let Some((_, path)) = self.url_to_path.remove(url) {
-            // Snapshot analysis into workspace. Tree + text are dropped —
-            // workspace entries don't carry them.
-            self.workspace.insert(path, doc.analysis);
+            // Snapshot analysis into workspace under the CANONICAL spelling —
+            // the bulk indexer keys canonically, and a URI spelled through a
+            // symlinked root would otherwise coexist with the canonical entry
+            // as two store keys for one file (double hits, double edits).
+            let canon = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            self.workspace.remove(&path);
+            self.workspace.insert(canon, doc.analysis);
         }
     }
 
@@ -146,7 +150,17 @@ impl FileStore {
     /// ModuleIndex under its primary package name) without cloning
     /// the FileAnalysis twice at workspace-index startup.
     pub fn insert_workspace_arc(&self, path: PathBuf, analysis: Arc<FileAnalysis>) {
-        let shadowed = self.url_to_path.iter().any(|e| e.value() == &path);
+        // Compare canonically: the indexer passes canonical paths while
+        // url_to_path holds URI spellings — under a symlinked root a raw
+        // equality check never matches and an OPEN file gets a stale
+        // workspace twin.
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let shadowed = self.url_to_path.iter().any(|e| {
+            e.value() == &path
+                || std::fs::canonicalize(e.value())
+                    .map(|c| c == canon)
+                    .unwrap_or(false)
+        });
         if !shadowed {
             self.workspace.insert(path, analysis);
         }
@@ -205,6 +219,10 @@ impl FileStore {
         for entry in self.open.iter() {
             let url = entry.key().clone();
             if let Ok(path) = url.to_file_path() {
+                // Claim the canonical spelling too (indexer keys canonically).
+                if let Ok(canon) = std::fs::canonicalize(&path) {
+                    covered_paths.insert(canon);
+                }
                 covered_paths.insert(path);
             }
             f(FileKey::Url(url), &entry.value().analysis);

@@ -488,3 +488,265 @@ fn edit_swap_drops_names_the_new_version_lost() {
     assert!(idx.get_cached("helper").is_none(), "dropped function gone");
     assert!(idx.get_cached("Crate").is_some(), "new class registered");
 }
+
+/// Registration-owned strip: the name/edge feeds and the class-rank record
+/// are extracted from the WHOLE analysis before `symbols` evicts, so
+/// lookups, tie-breaks, and the unregister inverse all survive a
+/// symbol-stripped resident copy.
+#[test]
+fn register_symbols_stripping_feeds_before_evict() {
+    use crate::pack_bag_cache::PackBagCache;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let full_syms = full.analysis.symbols.len();
+    assert!(full_syms > 0);
+    let path = full.path.clone();
+
+    let idx = ModuleIndex::new_for_cli();
+    let arc = idx.register_symbols_stripping((*path).to_path_buf(), (*full.analysis).clone(), true, true);
+    assert!(arc.symbols_are_evicted() && arc.symbols.is_empty(), "stored copy is stripped");
+    assert!(arc.refs_are_evicted());
+
+    // Name lookups still resolve — the feed ran on the whole copy. (`make`
+    // is a Sub — C-linkage-visible; a Perl Package symbol is not part of
+    // the pack feed, so the sub name is the right probe here.)
+    let hit = idx.get_cached("make").expect("sub name registered pre-strip");
+    assert_eq!(hit.path, path);
+    assert!(!idx.def_candidates("make").is_empty(), "candidate table fed pre-strip");
+
+    // whole_present rehydrates symbols through the LRU.
+    let full_for_loader = full.analysis.clone();
+    let cache = std::sync::Arc::new(PackBagCache::new(1024 * 1024, move |_p| {
+        Some((*full_for_loader).clone())
+    }));
+    let idx2 = ModuleIndex::new_for_cli().with_bag_cache(cache);
+    let whole = idx2.whole_present(&hit);
+    assert!(!whole.symbols_are_evicted());
+    assert_eq!(whole.symbols.len(), full_syms);
+
+    // The unregister inverse walks the recorded names, not the evicted vec.
+    idx.unregister_file(&path);
+    assert!(idx.get_cached("make").is_none(), "cache slot removed");
+    assert!(idx.def_candidates("make").is_empty(), "candidates removed");
+}
+
+/// The enrichment overlay (R4): a snapshot is cached while its
+/// fingerprint key stands (same Arc back), recomputes when a PROVIDER's
+/// surface changes, and never mutates the shared workspace Arc.
+#[test]
+fn enriched_snapshot_caches_and_invalidates_on_provider_change() {
+    let idx = ModuleIndex::new_for_test();
+    let lib_v1 = parse_source_to_cached(
+        "package Lib;\nour @EXPORT_OK = ('make');\nsub make { my %h = (id => 1); return \\%h }\n1;\n",
+        "Lib",
+    );
+    let consumer = parse_source_to_cached(
+        "package App;\nuse Lib 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(
+        lib_v1.path.to_path_buf(),
+        Arc::clone(&lib_v1.analysis),
+    );
+    idx.register_workspace_module(
+        consumer.path.to_path_buf(),
+        Arc::clone(&consumer.analysis),
+    );
+
+    let shared_witnesses_before = consumer.analysis.witnesses.len();
+    let snap1 = idx.enriched_snapshot(&consumer).expect("snapshot");
+    let snap2 = idx.enriched_snapshot(&consumer).expect("snapshot");
+    assert!(
+        Arc::ptr_eq(&snap1, &snap2),
+        "key unchanged: the cached snapshot is returned, not recomputed"
+    );
+    assert_eq!(
+        consumer.analysis.witnesses.len(),
+        shared_witnesses_before,
+        "the shared workspace Arc is never enriched in place"
+    );
+
+    // Provider contract change → the consumer's key moves → recompute.
+    let lib_v2 = parse_source_to_cached(
+        "package Lib;\nour @EXPORT_OK = ('make', 'other');\nsub make { my %h = (id => 1); return \\%h }\nsub other { return 2 }\n1;\n",
+        "Lib",
+    );
+    idx.register_workspace_module(
+        lib_v2.path.to_path_buf(),
+        Arc::clone(&lib_v2.analysis),
+    );
+    let snap3 = idx.enriched_snapshot(&consumer).expect("snapshot");
+    assert!(
+        !Arc::ptr_eq(&snap1, &snap3),
+        "provider surface changed: the stale snapshot must not be served"
+    );
+
+    // BODY edit to the consumer itself: the surface fingerprint stands,
+    // but the rebuilt analysis is a NEW Arc — the snapshot must derive
+    // from it (spans/refs moved even though the contract didn't).
+    let consumer_v2 = parse_source_to_cached(
+        "package App;\nuse Lib 'make';\nsub go { my $x = make();\n    return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(
+        consumer_v2.path.to_path_buf(),
+        Arc::clone(&consumer_v2.analysis),
+    );
+    let snap4 = idx.enriched_snapshot(&consumer_v2).expect("snapshot");
+    assert!(
+        !Arc::ptr_eq(&snap3, &snap4),
+        "body edit: the snapshot must derive from the rebuilt analysis"
+    );
+}
+
+/// The R4 always-enriched seams: a closed dep whose answer chains through
+/// ITS OWN imports is a raw-bag dead end (the walker pins no edge for
+/// imported calls); the fallback-on-miss retry through the enrichment
+/// overlay fills it. Two seams, one fixture: B::make's return binds
+/// through B's import of C.
+#[test]
+fn closed_dep_return_type_resolves_through_enriched_overlay() {
+    // C: exports thing() with a concrete blessed return.
+    let c = parse_source_to_cached(
+        "package C;\nour @EXPORT_OK = ('thing');\nsub thing { return bless {}, 'Widget' }\n1;\n",
+        "C",
+    );
+    // B: make()'s return type exists only through B's OWN import of C.
+    let b = parse_source_to_cached(
+        "package B;\nuse C 'thing';\nour @EXPORT_OK = ('make');\nsub make { my $x = thing(); return $x }\n1;\n",
+        "B",
+    );
+    // A: the querying consumer, imports make from B.
+    let a = parse_source_to_cached(
+        "package A;\nuse B 'make';\nsub go { my $m = make(); return $m }\n1;\n",
+        "A",
+    );
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(c.path.to_path_buf(), Arc::clone(&c.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+
+    // Precondition: B's RAW bag alone can't answer (else the seam proves
+    // nothing) — thing() is imported, no local edge.
+    assert_eq!(
+        b.analysis.sub_return_type_at_arity("make", None),
+        None,
+        "fixture must dead-end without the index (raw bag)"
+    );
+
+    // Seam 1: the imported-sub recursion from A dead-ends on B's raw bag,
+    // retries through the enrichment overlay, and resolves Widget.
+    let t = a
+        .analysis
+        .sub_return_type_at_arity_ctx("make", None, Some(&idx))
+        .expect("enriched overlay must fill the closed-dep chain");
+    assert_eq!(
+        t.class_name().as_deref(),
+        Some("Widget"),
+        "resolved through B's OWN import of C: {t:?}"
+    );
+
+    // Seam 2: the MethodOnClass cross-file primary — B::make as a method
+    // call target.
+    let t2 = a
+        .analysis
+        .find_method_return_type("B", "make", Some(&idx), None)
+        .expect("MethodOnClass chase must fill through the overlay");
+    assert_eq!(t2.class_name().as_deref(), Some("Widget"));
+}
+
+/// Mutual imports terminate: the thread-local cycle guard declines the
+/// re-entrant enrich, the tainted build is remembered as a DECLINE (never
+/// cached as a degraded copy, never rebuilt per query), and the acyclic
+/// leg still resolves through the raw bag.
+#[test]
+fn enrichment_cycle_terminates_and_declines_deterministically() {
+    let a = parse_source_to_cached(
+        "package CycA;\nuse CycB 'bfn';\nour @EXPORT_OK = ('afn');\nsub afn { return bless {}, 'AObj' }\n1;\n",
+        "CycA",
+    );
+    let b = parse_source_to_cached(
+        "package CycB;\nuse CycA 'afn';\nour @EXPORT_OK = ('bfn');\nsub bfn { my $y = afn(); return $y }\n1;\n",
+        "CycB",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+
+    // Terminates (no hang / overflow); B's enrichment resolves afn through
+    // A's RAW bag (afn's return is local to A — no cycle needed for it).
+    let snap = idx.enriched_snapshot(&b);
+    assert!(snap.is_some(), "acyclic leg enriches");
+    // And a consumer's query through the seam answers AObj.
+    let consumer = parse_source_to_cached(
+        "package Cons;\nuse CycB 'bfn';\nsub go { my $r = bfn(); return $r }\n1;\n",
+        "Cons",
+    );
+    let t = consumer
+        .analysis
+        .sub_return_type_at_arity_ctx("bfn", None, Some(&idx))
+        .expect("cycle must not block the resolvable leg");
+    assert_eq!(t.class_name().as_deref(), Some("AObj"));
+}
+
+/// The trait DEFAULT stays unenriched-but-correct: an overlay-less impl
+/// answers the raw bag view, so the seams' fallback is a no-op there.
+#[test]
+fn enriched_present_default_is_the_raw_bag() {
+    struct Bare(Arc<CachedModule>);
+    impl crate::file_analysis::CrossFileLookup for Bare {
+        fn get_cached(&self, _m: &str) -> Option<Arc<CachedModule>> {
+            Some(Arc::clone(&self.0))
+        }
+        fn parents_cached(&self, _m: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn modules_with_symbol(&self, _n: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn find_exporters(&self, _n: &str) -> Vec<String> {
+            Vec::new()
+        }
+        fn defining_module_cached(
+            &self,
+            _entry: &str,
+            _name: &str,
+        ) -> Option<Arc<CachedModule>> {
+            None
+        }
+        fn module_declaring_method_in_package(
+            &self,
+            _p: &str,
+            _m: &str,
+        ) -> Option<String> {
+            None
+        }
+        fn for_each_cached(&self, _f: &mut dyn FnMut(&str, &Arc<CachedModule>)) {}
+        fn for_each_reexport_module(
+            &self,
+            _start: Vec<String>,
+            _visit: &mut dyn FnMut(&Arc<CachedModule>) -> std::ops::ControlFlow<()>,
+        ) {
+        }
+        fn for_each_entity_bridged_to(
+            &self,
+            _c: &str,
+            _f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::file_analysis::Symbol),
+        ) {
+        }
+        fn direct_children_of(&self, _p: &str) -> Vec<(String, String)> {
+            Vec::new()
+        }
+        fn for_each_loader_shape(
+            &self,
+            _f: &mut dyn FnMut(&str, &crate::file_analysis::InferredType),
+        ) {
+        }
+    }
+    let cm = parse_source_to_cached("package P;\nsub f { return 1 }\n1;\n", "P");
+    let lk = Bare(Arc::clone(&cm));
+    let e = crate::file_analysis::CrossFileLookup::enriched_present(&lk, &cm);
+    let b = crate::file_analysis::CrossFileLookup::bag_present(&lk, &cm);
+    assert!(Arc::ptr_eq(&e, &b), "default enriched view IS the raw bag view");
+}

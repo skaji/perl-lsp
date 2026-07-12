@@ -35,15 +35,41 @@ pub use crate::file_analysis::{CachedModule, SubInfo};
 
 type InferredTypeOwned = crate::file_analysis::InferredType;
 
-/// Does this cached module declare a `Class`/type named `name`? The cache
-/// slot's rank (Class beats Sub/value) is derived from the occupant rather
-/// than stored alongside it, so the deterministic-winner tie-break in
-/// `register_symbols` can compare ranks order-independently.
-fn module_defines_class(m: &CachedModule, name: &str) -> bool {
-    m.analysis
-        .symbols
-        .iter()
-        .any(|s| matches!(s.kind, SymKind::Class) && s.name == name)
+/// The linkage-visible feed a registration extracts from a WHOLE analysis:
+/// (name, declares-a-Class) per visible symbol. Collected before any strip
+/// so the feeds and tie-breaks never read an emptied `symbols`.
+fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut feed: Vec<(String, bool)> = Vec::new();
+    for sym in &analysis.symbols {
+        // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
+        // the same predicate completion gathering uses, so every name
+        // registered here is also offerable and vice versa.
+        if !analysis.is_linkage_visible(sym) {
+            continue;
+        }
+        let is_class = matches!(sym.kind, SymKind::Class);
+        match index.get(sym.name.as_str()) {
+            // A file declaring both a value AND a Class under one name
+            // ranks as a Class.
+            Some(&i) => feed[i].1 |= is_class,
+            None => {
+                index.insert(sym.name.as_str(), feed.len());
+                feed.push((sym.name.clone(), is_class));
+            }
+        }
+    }
+    // Class rank is visibility-INDEPENDENT (the old occupant scan matched
+    // any Class symbol): a non-linkage-visible Class sharing a visible
+    // value's name still ranks the file as declaring that Class.
+    for sym in &analysis.symbols {
+        if matches!(sym.kind, SymKind::Class) {
+            if let Some(&i) = index.get(sym.name.as_str()) {
+                feed[i].1 = true;
+            }
+        }
+    }
+    feed
 }
 
 /// Pick the winner among same-name candidates by the SAME total order
@@ -51,12 +77,16 @@ fn module_defines_class(m: &CachedModule, name: &str) -> bool {
 /// Sub/value, then the smallest canonical path breaks the tie (order-independent
 /// — no reliance on registration order). Factored so the scoped lookup and the
 /// registration winner agree by construction.
-fn best_candidate(cands: &[&Arc<CachedModule>], name: &str) -> Option<Arc<CachedModule>> {
+fn best_candidate<'c>(
+    cands: &[&'c Arc<CachedModule>],
+    name: &str,
+    defines_class: &dyn Fn(&CachedModule, &str) -> bool,
+) -> Option<Arc<CachedModule>> {
     cands
         .iter()
         .copied()
         .max_by(|a, b| {
-            let (ac, bc) = (module_defines_class(a, name), module_defines_class(b, name));
+            let (ac, bc) = (defines_class(a, name), defines_class(b, name));
             // Class beats non-class; then SMALLER path wins (reverse for max_by).
             ac.cmp(&bc).then_with(|| b.path.cmp(&a.path))
         })
@@ -123,6 +153,14 @@ pub struct ModuleEdgeIndexes {
     /// `FileAnalysis.specializes`). The `Specializes` family edge's
     /// cross-file half; member resolution never reads it.
     specs: DashMap<String, Vec<String>>,
+    /// The indexable-name list each module last fed — the symbols-derived
+    /// half of `feed`, recorded from the WHOLE analysis so a rebuild over
+    /// symbol-EVICTED cache copies (`rebuild_reverse_index*` after the
+    /// workspace indexer strips) replays the names instead of reading empty
+    /// vecs and silently blinding `modules_with_symbol`/`find_exporters`
+    /// for every workspace module. `clear()` keeps it (rebuilds are exactly
+    /// when it's needed); `purge_module` drops it with the edges.
+    name_records: DashMap<String, Vec<String>>,
 }
 
 impl ModuleEdgeIndexes {
@@ -132,14 +170,31 @@ impl ModuleEdgeIndexes {
             bridges: DashMap::new(),
             children: DashMap::new(),
             specs: DashMap::new(),
+            name_records: DashMap::new(),
         }
     }
 
     /// Register every edge `analysis` contributes under `module_name`.
     /// The ONLY write path besides `purge_module`/`clear` — new edge
-    /// maps get their extraction added here and nowhere else.
+    /// maps get their extraction added here and nowhere else. Eviction-
+    /// aware: a symbol-stripped copy replays its recorded name list; a
+    /// whole copy recomputes and re-records it.
     pub fn feed(&self, module_name: &str, analysis: &FileAnalysis) {
-        for name in Self::indexable_names(analysis) {
+        let names: Vec<String> = if analysis.symbols_are_evicted() {
+            match self.name_records.get(module_name) {
+                Some(rec) => rec.clone(),
+                // No record (a stripped copy fed without ever being fed
+                // whole — shouldn't happen, but degrade to the pinned
+                // export names rather than nothing).
+                None => Self::indexable_names(analysis),
+            }
+        } else {
+            let names = Self::indexable_names(analysis);
+            self.name_records
+                .insert(module_name.to_string(), names.clone());
+            names
+        };
+        for name in names {
             self.names
                 .entry(name)
                 .or_default()
@@ -175,8 +230,12 @@ impl ModuleEdgeIndexes {
                 !mods.is_empty()
             });
         }
+        self.name_records.remove(module_name);
     }
 
+    /// Wipe the edge maps for a rebuild. Deliberately KEEPS `name_records`
+    /// — the rebuild re-feeds from cache copies that may be symbol-evicted,
+    /// and the records are their only complete name source.
     pub fn clear(&self) {
         self.names.clear();
         self.bridges.clear();
@@ -243,6 +302,24 @@ impl ModuleEdgeIndexes {
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
 /// thread populates the cache by parsing `.pm` files in-process.
 #[allow(dead_code)]
+/// What `prepare_pack_parts` hands back: the (possibly stripped) arc to
+/// register plus the whole-analysis halves — feed, specialization edges,
+/// projected surface — extracted BEFORE the strip.
+pub(crate) struct PackRegistrationParts {
+    pub arc: Arc<FileAnalysis>,
+    pub feed: Vec<(String, bool)>,
+    pub specs: Vec<(String, String)>,
+    pub surface: crate::surface::Surface,
+}
+
+/// What `prepare_workspace_parts` hands back — the Perl twin of
+/// `PackRegistrationParts`.
+pub(crate) struct WorkspaceRegistrationParts {
+    pub arc: Arc<FileAnalysis>,
+    pub module_name: Option<String>,
+    pub surface: crate::surface::Surface,
+}
+
 pub struct ModuleIndex {
     cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
     /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
@@ -298,12 +375,65 @@ pub struct ModuleIndex {
     /// name-keyed views can't reach those, but whole-project sweeps
     /// (`for_each_cached_file`) must.
     all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
+    /// The freshness engine (`docs/adr/storage-engine.md`):
+    /// per-file span-free surface records + the reverse-dependency index.
+    /// Fed at registration (whole copy, pre-strip) and on open-doc
+    /// rebuilds; `dirty_consumers` names who must re-enrich after a
+    /// surface CHANGE, and an Unchanged verdict is the early-cutoff.
+    freshness: Arc<crate::surface::FreshnessIndex>,
+    /// The enrichment overlay (R4): derived enriched copies keyed by the
+    /// surface fingerprints of the file + its providers. Bounded FIFO —
+    /// `enriched_order` is the eviction queue.
+    /// `None` payload = a DECLINED build (byte-cap giant / cycle-tainted)
+    /// at this key: repeat queries skip the deep-copy entirely until a
+    /// provider change moves the key.
+    enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
+    /// Monotonic per-path registration generation — the ABA-proof identity
+    /// token `enrichment_key` hashes (an Arc pointer can be freed and its
+    /// address reused; a counter can't run backwards). Bumped by every
+    /// registration front door.
+    registration_gen: Arc<DashMap<std::path::PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// The witness seams' fallback-on-miss enriched retries only pay off
+    /// when the process lives long enough to amortize the overlay (each
+    /// miss is a whole-analysis deep copy + enrich). Off by default; the
+    /// SERVER enables it at initialize. One-shot CLI query modes leave it
+    /// off — the bisected cost was 2x warm-gold wall for answers no
+    /// one-shot invocation reuses. (`--check`/`--dump-package` consume
+    /// `enriched_snapshot` directly and are unaffected by this gate.)
+    long_lived: Arc<std::sync::atomic::AtomicBool>,
+    enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
+    /// The linkage-visible (name, declares-a-Class) pairs each file
+    /// registered — the exact inverse list `unregister_file` walks AND the
+    /// class-rank source for the cache-slot tie-break. Recorded at
+    /// registration (pre-strip) because the resident copy's `symbols` may be
+    /// evicted, and rehydration after an edit persists would fetch the NEW
+    /// generation's names.
+    registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
     /// Slice-2 rehydration store — SET ONLY on pack sub-indexes, `None` on the
     /// Perl hub (Perl copies are never bag-evicted). After indexing, each
     /// resident pack `FileAnalysis` has its witness bag evicted; a type query
     /// reaching into an evicted file rehydrates the exact persisted bag through
     /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
-    bag_cache: Option<Arc<crate::pack_bag_cache::PackBagCache>>,
+    bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
+    /// Read-connection opener for the relational ref index
+    /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
+    /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
+    /// for pack sub-indexes). Opened per retrieval (WAL readers are cheap
+    /// and `rusqlite::Connection` isn't `Sync`); `None` (tests, no cache
+    /// dir) contributes no candidates and the resident sweep still covers.
+    ref_rows_opener:
+        std::sync::RwLock<Option<Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>>>,
+    /// The retained read connection the opener fills lazily — one per index,
+    /// so the statement cache amortizes across queries (a heatmap projects
+    /// references once per symbol; per-call opens would re-prepare every
+    /// statement). WAL readers see each write txn that committed before
+    /// their own read txn begins, so retaining it never serves stale rows.
+    /// Paired with the DB file's inode at open: `--clear-cache` UNLINKS the
+    /// file, and an fd pinning the dead inode would serve frozen rows
+    /// forever — an inode change (or missing file) drops the conn so the
+    /// next query reopens the recreated DB.
+    ref_rows_conn: std::sync::Mutex<Option<(rusqlite::Connection, u64)>>,
 }
 
 impl ModuleIndex {
@@ -329,6 +459,10 @@ impl ModuleIndex {
 
         let refresh = Arc::new(on_diagnostics_refresh);
         let refresh_clone = Arc::clone(&refresh);
+        let long_lived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bag_cache: Arc<
+            std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
+        > = Arc::new(std::sync::RwLock::new(None));
 
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
@@ -341,6 +475,8 @@ impl ModuleIndex {
             Arc::clone(&workspace_root),
             client,
             Box::new(move || refresh_clone()),
+            Arc::clone(&long_lived),
+            Arc::clone(&bag_cache),
         );
 
         ModuleIndex {
@@ -350,7 +486,16 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: None,
+            registered_names: Arc::new(DashMap::new()),
+            freshness: Arc::new(crate::surface::FreshnessIndex::default()),
+            enriched: Arc::new(DashMap::new()),
+            registration_gen: Arc::new(DashMap::new()),
+            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            long_lived,
+            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
+            bag_cache,
+            ref_rows_opener: std::sync::RwLock::new(None),
+            ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -378,6 +523,29 @@ impl ModuleIndex {
         }
         *guard = Some(root.map(String::from));
         self.workspace_root.condvar.notify_one();
+        drop(guard);
+        // The hub's relational-ref-index reader: the SAME cache key the
+        // resolver thread writes under (both spell it as this root string),
+        // so retrieval and shred always address one DB.
+        let key = root.map(String::from);
+        {
+            let key = key.clone();
+            self.set_ref_rows_opener(Arc::new(move || {
+                crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")
+            }));
+        }
+        // The hub's rehydration LRU: Perl workspace copies are refs/bag-
+        // evicted once persisted; queries that need the whole analysis
+        // rehydrate through this, same as the pack sub-indexes. Fixed
+        // 128 MiB cap (Perl analyses are 10-100x smaller than cpp ones).
+        let loader = move |path: &std::path::Path| {
+            let conn = crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")?;
+            crate::module_cache::load_one(&conn, &path.to_string_lossy())
+        };
+        self.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
+            128 * 1024 * 1024,
+            loader,
+        )));
     }
 
     /// Get the workspace root URI if set.
@@ -428,7 +596,7 @@ impl ModuleIndex {
                     .iter()
                     .filter(|c| visible.contains(&c.path.to_string_lossy().into_owned()))
                     .collect();
-                if let Some(best) = best_candidate(&reachable, module_name) {
+                if let Some(best) = best_candidate(&reachable, module_name, &|m, n| self.module_defines_class(m, n)) {
                     return Some(best);
                 }
             }
@@ -462,7 +630,7 @@ impl ModuleIndex {
                 .iter()
                 .filter(|c| c.path.to_str().is_some_and(|p| visible.contains(p)))
                 .collect();
-            if let Some(best) = best_candidate(&reachable, entry.key()) {
+            if let Some(best) = best_candidate(&reachable, entry.key(), &|m, n| self.module_defines_class(m, n)) {
                 out.push((entry.key().clone(), best));
             }
         }
@@ -518,7 +686,8 @@ impl ModuleIndex {
         use std::ops::ControlFlow;
         let mut found = None;
         self.for_each_reexport_module(std::iter::once(entry.to_string()), |cached| {
-            if cached.sub_info(name).is_some() {
+            use crate::file_analysis::CrossFileLookup;
+            if self.whole_present(cached).sub_info_view(name).is_some() {
                 found = Some(Arc::clone(cached));
                 ControlFlow::Break(())
             } else {
@@ -584,10 +753,14 @@ impl ModuleIndex {
     /// Look up the return type of an imported function. Zero I/O.
     #[cfg(test)]
     pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
+        use crate::file_analysis::CrossFileLookup;
         let modules = self.edges.names.get(func_name)?;
         for module_name in modules.value() {
             if let Some(cached) = self.get_cached(module_name) {
-                if let Some(ty) = cached.analysis.sub_return_type_local(func_name) {
+                // `sub_return_type_local` walks symbols AND resolves through
+                // the bag — two evictable axes, take the whole view.
+                let whole = self.whole_present(&cached);
+                if let Some(ty) = whole.sub_return_type_local(func_name) {
                     return Some(ty.clone());
                 }
             }
@@ -643,11 +816,12 @@ impl ModuleIndex {
         name: &str,
         class: &str,
     ) -> Option<String> {
+        use crate::file_analysis::CrossFileLookup;
         self.modules_with_symbol(name)
             .into_iter()
             .find(|mod_name| {
                 self.get_cached(mod_name)
-                    .map(|c| c.has_sub_in_package(name, class))
+                    .map(|c| self.whole_present(&c).has_sub_in_package(name, class))
                     .unwrap_or(false)
             })
     }
@@ -696,7 +870,16 @@ impl ModuleIndex {
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: None,
+            registered_names: Arc::new(DashMap::new()),
+            freshness: Arc::new(crate::surface::FreshnessIndex::default()),
+            enriched: Arc::new(DashMap::new()),
+            registration_gen: Arc::new(DashMap::new()),
+            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
+            bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            ref_rows_opener: std::sync::RwLock::new(None),
+            ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -706,6 +889,29 @@ impl ModuleIndex {
             resolved,
             workspace_root,
             refresh_diagnostics: Arc::new(|| {}),
+        }
+    }
+
+    /// Mark this process LONG-LIVED (the server): the witness seams'
+    /// enriched retries turn on (the overlay amortizes them; one-shot CLI
+    /// modes never recoup the deep-copies — bisected at 2x warm-harness
+    /// wall), and the resolver strips warm-loaded @INC copies (their
+    /// rehydration cost amortizes the same way).
+    pub fn mark_long_lived(&self) {
+        self.long_lived
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `PERL_LSP_LONG_LIVED=1` forces the long-lived behaviors in one-shot
+    /// CLI processes — the harness lane that keeps the server-only paths
+    /// (enriched retries, warm @INC strip) under a regression net.
+    pub fn is_long_lived(&self) -> bool {
+        self.long_lived.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn mark_long_lived_from_env(&self) {
+        if std::env::var("PERL_LSP_LONG_LIVED").as_deref() == Ok("1") {
+            self.mark_long_lived();
         }
     }
 
@@ -742,14 +948,23 @@ impl ModuleIndex {
             Arc::clone(&workspace_root),
         );
 
-        ModuleIndex {
+        let idx = ModuleIndex {
             cache,
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
-            bag_cache: None,
+            registered_names: Arc::new(DashMap::new()),
+            freshness: Arc::new(crate::surface::FreshnessIndex::default()),
+            enriched: Arc::new(DashMap::new()),
+            registration_gen: Arc::new(DashMap::new()),
+            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
+            bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            ref_rows_opener: std::sync::RwLock::new(None),
+            ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
             loader_config_shapes: Arc::new(DashMap::new()),
             stale_modules,
@@ -759,7 +974,11 @@ impl ModuleIndex {
             resolved,
             workspace_root,
             refresh_diagnostics: Arc::new(|| {}),
-        }
+        };
+        // Unit nets exercise the seams' retries; production defaults OFF
+        // (the server enables at initialize).
+        idx.mark_long_lived();
+        idx
     }
 
     /// Test-only: seed the builtins map directly (bypasses SQLite +
@@ -807,14 +1026,409 @@ impl ModuleIndex {
         }
     }
 
-    /// Register a workspace-indexed file under its primary package name
-    /// so cross-file resolution (method lookup, Handler walks) can find
-    /// it without first requiring an `@INC` resolve. Workspace files
-    /// otherwise live only in `FileStore` — this bridges them into the
-    /// ModuleIndex so queries that key on package name work uniformly
-    /// whether the target came from `use` or from the project tree.
+    /// The workspace-registration reads that need the FULL analysis:
+    /// loaded-module tracking (imports + method-form plugin loads — fed
+    /// even for PACKAGELESS entrypoint scripts, which is where `plugin
+    /// 'X'` loads live) and loader-config shapes, which read the witness
+    /// bag via `expr_type_at_span`. Callers stripping a resident copy run
+    /// this on the whole analysis FIRST; `register_workspace_module`
+    /// bundles it for full-copy callers.
+    pub fn record_workspace_projections(&self, path: &std::path::Path, analysis: &FileAnalysis) {
+        for imp in &analysis.imports {
+            self.loaded_modules.insert(imp.module_name.clone(), ());
+        }
+        for f in &analysis.plugin_loads {
+            self.loaded_modules.insert(f.name.clone(), ());
+        }
+        self.record_loader_shapes(&path.display().to_string(), analysis);
+    }
+
+    /// The residency half of workspace registration: the path-keyed
+    /// registry, name/edge feeds, and the cache insert. The name/edge feeds
+    /// read `symbols`, so a symbol-stripped copy must NOT register through
+    /// here — indexers strip via `register_workspace_stripping`, which feeds
+    /// from the whole analysis first. Files without a `package` declaration
+    /// get only the path entry.
+    /// Returns the surface verdict so re-registration seams (the watcher)
+    /// can act on `Changed` — dropping it leaves open consumers stale
+    /// after an external edit (git pull) to a dep.
+    pub fn register_workspace_resident(
+        &self,
+        path: std::path::PathBuf,
+        analysis: Arc<FileAnalysis>,
+    ) -> crate::surface::SurfaceVerdict {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.bump_registration_gen(&path);
+        let verdict = self.record_surface(&path, &analysis);
+        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        // Path-keyed registry first: the relational retrieval resolves
+        // candidate paths through `cached_by_path`, and packageless files
+        // (Mojolicious::Lite entrypoints) exist ONLY here.
+        self.all_files.insert(cached.path.clone(), cached.clone());
+        let Some(module_name) = first_package_name(&analysis) else {
+            return verdict;
+        };
+        self.workspace_modules.insert(module_name.clone(), ());
+        self.edges.purge_module(&module_name);
+        self.edges.feed(&module_name, &analysis);
+        self.cache.insert(module_name, Some(cached));
+        verdict
+    }
+
+    /// Project + record `fa`'s span-free surface for `path` — the
+    /// freshness engine's write half. Call with a WHOLE analysis (the
+    /// projection reads symbols + the bag). Returns the early-cutoff
+    /// verdict; `Changed` means `dirty_consumers(path)` names stale files.
+    pub fn record_surface(
+        &self,
+        path: &std::path::Path,
+        fa: &FileAnalysis,
+    ) -> crate::surface::SurfaceVerdict {
+        self.record_surface_value(path, crate::surface::Surface::project(fa))
+    }
+
+    /// Record an ALREADY-projected surface (the warm-stub path decodes the
+    /// persisted projection; the fresh worker projects once and shares it
+    /// with the stub encoder).
+    pub fn record_surface_value(
+        &self,
+        path: &std::path::Path,
+        surface: crate::surface::Surface,
+    ) -> crate::surface::SurfaceVerdict {
+        // Canonicalize here so every caller (open-doc, worker, watcher)
+        // lands on one key — a fresh/canon split would make every edit
+        // look FirstSeen and the gate never fires.
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.freshness.record(&canon, surface)
+    }
+
+    /// Every registration bumps this — the enrichment key's freshness
+    /// token for the file itself and for providers whose facts aren't
+    /// surface-covered (a body edit re-registers with a new generation,
+    /// where a surface fingerprint deliberately stands still).
+    pub(crate) fn bump_registration_gen(&self, path: &std::path::Path) {
+        let g = self
+            .gen_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.registration_gen.insert(path.to_path_buf(), g);
+    }
+
+    fn registration_gen_of(&self, path: &std::path::Path) -> u64 {
+        self.registration_gen.get(path).map(|g| *g).unwrap_or(0)
+    }
+
+    /// Drop `path`'s recorded surface and its dep edges (file deleted).
+    /// A deleted file can't canonicalize, but the record was keyed under
+    /// the RESOLVED path while it existed — resolve the parent and rejoin
+    /// (the Perl watcher's delete fallback) so symlinked roots still hit.
+    pub fn remove_surface(&self, path: &std::path::Path) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            path.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .and_then(|d| path.file_name().map(|f| d.join(f)))
+                .unwrap_or_else(|| path.to_path_buf())
+        });
+        self.freshness.remove(&canon);
+        // Belt over braces: if the caller's raw spelling was the recorded
+        // key (registration itself fell back), remove that too.
+        if canon != path {
+            self.freshness.remove(path);
+        }
+    }
+
+    /// The enrichment overlay (R4): an enriched copy of a workspace file's
+    /// analysis, DERIVED and keyed by the surface fingerprints of the file
+    /// plus its declared providers — never an in-place mutation of the
+    /// shared Arc. Self-validating at read: any provider's surface change
+    /// moves the key and the entry recomputes. Bounded (drop-oldest) so a
+    /// whole-tree sweep churns through without pinning the tree resident.
+    pub fn enriched_snapshot(
+        &self,
+        cached: &Arc<CachedModule>,
+    ) -> Option<Arc<FileAnalysis>> {
+        // Cycle guard: enriching A runs type queries whose cross-file chase
+        // may ask for enriched(B), and B's enrichment may ask for
+        // enriched(A) (mutual imports). A re-entrant request for a path
+        // already enriching ON THIS THREAD answers None — the caller's
+        // fallback serves the raw bag, the cycle breaks, and the outer
+        // enrichment completes with the unenriched view of its cyclic dep.
+        thread_local! {
+            static ENRICHING: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>> =
+                Default::default();
+        }
+        thread_local! {
+            static DECLINED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        struct Entered(std::path::PathBuf);
+        impl Drop for Entered {
+            fn drop(&mut self) {
+                ENRICHING.with(|s| {
+                    s.borrow_mut().remove(&self.0);
+                });
+            }
+        }
+        if !ENRICHING.with(|s| s.borrow_mut().insert(cached.path.clone())) {
+            DECLINED.with(|c| c.set(c.get() + 1));
+            return None;
+        }
+        let _entered = Entered(cached.path.clone());
+        let declined_before = DECLINED.with(|c| c.get());
+        // BYTE-bounded first (enriched copies are whole analyses — 64 of a
+        // tree's biggest generated modules would quietly re-pin the
+        // gigabytes the eviction axes stripped), entry-bounded second.
+        const ENRICHED_CAP: usize = 64;
+        const ENRICHED_BYTE_CAP: usize = 128 * 1024 * 1024;
+        let path = &cached.path;
+        let key = self.enrichment_key(cached);
+        if let Some(e) = self.enriched.get(path) {
+            if e.0 == key {
+                let hit = e.1.clone();
+                drop(e);
+                // LRU touch — a FIFO would let any sweep evict the hot dep
+                // entries the witness seams lean on, in insertion order.
+                let mut order = self.enriched_order.lock().unwrap();
+                order.retain(|p| p != path);
+                order.push_back(path.clone());
+                // `None` = a remembered DECLINE (giant / cycle-tainted):
+                // repeat queries skip the deep-copy until the key moves.
+                return hit;
+            }
+        }
+        let whole = crate::file_analysis::CrossFileLookup::whole_present(self, cached);
+        // Deep copy via serde — enrichment must never write through the
+        // shared Arc (the R4 rule the overlay exists to enforce).
+        let mut copy: FileAnalysis = bincode::serialize(&*whole)
+            .ok()
+            .and_then(|bin| bincode::deserialize(&bin).ok())?;
+        copy.after_deserialize();
+        copy.enrich_imported_types_with_keys(Some(self));
+        let arc = Arc::new(copy);
+        // Cycle-tainted: some dep declined mid-enrich (mutual imports), so
+        // this copy baked a RAW view of that dep. Caching it would serve
+        // the degraded answer until an unrelated surface change; serving
+        // it unretained would let the witness seams mint fresh copies per
+        // recursion level (unbounded). Answer None — cyclic files honestly
+        // degrade to their raw bags, deterministically.
+        let tainted = DECLINED.with(|c| c.get()) != declined_before;
+        let bytes = arc.heap_estimate().total();
+        // Past the byte cap the copy can't be RETAINED, and an unretained
+        // copy must never leave this function: the seams' termination and
+        // memo validity both key on overlay-held Arc identity. Giants and
+        // cycle-tainted builds honestly answer unenriched — and the
+        // decline is CACHED so repeat queries don't rebuild the copy just
+        // to re-decline it.
+        let stored: Option<Arc<FileAnalysis>> =
+            if tainted || bytes > ENRICHED_BYTE_CAP { None } else { Some(arc) };
+        let entry_bytes = if stored.is_some() { bytes } else { 0 };
+        self.enriched.insert(path.clone(), (key, stored.clone(), entry_bytes));
+        {
+            let mut order = self.enriched_order.lock().unwrap();
+            order.retain(|p| p != path);
+            order.push_back(path.clone());
+            let total_bytes = |order: &std::collections::VecDeque<std::path::PathBuf>| {
+                order
+                    .iter()
+                    .filter_map(|p| self.enriched.get(p))
+                    .map(|e| e.2)
+                    .sum::<usize>()
+            };
+            while order.len() > 1
+                && (order.len() > ENRICHED_CAP || total_bytes(&order) > ENRICHED_BYTE_CAP)
+            {
+                if let Some(evictee) = order.pop_front() {
+                    self.enriched.remove(&evictee);
+                }
+            }
+        }
+        stored
+    }
+
+    /// The overlay's validity key — it must cover EVERYTHING
+    /// `enrich_imported_types_with_keys` reads, or a stale snapshot gets
+    /// served silently. The read set and its key coverage:
     ///
-    /// No-op for files without a `package` declaration (top-level scripts).
+    /// - the file's own analysis → the source Arc's identity (a body edit
+    ///   keeps the span-free fingerprint still, but every re-registration
+    ///   mints a new Arc);
+    /// - the file's own surface fingerprint (defense in depth alongside
+    ///   the Arc identity);
+    /// - every TRANSITIVELY reachable provider (imports ∪ parents ∪
+    ///   bridges, then THEIR deps — enrichment walks ancestor chains, so a
+    ///   grandparent's contract change must move the key): its freshness
+    ///   fingerprint when recorded, else the provider analysis's Arc
+    ///   identity (the @INC tier has no surface records; re-resolution
+    ///   mints a new Arc). Unresolved providers hash as a distinct
+    ///   discriminant so their later appearance recomputes;
+    /// - the loader-config shapes (a REVERSE edge: caller files feed the
+    ///   shapes this file's enrichment bakes) — hashed wholesale, so any
+    ///   shape change over-invalidates rather than under.
+    ///
+    /// Extending enrichment with a new cross-file read means extending
+    /// this key.
+    fn enrichment_key(&self, cached: &Arc<CachedModule>) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.registration_gen_of(&cached.path).hash(&mut h);
+        self.freshness.fingerprint_of(&cached.path).unwrap_or(0).hash(&mut h);
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        let mut frontier: Vec<String> = self.freshness.deps_of_names(&cached.path);
+        frontier.sort_unstable();
+        frontier.dedup();
+        // Same bound as `resolve_method_in_ancestors` — enrichment's own
+        // walks stop there too.
+        for _depth in 0..20 {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<String> = Vec::new();
+            for dep in frontier {
+                if !seen.insert(dep.clone()) {
+                    continue;
+                }
+                dep.hash(&mut h);
+                match self.get_cached(&dep) {
+                    None => 0u8.hash(&mut h),
+                    Some(cm) => {
+                        // Generation ALWAYS on the key, fingerprint too when
+                        // recorded: enrichment's ctx-ful passes bake
+                        // BODY-dependent provider facts the span-free
+                        // fingerprint deliberately ignores, so a provider
+                        // re-registration must move every consumer's key
+                        // (over-invalidation, never staleness).
+                        self.registration_gen_of(&cm.path).hash(&mut h);
+                        match self.freshness.fingerprint_of(&cm.path) {
+                            Some(fp) => {
+                                1u8.hash(&mut h);
+                                fp.hash(&mut h);
+                                next.extend(self.freshness.deps_of_names(&cm.path));
+                            }
+                            None => {
+                                2u8.hash(&mut h);
+                                // @INC tier: no registration gen (the
+                                // resolver thread inserts without the hub's
+                                // gen map) — the Arc pointer is the residual
+                                // freshness token (ABA-prone in principle;
+                                // ledgered).
+                                if self.registration_gen_of(&cm.path) == 0 {
+                                    (Arc::as_ptr(&cm.analysis) as usize).hash(&mut h);
+                                }
+                                // Recordless tier: no deps_of record; its
+                                // parents ride the analysis itself.
+                                for parents in cm.analysis.package_parents.values() {
+                                    next.extend(parents.iter().cloned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            frontier = next;
+        }
+        let mut shapes: Vec<(String, Vec<u8>)> = self
+            .loader_config_shapes
+            .iter()
+            .map(|e| {
+                let mut buf = Vec::new();
+                for pair in e.value() {
+                    buf.extend(bincode::serialize(pair).unwrap_or_default());
+                }
+                (e.key().clone(), buf)
+            })
+            .collect();
+        shapes.sort();
+        for (name, buf) in shapes {
+            name.hash(&mut h);
+            buf.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The transitive consumers of `path`'s last-recorded surface — the
+    /// re-enrich set after a `Changed` verdict.
+    pub fn dirty_consumers(
+        &self,
+        path: &std::path::Path,
+    ) -> std::collections::HashSet<std::path::PathBuf> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.freshness.dirty_consumers(&canon)
+    }
+
+    /// The name/edge feed half of workspace registration, run on the WHOLE
+    /// analysis BEFORE any strip (a stripped copy's `symbols` is empty and
+    /// would blind the feeds). Returns the module name the residency half
+    /// keys the cache slot on.
+    pub(crate) fn workspace_feed_prestrip(&self, fa: &FileAnalysis) -> Option<String> {
+        let module_name = first_package_name(fa);
+        if let Some(ref name) = module_name {
+            self.workspace_modules.insert(name.clone(), ());
+            self.edges.purge_module(name);
+            self.edges.feed(name, fa);
+        }
+        module_name
+    }
+
+    /// The residency half: the path-keyed registry + the cache slot. For a
+    /// STRIPPED copy this must run only after its blob+rows are COMMITTED —
+    /// an evicted copy registered before its persistence exists rehydrates
+    /// to nothing and answers wrong-empty instead of "not yet indexed".
+    pub(crate) fn register_workspace_residency(
+        &self,
+        path: std::path::PathBuf,
+        arc: Arc<FileAnalysis>,
+        module_name: Option<String>,
+    ) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.bump_registration_gen(&path);
+        let cached = Arc::new(CachedModule::new(path, arc));
+        self.all_files.insert(cached.path.clone(), cached.clone());
+        if let Some(name) = module_name {
+            self.cache.insert(name, Some(cached));
+        }
+    }
+
+    /// Registration-owned strip: feed the name/edge registrations from the
+    /// WHOLE analysis, then evict the requested axes, then store the
+    /// stripped arc — so a feed can never read an already-emptied `symbols`
+    /// (the ordering bug a caller-side strip invites). Returns the stored
+    /// arc for the caller's FileStore mirror. Synchronous-persistence
+    /// callers only (the warm path — the blob already exists on disk);
+    /// the bulk fresh path splits the halves around the writer's COMMIT.
+    pub fn register_workspace_stripping(
+        &self,
+        path: std::path::PathBuf,
+        fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> Arc<FileAnalysis> {
+        let parts = self.prepare_workspace_parts(fa, strip_bag, strip_rows);
+        let _ = self.record_surface_value(&path, parts.surface);
+        self.register_workspace_residency(path, parts.arc.clone(), parts.module_name);
+        parts.arc
+    }
+
+    /// Remove a deleted workspace file's registrations — the path-keyed
+    /// entry plus its name-keyed cache row and edges (a dead file must not
+    /// stay a retrieval candidate or a phantom module).
+    pub fn unregister_workspace_path(&self, path: &std::path::Path) {
+        self.remove_surface(path);
+        self.all_files.remove(path);
+        let name = self.cache.iter().find_map(|entry| {
+            entry
+                .value()
+                .as_ref()
+                .filter(|cm| cm.path == path)
+                .map(|_| entry.key().clone())
+        });
+        if let Some(name) = name {
+            self.edges.purge_module(&name);
+            self.cache.remove(&name);
+            self.workspace_modules.remove(&name);
+        }
+    }
+
+    #[cfg(test)]
     pub fn register_workspace_module(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         // Loaded-module tracking feeds the entrypoint-scan lint and must
         // run BEFORE the packageless early-return: Mojolicious::Lite
@@ -822,35 +1436,8 @@ impl ModuleIndex {
         // `plugin 'X'` loads (via SyntheticUse imports) the lint needs
         // to see. Workspace scan re-runs every startup, so this set
         // needs no warm-rebuild feed.
-        for imp in &analysis.imports {
-            self.loaded_modules.insert(imp.module_name.clone(), ());
-        }
-        // Method-form loads (`$app->plugin('X')`, the nested cascade)
-        // are recorded as `plugin_loads` by the trigger-independent
-        // builder recognizer — feed them too. Names are short
-        // (`FeatureFlags`); `is_module_loaded` tail-matches them to FQ
-        // providers (`Clove::App::Plugin::FeatureFlags`).
-        for f in &analysis.plugin_loads {
-            self.loaded_modules.insert(f.name.clone(), ());
-        }
-        self.record_loader_shapes(&path.display().to_string(), &analysis);
-        let Some(module_name) = first_package_name(&analysis) else { return };
-        self.workspace_modules.insert(module_name.clone(), ());
-        // Canonicalize the path — `Url::from_file_path` in symbols.rs
-        // requires absolute paths, so relative workspace paths (e.g.
-        // "./test_files/lib/Users.pm" from CLI `.` root) would silently
-        // fail conversion and break cross-file goto-def.
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let cached = Arc::new(CachedModule::new(path, analysis.clone()));
-
-        // Re-registration happens on file-watcher save. Old edges still
-        // point at this module, so without a purge they accumulate
-        // forever — a name or bridge that a previous version declared
-        // lingers after it's removed, and cross-file lookups return
-        // phantom modules.
-        self.edges.purge_module(&module_name);
-        self.edges.feed(&module_name, &analysis);
-        self.cache.insert(module_name, Some(cached));
+        self.record_workspace_projections(&path, &analysis);
+        self.register_workspace_resident(path, analysis);
     }
 
     /// Register a pack-language file under each CLASS name it defines —
@@ -869,19 +1456,140 @@ impl ModuleIndex {
     /// `Arc`-wrapped and registered. Consuming builder so the field is set once
     /// on the owned value (the index is shared immutably thereafter).
     pub fn with_bag_cache(
-        mut self,
+        self,
         cache: Arc<crate::pack_bag_cache::PackBagCache>,
     ) -> Self {
-        self.bag_cache = Some(cache);
+        self.set_bag_cache(cache);
         self
     }
 
-    /// Drop `path`'s rehydrated bag from this pack index's LRU (a changed/saved
-    /// file's bag is stale). No-op on the Perl hub (no bag cache).
+    /// Post-`Arc` variant for the hub, set alongside the workspace root.
+    /// LAST root wins — a re-rooted session must not keep rehydrating from
+    /// the first root's DB while the writers moved to the new one.
+    pub fn set_bag_cache(&self, cache: Arc<crate::pack_bag_cache::PackBagCache>) {
+        if let Ok(mut g) = self.bag_cache.write() {
+            *g = Some(cache);
+        }
+    }
+
+    fn bag_cache_ref(&self) -> Option<Arc<crate::pack_bag_cache::PackBagCache>> {
+        self.bag_cache.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Install the relational ref index's read-connection opener (once).
+    /// Callable post-`Arc` (interior `OnceLock`) because the hub is shared
+    /// before the workspace root — and therefore the cache path — is known.
+    pub fn set_ref_rows_opener(
+        &self,
+        opener: Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>,
+    ) {
+        if let Ok(mut g) = self.ref_rows_opener.write() {
+            *g = Some(opener);
+        }
+        // The retained conn belongs to the previous opener's DB.
+        if let Ok(mut c) = self.ref_rows_conn.lock() {
+            *c = None;
+        }
+    }
+
+    /// Drop `path`'s rehydrated analysis from this index's LRU (a
+    /// changed/saved file's copy is stale). Pack sub-indexes AND the Perl
+    /// hub each carry one — the watcher and the bulk-index writers rely on
+    /// this taking effect on both.
     pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
-        if let Some(bc) = &self.bag_cache {
+        if let Some(bc) = self.bag_cache_ref() {
             bc.invalidate(path);
         }
+    }
+
+    /// Rehydrate `cached`'s whole persisted analysis through this index's
+    /// LRU, degrading to the (evicted) resident copy on a miss rather than
+    /// fabricating — the caller's query then answers as it would for a
+    /// genuinely fact-less file. One body serves `bag_present` and
+    /// `refs_present`: the miss policy and LRU selection must never diverge
+    /// between the type path and the reference path.
+    fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if let Some(bc) = self.bag_cache_ref() {
+            if let Some(full) = bc.bag_for(&cached.path) {
+                return full;
+            }
+        }
+        // Warn, not debug: an evicted copy whose blob can't rehydrate means
+        // references/types for this file are quietly incomplete this session
+        // (the next warm start re-parses it — decode failures invalidate the
+        // row's stamp match by re-analysis).
+        log::warn!(
+            "rehydration miss for evicted copy {:?} — serving stripped resident",
+            cached.path
+        );
+        cached.analysis.clone()
+    }
+
+    /// Does `m` declare a `Class`/type named `name`? Rank source for the
+    /// cache-slot tie-break and the scoped/survivor re-picks. Reads the
+    /// registration record first — the resident copy's `symbols` may be
+    /// evicted — and falls back to the symbol scan for copies registered
+    /// whole (recovery paths, tests).
+    fn module_defines_class(&self, m: &CachedModule, name: &str) -> bool {
+        if let Some(rec) = self.registered_names.get(&m.path) {
+            return rec.iter().any(|(n, is_class)| n == name && *is_class);
+        }
+        m.analysis
+            .symbols
+            .iter()
+            .any(|s| matches!(s.kind, SymKind::Class) && s.name == name)
+    }
+
+    /// Run `f` against this index's retained read connection to the
+    /// relational row store, opening (or re-opening, if the DB file was
+    /// unlinked/recreated) through the installed opener. `None` when no
+    /// opener is set (tests, no cache dir) or the open fails. One retained
+    /// connection per index so the statement cache amortizes across queries.
+    fn with_rows_conn<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> Option<R> {
+        let opener = self.ref_rows_opener.read().ok().and_then(|g| g.clone())?;
+        fn db_ino(conn: &rusqlite::Connection) -> u64 {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return conn
+                    .path()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.ino())
+                    .unwrap_or(0);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = conn;
+                0
+            }
+        }
+        // Poison-proof: the Option is a pure cache — a panic in some earlier
+        // holder must not permanently disable retrieval.
+        let mut guard = self
+            .ref_rows_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((conn, ino)) = guard.as_ref() {
+            if db_ino(conn) != *ino {
+                *guard = None; // file unlinked/recreated — reopen below
+            }
+        }
+        if guard.is_none() {
+            *guard = opener().map(|c| {
+                let ino = db_ino(&c);
+                (c, ino)
+            });
+        }
+        let (conn, _) = guard.as_ref()?;
+        Some(f(conn))
+    }
+
+    /// Rows-backed workspace/symbol scan over THIS index's store — the
+    /// enumeration surface for symbol-evicted copies. The hub serves Perl
+    /// rows; callers fan out to `pack_index` sub-indexes for pack rows.
+    pub fn sym_search(&self, query: &str) -> Vec<crate::module_cache::SymRowHit> {
+        self.with_rows_conn(|conn| crate::module_cache::sym_rows_matching(conn, query))
+            .unwrap_or_default()
     }
 
     /// The sub-index for `lang`, if this distribution indexes it.
@@ -907,27 +1615,107 @@ impl ModuleIndex {
     /// goto-def lands on the body. Methods need no entry — they resolve
     /// through their class's file.
     pub fn register_symbols(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
-        use crate::file_analysis::SymKind;
+        // Feed source and stored copy are the same whole analysis here;
+        // indexers that strip go through `register_symbols_stripping`.
+        let _ = self.record_surface(&path, &analysis);
+        let (feed, specs) = Self::prepare_pack_feed(&analysis);
+        self.register_symbols_inner(path, analysis, &feed, &specs);
+    }
+
+    /// Registration-owned strip for the pack bulk index: collect the
+    /// linkage-visible feed from the WHOLE analysis, evict the requested
+    /// axes, then register the stripped arc — the feeds can never read an
+    /// already-emptied `symbols`. Returns the stored arc (the worker sends
+    /// it to the persist writer).
+    /// The pack feed half, computed on the WHOLE analysis pre-strip: the
+    /// linkage-visible (name, is-class) pairs plus the specialization
+    /// edges, in the exact shape `register_symbols_inner` consumes.
+    pub(crate) fn prepare_pack_feed(
+        fa: &FileAnalysis,
+    ) -> (Vec<(String, bool)>, Vec<(String, String)>) {
+        let feed = collect_linkage_feed(fa);
+        let specs: Vec<(String, String)> =
+            fa.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        (feed, specs)
+    }
+
+    /// The Perl-workspace twin of `prepare_pack_parts`: the name feed and
+    /// the surface project from the WHOLE analysis, THEN the requested axes
+    /// evict, then the arc is minted. `register_workspace_stripping` and the
+    /// fresh workspace worker both route here so the reads-whole-before-
+    /// evict ordering has one speller per tier.
+    pub(crate) fn prepare_workspace_parts(
+        &self,
+        mut fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> WorkspaceRegistrationParts {
+        let module_name = self.workspace_feed_prestrip(&fa);
+        let surface = crate::surface::Surface::project(&fa);
+        fa.evict_axes(strip_bag, strip_rows);
+        WorkspaceRegistrationParts { arc: Arc::new(fa), module_name, surface }
+    }
+
+    /// The ONE speller of the pack strip ordering: feed + specs + surface
+    /// project from the WHOLE analysis, THEN the requested axes evict, then
+    /// the arc is minted. Every pack registration that strips (bulk warm,
+    /// fresh worker, edit swap) routes here so the "reads-whole-before-
+    /// evict" invariant can't drift between separately-spelled copies —
+    /// and the stub encoder gets exactly the halves registration used.
+    pub(crate) fn prepare_pack_parts(
+        mut fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> PackRegistrationParts {
+        let (feed, specs) = Self::prepare_pack_feed(&fa);
+        let surface = crate::surface::Surface::project(&fa);
+        fa.evict_axes(strip_bag, strip_rows);
+        PackRegistrationParts { arc: Arc::new(fa), feed, specs, surface }
+    }
+
+    pub fn register_symbols_stripping(
+        &self,
+        path: std::path::PathBuf,
+        fa: FileAnalysis,
+        strip_bag: bool,
+        strip_rows: bool,
+    ) -> Arc<FileAnalysis> {
+        let parts = Self::prepare_pack_parts(fa, strip_bag, strip_rows);
+        let _ = self.record_surface_value(&path, parts.surface);
+        self.register_symbols_inner(path, parts.arc.clone(), &parts.feed, &parts.specs);
+        parts.arc
+    }
+
+    pub(crate) fn register_symbols_inner(
+        &self,
+        path: std::path::PathBuf,
+        analysis: Arc<FileAnalysis>,
+        feed: &[(String, bool)],
+        specializes: &[(String, String)],
+    ) {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
+        // The registration record FIRST — before all_files/all_defs/cache
+        // publish this (possibly symbol-stripped) copy: a concurrent
+        // registration's tie-break consults the record via
+        // `module_defines_class`, and the fallback symbol scan on a
+        // stripped copy misjudges every Class as a value.
+        self.registered_names.insert(cached.path.clone(), feed.to_vec());
         // Unconditional: even a file declaring nothing registrable (an
         // include-only shim) must be reachable by whole-project sweeps.
         self.all_files.insert(cached.path.clone(), cached.clone());
-        for sym in &analysis.symbols {
-            // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
-            // the same predicate completion gathering uses, so every name
-            // registered here is also offerable and vice versa.
-            if !analysis.is_linkage_visible(sym) {
-                continue;
-            }
-            self.workspace_modules.insert(sym.name.clone(), ());
+        for (name, is_class) in feed {
+            let sym_name = name;
+            let incoming_is_class = *is_class;
+            self.workspace_modules.insert(sym_name.clone(), ());
             // Keep EVERY candidate for `name` (not just the winner below), so a
             // scoped query can pick the one reachable from its include closure.
             // Keyed by path: a re-registered file (edit, or prototype→definition)
             // REPLACES its own candidate so the scoped lookup never serves a
             // stale analysis, and duplicate paths never stack.
             {
-                let mut v = self.all_defs.entry(sym.name.clone()).or_default();
+                let mut v = self.all_defs.entry(sym_name.clone()).or_default();
                 match v.iter().position(|c| c.path == cached.path) {
                     Some(i) => v[i] = cached.clone(),
                     None => v.push(cached.clone()),
@@ -946,9 +1734,8 @@ impl ModuleIndex {
             // per-process (the Rayon index registers in nondeterministic
             // order). Break the tie by the smallest canonical path — a
             // stable, order-independent choice.
-            let incoming_is_class = matches!(sym.kind, SymKind::Class);
             use dashmap::mapref::entry::Entry;
-            match self.cache.entry(sym.name.clone()) {
+            match self.cache.entry(sym_name.clone()) {
                 Entry::Vacant(v) => {
                     v.insert(Some(cached.clone()));
                 }
@@ -957,7 +1744,7 @@ impl ModuleIndex {
                         None => true,
                         Some(existing) => {
                             let existing_is_class =
-                                module_defines_class(existing, &sym.name);
+                                self.module_defines_class(existing, sym_name);
                             match (incoming_is_class, existing_is_class) {
                                 (true, false) => true,  // Class beats Sub/value
                                 (false, true) => false, // Sub/value never beats a Class
@@ -978,7 +1765,7 @@ impl ModuleIndex {
         // pack index uses. A stale entry (edited file dropped a spec)
         // self-heals at read: `direct_specializations_of` re-checks the pair
         // against the CURRENT analysis.
-        for (spec, primary) in &analysis.specializes {
+        for (spec, primary) in specializes {
             let mut v = self.edges.specs.entry(primary.clone()).or_default();
             if !v.iter().any(|m| m == spec) {
                 v.push(spec.clone());
@@ -995,37 +1782,47 @@ impl ModuleIndex {
     /// don't linger).
     pub fn unregister_file(&self, path: &std::path::Path) {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let Some((_, old)) = self.all_files.remove(&canon) else { return };
-        for sym in &old.analysis.symbols {
-            if !old.analysis.is_linkage_visible(sym) {
-                continue;
-            }
-            if let Some(mut v) = self.all_defs.get_mut(&sym.name) {
+        if self.all_files.remove(&canon).is_none() {
+            return;
+        }
+        // Symbols may be evicted on the resident copy, and rehydration
+        // would fetch the WRONG generation after an edit persists — so the
+        // inverse runs on the name list registration recorded, not on
+        // `old.analysis.symbols`.
+        let names = self
+            .registered_names
+            .remove(&canon)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
+        for (name, _) in &names {
+            if let Some(mut v) = self.all_defs.get_mut(name) {
                 v.retain(|c| c.path != canon);
             }
-            self.all_defs.remove_if(&sym.name, |_, v| v.is_empty());
+            self.all_defs.remove_if(name, |_, v| v.is_empty());
             let survivor = self
                 .all_defs
-                .get(&sym.name)
-                .and_then(|v| best_candidate(&v.iter().collect::<Vec<_>>(), &sym.name));
+                .get(name)
+                .and_then(|v| best_candidate(&v.iter().collect::<Vec<_>>(), name, &|m, n| {
+                    self.module_defines_class(m, n)
+                }));
             // Only touch the cache slot if the departing file held it.
             let held = self
                 .cache
-                .get(&sym.name)
+                .get(name)
                 .map(|e| matches!(e.value(), Some(c) if c.path == canon))
                 .unwrap_or(false);
             if held {
                 match survivor {
                     Some(cand) => {
-                        self.cache.insert(sym.name.clone(), Some(cand));
+                        self.cache.insert(name.clone(), Some(cand));
                     }
                     None => {
-                        self.cache.remove(&sym.name);
+                        self.cache.remove(name);
                     }
                 }
             }
-            if !self.all_defs.contains_key(&sym.name) {
-                self.workspace_modules.remove(&sym.name);
+            if !self.all_defs.contains_key(name) {
+                self.workspace_modules.remove(name);
             }
         }
     }
@@ -1033,6 +1830,22 @@ impl ModuleIndex {
     /// Every file registered via `register_symbols` — the reverse-dependency
     /// sweep surface (a changed header's consumers are the registered files
     /// whose `include_closure` contains it).
+    /// The residency tripwire's observable: fully-resident registered
+    /// copies. After a bulk index with eviction on, every one of these must
+    /// be accounted for by a deliberate whole-copy site (writer fallback,
+    /// degraded/unpersisted analysis) — an unexplained count means a
+    /// registration path is silently pinning whole analyses (the RAM
+    /// regression no functional test can see).
+    pub fn count_fully_resident(&self) -> usize {
+        let mut n = 0usize;
+        self.for_each_registered_file(&mut |cm| {
+            if cm.analysis.is_fully_resident() {
+                n += 1;
+            }
+        });
+        n
+    }
+
     pub fn for_each_registered_file(&self, f: &mut dyn FnMut(&Arc<CachedModule>)) {
         for entry in self.all_files.iter() {
             f(entry.value());
@@ -1197,9 +2010,14 @@ impl ModuleIndex {
         // file's first `package` can differ.
         mut visit: impl FnMut(&str, &Arc<CachedModule>, &crate::file_analysis::Symbol),
     ) {
+        use crate::file_analysis::CrossFileLookup;
         for mod_name in self.modules_bridging_to(class_name) {
             let Some(cached) = self.get_cached(&mod_name) else { continue };
-            for ns in &cached.analysis.plugin_namespaces {
+            // Entities index into `symbols`, which may be evicted on the
+            // resident copy — resolve them against the whole view (same
+            // generation: the LRU is invalidated on every rewrite).
+            let whole = self.whole_present(&cached);
+            for ns in &whole.plugin_namespaces {
                 let bridges_class = ns.bridges.iter().any(|b|
                     matches!(b, crate::file_analysis::Bridge::Class(c) if c == class_name));
                 if !bridges_class { continue; }
@@ -1211,7 +2029,7 @@ impl ModuleIndex {
                 // per-bridge Method fan-out is needed.
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
-                    let Some(sym) = cached.analysis.symbols.get(idx) else { continue };
+                    let Some(sym) = whole.symbols.get(idx) else { continue };
                     visit(&mod_name, &cached, sym);
                 }
             }
@@ -1282,24 +2100,60 @@ impl CrossFileLookup for ModuleIndex {
         self.get_cached_scoped(module_name, visible)
     }
 
+    fn refs_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if !cached.analysis.refs_are_evicted() {
+            return cached.analysis.clone();
+        }
+        self.rehydrate_or_resident(cached)
+    }
+
+    fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if cached.analysis.is_fully_resident() {
+            return cached.analysis.clone();
+        }
+        self.rehydrate_or_resident(cached)
+    }
+
+    fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
+        self.with_rows_conn(|conn| {
+            crate::module_cache::ref_candidate_files(conn, keys)
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn cached_by_path(&self, path: &std::path::Path) -> Option<Arc<CachedModule>> {
+        // Pack sub-indexes: the per-path registry is O(1). The Perl hub's
+        // cache is name-keyed with unique paths — linear fallback (hub
+        // candidate sets are @INC-sized, not tree-sized).
+        if let Some(cm) = self.all_files.get(path) {
+            return Some(cm.value().clone());
+        }
+        self.cache.iter().find_map(|entry| {
+            entry
+                .value()
+                .as_ref()
+                .filter(|cm| cm.path == path)
+                .cloned()
+        })
+    }
+
+    fn enriched_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        if !self.long_lived.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.bag_present(cached);
+        }
+        self.enriched_snapshot(cached)
+            .unwrap_or_else(|| self.bag_present(cached))
+    }
     fn bag_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        // Never-evicted copy (open docs, Perl hub, degraded pack files kept
-        // whole): a cheap Arc bump, no I/O.
+        // Never-evicted copy (open docs, degraded files kept whole): a cheap
+        // Arc bump, no I/O.
         if !cached.analysis.bag_is_evicted() {
             return cached.analysis.clone();
         }
-        // A pack cross-file type query threads the PACK sub-index as its
-        // `module_index` (it owns `visibility_scope`), so `self.bag_cache` is
-        // the right one. Rehydrate the exact persisted bag; on a miss (no row /
-        // decode failure) degrade to the bag-less resident copy rather than
-        // fabricate — the type query then returns None, as it would pre-Slice-2
-        // for a genuinely bag-less file.
-        if let Some(bc) = &self.bag_cache {
-            if let Some(full) = bc.bag_for(&cached.path) {
-                return full;
-            }
-        }
-        cached.analysis.clone()
+        self.rehydrate_or_resident(cached)
     }
 
     fn parents_cached(&self, module_name: &str) -> Vec<String> {

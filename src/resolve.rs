@@ -312,7 +312,7 @@ fn attr_group_via_ancestors(
             .filter(ok)
             .or_else(|| {
                 idx.get_cached(c)
-                    .and_then(|cc| cc.analysis.field_projections_named(bare, c))
+                    .and_then(|cc| idx.whole_present(&cc).field_projections_named(bare, c))
                     .filter(ok)
             })
     };
@@ -348,11 +348,12 @@ fn attr_group_via_ancestors(
         }
     }
     let cached = idx.get_cached(&defining)?;
-    let p = cached.analysis.field_projections_named(bare, &defining)?;
+    let whole = idx.whole_present(&cached);
+    let p = whole.field_projections_named(bare, &defining)?;
     if !ok(&p) {
         return None;
     }
-    Some(group_from_projections(p, &cached.analysis, Some(cached.path.clone()), Some(idx)))
+    Some(group_from_projections(p, &whole, Some(cached.path.clone()), Some(idx)))
 }
 
 /// Cursor → cross-file target with the default override scope. Production
@@ -594,16 +595,17 @@ pub fn resolve_symbol_scoped(
                 None if names_visible_macro(&r.target_name, analysis, module_index) => {
                     Some(None)
                 }
-                None => module_index
-                    .and_then(|idx| idx.get_cached(&r.target_name))
-                    .and_then(|cached| {
-                        cached
-                            .analysis
-                            .symbols
-                            .iter()
-                            .filter(|s| s.name == r.target_name)
-                            .find_map(|s| class_or_value(&cached.analysis, s))
-                    }),
+                None => module_index.and_then(|idx| {
+                    let cached = idx.get_cached(&r.target_name)?;
+                    // Whole view: the class-content / file-scope shape tests
+                    // walk symbols, which the resident copy may have evicted.
+                    let whole = idx.whole_present(&cached);
+                    whole
+                        .symbols
+                        .iter()
+                        .filter(|s| s.name == r.target_name)
+                        .find_map(|s| class_or_value(&whole, s))
+                }),
             };
             match resolved {
                 Some(Some((class, bare))) => {
@@ -1045,8 +1047,10 @@ impl<'a> CandidateSet<'a> {
                 if matches!(sym.kind, SymKind::Class) {
                     let enum_name = sym.name.clone();
                     idx.for_each_cached_file(&mut |cached| {
-                        for span in cached
-                            .analysis
+                        // `resolve_enumerator_enum`'s local arm reads the
+                        // copy's own symbols — take the whole view.
+                        for span in idx
+                            .whole_present(cached)
                             .field_sites_for_enum(&enum_name, Some(idx))
                         {
                             out.push(RefLocation {
@@ -1138,7 +1142,7 @@ impl<'a> CandidateSet<'a> {
         // Class-keyed cached module — the fast path when `class` names a
         // struct/class/enum that is itself a cache key.
         if let Some(cached) = idx.get_cached(class) {
-            if let Some(span) = member_span_in(&cached.analysis) {
+            if let Some(span) = member_span_in(&idx.whole_present(&cached)) {
                 return loc_of(&cached, span);
             }
         }
@@ -1149,7 +1153,7 @@ impl<'a> CandidateSet<'a> {
         let connected = |cached: &crate::file_analysis::CachedModule| {
             let p = cached.path.to_string_lossy();
             visible.contains(p.as_ref())
-                || cached.analysis.include_closure.iter().any(|c| *c == self_str)
+                || cached.analysis.include_closure.contains(&self_str)
         };
         // Name-indexed def candidates first (a File-scope member the index
         // registered) — the cheap subset, path-sorted for determinism.
@@ -1160,7 +1164,7 @@ impl<'a> CandidateSet<'a> {
                 if !connected(&cached) {
                     continue;
                 }
-                if let Some(span) = member_span_in(&cached.analysis) {
+                if let Some(span) = member_span_in(&idx.whole_present(&cached)) {
                     return loc_of(&cached, span);
                 }
             }
@@ -1177,7 +1181,9 @@ impl<'a> CandidateSet<'a> {
             if !connected(cached) || Url::from_file_path(&cached.path).is_err() {
                 return;
             }
-            if let Some(span) = member_span_in(&cached.analysis) {
+            // Broad scan, cold tail only (both keyed lookups missed) — the
+            // rehydration LRU bounds the per-file cost for evicted copies.
+            if let Some(span) = member_span_in(&idx.whole_present(cached)) {
                 let p = cached.path.to_string_lossy().into_owned();
                 if hit.as_ref().is_none_or(|(hp, _)| p < *hp) {
                     hit = Some((p, span));
@@ -1293,17 +1299,13 @@ impl<'a> CandidateSet<'a> {
                     }
                     let p = cached.path.to_string_lossy().into_owned();
                     let connected = visible.contains(&p)
-                        || cached.analysis.include_closure.iter().any(|c| *c == self_str);
+                        || cached.analysis.include_closure.contains(&self_str);
                     if !connected {
                         continue;
                     }
                     let key = FileKey::Path(cached.path.clone());
-                    for s in cached
-                        .analysis
-                        .symbols
-                        .iter()
-                        .filter(|s| cand_is_def(&cached.analysis, s))
-                    {
+                    let whole = idx.whole_present(&cached);
+                    for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
                         push(&mut defs, &key, s.selection_span);
                     }
                 }
@@ -1423,13 +1425,14 @@ impl<'a> CandidateSet<'a> {
         if let Some(p) = &pkg {
             if let Some(cached) = idx.get_cached(p) {
                 let key = FileKey::Path(cached.path.clone());
-                for s in cached.analysis.symbols.iter().filter(|s| {
+                let whole = idx.whole_present(&cached);
+                for s in whole.symbols.iter().filter(|s| {
                     s.name == name
                         && matches!(s.kind, SymKind::Sub | SymKind::Method)
                         && pkg_ok(s.package.as_deref())
                 }) {
                     let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
-                    push(owner_matched(s.package.as_deref()), fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                    push(owner_matched(s.package.as_deref()), fit, has_body(&whole, s), false, &key, s.selection_span, &mut cands);
                 }
             }
         }
@@ -1446,18 +1449,19 @@ impl<'a> CandidateSet<'a> {
                 }
                 let p = cached.path.to_string_lossy().into_owned();
                 let connected = visible.contains(&p)
-                    || cached.analysis.include_closure.iter().any(|c| *c == self_str);
+                    || cached.analysis.include_closure.contains(&self_str);
                 if !connected {
                     continue;
                 }
                 let key = FileKey::Path(cached.path.clone());
-                for s in cached.analysis.symbols.iter().filter(|s| {
+                let whole = idx.whole_present(&cached);
+                for s in whole.symbols.iter().filter(|s| {
                     s.name == name
                         && matches!(s.kind, SymKind::Sub | SymKind::Method)
                         && pkg_ok(s.package.as_deref())
                 }) {
                     let fit = s.param_arity().map(|a| a.fit(argc)).unwrap_or(0);
-                    push(owner_matched(s.package.as_deref()), fit, has_body(&cached.analysis, s), false, &key, s.selection_span, &mut cands);
+                    push(owner_matched(s.package.as_deref()), fit, has_body(&whole, s), false, &key, s.selection_span, &mut cands);
                 }
             }
         }
@@ -1761,7 +1765,9 @@ impl<'a> CandidateSet<'a> {
                         // name. One hop to it whenever known: landing on the
                         // consumer's `use` line was never the goal.
                         let def_line = defining.and_then(|cached| {
-                            cached.sub_info(&remote_name).map(|s| s.def_line())
+                            idx.whole_present(&cached)
+                                .sub_info_view(&remote_name)
+                                .map(|s| s.def_line())
                         });
                         if let Some(line) = def_line {
                             return vec![line_loc(module_path, line)];
@@ -1785,7 +1791,11 @@ impl<'a> CandidateSet<'a> {
                     let bare = r.unqualified_target_name();
                     if let Some(cached) = idx.get_cached(pkg) {
                         if Url::from_file_path(&cached.path).is_ok() {
-                            match cached.sub_info(bare).map(|s| s.def_line()) {
+                            match idx
+                                .whole_present(&cached)
+                                .sub_info_view(bare)
+                                .map(|s| s.def_line())
+                            {
                                 Some(line) => return vec![line_loc(cached.path.clone(), line)],
                                 // Fail safe for a pack `Scope::member` miss: the
                                 // owner-anchored member lookup already ran (and
@@ -1813,7 +1823,9 @@ impl<'a> CandidateSet<'a> {
             if let Some((pkg, name)) = r.qualified_var_target() {
                 if let Some(cached) = idx.get_cached(pkg) {
                     if Url::from_file_path(&cached.path).is_ok() {
-                        if let Some(def_line) = cached.package_var_def_line(&name, pkg) {
+                        if let Some(def_line) =
+                            idx.whole_present(&cached).package_var_def_line(&name, pkg)
+                        {
                             return vec![line_loc(cached.path.clone(), def_line)];
                         }
                     }
@@ -1831,8 +1843,8 @@ impl<'a> CandidateSet<'a> {
             if matches!(r.kind, RefKind::PackageRef) {
                 if let Some(cached) = idx.get_cached(&r.target_name) {
                     if Url::from_file_path(&cached.path).is_ok() {
-                        let span = cached
-                            .analysis
+                        let whole = idx.whole_present(&cached);
+                        let span = whole
                             .symbols
                             .iter()
                             .find(|s| {
@@ -1849,10 +1861,10 @@ impl<'a> CandidateSet<'a> {
                             // file top. Pack-only structural gates; Perl module
                             // lookups keep the file-top fallback.
                             .or_else(|| {
-                                cached.analysis.symbols.iter().find(|s| {
+                                whole.symbols.iter().find(|s| {
                                     s.name == r.target_name
-                                        && (cached.analysis.symbol_is_class_content(s)
-                                            || cached.analysis.symbol_is_file_scope_value(s))
+                                        && (whole.symbol_is_class_content(s)
+                                            || whole.symbol_is_file_scope_value(s))
                                 })
                             })
                             .map(|s| s.selection_span)
@@ -1916,7 +1928,8 @@ impl<'a> CandidateSet<'a> {
                         // either way.
                         let module = def_module.as_deref().unwrap_or(class);
                         if let Some(cached) = idx.get_cached(module) {
-                            if let Some(sub_info) = cached.sub_info(method) {
+                            let whole = idx.whole_present(&cached);
+                            if let Some(sub_info) = whole.sub_info_view(method) {
                                 if Url::from_file_path(&cached.path).is_ok() {
                                     return vec![line_loc(
                                         cached.path.clone(),
@@ -1926,13 +1939,13 @@ impl<'a> CandidateSet<'a> {
                             }
                             // cpp data field (or enum constant): a
                             // Variable/Field/Enumerator member, not a sub.
-                            if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                            if let Some(sym) = whole.symbols.iter().find(|s| {
                                 matches!(
                                     s.kind,
                                     SymKind::Variable | SymKind::Field | SymKind::Enumerator
                                 ) && s.name == method
                                     && s.package.as_deref() == Some(class.as_str())
-                                    && cached.analysis.symbol_is_class_content(s)
+                                    && whole.symbol_is_class_content(s)
                             }) {
                                 if Url::from_file_path(&cached.path).is_ok() {
                                     return vec![RefLocation {
@@ -1967,7 +1980,8 @@ impl<'a> CandidateSet<'a> {
             if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
                 let name = r.unqualified_target_name();
                 if let Some(cached) = idx.get_cached(name) {
-                    if let Some(sym) = cached.analysis.symbols.iter().find(|s| {
+                    let whole = idx.whole_present(&cached);
+                    if let Some(sym) = whole.symbols.iter().find(|s| {
                         s.name == name
                             && matches!(s.kind, SymKind::Sub | SymKind::Variable | SymKind::Enumerator)
                     }) {
@@ -1982,7 +1996,7 @@ impl<'a> CandidateSet<'a> {
                                     rewritable: true,
                                     label: None,
                                 },
-                                &cached.analysis,
+                                &whole,
                             );
                         }
                     }
@@ -2021,8 +2035,8 @@ impl<'a> CandidateSet<'a> {
             return Some(self.origin_decl(sym.selection_span));
         }
         let cached = idx.get_cached(type_name)?;
-        let sym = cached
-            .analysis
+        let whole = idx.whole_present(&cached);
+        let sym = whole
             .symbols
             .iter()
             .find(|s| s.name == type_name && wanted(&s.kind))?;
@@ -2087,16 +2101,29 @@ impl<'a> CandidateSet<'a> {
             if mask.contains(RoleMask::DEPENDENCY) && !self.origin.include_closure.is_empty() {
                 if let Some(idx) = self.module_index {
                     let visible: std::collections::HashSet<String> =
-                        self.origin.include_closure.iter().cloned().collect();
+                        self.origin.include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
+                    // Many candidate names come from the same header —
+                    // resolve each FILE's whole view once per request, not
+                    // once per name (the LRU absorbs misses, but even hits
+                    // pay a map probe + recency write).
+                    let mut whole_memo: std::collections::HashMap<
+                        PathBuf,
+                        std::sync::Arc<crate::file_analysis::FileAnalysis>,
+                    > = std::collections::HashMap::new();
                     for (name, cached) in idx.visible_defs_with_prefix(prefix, &visible) {
                         // Only linkage-visible defs (a TU-static never
-                        // completes elsewhere).
-                        let Some(sym) = cached
-                            .analysis
+                        // completes elsewhere). Symbol detail (kind, parent
+                        // enum) reads the whole view — the resident copy may
+                        // be symbol-evicted.
+                        let whole = whole_memo
+                            .entry(cached.path.clone())
+                            .or_insert_with(|| idx.whole_present(&cached))
+                            .clone();
+                        let Some(sym) = whole
                             .symbols_named(&name)
                             .iter()
-                            .map(|id| cached.analysis.symbol(*id))
-                            .find(|s| cached.analysis.is_linkage_visible(s))
+                            .map(|id| whole.symbol(*id))
+                            .find(|s| whole.is_linkage_visible(s))
                         else {
                             continue;
                         };
@@ -2323,13 +2350,16 @@ impl<'a> CandidateSet<'a> {
                 module_index.for_each_cached_file(&mut |cached| {
                     let p = cached.path.to_string_lossy();
                     let connected = visible.contains(p.as_ref())
-                        || cached.analysis.include_closure.iter().any(|c| *c == self_str);
+                        || cached.analysis.include_closure.contains(&self_str);
                     if !connected {
                         return;
                     }
                     let header =
                         cached.path.file_name().map(|f| f.to_string_lossy().into_owned());
-                    gather(&cached.analysis, header.as_deref(), &mut seen, &mut out);
+                    // The gather reads symbols — closure-connected copies may
+                    // be symbol-evicted; the LRU bounds the rehydration.
+                    let whole = module_index.whole_present(cached);
+                    gather(&whole, header.as_deref(), &mut seen, &mut out);
                 });
             }
         }
@@ -2372,8 +2402,9 @@ fn import_candidates(
             if !mask.contains(RoleMask::OPEN) {
                 continue;
             }
+            let whole = cached.as_ref().map(|c| idx.bag_present(c));
             let detail =
-                completion_detail_for_import(is.remote(), cached.as_deref(), &import.module_name);
+                completion_detail_for_import(is.remote(), whole.as_deref(), &import.module_name);
             out.push(CompletionCandidate {
                 label: local.clone(),
                 kind: FaSymKind::Sub,
@@ -2412,8 +2443,9 @@ fn import_candidates(
                     continue;
                 }
 
-                let rt_prefix = cached
-                    .sub_info(name)
+                let rt_prefix = idx
+                    .whole_present(cached)
+                    .sub_info_view(name)
                     .and_then(|s| s.return_type(None))
                     .map(|rt| format!("→ {} ", format_inferred_type(&rt)))
                     .unwrap_or_default();
@@ -2508,12 +2540,14 @@ fn unimported_export_candidates(
 
 fn completion_detail_for_import(
     name: &str,
-    cached: Option<&crate::file_analysis::CachedModule>,
+    // The bag-present analysis (`idx.bag_present`) — return types read the
+    // bag, and the resident index copy may be evicted.
+    whole: Option<&crate::file_analysis::FileAnalysis>,
     module_name: &str,
 ) -> String {
     use crate::file_analysis::format_inferred_type;
-    if let Some(cached) = cached {
-        if let Some(sub_info) = cached.sub_info(name) {
+    if let Some(whole) = whole {
+        if let Some(sub_info) = whole.sub_info_view(name) {
             if let Some(rt) = sub_info.return_type(None) {
                 return format!("→ {} ({})", format_inferred_type(&rt), module_name);
             }
@@ -2536,7 +2570,8 @@ fn dispatch_handler_locations(
     let mut locs: Vec<RefLocation> = Vec::new();
     for module_name in module_index.modules_with_symbol(name) {
         let Some(cached) = module_index.get_cached(&module_name) else { continue };
-        for sym in &cached.analysis.symbols {
+        let whole = module_index.whole_present(&cached);
+        for sym in &whole.symbols {
             if sym.name != name {
                 continue;
             }
@@ -2648,7 +2683,7 @@ pub(crate) fn resolve_imported_function_classified<'b>(
 /// path to jump to. Returns the matched Import, the module's path, and the
 /// REMOTE name (the sub's actual name in the source module — differs from the
 /// caller's `func_name` only for renaming imports like `del` → `delete`).
-/// Callers use the remote name for `cached.sub_info(...)` lookups so
+/// Callers use the remote name for whole-view `sub_info_view(...)` lookups so
 /// hover/gd/sig-help reach the real sub.
 pub(crate) fn resolve_imported_function<'b>(
     analysis: &'b FileAnalysis,
@@ -2964,6 +2999,54 @@ pub fn group_rename_edits(
     out
 }
 
+/// Per-process override for the relational retrieval switch — the parity
+/// harness toggles this between two projections of one set (an env write
+/// there would race other threads reading the env). 0 = defer to the env.
+static REF_ROWS_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_ref_rows_override(on: Option<bool>) {
+    REF_ROWS_OVERRIDE.store(
+        match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The relational retrieval switch (`docs/adr/relational-ref-index.md`).
+/// ON by default — resident index copies are refs-evicted after persist, so
+/// the SQL retrieval IS the reference path for them. `PERL_LSP_REF_ROWS=0`
+/// forces the resident-only walk (pair it with PERL_LSP_NO_EVICT=1, or
+/// evicted-file sites vanish — the parity harness runs exactly that pairing).
+fn ref_rows_enabled() -> bool {
+    match REF_ROWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    match std::env::var("PERL_LSP_REF_ROWS") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// The name keys the relational retrieval probes for `target`: the target
+/// name's match key plus every delegation alias's — the same
+/// `name_match_key` spelling rows are written under, so retrieval is exactly
+/// as generous as the matcher's name checks.
+fn retrieval_keys(target: &TargetRef, aliases: &[DelegationAlias]) -> Vec<String> {
+    let mut keys = vec![crate::file_analysis::name_match_key(&target.name)];
+    for a in aliases {
+        let k = crate::file_analysis::name_match_key(&a.name);
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
 /// Collect every reference to `target` across the masked file set.
 ///
 /// - `files`   — open + workspace store
@@ -2990,18 +3073,19 @@ pub fn refs_to(
     // union of the direct seers' closures; membership is the reverse edge.
     // Empty def_paths (no gate — every Perl target) skips the sweep.
     let mut seen_by_inclusion: std::collections::HashSet<String> = Default::default();
+    let target_def_ids = def_path_ids(target);
     if !target.def_paths.is_empty() {
         if let Some(idx) = module_index {
             idx.for_each_cached_file(&mut |cached| {
                 let own = cached.path.to_string_lossy();
-                if file_sees_target(target, &cached.analysis, &own) {
-                    seen_by_inclusion.extend(cached.analysis.include_closure.iter().cloned());
+                if file_sees_target_ids(target, &target_def_ids, &cached.analysis, &own) {
+                    seen_by_inclusion.extend(cached.analysis.include_closure.iter_strs().map(|a| a.as_ref().to_owned()));
                 }
             });
         }
     }
     let gate = |analysis: &FileAnalysis, file_str: &str| {
-        file_sees_target(target, analysis, file_str)
+        file_sees_target_ids(target, &target_def_ids, analysis, file_str)
             || seen_by_inclusion.contains(file_str)
     };
 
@@ -3011,10 +3095,16 @@ pub fn refs_to(
         files.for_each_open(|url, doc| {
             let url = url.clone();
             if let Ok(p) = url.to_file_path() {
+                // Claim the canonical spelling too: candidate rows are keyed
+                // canonical, and an open doc reached through a symlinked
+                // root must shadow its own persisted generation.
+                if let Ok(canon) = std::fs::canonicalize(&p) {
+                    covered_paths.insert(canon);
+                }
                 covered_paths.insert(p);
             }
             // The walk applies visibility: role mask picked the tier, the
-            // closure gate decides per file (`file_sees_target`); the
+            // closure gate decides per file (`file_sees_target_ids`); the
             // matcher below only matches.
             let key = FileKey::Url(url);
             let file_str = canonical_file_str(&key);
@@ -3028,9 +3118,73 @@ pub fn refs_to(
         // doesn't duplicate them (an open file's pre-close state isn't meaningful).
         files.for_each_open(|url, _doc| {
             if let Ok(p) = url.to_file_path() {
+                if let Ok(canon) = std::fs::canonicalize(&p) {
+                    covered_paths.insert(canon);
+                }
                 covered_paths.insert(p);
             }
         });
+    }
+
+    // Relational retrieval (`docs/adr/relational-ref-index.md`): the files
+    // holding name-keyed candidate rows, rehydrated (`refs_present`) and run
+    // through the SAME matcher as every resident copy. Runs BEFORE the
+    // resident sweep and claims `covered_paths`, so each file is collected
+    // from its best copy exactly once; the sweep behind it still contributes
+    // declaration-only files and files without rows (degraded, persistence
+    // off, mid-index lag) — composition stays at-least-as-complete whether
+    // or not resident refs were evicted.
+    if ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY) {
+        if let Some(idx) = module_index {
+            let keys = retrieval_keys(target, &aliases);
+            for path in idx.ref_candidate_paths(&keys) {
+                if covered_paths.contains(&path) {
+                    continue;
+                }
+                // Tier attribution: a FileStore workspace entry rides the
+                // WORKSPACE role (Perl project files); everything else the
+                // rows name lives in a module-index tier (DEPENDENCY —
+                // @INC and the pack caches). The mask must admit the
+                // candidate's OWN tier, or an EDITABLE rename would walk
+                // read-only deps (and vice versa).
+                let ws_arc = files
+                    .workspace_raw()
+                    .get(&path)
+                    .map(|e| std::sync::Arc::clone(e.value()));
+                let cached = match ws_arc {
+                    Some(arc) => {
+                        if !mask.contains(RoleMask::WORKSPACE) {
+                            continue;
+                        }
+                        std::sync::Arc::new(crate::file_analysis::CachedModule::new(
+                            path.clone(),
+                            arc,
+                        ))
+                    }
+                    None => {
+                        if !mask.contains(RoleMask::DEPENDENCY) {
+                            continue;
+                        }
+                        match idx.cached_by_path(&path) {
+                            Some(cm) => cm,
+                            None => continue,
+                        }
+                    }
+                };
+                covered_paths.insert(path);
+                let key = FileKey::Path(cached.path.clone());
+                let file_str = canonical_file_str(&key);
+                if !gate(&cached.analysis, &file_str) {
+                    continue;
+                }
+                // The matcher reads refs (usage sites) AND symbols
+                // (declaration sites) — take the whole view.
+                let full = idx.whole_present(&cached);
+                collect_from_analysis(
+                    &key, &full, target, &aliases, module_index, &file_str, &mut out,
+                );
+            }
+        }
     }
 
     // Workspace files.
@@ -3064,7 +3218,11 @@ pub fn refs_to(
                 if !gate(&cached.analysis, &file_str) {
                     return;
                 }
-                collect_from_analysis(&key, &cached.analysis, target, &aliases, module_index, &file_str, &mut out);
+                // Rows-off fallback sweep: copies here may still be
+                // symbol-evicted (rows exist, retrieval switched off) —
+                // the matcher needs symbols, so take the whole view.
+                let full = idx.whole_present(cached);
+                collect_from_analysis(&key, &full, target, &aliases, module_index, &file_str, &mut out);
             });
         }
     }
@@ -3136,7 +3294,7 @@ pub fn implementations_of(
         } else {
             for m in idx.modules_with_symbol(pkg) {
                 if let Some(c) = idx.get_cached(&m) {
-                    let declares = c.analysis.symbols.iter().any(|s| {
+                    let declares = idx.whole_present(&c).symbols.iter().any(|s| {
                         matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
                     });
                     if declares {
@@ -3154,7 +3312,8 @@ pub fn implementations_of(
             if is_marker {
                 continue;
             }
-            for s in &cached.analysis.symbols {
+            let whole = idx.whole_present(&cached);
+            for s in &whole.symbols {
                 if s.name == target.name
                     && matches!(s.kind, SymKind::Sub | SymKind::Method)
                     && s.package.as_deref() == Some(pkg.as_str())
@@ -3214,7 +3373,8 @@ fn specialization_family(
         // keys everything on — every file defining this spec spelling.
         let Some(idx) = module_index else { continue };
         for cached in idx.def_candidates(spec) {
-            for s in &cached.analysis.symbols {
+            let whole = idx.whole_present(&cached);
+            for s in &whole.symbols {
                 if &s.name == spec && matches!(s.kind, SymKind::Class) {
                     out.push(RefLocation {
                         key: FileKey::Path(cached.path.clone()),
@@ -3650,9 +3810,10 @@ fn pack_symbol_def_location(
         if !seen_paths.insert(cached.path.clone()) {
             continue;
         }
-        for sym in cached.analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+        let whole = module_index.whole_present(&cached);
+        for sym in whole.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
             candidates.push((
-                has_body(&cached.analysis, sym),
+                has_body(&whole, sym),
                 false,
                 cached.path.clone(),
                 sym.selection_span.start.row,
@@ -3981,11 +4142,44 @@ pub fn references_mask_for(
             found_in_editable = true;
         }
     });
+    // Workspace copies may be symbol-evicted (an empty vec here is "on
+    // disk", not "declares nothing") — the resident scan covers whole
+    // copies; evicted ones are checked via the row-store candidate filter
+    // below (a couple of rehydrations, never a whole-tree decode).
     if !found_in_editable {
         for entry in files.workspace_raw().iter() {
+            if entry.value().symbols_are_evicted() {
+                continue;
+            }
             if entry.value().symbols.iter().any(|s| symbol_defines_target(s, target, entry.value())) {
                 found_in_editable = true;
                 break;
+            }
+        }
+    }
+    if !found_in_editable {
+        if let Some(idx) = module_index {
+            let keys = retrieval_keys(target, &[]);
+            for path in idx.ref_candidate_paths(&keys) {
+                let Some(arc) = files
+                    .workspace_raw()
+                    .get(&path)
+                    .map(|e| std::sync::Arc::clone(e.value()))
+                else {
+                    continue;
+                };
+                if !arc.symbols_are_evicted() {
+                    continue; // the resident scan already judged it
+                }
+                let cm = std::sync::Arc::new(crate::file_analysis::CachedModule::new(
+                    path.clone(),
+                    arc,
+                ));
+                let whole = idx.whole_present(&cm);
+                if whole.symbols.iter().any(|s| symbol_defines_target(s, target, &whole)) {
+                    found_in_editable = true;
+                    break;
+                }
             }
         }
     }
@@ -3995,15 +4189,40 @@ pub fn references_mask_for(
     // care about are project files. Fall back to the module index only
     // when nothing project-side claims it.
     if !found_in_editable {
-        if let (TargetKind::Method { class }, Some(_idx)) = (&target.kind, module_index) {
+        if let (TargetKind::Method { class }, Some(idx)) = (&target.kind, module_index) {
+            let declares_class = |fa: &FileAnalysis| {
+                fa.symbols.iter().any(|s| {
+                    matches!(s.kind, SymKind::Package | SymKind::Class) && s.name == *class
+                })
+            };
             let mut declared_in_workspace = false;
             for entry in files.workspace_raw().iter() {
-                if entry.value().symbols.iter().any(|s| {
-                    matches!(s.kind, SymKind::Package | SymKind::Class)
-                        && s.name == *class
-                }) {
+                if !entry.value().symbols_are_evicted() && declares_class(entry.value()) {
                     declared_in_workspace = true;
                     break;
+                }
+            }
+            if !declared_in_workspace {
+                let keys = vec![crate::file_analysis::name_match_key(class)];
+                for path in idx.ref_candidate_paths(&keys) {
+                    let Some(arc) = files
+                        .workspace_raw()
+                        .get(&path)
+                        .map(|e| std::sync::Arc::clone(e.value()))
+                    else {
+                        continue;
+                    };
+                    if !arc.symbols_are_evicted() {
+                        continue;
+                    }
+                    let cm = std::sync::Arc::new(crate::file_analysis::CachedModule::new(
+                        path.clone(),
+                        arc,
+                    ));
+                    if declares_class(&idx.whole_present(&cm)) {
+                        declared_in_workspace = true;
+                        break;
+                    }
                 }
             }
             if declared_in_workspace {
@@ -4097,23 +4316,27 @@ fn collect_package_var(
     }
 }
 
-/// The closure-connectivity half of the visibility axis (RoleMask is the
-/// role half): may `analysis` — living at canonical `file_str` — see one of
-/// the target's defining files? A scanned file whose closure reaches none of
-/// them can't be referring to the target: its same-named tokens resolve (or
-/// would resolve) to something else entirely (an unrelated TU's static,
-/// another header's same-named struct/enum, a Perl `croak` half a workspace
-/// away). Empty `def_paths` (every Perl target, unscoped callers) = no gate.
-/// Applied by the WALK driver (`refs_to`) before a file is scanned — decls
-/// included, so two same-named statics never cross-list — which is what
-/// makes every projection that walks inherit it (arc-review C1's fix, owned
-/// by the seam, not the matcher).
-fn file_sees_target(target: &TargetRef, analysis: &FileAnalysis, file_str: &str) -> bool {
+/// The per-query half of the visibility gate: each def_path's global path
+/// id, resolved ONCE — the per-candidate test is then lock-free binary
+/// search (`contains_id`). `None` = that def_path is in no closure at all.
+fn def_path_ids(target: &TargetRef) -> Vec<Option<u32>> {
+    target
+        .def_paths
+        .iter()
+        .map(|d| crate::file_analysis::path_intern::lookup_id(d))
+        .collect()
+}
+
+fn file_sees_target_ids(
+    target: &TargetRef,
+    ids: &[Option<u32>],
+    analysis: &FileAnalysis,
+    file_str: &str,
+) -> bool {
     target.def_paths.is_empty()
-        || target
-            .def_paths
-            .iter()
-            .any(|d| d == file_str || analysis.include_closure.iter().any(|c| c == d))
+        || target.def_paths.iter().zip(ids).any(|(d, id)| {
+            d == file_str || id.is_some_and(|id| analysis.include_closure.contains_id(id))
+        })
 }
 
 /// A `FileKey`'s canonical path string — the spelling the visibility facts
@@ -4145,7 +4368,7 @@ fn collect_from_analysis(
         .iter()
         .filter(|a| {
             a.def_path == file_str
-                || analysis.include_closure.iter().any(|c| *c == a.def_path)
+                || analysis.include_closure.contains(&a.def_path)
         })
         .collect();
 

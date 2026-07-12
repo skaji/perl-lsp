@@ -18,6 +18,78 @@ Format per entry:
 
 ---
 
+## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
+- **Context:** storage-engine mission phase 3 (docs/prompt-storage-engine.md;
+  eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes
+  the engine choice reversible.
+- **Options:** A — hand-rolled `FreshnessIndex` (surface records +
+  name-keyed reverse-dep + seen-set dirty walk, ~150 lines, no deps).
+  B — Salsa 0.27 (revision machinery, durability, auto edges; `'db`
+  virality, memory-tuning burden, pre-1.0). C — comemo (lighter, no
+  revision machinery).
+- **Picked:** A, per the eval's own recommendation: we already own the
+  reverse-index discipline, and the engine sits entirely behind
+  `Surface`/`SurfaceVerdict` — swapping in Salsa later touches the
+  recording sites, not the consumers.
+- **Undo cost:** moderate — reimplement `record`/`dirty_consumers` over
+  salsa inputs/tracked fns; call sites unchanged.
+- **Discussion needed:** when the query graph deepens (materialized
+  workspace enrichment, phase 4 SQL views), revisit whether the dirty-set
+  still suffices or Salsa's cancellation/durability earns its costs.
+
+## Unregister inverse under symbol eviction: recorded name list vs self-healing candidates — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
+- **Context:** symbols-relational phase B. `unregister_file` walked
+  `old.analysis.symbols` to remove name registrations; under symbol
+  eviction that vec is empty, and rehydrating after an edit persists
+  fetches the NEW generation's names (wrong inverse).
+- **Options:** A — record the registered (name, is-class) pairs per path
+  at registration time (a side map, ~pointers + names). B — make
+  `all_defs`/`cache` self-healing at read (validate candidates against
+  `all_files` membership/Arc identity; registration appends only). C —
+  read the syms rows for the OLD generation before shredding the new one
+  (couples unregister ordering to persistence).
+- **Picked:** A (`ModuleIndex.registered_names`). Exact inverse by
+  construction, no read-path cost, and it doubles as the class-rank
+  source for the cache-slot tie-break (which also read evicted symbols).
+  Cost: one Vec<(String, bool)> per registered file — ~tens of MB at
+  chromium scale, bounded and measured into the floor.
+- **Undo cost:** small — the map is private to `module_index.rs`; B can
+  replace it without touching call sites outside registration/unregister.
+- **Discussion needed:** if the floor budget tightens further, B removes
+  the per-file name copies entirely at the price of lazy consistency
+  (stale candidates until next read).
+
+---
+
+## include_closure representation: interned path pointers vs file-id arrays — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
+- **Context:** chromium warm heap dump post-refs/symbols eviction:
+  `include_closure` is the largest resident bucket — 2,827 MB / 41% at
+  132K files (16-byte `Arc<str>` per closure entry × deep header
+  closures). It is read on hot paths (the refs_to visibility gate, per
+  candidate) so relocation to rows would thrash; this is a REPRESENTATION
+  problem.
+- **Options:** A — global path table + per-file sorted `Arc<[u32]>`
+  (4 bytes/entry, ~4× smaller; gate becomes a binary search over ids).
+  B — dedupe identical closure SETS across files (headers within one
+  subtree share suffixes; measure hit rate first). C — roaring bitmaps
+  over the global file table (best compression, new dep).
+- **Picked:** A, landed same day (`path_intern::ClosureList` — sorted
+  `Arc<[u32]>` over a process-global path-id table; serde keeps the
+  `Vec<String>` blob shape so no EXTRACT_VERSION bump). Membership became
+  id binary-search (`contains`), set/save consumers go through
+  `iter_strs`. One subtlety worth remembering: `closure_stamp` had to
+  SORT before hashing — id order is global mint order, nondeterministic
+  across sessions, and an order-sensitive hash would have silently
+  invalidated every warm row every run. Measured on abseil: closure
+  bucket 10.8 → 1.8 MB (residual is `include_directives` strings), whole
+  payload 20.2 → 11.2 MB; table 1,123 paths / 0.1 MB. Chromium
+  projection: 2,827 MB → roughly 300–500 MB + a ~150 MB one-time table.
+- **Undo cost:** small — representation is private to `ClosureList`;
+  swapping to dedup'd sets (B) or bitmaps (C) touches only the type.
+- **Discussion needed:** whether `include_directives` (now the residual)
+  should ride the same table; and whether B (closure-set dedup) stacks
+  worthwhile savings on top at chromium depth.
+
 ## Implicit-`this` capability: one flag for fields AND calls — 2026-07-05 — RATIFIED + RENAME LANDED (veesh, 2026-07-05)
 - **Context:** hitlist-3 Family A+I slice. The implicit-member pass is
   gated by the pack's `implicit_this_members` capability. The sibling-CALL
@@ -215,3 +287,233 @@ Format per entry:
 - **Ratification (veesh):** leave as is — "ArgPosition is a drop of a
   lie, but Slot::Comparison would be sprawl." A friendly comment on the
   variant acknowledges the stretch (landed in `src/cursor_slot.rs`).
+
+## Warm stubs — separate table vs. blob column — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
+
+- **Context:** register-from-Surface warm start persists a per-file stub
+  (registration feed + specialization edges + projected Surface + the
+  stripped skeleton) so warm scans never decode full analysis blobs.
+  Where does the stub live?
+- **Options:** A — `ALTER TABLE modules ADD COLUMN stub BLOB` (the
+  `deps_stamp` precedent). B — a separate `stubs(path PRIMARY KEY, stub)`
+  table joined at warm.
+- **Picked:** B. SQLite reads a record left-to-right; a column appended
+  AFTER the `analysis` BLOB sits past its overflow-page chain, so every
+  stub read would drag the full blob off disk — the exact cost the lane
+  exists to skip. The separate table also gets its own `stub_version`
+  meta wipe without touching blob validity.
+- **Undo cost:** low — the stub is a pure cache derived from the blob in
+  the same txn; dropping the table (or the version gate wiping it)
+  degrades to the full-decode lane and backfills on the next warm.
+- **Tradeoffs accepted:** (a) every modules-row rewrite must DELETE the
+  path's stub or a stale skeleton pairs with a fresh stamp — enforced
+  inside `save_to_db`/`save_blob_to_db_stamped` so writers can't forget;
+  (b) `pack_file_changed` deletes but doesn't rewrite stubs, so edited
+  files take the full lane on the next warm (bounded: only edited files);
+  (c) NO_EVICT bypasses stubs entirely (skeletons are stripped by
+  construction — a whole-copy session can't register them);
+  (d) stub-lane files whose derived rows vanished (REF_ROWS_VERSION
+  wipe) decline to the full lane because re-shredding needs the whole
+  analysis.
+- **Discussion needed:** whether the Perl workspace tier should get the
+  same lane (its warm is milliseconds on bugzilla today; chromium-scale
+  Perl trees don't exist in the corpus set).
+
+## Mission-2 hardening round — deferred findings — 2026-07-06 — OPEN (Claude)
+
+Fixed in the round (for the record): free callables were absent from the
+Surface (a C free-function signature change read as Unchanged — the
+firewall's worst failure mode); the dirty walk missed consumers of
+RENAMED-away packages (`stale_provided` now seeds one walk); the deleted
+pack file's own reparse caches leaked (deletion was semantically
+invisible to re-analyzed consumers); open-doc surfaces were recorded
+POST-enrichment (verdict flapping against pre-enrichment indexer
+records); the Unchanged gate skipped consumer deps-stamp refresh (the
+restart cold storm); watcher re-registration dropped the verdict (stale
+open consumers after git pull); stub-lane rows with an unrehydratable
+blob (NULL/empty) no longer register; deferred stub backfill is
+stamp-guarded against racing edits; `remove_surface` parent-canonicalizes
+deleted paths; method dedup collapses only FULLY-equal duplicates.
+
+Deferred, in rough priority order:
+
+- **Concurrent surface writers (buffer vs disk)**: a bulk index or watcher
+  tick re-records a DISK build over an open doc's BUFFER record; an edit
+  reverting the buffer to the disk state then reads Unchanged against the
+  wrong baseline and skips a consumer refresh. Needs record provenance
+  (open-doc records outrank background ones while the doc is open) or a
+  doc-open guard on background recording. Rare (requires an unsaved
+  contract change raced by a background re-record), silent when hit.
+- **Verdict-policy seam**: the record→gate→act sequence is spelled in
+  three places now (open-doc edits, the watcher, `pack_file_changed`).
+  A `FreshnessIndex`-owned policy hook (or a `record_and_dirty` that
+  returns the closure) would make the next registration path inherit the
+  gate by construction instead of by remembering.
+- **Probe serialization in `pack_file_changed`** (Changed case): the
+  changed file's probe runs serially before the parallel consumer fan-out
+  (~one header-analysis of added latency per save while actively editing
+  a widely-included header whose surface DID change). Speculative
+  consumer re-analysis concurrent with the probe would restore the old
+  wall clock at the cost of wasted work on Unchanged — measure before
+  building.
+- **`warm_pack_stream_with_stubs` two-closure API**: the shared-state
+  RefCell dance at the call site wants a single
+  `FnMut(path, WarmPayload) -> Directive` shape.
+- **Pack provided-names vocabulary**: `SurfaceRecord.provided` is
+  packages-only; a future pack-tier NAME-keyed dirty walk (cpp uses
+  include-closure consumers today, so nothing reads it) would
+  under-invalidate for free-function headers. If that walk ever lands,
+  feed `provided` from the linkage feed, not `packages`.
+- **Declined micro-optimizations**: per-registration `fs::canonicalize`
+  in `record_surface_value` stays (correctness guard; ~µs against per-file
+  analysis costs); cold-path stub encoding stays (measured cold wall
+  unchanged, and it buys the FIRST warm, not the second).
+
+## Session review round — duplication + structural residency — 2026-07-07 — TRIAGED (veesh, 2026-07-07)
+
+Landed: `evict_axes` / `prepare_pack_parts` / `prepare_workspace_parts` are
+the only spellers of the reads-whole-before-evict strip; the warm scans
+share `classify_row_generation` + `write_in_chunks` + a single-callback
+`WarmPayload` API (RefCell dance gone; dead rows rejected pre-decode);
+`register_symbols` feeds through `prepare_pack_feed`; the watcher and
+editor paths share `republish_open_docs_in`; the writers' PANIC arms now
+drop stale LRU pins like their commit-fail arms (live bug, both tiers);
+the enrichment overlay is byte-capped (128 MiB + 64 entries, per-entry
+`heap_estimate` stored); `whole_copy_registration_sites_are_allowlisted`
+(layering_tests) makes every whole-copy registration call site declare its
+residency bound; a post-bulk-index residency tripwire counts
+fully-resident pack copies against the deliberate whole-copy sites and
+`log::error` + debug-asserts on unexplained pins.
+
+Deferred, with designs:
+
+- **@INC/'import' tier is never stripped** — LANDED 2026-07-07 (see
+  "@INC stripping arc — closed" below): cold-path strip via
+  `strip_import_copy`, warm strip at insert inside `warm_cache` for
+  long-lived processes. Residuals: CLI one-shot keeps whole warm copies
+  (deliberate — wall over RAM there), registration-generation keys for
+  the tier.
+- **Watcher re-registration never re-strips** — whole copies pinned until
+  restart; a big `git pull` is an unbounded resident delta. Design:
+  persist (blob+rows) in the watcher's blocking task, then
+  `register_workspace_stripping` on commit, whole-copy fallback only on
+  persist failure.
+- **Writer fallback budget** — a persistently failing writer (disk full)
+  falls back to whole copies for the ENTIRE tree; the tripwire now makes
+  it visible but nothing bounds it. Design: byte-accounted fallback
+  budget shared per index run.
+- **Rows-missing re-strip after backfill** — after a REF_ROWS_VERSION
+  bump, refs+symbols stay resident for one session (self-healing at next
+  restart; never trips the fully-resident wire). Re-registering post-
+  backfill needs a surface-PRESERVING residency-only lane (re-projecting
+  from a bag-evicted copy would corrupt the freshness record) — build it
+  on `register_workspace_residency`/`register_symbols_inner` with the
+  original parts, not the stripped copy.
+- **Writer-thread harness dedup** — WsFresh and FreshEntry writers share
+  the whole chunk/txn/fallback scaffold shape; a generic harness would
+  make fixes land in both by construction. Moderate refactor; the panic
+  fix above is the drift it would have prevented.
+- **Stamp-capture helper** — the stamp-before-read + re-stat-after-parse
+  protocol is spelled in both fresh workers.
+- **Parts-token-only inner registration** — make `register_symbols_inner`
+  / `register_workspace_residency` accept only the parts structs (private
+  fields, constructible solely via the prepare_* choke points) so a
+  feed-from-stripped-copy or whole-arc hookup fails to compile. The
+  allowlist test covers the gap until then.
+
+
+## Triage (veesh, 2026-07-07)
+
+- The four architecture picks above: **ratified as-is**, revisit triggers
+  stand as written.
+- Next arcs, in order: **R4 server consumers** (always-enriched closed
+  files through the overlay), then **@INC tier stripping** — both full
+  auto with hardening rounds.
+- Backlog now: **writer-harness + stamp-capture dedup**. Staying
+  laddered: parts-token inner APIs (allowlist test covers the gap),
+  pack provided-names vocabulary (fix when a name-keyed pack dirty walk
+  lands), writer fallback budget (tripwire keeps it visible), watcher
+  persist+re-strip, buffer-vs-disk record provenance, probe
+  serialization (measure first), phase-4 SQL views. Declined micro-opts
+  stay declined.
+
+## R4 hardening round — 2026-07-07 — OPEN (Claude)
+
+Fixed: retries only ever use RETAINED overlay copies (an unretained copy
+gave the seams fresh bag pointers per recursion level — unbounded mints
+to the 512-depth cap on byte-cap giants, and memo entries keyed on freed
+addresses); declines (giant/cycle-taint) are CACHED under the key, so
+repeat queries skip the deep copy; the exporter loop is two-pass (raw
+answers can never be shadowed by an earlier exporter's enriched answer;
+symbol-less exporters never trigger a retry); QueryState pins enriched
+Arcs for memo-address validity; the overlay is LRU (was FIFO);
+enrichment keys use monotonic REGISTRATION GENERATIONS instead of Arc
+pointers (ABA-proof; also covers body-dependent provider facts the
+span-free fingerprint deliberately ignores); --dump-package warns on
+overlay decline. Cycle policy: tainted builds decline deterministically
+— cyclic files answer raw everywhere, never a query-order-dependent
+half-enriched cache.
+
+Deferred:
+- **Unwired seams** (same fallback-on-miss pattern, wire next):
+  bridged-plugin-entity chase (witnesses.rs ~1916 — bridged methods
+  resolve unenriched while plain methods now resolve enriched),
+  enrichment's own import scan (file_analysis.rs ~5809 — makes
+  enrichment transitive; the cycle guard's real customer), SlotType
+  primary (~1938). TypeName chase: skip (pack aliases, no Perl win).
+- **@INC providers keep the Arc-pointer freshness token** (no
+  registration gen — the resolver thread inserts without the hub map);
+  ABA-prone in principle. Fold into the @INC-stripping arc: route
+  insert_into_cache through a hub-owned seam that bumps generations.
+- **In-flight dedup**: two threads missing on one path both pay the
+  deep-copy (last insert wins). Bounded waste; revisit if profiling
+  shows it.
+
+## @INC stripping arc — closed — 2026-07-07 (Claude)
+
+Landed across four commits: the cold-path strip (persist-first,
+strip gated on the blob landing, memo unpinned), generation-coherence
+fixes (NULL-blob rows report unpersisted; shred gated on persist), the
+`mark_long_lived` gate (R4 enriched retries + the warm @INC strip run
+only where a process amortizes them — the server; one-shot CLI skips
+both), lifecycle fixes (resolver stale-pin clears, memo-None parity,
+warm sentinel None-over-Some guard, `load_one` prefers the workspace
+generation), and `idx_modules_path`.
+
+The wall saga, for the record: warm gold 40s (NO_EVICT) vs 442-547s
+(default) decomposed into (a) the R4 retries in one-shot processes
+(bisected 374→790s; now gated off there), and (b) `load_one` full table
+scans — modules had NO path index, so every rehydration since the
+eviction axes landed scanned blob-bearing rows (sys-time storms). The
+index took warm gold 547→162s (sys 227→7.6s). Residual 162s vs 40s =
+per-row cold-LRU rehydration in one-shot processes — the accepted
+profile; the long-lived server amortizes it.
+
+Measured: warm-harness RSS 615→348MB (default vs NO_EVICT); warm
+SERVER sessions additionally strip warm-loaded @INC copies (CLI keeps
+them whole — RAM dies with the process; wall matters more there).
+
+Deferred: @INC registration generations for the enrichment key (the
+Arc-pointer token stands for that tier); the 162s one-shot rehydration
+profile if CI minutes ever matter (options: per-process blob-decode
+memo, or NO_EVICT in the harness at the cost of blinding the eviction
+nets).
+
+## Intermittent cold-start flake — 2026-07-07 — OPEN (investigation)
+
+Twice this branch, a COLD gold run misbehaved and was clean on
+immediate rerun: once 3 FAILs, once 372 PASS / 41 FAIL / 5 XPASS with an
+impossibly fast wall (88s vs ~300-500s) — the "inputs vanished,
+absence-as-answer" signature (diagnostics XPASS = typeless sweep). Both
+occurrences ran immediately after (or concurrent with) heavy build/test
+activity on the same box; 4 deliberate cold passes after the second
+occurrence were all clean, as were all committed-gate colds. Suspects:
+the two-writer startup window (resolver thread + workspace indexer on
+one modules.db) under load — a busy-timeout expiry making one writer
+run cache-less that session (post-hygiene this is a clean None, but the
+session's strips then key on the OTHER writer's rows), or a
+strip-before-persist window the tripwire doesn't cover on the Perl
+tier. Next probe: cold gold under artificial CPU/IO load with
+PERL_LSP_TIMINGS + a Perl-tier residency tripwire; the harness could
+also assert per-fixture wall lower bounds so a too-fast cold fails
+loudly instead of scoring wrong answers.

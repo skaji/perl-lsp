@@ -149,21 +149,24 @@ pub fn plugin_namespace_to_workspace_info(
 }
 
 #[allow(deprecated)]
-pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+/// The ONE workspace-search visibility rule, shared by the resident sweep
+/// (`symbol_to_workspace_info`) and the rows twin — a kind added to one
+/// gate cannot silently diverge the other.
+fn workspace_search_visible(kind: &crate::file_analysis::SymKind, hidden: bool, lexical: bool) -> bool {
     use crate::file_analysis::SymKind as FaSymKind;
-    // Only include significant symbols (subs, methods, packages, classes)
-    match sym.kind {
-        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class => {}
-        _ => return None,
-    }
-    // The detail's hide_in_outline covers the workspace list too —
-    // anon subs and plugin DSL imports are resolvable, not browsable.
-    // Lexical subs likewise: document symbols show them (in-file
-    // structure), workspace search does not (not addressable outside
-    // their block).
-    if sym.hidden_in_outline()
-        || matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { lexical: true, .. })
-    {
+    matches!(
+        kind,
+        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class
+    ) && !hidden
+        && !lexical
+}
+
+pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+    if !workspace_search_visible(
+        &sym.kind,
+        sym.hidden_in_outline(),
+        matches!(&sym.detail, crate::file_analysis::SymbolDetail::Sub { lexical: true, .. }),
+    ) {
         return None;
     }
     Some(SymbolInformation {
@@ -176,6 +179,50 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
             range: span_to_range(sym.selection_span),
         },
         container_name: sym.package.clone(),
+    })
+}
+
+/// The rows half of workspace/symbol: fan the query across the hub's Perl
+/// store and every pack sub-index's store. One spelling of the fan-out so
+/// the LSP handler and the CLI verb can never diverge.
+pub fn sym_row_search(
+    idx: &crate::module_index::ModuleIndex,
+    query: &str,
+) -> Vec<crate::module_cache::SymRowHit> {
+    let mut hits = idx.sym_search(query);
+    idx.for_each_pack_index(|_lang, pack| {
+        hits.extend(pack.sym_search(query));
+    });
+    hits
+}
+
+/// `symbol_to_workspace_info`'s row twin — identical kind gate and
+/// hidden/lexical suppressions, sourced from the baked row flags.
+pub fn sym_row_to_workspace_info(
+    hit: &crate::module_cache::SymRowHit,
+) -> Option<SymbolInformation> {
+    use crate::file_analysis::{sym_kind_from_code, SymRowSeed};
+    let kind = sym_kind_from_code(hit.kind)?;
+    if !workspace_search_visible(
+        &kind,
+        hit.flags & SymRowSeed::FLAG_HIDDEN_IN_OUTLINE != 0,
+        hit.flags & SymRowSeed::FLAG_LEXICAL_SUB != 0,
+    ) {
+        return None;
+    }
+    let path = std::path::Path::new(&hit.path);
+    let uri = Url::from_file_path(path).ok()?;
+    let span = crate::file_analysis::Span {
+        start: tree_sitter::Point::new(hit.start_row, hit.start_col),
+        end: tree_sitter::Point::new(hit.end_row, hit.end_col),
+    };
+    Some(SymbolInformation {
+        name: hit.name.clone(),
+        kind: fa_sym_kind_to_lsp(&kind),
+        tags: None,
+        deprecated: None,
+        location: Location { uri, range: span_to_range(span) },
+        container_name: hit.container.clone(),
     })
 }
 
@@ -773,7 +820,8 @@ fn completion_items_native(
                 // the "still indexing" placeholder is a slot affordance
                 // (no entity to gather yet), so it stays adapter-side.
                 return match module_index.get_cached(name) {
-                    Some(cached) => cached
+                    Some(cached) => module_index
+                        .whole_present(&cached)
                         .import_list_candidates()
                         .into_iter()
                         .map(candidate_to_completion_item)
@@ -1159,10 +1207,13 @@ fn render_candidate_hover(
         });
     }
     if let Some(cached) = &found {
-        if let Some(i) = sym_at(&cached.analysis) {
-            let sym = &cached.analysis.symbols[i];
+        let whole = module_index
+            .map(|midx| midx.whole_present(cached))
+            .unwrap_or_else(|| cached.analysis.clone());
+        if let Some(i) = sym_at(&whole) {
+            let sym = &whole.symbols[i];
             let mut out = render_symbol_hover(
-                sym, &text, &sym.span.start, language, &cached.analysis, sym.span.start,
+                sym, &text, &sym.span.start, language, &whole, sym.span.start,
                 module_index,
             );
             out.push_str(&format!("\n\n— `{}`", fname));
@@ -1307,7 +1358,8 @@ pub fn hover_info(
                     .defining_module_cached(&import.module_name, &remote_name)
                     .or_else(|| module_index.get_cached(&import.module_name))
                 {
-                    if let Some(sub_info) = cached.sub_info(&remote_name) {
+                    let whole = module_index.bag_present(&cached);
+                    if let Some(sub_info) = whole.sub_info_view(&remote_name) {
                         // Present the sig under the LOCAL name — that's
                         // what the user typed and what hover should lead
                         // with; the remote name is just how we fetched it.
@@ -1342,7 +1394,8 @@ pub fn hover_info(
             if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
                 let bare = r.unqualified_target_name();
                 if let Some(cached) = module_index.get_cached(pkg) {
-                    if let Some(sub_info) = cached.sub_info(bare) {
+                    let whole = module_index.bag_present(&cached);
+                    if let Some(sub_info) = whole.sub_info_view(bare) {
                         let sig = format_imported_signature(bare, &sub_info);
                         let mut parts = vec![format!("```perl\n{}\n```", sig)];
                         if let Some(doc) = sub_info.doc() {
@@ -1757,7 +1810,8 @@ fn dispatch_target_items_for(
         emit(sym);
     }
     module_index.for_each_cached(|_, cached| {
-        for sym in cached.analysis.handlers_for_owner(owner_class, dispatcher_names) {
+        let whole = module_index.whole_present(cached);
+        for sym in whole.handlers_for_owner(owner_class, dispatcher_names) {
             emit(sym);
         }
     });
@@ -1934,7 +1988,8 @@ fn string_dispatch_signature_for(
     if let Some(idx) = module_index {
         for module_name in idx.modules_with_symbol(handler_name) {
             let Some(cached) = idx.get_cached(&module_name) else { continue };
-            for sym in &cached.analysis.symbols {
+            let whole = idx.whole_present(&cached);
+            for sym in &whole.symbols {
                 if sym.name != handler_name { continue; }
                 push_sig(&mut signatures, sym, Some(module_name.as_str()));
             }

@@ -960,7 +960,7 @@ impl Backend {
                             .ok()
                             .map(|p| p.canonicalize().unwrap_or(p) == canon)
                             .unwrap_or(false);
-                    if is_self || analysis.include_closure.iter().any(|c| c == &canon_str) {
+                    if is_self || analysis.include_closure.contains(&canon_str) {
                         to_refresh.push(u);
                     }
                 }
@@ -1013,8 +1013,71 @@ impl Backend {
         }
         let cached = idx.get_cached(word)?;
         let text = std::fs::read_to_string(&cached.path).ok()?;
-        let (span, line) = pick(&cached.analysis, &text)?;
+        let (span, line) = pick(&idx.whole_present(&cached), &text)?;
         Some((Url::from_file_path(&cached.path).ok(), span, line))
+    }
+
+    /// The freshness engine's consumption half for OPEN docs: after an
+    /// edit to `uri` rebuilt its analysis, record the new surface. An
+    /// `Unchanged` verdict is the early-cutoff — a body edit refreshes
+    /// nobody. `Changed` re-enriches + republishes exactly the OPEN docs
+    /// in the transitive dirty closure (closed workspace consumers stay
+    /// correct through the query-time walks; their always-enriched
+    /// materialization is the next phase).
+    /// Record the open doc's surface right after a rebuild — BEFORE
+    /// `publish_diagnostics` enriches the analysis in place.
+    /// `Surface::project`'s contract is the file's OWN facts: an enriched
+    /// projection would fingerprint imported types into the record and
+    /// flip-flop verdicts against the workspace indexer's pre-enrichment
+    /// records (spurious Changed storms on body edits).
+    fn record_open_doc_surface(
+        &self,
+        uri: &Url,
+    ) -> Option<(std::path::PathBuf, crate::surface::SurfaceVerdict)> {
+        let path = uri.to_file_path().ok()?;
+        let canon = std::fs::canonicalize(&path).unwrap_or(path);
+        let doc = self.files.get_open(uri)?;
+        if doc.language != "perl" {
+            return None;
+        }
+        let verdict = self.module_index.record_surface(&canon, &doc.analysis);
+        Some((canon, verdict))
+    }
+
+    async fn refresh_dirty_open_consumers(
+        &self,
+        canon: &std::path::Path,
+        verdict: crate::surface::SurfaceVerdict,
+    ) {
+        if verdict != crate::surface::SurfaceVerdict::Changed {
+            return;
+        }
+        let dirty = self.module_index.dirty_consumers(canon);
+        self.republish_open_docs_in(&dirty).await;
+    }
+
+    /// Re-enrich + republish every OPEN doc in a dirty closure — the one
+    /// speller of the membership rule (canonical-path match), shared by
+    /// the in-editor verdict path and the watcher's aggregated closure.
+    async fn republish_open_docs_in(
+        &self,
+        dirty: &std::collections::HashSet<std::path::PathBuf>,
+    ) {
+        if dirty.is_empty() {
+            return;
+        }
+        let mut to_refresh: Vec<Url> = Vec::new();
+        self.files.for_each_open(|u, _doc| {
+            if let Ok(p) = u.to_file_path() {
+                let c = std::fs::canonicalize(&p).unwrap_or(p);
+                if dirty.contains(&c) {
+                    to_refresh.push(u.clone());
+                }
+            }
+        });
+        for u in to_refresh {
+            self.publish_diagnostics(&u).await;
+        }
     }
 
     fn enrich_analysis(&self, uri: &Url) {
@@ -1153,6 +1216,11 @@ impl LanguageServer for Backend {
                     .and_then(|f| f.first())
                     .map(|f| f.uri.as_str())
             });
+        // Long-lived process: the overlay + rehydration LRU amortize here
+        // (one-shot CLI modes leave both off — bisected at 2x warm-harness
+        // wall). BEFORE set_workspace_root: the resolver wakes on the root
+        // and reads the flag at warm time.
+        self.module_index.mark_long_lived();
         self.module_index.set_workspace_root(root);
         // Same root drives repo-local `.perl-lsp/` plugin discovery, so the
         // plugin set and the per-project cache key can't disagree.
@@ -1464,7 +1532,15 @@ impl LanguageServer for Backend {
                     }
                 }
             }
+            // Pre-enrichment record — publish_diagnostics enriches in place.
+            let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
+            // Surface-gated consumer refresh: a body edit stops here
+            // (Unchanged); a contract change republishes the open docs
+            // that can see it.
+            if let Some((canon, verdict)) = recorded {
+                self.refresh_dirty_open_consumers(&canon, verdict).await;
+            }
             return;
         }
         if let Some(mut doc) = self.files.get_open_mut(&uri) {
@@ -1489,7 +1565,11 @@ impl LanguageServer for Backend {
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(text);
             }
+            let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
+            if let Some((canon, verdict)) = recorded {
+                self.refresh_dirty_open_consumers(&canon, verdict).await;
+            }
         }
         // The saved bytes are on disk: re-register this file's indexed copy,
         // evict the macro/closure caches it participates in, and refresh its
@@ -1707,18 +1787,34 @@ impl LanguageServer for Backend {
         // One construction, one projection — target/group/lexical branching,
         // visibility (incl. the origin's include-closure scope and the pack
         // VISIBLE widening), and the cross-file walk all live inside the set.
-        let mut cs = crate::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            point,
-            Some(base_idx),
-            self.override_scope(),
-        );
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
-        Ok(refs_to_locations(cs.references()))
+        // The backward walk does real I/O now (relational retrieval +
+        // candidate-blob rehydration) — run construction + projection on the
+        // blocking pool, never the reactor. Everything moved is Arc'd.
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let uri = uri.clone();
+        let scope = self.override_scope();
+        let locs = tokio::task::spawn_blocking(move || {
+            let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => &*module_index,
+            };
+            let mut cs = crate::resolve::resolve(
+                &files,
+                &analysis,
+                FileKey::Url(uri),
+                point,
+                Some(base_idx),
+                scope,
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            refs_to_locations(cs.references())
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        Ok(locs)
     }
 
     async fn prepare_rename(
@@ -1802,24 +1898,39 @@ impl LanguageServer for Backend {
         let pack = (language != "perl")
             .then(|| self.module_index.pack_index(language))
             .flatten();
-        let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+        let _base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
             Some(i) => i,
             None => &*self.module_index,
         };
-        let mut cs = crate::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            point,
-            Some(base_idx),
-            self.override_scope(),
-        );
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
-        cs.rename_edits(new_name)
-            .map(edit_pairs_to_workspace_edit)
-            .map_err(tower_lsp::jsonrpc::Error::invalid_params)
+        // Same blocking-pool routing as `references`: rename projects the
+        // references image, which now reads SQLite + rehydrates blobs.
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let uri = uri.clone();
+        let new_name = new_name.clone();
+        let scope = self.override_scope();
+        tokio::task::spawn_blocking(move || {
+            let base_idx: &dyn crate::file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => &*module_index,
+            };
+            let mut cs = crate::resolve::resolve(
+                &files,
+                &analysis,
+                FileKey::Url(uri),
+                point,
+                Some(base_idx),
+                scope,
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            cs.rename_edits(&new_name)
+                .map(edit_pairs_to_workspace_edit)
+                .map_err(tower_lsp::jsonrpc::Error::invalid_params)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -2160,14 +2271,31 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
         let mut results = Vec::new();
+        // Paths a symbols-present resident copy already answered — the rows
+        // pass skips these (open docs and un-evicted copies are fresher than
+        // their persisted rows; evicted copies are rows-guaranteed).
+        let mut covered: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
 
         self.files.for_each_analysis(|key, analysis| {
             let uri = match key {
                 FileKey::Url(u) => u,
                 FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
-                    Url::parse(&format!("file://{}", p.display())).unwrap()
+                    Url::parse(&format!("file://{}", p.display()))
+                        .unwrap()
                 }),
             };
+            if !analysis.symbols_are_evicted() {
+                if let Ok(p) = uri.to_file_path() {
+                    // Claim the canonical spelling too: rows are keyed
+                    // canonical, and an open doc reached through a symlinked
+                    // root must shadow its own persisted rows.
+                    if let Ok(canon) = std::fs::canonicalize(&p) {
+                        covered.insert(canon);
+                    }
+                    covered.insert(p);
+                }
+            }
             for sym in &analysis.symbols {
                 if sym.name.to_lowercase().contains(&query) {
                     if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
@@ -2190,6 +2318,9 @@ impl LanguageServer for Backend {
         // the FileStore — sweep them so a C typedef/class/free function shows in
         // workspace search alongside Perl packages.
         self.module_index.for_each_pack_registered_file(&mut |path, analysis| {
+            if !analysis.symbols_are_evicted() {
+                covered.insert(path.to_path_buf());
+            }
             let uri = Url::from_file_path(path).unwrap_or_else(|_| {
                 Url::parse(&format!("file://{}", path.display())).unwrap()
             });
@@ -2201,6 +2332,20 @@ impl LanguageServer for Backend {
                 }
             }
         });
+
+        // Rows pass: symbol-evicted copies (Perl workspace + @INC + every
+        // pack tier) answer from the relational store — the resident sweep
+        // above saw empty vecs for them. Same containment test, same
+        // kind/visibility filters as `symbol_to_workspace_info`.
+        for hit in symbols::sym_row_search(&self.module_index, &query) {
+            let path = std::path::PathBuf::from(&hit.path);
+            if covered.contains(&path) {
+                continue;
+            }
+            if let Some(info) = symbols::sym_row_to_workspace_info(&hit) {
+                results.push(info);
+            }
+        }
 
         if results.is_empty() {
             Ok(None)
@@ -2233,25 +2378,83 @@ impl LanguageServer for Backend {
             return;
         }
         let files = Arc::clone(&self.files);
-        tokio::task::spawn_blocking(move || {
+        let module_index = Arc::clone(&self.module_index);
+        let dirty = tokio::task::spawn_blocking(move || {
+            // Externally changed deps break their consumers' enrichment too
+            // — collect the dirty closure while the records are in hand and
+            // hand it back for the open-doc republish below.
+            let mut dirty_all: std::collections::HashSet<PathBuf> = Default::default();
+            // The persisted generation (blob + ref rows) is now stale for
+            // these paths; drop it so warm starts re-parse and the
+            // relational retrieval can't serve outdated spans. The fresh
+            // in-RAM copy registered below is FULL (never stripped), so the
+            // resident sweep covers it until the next bulk index persists a
+            // new generation.
+            let ws_key = module_index.workspace_root();
+            let conn = crate::module_cache::open_cache_db(ws_key.as_deref(), "perl");
             for (path, typ) in perl_changes {
+                // A DELETED file can't canonicalize (it's gone) — resolve the
+                // parent instead so the spelling still matches the canonical
+                // keys everything was registered/persisted under.
+                let canon = path.canonicalize().unwrap_or_else(|_| {
+                    match (path.parent(), path.file_name()) {
+                        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                            .map(|d| d.join(name))
+                            .unwrap_or_else(|_| path.clone()),
+                        _ => path.clone(),
+                    }
+                });
+                if let Some(ref conn) = conn {
+                    crate::module_cache::invalidate_generation(conn, &canon.to_string_lossy());
+                    if canon != path {
+                        crate::module_cache::invalidate_generation(
+                            conn,
+                            &path.to_string_lossy(),
+                        );
+                    }
+                }
+                module_index.invalidate_bag_cache(&canon);
                 match typ {
                     FileChangeType::DELETED => {
                         files.remove_workspace(&path);
+                        files.remove_workspace(&canon);
+                        // Consumers of the departed file's packages, BEFORE
+                        // the record (and its provided names) are removed.
+                        dirty_all.extend(module_index.dirty_consumers(&canon));
+                        // The hub's path/name registrations must go too, or
+                        // the dead file stays a retrieval candidate and a
+                        // phantom module in name lookups.
+                        module_index.unregister_workspace_path(&canon);
                     }
                     _ => {
-                        // Re-index the file (created or changed)
+                        // Re-index the file (created or changed). The fresh
+                        // copy registers WHOLE (refs + bag) in both stores:
+                        // its persisted generation was just invalidated, so
+                        // the resident copy is the only source until the
+                        // next bulk index re-persists.
                         if let Ok(source) = std::fs::read_to_string(&path) {
                             let mut parser = crate::module_resolver::create_parser();
                             if let Some(tree) = parser.parse(&source, None) {
                                 let analysis = crate::builder::build(&tree, source.as_bytes());
-                                files.insert_workspace(path, analysis);
+                                let arc = Arc::new(analysis);
+                                files.insert_workspace_arc(canon.clone(), arc.clone());
+                                module_index.record_workspace_projections(&canon, &arc);
+                                let verdict = module_index
+                                    .register_workspace_resident(canon.clone(), arc);
+                                if verdict == crate::surface::SurfaceVerdict::Changed {
+                                    dirty_all
+                                        .extend(module_index.dirty_consumers(&canon));
+                                }
                             }
                         }
                     }
                 }
             }
-        });
+            dirty_all
+        })
+        .await
+        .unwrap_or_default();
+        self.republish_open_docs_in(&dirty).await;
     }
 
     async fn range_formatting(

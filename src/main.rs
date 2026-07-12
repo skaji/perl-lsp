@@ -19,6 +19,7 @@ mod plugin;
 mod plugin_cli;
 mod pod;
 mod query_cache;
+mod surface;
 // Kept-as-spike PoC modules: measured by their own tests, deliberately not
 // wired into the build pipeline (the go-live map's "ADDITIVE DEPTH" tier —
 // overload/dispatch/templates/superposition — plus the Perl seams they
@@ -151,6 +152,12 @@ async fn main() {
         }
         Some("--heatmap") if args.len() >= 3 => {
             cli_heatmap(&args[2], &args[3..]);
+            return;
+        }
+        Some("--refs-parity") if args.len() >= 3 => {
+            let sample = args.get(3).and_then(|a| a.strip_prefix("--sample="))
+                .and_then(|n| n.parse::<usize>().ok());
+            cli_refs_parity(&args[2], sample);
             return;
         }
         Some("--batch") if args.len() >= 3 => {
@@ -593,6 +600,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // Indexing without the index (bridge-less) is what forced callers to
     // hand-roll their own `index_workspace_with_index`, and they drifted.
     let module_index = module_index::ModuleIndex::new_for_cli();
+    module_index.mark_long_lived_from_env();
     // Wake the headless resolver: it blocks on this channel for the
     // @INC scan + SQLite warm.
     module_index.set_workspace_root(Some(root_uri.as_str()));
@@ -634,7 +642,11 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             conn,
             &plugin::rhai_host::plugin_fingerprint(),
         );
-        let (warmed, stale) = module_cache::warm_cache(conn, &module_index.cache_raw());
+        let (warmed, stale) = module_cache::warm_cache(
+            conn,
+            &module_index.cache_raw(),
+            module_index.is_long_lived() && module_resolver::eviction_enabled(),
+        );
         if warmed > 0 {
             eprintln!("Cache: {} modules loaded from disk", warmed);
         }
@@ -1627,8 +1639,19 @@ fn run_one(
                     }));
                 }
             };
+            // Same resident + rows composition as the LSP handler: a
+            // symbols-present copy answers residently; evicted copies are
+            // rows-guaranteed and answer from the store.
+            let mut covered: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
             for entry in ws.workspace_raw().iter() {
                 let file = entry.key().display().to_string();
+                if !entry.value().symbols_are_evicted() {
+                    if let Ok(canon) = std::fs::canonicalize(entry.key()) {
+                        covered.insert(canon);
+                    }
+                    covered.insert(entry.key().clone());
+                }
                 for sym in &entry.value().symbols {
                     push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
@@ -1638,10 +1661,25 @@ fn run_one(
             // function surfaces in workspace search too.
             idx.for_each_pack_registered_file(&mut |path, analysis| {
                 let file = path.display().to_string();
+                if !analysis.symbols_are_evicted() {
+                    covered.insert(path.to_path_buf());
+                }
                 for sym in &analysis.symbols {
                     push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
             });
+            for hit in symbols::sym_row_search(idx, &q) {
+                let path = std::path::PathBuf::from(&hit.path);
+                if covered.contains(&path) {
+                    continue;
+                }
+                let Some(kind) = file_analysis::sym_kind_from_code(hit.kind) else { continue };
+                let span = file_analysis::Span {
+                    start: tree_sitter::Point::new(hit.start_row, hit.start_col),
+                    end: tree_sitter::Point::new(hit.end_row, hit.end_col),
+                };
+                push(&hit.name, &kind, hit.path.clone(), span);
+            }
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
         "rename" => {
@@ -1804,11 +1842,11 @@ fn run_rename(
 }
 
 /// Whole-tree diagnostics with enrichment parity: each workspace entry
-/// is deep-copied (bincode — `FileAnalysis` isn't `Clone`) and enriched
-/// with imported types before `collect_diagnostics` — the same pass
-/// `publish_diagnostics` runs on open docs, so cross-file-typed shapes
-/// hint here too. A file whose roundtrip fails degrades to its
-/// unenriched analysis rather than vanishing.
+/// goes through the hub's enrichment overlay (`enriched_snapshot` — a
+/// derived, fingerprint-keyed copy; the same pass `publish_diagnostics`
+/// runs on open docs), so cross-file-typed shapes hint here too. A file
+/// whose snapshot fails degrades to its unenriched whole view rather
+/// than vanishing.
 fn enriched_tree_diagnostics(
     ws: &file_store::FileStore,
     idx: &module_index::ModuleIndex,
@@ -1817,17 +1855,20 @@ fn enriched_tree_diagnostics(
     let mut all = Vec::new();
     for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
-        let enriched = bincode::serialize(&**entry.value())
-            .ok()
-            .and_then(|bin| bincode::deserialize::<file_analysis::FileAnalysis>(&bin).ok())
-            .map(|mut fa| {
-                fa.after_deserialize();
-                fa.enrich_imported_types_with_keys(Some(idx));
-                fa
-            });
-        let diags = match &enriched {
-            Some(fa) => symbols::collect_diagnostics(fa, idx, options),
-            None => symbols::collect_diagnostics(entry.value(), idx, options),
+        let cached = std::sync::Arc::new(file_analysis::CachedModule::new(
+            entry.key().clone(),
+            std::sync::Arc::clone(entry.value()),
+        ));
+        let diags = match idx.enriched_snapshot(&cached) {
+            Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
+            None => {
+                // Index copies may be refs/bag-evicted; diagnostics read
+                // refs AND the bag, so degrade to the whole-on-both-axes
+                // view, not the resident copy.
+                let whole =
+                    file_analysis::CrossFileLookup::whole_present(idx, &cached);
+                symbols::collect_diagnostics(&whole, idx, options)
+            }
         };
         for d in diags {
             all.push((file.clone(), d));
@@ -1838,11 +1879,15 @@ fn enriched_tree_diagnostics(
     // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
     // diagnostics` / `--check` / gold see the same Mode-B answers the LSP
     // publishes. No enrichment (pack files aren't cross-file-enriched).
-    idx.for_each_pack_registered_file(&mut |path, analysis| {
-        let file = path.display().to_string();
-        for d in symbols::pack_diagnostics(analysis, options) {
-            all.push((file.clone(), d));
-        }
+    idx.for_each_pack_index(|_lang, pack| {
+        pack.for_each_registered_file(&mut |cm| {
+            let file = cm.path.display().to_string();
+            // Same whole-view routing: pack index copies are evicted.
+            let whole = file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cm);
+            for d in symbols::pack_diagnostics(&whole, options) {
+                all.push((file.clone(), d));
+            }
+        });
     });
     all
 }
@@ -1949,43 +1994,55 @@ fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
 /// a glance whether the bag has anything to say.
 fn cli_dump_package(root: &str, package_name: &str) {
     use std::sync::Arc;
-    use file_analysis::{FileAnalysis, SymKind, SymbolDetail};
+    use file_analysis::{SymKind, SymbolDetail};
 
     let (ws, module_index) = cli_full_startup(root);
 
     // Find a FileAnalysis whose package matches. Workspace first; fall
     // back to cached @INC modules. No bespoke discovery — only what
     // the normal startup populated.
-    let mut found: Option<(String, Arc<FileAnalysis>)> = None;
+    let mut found: Option<(String, Arc<file_analysis::CachedModule>)> = None;
     for entry in ws.workspace_raw().iter() {
-        let analysis = entry.value();
+        let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
+            entry.key().clone(),
+            std::sync::Arc::clone(entry.value()),
+        ));
+        let analysis = file_analysis::CrossFileLookup::whole_present(&module_index, &cm);
         let has_package = analysis.symbols.iter().any(|s| {
             matches!(s.kind, SymKind::Package | SymKind::Class)
                 && s.name == package_name
         });
         if has_package {
-            found = Some((entry.key().display().to_string(), Arc::clone(analysis)));
+            found = Some((entry.key().display().to_string(), cm));
             break;
         }
     }
     if found.is_none() {
         if let Some(cached) = module_index.get_cached(package_name) {
-            found = Some((cached.path.display().to_string(), Arc::clone(&cached.analysis)));
+            found = Some((cached.path.display().to_string(), cached));
         }
     }
 
-    let Some((path, analysis_ro)) = found else {
+    let Some((path, cached)) = found else {
         eprintln!("Package '{}' not found in workspace or module cache.", package_name);
         eprintln!("(Run the LSP against this workspace once to populate cached @INC modules.)");
         std::process::exit(1);
     };
 
-    // Deep-copy via bincode (FileAnalysis isn't Clone) and enrich the
-    // private copy with imported types so cross-file return inferences
-    // are visible — same pass the LSP runs in publish_diagnostics.
-    let bin = bincode::serialize(&*analysis_ro).expect("bincode FileAnalysis");
-    let mut analysis: FileAnalysis = bincode::deserialize(&bin).expect("bincode FileAnalysis roundtrip");
-    analysis.enrich_imported_types_with_keys(Some(&module_index));
+    // The enrichment overlay (R4): the same derived, fingerprint-keyed
+    // enriched copy the diagnostics sweep reads — imported return types
+    // visible, shared Arc untouched. Degrade to the whole view when the
+    // overlay declines (cycle guard).
+    let analysis = module_index.enriched_snapshot(&cached).unwrap_or_else(|| {
+        // Overlay declined (serde break / byte-cap giant / cycle taint):
+        // dump unenriched, LOUDLY — silent degrade here looks exactly like
+        // the inference bug the user is debugging.
+        eprintln!(
+            "warning: enrichment overlay declined for {path}; cross-file return \
+             types will be missing from this dump"
+        );
+        file_analysis::CrossFileLookup::whole_present(&module_index, &cached)
+    });
 
     // Collect subs/methods declared inside this package.
     let mut subs: Vec<&file_analysis::Symbol> = analysis
@@ -2367,6 +2424,163 @@ fn heatmap_symbol_row(
     (row, is_callable, dead)
 }
 
+/// --refs-parity <root> — the relational-ref-index migration net
+/// (`docs/adr/relational-ref-index.md`). Mints the CandidateSet at every
+/// heatmap-eligible symbol declaration (Perl workspace + pack files) and
+/// projects `references()` twice — resident scan (`PERL_LSP_REF_ROWS=0`) vs
+/// SQL retrieval (`=1`) — asserting identical (file, span, access,
+/// rewritable) sets. Exit 1 on any divergence. A dev/CI net, not a user
+/// verb: run it against a real corpus after touching `refs_to`, the shred,
+/// or the eviction seams.
+fn cli_refs_parity(root: &str, sample: Option<usize>) {
+    // The A/B needs the resident side complete: keep refs + bags resident
+    // (rows are still written — eviction and persistence are independent).
+    std::env::set_var("PERL_LSP_NO_EVICT", "1");
+    let (ws, idx) = cli_full_startup(root);
+    let scope = override_scope_from_env();
+
+    let mut pack_entries: Vec<(
+        std::path::PathBuf,
+        std::sync::Arc<file_analysis::FileAnalysis>,
+        std::sync::Arc<module_index::ModuleIndex>,
+    )> = Vec::new();
+    idx.for_each_pack_index(|_lang, pack| {
+        pack.for_each_registered_file(&mut |cached| {
+            // Index copies are refs-evicted; fan-out scans + set minting read
+            // refs, so take the refs-present view (resident when not evicted,
+            // rehydrated otherwise). Batch-CLI-sized cost, not a query path.
+            pack_entries.push((
+                cached.path.clone(),
+                file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cached),
+                std::sync::Arc::clone(pack),
+            ));
+        });
+    });
+    pack_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
+        .workspace_raw()
+        .iter()
+        .map(|e| {
+            // Workspace copies may be refs-evicted; fan-out scans + set
+            // minting read refs, so take the refs-present view.
+            let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
+                e.key().clone(),
+                std::sync::Arc::clone(e.value()),
+            ));
+            (
+                e.key().clone(),
+                file_analysis::CrossFileLookup::whole_present(&idx, &cm),
+            )
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let normalize = |locs: &[resolve::RefLocation]| -> Vec<String> {
+        let mut v: Vec<String> = locs
+            .iter()
+            .map(|l| {
+                format!(
+                    "{:?}:{}:{}-{}:{}:{:?}:{}",
+                    l.key,
+                    l.span.start.row,
+                    l.span.start.column,
+                    l.span.end.row,
+                    l.span.end.column,
+                    l.access,
+                    l.rewritable
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+
+    // `--sample=N` strides the symbol universe down to ~N checks — the
+    // per-phase quick net (~a minute). The full sweep (no flag) is the
+    // pre-merge gate: it re-runs the OLD O(symbols × tree) resident walk
+    // per symbol, so it is heatmap×2-shaped by construction.
+    let mut seen_symbols = 0usize;
+    let total_symbols: usize = entries.iter().map(|(_, a)| a.symbols.len()).sum::<usize>()
+        + pack_entries.iter().map(|(_, a, _)| a.symbols.len()).sum::<usize>();
+    let stride = sample
+        .map(|n| (total_symbols / n.max(1)).max(1))
+        .unwrap_or(1);
+    let mut checked = 0usize;
+    let mut mismatched = 0usize;
+    let mut check = |ws: &file_store::FileStore,
+                     routing: &dyn file_analysis::CrossFileLookup,
+                     path: &std::path::Path,
+                     analysis: &file_analysis::FileAnalysis,
+                     is_pack: bool,
+                     checked: &mut usize,
+                     mismatched: &mut usize| {
+        for sym in &analysis.symbols {
+            seen_symbols += 1;
+            if seen_symbols % stride != 0 {
+                continue;
+            }
+            if sym.hidden_in_outline() || !heatmap_symbol_eligible(sym) {
+                continue;
+            }
+            if *checked % 200 == 0 && *checked > 0 {
+                eprintln!("refs-parity: {} checked...", *checked);
+            }
+            let mut cs = resolve::resolve(
+                ws,
+                analysis,
+                file_store::FileKey::Path(path.to_path_buf()),
+                sym.selection_span.start,
+                Some(routing),
+                scope,
+            );
+            if is_pack {
+                cs = cs.pack_routed();
+            } else {
+                cs = cs.with_visibility(resolve::RoleMask::VISIBLE);
+            }
+            resolve::set_ref_rows_override(Some(false));
+            let resident = normalize(&cs.references());
+            resolve::set_ref_rows_override(Some(true));
+            let rows = normalize(&cs.references());
+            resolve::set_ref_rows_override(None);
+            *checked += 1;
+            if resident != rows {
+                *mismatched += 1;
+                let only_resident: Vec<_> =
+                    resident.iter().filter(|x| !rows.contains(x)).take(3).collect();
+                let only_rows: Vec<_> =
+                    rows.iter().filter(|x| !resident.contains(x)).take(3).collect();
+                eprintln!(
+                    "PARITY MISMATCH {}::{} @ {:?} — resident {} vs rows {}\n  only-resident: {:?}\n  only-rows: {:?}",
+                    sym.package.as_deref().unwrap_or(""),
+                    sym.name,
+                    path,
+                    resident.len(),
+                    rows.len(),
+                    only_resident,
+                    only_rows
+                );
+            }
+        }
+    };
+
+    for (path, analysis) in &entries {
+        check(&ws, &idx, path, analysis, false, &mut checked, &mut mismatched);
+    }
+    for (path, analysis, pack) in &pack_entries {
+        check(&ws, pack.as_ref(), path, analysis, true, &mut checked, &mut mismatched);
+    }
+
+    println!(
+        "refs-parity: {} symbols checked, {} mismatched",
+        checked, mismatched
+    );
+    if mismatched > 0 {
+        std::process::exit(1);
+    }
+}
+
 /// --heatmap <root> [--csv|--html] [--include-deps] [--all] — Code-usage heatmap.
 ///
 /// Emits per-symbol USAGE metrics as a projection of the resolution
@@ -2416,9 +2630,12 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     )> = Vec::new();
     idx.for_each_pack_index(|_lang, pack| {
         pack.for_each_registered_file(&mut |cached| {
+            // Index copies are refs-evicted; fan-out scans + set minting read
+            // refs, so take the refs-present view (resident when not evicted,
+            // rehydrated otherwise). Batch-CLI-sized cost, not a query path.
             pack_entries.push((
                 cached.path.clone(),
-                std::sync::Arc::clone(&cached.analysis),
+                file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cached),
                 std::sync::Arc::clone(pack),
             ));
         });
@@ -2461,7 +2678,18 @@ fn cli_heatmap(root: &str, opts: &[String]) {
     let mut entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
         .workspace_raw()
         .iter()
-        .map(|e| (e.key().clone(), std::sync::Arc::clone(e.value())))
+        .map(|e| {
+            // Workspace copies may be refs-evicted; fan-out scans + set
+            // minting read refs, so take the refs-present view.
+            let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
+                e.key().clone(),
+                std::sync::Arc::clone(e.value()),
+            ));
+            (
+                e.key().clone(),
+                file_analysis::CrossFileLookup::whole_present(&idx, &cm),
+            )
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
