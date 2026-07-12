@@ -542,21 +542,40 @@ profile if CI minutes ever matter (options: per-process blob-decode
 memo, or NO_EVICT in the harness at the cost of blinding the eviction
 nets).
 
-## Intermittent cold-start flake — 2026-07-07 — OPEN (investigation)
+## Intermittent cold-start flake — 2026-07-07 — CLOSED as watch-with-tripwires (2026-07-12)
 
 Twice this branch, a COLD gold run misbehaved and was clean on
 immediate rerun: once 3 FAILs, once 372 PASS / 41 FAIL / 5 XPASS with an
 impossibly fast wall (88s vs ~300-500s) — the "inputs vanished,
 absence-as-answer" signature (diagnostics XPASS = typeless sweep). Both
 occurrences ran immediately after (or concurrent with) heavy build/test
-activity on the same box; 4 deliberate cold passes after the second
-occurrence were all clean, as were all committed-gate colds. Suspects:
-the two-writer startup window (resolver thread + workspace indexer on
-one modules.db) under load — a busy-timeout expiry making one writer
-run cache-less that session (post-hygiene this is a clean None, but the
-session's strips then key on the OTHER writer's rows), or a
-strip-before-persist window the tripwire doesn't cover on the Perl
-tier. Next probe: cold gold under artificial CPU/IO load with
-PERL_LSP_TIMINGS + a Perl-tier residency tripwire; the harness could
-also assert per-fixture wall lower bounds so a too-fast cold fails
-loudly instead of scoring wrong answers.
+activity on the same box. Suspects at the time: the two-writer startup
+window (resolver thread + workspace indexer on one modules.db) under
+load, or a strip-before-persist window on the Perl tier.
+
+The nets, all landed: `PERL_LSP_STRICT_RESIDENCY=1` (set by the gold
+harness) makes a rehydration miss on an evicted copy PANIC with the
+failing stage named — a compromised session dies as CRASH rows instead
+of scoring wrong answers; `rehydration_miss_count` counts the same
+degrades in live servers; the workspace tier got the residency tripwire
+the pack tier had (shared `residency_tripwire` speller, strict-fatal in
+release).
+
+Probe result: 3 fully-cold gold runs under saturating CPU (4 busy
+loops) + fsync-churn IO load — all 432/17/0/0/0, zero strict
+violations, walls honestly degraded (~335s vs ~245s quiet). No repro.
+
+First blood went to the net itself, immediately on arming: the strict
+baseline caught a DETERMINISTIC absence-as-answer bug — the whole-view
+workspace sweep handed PERL paths to the routed PACK sub-index, whose
+loader (modules-{lang}.db) can never serve them, so cross-TU cpp
+references silently dropped every Perl workspace file's matches. Fixed
+at the mechanism: `rehydrate_or_resident` routes a foreign path to the
+owning sibling tier (sub-index → the hub's rehydration cell, hub → the
+registering pack sibling; one hop, cache-only, no recursion). That bug
+postdates the original flake occurrences and does not explain them.
+
+Standing state: any recurrence now fails LOUDLY in gold (named stage,
+CRASH row) and is countable in servers. If it never fires again, the
+original occurrences stay attributed to the pre-hygiene two-writer
+window whose fixes have since landed.
