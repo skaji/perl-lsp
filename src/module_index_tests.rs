@@ -992,3 +992,36 @@ fn transitive_enrichment_mutual_import_terminates_without_poison() {
     // Deterministic + no poison: a second call re-declines identically.
     assert!(idx.enriched_snapshot(&a).is_none());
 }
+
+/// The rehydration-miss tripwire's observable: an evicted registered copy
+/// with no rehydration source (no bag cache installed) is served as the
+/// stripped resident AND counted — the "absence-as-answer" signature the
+/// strict gate (`PERL_LSP_STRICT_RESIDENCY`) turns into a loud crash.
+/// Strict mode is off in tests, so this exercises the counting arm.
+#[test]
+fn rehydration_miss_is_counted_and_serves_resident() {
+    let idx = ModuleIndex::new_for_test();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let src = "package Ghost;\nsub boo { return 1 }\n1;\n";
+    let tree = parser.parse(src, None).unwrap();
+    let mut fa = crate::builder::build(&tree, src.as_bytes());
+    fa.evict_axes(true, true);
+    let cm = Arc::new(CachedModule::new(
+        PathBuf::from("/fake/Ghost.pm"),
+        Arc::new(fa),
+    ));
+
+    let before = crate::module_index::rehydration_miss_count();
+    let served = crate::file_analysis::CrossFileLookup::bag_present(&idx, &cm);
+    assert!(
+        Arc::ptr_eq(&served, &cm.analysis),
+        "miss degrades to the stripped resident copy, never fabricates"
+    );
+    assert!(
+        crate::module_index::rehydration_miss_count() > before,
+        "the miss must be counted — silent absence is the flake signature"
+    );
+}

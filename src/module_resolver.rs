@@ -936,6 +936,11 @@ pub fn index_workspace_with_index(
     let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
     let timing = crate::timings::is_enabled();
 
+    // Deliberate whole-copy accounting for the workspace-tier residency
+    // tripwire — the Perl twin of the pack indexer's counter.
+    let expected_whole = Arc::new(AtomicUsize::new(0));
+    let expected_whole_writer = Arc::clone(&expected_whole);
+
     // The Connection moves INTO the writer thread (rusqlite connections are
     // Send, not Sync); nothing after the scope needs it.
     let writer_conn = conn;
@@ -1007,6 +1012,9 @@ pub fn index_workspace_with_index(
                         files.insert_workspace_arc(e.path.clone(), arc.clone());
                         if let Some(idx) = module_index {
                             let _ = idx.register_workspace_resident(e.path.clone(), arc);
+                            // A deliberate whole pin — account it so the
+                            // tripwire flags only UNEXPLAINED residents.
+                            expected_whole_writer.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 },
@@ -1108,6 +1116,10 @@ pub fn index_workspace_with_index(
                                 let parts = idx.prepare_workspace_parts(analysis, false, false);
                                 let arc = std::sync::Arc::clone(parts.arc());
                                 idx.register_workspace_residency(canon.clone(), parts);
+                                // Deliberate whole pin (unpersistable /
+                                // degraded / NO_EVICT) — accounted for the
+                                // tripwire.
+                                expected_whole.fetch_add(1, Ordering::Relaxed);
                                 arc
                             }
                             None => std::sync::Arc::new(analysis),
@@ -1144,6 +1156,18 @@ pub fn index_workspace_with_index(
         let _ = writer.join();
     });
 
+    // Workspace-tier residency tripwire, mirroring the pack indexer's:
+    // gated off under NO_EVICT (everything is deliberately whole there).
+    if let Some(idx) = module_index {
+        if eviction_enabled() {
+            residency_tripwire(
+                "workspace",
+                idx.count_fully_resident(),
+                expected_whole.load(Ordering::Relaxed),
+            );
+        }
+    }
+
     count.load(Ordering::Relaxed)
 }
 
@@ -1162,6 +1186,43 @@ pub fn index_workspace_with_index(
 /// lever for isolating an eviction-caused regression.
 pub(crate) fn eviction_enabled() -> bool {
     std::env::var_os("PERL_LSP_NO_EVICT").is_none()
+}
+
+/// `PERL_LSP_STRICT_RESIDENCY=1`: residency invariant breaks (an evicted
+/// copy that can't rehydrate, a tripwire overrun) PANIC instead of
+/// degrading. The gold harness sets it so a session serving
+/// absence-as-answer dies as a CRASH row (hard fail) rather than scoring
+/// wrong answers — the cold-flake net. Off by default: a live server
+/// prefers degraded-but-useful.
+pub(crate) fn strict_residency() -> bool {
+    std::env::var_os("PERL_LSP_STRICT_RESIDENCY").is_some_and(|v| v != "0")
+}
+
+/// The post-bulk-index residency check, one speller for the pack tier and
+/// the Perl workspace tier: fully-resident registered copies beyond the
+/// deliberately-accounted ones (writer fallbacks, degraded/unpersisted
+/// analyses) mean a registration path is silently pinning whole analyses —
+/// the RAM regression no functional test can see. `debug_assert` catches it
+/// in `cargo test`; strict mode makes it fatal in release (the gold net).
+fn residency_tripwire(tier: &str, whole: usize, expected: usize) {
+    if whole <= expected {
+        return;
+    }
+    log::error!(
+        "residency tripwire ({tier}): {whole} fully-resident copies, only \
+         {expected} accounted (writer fallbacks / degraded) — a registration \
+         path is pinning whole analyses"
+    );
+    debug_assert!(
+        false,
+        "residency tripwire ({tier}): {whole} fully-resident > {expected} accounted"
+    );
+    if strict_residency() {
+        panic!(
+            "PERL_LSP_STRICT_RESIDENCY: residency tripwire ({tier}): {whole} \
+             fully-resident copies, only {expected} accounted"
+        );
+    }
 }
 
 /// Persist one module's generation: blob + its relational ref rows, always
@@ -1670,19 +1731,11 @@ pub fn index_pack_languages(
             let _ = writer.join();
         });
         if strip {
-            let whole = pack_index.count_fully_resident();
-            let expected = expected_whole.load(Ordering::Relaxed);
-            if whole > expected {
-                log::error!(
-                    "residency tripwire ({lang}): {whole} fully-resident copies, only \
-                     {expected} accounted (writer fallbacks / degraded) — a registration \
-                     path is pinning whole analyses"
-                );
-                debug_assert!(
-                    false,
-                    "residency tripwire ({lang}): {whole} fully-resident > {expected} accounted"
-                );
-            }
+            residency_tripwire(
+                &lang.to_string(),
+                pack_index.count_fully_resident(),
+                expected_whole.load(Ordering::Relaxed),
+            );
         }
         hub.attach_pack_index(lang, pack_index);
     }

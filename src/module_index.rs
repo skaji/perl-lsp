@@ -35,6 +35,21 @@ pub use crate::file_analysis::{CachedModule, SubInfo};
 
 type InferredTypeOwned = crate::file_analysis::InferredType;
 
+/// Rehydration misses on evicted copies this process served degraded
+/// (`rehydrate_or_resident`'s invariant-break arm). Process-global: the
+/// residency story spans the hub and every pack sub-index, and the flake
+/// this polices ("inputs vanished" cold runs) is a per-process verdict.
+static REHYDRATION_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many evicted copies failed to rehydrate this process (each was
+/// served as a stripped resident — quietly incomplete answers). Zero in a
+/// healthy session; the strict gate (`PERL_LSP_STRICT_RESIDENCY`) panics
+/// at the first miss instead of counting.
+pub fn rehydration_miss_count() -> usize {
+    REHYDRATION_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Mint a fresh monotonic registration generation for `path`. The enrichment
 /// key's ABA-proof identity token: a re-registration (or an @INC re-resolve)
 /// bumps the gen, moving every consumer's key — where a bare Arc pointer
@@ -1683,20 +1698,36 @@ impl ModuleIndex {
     /// genuinely fact-less file. One body serves `bag_present` and
     /// `refs_present`: the miss policy and LRU selection must never diverge
     /// between the type path and the reference path.
+    ///
+    /// A miss here is ALWAYS an invariant break in-session: eviction is
+    /// licensed only by a committed blob (persist-first), so an evicted
+    /// registered copy that can't rehydrate means the blob vanished under
+    /// us (a second writer's generation clobber, an external cache clear)
+    /// or was never readable. Degrading keeps the server useful; the
+    /// counter + strict mode keep it HONEST — under
+    /// `PERL_LSP_STRICT_RESIDENCY=1` (the gold harness sets it) the miss
+    /// panics so a run serving absence-as-answer fails loudly instead of
+    /// scoring wrong results.
     fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         if let Some(bc) = self.bag_cache_ref() {
             if let Some(full) = bc.bag_for(&cached.path) {
                 return full;
             }
         }
-        // Warn, not debug: an evicted copy whose blob can't rehydrate means
-        // references/types for this file are quietly incomplete this session
-        // (the next warm start re-parses it — decode failures invalidate the
-        // row's stamp match by re-analysis).
-        log::warn!(
-            "rehydration miss for evicted copy {:?} — serving stripped resident",
+        REHYDRATION_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::error!(
+            "rehydration miss for evicted copy {:?} — serving stripped resident \
+             (references/types for this file are quietly incomplete this session)",
             cached.path
         );
+        if crate::module_resolver::strict_residency() {
+            panic!(
+                "PERL_LSP_STRICT_RESIDENCY: evicted copy {:?} failed to rehydrate — \
+                 its blob is unreadable or vanished post-eviction (writer generation \
+                 clobber / external cache clear). Refusing to serve absence-as-answer.",
+                cached.path
+            );
+        }
         cached.analysis.clone()
     }
 

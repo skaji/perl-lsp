@@ -74,6 +74,13 @@ unless (-d $corpus) {
 my ($arch) = grep { -d } glob("$corpus/*/auto") ? map { s{/auto$}{}r } glob("$corpus/*/auto") : ();
 $ENV{PERL5LIB} = join(':', grep { defined && length } $corpus, $arch, $ENV{PERL5LIB});
 
+# Strict residency: a server that would serve absence-as-answer (an evicted
+# copy whose blob can't rehydrate, an unaccounted whole-copy pin) PANICS —
+# the row scores as a crash (hard fail) instead of quietly-wrong results.
+# The net for the intermittent "inputs vanished" cold flake; override with
+# PERL_LSP_STRICT_RESIDENCY=0 to reproduce the degraded behavior on purpose.
+$ENV{PERL_LSP_STRICT_RESIDENCY} //= '1';
+
 my %CAP = (
     'definition'         => { flag => '--definition',        root => 1, file => 1, lc => 1 },
     'references'         => { flag => '--references',         root => 1, file => 1, lc => 1 },
