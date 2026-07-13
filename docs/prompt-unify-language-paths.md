@@ -1,5 +1,11 @@
 # Unify Perl into the generic language path (kill the parallel paths)
 
+> Prerequisite: `docs/prompt-unify-semantic-tiers.md` (one witness
+> engine, per-language emitters — emission library, neutral fold,
+> enrichment policy). Land that first: every serving-path fork below
+> hides behind "pack types work differently", and the semantic
+> unification removes the excuse.
+
 Design debt, flagged during the C++ cross-file work. Today Perl and the
 pack languages (C++/Python/R/…) run on **parallel paths** at several
 layers. They were built that way because Perl came first (bespoke) and the
