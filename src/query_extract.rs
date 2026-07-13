@@ -313,7 +313,7 @@ fn brace_body_extent(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
 
 impl SkeletonAnalysis {
     /// Re-anchor members that lost their enclosing container to a tree-sitter
-    /// misparse — the re-anchor invariant (`docs/prompt-json-reanchor.md`).
+    /// misparse — the re-anchor invariant (`docs/adr/config-superposition-declarations.md`).
     /// When a deep misparse truncates a `class_specifier`/`namespace` node
     /// (json.hpp's `basic_json`: a `#if` in ctor-initializer position closes
     /// the class ~4400 lines early), every member after the truncation becomes
@@ -1227,7 +1227,7 @@ pub struct LangPack {
     /// container's body braces on the ORIGINAL source
     /// (`reanchor_truncated_containers`). True for C/C++; false for
     /// indentation-scoped (Python) or non-nesting packs.
-    /// `docs/prompt-json-reanchor.md`.
+    /// `docs/adr/config-superposition-declarations.md`.
     pub brace_scoped_members: bool,
     /// Completion trigger characters for the LSP
     /// `completionProvider.triggerCharacters` slot — the client auto-fires

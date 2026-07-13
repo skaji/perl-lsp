@@ -3,7 +3,7 @@
 Base: `spike/cpp-support` @ `088da995` (EXTRACT_VERSION 162), the commit
 right after Memory Slice 2 landed. Companion runbook:
 `docs/clangd-benchmark-procedure.md` (exact commands to reproduce every
-number below). Prior scouting brief: `docs/prompt-clangd-perf-comparison.md`.
+number below).
 
 **Tooling used to measure**: `e2e/compare-clangd.sh` (existing, correctness
 differential) + `e2e/lsp_latency.py` (new, added by this pass — a minimal
@@ -125,7 +125,8 @@ same-corpus pair — the strongest number in this report.
   fixture `gold-corpus/cpp-fixture/multitu/` (references from both decl and
   use anchors reaches every including TU incl. the `_test.cc`, and excludes a
   TU that includes the header but never names the symbol — precision, not
-  just recall). Root-cause writeup: `docs/prompt-cpp-cross-tu-refs.md`.
+  just recall). Root cause: a 0-based vs 1-based coordinate artifact, not a
+  real ref gap.
 
 **Net honest read on the differentiator axis**: whole-tree *file coverage*,
 cross-file *goto-def/hover*, AND whole-tree *references* completeness — the

@@ -926,7 +926,7 @@ fn sksym(src: &str, kind: &str, name: &str, occ: usize, package: Option<&str>) -
     }
 }
 
-/// The re-anchor invariant (`docs/prompt-json-reanchor.md`): when a deep
+/// The re-anchor invariant (`docs/adr/config-superposition-declarations.md`): when a deep
 /// misparse truncates a `class_specifier`, its late members become siblings in
 /// the enclosing scope and lose their `package` (json.hpp `basic_json`: ~4400
 /// lines fall through to `nlohmann`). The recovery brace-matches the ORIGINAL
@@ -1904,7 +1904,7 @@ fn cpp_dangling_arrow_keeps_provable_mismatches() {
     // intervening `}`. (A mismatch whose receiver DECLARATION the dangling
     // expression greedily consumes is genuinely unprovable in the recovered
     // tree — its type is gone — and is left out rather than guessed: that
-    // narrow loss is documented in docs/hitlist-4.md Family D.)
+    // narrow loss is a recovered-tree limitation, not a bug.)
     let src = "\
 struct Box { int w; };
 void f() {

@@ -96,7 +96,7 @@ Hardening:
 
 QA tail:
 - MAIN-1 (`main::` across `require`) and H1 (duplicate packages) —
-  designs in `qa-design-items.md`. MooseX::Role::Parameterized — no
+  designs in `docs/open-problems.md`. MooseX::Role::Parameterized — no
   design yet.
 - Per-row known gaps: `gold-corpus/KNOWN-GAPS.md` (xfail rows are the
   live tracker).

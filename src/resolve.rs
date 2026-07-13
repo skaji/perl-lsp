@@ -3273,7 +3273,7 @@ pub fn implementations_of(
     // On a class/package name: the specialization FAMILY view — every spec
     // of the primary template (`formatter` → all `formatter<...>` defs).
     // gr on the primary stays "uses of the primary"; the family is this
-    // verb's answer (fork 4, docs/prompt-template-arc.md).
+    // verb's answer (fork 4, docs/adr/cpp-templates.md).
     if matches!(target.kind, TargetKind::Package) {
         return specialization_family(origin, module_index, &target.name);
     }

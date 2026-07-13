@@ -10,7 +10,7 @@ markers are point-in-time; the *structure* is the durable part.
 
 ## THE MACRO/SEMANTIC ARC — landed (the dogfooding→design→queue run)
 
-The full arc, from "cpp-lsp is completely useless" (hitlist.md, real op.c/fmt
+The full arc, from "cpp-lsp is completely useless" (real op.c/fmt
 dogfooding) to a semantic macro layer. The durable shape: **every C construct,
 correctly named, turned out to BE a Perl construct** — config-variant macro =
 superposition (arm-fold), field-block copypasta = role (`with` edge), include =
@@ -52,15 +52,14 @@ selection + the unified projection engine ✅ (`src/projection.rs`). THE
 MIGRATION landed: the resolution CandidateSet (PR #107, merged to main)
 now runs the spike too — visibility/edges/ranking are construction facts,
 inherited by every projection, both languages. Heatmap #99 migrated onto
-`references()`. Full ledger + parked list:
-`docs/session-2026-07-03-summary.md`. Dogfood round 2 findings AND the
-landed fix run: `docs/hitlist-2.md` (all five slices A–E landed — see
-queue #9; residuals pinned in `gold-corpus/KNOWN-GAPS.md`).
+`references()`. Parked list: `docs/PARKED.md`; dogfood round 2 landed all
+five slices A–E (see queue #9; residuals pinned in
+`gold-corpus/KNOWN-GAPS.md`).
 
 ## STATE @ 2026-07-05 — hitlist-4 families + heatmap-cpp + refs reach
 
-Dogfood round on op.c/op.h (`docs/hitlist-4.md`) root-caused six findings
-into four families, all landed. Durable structure:
+A dogfood round on op.c/op.h root-caused six findings into four families,
+all landed. Durable structure:
 
 - **Family A/C/D** are the KNOWN-LIVE-BUGS flips below (`OP` gd fn-like-macro
   arbitration; macro-body member field payload; DEEP-receiver peel hint +
@@ -70,7 +69,7 @@ into four families, all landed. Durable structure:
 - **heatmap-into-cpp** — `--heatmap` lights up for pack languages: per-symbol
   fan-in/fan-out over the pack sub-indexes (fan-in routes through each pack's
   own cache, not the Perl hub), a pack-language usage/dead-code view.
-  `docs/prompt-heatmap.md`.
+  `docs/adr/heatmap.md`.
 - **macro-body ref indexing** — a macro name used inside another macro's
   `#define` body mints a read at its span (`macro_body_name_refs`), so gr on
   `SvFLAGS`/`SvANY` reaches nested-macro uses. Cross-file-closure reach is the
@@ -129,7 +128,7 @@ into four families, all landed. Durable structure:
    bag. **Lands on MAIN first** (the seam isn't cpp-specific), then
    main→spike merge migrates the cpp axes (ScopedLookup/delegation/
    FileScopeValue) into it as the template arc's opening slice.
-6d. ✅ **arc-review fix waves** (`docs/arc-review-findings.md`) — wave 1:
+6d. ✅ **arc-review fix waves** — wave 1:
    C1 gr visibility gating + C2 rename full-or-refuse + H2 path/range
    splice + H3 brace-init + H4 span-remap; wave 2a: cache lifecycle
    (H1/M1/M2/H8/M7 — in-session header edits propagate, trustworthy persist
@@ -145,7 +144,7 @@ into four families, all landed. Durable structure:
    `module_paths` driver method, `scope_depth`, `NominalDomain.storage`),
    kept-as-spike PoC modules explicitly annotated, history-narrating
    comments rewritten, both feature builds warning-clean.
-8. ✅ **TEMPLATE ARC** — brief in `docs/prompt-template-arc.md`; all three
+8. ✅ **TEMPLATE ARC** (`docs/adr/cpp-templates.md`) — all three
    slices landed. (a) spec identity + Specializes edge, explicit-inst
    outline, aliases/concepts, ScopeKind fix, union DX. (b) the instance
    joins the class (`ParametricType::Instance`, exact-spelling dispatch).
@@ -160,8 +159,7 @@ into four families, all landed. Durable structure:
    share the worklist/seen-set/provenance spine). Parked residue: the
    deduction/dependent-type rungs, template-template params,
    `extern template` ERROR parse (see the brief's parked list).
-9. ✅ **hitlist-2 fix run** (`docs/hitlist-2.md`, dogfood round 2 → five
-   slices, all landed). A: one canonical `FileScopeValue` macro identity
+9. ✅ **dogfood round 2 fix run** (five slices, all landed). A: one canonical `FileScopeValue` macro identity
    from every spelling (gr grep-exact on the abseil guards). B: one-symbol
    verbs keyed on owner class / namespace / spec ladder (member gr 1621 →
    17 real; qualified calls participate; arity evaluated-not-taken). C:
@@ -233,8 +231,7 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              evict the bag from pack-workspace analyses + rehydrate on demand
              from the 26 MB SQLite blob into a byte-capped LRU; targets
              ~0.5 GB, completeness-preserving (refs/symbols/name-index stay
-             pinned). `docs/adr/memory-slice-2-lru.md` +
-             `docs/prompt-memory-slice-2.md`. EXTRACT_VERSION unchanged.
+             pinned). `docs/adr/memory-slice-2-lru.md`. EXTRACT_VERSION unchanged.
 
        FLOW DIFFERENTIATORS (where a flow-aware engine beats clangd):
          · dynamic_cast + `std::optional` engaged narrowing  ✅
@@ -307,7 +304,7 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
              `typedef struct op OP` wins the candidate lane. rule #10 clean
              (the macro's own arity gates it, no name allowlist).
 
-       TABLE STAKES — the ship gate (dogfooding, hitlist.md). The honest
+       TABLE STAKES — the ship gate (dogfooding). The honest
          read: the DIFFERENTIATORS (narrowing, use-after-move, function-scope)
          sat on a core tier that under-emitted for cpp — ONE core-emission gap
          wearing six hats. The LSP surfaces are thin adapters over

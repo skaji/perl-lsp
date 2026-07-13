@@ -94,9 +94,8 @@ quoting a peak.
 
 This is the number that matters for "does the editor feel responsive on
 open" — NOT the CLI `--batch`/`--references` paths, which under- or
-over-report relative to the real async server (see `docs/prompt-clangd-perf-comparison.md`'s
-original warning, confirmed true; extends to the CLI `--references` path
-too — see the coverage caveats in `docs/clangd-comparison.md`).
+over-report relative to the real async server; this extends to the CLI
+`--references` path too — see the coverage caveats in `docs/clangd-comparison.md`.
 
 ```bash
 python3 e2e/lsp_latency.py --bin ./target/release/perl-lsp \

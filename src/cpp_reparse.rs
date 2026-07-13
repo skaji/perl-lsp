@@ -2551,7 +2551,7 @@ pub fn evict_analysis_caches(files: &std::collections::HashSet<std::path::PathBu
 /// memo of each source file's include-closure merge — never read by any other
 /// file's gather (that only consults `header_cache`), disk-backed, and cheaply
 /// re-derived from the warm shared header table on a later on-edit re-gather.
-/// See `docs/prompt-bounded-memory.md` (Slice 1). Content-edit invalidation
+/// See `docs/adr/memory-slice-2-lru.md`. Content-edit invalidation
 /// must NOT use this — a changed header's own `header_cache` entry has to go,
 /// so that path calls `evict_analysis_caches` (drops headers too).
 pub fn evict_gather_caches_keep_headers(files: &std::collections::HashSet<std::path::PathBuf>) {
