@@ -525,6 +525,162 @@ fn shred_sym_rows_same_generation() {
     let _ = std::fs::remove_file(&pm);
 }
 
+/// `FLAG_EXPORTED` is minted from the real `@EXPORT`/`@EXPORT_OK` surface
+/// (`exports_name`), so the rows agree with the source the Surface projects —
+/// never a parallel notion of exportedness.
+#[test]
+fn flag_exported_minted_from_exports_source() {
+    let dir = std::env::temp_dir();
+    let pm = dir.join("UE_Flags.pm");
+    let src = "package UE::Flags;\n\
+        our @EXPORT = qw(alpha);\n\
+        our @EXPORT_OK = qw(beta);\n\
+        sub alpha { 1 }\n\
+        sub beta { 2 }\n\
+        sub gamma { 3 }\n1;\n";
+    std::fs::write(&pm, src).unwrap();
+    let cached = parse_source_to_cached(src, &pm);
+    let seeds = cached.analysis.sym_row_seeds();
+    let exported = |name: &str| {
+        seeds
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.flags & crate::file_analysis::SymRowSeed::FLAG_EXPORTED != 0)
+    };
+    assert_eq!(exported("alpha"), Some(true), "@EXPORT member is flagged");
+    assert_eq!(exported("beta"), Some(true), "@EXPORT_OK member is flagged");
+    assert_eq!(exported("gamma"), Some(false), "non-exported sub is not flagged");
+    // The flag must never diverge from the source it is baked from.
+    assert!(cached.analysis.exports_name("alpha"));
+    assert!(cached.analysis.exports_name("beta"));
+    assert!(!cached.analysis.exports_name("gamma"));
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// The unused-exports view: exported syms with zero CROSS-FILE reference rows.
+/// Same-file refs are excluded (an export used only internally is dead to
+/// consumers); a cross-file consumer keeps an export live; a non-exported sym
+/// is never listed.
+#[test]
+fn unused_exports_view() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+
+    // Producer exports three subs: `lonely` (used nowhere), `used` (a consumer
+    // calls it), `internal_only` (referenced only in its own file).
+    let prod = dir.join("UE_Producer.pm");
+    let prod_src = "package UE::Producer;\n\
+        our @EXPORT_OK = qw(lonely used internal_only);\n\
+        sub lonely { 1 }\n\
+        sub used { 2 }\n\
+        sub internal_only { 3 }\n\
+        sub caller_here { internal_only(); }\n1;\n";
+    std::fs::write(&prod, prod_src).unwrap();
+    let prod_cached = parse_source_to_cached(prod_src, &prod);
+    let prod_path = prod.to_string_lossy().to_string();
+    let prod_refs: Vec<_> = prod_cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let prod_syms = prod_cached.analysis.sym_row_seeds();
+    shred_derived_rows(&conn, &prod_path, "workspace", &prod_refs, &prod_syms).unwrap();
+
+    // Consumer in ANOTHER file references `used`.
+    let cons = dir.join("UE_Consumer.pm");
+    let cons_src = "package UE::Consumer;\n\
+        use UE::Producer qw(used);\n\
+        sub go { used(); }\n1;\n";
+    std::fs::write(&cons, cons_src).unwrap();
+    let cons_cached = parse_source_to_cached(cons_src, &cons);
+    let cons_path = cons.to_string_lossy().to_string();
+    let cons_refs: Vec<_> = cons_cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let cons_syms = cons_cached.analysis.sym_row_seeds();
+    shred_derived_rows(&conn, &cons_path, "workspace", &cons_refs, &cons_syms).unwrap();
+
+    let dead: std::collections::HashSet<String> =
+        unused_exported_syms(&conn).into_iter().map(|d| d.name).collect();
+
+    assert!(dead.contains("lonely"), "exported, unreferenced → dead: {dead:?}");
+    assert!(
+        dead.contains("internal_only"),
+        "same-file use does not make an export live: {dead:?}"
+    );
+    assert!(
+        !dead.contains("used"),
+        "a cross-file consumer keeps the export live: {dead:?}"
+    );
+    assert!(
+        !dead.contains("caller_here"),
+        "a non-exported sub is never a dead export: {dead:?}"
+    );
+
+    let _ = std::fs::remove_file(&prod);
+    let _ = std::fs::remove_file(&cons);
+}
+
+/// A candidate ref row in another file suppresses the dead-export flag even
+/// when it is the ONLY reference — the view's nonzero side is "unknown, not
+/// used", so any cross-file candidate is enough to withhold the verdict.
+#[test]
+fn unused_exports_view_cross_file_candidate_suppresses() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+
+    let prod = dir.join("UE2_Producer.pm");
+    let prod_src = "package UE2::Producer;\n\
+        our @EXPORT_OK = qw(widget);\n\
+        sub widget { 1 }\n1;\n";
+    std::fs::write(&prod, prod_src).unwrap();
+    let prod_cached = parse_source_to_cached(prod_src, &prod);
+    let prod_path = prod.to_string_lossy().to_string();
+    let prod_syms = prod_cached.analysis.sym_row_seeds();
+    // Producer has no ref rows of its own.
+    shred_derived_rows(&conn, &prod_path, "workspace", &[], &prod_syms).unwrap();
+
+    // Before any consumer: dead.
+    let dead0: std::collections::HashSet<String> =
+        unused_exported_syms(&conn).into_iter().map(|d| d.name).collect();
+    assert!(dead0.contains("widget"), "no consumer yet → dead: {dead0:?}");
+
+    // A consumer references it exactly once, cross-file.
+    let cons = dir.join("UE2_Consumer.pm");
+    let cons_src = "package UE2::Consumer;\nsub go { UE2::Producer::widget(); }\n1;\n";
+    std::fs::write(&cons, cons_src).unwrap();
+    let cons_cached = parse_source_to_cached(cons_src, &cons);
+    let cons_path = cons.to_string_lossy().to_string();
+    let cons_refs: Vec<_> = cons_cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    assert!(
+        cons_refs.iter().any(|s| s.key == "widget"),
+        "consumer must produce a `widget` candidate row"
+    );
+    shred_derived_rows(&conn, &cons_path, "workspace", &cons_refs, &[]).unwrap();
+
+    let dead1: std::collections::HashSet<String> =
+        unused_exported_syms(&conn).into_iter().map(|d| d.name).collect();
+    assert!(!dead1.contains("widget"), "one cross-file candidate → not listed: {dead1:?}");
+
+    let _ = std::fs::remove_file(&prod);
+    let _ = std::fs::remove_file(&cons);
+}
+
+/// The general pre-prune set is exactly the DISTINCT ref-row name keys — the
+/// witness `--heatmap` uses to skip the references projection for names that
+/// have no reference row at all.
+#[test]
+fn names_with_ref_rows_is_the_distinct_key_set() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("UE_Names.pm");
+    let src = "package UE::Names;\nsub helper { 1 }\nsub go { helper(); }\n1;\n";
+    std::fs::write(&pm, src).unwrap();
+    let cached = parse_source_to_cached(src, &pm);
+    let refs: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    shred_derived_rows(&conn, &pm.to_string_lossy(), "workspace", &refs, &[]).unwrap();
+
+    let names = names_with_ref_rows(&conn);
+    assert!(names.contains("helper"), "called name has a ref row: {names:?}");
+    assert!(!names.contains("go"), "a name only DECLARED has no ref row: {names:?}");
+
+    let _ = std::fs::remove_file(&pm);
+}
+
 /// The row seeds must key by the same spelling retrieval probes: qualified
 /// calls key by their bare tail, sigil variables keep the sigil.
 #[test]

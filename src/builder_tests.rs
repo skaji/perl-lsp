@@ -1759,7 +1759,7 @@ $calc->get_self->get_config->{host};
 }
 
 /// Acceptance for the unified, tree-free expression-type chase
-/// (`docs/prompt-unify-expr-type-resolution.md`): the ref-keyed,
+/// (`docs/adr/bag-canonical.md`): the ref-keyed,
 /// `tree: None` invocant-class path and the node-keyed
 /// `resolve_expression_type` path must produce identical answers for
 /// every invocant shape — scalar, chain, array-element, function-call,
@@ -9222,7 +9222,7 @@ $minion->add_task(resize_image => sub { my ($job) = @_; });
 /// enqueue's own options hash.
 ///
 /// Proper fix: plugin-controlled dispatch (see
-/// `docs/prompt-plugin-architecture.md` — IoC query hooks).
+/// `docs/adr/plugin-system.md` — IoC query hooks).
 /// The plugin decides when sig help applies to the handler vs
 /// when it applies to the dispatcher itself. Core-side fix is
 /// possible (narrow the string-dispatch path to the declared

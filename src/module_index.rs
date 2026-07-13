@@ -35,6 +35,55 @@ pub use crate::file_analysis::{CachedModule, SubInfo};
 
 type InferredTypeOwned = crate::file_analysis::InferredType;
 
+/// Rehydration misses on evicted copies this process served degraded
+/// (`rehydrate_or_resident`'s invariant-break arm). Process-global: the
+/// residency story spans the hub and every pack sub-index, and the flake
+/// this polices ("inputs vanished" cold runs) is a per-process verdict.
+static REHYDRATION_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many evicted copies failed to rehydrate this process (each was
+/// served as a stripped resident — quietly incomplete answers). Zero in a
+/// healthy session; the strict gate (`PERL_LSP_STRICT_RESIDENCY`) panics
+/// at the first miss instead of counting.
+pub fn rehydration_miss_count() -> usize {
+    REHYDRATION_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mint a fresh monotonic registration generation for `path`. The enrichment
+/// key's ABA-proof identity token: a re-registration (or an @INC re-resolve)
+/// bumps the gen, moving every consumer's key — where a bare Arc pointer
+/// could be freed and its address reused. The resolver THREAD holds the raw
+/// Arcs (not a `&ModuleIndex`), so this is a free fn both the thread and the
+/// `ModuleIndex` methods route through.
+pub(crate) fn mint_registration_gen(
+    registration_gen: &DashMap<std::path::PathBuf, u64>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+    path: &std::path::Path,
+) {
+    let g = gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    registration_gen.insert(path.to_path_buf(), g);
+}
+
+/// Stamp a generation for every name-keyed cache entry that lacks one. The
+/// @INC warm scan (`warm_cache`) writes blobs straight into the cache
+/// without a registration front door, so those providers would otherwise
+/// read gen 0 in `enrichment_key`. `or_insert` so a warm entry racing a
+/// workspace front-door registration keeps the front-door generation.
+pub(crate) fn stamp_missing_import_gens(
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    registration_gen: &DashMap<std::path::PathBuf, u64>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+) {
+    for entry in cache.iter() {
+        if let Some(ref cm) = *entry.value() {
+            registration_gen.entry(cm.path.clone()).or_insert_with(|| {
+                gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
+    }
+}
+
 /// The linkage-visible feed a registration extracts from a WHOLE analysis:
 /// (name, declares-a-Class) per visible symbol. Collected before any strip
 /// so the feeds and tie-breaks never read an emptied `symbols`.
@@ -301,23 +350,127 @@ impl ModuleEdgeIndexes {
 
 /// Async LSP handlers read from `cache` (zero I/O). The background resolver
 /// thread populates the cache by parsing `.pm` files in-process.
-#[allow(dead_code)]
-/// What `prepare_pack_parts` hands back: the (possibly stripped) arc to
-/// register plus the whole-analysis halves — feed, specialization edges,
-/// projected surface — extracted BEFORE the strip.
+/// The pack registration TOKEN: the (possibly stripped) arc to register
+/// plus the whole-analysis halves — feed, specialization edges, projected
+/// surface — all extracted BEFORE the strip. Fields are PRIVATE and the
+/// struct is minted ONLY by the choke points in this module
+/// (`prepare_pack_parts` = the reads-whole-before-evict strip, `whole` =
+/// a deliberate whole-copy door, `from_warm_stub` = a persisted token
+/// rehydrated). Holding one is the compile-time proof that a resident
+/// `FileAnalysis` reached registration through one of those seams — a new
+/// caller cannot hand `register_symbols_inner` a loose whole arc.
 pub(crate) struct PackRegistrationParts {
-    pub arc: Arc<FileAnalysis>,
-    pub feed: Vec<(String, bool)>,
-    pub specs: Vec<(String, String)>,
-    pub surface: crate::surface::Surface,
+    arc: Arc<FileAnalysis>,
+    feed: Vec<(String, bool)>,
+    specs: Vec<(String, String)>,
+    surface: crate::surface::Surface,
 }
 
-/// What `prepare_workspace_parts` hands back — the Perl twin of
-/// `PackRegistrationParts`.
+impl PackRegistrationParts {
+    /// The arc registration stores (read for persistence — `include_closure`
+    /// — and for stub encoding).
+    pub(crate) fn arc(&self) -> &Arc<FileAnalysis> {
+        &self.arc
+    }
+    pub(crate) fn feed(&self) -> &[(String, bool)] {
+        &self.feed
+    }
+    pub(crate) fn specs(&self) -> &[(String, String)] {
+        &self.specs
+    }
+    pub(crate) fn surface(&self) -> &crate::surface::Surface {
+        &self.surface
+    }
+
+    /// A whole-copy token minted from an already-`Arc`'d analysis: the feed
+    /// reads the whole `symbols`, the surface projects from the whole bag.
+    /// The deliberate whole-copy front door (`register_symbols`) — bounded,
+    /// tripwire-counted at its call sites.
+    pub(crate) fn whole(arc: Arc<FileAnalysis>) -> Self {
+        let (feed, specs) = ModuleIndex::prepare_pack_feed(&arc);
+        let surface = crate::surface::Surface::project(&arc);
+        PackRegistrationParts { arc, feed, specs, surface }
+    }
+
+    /// Rehydrate a token from a warm stub — the persisted form of a prior
+    /// `prepare_pack_parts` output (`encode_stub` was fed exactly these
+    /// halves). The proof-of-strip is the persistence itself: a stub only
+    /// exists because a fully-stripped copy was written.
+    pub(crate) fn from_warm_stub(stub: crate::module_cache::WarmStub) -> Self {
+        PackRegistrationParts {
+            arc: Arc::new(stub.skeleton),
+            feed: stub.feed,
+            specs: stub.specs,
+            surface: stub.surface,
+        }
+    }
+
+    /// Record this file's span-free surface (the freshness write half).
+    /// Separate from registration so the deferred-writer path can record
+    /// pre-COMMIT (session-local) while the residency half waits for the
+    /// commit; the sync front doors record then register in sequence.
+    pub(crate) fn record_surface(
+        &self,
+        idx: &ModuleIndex,
+        path: &std::path::Path,
+    ) -> crate::surface::SurfaceVerdict {
+        idx.record_surface_value(path, self.surface.clone())
+    }
+}
+
+/// The workspace registration TOKEN — the Perl twin of
+/// `PackRegistrationParts`. Same private-field / choke-point-mint discipline:
+/// minted only by `prepare_workspace_parts` (strip) in this module.
 pub(crate) struct WorkspaceRegistrationParts {
-    pub arc: Arc<FileAnalysis>,
-    pub module_name: Option<String>,
-    pub surface: crate::surface::Surface,
+    arc: Arc<FileAnalysis>,
+    module_name: Option<String>,
+    surface: crate::surface::Surface,
+}
+
+impl WorkspaceRegistrationParts {
+    pub(crate) fn arc(&self) -> &Arc<FileAnalysis> {
+        &self.arc
+    }
+
+    /// See `PackRegistrationParts::record_surface`.
+    pub(crate) fn record_surface(
+        &self,
+        idx: &ModuleIndex,
+        path: &std::path::Path,
+    ) -> crate::surface::SurfaceVerdict {
+        idx.record_surface_value(path, self.surface.clone())
+    }
+}
+
+/// Who is recording a surface. While a doc is OPEN, cross-file consumers
+/// read its BUFFER analysis (query priority: open docs shadow the indexed
+/// disk copy), so the freshness baseline must track the buffer: a
+/// `Background` write (bulk indexer, watcher tick, save re-register) for an
+/// open path describes a disk state consumers cannot see and is SUPPRESSED
+/// — otherwise an edit reverting the buffer to the disk state reads
+/// Unchanged against the wrong baseline and skips the consumer refresh.
+/// `did_close` reconciles: consumers flip back to the disk copy, so the
+/// close path re-records it (and refreshes whoever the flip dirtied).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SurfaceWrite {
+    /// The open-doc editor path — owns the record while the doc is open.
+    OpenDoc,
+    /// Everything else (indexers, watcher, warm lanes) — yields to an open
+    /// doc's record, wins otherwise.
+    Background,
+}
+
+/// The freshness gate's answer: the surface verdict plus, on `Changed`, the
+/// transitive dirty consumer set. Returned by `ModuleIndex::record_and_dirty`
+/// (and by `register_workspace_resident`, which routes through it) so a
+/// caller that records a surface always holds the consumer answer from the
+/// same path.
+pub struct SurfaceDirty {
+    /// Rides the answer for callers that gate on FirstSeen vs Unchanged vs
+    /// Changed; today's consumers act only on `dirty` (empty ⇒ nothing to do).
+    #[allow(dead_code)]
+    pub verdict: crate::surface::SurfaceVerdict,
+    pub dirty: std::collections::HashSet<std::path::PathBuf>,
 }
 
 pub struct ModuleIndex {
@@ -363,6 +516,13 @@ pub struct ModuleIndex {
     /// languages. The Perl index is the hub; query routing picks the right
     /// one by the queried file's language. Generic: any pack language.
     pack_indexes: Arc<DashMap<String, Arc<ModuleIndex>>>,
+    /// Canonical paths of currently-open docs whose surface record the
+    /// open-doc path owns (`SurfaceWrite` — background writes yield).
+    /// Marked by the backend on didOpen, cleared + reconciled on didClose.
+    /// Perl hub only today: pack languages have no open-doc surface
+    /// recorder yet, so guarding their background writes would freeze
+    /// records staleward.
+    open_doc_paths: Arc<DashMap<std::path::PathBuf, ()>>,
     /// ALL cross-file candidates per name (not just the single winner in
     /// `cache`) — pack languages only. C linkage is globally flat, so two
     /// unrelated files can each define `class Box`; `cache` picks one
@@ -410,12 +570,24 @@ pub struct ModuleIndex {
     /// evicted, and rehydration after an edit persists would fetch the NEW
     /// generation's names.
     registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
-    /// Slice-2 rehydration store — SET ONLY on pack sub-indexes, `None` on the
-    /// Perl hub (Perl copies are never bag-evicted). After indexing, each
-    /// resident pack `FileAnalysis` has its witness bag evicted; a type query
-    /// reaching into an evicted file rehydrates the exact persisted bag through
-    /// this LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
+    /// Slice-2 rehydration store. Pack sub-indexes get theirs at
+    /// construction (keyed to `modules-{lang}.db`); the Perl hub gets its
+    /// own in `set_workspace_root` (keyed to `modules.db` — workspace
+    /// copies are refs/bag-evicted once persisted). A type query reaching
+    /// into an evicted file rehydrates the exact persisted bag through this
+    /// LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
     bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
+    /// The SIBLING tier's rehydration store, for copies this index does not
+    /// own. Sweeps mint `CachedModule`s from FileStore entries and ask
+    /// whatever index the query routed to — a cpp query's workspace sweep
+    /// hands PERL paths to the cpp sub-index, whose own loader (keyed to
+    /// `modules-{lang}.db`) can never serve them. `attach_pack_index`
+    /// shares the hub's `bag_cache` cell here so a foreign path routes to
+    /// its owner instead of degrading to the stripped resident. The hub's
+    /// converse route (a pack path asked of the hub) walks `pack_indexes`.
+    foreign_bag_cache: std::sync::RwLock<
+        Option<Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>>,
+    >,
     /// Read-connection opener for the relational ref index
     /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
     /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
@@ -463,6 +635,10 @@ impl ModuleIndex {
         let bag_cache: Arc<
             std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
         > = Arc::new(std::sync::RwLock::new(None));
+        // Hoisted before the spawn so the resolver thread stamps @INC
+        // generations on the SAME maps the enrichment key reads.
+        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
+        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
         module_resolver::spawn_resolver(
             Arc::clone(&cache),
@@ -477,6 +653,8 @@ impl ModuleIndex {
             Box::new(move || refresh_clone()),
             Arc::clone(&long_lived),
             Arc::clone(&bag_cache),
+            Arc::clone(&registration_gen),
+            Arc::clone(&gen_counter),
         );
 
         ModuleIndex {
@@ -484,16 +662,18 @@ impl ModuleIndex {
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
+            open_doc_paths: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen: Arc::new(DashMap::new()),
-            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            registration_gen,
+            gen_counter,
             long_lived,
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache,
+            foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -853,6 +1033,8 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
+        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
+        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
             Arc::clone(&edges),
@@ -861,6 +1043,8 @@ impl ModuleIndex {
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
+            Arc::clone(&registration_gen),
+            Arc::clone(&gen_counter),
         );
 
         ModuleIndex {
@@ -868,16 +1052,18 @@ impl ModuleIndex {
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
+            open_doc_paths: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen: Arc::new(DashMap::new()),
-            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            registration_gen,
+            gen_counter,
             long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -938,6 +1124,8 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
+        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
+        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
         module_resolver::spawn_test_resolver(
             Arc::clone(&cache),
             Arc::clone(&edges),
@@ -946,6 +1134,8 @@ impl ModuleIndex {
             Arc::clone(&queue),
             Arc::clone(&resolved),
             Arc::clone(&workspace_root),
+            Arc::clone(&registration_gen),
+            Arc::clone(&gen_counter),
         );
 
         let idx = ModuleIndex {
@@ -953,16 +1143,18 @@ impl ModuleIndex {
             edges,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
+            open_doc_paths: Arc::new(DashMap::new()),
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen: Arc::new(DashMap::new()),
-            gen_counter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            registration_gen,
+            gen_counter,
             long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
@@ -999,6 +1191,9 @@ impl ModuleIndex {
         if let Some(ref m) = cached {
             self.edges.feed(module_name, &m.analysis);
             self.record_loader_shapes(module_name, &m.analysis);
+            // A CLI-resolved @INC provider: mint its generation so the
+            // enrichment key reads a real token, and a re-resolve moves it.
+            self.mint_import_gen(&m.path);
         }
         self.cache.insert(module_name.to_string(), cached);
     }
@@ -1049,36 +1244,65 @@ impl ModuleIndex {
     /// here — indexers strip via `register_workspace_stripping`, which feeds
     /// from the whole analysis first. Files without a `package` declaration
     /// get only the path entry.
-    /// Returns the surface verdict so re-registration seams (the watcher)
-    /// can act on `Changed` — dropping it leaves open consumers stale
-    /// after an external edit (git pull) to a dep.
+    /// Returns the `SurfaceDirty` outcome (verdict + on-`Changed` dirty
+    /// consumer set) so re-registration seams (the watcher) act on the same
+    /// record→verdict→dirty answer — dropping it leaves open consumers
+    /// stale after an external edit (git pull) to a dep.
     pub fn register_workspace_resident(
         &self,
         path: std::path::PathBuf,
         analysis: Arc<FileAnalysis>,
-    ) -> crate::surface::SurfaceVerdict {
+    ) -> SurfaceDirty {
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
-        let verdict = self.record_surface(&path, &analysis);
+        let sd = self.record_and_dirty(&path, &analysis, SurfaceWrite::Background);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));
         // Path-keyed registry first: the relational retrieval resolves
         // candidate paths through `cached_by_path`, and packageless files
         // (Mojolicious::Lite entrypoints) exist ONLY here.
         self.all_files.insert(cached.path.clone(), cached.clone());
         let Some(module_name) = first_package_name(&analysis) else {
-            return verdict;
+            return sd;
         };
         self.workspace_modules.insert(module_name.clone(), ());
         self.edges.purge_module(&module_name);
         self.edges.feed(&module_name, &analysis);
         self.cache.insert(module_name, Some(cached));
-        verdict
+        sd
+    }
+
+    /// The freshness gate, single-sourced: record `fa`'s span-free surface
+    /// for `path` and, on a `Changed` verdict, walk its transitive dirty
+    /// consumers (empty otherwise). Binding record → verdict → dirty in one
+    /// seam means a caller cannot record a surface without the consumer
+    /// answer from the same path (the "watcher dropped the verdict" bug
+    /// class). The caller owns the ACT on the outcome (re-enrich open docs /
+    /// accumulate a batch / deps-stamp refresh) — those legitimately differ.
+    /// The pack tier discovers consumers by include-closure, not this walk,
+    /// so it uses `record_surface` directly (a genuinely different axis).
+    pub fn record_and_dirty(
+        &self,
+        path: &std::path::Path,
+        fa: &FileAnalysis,
+        write: SurfaceWrite,
+    ) -> SurfaceDirty {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let verdict =
+            self.record_surface_write(&canon, crate::surface::Surface::project(fa), write);
+        let dirty = match verdict {
+            crate::surface::SurfaceVerdict::Changed => self.dirty_consumers(&canon),
+            _ => Default::default(),
+        };
+        SurfaceDirty { verdict, dirty }
     }
 
     /// Project + record `fa`'s span-free surface for `path` — the
     /// freshness engine's write half. Call with a WHOLE analysis (the
     /// projection reads symbols + the bag). Returns the early-cutoff
     /// verdict; `Changed` means `dirty_consumers(path)` names stale files.
+    /// `Background` provenance — every direct caller is an indexer lane.
+    /// Prefer `record_and_dirty` when you will act on the consumer set —
+    /// it binds the walk to the record so it can't be forgotten.
     pub fn record_surface(
         &self,
         path: &std::path::Path,
@@ -1099,7 +1323,45 @@ impl ModuleIndex {
         // lands on one key — a fresh/canon split would make every edit
         // look FirstSeen and the gate never fires.
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.freshness.record(&canon, surface)
+        self.record_surface_write(&canon, surface, SurfaceWrite::Background)
+    }
+
+    /// The ONE freshness write (`canon` pre-canonicalized): applies the
+    /// `SurfaceWrite` provenance rule — a `Background` write on an open
+    /// doc's path is suppressed (Unchanged: consumers read the buffer, and
+    /// what they read didn't move).
+    fn record_surface_write(
+        &self,
+        canon: &std::path::Path,
+        surface: crate::surface::Surface,
+        write: SurfaceWrite,
+    ) -> crate::surface::SurfaceVerdict {
+        if write == SurfaceWrite::Background && self.open_doc_paths.contains_key(canon) {
+            return crate::surface::SurfaceVerdict::Unchanged;
+        }
+        self.freshness.record(canon, surface)
+    }
+
+    /// didOpen: the open-doc path owns `path`'s surface record until
+    /// `mark_doc_closed` (see `SurfaceWrite`).
+    pub fn mark_doc_open(&self, path: &std::path::Path) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.open_doc_paths.insert(canon, ());
+    }
+
+    /// didClose: release the record to background writers and reconcile —
+    /// consumers flip back to reading the indexed DISK copy, so re-record it
+    /// (whole view: the resident copy may be stripped) and hand back whoever
+    /// that flip dirtied. `None` when no indexed copy exists (never indexed,
+    /// or deleted — the watcher's delete arm owns record removal): the
+    /// open-doc record stays as the last truth until a background write
+    /// corrects it.
+    pub fn mark_doc_closed(&self, path: &std::path::Path) -> Option<SurfaceDirty> {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.open_doc_paths.remove(&canon);
+        let cm = self.all_files.get(&canon).map(|e| e.value().clone())?;
+        let whole = crate::file_analysis::CrossFileLookup::whole_present(self, &cm);
+        Some(self.record_and_dirty(&canon, &whole, SurfaceWrite::Background))
     }
 
     /// Every registration bumps this — the enrichment key's freshness
@@ -1107,10 +1369,21 @@ impl ModuleIndex {
     /// surface-covered (a body edit re-registers with a new generation,
     /// where a surface fingerprint deliberately stands still).
     pub(crate) fn bump_registration_gen(&self, path: &std::path::Path) {
-        let g = self
-            .gen_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.registration_gen.insert(path.to_path_buf(), g);
+        mint_registration_gen(&self.registration_gen, &self.gen_counter, path);
+    }
+
+    /// Mint a generation for an @INC provider the CLI resolved directly
+    /// (main.rs's `insert_cache`) — the resolver THREAD mints through the
+    /// free `mint_registration_gen` on its own Arcs.
+    pub(crate) fn mint_import_gen(&self, path: &std::path::Path) {
+        mint_registration_gen(&self.registration_gen, &self.gen_counter, path);
+    }
+
+    /// Stamp a generation for every name-keyed cache entry that lacks one —
+    /// the warm scan loads @INC blobs straight into the cache without a
+    /// registration front door. See `stamp_missing_import_gens`.
+    pub(crate) fn stamp_import_generations(&self) {
+        stamp_missing_import_gens(&self.cache, &self.registration_gen, &self.gen_counter);
     }
 
     fn registration_gen_of(&self, path: &std::path::Path) -> u64 {
@@ -1304,16 +1577,12 @@ impl ModuleIndex {
                             }
                             None => {
                                 2u8.hash(&mut h);
-                                // @INC tier: no registration gen (the
-                                // resolver thread inserts without the hub's
-                                // gen map) — the Arc pointer is the residual
-                                // freshness token (ABA-prone in principle;
-                                // ledgered).
-                                if self.registration_gen_of(&cm.path) == 0 {
-                                    (Arc::as_ptr(&cm.analysis) as usize).hash(&mut h);
-                                }
-                                // Recordless tier: no deps_of record; its
-                                // parents ride the analysis itself.
+                                // @INC/recordless tier: its registration
+                                // generation (minted at insert/warm by the
+                                // resolver thread + `insert_cache`) already
+                                // rode the key above — a re-resolve bumps it.
+                                // No deps_of record; its parents ride the
+                                // analysis itself.
                                 for parents in cm.analysis.package_parents.values() {
                                     next.extend(parents.iter().cloned());
                                 }
@@ -1373,12 +1642,16 @@ impl ModuleIndex {
     /// STRIPPED copy this must run only after its blob+rows are COMMITTED —
     /// an evicted copy registered before its persistence exists rehydrates
     /// to nothing and answers wrong-empty instead of "not yet indexed".
+    /// Consumes a workspace token (minted only via `prepare_workspace_parts`
+    /// in this module) — the same construct-is-proof discipline as
+    /// `register_symbols_inner`. Surface recording is the caller's separate
+    /// concern; the token's `surface` is dropped here.
     pub(crate) fn register_workspace_residency(
         &self,
         path: std::path::PathBuf,
-        arc: Arc<FileAnalysis>,
-        module_name: Option<String>,
+        parts: WorkspaceRegistrationParts,
     ) {
+        let WorkspaceRegistrationParts { arc, module_name, surface: _ } = parts;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, arc));
@@ -1403,9 +1676,10 @@ impl ModuleIndex {
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
         let parts = self.prepare_workspace_parts(fa, strip_bag, strip_rows);
-        let _ = self.record_surface_value(&path, parts.surface);
-        self.register_workspace_residency(path, parts.arc.clone(), parts.module_name);
-        parts.arc
+        parts.record_surface(self, &path);
+        let arc = Arc::clone(parts.arc());
+        self.register_workspace_residency(path, parts);
+        arc
     }
 
     /// Remove a deleted workspace file's registrations — the path-keyed
@@ -1449,6 +1723,12 @@ impl ModuleIndex {
     /// MethodOnClass / member-completion machinery resolves across files.
     /// Attach a per-language sub-index (`"cpp"`, `"python"`, …).
     pub fn attach_pack_index(&self, lang: &str, idx: Arc<ModuleIndex>) {
+        // Share the hub's rehydration CELL (not its current contents — the
+        // cell, so a later `set_workspace_root` install stays visible): the
+        // sub-index can then serve a hub-owned path a sweep misroutes to it.
+        if let Ok(mut g) = idx.foreign_bag_cache.write() {
+            *g = Some(Arc::clone(&self.bag_cache));
+        }
         self.pack_indexes.insert(lang.to_string(), idx);
     }
 
@@ -1508,21 +1788,79 @@ impl ModuleIndex {
     /// genuinely fact-less file. One body serves `bag_present` and
     /// `refs_present`: the miss policy and LRU selection must never diverge
     /// between the type path and the reference path.
+    ///
+    /// A miss here is ALWAYS an invariant break in-session: eviction is
+    /// licensed only by a committed blob (persist-first), so an evicted
+    /// registered copy that can't rehydrate means the blob vanished under
+    /// us (a second writer's generation clobber, an external cache clear)
+    /// or was never readable. Degrading keeps the server useful; the
+    /// counter + strict mode keep it HONEST — under
+    /// `PERL_LSP_STRICT_RESIDENCY=1` (the gold harness sets it) the miss
+    /// panics so a run serving absence-as-answer fails loudly instead of
+    /// scoring wrong results.
     fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        let mut stage = "no bag cache installed on this index";
         if let Some(bc) = self.bag_cache_ref() {
             if let Some(full) = bc.bag_for(&cached.path) {
                 return full;
             }
+            stage = "loader returned None (opener failed / no row / decode failed)";
         }
-        // Warn, not debug: an evicted copy whose blob can't rehydrate means
-        // references/types for this file are quietly incomplete this session
-        // (the next warm start re-parses it — decode failures invalidate the
-        // row's stamp match by re-analysis).
-        log::warn!(
-            "rehydration miss for evicted copy {:?} — serving stripped resident",
+        // Foreign route: sweeps mint `CachedModule`s from FileStore entries
+        // and ask whatever index the query routed to — this index's own
+        // loader can never serve a path a SIBLING tier persisted. One hop,
+        // sibling's CACHE directly (never its `rehydrate_or_resident` — no
+        // recursion): sub-index → the hub's cell; hub → the pack sibling
+        // that registered the path.
+        if let Some(fa) = self.rehydrate_foreign(&cached.path) {
+            return fa;
+        }
+
+        REHYDRATION_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::error!(
+            "rehydration miss for evicted copy {:?} ({stage}) — serving stripped \
+             resident (references/types for this file are quietly incomplete this \
+             session)",
             cached.path
         );
+        if crate::module_resolver::strict_residency() {
+            panic!(
+                "PERL_LSP_STRICT_RESIDENCY: evicted copy {:?} failed to rehydrate \
+                 ({stage}). Refusing to serve absence-as-answer.",
+                cached.path
+            );
+        }
         cached.analysis.clone()
+    }
+
+    /// A whole copy of `path` from the SIBLING tier that owns it — the
+    /// cross-index half of `rehydrate_or_resident`. Exactly one hop, always
+    /// through the sibling's cache (never its miss path), so routing can't
+    /// recurse. `None` when no sibling owns the path — the caller's miss
+    /// handling then applies.
+    fn rehydrate_foreign(&self, path: &std::path::Path) -> Option<Arc<FileAnalysis>> {
+        // Sub-index → the hub's cell (shared at `attach_pack_index`).
+        let hub_cell = self.foreign_bag_cache.read().ok().and_then(|g| g.clone());
+        if let Some(cell) = hub_cell {
+            let hub_cache = cell.read().ok().and_then(|g| g.clone());
+            if let Some(bc) = hub_cache {
+                if let Some(fa) = bc.bag_for(path) {
+                    return Some(fa);
+                }
+            }
+        }
+        // Hub → the pack sibling that registered the path.
+        for entry in self.pack_indexes.iter() {
+            let sub = entry.value();
+            if sub.all_files.contains_key(path) {
+                if let Some(bc) = sub.bag_cache_ref() {
+                    if let Some(fa) = bc.bag_for(path) {
+                        return Some(fa);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Does `m` declare a `Class`/type named `name`? Rank source for the
@@ -1592,6 +1930,33 @@ impl ModuleIndex {
             .unwrap_or_default()
     }
 
+    /// The unused-exports view over THIS index's row store — exported syms
+    /// with zero cross-file reference rows (`docs/adr/relational-ref-index.md`).
+    /// `None` when the row store is unavailable (opener absent, cold cache);
+    /// the caller degrades to the references projection.
+    pub fn unused_exported_syms(&self) -> Option<Vec<crate::module_cache::DeadExportRow>> {
+        self.with_rows_conn(crate::module_cache::unused_exported_syms)
+    }
+
+    /// The `--heatmap` pre-prune index: the DISTINCT ref-name-key set plus the
+    /// shredded-path set (coverage witness). `None` when the row store is
+    /// unavailable. The name set answers "could any file reference this name";
+    /// the path set lets the caller verify the store actually covers the files
+    /// its projection would scan before trusting an "absent ⇒ zero" verdict.
+    pub fn ref_prune_index(
+        &self,
+    ) -> Option<(
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    )> {
+        self.with_rows_conn(|conn| {
+            (
+                crate::module_cache::names_with_ref_rows(conn),
+                crate::module_cache::paths_with_ref_rows(conn),
+            )
+        })
+    }
+
     /// The sub-index for `lang`, if this distribution indexes it.
     pub fn pack_index(&self, lang: &str) -> Option<Arc<ModuleIndex>> {
         self.pack_indexes.get(lang).map(|e| e.value().clone())
@@ -1617,9 +1982,11 @@ impl ModuleIndex {
     pub fn register_symbols(&self, path: std::path::PathBuf, analysis: Arc<FileAnalysis>) {
         // Feed source and stored copy are the same whole analysis here;
         // indexers that strip go through `register_symbols_stripping`.
-        let _ = self.record_surface(&path, &analysis);
-        let (feed, specs) = Self::prepare_pack_feed(&analysis);
-        self.register_symbols_inner(path, analysis, &feed, &specs);
+        // `whole` mints the deliberate whole-copy token (feed + surface off
+        // the unstripped arc) — the only door that pins a resident analysis.
+        let parts = PackRegistrationParts::whole(analysis);
+        parts.record_surface(self, &path);
+        self.register_symbols_inner(path, parts);
     }
 
     /// Registration-owned strip for the pack bulk index: collect the
@@ -1681,18 +2048,25 @@ impl ModuleIndex {
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
         let parts = Self::prepare_pack_parts(fa, strip_bag, strip_rows);
-        let _ = self.record_surface_value(&path, parts.surface);
-        self.register_symbols_inner(path, parts.arc.clone(), &parts.feed, &parts.specs);
-        parts.arc
+        parts.record_surface(self, &path);
+        let arc = Arc::clone(parts.arc());
+        self.register_symbols_inner(path, parts);
+        arc
     }
 
+    /// Register a pack file from its token. Consuming the token IS the proof
+    /// the caller went through a mint choke point (`prepare_pack_parts` /
+    /// `whole` / `from_warm_stub`) — a loose resident arc can't reach here.
+    /// Surface recording is the caller's separate concern (the deferred
+    /// writer records pre-COMMIT; the token's `surface` is dropped here).
     pub(crate) fn register_symbols_inner(
         &self,
         path: std::path::PathBuf,
-        analysis: Arc<FileAnalysis>,
-        feed: &[(String, bool)],
-        specializes: &[(String, String)],
+        parts: PackRegistrationParts,
     ) {
+        let PackRegistrationParts { arc: analysis, feed, specs: specializes, surface: _ } = parts;
+        let feed = &feed;
+        let specializes = &specializes;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, analysis.clone()));

@@ -391,7 +391,7 @@ does this plugin emit on this input").
   emissions, the canonical event-emitter pattern.
 - `frameworks/minion.rhai` — most complex bundled plugin: emit hooks
   + query hooks + the `ctx["call"]` workaround in action.
-- `docs/prompt-plugin-architecture.md` — design rationale, namespace
+- `docs/adr/plugin-system.md` — design rationale, namespace
   semantics, what's intentionally out of scope.
 - `src/plugin/mod.rs` — authoritative type definitions for
   `EmitAction`, `PatternSpec` / `MatchContext`, query-hook answer shapes.

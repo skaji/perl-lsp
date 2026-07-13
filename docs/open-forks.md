@@ -19,7 +19,7 @@ Format per entry:
 ---
 
 ## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
-- **Context:** storage-engine mission phase 3 (docs/prompt-storage-engine.md;
+- **Context:** storage-engine mission phase 3 (docs/adr/storage-engine.md;
   eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes
   the engine choice reversible.
 - **Options:** A — hand-rolled `FreshnessIndex` (surface records +
@@ -337,18 +337,26 @@ deleted paths; method dedup collapses only FULLY-equal duplicates.
 
 Deferred, in rough priority order:
 
-- **Concurrent surface writers (buffer vs disk)**: a bulk index or watcher
-  tick re-records a DISK build over an open doc's BUFFER record; an edit
-  reverting the buffer to the disk state then reads Unchanged against the
-  wrong baseline and skips a consumer refresh. Needs record provenance
-  (open-doc records outrank background ones while the doc is open) or a
-  doc-open guard on background recording. Rare (requires an unsaved
-  contract change raced by a background re-record), silent when hit.
-- **Verdict-policy seam**: the record→gate→act sequence is spelled in
-  three places now (open-doc edits, the watcher, `pack_file_changed`).
-  A `FreshnessIndex`-owned policy hook (or a `record_and_dirty` that
-  returns the closure) would make the next registration path inherit the
-  gate by construction instead of by remembering.
+- **Concurrent surface writers (buffer vs disk)** — LANDED 2026-07-12.
+  Record provenance (`SurfaceWrite::{OpenDoc, Background}`) at the one
+  freshness write (`record_surface_write`): while a doc is open (didOpen
+  marks, didClose clears), background writes on its path are suppressed —
+  consumers read the buffer, so the baseline must track the buffer.
+  didClose reconciles: re-records the indexed DISK copy (whole view) and
+  republishes whoever the flip dirtied, so a buffer that dies with unsaved
+  contract changes can't leave consumers enriched against a ghost. didOpen
+  now records too (catches open-after-external-change). Perl hub only —
+  pack languages have no open-doc surface recorder yet; guarding their
+  background writes would freeze records staleward (residual below).
+- **Verdict-policy seam** — LANDED 2026-07-12.
+  `ModuleIndex::record_and_dirty(path, fa) -> SurfaceDirty {verdict, dirty}`
+  binds record → verdict → dirty-consumers in one seam; the open-doc editor
+  path and the watcher (via `register_workspace_resident`, which routes
+  through it) both consume it, so a caller can't record a surface without
+  the consumer answer. The ACT arms stay separate (open-doc republish vs
+  watcher batch). `pack_file_changed` is NOT forced through it: the pack
+  tier discovers consumers by include-closure, a genuinely different axis,
+  so it keeps `record_surface` (verdict only) — the honest residual.
 - **Probe serialization in `pack_file_changed`** (Changed case): the
   changed file's probe runs serially before the parallel consumer fan-out
   (~one header-analysis of added latency per save while actively editing
@@ -398,10 +406,18 @@ Deferred, with designs:
   persist (blob+rows) in the watcher's blocking task, then
   `register_workspace_stripping` on commit, whole-copy fallback only on
   persist failure.
-- **Writer fallback budget** — a persistently failing writer (disk full)
-  falls back to whole copies for the ENTIRE tree; the tripwire now makes
-  it visible but nothing bounds it. Design: byte-accounted fallback
-  budget shared per index run.
+- **Writer fallback budget** — LANDED 2026-07-12. `FALLBACK_WHOLE_BYTE_CAP`
+  (128 MiB, byte-accounted via `FileAnalysis::heap_estimate` like the
+  enrichment overlay) bounds the whole copies each persist writer retains
+  on commit-fail/panic. Past the cap the fallback DROPS the resident copy
+  (does not register a stripped one — the chunk didn't commit, so a
+  stripped copy's blob isn't on disk and could only rehydrate to
+  wrong-empty): honest absence, re-indexed next run, never wrong data,
+  never an unrehydratable evicted copy. Under-cap pack fallbacks stay
+  tripwire-accounted (`expected_whole`). Residual: the budget is
+  per-writer-thread (per pack language / the workspace writer), not a
+  single index-wide atomic — bounds total to (writers × 128 MiB), fine at
+  the 1-2 pack languages the corpus has.
 - **Rows-missing re-strip after backfill** — after a REF_ROWS_VERSION
   bump, refs+symbols stay resident for one session (self-healing at next
   restart; never trips the fully-resident wire). Re-registering post-
@@ -415,11 +431,17 @@ Deferred, with designs:
   fix above is the drift it would have prevented.
 - **Stamp-capture helper** — the stamp-before-read + re-stat-after-parse
   protocol is spelled in both fresh workers.
-- **Parts-token-only inner registration** — make `register_symbols_inner`
-  / `register_workspace_residency` accept only the parts structs (private
-  fields, constructible solely via the prepare_* choke points) so a
-  feed-from-stripped-copy or whole-arc hookup fails to compile. The
-  allowlist test covers the gap until then.
+- **Parts-token-only inner registration** — LANDED 2026-07-12.
+  `register_symbols_inner` / `register_workspace_residency` now consume a
+  `PackRegistrationParts` / `WorkspaceRegistrationParts` token whose fields
+  are private and minted only by the choke points in module_index.rs
+  (`prepare_pack_parts` / `prepare_workspace_parts`, plus
+  `PackRegistrationParts::whole` for the deliberate whole-copy front door
+  and `from_warm_stub` for a persisted token). Constructing the argument is
+  the compile-time proof of reads-whole-before-evict; the writer channels
+  carry the token instead of raw pieces. Allowlist counts unchanged (a
+  type-level change, not a call-site collapse); the allowlist test still
+  polices the whole-copy front doors.
 
 
 ## Triage (veesh, 2026-07-07)
@@ -437,7 +459,19 @@ Deferred, with designs:
   serialization (measure first), phase-4 SQL views. Declined micro-opts
   stay declined.
 
-## R4 hardening round — 2026-07-07 — OPEN (Claude)
+## Phase-4 SQL views — CLOSED 2026-07-12 (Claude)
+
+The one triaged-"build" view landed: unused-exports
+(`unused_exported_syms` + `SymRowSeed::FLAG_EXPORTED`,
+`REF_ROWS_VERSION` 5), wired into `--heatmap` as a dead-export queue
+plus a sound pre-prune of the fan-in walk. The row-backed verdict
+substitutes only for skipped walks (provably equal there); a running
+projection always decides — candidate rows over-approximate, so a row
+"maybe used" could mask a dead export whose every candidate the matcher
+rejects. Parked/declined views and the full contract:
+`docs/adr/relational-ref-index.md` ("Further relational views").
+
+## R4 hardening round — 2026-07-07 — CLOSED 2026-07-12 (Claude)
 
 Fixed: retries only ever use RETAINED overlay copies (an unretained copy
 gave the seams fresh bag pointers per recursion level — unbounded mints
@@ -454,17 +488,29 @@ overlay decline. Cycle policy: tainted builds decline deterministically
 — cyclic files answer raw everywhere, never a query-order-dependent
 half-enriched cache.
 
-Deferred:
-- **Unwired seams** (same fallback-on-miss pattern, wire next):
-  bridged-plugin-entity chase (witnesses.rs ~1916 — bridged methods
-  resolve unenriched while plain methods now resolve enriched),
-  enrichment's own import scan (file_analysis.rs ~5809 — makes
-  enrichment transitive; the cycle guard's real customer), SlotType
-  primary (~1938). TypeName chase: skip (pack aliases, no Perl win).
-- **@INC providers keep the Arc-pointer freshness token** (no
-  registration gen — the resolver thread inserts without the hub map);
-  ABA-prone in principle. Fold into the @INC-stripping arc: route
-  insert_into_cache through a hub-owned seam that bumps generations.
+The unwired seams landed 2026-07-12: bridged-plugin-entity chase
+(index-less by design — a ctx-ful leaf query would spawn a fresh cycle
+guard per bridged hop, so mutual bridges could recurse unbounded; the
+ENRICHING-guarded bake reaches the same transitive answer), SlotType
+primary (dormant twin of the MethodOnClass retry — SlotType seeds are
+build-gated on a resolvable RHS, so it goes live the moment slot
+seeding emits an unconditional edge), and enrichment's own import scan
+(enrichment is now transitive A→B→C; the cycle guard's first real
+customer — mutual imports decline to raw deterministically, tainted
+copies never cached). TypeName chase stays raw (pack aliases, no Perl
+win). Gold: 432/17/0/0/0 cold+warm, warm RSS flat.
+
+The @INC Arc-pointer freshness token also landed 2026-07-12: the
+generation maps (`registration_gen` + `gen_counter`) are threaded into
+`spawn_resolver` / `spawn_test_resolver` (like `long_lived` /
+`bag_cache`); the resolver thread mints a generation for every @INC
+provider it (re-)resolves and stamps warm-loaded providers after
+`warm_cache` (the CLI main-thread path mirrors this in `insert_cache` +
+a post-warm stamp). Every provider now has a real, monotonic
+generation, so the Arc-pointer fallback arm in `enrichment_key` is
+deleted (ABA-proof).
+
+Still deferred:
 - **In-flight dedup**: two threads missing on one path both pay the
   deep-copy (last insert wins). Bounded waste; revisit if profiling
   shows it.
@@ -493,27 +539,47 @@ Measured: warm-harness RSS 615→348MB (default vs NO_EVICT); warm
 SERVER sessions additionally strip warm-loaded @INC copies (CLI keeps
 them whole — RAM dies with the process; wall matters more there).
 
-Deferred: @INC registration generations for the enrichment key (the
-Arc-pointer token stands for that tier); the 162s one-shot rehydration
+Deferred: @INC registration generations for the enrichment key — LANDED
+2026-07-12 (threaded into the resolver thread; the Arc-pointer fallback is
+gone, see the R4 hardening round's entry above); the 162s one-shot rehydration
 profile if CI minutes ever matter (options: per-process blob-decode
 memo, or NO_EVICT in the harness at the cost of blinding the eviction
 nets).
 
-## Intermittent cold-start flake — 2026-07-07 — OPEN (investigation)
+## Intermittent cold-start flake — 2026-07-07 — CLOSED as watch-with-tripwires (2026-07-12)
 
 Twice this branch, a COLD gold run misbehaved and was clean on
 immediate rerun: once 3 FAILs, once 372 PASS / 41 FAIL / 5 XPASS with an
 impossibly fast wall (88s vs ~300-500s) — the "inputs vanished,
 absence-as-answer" signature (diagnostics XPASS = typeless sweep). Both
 occurrences ran immediately after (or concurrent with) heavy build/test
-activity on the same box; 4 deliberate cold passes after the second
-occurrence were all clean, as were all committed-gate colds. Suspects:
-the two-writer startup window (resolver thread + workspace indexer on
-one modules.db) under load — a busy-timeout expiry making one writer
-run cache-less that session (post-hygiene this is a clean None, but the
-session's strips then key on the OTHER writer's rows), or a
-strip-before-persist window the tripwire doesn't cover on the Perl
-tier. Next probe: cold gold under artificial CPU/IO load with
-PERL_LSP_TIMINGS + a Perl-tier residency tripwire; the harness could
-also assert per-fixture wall lower bounds so a too-fast cold fails
-loudly instead of scoring wrong answers.
+activity on the same box. Suspects at the time: the two-writer startup
+window (resolver thread + workspace indexer on one modules.db) under
+load, or a strip-before-persist window on the Perl tier.
+
+The nets, all landed: `PERL_LSP_STRICT_RESIDENCY=1` (set by the gold
+harness) makes a rehydration miss on an evicted copy PANIC with the
+failing stage named — a compromised session dies as CRASH rows instead
+of scoring wrong answers; `rehydration_miss_count` counts the same
+degrades in live servers; the workspace tier got the residency tripwire
+the pack tier had (shared `residency_tripwire` speller, strict-fatal in
+release).
+
+Probe result: 3 fully-cold gold runs under saturating CPU (4 busy
+loops) + fsync-churn IO load — all 432/17/0/0/0, zero strict
+violations, walls honestly degraded (~335s vs ~245s quiet). No repro.
+
+First blood went to the net itself, immediately on arming: the strict
+baseline caught a DETERMINISTIC absence-as-answer bug — the whole-view
+workspace sweep handed PERL paths to the routed PACK sub-index, whose
+loader (modules-{lang}.db) can never serve them, so cross-TU cpp
+references silently dropped every Perl workspace file's matches. Fixed
+at the mechanism: `rehydrate_or_resident` routes a foreign path to the
+owning sibling tier (sub-index → the hub's rehydration cell, hub → the
+registering pack sibling; one hop, cache-only, no recursion). That bug
+postdates the original flake occurrences and does not explain them.
+
+Standing state: any recurrence now fails LOUDLY in gold (named stage,
+CRASH row) and is countable in servers. If it never fires again, the
+original occurrences stay attributed to the pre-hygiene two-writer
+window whose fixes have since landed.

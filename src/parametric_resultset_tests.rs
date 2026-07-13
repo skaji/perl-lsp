@@ -360,7 +360,7 @@ $schema->resultset('Schema::Result::Users')->search({ name => 'X' });
 /// which is unknown without a stub. Queued with the
 /// DBIC-as-plugin work; the per-method projection rules belong
 /// to the plugin's parametric-semantics declaration (see
-/// `docs/prompt-dbic-as-plugin.md` + `docs/prompt-parametric-semantics.md`).
+/// `docs/prompt-dbic-as-plugin.md` + `docs/adr/parametric-types.md`).
 #[test]
 fn method_dispatch_through_find_resolves_to_row_class() {
     let src = format!(

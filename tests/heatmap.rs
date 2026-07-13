@@ -108,6 +108,79 @@ fn fan_in_counts_and_unreferenced_subs_flagged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The dead-export queue: an EXPORTED sub with no cross-file use is listed,
+/// an exported sub a consumer references is not, and a non-exported sub is
+/// never a dead export (though it may still be a dead-code candidate). This
+/// drives the full CLI — the relational store's unused-exports view when it
+/// covers the workspace, the references projection as the sound fallback —
+/// and both must yield the same verdict.
+#[test]
+fn dead_exports_flagged_and_scoped_to_cross_file_use() {
+    let dir = std::env::temp_dir().join(format!("perl-lsp-heatmap-deadexp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let lib = dir.join("lib").join("My");
+    std::fs::create_dir_all(&lib).unwrap();
+
+    std::fs::write(
+        lib.join("Api.pm"),
+        "package My::Api;\n\
+         use Exporter 'import';\n\
+         our @EXPORT_OK = qw(used_export lonely_export);\n\
+         sub used_export { return 1; }\n\
+         sub lonely_export { return 2; }\n\
+         sub internal_only { return 3; }\n\
+         1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("script.pl"),
+        "use lib 'lib';\n\
+         use My::Api qw(used_export);\n\
+         used_export();\n",
+    )
+    .unwrap();
+
+    let report = run_heatmap(&dir);
+
+    let dead_exports: Vec<&str> = report["dead_exports"]
+        .as_array()
+        .expect("dead_exports array")
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        dead_exports.contains(&"lonely_export"),
+        "an exported sub with no cross-file use is a dead export: {dead_exports:?}"
+    );
+    assert!(
+        !dead_exports.contains(&"used_export"),
+        "a cross-file consumer keeps the export live: {dead_exports:?}"
+    );
+    assert!(
+        !dead_exports.contains(&"internal_only"),
+        "a non-exported sub is never a dead export: {dead_exports:?}"
+    );
+
+    // The per-symbol flag agrees with the top-level queue.
+    assert_eq!(sym(&report, "lonely_export")["dead_export"].as_bool(), Some(true));
+    assert_eq!(sym(&report, "used_export")["dead_export"].as_bool(), Some(false));
+    assert_eq!(sym(&report, "internal_only")["dead_export"].as_bool(), Some(false));
+
+    // A dead export is orthogonal to the dead-code queue: exported symbols are
+    // shielded there (the `exported` guard), so `lonely_export` is a dead
+    // EXPORT but not a dead-code candidate.
+    assert_eq!(
+        sym(&report, "lonely_export")["dead_code_candidate"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        report["summary"]["dead_exports"].as_u64(),
+        Some(dead_exports.len() as u64)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn arity_variant_accessors_count_once_and_dsl_imports_are_hidden() {
     // A Mojo::Base `rw` accessor is synthesized as a getter + a fluent writer

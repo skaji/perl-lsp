@@ -6,6 +6,133 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.7.0 — 2026-07-12
+
+### C/C++ support (opt-in build feature `cpp`)
+
+perl-lsp now serves C/C++ alongside Perl from one server: goto-definition,
+references (including cross-translation-unit), member and in-scope
+completion, hover, outline, semantic tokens, and `#include` navigation.
+Extraction is query-driven behind a generic language seam, so the same
+machinery hosts experimental Python / R / CMake packs. Default builds
+remain Perl-only; `cargo build --release --features cpp` turns the rest on.
+
+### Storage engine — warm starts, bounded memory
+
+Cross-file analysis now persists per project (SQLite, `~/.cache/perl-lsp`):
+
+- **Relational ref index.** References/rename candidates resolve through
+  indexed rows instead of a full in-memory sweep; `--refs-parity <root>`
+  is the built-in A/B verification harness.
+- **Warm starts.** Workspace and dependency analyses reload from disk —
+  unchanged files are never re-parsed at startup.
+- **Bounded residency.** In-memory copies are stripped once persisted and
+  rehydrate on demand through byte-capped LRUs; a large C++ workspace
+  (abseil) idles around 34 MB warm. Structural tripwires guard against
+  regressions, and `PERL_LSP_STRICT_RESIDENCY=1` turns any would-be
+  silently-degraded answer into a loud failure (the gold harness runs
+  with it on).
+- **Freshness gating.** Edits that don't change a file's cross-file-visible
+  surface no longer trigger dependent re-analysis; open-buffer state is
+  tracked separately from on-disk state so consumers are never refreshed
+  against the wrong baseline.
+- `perl-lsp --clear-cache [<root>]` wipes a project's cache (or all of it).
+
+### Query-declared plugins
+
+Framework plugins (`.rhai`) now declare the syntax they care about as
+tree-sitter query patterns with `on_match` handlers — no more hand-rolled
+capture plumbing — and can publish their own diagnostics. Editing a plugin
+invalidates the affected cache automatically. `--plugin-check` validates a
+plugin bundle, and legacy hook styles are rejected with a porting hint.
+
+### Usage heatmap
+
+`perl-lsp --heatmap <root> [--csv|--html]` reports per-symbol fan-in /
+fan-out, an unreferenced-symbol review queue, and a dead-exports queue
+(exported subs no other file references — sound: a listed export is truly
+unused by consumers). `--html` emits a self-contained offline viewer.
+
+### Cross-file type inference
+
+Closed files now answer type queries with their imports applied
+(previously only open documents did), and that enrichment is transitive
+across module chains (A → B → C). Inheritance-aware method resolution,
+receiver-gated dispatch, and structural hash-shape typing all ride the
+same witness engine.
+
+## v0.6.0 — 2026-07-05
+
+### Type narrowing
+
+The flow-sensitive type narrowing begun in v0.5.2 is now complete. A `defined`
+/ `blessed` / `isa` guard refines a value to its concrete type inside the branch
+it guards, and `Optional<T>` tracks maybe-undef values. That refined type flows
+through hover, completion, and goto — and, new this release, into the
+diagnostics below.
+
+- **Reassignment clears narrowing.** A narrowed type is dropped the moment its
+  scalar is rebound, so a later use never inherits a stale type.
+- **Completion peels `Optional<T>`.** Members complete on a maybe-undef value;
+  the optional-deref lint below then offers the guard that makes the access safe.
+- **Optional receivers dispatch leniently** — no spurious unresolved-method
+  warning on a call through a maybe-undef value.
+
+### Diagnostics (new)
+
+Lints that catch runtime errors by reading a value's inferred type at the point
+of use. Undef-deref is always on; the rest are opt-in, each a
+key under `initializationOptions.diagnostics` or a `--<kebab>` CLI flag.
+
+- **Undef dereference** (always on). Warns when you dereference a value the
+  flow analysis proves is `undef` — a `->method`, `->{k}`, `->[i]`, or `->()`
+  on the failing side of a `defined` guard — each a guaranteed runtime die.
+- **Unguarded optional dereference** (`optionalDeref`). Flags a deref of a
+  maybe-undef `Optional<T>` that no `defined`/`blessed` guard covers, with a
+  one-click "add `return unless defined …`" quick-fix.
+- **Redundant / contradictory guards** (`redundantGuard`). Flags a
+  `defined`/`isa`/`DOES` check whose outcome the value's known type already
+  decides — always true (dead `else`) or always false (dead branch).
+- **Dereference-shape mismatch** (`derefShape`). Flags a `->{k}` / `->[i]` /
+  `->()` whose form contradicts a rep a `ref … eq` guard just proved.
+- **Cross-file unresolved method** (`unresolvedMethodCrossFile`). Extends the
+  unresolved-method warning to narrowed and imported receivers.
+
+### Rename
+
+- **Cross-file symmetry.** Renaming a sub or method updates every importing
+  and calling file, in both directions across the boundary.
+- **Configurable method-override scope.** Renaming an overridden method renames
+  the whole override family by default — the base declaration, every override
+  up and down the hierarchy, and all call sites (matched over proven `@ISA` /
+  role edges, never by name). Set `rename.overrideScope: "dispatch"` to rename
+  only the definition under the cursor and the calls that dispatch to *it*
+  (including `SUPER::`), leaving sibling overrides untouched.
+- **`our` package variables** rename across their package, with UX guards.
+- **Lexical hash keys** — `my %h = (k => …); $h{k}` renames the key everywhere.
+- **Framework-aware groups.** Moo/Moose accessor groups (inheritance-aware),
+  Corinna field privacy, and DBIC column-keyed verbs each rename as a unit.
+
+### Heatmap (new)
+
+- **`perl-lsp --heatmap <root>`** — a per-symbol fan-in / fan-out and
+  dead-code view over the whole reference graph. JSON by default, `--csv` for
+  a flat table, `--html` for a self-contained offline viewer (treemap heat,
+  fan-in/out butterfly, dead-code queue).
+
+### Type inference
+
+- **DBIC**: result sources type their rows; `search` / `find` return typed
+  result sets and columns resolve as keys.
+- **Moo**: a constant array-ref of names expands into individual `has`
+  attributes.
+- **Mojolicious**: plugin-supplied route invocants resolve generically, so
+  goto and hover follow routes built through helper / plugin verbs.
+
+### Fixes
+
+- Skip the unresolved-method warning when `AUTOLOAD` is in the MRO.
+
 ## v0.5.3 - 2026-06-23
 
 ### Licensing

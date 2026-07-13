@@ -38,6 +38,12 @@ pub fn spawn_resolver(
     on_resolved: OnResolved,
     long_lived: Arc<std::sync::atomic::AtomicBool>,
     bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>>,
+    // The enrichment-key generation maps, threaded the same way as
+    // `long_lived`/`bag_cache`: the resolver thread mints a generation for
+    // every @INC provider it warms or (re-)resolves so `enrichment_key` reads
+    // a real, ABA-proof token instead of an Arc pointer.
+    registration_gen: Arc<DashMap<PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let handle = tokio::runtime::Handle::current();
 
@@ -83,6 +89,11 @@ pub fn spawn_resolver(
                     && eviction_enabled();
                 let (n, stale_names) = module_cache::warm_cache(conn, &cache, strip_warm);
                 log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
+                // Stamp generations for the warm-loaded @INC providers (they
+                // landed in the cache without a registration front door).
+                crate::module_index::stamp_missing_import_gens(
+                    &cache, &registration_gen, &gen_counter,
+                );
                 // Queue stale modules for priority re-resolution.
                 for name in &stale_names {
                     stale_modules.insert(name.clone(), ());
@@ -205,6 +216,11 @@ pub fn spawn_resolver(
                         if let Some(bc) = bag_cache.read().ok().and_then(|g| g.clone()) {
                             bc.invalidate(&m.path);
                         }
+                        // Mint a fresh generation: a re-resolve (content
+                        // changed) moves every consumer's enrichment key.
+                        crate::module_index::mint_registration_gen(
+                            &registration_gen, &gen_counter, &m.path,
+                        );
                     }
                     insert_into_cache(&cache, &edges, &module_name, stored);
 
@@ -355,6 +371,8 @@ pub fn spawn_test_resolver(
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
+    registration_gen: Arc<DashMap<PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     std::thread::Builder::new()
         .name("module-resolver-test".into())
@@ -378,6 +396,9 @@ pub fn spawn_test_resolver(
                     &crate::plugin::rhai_host::plugin_fingerprint(),
                 );
                 let (_, stale_names) = module_cache::warm_cache(conn, &cache, false);
+                crate::module_index::stamp_missing_import_gens(
+                    &cache, &registration_gen, &gen_counter,
+                );
                 for name in stale_names {
                     stale_modules.insert(name, ());
                 }
@@ -408,6 +429,11 @@ pub fn spawn_test_resolver(
                     let stored =
                         strip_import_copy(&result, persisted, eviction_enabled());
                     parse_memo.insert(module_name.clone(), stored.clone());
+                    if let Some(ref m) = stored {
+                        crate::module_index::mint_registration_gen(
+                            &registration_gen, &gen_counter, &m.path,
+                        );
+                    }
                     insert_into_cache(&cache, &edges, &module_name, stored);
                     stale_modules.remove(&module_name);
                     let _g = resolved.mu.lock().unwrap();
@@ -891,12 +917,13 @@ pub fn index_workspace_with_index(
     // before its blob exists rehydrates to nothing and serves wrong-empty.
     struct WsFresh {
         path: PathBuf,
-        /// The copy to register on `deferred` entries (stripped; the feed
-        /// half already ran on the whole analysis).
+        /// The copy to mirror into the FileStore on `deferred` entries
+        /// (stripped; the feed half already ran on the whole analysis).
         arc: std::sync::Arc<crate::file_analysis::FileAnalysis>,
-        /// Cache-slot key from the pre-strip feed half (`None` for
-        /// packageless entrypoint scripts — they get only the path entry).
-        module_name: Option<String>,
+        /// `Some` → register the residency token AFTER the chunk commits
+        /// (only when an index exists; `None` covers packageless / no-index
+        /// deferred entries and every persist-only whole copy).
+        parts: Option<crate::module_index::WorkspaceRegistrationParts>,
         /// Register + mirror in the writer after COMMIT. `false` = the
         /// worker already registered a WHOLE copy (NO_EVICT); persist only.
         deferred: bool,
@@ -909,11 +936,18 @@ pub fn index_workspace_with_index(
     let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
     let timing = crate::timings::is_enabled();
 
+    // Deliberate whole-copy accounting for the workspace-tier residency
+    // tripwire — the Perl twin of the pack indexer's counter.
+    let expected_whole = Arc::new(AtomicUsize::new(0));
+    let expected_whole_writer = Arc::clone(&expected_whole);
+
     // The Connection moves INTO the writer thread (rusqlite connections are
     // Send, not Sync); nothing after the scope needs it.
     let writer_conn = conn;
     std::thread::scope(|scope| {
         let writer = scope.spawn(move || {
+            // Same failure-bounded whole-copy budget as the pack writer.
+            let mut fallback_bytes = 0usize;
             run_persist_writer(
                 fresh_rx,
                 writer_conn.as_ref(),
@@ -945,8 +979,8 @@ pub fn index_workspace_with_index(
                     }
                     if e.deferred {
                         files.insert_workspace_arc(e.path.clone(), e.arc.clone());
-                        if let Some(idx) = module_index {
-                            idx.register_workspace_residency(e.path, e.arc, e.module_name);
+                        if let (Some(idx), Some(parts)) = (module_index, e.parts) {
+                            idx.register_workspace_residency(e.path, parts);
                         }
                     }
                 },
@@ -955,15 +989,32 @@ pub fn index_workspace_with_index(
                     // for it. The blob in hand IS the whole analysis —
                     // register full copies instead, so nothing is lost
                     // beyond the persistence itself (disk full / lock storm
-                    // stays loud AND self-heals).
+                    // stays loud AND self-heals) — up to the budget.
                     if let Some(idx) = module_index {
                         idx.invalidate_bag_cache(&e.path);
                     }
                     if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                        let bytes = fa.heap_estimate().total();
+                        if fallback_bytes.saturating_add(bytes) > FALLBACK_WHOLE_BYTE_CAP {
+                            // Over budget: DROP (the chunk didn't commit, so a
+                            // stripped copy has no blob to rehydrate from —
+                            // honest absence, re-indexed next run).
+                            log::warn!(
+                                "workspace persist writer: fallback budget ({} MiB) exceeded — \
+                                 dropping resident copy for {:?}; re-indexes next run",
+                                FALLBACK_WHOLE_BYTE_CAP / (1024 * 1024),
+                                e.path,
+                            );
+                            return;
+                        }
+                        fallback_bytes += bytes;
                         let arc = std::sync::Arc::new(fa);
                         files.insert_workspace_arc(e.path.clone(), arc.clone());
                         if let Some(idx) = module_index {
                             let _ = idx.register_workspace_resident(e.path.clone(), arc);
+                            // A deliberate whole pin — account it so the
+                            // tripwire flags only UNEXPLAINED residents.
+                            expected_whole_writer.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 },
@@ -1030,12 +1081,12 @@ pub fn index_workspace_with_index(
                         // residency + FileStore mirror in the writer AFTER
                         // its chunk commits. Until then the file reads as
                         // "not yet indexed" — never wrong-empty.
-                        let (arc, module_name) = match module_index {
+                        let (arc, parts) = match module_index {
                             Some(idx) => {
                                 let parts =
                                     idx.prepare_workspace_parts(analysis, true, true);
-                                let _ = idx.record_surface_value(&canon, parts.surface);
-                                (parts.arc, parts.module_name)
+                                parts.record_surface(idx, &canon);
+                                (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
                             None => {
                                 analysis.evict_axes(true, true);
@@ -1046,7 +1097,7 @@ pub fn index_workspace_with_index(
                         let _ = fresh_tx.send(WsFresh {
                             path: canon.clone(),
                             arc,
-                            module_name,
+                            parts,
                             deferred: true,
                             blob,
                             seeds,
@@ -1056,22 +1107,28 @@ pub fn index_workspace_with_index(
                         });
                     } else {
                         // Whole copy (no persistence, degraded, or NO_EVICT):
-                        // safe to register immediately; still persist when a
-                        // blob exists.
-                        let arc = std::sync::Arc::new(analysis);
-                        if let Some(idx) = module_index {
-                            let module_name = idx.workspace_feed_prestrip(&arc);
-                            idx.register_workspace_residency(
-                                canon.clone(),
-                                arc.clone(),
-                                module_name,
-                            );
-                        }
+                        // register immediately (no strip — the whole-copy door);
+                        // still persist when a blob exists. `false, false` mints
+                        // the token without evicting or recording surface, so
+                        // this path's freshness behavior is unchanged.
+                        let arc = match module_index {
+                            Some(idx) => {
+                                let parts = idx.prepare_workspace_parts(analysis, false, false);
+                                let arc = std::sync::Arc::clone(parts.arc());
+                                idx.register_workspace_residency(canon.clone(), parts);
+                                // Deliberate whole pin (unpersistable /
+                                // degraded / NO_EVICT) — accounted for the
+                                // tripwire.
+                                expected_whole.fetch_add(1, Ordering::Relaxed);
+                                arc
+                            }
+                            None => std::sync::Arc::new(analysis),
+                        };
                         if let Some((blob, seeds, sym_seeds, closure)) = payload {
                             let _ = fresh_tx.send(WsFresh {
                                 path: canon.clone(),
                                 arc: arc.clone(),
-                                module_name: None,
+                                parts: None,
                                 deferred: false,
                                 blob,
                                 seeds,
@@ -1099,6 +1156,18 @@ pub fn index_workspace_with_index(
         let _ = writer.join();
     });
 
+    // Workspace-tier residency tripwire, mirroring the pack indexer's:
+    // gated off under NO_EVICT (everything is deliberately whole there).
+    if let Some(idx) = module_index {
+        if eviction_enabled() {
+            residency_tripwire(
+                "workspace",
+                idx.count_fully_resident(),
+                expected_whole.load(Ordering::Relaxed),
+            );
+        }
+    }
+
     count.load(Ordering::Relaxed)
 }
 
@@ -1117,6 +1186,43 @@ pub fn index_workspace_with_index(
 /// lever for isolating an eviction-caused regression.
 pub(crate) fn eviction_enabled() -> bool {
     std::env::var_os("PERL_LSP_NO_EVICT").is_none()
+}
+
+/// `PERL_LSP_STRICT_RESIDENCY=1`: residency invariant breaks (an evicted
+/// copy that can't rehydrate, a tripwire overrun) PANIC instead of
+/// degrading. The gold harness sets it so a session serving
+/// absence-as-answer dies as a CRASH row (hard fail) rather than scoring
+/// wrong answers — the cold-flake net. Off by default: a live server
+/// prefers degraded-but-useful.
+pub(crate) fn strict_residency() -> bool {
+    std::env::var_os("PERL_LSP_STRICT_RESIDENCY").is_some_and(|v| v != "0")
+}
+
+/// The post-bulk-index residency check, one speller for the pack tier and
+/// the Perl workspace tier: fully-resident registered copies beyond the
+/// deliberately-accounted ones (writer fallbacks, degraded/unpersisted
+/// analyses) mean a registration path is silently pinning whole analyses —
+/// the RAM regression no functional test can see. `debug_assert` catches it
+/// in `cargo test`; strict mode makes it fatal in release (the gold net).
+fn residency_tripwire(tier: &str, whole: usize, expected: usize) {
+    if whole <= expected {
+        return;
+    }
+    log::error!(
+        "residency tripwire ({tier}): {whole} fully-resident copies, only \
+         {expected} accounted (writer fallbacks / degraded) — a registration \
+         path is pinning whole analyses"
+    );
+    debug_assert!(
+        false,
+        "residency tripwire ({tier}): {whole} fully-resident > {expected} accounted"
+    );
+    if strict_residency() {
+        panic!(
+            "PERL_LSP_STRICT_RESIDENCY: residency tripwire ({tier}): {whole} \
+             fully-resident copies, only {expected} accounted"
+        );
+    }
 }
 
 /// Persist one module's generation: blob + its relational ref rows, always
@@ -1320,13 +1426,12 @@ pub fn index_pack_languages(
                                 // re-shred needs the full analysis.
                                 return WarmDirective::NeedFull;
                             }
-                            let _ = pack_index.record_surface_value(&path, stub.surface);
-                            pack_index.register_symbols_inner(
-                                path.clone(),
-                                Arc::new(stub.skeleton),
-                                &stub.feed,
-                                &stub.specs,
-                            );
+                            // The stub IS a persisted `prepare_pack_parts`
+                            // output — rehydrate the token, register through it.
+                            let parts =
+                                crate::module_index::PackRegistrationParts::from_warm_stub(stub);
+                            parts.record_surface(&pack_index, &path);
+                            pack_index.register_symbols_inner(path.clone(), parts);
                             warmed.insert(path);
                             return WarmDirective::Handled;
                         }
@@ -1348,22 +1453,17 @@ pub fn index_pack_languages(
                     );
                     if fully_stripped {
                         if let Some(blob) = module_cache::encode_stub(
-                            &parts.feed,
-                            &parts.specs,
-                            &parts.surface,
-                            &parts.arc,
+                            parts.feed(),
+                            parts.specs(),
+                            parts.surface(),
+                            parts.arc(),
                         ) {
                             let stamp = module_cache::file_stamp(&path).unwrap_or((0, 0));
                             pending_stubs.push((path.clone(), blob, stamp));
                         }
                     }
-                    let _ = pack_index.record_surface_value(&path, parts.surface);
-                    pack_index.register_symbols_inner(
-                        path.clone(),
-                        parts.arc,
-                        &parts.feed,
-                        &parts.specs,
-                    );
+                    parts.record_surface(&pack_index, &path);
+                    pack_index.register_symbols_inner(path.clone(), parts);
                     warmed.insert(path);
                     WarmDirective::Handled
                 },
@@ -1424,10 +1524,13 @@ pub fn index_pack_languages(
         // persists.
         struct FreshEntry {
             path: PathBuf,
+            // For persistence (`include_closure`) — always present. For a
+            // deferred entry this is the same arc the token carries.
             arc: Arc<crate::file_analysis::FileAnalysis>,
-            feed: Vec<(String, bool)>,
-            specs: Vec<(String, String)>,
-            deferred: bool,
+            // `Some` → register the token AFTER the chunk commits (stripped
+            // copies). `None` → the worker already registered a whole copy
+            // (NO_EVICT/degraded); the writer only persists.
+            parts: Option<crate::module_index::PackRegistrationParts>,
             blob: Vec<u8>,
             // Warm stub (deferred/stripped entries only) — persisted in the
             // same chunk txn as the blob so the next warm start registers
@@ -1449,6 +1552,10 @@ pub fn index_pack_languages(
         let expected_whole_writer = Arc::clone(&expected_whole);
         std::thread::scope(|scope| {
             let writer = scope.spawn(move || {
+                // Byte budget for the whole copies a failed chunk retains
+                // (see FALLBACK_WHOLE_BYTE_CAP). Per-writer accumulator — the
+                // fallback lane is single-threaded (this writer thread).
+                let mut fallback_bytes = 0usize;
                 run_persist_writer(
                     fresh_rx,
                     writer_conn.as_ref(),
@@ -1489,17 +1596,33 @@ pub fn index_pack_languages(
                         // reachable, so its first rehydration reads the
                         // just-committed blob.
                         pack_index_writer.invalidate_bag_cache(&e.path);
-                        if e.deferred {
-                            pack_index_writer.register_symbols_inner(
-                                e.path, e.arc, &e.feed, &e.specs,
-                            );
+                        if let Some(parts) = e.parts {
+                            pack_index_writer.register_symbols_inner(e.path, parts);
                         }
                     },
                     |e: FreshEntry| {
                         pack_index_writer.invalidate_bag_cache(&e.path);
                         if let Some(fa) = module_cache::decode_analysis(&e.blob) {
-                            expected_whole_writer.fetch_add(1, Ordering::Relaxed);
-                            pack_index_writer.register_symbols(e.path, Arc::new(fa));
+                            let bytes = fa.heap_estimate().total();
+                            if fallback_bytes.saturating_add(bytes) <= FALLBACK_WHOLE_BYTE_CAP {
+                                fallback_bytes += bytes;
+                                // Tripwire-accounted: this whole copy is a
+                                // DELIBERATE (failure-bounded) pin.
+                                expected_whole_writer.fetch_add(1, Ordering::Relaxed);
+                                pack_index_writer.register_symbols(e.path, Arc::new(fa));
+                            } else {
+                                // Over budget: DROP the resident copy. The
+                                // chunk didn't commit, so a stripped copy
+                                // would rehydrate to wrong-empty; leaving it
+                                // unregistered is honest absence that the next
+                                // index/warm re-registers.
+                                log::warn!(
+                                    "pack persist writer: fallback budget ({} MiB) exceeded — \
+                                     dropping resident copy for {:?}; re-indexes next run",
+                                    FALLBACK_WHOLE_BYTE_CAP / (1024 * 1024),
+                                    e.path,
+                                );
+                            }
                         }
                     },
                 );
@@ -1541,29 +1664,28 @@ pub fn index_pack_languages(
                         None
                     };
                     if strip && payload.is_some() {
-                        // Stripped copy: compute the feed pre-strip, hand
-                        // BOTH to the writer — it registers after the chunk
-                        // COMMITS, so an evicted copy is never reachable
-                        // before its blob can rehydrate it.
+                        // Stripped copy: mint the token pre-strip, hand it to
+                        // the writer — it registers after the chunk COMMITS,
+                        // so an evicted copy is never reachable before its blob
+                        // can rehydrate it.
                         let parts = crate::module_index::ModuleIndex::prepare_pack_parts(
                             analysis, true, true,
                         );
                         let stub_blob = module_cache::encode_stub(
-                            &parts.feed,
-                            &parts.specs,
-                            &parts.surface,
-                            &parts.arc,
+                            parts.feed(),
+                            parts.specs(),
+                            parts.surface(),
+                            parts.arc(),
                         );
                         // Recording before the writer's COMMIT is safe — the
                         // freshness index is session-local.
-                        let _ = pack_index.record_surface_value(&canon, parts.surface);
+                        parts.record_surface(&pack_index, &canon);
                         let (blob, seeds, sym_seeds) = payload.unwrap();
+                        let arc = Arc::clone(parts.arc());
                         let _ = fresh_tx.send(FreshEntry {
                             path: canon.clone(),
-                            arc: parts.arc,
-                            feed: parts.feed,
-                            specs: parts.specs,
-                            deferred: true,
+                            arc,
+                            parts: Some(parts),
                             blob,
                             stub_blob,
                             seeds,
@@ -1581,9 +1703,7 @@ pub fn index_pack_languages(
                             let _ = fresh_tx.send(FreshEntry {
                                 path: canon.clone(),
                                 arc,
-                                feed: Vec::new(),
-                                specs: Vec::new(),
-                                deferred: false,
+                                parts: None,
                                 blob,
                                 stub_blob: None,
                                 seeds,
@@ -1611,19 +1731,11 @@ pub fn index_pack_languages(
             let _ = writer.join();
         });
         if strip {
-            let whole = pack_index.count_fully_resident();
-            let expected = expected_whole.load(Ordering::Relaxed);
-            if whole > expected {
-                log::error!(
-                    "residency tripwire ({lang}): {whole} fully-resident copies, only \
-                     {expected} accounted (writer fallbacks / degraded) — a registration \
-                     path is pinning whole analyses"
-                );
-                debug_assert!(
-                    false,
-                    "residency tripwire ({lang}): {whole} fully-resident > {expected} accounted"
-                );
-            }
+            residency_tripwire(
+                &lang.to_string(),
+                pack_index.count_fully_resident(),
+                expected_whole.load(Ordering::Relaxed),
+            );
         }
         hub.attach_pack_index(lang, pack_index);
     }
@@ -1663,6 +1775,21 @@ fn analyze_stamped<T>(
     }
     Some((out, stamp))
 }
+
+/// Byte budget for whole `FileAnalysis` copies the persist writer retains
+/// when a chunk fails to commit (disk full) or panics. The strip is licensed
+/// only by a landed blob, so a fallback keeps copies WHOLE — and a
+/// persistently failing writer would otherwise pin the ENTIRE tree resident
+/// (the docs/open-forks.md "writer fallback budget" residual). Past the cap
+/// we DROP the resident copy rather than register a stripped one: the chunk
+/// didn't commit, so a stripped copy's blob isn't on disk and could only
+/// rehydrate to wrong-empty. Dropping is honest absence — the file reads as
+/// "not indexed this session" and the next index/warm re-registers it; it
+/// never serves wrong data and never leaves an evicted copy unrehydratable
+/// (nothing is evicted — nothing is registered). Byte-accounted like the
+/// enrichment overlay (`ENRICHED_BYTE_CAP`); 128 MiB per writer thread — a
+/// transient failure degrades gracefully, a permanent one can't OOM.
+const FALLBACK_WHOLE_BYTE_CAP: usize = 128 * 1024 * 1024;
 
 /// The persist-writer harness both bulk indexers share: batches entries off
 /// the channel (≤128 per txn), owns BEGIN IMMEDIATE / COMMIT / ROLLBACK

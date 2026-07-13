@@ -377,6 +377,32 @@ warm RSS **47 MB**. Bugzilla warm RSS: 75 MB.
 The store: `modules-cpp.db` 6.1 GB, 34.8 M ref rows over 2.16 M interned
 strings.
 
+## Further relational views
+
+The shred makes a class of "interesting data" queries buildable as SQL over
+`refs`/`syms` rather than one-off Rust walks. Triaged:
+
+- **Unused exports — built.** `unused_exported_syms`: `syms` rows flagged
+  `SymRowSeed::FLAG_EXPORTED` (bit 3, baked from `FileAnalysis::exports_name`
+  — the same `@EXPORT`/`@EXPORT_OK` surface the Surface projects) with zero
+  ref rows in any OTHER file. Sound in one direction — zero cross-file
+  candidate rows ⇒ truly unused by any consumer; nonzero ⇒ unknown, never
+  "used" (rows over-approximate references) — the right polarity for a
+  dead-export review queue. It doubles as a sound pre-prune for `--heatmap`'s
+  per-declaration references projection: a name absent from the ref-row key
+  set (`names_with_ref_rows`) has a provably-empty projection, so the walk is
+  skipped and fan-in forced to 0. The pre-prune only ever skips
+  provably-empty work — every computed fan-in still comes from
+  `references()` — and is gated on the store actually covering the scanned
+  files (`paths_with_ref_rows`), degrading to the full projection when it
+  does not (`PERL_LSP_REF_ROWS=0`, cold cache, `--include-deps`).
+- **Implementors-of-a-role — parked awaiting a consumer.** Isa/bridge edges
+  aren't shredded; this needs a new edge table, paid only when a code lens or
+  query verb wants it.
+- **Callers-by-arg-type — declined as SQL.** Argument types live in the
+  witness bag, and bag + fold stay blob + in-Rust (the ratified hybrid
+  boundary). If ever needed it is a Rust report walk, not a view.
+
 ## Regression net
 
 - **Parity harness (the load-bearing gate):** `--refs-parity <root>` runs

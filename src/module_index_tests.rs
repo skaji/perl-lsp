@@ -599,6 +599,50 @@ fn enriched_snapshot_caches_and_invalidates_on_provider_change() {
     );
 }
 
+/// @INC providers carry a real registration generation (minted at
+/// insert/warm), so a re-resolve moves the consumer's enrichment key even
+/// though the provider is a RECORDLESS cache entry (no surface fingerprint —
+/// the `None` arm that used to fall back to the Arc pointer). `insert_cache`
+/// is the CLI/@INC insertion door; each Some insert mints a fresh gen.
+#[test]
+fn inc_provider_reresolve_moves_enrichment_key() {
+    let idx = ModuleIndex::new_for_test();
+    // Consumer imports from an @INC-tier provider inserted name-keyed (no
+    // surface record → the recordless enrichment-key arm).
+    let consumer = parse_source_to_cached(
+        "package App;\nuse Ext::Lib 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(consumer.path.to_path_buf(), Arc::clone(&consumer.analysis));
+
+    let prov_v1 = parse_source_to_cached(
+        "package Ext::Lib;\nour @EXPORT_OK = ('make');\nsub make { return bless {}, 'W1' }\n1;\n",
+        "Ext::Lib",
+    );
+    idx.insert_cache("Ext::Lib", Some(prov_v1));
+
+    let snap1 = idx.enriched_snapshot(&consumer).expect("snapshot v1");
+    let snap1b = idx.enriched_snapshot(&consumer).expect("snapshot v1 cached");
+    assert!(
+        Arc::ptr_eq(&snap1, &snap1b),
+        "key stable across queries: the cached snapshot is returned"
+    );
+
+    // Re-resolve the provider (content changed): a new generation must move
+    // the consumer's key even for a recordless @INC entry.
+    let prov_v2 = parse_source_to_cached(
+        "package Ext::Lib;\nour @EXPORT_OK = ('make', 'other');\nsub make { return bless {}, 'W2' }\nsub other { return 2 }\n1;\n",
+        "Ext::Lib",
+    );
+    idx.insert_cache("Ext::Lib", Some(prov_v2));
+
+    let snap2 = idx.enriched_snapshot(&consumer).expect("snapshot v2");
+    assert!(
+        !Arc::ptr_eq(&snap1, &snap2),
+        "@INC provider re-resolve (gen bump) must move the enrichment key"
+    );
+}
+
 /// The R4 always-enriched seams: a closed dep whose answer chains through
 /// ITS OWN imports is a raw-bag dead end (the walker pins no edge for
 /// imported calls); the fallback-on-miss retry through the enrichment
@@ -749,4 +793,382 @@ fn enriched_present_default_is_the_raw_bag() {
     let e = crate::file_analysis::CrossFileLookup::enriched_present(&lk, &cm);
     let b = crate::file_analysis::CrossFileLookup::bag_present(&lk, &cm);
     assert!(Arc::ptr_eq(&e, &b), "default enriched view IS the raw bag view");
+}
+
+/// Build a `FileAnalysis` and cache it under `module_name` with a plugin
+/// namespace bridging to `bridge_class`, its entity being the named sub.
+/// Exercises the bridged-entity hop of the `MethodOnClass` fallback.
+fn cache_bridged(
+    idx: &ModuleIndex,
+    module_name: &str,
+    source: &str,
+    entity_sub: &str,
+    bridge_class: &str,
+) {
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(source, None).unwrap();
+    let mut fa = crate::builder::build(&tree, source.as_bytes());
+    let entity_id = fa
+        .symbols
+        .iter()
+        .find(|s| s.name == entity_sub)
+        .map(|s| s.id)
+        .expect("entity sub must exist");
+    fa.plugin_namespaces.push(crate::file_analysis::PluginNamespace {
+        id: format!("test:{module_name}"),
+        plugin_id: "test".into(),
+        kind: "emitter".into(),
+        entities: vec![entity_id],
+        bridges: vec![crate::file_analysis::Bridge::Class(bridge_class.into())],
+        decl_span: crate::file_analysis::Span {
+            start: tree_sitter::Point { row: 0, column: 0 },
+            end: tree_sitter::Point { row: 0, column: 0 },
+        },
+    });
+    idx.insert_cache(
+        module_name,
+        Some(Arc::new(CachedModule::new(
+            PathBuf::from(format!("/fake/{}.pm", module_name.replace("::", "/"))),
+            Arc::new(fa),
+        ))),
+    );
+}
+
+/// Seam (a): a plugin-bridged entity whose return type materializes ONLY
+/// after the bridging file is itself enriched. The `MethodOnClass` bridged
+/// hop queries the bridging file's RAW bag first (dead-ends — `render`'s
+/// value chains through the bridging file's import of C), then falls back to
+/// the enriched overlay copy, which resolves it.
+#[test]
+fn bridged_entity_return_resolves_through_enriched_overlay() {
+    let idx = ModuleIndex::new_for_test();
+    // C exports thing() → Widget.
+    let c = parse_source_to_cached(
+        "package C;\nour @EXPORT_OK = ('thing');\nsub thing { return bless {}, 'Widget' }\n1;\n",
+        "C",
+    );
+    idx.register_workspace_module(c.path.to_path_buf(), Arc::clone(&c.analysis));
+    // Br bridges its `render` entity to class `Painter`; render's return type
+    // exists only through Br's OWN import of C.
+    let br_src = "package Br;\nuse C 'thing';\nsub render { my $x = thing(); return $x }\n1;\n";
+    cache_bridged(&idx, "Br", br_src, "render", "Painter");
+
+    // Precondition: Br's RAW bag alone can't type render (thing() imported,
+    // no local edge) — else the enriched fallback proves nothing.
+    let br = idx.get_cached("Br").expect("Br cached");
+    let render_id = br
+        .analysis
+        .symbols
+        .iter()
+        .find(|s| s.name == "render")
+        .map(|s| s.id)
+        .unwrap();
+    assert_eq!(
+        br.analysis.symbol_return_type_via_bag(render_id, None),
+        None,
+        "fixture must dead-end on the raw bag"
+    );
+
+    // MethodOnClass{Painter, render}: hop (1)/(2) find nothing (no Painter
+    // module, no parents); the bridged hop (3) retries through the enriched
+    // overlay and resolves Widget.
+    let t = idx_find_method_return(&idx, "Painter", "render");
+    assert_eq!(
+        t.as_ref().and_then(|t| t.class_name()).as_deref(),
+        Some("Widget"),
+        "bridged entity resolved through Br's enriched overlay: {t:?}"
+    );
+}
+
+/// Route a `MethodOnClass{class, name}` query from a throwaway consumer FA
+/// through the index (the bridged hop needs a `BagContext` with the index).
+fn idx_find_method_return(
+    idx: &ModuleIndex,
+    class: &str,
+    method: &str,
+) -> Option<InferredType> {
+    let consumer = parse_source_to_cached("package Q;\nsub noop { 1 }\n1;\n", "Q");
+    consumer
+        .analysis
+        .find_method_return_type(class, method, Some(idx), None)
+}
+
+/// Seam (b), primary (hop 1): the cross-file `SlotType{class, key}` primary —
+/// a typed slot WRITE in the class's OWN file, read from a consumer, resolves
+/// through the extracted `attempt` closure. (The enriched-retry twin of this
+/// hop is dormant today: SlotType seeds are build-gated on a resolvable RHS,
+/// so a seed that exists already answers on the raw bag. The retry is wired
+/// for symmetry with the MethodOnClass primary; this test guards the refactor
+/// that extracted its `attempt` closure.)
+#[test]
+fn cross_file_slot_type_primary_resolves_hop1() {
+    let idx = ModuleIndex::new_for_test();
+    let store = parse_source_to_cached(
+        "package Store;\nsub init {\n    my $self = shift;\n    $self->{conn} = Conn->new;\n}\n1;\n",
+        "Store",
+    );
+    idx.register_workspace_module(store.path.to_path_buf(), Arc::clone(&store.analysis));
+
+    let app_src =
+        "package App;\nsub run {\n    my $s = Store->new;\n    my $c = $s->{conn};\n}\n1;\n";
+    let mut parser = crate::builder::create_parser();
+    let tree = parser.parse(app_src, None).unwrap();
+    let fa = crate::builder::build(&tree, app_src.as_bytes());
+
+    // `$c` rode `Edge(Expr($s->{conn}))`, which drilled `SlotType{Store, conn}`
+    // into Store's own file (hop 1) and found the `Conn->new` slot write.
+    let t = fa.inferred_type_via_bag_ctx(
+        "$c",
+        tree_sitter::Point { row: 4, column: 0 },
+        Some(&idx),
+    );
+    assert_eq!(
+        t.as_ref().and_then(|t| t.class_name()).as_deref(),
+        Some("Conn"),
+        "read narrows via Store's own slot write (cross-file SlotType primary): {t:?}"
+    );
+}
+
+/// Seam (c): enrichment is TRANSITIVE through the overlay. A imports `make`
+/// from B; B's `make` types only through B's import of C. Enriching A must
+/// bake `make → Widget` into A's OWN bag — which requires A's import scan to
+/// fall back to B's ENRICHED copy (B's raw bag dead-ends on the imported
+/// `thing()`).
+#[test]
+fn enrichment_is_transitive_through_the_overlay() {
+    let c = parse_source_to_cached(
+        "package C;\nour @EXPORT_OK = ('thing');\nsub thing { return bless {}, 'Widget' }\n1;\n",
+        "C",
+    );
+    let b = parse_source_to_cached(
+        "package B;\nuse C 'thing';\nour @EXPORT_OK = ('make');\nsub make { my $x = thing(); return $x }\n1;\n",
+        "B",
+    );
+    let a = parse_source_to_cached(
+        "package A;\nuse B 'make';\nsub go { my $m = make(); return $m }\n1;\n",
+        "A",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(c.path.to_path_buf(), Arc::clone(&c.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+
+    // Precondition: A's RAW bag can't type go (make imported, no index).
+    assert_eq!(a.analysis.sub_return_type_at_arity("go", None), None);
+
+    // Enrich A through the overlay; its OWN bag must now answer go → Widget
+    // WITHOUT an index, proving enrichment baked the A→B→C transitive type.
+    let enriched_a = idx.enriched_snapshot(&a).expect("A enriches");
+    let t = enriched_a
+        .sub_return_type_at_arity("go", None)
+        .expect("enrichment must bake make's C-derived return into A");
+    assert_eq!(t.class_name().as_deref(), Some("Widget"), "{t:?}");
+}
+
+/// Seam (c), cycle: mutual imports whose exports type only through each
+/// other exercise the ENRICHING re-entrant guard (enrichment's own import
+/// scan is its first customer). The re-entrant enrich declines to the raw
+/// bag, the cyclic build is tainted → answered as a DECLINE, and the tainted
+/// copy is never cached — so a repeat query re-declines identically and the
+/// call terminates (no hang / stack overflow).
+#[test]
+fn transitive_enrichment_mutual_import_terminates_without_poison() {
+    let a = parse_source_to_cached(
+        "package CycA;\nuse CycB 'bfn';\nour @EXPORT_OK = ('afn');\nsub afn { my $x = bfn(); return $x }\n1;\n",
+        "CycA",
+    );
+    let b = parse_source_to_cached(
+        "package CycB;\nuse CycA 'afn';\nour @EXPORT_OK = ('bfn');\nsub bfn { my $y = afn(); return $y }\n1;\n",
+        "CycB",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+    idx.register_workspace_module(b.path.to_path_buf(), Arc::clone(&b.analysis));
+
+    // Terminates: the guard declines the re-entrant enrich, the tainted build
+    // answers as a decline (None), never a cached degraded copy.
+    let snap = idx.enriched_snapshot(&a);
+    assert!(snap.is_none(), "mutually-cyclic enrich declines deterministically");
+    // Deterministic + no poison: a second call re-declines identically.
+    assert!(idx.enriched_snapshot(&a).is_none());
+}
+
+/// The rehydration-miss tripwire's observable: an evicted registered copy
+/// with no rehydration source (no bag cache installed) is served as the
+/// stripped resident AND counted — the "absence-as-answer" signature the
+/// strict gate (`PERL_LSP_STRICT_RESIDENCY`) turns into a loud crash.
+/// Strict mode is off in tests, so this exercises the counting arm.
+#[test]
+fn rehydration_miss_is_counted_and_serves_resident() {
+    let idx = ModuleIndex::new_for_test();
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let src = "package Ghost;\nsub boo { return 1 }\n1;\n";
+    let tree = parser.parse(src, None).unwrap();
+    let mut fa = crate::builder::build(&tree, src.as_bytes());
+    fa.evict_axes(true, true);
+    let cm = Arc::new(CachedModule::new(
+        PathBuf::from("/fake/Ghost.pm"),
+        Arc::new(fa),
+    ));
+
+    let before = crate::module_index::rehydration_miss_count();
+    let served = crate::file_analysis::CrossFileLookup::bag_present(&idx, &cm);
+    assert!(
+        Arc::ptr_eq(&served, &cm.analysis),
+        "miss degrades to the stripped resident copy, never fabricates"
+    );
+    assert!(
+        crate::module_index::rehydration_miss_count() > before,
+        "the miss must be counted — silent absence is the flake signature"
+    );
+}
+
+/// The foreign-route half of rehydration: a sweep minting `CachedModule`s
+/// from FileStore entries asks whatever index the query routed to — a cpp
+/// query's workspace sweep hands PERL paths to the cpp sub-index, whose own
+/// loader can never serve them (first caught live by the strict-residency
+/// tripwire: cross-TU cpp references silently dropped every Perl workspace
+/// file's matches). The sub-index must route a hub-owned path to the hub's
+/// rehydration cell instead of degrading to the stripped resident.
+#[test]
+fn foreign_path_rehydrates_through_the_owning_sibling() {
+    let hub = ModuleIndex::new_for_test();
+
+    // A whole analysis the "hub blob store" can serve, and its stripped twin
+    // the sweep would otherwise read empty.
+    let src = "package Ghost;\nsub boo { return 1 }\n1;\n";
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let whole = crate::builder::build(&tree, src.as_bytes());
+    let whole_arc = Arc::new(whole);
+    let mut stripped = (*whole_arc).clone();
+    stripped.evict_axes(true, true);
+    let path = PathBuf::from("/fake/hub/Ghost.pm");
+
+    // Install the hub's rehydration cell with a loader that serves the
+    // whole copy (stands in for the modules.db blob load).
+    let served = Arc::clone(&whole_arc);
+    hub.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
+        128 * 1024 * 1024,
+        move |p: &std::path::Path| {
+            (p == std::path::Path::new("/fake/hub/Ghost.pm")).then(|| (*served).clone())
+        },
+    )));
+
+    // Attach a pack sub-index (its own bag cache can never serve the path).
+    let sub = Arc::new(ModuleIndex::new_for_test());
+    hub.attach_pack_index("cpp", Arc::clone(&sub));
+
+    // The misrouted ask: the sub-index handed a hub-owned stripped copy.
+    let cm = Arc::new(CachedModule::new(path, Arc::new(stripped)));
+    let before = crate::module_index::rehydration_miss_count();
+    let full = crate::file_analysis::CrossFileLookup::whole_present(sub.as_ref(), &cm);
+    assert!(
+        full.symbols.iter().any(|s| s.name == "boo"),
+        "foreign route must serve the owner's WHOLE copy, not the stripped resident"
+    );
+    assert_eq!(
+        crate::module_index::rehydration_miss_count(),
+        before,
+        "a foreign-routed answer is a hit, not a residency miss"
+    );
+}
+
+/// Build a FileAnalysis from source (whole, never registered).
+fn build_fa(src: &str) -> crate::file_analysis::FileAnalysis {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    crate::builder::build(&tree, src.as_bytes())
+}
+
+/// The buffer-vs-disk provenance rule (`SurfaceWrite`): while a doc is
+/// open, consumers read its BUFFER, so the freshness baseline must track
+/// the open-doc records — a background (disk) re-record must not replace
+/// it. The trap this guards: buffer holds a contract change A', background
+/// re-records disk state A over it, the user REVERTS the buffer to A — and
+/// the revert must read CHANGED (consumers saw A'), not Unchanged against
+/// the smuggled disk baseline.
+#[test]
+fn background_surface_write_yields_to_open_doc_record() {
+    use crate::module_index::SurfaceWrite;
+    use crate::surface::SurfaceVerdict;
+    let idx = ModuleIndex::new_for_test();
+    let path = PathBuf::from("/fake/prov/Widget.pm");
+    let disk = build_fa("package Widget;\nsub base { 1 }\n1;\n");
+    let buffer = build_fa("package Widget;\nsub base { 1 }\nsub extra { 2 }\n1;\n");
+
+    // Indexer records the disk build, then the doc opens.
+    assert_eq!(
+        idx.record_and_dirty(&path, &disk, SurfaceWrite::Background).verdict,
+        SurfaceVerdict::FirstSeen
+    );
+    idx.mark_doc_open(&path);
+
+    // Buffer gains a contract change — consumers refreshed against A'.
+    assert_eq!(
+        idx.record_and_dirty(&path, &buffer, SurfaceWrite::OpenDoc).verdict,
+        SurfaceVerdict::Changed
+    );
+    // A background tick re-records the DISK build: suppressed.
+    assert_eq!(
+        idx.record_and_dirty(&path, &disk, SurfaceWrite::Background).verdict,
+        SurfaceVerdict::Unchanged,
+        "background write on an open path must yield"
+    );
+    // The revert: buffer back to the disk state. Baseline must still be
+    // the buffer record A' — this is CHANGED, the refresh consumers need.
+    assert_eq!(
+        idx.record_and_dirty(&path, &disk, SurfaceWrite::OpenDoc).verdict,
+        SurfaceVerdict::Changed,
+        "revert-to-disk must read Changed against the BUFFER baseline"
+    );
+}
+
+/// didClose reconcile: consumers flip back to the indexed disk copy, so
+/// `mark_doc_closed` re-records it (Changed when the buffer died with an
+/// unsaved contract change) and background writes own the record again.
+#[test]
+fn close_reconciles_the_disk_record() {
+    use crate::module_index::SurfaceWrite;
+    use crate::surface::SurfaceVerdict;
+    let idx = ModuleIndex::new_for_test();
+    let path = PathBuf::from("/fake/prov/Gadget.pm");
+    let disk = build_fa("package Gadget;\nsub base { 1 }\n1;\n");
+    let buffer = build_fa("package Gadget;\nsub base { 1 }\nsub unsaved { 2 }\n1;\n");
+
+    // The indexed disk copy (registration records Background — but the doc
+    // opens first here, so the registration's record is suppressed and the
+    // copy still registers).
+    idx.mark_doc_open(&path);
+    let _ = idx.register_workspace_resident(path.clone(), Arc::new(disk));
+    // Open-doc record: the buffer's unsaved contract change. FirstSeen —
+    // the registration's background record above was suppressed, so this
+    // is the freshness index's first sight of the path.
+    assert_eq!(
+        idx.record_and_dirty(&path, &buffer, SurfaceWrite::OpenDoc).verdict,
+        SurfaceVerdict::FirstSeen
+    );
+
+    // Close: reconcile against the registered disk copy.
+    let sd = idx.mark_doc_closed(&path).expect("indexed copy exists");
+    assert_eq!(
+        sd.verdict,
+        SurfaceVerdict::Changed,
+        "buffer died with an unsaved contract change — the flip to disk is Changed"
+    );
+    // Background writers own the record again: re-recording disk is Unchanged.
+    assert_eq!(
+        idx.record_and_dirty(&path, &build_fa("package Gadget;\nsub base { 1 }\n1;\n"), SurfaceWrite::Background)
+            .verdict,
+        SurfaceVerdict::Unchanged
+    );
 }
