@@ -83,7 +83,9 @@ why parked, what unblocks it. Prune on landing.
   use-after-move cleared. Default-off + opt-in + pack-capability gate
   (declared like `implicit_this_members`, never `lang == cpp`) is understood;
   only the valve + its calibration remain. `docs/adr/narrowing-diagnostics.md`.
-- **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
+- **PR #100** re-extraction onto the projection engine (user closes or
+  reworks; the `projection.rs` PoC now rests in git history — the design
+  is `docs/adr/cpp-templates.md`).
   - i think this will just be closed; anyways it didn't look like it did the intended PPP,
     which is to have mojo helpers which mint dynamic helpers show their definitions;
     literally no reason to punt on a conrete impl. this branch is leaning towards prod, so

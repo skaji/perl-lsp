@@ -93,10 +93,14 @@ SELECTION (this seam).
 
 ## One projection engine
 
-`src/projection.rs::project_fixpoint` is the single worklist + seen-set +
-root-chained-provenance spine. `perl_generators::synthesize` (strings, eager
-symbols, plugin-declared) and `cpp_templates::instantiate_to_fixpoint` (types,
-whole-program, syntax-derived) are thin domain closures over it. Emission policy
+The projection engine design: one worklist + seen-set +
+root-chained-provenance spine, with per-domain closures over it — Perl
+generator synthesis (strings, eager symbols, plugin-declared) and template
+instantiation-to-fixpoint (types, whole-program, syntax-derived). The PoC
+modules that proved it (`projection.rs`, `perl_generators.rs`,
+`cpp_templates.rs`) were experiment-only and rest in git history (removed
+at the spike GC, 2026-07-13); a producer arc re-lands the engine from this
+design. Emission policy
 and seen-set granularity stay the caller's — expressed at the call boundary, not
 by a branch inside the engine — because eager per-declaration symbol minting is
 right for a finite Perl generator group and wrong for a template × every
@@ -105,9 +109,9 @@ emission is per-language.
 
 Projection is **lazy** for LSP queries: one template symbol, substitute at query
 time in the reducer. Per-instantiation materialization is the parallel store
-"edges, not values" bans; an eager whole-program monomorphizer
-(`cpp_template_join.rs`) runs on the same engine but stays unwired until a
-call-graph / heatmap consumer pulls it. Outline / workspace-symbols show
+"edges, not values" bans; an eager whole-program monomorphizer (the
+`cpp_template_join` PoC, same git-history resting place) runs on the same
+engine and stays unbuilt until a call-graph / heatmap consumer pulls it. Outline / workspace-symbols show
 primaries and explicit instantiations (the latter are deliberate, enumerable,
 and the whole content of an explicit-instantiation TU), not every witnessed
 instantiation.

@@ -48,7 +48,8 @@ import (`use`), field slot = one shared subject. Same machinery, C surface.
 The template arc landed end-to-end: (a) extraction hygiene ✅ (specs/
 explicit-inst/aliases/concepts/unions/ScopeKind), (b) instances join their
 class ✅ (`ParametricType::Instance`), (c) lazy projection + partial-spec
-selection + the unified projection engine ✅ (`src/projection.rs`). THE
+selection + the unified projection engine ✅ (PoC; design in
+`docs/adr/cpp-templates.md`, code rests in git history). THE
 MIGRATION landed: the resolution CandidateSet (PR #107, merged to main)
 now runs the spike too — visibility/edges/ranking are construction facts,
 inherited by every projection, both languages. Heatmap #99 migrated onto
@@ -154,9 +155,10 @@ all landed. Durable structure:
    ladder (exact > partial > primary; `match_template_pattern` binds the
    spec's params from the concrete spelling), ranked never-pruned family
    goto-def, the tree-free pack member-chain arm of `expr_type_at_span`
-   (chained gd/completion), and the unified projection engine
-   (`src/projection.rs` — Perl generators + template monomorphization
-   share the worklist/seen-set/provenance spine). Parked residue: the
+   (chained gd/completion), and the unified projection engine (PoC —
+   Perl generators + template monomorphization share the
+   worklist/seen-set/provenance spine; `docs/adr/cpp-templates.md`).
+   Parked residue: the
    deduction/dependent-type rungs, template-template params,
    `extern template` ERROR parse (see the brief's parked list).
 9. ✅ **dogfood round 2 fix run** (five slices, all landed). A: one canonical `FileScopeValue` macro identity

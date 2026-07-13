@@ -1,5 +1,10 @@
 # Parallel realities — config-lifted `#ifdef` analysis
 
+> Spike PoC modules this brief cites (`c_preproc`, `c_reparse`,
+> `c_superpose`) were experiment-only and rest in git history (removed in
+> the 2026-07-13 spike GC). Re-land from this brief when the arc starts.
+
+
 **Status: PARKED — needs deep thought before any build.** Branch
 `spike/cpp-support`. Sibling to `docs/prompt-cpp-reparse.md` (the reparse
 seam) and the strategy context in
