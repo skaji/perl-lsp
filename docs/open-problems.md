@@ -139,3 +139,47 @@ resolving each gate cross-file. That is a real overlay-symbols mechanism —
 every symbol-table consumer must consult it — and is the natural companion to
 the planned graph-walking pillar (`docs/prompt-graph-walking.md`), not a
 contained follow-up. Deferred there.
+
+## `main::` aggregation across `require` of package-less scripts
+
+Legacy CGI (AWStats) `require`s package-less `.pm`/plugin files into the
+running script; with no `package` statement every sub lands in `main::`. Host
+and plugins call each other's subs — all `main` at runtime — but each file is
+analyzed in isolation, so cross-file `main::` symbols never unify (~270 FPs
+both directions in `awstats.pl` and its `require "$pluginpath"` plugins).
+
+Cross-file resolution keys on a *named* package (`package_parents`, the
+module→file map, the reverse index). `main` is the implicit, unnamed package,
+and many unrelated scripts each define their own `main::` subs, so naïvely
+unifying all `main` symbols workspace-wide cross-links unrelated files (every
+`t/*.t` has its own `main`). The real edge is `require`-induced — file A
+`require`s file B, so B's `main` subs are visible in A: a file-level dependency
+edge the engine doesn't model, distinct from `@ISA` (not inheritance) and
+`use`-import (no export list; everything in `main` is just visible). Modeling
+it wrong (union all `main`) is worse than the FP.
+
+The principled fix models the `require`-dependency edge: on a static `require`
+(literal path, or a `$var` tracing to a constant path) add a directed edge
+A→B and resolve unqualified calls in A against B's `main::` subs along it
+(bounded, seen-set) — only require-reachable files unify. The dynamic
+`require "$pluginpath"` (path from config) degrades silently. Gated on
+legacy-CGI support being in scope; modern code uses packages, and the
+dynamic-path require defeats static analysis anyway.
+
+## Duplicate-package resolution — two files `package Foo;`, which wins?
+
+Two files declare `package Bugzilla;` (`contrib/Bugzilla.pm` shadows the root
+`Bugzilla.pm`); picking the wrong one breaks the singleton's type inference and
+exports. "Which file owns `package Foo`?" has no static ground truth — at
+runtime `@INC` order decides, and the LSP has no single `@INC`. A heuristic is
+unavoidable but must be principled and stable (rule #10: not "is this path
+`contrib/`"). It interacts with the shadowed-`@EXPORT` bug and with the
+documents → workspace_index → module_index tier priority (duplicates *within* a
+tier are the gap).
+
+The principled shape ranks by a typed `FileRole` computed once at index time
+and carried on the entry: prefer the file whose path best matches the package
+name (`Bugzilla::Foo` → `lib/Bugzilla/Foo.pm`), then `lib/` over
+`t/`/`contrib/`/`xt/`/`examples/` — so the resolver asks the entry "are you
+canonical?" and the entry answers, no path-string branch at the resolution
+site. A real `@INC` / `.perl-lsp` config order overrides when present.

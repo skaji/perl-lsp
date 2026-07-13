@@ -583,3 +583,35 @@ Standing state: any recurrence now fails LOUDLY in gold (named stage,
 CRASH row) and is countable in servers. If it never fires again, the
 original occurrences stay attributed to the pre-hygiene two-writer
 window whose fixes have since landed.
+
+## Stack graphs for name resolution — 2026-07 — CONCLUDED / DECLINED (Claude)
+
+Full eval + spike kept as the paper trail: `docs/evals/stack-graphs.md`
+(+ `stack-graphs-spike.rs`). Verdict: do not adopt. Stack graphs solve
+name binding (reference→definition path-find), but the high-value
+perl-lsp problem is type inference, and in Perl the two aren't separable
+— the dominant nav case `$obj->method` needs `$obj`'s inferred class,
+which stack graphs cannot derive and must be fed from the witness bag. A
+running spike (`stack-graphs 0.14`, real `ForwardPartialPathStitcher`)
+resolved method dispatch 0 on syntax alone, 1 only when the `$o : Obj`
+type fact was hand-injected as edges; a gold-corpus census put reach at
+~38% of rows (pure name-binding) with ~62% type/framework-gated.
+Adoption would also re-encode each Perl exporter/`@ISA`/`use constant`
+dialect in a second formalism, add ~36 crates + a parallel graph store,
+and lose the type-carrying edges the witness bag already has (`graph.rs`
+derives edges on demand). Net more bookkeeping, not less; the typed-edge
+`GraphView` is the better generalization. Revisit only if stack graphs
+gain value/type-flow semantics AND an upstream Perl TSG definition ships.
+
+## Arc-review deferred suspicions — 2026-07 — OPEN (Claude)
+
+Two unverified observations from the cpp adversarial review, recorded on
+the residency/robustness axis so they aren't lost:
+- **`modules-{lang}.db` rows for deleted files are skipped on warm but
+  never purged** — a suspected unbounded-growth residual on long-lived
+  pack caches. Sibling of the watcher re-registration / writer-fallback
+  residuals above.
+- **`clean_body` truncates at `//` inside string literals** — a
+  `#define URL "https://x"` body would be mangled, potentially flipping
+  the whole-file validate gate to alias-only. Needs a string-literal-aware
+  comment strip if confirmed.

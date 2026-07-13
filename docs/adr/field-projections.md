@@ -66,3 +66,13 @@ receiver-gated discipline applied to hash keys. This is the one
 deliberately lazy resolution left in the ref model: dependency files
 are never enriched, so candidates ride the cache and resolve when
 asked.
+
+## Domain fold on the C side: the threshold is not a tuning problem
+
+The C `DomainCoherenceFold` over `Field { owner, name }` folds per-site
+evidence into a nominal domain (a field compared against `OP_*` constants is
+that enum's domain). The coherence threshold is measured, not tuned: on op.c,
+85.7% of `op_type` sites are strong opcode evidence and the genuine raw-int
+noise is 2 sites out of 1759, so any threshold in (0.5, 0.99) fires cleanly.
+The fold is a majority-agreement check on the field subject, not a per-field
+allowlist — the same subject the refs-splat and Perl domain typing consume.
