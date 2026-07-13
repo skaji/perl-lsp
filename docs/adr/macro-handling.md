@@ -1,6 +1,6 @@
 # ADR: Semantic handling of C/C++ macros
 
-Status: accepted (incremental). Measured baseline: `docs/macro-semantic-map.md`.
+Status: accepted (incremental).
 
 ## Context
 
@@ -146,7 +146,7 @@ machinery (`cpp_macro_model::classify` + the per-file include closure the
 gather already computes). Symbol resolution and macro resolution converge on
 one pattern: **global set + reachability scope.**
 
-### Parametric return — LANDED
+### Parametric return
 
 An identity/projection macro (`#define ID(x) (x)`, `#define SEL2(a,b) (b)`,
 cast-wrapped `#define CID(x) ((T*)(x))`) returns its n-th **argument's** type.
@@ -163,7 +163,7 @@ delegates (`likely`/`unlikely` → `__builtin_expect` under `#if __GNUC__`)
 stay in the delegation lane; projection macros returning a member
 (`((n)->value)`) are not bare params → not claimed.
 
-## Parked (we'll get there — correctness on a solid base, deepen as needed)
+## Parked
 
 - **Effects** — the second superposition dimension.
 
@@ -172,28 +172,8 @@ stay in the delegation lane; projection macros returning a member
 - Determinism precondition: the join-vs-chase winner must be a **principled,
   deterministic** rule, not witness/iteration order (owned by the flakiness
   fix). The function-like *return-typing* slice waits on that verdict.
-- Slice order (independent slices first; the coupled pair last):
-  1. **goto-def overhaul** — **LANDED** (959b388).
-  2. **provenance-leaf hover display** — **LANDED** (a6d8223). op_type hovers
-     the concrete leaf; typing stays the abstraction.
-  3. **member-block macros = roles** (the field-splat / copypasta-as-
-     inheritance) — **LANDED**. `cpp_reparse::plan_member_blocks` classifies a
-     field-block macro by struct-body usage (body-parseability is the
-     discriminator, per-candidate parse-damage gate confirms), **blanks** the
-     use (length-preserving; introduces the blank mode; the original keeps the
-     token, so goto-def-on-`BASEOP` is untouched), and mints one synthetic base
-     Class per macro with members from the config-active variant.
-     `language_driver::inject_member_blocks` reclassifies the macro symbol →
-     Class, adds the members (re-sourcing the same `TypeName` edge) + the
-     `struct → BASEOP` parent edges; the existing ancestor walk
-     (`resolve_method_in_ancestors` / `parents_of` / `GraphView::InheritsInv`,
-     now including same-file children) delivers member resolution, hover, and
-     the references splat. Fixes `BASEOP` field refs-splat / hover / goto-def.
-  4. **resolution visibility = include-closure scope** — the lie above; reuses
-     slice 1's reachability machinery. Correctness for vendored/monorepo name
-     collisions. Independent of the expansion policy.
-  5. **function-like implied return typing + full expansion policy flip** —
-     COUPLED: the "unexpanded macro parses as a `call_expression` → sub-return
-     bag path" mechanism only exists once expansion is parse-repair-only (the
-     full leave/blank/expand generalization of slice 3's blank). Biggest blast
-     radius, last, after the splice/gather work stabilizes.
+- **Function-like implied return typing** is coupled to the expansion-policy
+  flip: the "unexpanded macro parses as a `call_expression` → sub-return bag
+  path" mechanism only exists once expansion is parse-repair-only (the full
+  leave/blank/expand generalization of the member-block blank). Largest blast
+  radius, sequenced after the splice/gather work stabilizes.

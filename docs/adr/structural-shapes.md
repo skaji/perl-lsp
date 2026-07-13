@@ -4,8 +4,7 @@ Hash literals carry their keys in the type: `{ host => 'x' }` is not a
 bare `HashRef`, it's a shape — and `->{key}` narrows through it, across
 assignment hops, double-drills, sub returns, and imports. This ADR is
 the data model + lattice + trust contract; `ROADMAP.md`
-keeps the residual phases. Landed across the `nested-hashkey` branch
-(PR #50). Arrays got the same treatment earlier — see
+keeps the residual phases. Arrays get the same treatment — see
 `sequence-types.md`; the two variants share every rule below that
 mentions them together.
 
@@ -126,7 +125,7 @@ latest-wins, truncated away by the next enrichment cycle. `KeyWrite`s
 persist on `FileAnalysis` precisely so enrichment can re-run the pass
 once imported shapes land.
 
-### Escapes are open-switching writes (the gate clause came out)
+### Escapes are open-switching writes
 
 An escape — a scalar READ in any non-element-access position: call
 argument, RHS alias, invocant, sigil deref — hands the reference to
@@ -150,7 +149,7 @@ unmodeled conditional-reassignment disagreement (`$spec = {…} unless
 ref $spec`) plus the unknown-RHS reassignment (`$h = fetch()` — the
 bag has no retraction, so a stale closed shape would survive
 latest-wins). When a disagreement fold lands, this clause comes OUT
-of the gate, the way key writes and escapes did.
+of the gate.
 
 ### Calibration is part of done
 

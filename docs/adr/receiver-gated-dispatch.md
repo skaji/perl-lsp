@@ -58,8 +58,8 @@ isa-check runs at **query time**:
 
 Why C over the alternatives:
 
-- **Enrichment-only promotion** (what landed before) materialized
-  `DispatchCall` refs at enrichment, which only open files get — the gap.
+- **Enrichment-only promotion** materializes `DispatchCall` refs at
+  enrichment, which only open files get — the gap.
 - **Eager index over all workspace files** re-enriches dependency/
   workspace `Arc`'d analyses in a post-index pass, introducing an
   ordering + invalidation lifecycle. Large, and it duplicates the lazy
@@ -76,7 +76,7 @@ against those materialized refs by (span, dispatcher), so a triggered file
 surfaces each site exactly once. There are not two promotion paths to keep
 in sync: the materialized refs are the emit-hook's own output, and the
 gated candidates are the only thing the manifest path produces — there is
-no enrichment-time promotion of candidates into refs anymore.
+no enrichment-time promotion of candidates into refs.
 
 ## The 3-way `GateResult` + opt-in diagnostic
 
@@ -102,7 +102,7 @@ that predicate is cross-file*. The same `ReceiverGated` producer mints
 the other deferred emission-conditionals (see
 `docs/prompt-enrichment-inheritance-residual.md`).
 
-**`param_types` `in_role` — LANDED.** A plugin `param_types()` rule types a
+**`param_types` `in_role`.** A plugin `param_types()` rule types a
 named param when the enclosing package `isa` the rule's `in_role` class. The
 builder now emits one `ReceiverGated<TypeConstraint>` per matching sub
 (`gate = in_role`), UNGATED — no local-ancestry precondition, preserving the

@@ -1,8 +1,7 @@
 # Aspirational type-system features (NEW features — NOT QA-pass FP fixes)
 
-Two capabilities we want but have deliberately **not** built. Both are *new features*, not
-false-positive cleanups, so they sit outside the QA-fix loop and land on their own schedule.
-Both **extend what the witness bag carries**, and both take `InferredType::BrandedRoute`
+Two capabilities that **extend what the witness bag carries** — narrowing (§1, landed) and
+effects (§2, forward). Both take `InferredType::BrandedRoute`
 (`docs/adr/route-branding.md`) as the mechanism precedent — *option C collapsed*: extra
 resolved info lives **in** the carried value (no side-table, no id), rides the bag's existing
 edges/fold for free, and is read through the one chain typer. The two differ in **which edges**
@@ -10,33 +9,14 @@ the payload rides and **how much control-flow** they need.
 
 ---
 
-## 1. Narrowing (flow-sensitivity) — the "we don't model conditionals" pillar
+## 1. Narrowing (flow-sensitivity)
 
-A guard refines a variable's type *within a branch*:
-
-```perl
-if (ref $x eq 'Foo')                  { $x->foo_method }   # $x is Foo inside the if
-if (Params::Util::_INSTANCE($x,'Foo')){ $x->foo_method }   # ditto (the QA NARROW-1 case)
-return unless $x->isa('Bar');         # $x is Bar after the guard
-```
-
-**Why it's deferred / hard:** we do not model conditionals *anywhere*. Narrowing is intrinsically
-flow-sensitive — a type that holds only on one side of a branch and must re-widen at the join.
-That needs a branch/flow layer we've never built. Do it as **one pillar**, not piecemeal — picking
-off `isa` then `ref eq` then `_INSTANCE` is the rule-#10 partial-enumeration trap.
-
-**Cases that live behind this wall (group them):**
-- **NARROW-1** — `ref $x eq 'C'` / `_INSTANCE($x,'C')` / `$x->isa('C')` / `$x->can('m')` guards.
-- **A4's cross-procedural tail** — a hash slot written by a constructor in *another* file
-  (path-dependent; the same-file write case is conditional-free and is the actual A4 round).
-- **re-export form (4)** — runtime `Mod->import` delegation inside `sub import` (control-flow).
-
-**Sketch (when we build it):** branch-span-scoped narrowing witnesses — a witness valid only within
-`[branch_start, branch_end)`. The query already carries a `point`, so a point-scoped witness reads
-correctly inside the branch and is invisible outside it; the hard part is the join/else re-widening
-and negative guards (`unless`, early `return`/`die` flipping the fallthrough). Seeds: a small,
-type-encoded set of guard recognizers (`isa`/`can`/`ref eq`/`_INSTANCE`), recognized by shape but
-folded into a single "narrows `$v` to `C` on the true edge" witness, not consumer branches.
+Flow-sensitive guard narrowing — `ref $x eq 'C'` / `_INSTANCE($x,'C')` /
+`$x->isa('C')` / `$x->can('m')`, negative guards (`unless`, early
+`return`/`die`), branch-scoped witnesses that re-widen at the join — landed as
+one pillar: `docs/adr/flow-narrowing.md`. The residual tail behind it (A4's
+cross-file / conditional-write slot writes, and the runtime `Mod->import`
+re-export form) is tracked in `docs/PARKED.md` / `docs/open-problems.md`.
 
 ---
 

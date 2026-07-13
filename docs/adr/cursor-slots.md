@@ -1,6 +1,6 @@
 # ADR: The cursor Slot — one taxonomy, per-language detectors
 
-Status: accepted (design); implementation is the tightening round's slice 1.
+Status: accepted (design).
 
 ## Context
 
@@ -56,9 +56,9 @@ enum Slot {
 - **`Slot::expected_type()`** — the type-constrained completion hook:
   `ArgPosition` (param type at index) and comparison-shaped slots
   (`op_type == |` → the field's DOMAIN) return the expected
-  `InferredType`; everything else `None`. Landed as a STUB consumed by
-  nothing initially — the seam exists, the feature (rank/filter by
-  expected type) is a separate slice that plugs in.
+  `InferredType`; everything else `None`. A STUB consumed by nothing: the
+  seam exists; ranking/filtering by expected type is a separate slice that
+  plugs in.
 
 ## Loose-coupling / undo story (per the standing forks convention)
 

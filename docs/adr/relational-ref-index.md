@@ -1,6 +1,6 @@
 # ADR: The relational ref index — SQLite is the reverse index
 
-Motivating measurement: `docs/chromium-scale-analysis.md`. Prior residency
+Prior residency
 work: `docs/adr/memory-slice-2-lru.md` (the eviction/rehydration lifecycle
 this design reuses, and the completeness invariant this design's residency
 changes must preserve: residency is bounded, coverage never is).
@@ -372,8 +372,8 @@ warm RSS **47 MB**. Bugzilla warm RSS: 75 MB.
 
 **Whole-tree Chromium** (4-core/15 GB box): **132,659 files, cold index
 3 h 02 m wall, peak RSS 7.3 GB; warm start 9 m 01 s, peak 6.7 GB**
-(0.05 MB/file), well inside the 20 GB guard that caps
-`docs/chromium-scale-analysis.md`'s pre-relational baseline at 38K files.
+(0.05 MB/file), well inside the 20 GB guard that the pre-relational
+(bag-resident) model crossed at ~38K files.
 The store: `modules-cpp.db` 6.1 GB, 34.8 M ref rows over 2.16 M interned
 strings.
 
@@ -382,7 +382,7 @@ strings.
 The shred makes a class of "interesting data" queries buildable as SQL over
 `refs`/`syms` rather than one-off Rust walks. Triaged:
 
-- **Unused exports — built.** `unused_exported_syms`: `syms` rows flagged
+- **Unused exports.** `unused_exported_syms`: `syms` rows flagged
   `SymRowSeed::FLAG_EXPORTED` (bit 3, baked from `FileAnalysis::exports_name`
   — the same `@EXPORT`/`@EXPORT_OK` surface the Surface projects) with zero
   ref rows in any OTHER file. Sound in one direction — zero cross-file

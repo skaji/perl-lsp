@@ -5,7 +5,7 @@ context operators (`map`, `grep`, `sort`, `reverse`, splat) are all
 positional containers. This ADR is the data model + walker contract;
 `prompt-sequence-types.md` is the design corpus for the residual
 phases (full shape lattice, cross-method contributions, framework
-integration). Spike landed in `ec62653`.
+integration).
 
 ## Decisions worth keeping
 
@@ -85,8 +85,7 @@ one `match` arm. Not landed yet; the spike scope was the container.
 fired. Matches Perl's runtime semantics — every script starts in
 `main`.
 
-Hash-key owners on top-level subs now carry `Some("main")` rather
-than `None`; fixture tests asserting `None` were corrected.
+Hash-key owners on top-level subs carry `Some("main")`.
 
 ## Where this is going
 

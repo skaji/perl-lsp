@@ -1,14 +1,13 @@
 # ADR: Bag-canonical typing — edges, not values
 
-The analyzer had two truths about types: a walk-time eager path
-(`infer_expression_type`, `Builder.resolved_returns` map, framework
-synthesis writing `return_type` fields) and a bag-time path
-(witnesses + reducers). Every new type feature paid a tax to bridge
-them — a `deferred_X` field, a `seed_X_into_return_types` shim, a
-writeback that re-published the registry's own answer as an
-`InferredType` "cache." The four-step unification staircase
-(`prompt-type-inference-unification.md`, retired) collapses both
-paths into one.
+Types have one source: the witness bag. Production is `bag.push(...)`,
+consumption is `bag_query(att)` through the reducer registry; there is
+no second (walk-time eager) path. A parallel eager path — an
+`infer_expression_type`, a `Builder.resolved_returns` map, framework
+synthesis writing `return_type` fields directly — would force every new
+type feature to pay a bridging tax (a `deferred_X` field, a
+`seed_X_into_return_types` shim, a writeback re-publishing the registry's
+own answer as an `InferredType` "cache"). The single-source rule bans it.
 
 ## Decisions worth keeping
 
@@ -21,7 +20,7 @@ attachment). Every type read goes through `bag_query_attachment` →
 the witness first; no consumer reads a type that isn't materialized
 through the registry.
 
-`Builder::infer_expression_type` is deleted. The closed-syntax
+There is no `Builder::infer_expression_type`. The closed-syntax
 cases (literals, anon-sub `CodeRef`, constructor → `ClassName`)
 live in `expr_payload`'s match, called only by
 `emit_expr_witness`. Callers that need the type at walk time do
@@ -74,7 +73,7 @@ value copying. `ReturnExpr` declarations on the same attachment
 no-arity-hint slot and the fallback for non-arity-discriminated
 subs.
 
-`Builder.resolved_returns` is deleted. Walk-time synthesis pushes
+There is no `Builder.resolved_returns`. Walk-time synthesis pushes
 `Symbol(sid) + Plugin + InferredType(rt)` directly (free-fn and
 class-scoped both — the old `is_class_scoped` gate that relied on
 `resolved_returns → writeback → MethodOnClass` is gone).
@@ -100,14 +99,13 @@ force every future consumer to either re-walk the CST or duplicate
 the walker's branching. One witness emitted at one place; many
 consumers query.
 
-## Where this is going
+## Extending the foundation
 
-Sequence types — the first feature built fully on this foundation
-— landed in ~90 LOC (`ec62653`). See `adr/sequence-types.md` for
-the data-model contract; `prompt-sequence-types.md` for the
-residual phases. The shape held: zero new bag attachments, zero
-new reducers, zero registry touches, every list operator extends
-the same way (`SequenceTransform` payload + one `SeqOp` variant).
+Sequence types are built fully on this foundation with zero new bag
+attachments, zero new reducers, zero registry touches: every list
+operator extends the same way (`SequenceTransform` payload + one `SeqOp`
+variant). See `adr/sequence-types.md` for the data-model contract;
+`prompt-sequence-types.md` for the residual phases.
 
 Residual Parts 1–5 (`prompt-type-inference-residual.md`) are
 each a reducer + emitter pair. Same shape, same path.

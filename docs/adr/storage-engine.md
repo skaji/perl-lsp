@@ -12,8 +12,8 @@ span-free row source — re-shredding a file's rows on every body-local edit
 would be wasteful and would defeat early cutoff. Second, cross-file
 enrichment (propagated return types, synthetic hash-key defs) has no
 consumer→dependency edge: when file B changes, nothing knows which files'
-enrichment is now stale, so enrichment historically ran only for open
-documents, brute-forced on every resolver tick.
+enrichment is now stale, so enrichment can only run for open documents,
+brute-forced on every resolver tick.
 
 ## Decision: the Surface — a position-independent per-file projection
 
@@ -141,9 +141,8 @@ rewrite deletes the path's stub (inside `save_to_db`/
 `save_blob_to_db_stamped`, so writers can't forget); hard-clears wipe via
 `clear_derived_rows`.
 
-Measured (abseil): warm start 1.6 s → 0.4 s, warm peak RSS 47 → 34 MB,
-cold unchanged; references stay byte-identical, `--refs-parity` clean,
-gold unaffected.
+Measured (abseil): warm start 0.4 s, warm peak RSS 34 MB (cold unchanged);
+references byte-identical, `--refs-parity` clean, gold unaffected.
 
 ## Deferred
 
