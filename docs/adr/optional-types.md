@@ -3,8 +3,8 @@
 `InferredType::Optional(Box<InferredType>)` (value-or-undef, Type::Tiny
 `Maybe[T]`) and `InferredType::Undef` (the bottom element) are the
 complement of flow narrowing (`flow-narrowing.md`): a function that
-early-returns undef produces `Foo | undef`, which used to collapse to
-`None`. The two features are halves of one story — `Optional` creates the
+early-returns undef produces `Foo | undef`. The two features are halves of
+one story — `Optional` creates the
 imprecision, a `defined`/`blessed` guard resolves it, the negative side
 knows it's `Undef`.
 

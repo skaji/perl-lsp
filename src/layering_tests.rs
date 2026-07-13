@@ -52,25 +52,8 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("cpp_toolchain", Build),
         // sentinel re-parse for member-access cursor context
         ("cursor_sentinel", Build),
-        // C++ multiple-dispatch / overload-resolution PoC (spike)
-        ("cpp_multidispatch", Build),
-        // C++ templates as witnesses + projection PoC (spike)
-        ("cpp_templates", Build),
-        // join: template projection -> dispatch lattice (spike)
-        ("cpp_template_join", Build),
-        // C lexer-hack resolution via the symbol table (B1 spike)
-        ("c_reparse", Build),
-        // C preprocessor #ifdef config selection (A2 spike)
-        ("c_preproc", Build),
-        // C #ifdef superposition → presence-tagged return union (spike)
-        ("c_superpose", Build),
-        // overload-on-param Pi-type monomorphization (spike)
-        ("overload_pi", Build),
-        // productive Perl projection: plugin symbol generators (spike)
-        ("perl_generators", Build),
         // the shared metaprogram-projection engine (worklist + seen-set +
         // root-chained provenance); pure std, importable from any layer
-        ("projection", Model),
         ("module_index", Index),
         ("module_resolver", Index),
         ("module_cache", Index),

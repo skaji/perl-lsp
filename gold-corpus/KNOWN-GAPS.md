@@ -219,9 +219,8 @@ namespace reopenings attribute. Two xfail rows remain open:
 
 ### hitlist-2 fix-run residuals (dogfood round 2, slices A–E landed)
 
-The measured residue after the hitlist-2 fixes (`docs/hitlist-2.md` has the
-per-slice detail); none are pinned as rows yet — they were observed on real
-corpora (json.hpp/abseil), not minimal repros:
+The measured residue after the dogfood round-2 fixes; none are pinned as rows
+yet — they were observed on real corpora (json.hpp/abseil), not minimal repros:
 
 - json.hpp namespace attribution still stops at an `#if` inside a class
   body (extraction lane).
@@ -269,3 +268,31 @@ references of the wrapped function). Deliberately out of scope / honest gaps:
 | ~~cold-start deadlock (first query hangs, "5 compute assertions miss", self-heals on rerun)~~ **FIXED** | was a DashMap shard-reentrancy deadlock: a handler held a `get_open` read guard across `resolve()`, which re-locks the open shards via `for_each_open`; a concurrent `on_refresh` `for_each_open_mut` writer queuing on that shard (parking_lot writer preference) wedged the reentrant read behind the writer, behind the first read. The Perl cpanfile resolver fired ~45 refresh writers in a 400ms burst post-`didOpen`, so a mixed repo hit it intermittently; each wedged handler consumed a worker thread until the runtime starved. Fix: `Document::analysis` is `Arc`; handlers snapshot + drop the guard before `resolve()`. Repro lock: `e2e/cold-start-repro.sh` (7.5%→0). |
 | cold-open goto-def/hover return `None` / pack completion floods the Perl hub, then answers after warm | the on-open analyze is cached-only (no cold header gather blocking `didOpen`) and the pack index attaches after the lazy background walk; a def/hover served in that window is `None`, and pack completion (no pack index yet) falls back to the Perl hub → `@INC` flood — with no client re-request signal for the pull verbs (completion self-heals via `isIncomplete`). Normally <500ms; under a cold cache + resolver-storm CPU pressure it can outrun a fast query burst. A defer needs a completion signal on BOTH the gather refresh (`spawn_pack_gather_refresh`) and the pack index (`ensure_workspace_indexed`'s latch marks kickoff, not completion) plus a bounded wait in the handlers — deliberate design gap, recorded not queued (arc-review M6). No longer masked by the deadlock (fixed above). |
 | debounce-window stale analysis | between a keystroke and the debounced rebuild, `doc.analysis` describes the previous text; positions can misattribute mid-typing. Inherent to the debounce design (arc-review L3) |
+
+## C++ dogfood residuals (observed on real corpora, not pinned as rows)
+
+Behavior gaps surfaced dogfooding op.c/op.h, fmt, and abseil. Not minimal
+repros; recorded here so a fix flips a real observation, not just narrative.
+
+- **Function-designator ref emission.** A function passed by name without `()`
+  — `absl::ascii_isspace` handed to `std::find_if_not` — is never emitted as a
+  `FunctionCall`/use ref, so `references` misses those sites (4 in-file on the
+  abseil case). Builder ref-emission gap.
+- **Member-name references over-report across unrelated classes.** `references`
+  on `ordered_map::key_type` hits every class's `key_type` in the workspace —
+  matched by bare name with weak class scoping (the over-count twin of the
+  under-emission above).
+- **Field/member uses inside `#define` bodies undercounted.** `op_next` counts
+  85 vs grep's 134 (~37% miss): `collect_macro_body_uses` recovers macro-*name*
+  uses inside macro bodies but not `->field` / identifier member drills. Broader
+  than the tracked `cpp-macro-nested-ref-in-macro-body` xfail (macro-name only).
+- **Enumerator hover shows type but drops value.** `OP_NULL` hovers as `opcode`
+  but not `OP_NULL = 0: opcode`; extraction doesn't capture the enumerator value.
+- **`workspace/symbol` exact short-name ranking.** `workspace/symbol "OP"`
+  doesn't rank the exact-name typedef first among fuzzy matches.
+- **goto-def on C local variables.** A C local variable reference doesn't
+  resolve to its declaration. Needs a distinct `@def.local` capture, locals
+  emitted as scoped `Variable` symbols, `@expr.read.var` emitted as resolvable
+  Refs, and outline-skip so they don't flood `--outline`.
+- **C `goto` labels.** `label:` / `goto label;` are real navigation targets;
+  not yet handled.

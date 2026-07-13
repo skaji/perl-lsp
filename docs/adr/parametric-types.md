@@ -128,9 +128,8 @@ inner-string structure as encoded format); cost of recursive from
 day one is ~10 LOC. Easy call.
 
 `Box<InferredType>` serde works fine through bincode + zstd + JSON.
-The `Class(String)` fast-path on `TypeArg` (a soft denormalization
-that v1 carried) went away in v2 — flavors now carry their own
-fields directly, no shoehorning into a `Vec<TypeArg>`.
+Flavors carry their own fields directly; there is no `Class(String)`
+fast-path on `TypeArg` or shoehorning into a `Vec<TypeArg>`.
 
 ## Why two class accessors per flavor
 
@@ -161,9 +160,8 @@ HashRef/ArrayRef, GraphQL types when we get there). Plugin
 escape hatch handles the long tail. Don't ship a variant without
 an emitter.
 
-**Cache invalidation.** `EXTRACT_VERSION` bumped 23 → 24 for the
-v2 redesign, then 26 → 27 for the `ReturnExpr` payload variant.
-Bumping is free; old blobs re-resolve lazily.
+**Cache invalidation.** A shape change bumps `EXTRACT_VERSION`; bumping
+is free, old blobs re-resolve lazily.
 
 ## Where this is going
 

@@ -66,8 +66,7 @@ into `walk`, which holds no closure for the origin. `SUPER::` — parents
 only, never self — is the bare `walk`; there is no `skip_self` flag,
 because *checking self is not a walk*. The cycle guard is `walk`'s
 path-depth cap (the seen-set already breaks cycles); a class with many
-ancestors is no longer silently truncated the way the old total-node
-cap did.
+ancestors is not silently truncated.
 
 ## Boundaries — what is NOT a walk
 

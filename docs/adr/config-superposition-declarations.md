@@ -1,16 +1,13 @@
 # ADR: Config superposition over declarations
 
-Status: **decided** (veesh, 2026-07-05). **Slice 1 landed**: the
-macro-expansion exclusion narrowing (Case B, opportunistic widening with
-a wide-scope fallback), the declaration-position directive repair
-(`strip_declaration_position_directives`, Case A's isolated ctor-`#if`),
-and — closing the re-anchor invariant half of commitment 1 — the
-attribution-layer re-anchor (`SkeletonAnalysis::reanchor_truncated_
-containers`; `docs/prompt-json-reanchor.md`) that fixed Case A's json.hpp
-blast radius (`basic_json` 92 → 763 recovered members). Slice 2 (variant
-tags) remains open, and is now scoped ONLY to genuinely superposed
-declaration twins — the re-anchor, not variant tags, was Case A's fix. See
-`docs/PARKED.md`. Spike gate below ran before the main slices.
+Status: decided. Case B is handled by the macro-expansion exclusion
+narrowing (opportunistic widening with a wide-scope fallback). Case A is
+handled by the declaration-position directive repair
+(`strip_declaration_position_directives`, the isolated ctor-`#if`) plus the
+attribution-layer re-anchor (`SkeletonAnalysis::reanchor_truncated_containers`),
+which recovers `basic_json`'s member attribution (92 → 763). Variant tags are
+scoped ONLY to genuinely superposed declaration twins and remain deferred —
+the re-anchor, not variant tags, was Case A's fix. See `docs/PARKED.md`.
 
 ## Context
 

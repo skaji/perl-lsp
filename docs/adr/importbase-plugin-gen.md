@@ -2,9 +2,9 @@
 
 `Import::Base` subclasses are how real Perl shops centralize their
 import dance — `use Co::Base -Class;` collapses a dozen real `use`
-lines via `@IMPORT_MODULES` / `%IMPORT_BUNDLES`. PR #38's
-`EmitAction::SyntheticUse` gave us the runtime primitive to express
-the expansion. This ADR is about authorship: the plugins get
+lines via `@IMPORT_MODULES` / `%IMPORT_BUNDLES`. `EmitAction::SyntheticUse`
+is the runtime primitive that expresses the expansion. This ADR is about
+authorship: the plugins get
 generated, not hand-written. The generator lives in `perl-gen/`; the
 LSP side adds nothing.
 

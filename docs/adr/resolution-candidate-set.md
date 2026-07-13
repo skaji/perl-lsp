@@ -1,8 +1,7 @@
 # ADR: The resolution CandidateSet — one semantic core, features as projections
 
-Status: accepted; core landed on main (`resolve.rs::CandidateSet`).
-Originally motivated by a recurring bug *class* on `spike/cpp-support`; the
-seam is main-first and the spike's axes merge onto it.
+Status: accepted. The one resolution entry point is
+`resolve.rs::CandidateSet`; every feature is a projection of it.
 
 ## Context: the recurring asymmetry disease
 
@@ -123,7 +122,7 @@ Deliberately NOT on the set (the seam's edge, kept honest):
   (`PERL_BUILTINS` only suppresses diagnostics). When either grows a
   source it plugs into the same mask — that's the point of the seam.
 
-## Landing notes (main)
+## Structure
 
 - The set lives in `resolve.rs`, extending the existing
   `resolve_symbol`/`refs_to` seam — not a parallel module. `refs_to`,
@@ -138,15 +137,13 @@ Deliberately NOT on the set (the seam's edge, kept honest):
 - Projections only READ the stores (`FileStore::for_each_open`), so an LSP
   handler may hold its open-doc guard across a projection — the old
   `drop(doc)`-before-walking discipline (a deadlock trap) is gone.
-- Behavior-preserving by design: each projection reproduces the exact
-  pre-seam composition. Known pre-existing asymmetries surfaced by the
-  migration are documented in the PR/commit trail rather than silently
-  fixed (e.g. group rename does not consult `rewritable` while target
-  rename does). `definitions()` now returns the never-pruned ranked
-  multi-set for macro-named words (the spike's ranking axis, below);
-  other lanes keep first-winning-path.
+- Each projection reproduces the exact composition of the verb it serves.
+  One documented asymmetry holds: group rename does not consult `rewritable`
+  while target rename does. `definitions()` returns the never-pruned ranked
+  multi-set for macro-named words (the ranking axis below); other lanes keep
+  first-winning-path.
 
-## The cpp axes on the seam (merge landed)
+## The cpp axes on the seam
 
 The spike's axes live in CandidateSet construction:
 
@@ -211,5 +208,5 @@ and completion gathering move together.
 
 - New-axis review question shrinks from "did every feature get it?" to
   "is it in CandidateSet construction?"
-- Migration risk is real (resolve.rs is hot); the gold pairs + e2e are the
-  migration net — full net green after every migration step.
+- The gold pairs + e2e are the verification net for changes to `resolve.rs`
+  (a hot path); the full net must stay green.

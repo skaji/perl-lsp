@@ -9553,7 +9553,7 @@ impl FileAnalysis {
     /// formatter<int>`) dispatches there; otherwise the base primary.
     /// Exact-spelling-or-primary only — no partial-pattern specificity
     /// ladder (that selection tier is deferred; fork #4 in
-    /// `docs/prompt-template-arc.md`). Non-Instance types are unchanged
+    /// `docs/adr/cpp-templates.md`). Non-Instance types are unchanged
     /// by construction (`exact_spelling()` answers `None`).
     pub fn dispatch_class_of(
         &self,

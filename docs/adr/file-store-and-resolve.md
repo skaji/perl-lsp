@@ -1,20 +1,20 @@
 # ADR: One file store, role-tagged. One resolve(). One refs_to().
 
-The LSP used to have three parallel stores (`Backend.documents`,
-`Backend.workspace_index`, `ModuleIndex.cache`) and per-query tier walks
-that each independently picked which subset to consult. Each query was a
-place where a tier could be forgotten — the source of "find-references
-mysteriously misses dep call sites" type bugs.
+The LSP has one role-tagged store, not three parallel ones
+(`Backend.documents`, `Backend.workspace_index`, `ModuleIndex.cache`) with
+per-query tier walks that each independently pick which subset to consult.
+Parallel stores make every query a place where a tier can be forgotten — the
+source of "find-references mysteriously misses dep call sites" bugs.
 
-`@INC` modules also stored a lossy `ModuleExports` summary (no refs, no
-type constraints, no call bindings). Cross-file features degraded at the
-module boundary even when both files had been parsed.
+A lossy `@INC` `ModuleExports` summary (no refs, no type constraints, no call
+bindings) degrades cross-file features at the module boundary even when both
+files have been parsed; there is no such summary here.
 
 ## Decisions worth keeping
 
 ### Full `FileAnalysis` everywhere
 
-`ModuleExports` is dead. Workspace files, dep modules, and open files all
+There is no `ModuleExports` summary type. Workspace files, dep modules, and open files all
 store an `Arc<FileAnalysis>`. The SQLite cache (`module_cache.rs`,
 schema v9) stores `zstd(bincode(FileAnalysis))` — full fidelity round-
 trips through the cache. Cross-file refs, type constraints, call bindings,

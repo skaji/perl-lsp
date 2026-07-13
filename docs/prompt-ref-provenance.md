@@ -6,60 +6,12 @@
 > in. This doc is the residual: derivation chains where rename can find the
 > derived ref but can't update the source.
 
+Constant-fold provenance (`Ref.folded_from` — `my $m = 'process';
+$self->$m()` rename rewrites the source string literal) and framework-attribute
+unified rename (accessor ∪ constructor key ∪ internal hash key as one group)
+landed: `docs/adr/field-projections.md`.
+
 ## What's still missing
-
-### Constant-fold provenance — `Ref.folded_from`
-
-`my $m = 'process'; $self->$m()` — the builder folds `$m` to `"process"`
-and emits a `MethodCall` ref targeting `"process"`. Rename of `process`
-finds the call site but **doesn't update the source string literal** in the
-assignment.
-
-**Proposed shape:**
-
-```rust
-pub struct Ref {
-    // ... existing
-    pub folded_from: Option<Span>,  // span of source string literal
-}
-```
-
-When the builder emits a ref from a constant-folded value, store the source
-string's span. `rename_sub` (and friends) check `folded_from` and add an
-edit at the source span.
-
-`constant_strings` needs to track spans alongside values:
-`HashMap<String, Vec<(String, Span)>>`. Span follows the value through the
-chain.
-
-Same shape elsewhere: a lexical hash-key literal with a variable/constant key
-(`my $k = 'name'; my %h = ($k => 1); $h{name}`). `emit_lexical_hash_literal_keys`
-deliberately skips non-literal keys today — folding `$k` would give the value but
-no safe rename target (the key ref would land on `$k` and renaming would rewrite
-the variable, not the key). `folded_from` is exactly what unblocks it: emit the
-key carrying the `'name'` source span, so a rename of the key rewrites the source
-literal, not `$k`.
-
-### Framework-attribute unified rename
-
-`has name => (is => 'ro')` produces three things named `name`:
-
-1. accessor `Method` symbol
-2. `HashKeyDef` owned by `Sub("new")` (constructor key — already emitted)
-3. `HashKeyDef` for internal `$self->{name}` access (when present)
-
-Renaming any one of them today doesn't update the others. The fix is a
-unified rename helper that, when `rename_kind_at` recognizes a framework
-attribute, collects:
-
-- accessor Method symbol(s) named `old_name` in the class
-- `HashKeyDef` symbols owned by `Sub("new")` with the name (constructor)
-- `HashKeyDef` symbols owned by the class (internal hash)
-- `MethodCall` / `FunctionCall` refs targeting the name
-- `HashKeyAccess` refs targeting the name with matching owner
-
-Detection: symbol was synthesized by framework accessor code, OR the
-`HashKeyDef` is owned by `Sub("new")` in a Moo/Moose/Mojo::Base class.
 
 ### Import list rename verification
 

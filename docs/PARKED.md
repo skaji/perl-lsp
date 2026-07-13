@@ -83,7 +83,9 @@ why parked, what unblocks it. Prune on landing.
   use-after-move cleared. Default-off + opt-in + pack-capability gate
   (declared like `implicit_this_members`, never `lang == cpp`) is understood;
   only the valve + its calibration remain. `docs/adr/narrowing-diagnostics.md`.
-- **PR #100** re-extraction onto `projection.rs` (user closes or reworks).
+- **PR #100** re-extraction onto the projection engine (user closes or
+  reworks; the `projection.rs` PoC now rests in git history — the design
+  is `docs/adr/cpp-templates.md`).
   - i think this will just be closed; anyways it didn't look like it did the intended PPP,
     which is to have mojo helpers which mint dynamic helpers show their definitions;
     literally no reason to punt on a conrete impl. this branch is leaning towards prod, so
@@ -117,7 +119,7 @@ why parked, what unblocks it. Prune on landing.
   honestly `None` locally (its real subject — cross-file MRO dispatch keyed
   on the class name — is unaffected).
 - **json.hpp `basic_json` attribution blast radius — FIXED** (the
-  re-anchor invariant landed; `docs/prompt-json-reanchor.md`). Trigger
+  re-anchor invariant landed; `docs/adr/config-superposition-declarations.md`). Trigger
   named: `#if JSON_DIAGNOSTIC_POSITIONS` in ctor-initializer / declaration
   position (6 sites in `basic_json`) truncates the `class_specifier` node
   at the first ctor's body brace (row 21450 vs the true 25771) — every
@@ -168,7 +170,7 @@ why parked, what unblocks it. Prune on landing.
   from completion/gd).
 - **Nested-hash-key completion level leak** (Perl, pre-existing — xfail
   `completion-exact-hash-key-slot-no-nested-leak`).
-- **Moo rwp writer at decl-token group answer** (prompt-heatmap.md).
+- **Moo rwp writer at decl-token group answer** (`docs/adr/heatmap.md`).
 - **M6/L3 session determinism — cold-open degraded window** (the DEADLOCK,
   POISONED-PERSIST, and now the HEAL-REPUSH + COALESCE halves are FIXED; only a
   bounded-wait in the pull handlers is LEDGERED — see below). The on-open
@@ -291,5 +293,4 @@ why parked, what unblocks it. Prune on landing.
 
 ## Cross-references
 - Gap shapes behind open xfails: `gold-corpus/KNOWN-GAPS.md`
-- Fix-run narrative: `docs/hitlist-2.md`, `docs/session-2026-07-03-summary.md`
 - Architectural forks: `docs/open-forks.md`

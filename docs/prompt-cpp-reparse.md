@@ -158,7 +158,8 @@ via `template`/`typename` (stratifiable) or hands to a real frontend
 
 ### NEXT (when we pick up): multimethods / multiple dispatch
 
-Overload-on-one-operator (`overload_pi.rs`) is the unary/binary case of a
+Overload-on-one-operator (the `overload_pi` PoC — experiment-only,
+rests in git history since the 2026-07-13 spike GC) is the unary/binary case of a
 bigger thing: **dispatch on the runtime types of MULTIPLE arguments.**
 
 - **C++** — this is *overload resolution itself*, the bread-and-butter:

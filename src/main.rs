@@ -20,32 +20,7 @@ mod plugin_cli;
 mod pod;
 mod query_cache;
 mod surface;
-// Kept-as-spike PoC modules: measured by their own tests, deliberately not
-// wired into the build pipeline (the go-live map's "ADDITIVE DEPTH" tier —
-// overload/dispatch/templates/superposition — plus the Perl seams they
-// prototype). The allow covers the whole module: nothing here is production
-// dead code, it's evidence.
-#[allow(dead_code)]
-mod c_preproc;
-#[allow(dead_code)]
-mod c_reparse;
-#[allow(dead_code)]
-mod c_superpose;
-#[allow(dead_code)]
-mod overload_pi;
-#[allow(dead_code)]
-mod perl_generators;
-// the shared projection engine both metaprogram spikes run on; wired into
-// the pipeline when a producer lands (PR #100 / the monomorphizing consumer)
-#[allow(dead_code)]
-mod projection;
-#[allow(dead_code)]
-mod cpp_multidispatch;
 mod language_driver;
-#[allow(dead_code)]
-mod cpp_templates;
-#[allow(dead_code)]
-mod cpp_template_join;
 // Compiled unconditionally (symbols.rs consumes the macro-model surface in
 // every build); the driver registration is feature-gated, so a perl-only
 // build leaves most of the module unreferenced — silence dead-code there

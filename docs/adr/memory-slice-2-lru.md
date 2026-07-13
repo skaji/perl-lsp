@@ -1,16 +1,11 @@
-# Memory Slice 2 — evict the witness bag, rehydrate on demand
+# Memory: evict the witness bag, rehydrate on demand
 
-Status: design (measured). Not yet implemented. Follow-up brief:
-`docs/prompt-memory-slice-2.md`. Prior slice + the 4 GB investigation:
-`docs/prompt-bounded-memory.md`.
+## The dominant resident cost is the witness bag, not the refs
 
-## The surprise (again): it is NOT the refs, it is the witness bag
-
-Slice 1 (`evict_gather_caches_keep_headers`) collapsed the abseil cold peak
-4.02 → 1.22 GB by dropping the per-file macro gather caches. The remaining
-~1.2 GB was *believed* (by the original brief and the Slice-1 doc's Problem 2)
-to be dominated by heavy `FileAnalysis` **refs** held resident for every
-workspace file. **Measurement says otherwise.**
+Dropping the per-file macro gather caches (`evict_gather_caches_keep_headers`)
+holds the abseil cold peak at 1.22 GB. Of that ~1.2 GB, measurement shows the
+dominant resident bucket is the witness bag, not the `FileAnalysis` **refs**
+held resident for every workspace file.
 
 A new env-gated heap-composition probe (`PERL_LSP_HEAP_DUMP`,
 `FileAnalysis::heap_estimate`) walks the live pack `ModuleIndex` after a cold
@@ -43,7 +38,7 @@ RSS is allocator arena retention + transient parse trees + the `header_cache`
 **The witness bag is 71.5% of the resident payload** —
 `witness_vec` (417.7 MB, the `Vec<Witness>`) + `witness_index` (195.5 MB, the
 bag's rebuilt attachment `HashMap`) = **613.2 MB**. `refs` is a distant second
-at 18.4%. The original "evict the refs" framing was aimed at the wrong bucket.
+at 18.4%.
 
 Two facts make the bag the *ideal* eviction target — better than refs would
 have been:
@@ -174,12 +169,11 @@ today.
 `maxCacheMb` is surfaced via `initializationOptions` (default 128); 0 disables
 the LRU (rehydrate-and-drop, never retain) for the most aggressive footprint.
 
-### Why not the doc's original "split a lightweight name index + LRU the whole
-### body"?
+### Why not a lightweight name index + whole-body LRU?
 
-That plan (Slice-1 doc, Problem 2) evicts the *whole* `FileAnalysis` and keeps a
-separate compact `{name → file}` table pinned. Measurement makes it strictly
-more work for less: refs are only 18.4%, so evicting them buys little while
+The alternative evicts the *whole* `FileAnalysis` and keeps a separate compact
+`{name → file}` table pinned. Measurement makes it strictly more work for less:
+refs are only 18.4%, so evicting them buys little while
 forcing a rehydrate on the *hot* references path (the completeness differentiator
 we must keep instant) and demanding a whole new pinned-index structure. Evicting
 the bag instead (a) targets 71.5%, (b) leaves the hot path fully resident, and
@@ -199,8 +193,7 @@ kept as an optional **Slice 3** to chase clangd's ~320 MB, not needed to hit
 | `hover`-type / type-constrained completion | reducers / `expr_type_at_span` | **yes** | rehydrate exact bag from SQLite |
 | cross-file method-return chain | `find_method_return_type` → `MethodOnClass` | **yes** | rehydrate target file's bag |
 
-The whole-tree completeness invariant (`docs/prompt-bounded-memory.md`,
-"completeness is preserved") lives entirely in the first five rows, all bag-free
+The whole-tree completeness invariant lives entirely in the first five rows, all bag-free
 — so it holds by construction, resident or not. The two bag-consuming rows are
 *type-inference value-adds*, not the completeness differentiator; they rehydrate
 the **exact** persisted bag and therefore return byte-identical answers to
@@ -231,7 +224,7 @@ lifecycle* (strip after persist; rehydrate on demand) and adds a `#[serde(skip)]
 `bag_evicted` flag. Neither touches the bincode/zstd blob layout, so existing
 `modules-cpp.db` caches warm without re-resolution.
 
-## Measurement instrumentation (landed with this ADR, inert by default)
+## Measurement instrumentation (inert by default)
 
 - `FileAnalysis::heap_estimate() -> HeapBreakdown` (`file_analysis.rs`) — per-
   bucket resident-payload estimate for one analysis; `HeapBreakdown::add` sums
@@ -256,9 +249,9 @@ PERL_LSP_HEAP_DUMP=1 PERL_LSP_MEM_REPORT=1 /usr/bin/time -v \
 
 ---
 
-**Scale follow-up:** `docs/chromium-scale-analysis.md` measures this design at
-Chromium scale (131K C++ files). Per-file resident cost is linear at
-~0.51 MB/file (Slice 2 cuts it ~3.4× vs the bag-resident model), projecting
-whole-tree Chromium to ~67 GB. The pinned `refs`/`symbols` are the wall, and
+**Scale follow-up:** at Chromium scale (131K C++ files) per-file resident cost
+is linear at ~0.51 MB/file (bag eviction cuts it ~3.4× vs the bag-resident
+model), projecting whole-tree Chromium to ~67 GB. The pinned `refs`/`symbols`
+are the wall, and
 the analysis argues the next step is a **relational SQLite reverse-index**
 (shred refs into indexed tables, query on disk) rather than a Slice-3 ref-LRU.
