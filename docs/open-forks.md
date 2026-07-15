@@ -459,6 +459,49 @@ Deferred, with designs:
   serialization (measure first), phase-4 SQL views. Declined micro-opts
   stay declined.
 
+## Answer honesty under index/enrichment windows — 2026-07-14 — OPEN (Claude)
+- **Context:** edit-bench rounds 1–4 (bench/RESULTS.md). Verbs answer
+  PARTIAL or NULL inside two windows and the response looks complete:
+  cold index build (curl cold references 866 B vs 34 KB warm; bugzilla
+  cold completion 233 B vs 5.5 KB) and per-file build/enrichment waits
+  (bugzilla WARM outline sometimes null, WARM hover sometimes null —
+  the ~400 ms bounded waits `await_open_ready`/`await_index_ready`
+  expire and the verb serves whatever is there). Editor-tier sibling of
+  absence-as-answer.
+- **Options:** A — per-verb wait policy on one seam: bulk/identity verbs
+  (references, rename, implementations) wait for index-ready without the
+  400 ms cap (with LSP progress); per-file verbs (outline, hover,
+  completion) wait for THIS file's build (bounded by build time, not a
+  fixed cap); latency-critical interactive verbs keep best-effort.
+  B — always best-effort + server-initiated refresh nudges (works for
+  semanticTokens/inlayHint; LSP has NO refresh channel for
+  references/hover/outline responses — can't heal those).
+  C — label partial answers (LSP has no partiality flag on these verbs;
+  would need client cooperation).
+- **Picked (to implement):** A — it's the only shape that can't lie on
+  verbs whose answers are act-on-able (rename edits!), and the policy
+  lives on ONE seam (the existing await_* helpers grow a per-verb
+  policy parameter) so redirecting any verb's policy later is a
+  one-line change. B's nudge pattern stays for the verbs that have
+  refresh channels.
+- **Undo cost:** trivial per verb — the policy table is data.
+- **Discussion needed:** which verbs the user wants blocking-honest vs
+  fast-best-effort; whether rename should hard-refuse (error) instead
+  of wait when the index is cold.
+
+## cpp references sweep cost — 2026-07-14 — OPEN (profile first)
+- **Context:** edit-bench: abseil warm references 1.62 s for 54 result
+  sites vs redis 0.63 s (~250 sites) and curl 0.11 s (155 sites). Cost
+  tracks the VISIBILITY-GATE-PASSING file count, not the result count —
+  status.h is included by most of abseil's tree, so most TUs pass the
+  include-closure gate and get whole-view rehydrated through the LRU
+  per query.
+- **Next:** PERL_LSP_PHASE_TIMING profile of one warm abseil references
+  call; likely fixes are candidate-row pre-narrowing for pack tiers
+  (the Perl rows machinery exists; pack rows are per-language DBs) or
+  memoizing the swept whole-views across one query. Measure before
+  building.
+
 ## Phase-4 SQL views — CLOSED 2026-07-12 (Claude)
 
 The one triaged-"build" view landed: unused-exports
