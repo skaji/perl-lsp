@@ -15,3 +15,4 @@ gold-corpus/local
 # local scratch (scanner experiments — not part of the repo)
 /sner.pl
 /sner.scm
+__pycache__/
