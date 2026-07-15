@@ -1,0 +1,23 @@
+{
+  "project": {"repo": "https://github.com/bugzilla/bugzilla", "root_subdir": "",
+    "note": "194 .pm files; Bug.pm (5.1k lines, use base Bugzilla::Object) is the busy work file"},
+  "readiness": {"file": "Bugzilla.pm", "line": 40, "character": 8},
+  "steps": [
+    {"action": "open", "file": "Bugzilla/Bug.pm"},
+    {"action": "hover", "file": "Bugzilla/Bug.pm", "line": 63, "character": 23, "name": "hover-Bugzilla-dbh"},
+    {"action": "definition", "file": "Bugzilla/Bug.pm", "line": 379, "character": 6, "name": "def-ThrowUserError"},
+    {"action": "references", "file": "Bugzilla/Bug.pm", "line": 371, "character": 4, "name": "refs-check"},
+    {"action": "completion", "file": "Bugzilla/Bug.pm", "line": 65, "character": 61, "name": "completion-Bugzilla-arrow"},
+    {"action": "rss", "name": "post-nav"},
+    {"action": "insert_line", "file": "Bugzilla/Bug.pm", "line": 3482, "text": "    my $zz_bench_tmp = 1;", "name": "body-edit-1", "await_diagnostics": true},
+    {"action": "insert_line", "file": "Bugzilla/Bug.pm", "line": 3483, "text": "    $zz_bench_tmp += 1;", "name": "body-edit-2", "await_diagnostics": true},
+    {"action": "revert", "file": "Bugzilla/Bug.pm", "name": "revert-body", "await_diagnostics": true},
+    {"action": "insert_line", "file": "Bugzilla/Bug.pm", "line": 4830, "text": "sub zz_bench_probe { return 42 }", "name": "contract-edit-add-sub", "await_diagnostics": true},
+    {"action": "revert", "file": "Bugzilla/Bug.pm", "name": "revert-contract", "await_diagnostics": true},
+    {"action": "rss", "name": "post-edits"},
+    {"action": "open", "file": "Bugzilla/WebService/Bug.pm"},
+    {"action": "hover", "file": "Bugzilla/WebService/Bug.pm", "line": 302, "character": 29, "name": "hover-crossfile-check"},
+    {"action": "definition", "file": "Bugzilla/WebService/Bug.pm", "line": 302, "character": 29, "name": "def-crossfile-check"},
+    {"action": "rss", "name": "post-crossfile"}
+  ]
+}

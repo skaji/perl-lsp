@@ -1,0 +1,23 @@
+{
+  "project": {"repo": "https://github.com/redis/redis", "root_subdir": "src",
+    "note": "root at src/ — deps/ vendors hiredis/jemalloc/lua and would bloat the index"},
+  "readiness": {"file": "t_string.c", "line": 463, "character": 15},
+  "steps": [
+    {"action": "open", "file": "t_string.c"},
+    {"action": "hover", "file": "t_string.c", "line": 463, "character": 42, "name": "hover-field-c-argv"},
+    {"action": "definition", "file": "t_string.c", "line": 470, "character": 6, "name": "def-crossfile-addReplyBulk"},
+    {"action": "references", "file": "t_string.c", "line": 109, "character": 14, "name": "refs-addReply"},
+    {"action": "completion", "file": "t_string.c", "line": 463, "character": 40, "name": "completion-after-c-arrow"},
+    {"action": "definition", "file": "t_string.c", "line": 530, "character": 10, "name": "def-macro-serverAssert"},
+    {"action": "rss", "name": "post-nav"},
+    {"action": "insert_line", "file": "t_string.c", "line": 462, "text": "    long zz_bench_tmp = 0;", "name": "body-edit-1", "await_diagnostics": true},
+    {"action": "insert_line", "file": "t_string.c", "line": 463, "text": "    zz_bench_tmp += 1;", "name": "body-edit-2", "await_diagnostics": true},
+    {"action": "rss", "name": "post-edits"},
+    {"action": "revert", "file": "t_string.c", "name": "revert-body-edits", "await_diagnostics": true},
+    {"action": "open", "file": "server.h"},
+    {"action": "insert_line", "file": "server.h", "line": 3265, "text": "int zzBenchProbe(void);", "name": "header-contract-edit", "await_diagnostics": true},
+    {"action": "rss", "name": "post-header-edit"},
+    {"action": "hover", "file": "t_string.c", "line": 463, "character": 42, "name": "hover-post-invalidation"},
+    {"action": "revert", "file": "server.h", "name": "revert-header-edit", "await_diagnostics": true}
+  ]
+}
