@@ -705,7 +705,8 @@ impl Backend {
         if done.load(Ordering::Relaxed) {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
+        self.bounded_wait_with_progress(cap, waited, "Waiting for workspace index")
+            .await;
     }
 
     /// Bounded wait for a freshly-opened document's INITIAL build, when it is
@@ -735,7 +736,87 @@ impl Backend {
         if self.files.get_open(uri).is_some() {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
+        self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
+            .await;
+    }
+
+    /// Bounded wait that surfaces as client progress once it actually
+    /// BLOCKS. Silent for the first 500 ms — warm paths and every
+    /// `Interactive` wait (cap ≤ ~400 ms) resolve inside it, so no UI
+    /// noise; only a `Complete` wait that outlives the quiet window mints
+    /// a work-done token, keeping the honest-answer block visible instead
+    /// of reading as a hung request.
+    async fn bounded_wait_with_progress<F>(&self, cap_ms: u64, wait: F, title: &str)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::time::Duration;
+        const QUIET_MS: u64 = 500;
+        tokio::pin!(wait);
+        let quiet = cap_ms.min(QUIET_MS);
+        if tokio::time::timeout(Duration::from_millis(quiet), &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let remaining = cap_ms.saturating_sub(quiet);
+        if remaining == 0 {
+            return;
+        }
+        // Server-initiated progress requires the client capability; a client
+        // that never advertised it may also never answer the create request.
+        if !self
+            .work_done_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = tokio::time::timeout(Duration::from_millis(remaining), &mut wait).await;
+            return;
+        }
+        static WAIT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let token = NumberOrString::String(format!(
+            "perl-lsp/wait-{}",
+            WAIT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // Same detached-task discipline as the indexing progress: a bare
+        // `timeout(.., send_request)` drops the oneshot receiver on timeout
+        // and a late reply panics tower-lsp's pending map (#36); a detached
+        // task keeps the receiver alive, and the 2 s cap only bounds how
+        // long we stall before proceeding without the client's answer.
+        let create = tokio::spawn({
+            let client = self.client.clone();
+            let token = token.clone();
+            async move {
+                let _ = client
+                    .send_request::<request::WorkDoneProgressCreate>(
+                        WorkDoneProgressCreateParams { token },
+                    )
+                    .await;
+            }
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(2), create).await;
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: title.into(),
+                        cancellable: Some(false),
+                        message: None,
+                        percentage: None,
+                    },
+                )),
+            })
+            .await;
+        let _ = tokio::time::timeout(Duration::from_millis(remaining), &mut wait).await;
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                    WorkDoneProgressEnd { message: None },
+                )),
+            })
+            .await;
     }
 }
 

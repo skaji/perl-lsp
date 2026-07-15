@@ -103,8 +103,10 @@ Format per entry:
   fast-best-effort; whether rename should hard-refuse (error) instead
   of wait when the index is cold. Concrete price now measured: abseil
   COLD references blocks ~27 s for the honest answer (was 402 ms
-  partial). LSP progress reporting for Complete waits is the natural
-  follow-up.
+  partial). LSP progress for blocking waits is landed
+  (`Backend::bounded_wait_with_progress` — silent under 500 ms, so
+  Interactive waits never mint a token), so the block is visible in the
+  editor rather than reading as a hung request.
 - **New evidence (2026-07-15), the curl server-context case:** server
   references answer 4 sites where the CLI answers 155 —
   warm-deterministic, predates the fixing round. Eliminated: row
