@@ -812,10 +812,20 @@ impl Backend {
             else {
                 return;
             };
+            // A pack file's cross-file GATHER is cold on the first change after
+            // a cold open (did_open's `spawn_pack_gather_refresh` bails once the
+            // text changes, so it can't warm us). Paying the ~24 s cold gather
+            // HERE would make the first keystroke's diagnostics land 24 s late.
+            // Run CACHED-ONLY for fast, degraded diagnostics — same as did_open
+            // — then heal via a background gather refresh below. The flag is a
+            // thread-local no-op for perl. See docs/open-forks.md.
             let analysis = tokio::task::spawn_blocking(move || {
-                crate::language_driver::LanguageRegistry::with_enabled()
+                crate::cpp_reparse::set_gather_cached_only(true);
+                let a = crate::language_driver::LanguageRegistry::with_enabled()
                     .for_id(language)
-                    .map(|d| d.analyze_with_path(&text, path.as_deref()))
+                    .map(|d| d.analyze_with_path(&text, path.as_deref()));
+                crate::cpp_reparse::set_gather_cached_only(false);
+                a
             })
             .await
             .ok()
@@ -841,7 +851,15 @@ impl Backend {
                 .get_open(&uri)
                 .map(|doc| symbols::pack_diagnostics(&doc.analysis, options));
             if let Some(diags) = diags {
-                client.publish_diagnostics(uri, diags, None).await;
+                client.publish_diagnostics(uri.clone(), diags, None).await;
+            }
+            // Heal: warm the cross-file gather off this task and re-publish
+            // full-quality diagnostics when it lands (the same async-refresh
+            // did_open uses). No-op-fast once the gather cache is warm; its
+            // snapshot guard drops the result if a newer keystroke superseded
+            // this text. Perl skips inside the refresh (no gather to warm).
+            if language != "perl" {
+                Self::spawn_pack_doc_refresh(files, module_index, client, uri, options);
             }
         });
     }
