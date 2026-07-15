@@ -148,3 +148,15 @@ dragonbox template knownweak (unchanged, tracked); fmt warm header-revert
 def+prototype (CLI shows both, correct order — wobble, not defect);
 bugzilla warm hover still occasionally null under Interactive policy (by
 design — the fork's per-verb table is the redirect point).
+
+## Spot check — 2026-07-15 — big-header outline post-WaitPolicy (tip 0485ef9)
+
+Targeted re-verification of the rounds-1–4 "outline null on big headers"
+finding, redis `server.h` (fresh shallow clone, quiet box): outline
+returns the FULL 752 KB symbol tree in ~30 ms on the first pull, cold
+(ready 11.8 s) and warm (ready 1.1 s) — `WaitPolicy::Complete` on
+documentSymbol closed the window (bugzilla `Bug.pm` showed the same in
+rounds 5–8: 52,882 B every round). Blocking Complete waits now also
+surface as LSP work-done progress once they exceed 500 ms
+(`bounded_wait_with_progress`), so the honest block is visible in-editor
+instead of reading as a hang.
