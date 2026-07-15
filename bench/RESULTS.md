@@ -105,3 +105,46 @@ templates, 72 files), curl (C, root=lib, 380 TUs). Three full rounds
   goto-def→prototype replicated (C-tier pattern; fmt C++ lands on
   definitions, so it's the C path specifically); fmt explicit-instantiation
   template probe (dragonbox) answers empty — knownweak, tracked.
+
+## Rounds 5–8 — 2026-07-15 — post-fixing-round (tip 2bdf57e) — 4 cores / 15 GB
+
+Four rounds on the fixed binary. FIXED-BY verdicts (medians r5–8 vs r2–4):
+
+| finding | before | after | status |
+|---|---|---|---|
+| cpp first-edit-after-cold-open | 24.0 s | **195 ms** | FIXED-BY 622361b (cached-only change path + background heal; fork: fast-degraded-now, option B ledgered) |
+| abseil warm references | 1.62 s | **45 ms** | FIXED-BY aad409d+2bdf57e (row-narrowed sweeps; PERL_LSP_REFS_NARROW=0 kill-switch; answers byte-identical) |
+| bugzilla warm outline null (WaitPolicy) | 403 ms + null | **730 ms + full 53 KB outline, every round** | FIXED-BY f988b52 (Complete wait; honesty costs ~330 ms) |
+| rename missing index wait | partial edits possible | Complete wait | FIXED-BY f988b52 |
+| C goto-def stops at prototype | header only | **defining TU first + prototype** (redis/curl; +2 gold rows) | FIXED-BY 498d2da (qualified-path residual forked) |
+| `$self->` on `use base` | 1 item | **full method surface** (1 → 1574 in `update`) | FIXED-BY e904e7d (identity-over-rep; 2 ctor-gap sites forked) |
+| bugzilla warm refs-check | 91 ms | 15 ms | rode the row narrowing |
+| curl/mojo warm references | 112 / 19 ms | 10 / 2.4 ms | rode the row narrowing |
+| warm settled RSS | 188/274/171 MB (bz/absl/curl) | **159/105/122 MB** | narrowing removed sweep rehydration storms |
+
+### Costs of honesty (designed, fork-reviewable)
+- abseil COLD references now ~27 s: `WaitPolicy::Complete` blocks until the
+  873-file index lands instead of serving the old 402 ms PARTIAL (3.6 KB)
+  answer. The fork's "Discussion needed" now has its concrete price; LSP
+  progress reporting for the wait is the obvious follow-up.
+- bugzilla open→outline 730 ms warm (was fast-null).
+
+### New characterization: the curl server-context under-answer
+Server-mode references on curl answer **4 sites where the CLI answers
+155** — warm-deterministic, and it PREDATES the fixing round (rounds 2–4
+warm was constant at the same 866 B; only cold occasionally hit the full
+34 KB). Eliminated today: NOT row narrowing (identical with it off), NOT
+candidate retrieval (17 candidates, byte-same as CLI), NOT rehydration
+(strict-residency clean), NOT the relational block's view (whole_present).
+Remaining suspect: the OPEN doc's cached-only build mints a weaker pack
+target (identity/def_paths) than the CLI's fully-gathered staging, so the
+matcher rejects most candidates. Evidence attached to the answer-honesty
+fork entry; `PERL_LSP_REFS_DEBUG=1` prints the per-query key/candidate
+counts for the next session's repro.
+
+### Residual watch-list
+dragonbox template knownweak (unchanged, tracked); fmt warm header-revert
+~650 ms asymmetry; redis warm goto-def returns def-only while cold returns
+def+prototype (CLI shows both, correct order — wobble, not defect);
+bugzilla warm hover still occasionally null under Interactive policy (by
+design — the fork's per-verb table is the redirect point).

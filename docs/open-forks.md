@@ -531,7 +531,19 @@ Deferred, with designs:
 - **Undo cost:** trivial per verb — the policy table is data.
 - **Discussion needed:** which verbs the user wants blocking-honest vs
   fast-best-effort; whether rename should hard-refuse (error) instead
-  of wait when the index is cold.
+  of wait when the index is cold. Concrete price now measured: abseil
+  COLD references blocks ~27 s for the honest answer (was 402 ms
+  partial). LSP progress reporting for Complete waits is the natural
+  follow-up.
+- **New evidence (2026-07-15), the curl server-context case:** server
+  references answer 4 sites where the CLI answers 155 —
+  warm-deterministic, predates the fixing round. Eliminated: row
+  narrowing (identical off), candidate retrieval (17 candidates, same
+  as CLI), rehydration (strict clean), block view (whole_present).
+  Remaining suspect: the OPEN doc's cached-only build mints a weaker
+  pack target than the CLI's fully-gathered staging, so the matcher
+  rejects most candidates. Repro: bench curl scenario warm +
+  PERL_LSP_REFS_DEBUG=1.
 
 ## cpp references sweep cost — 2026-07-14 — OPEN (profile first)
 - **Context:** edit-bench: abseil warm references 1.62 s for 54 result
