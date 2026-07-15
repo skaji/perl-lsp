@@ -1291,6 +1291,7 @@ impl<'a> CandidateSet<'a> {
             if let Some((self_path, visible)) = idx.visibility_scope() {
                 let self_str = self_path.to_string_lossy().into_owned();
                 let decl_path = key_for_sort(&decl.key);
+                let decl_str = decl_path.to_string_lossy().into_owned();
                 let mut cands = idx.def_candidates(&sym.name);
                 cands.sort_by(|a, b| a.path.cmp(&b.path));
                 for cached in cands {
@@ -1298,8 +1299,19 @@ impl<'a> CandidateSet<'a> {
                         continue;
                     }
                     let p = cached.path.to_string_lossy().into_owned();
+                    // Connected when the origin sees the def, when the def's TU
+                    // includes the origin (the reverse `server.c` ⊇ `server.h`
+                    // link), OR when the def's TU includes the DECL's file. The
+                    // last is the general C separate-compilation link: a body's
+                    // TU includes the header that declares the same identity —
+                    // and the decl is the proven-same-symbol waypoint the origin
+                    // already resolved to. A THIRD TU calling through a shared
+                    // header (`t_string.c` → `server.h` proto, body in `db.c`)
+                    // reaches the body via this clause though it never sees
+                    // `db.c` textually.
                     let connected = visible.contains(&p)
-                        || cached.analysis.include_closure.contains(&self_str);
+                        || cached.analysis.include_closure.contains(&self_str)
+                        || cached.analysis.include_closure.contains(&decl_str);
                     if !connected {
                         continue;
                     }

@@ -687,3 +687,37 @@ the residency/robustness axis so they aren't lost:
   first-change, or should the first change block on correct diagnostics?
   If a shared-gather token is wanted anyway (to also kill the redundant
   double gather), that's the B upgrade — additive on top of A.
+## Decl→def ranking on QUALIFIED / member goto-def — 2026-07-15 — OPEN (Claude)
+- **Context:** the C-tier bench finding "C goto-def stops at the header
+  prototype" (bench/RESULTS.md). Fixed for UNqualified free-function calls
+  (redis `lookupKeyReadOrReply`/`addReplyBulk`, curl
+  `Curl_conn_cf_discard_all`): `CandidateSet::preferred_definitions` now
+  admits a def-candidate whose TU includes the DECL's header, so a third TU
+  calling through a shared prototype reaches the bodied definition (ranked
+  first, decl kept). But the QUALIFIED / namespaced spelling
+  (`pkg::Combine` in the multitu fixture) routes through
+  `member_def_location` (the owner-anchored `qualifier_at_point` path at the
+  top of `definitions()`), which returns a SINGLE location, applies the same
+  origin-only connectivity gate (excluding the defining TU), and does NO
+  decl→def ranking — so it still lands on the prototype.
+- **Options:** A — teach `member_def_location` the same decl-connectivity
+  clause AND a bodied-over-bodiless preference, returning the def (or def
+  ranked first). B — route qualified member/namespaced-function calls
+  through `preferred_definitions` (the free-function lane already fixed) so
+  one mechanism serves both spellings; `member_def_location` stays the
+  member-RESOLUTION seam, ranking becomes a projection concern. C — leave
+  qualified member goto-def landing on the decl and expose the def via
+  `textDocument/declaration` vs `definition` split.
+- **Picked:** none yet — the free-function fix is landed and scoped to the
+  bench finding; the qualified-member case is a strictly-additional surface
+  (the bench did not flag it, no regression introduced). Documented so the
+  maintainer can pick B (the loosely-coupled unification — one decl→def
+  mechanism, member_def_location keeps resolving, ranking is inherited) vs A
+  (local patch, faster but re-derives the ranking in a second place, the
+  asymmetry the resolution-CandidateSet ADR warns against).
+- **Undo cost:** low — the landed change is one added `||` clause in
+  `preferred_definitions`; picking any option above is net-new work, not a
+  reversal.
+- **Discussion needed:** should member/qualified goto-def rank def-over-decl
+  at all, and if so via the shared `preferred_definitions` seam (B) or a
+  local `member_def_location` patch (A)? B is the rule-#10-consistent pick.
