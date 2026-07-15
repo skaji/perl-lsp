@@ -3110,16 +3110,27 @@ pub fn refs_to(
     // the whole-view fallback. Empty set (`PERL_LSP_REF_ROWS=0`, no opener,
     // degraded) ⇒ every file is swept, exactly as before. This is what makes
     // the pack references path cost track candidate count, not tree size.
+    // Sweep-narrowing kill-switch (`PERL_LSP_REFS_NARROW=0`), the A/B lever
+    // for the row-narrowed backward walk. Answer-preservation verified:
+    // abseil narrowed vs swept byte-identical; curl identical either way
+    // (its server-warm under-answer PREDATES narrowing — the open-doc
+    // cached-only target-minting divergence, ledgered separately in
+    // docs/open-forks.md "Answer honesty under index/enrichment windows").
+    let narrow_enabled = std::env::var_os("PERL_LSP_REFS_NARROW")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let rows_active =
         ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY);
-    // Armed by the relational block below ONLY when candidate retrieval
-    // actually produced candidates. An EMPTY candidate set for a real
-    // target smells like a retrieval gap (key minting, scoped admission,
-    // mid-shred lag) — narrowing on that evidence would under-answer
-    // (observed: curl server-warm references 4 sites vs the sweep's 155).
-    // With no candidates the sweeps run whole-view, exactly as pre-rows;
-    // the guard trades occasional slowness for never-wrong.
+    // Armed by the relational block below. The sweep-skip is sound ONLY
+    // for files that hold rows AND are NOT candidates (provably matchless).
+    // A CANDIDATE must never be skipped by the sweeps even though it holds
+    // rows: the relational block can fail to RESOLVE it (`cached_by_path`
+    // path-spelling gaps under warm-stub registration — observed on curl:
+    // server-warm references 4 sites vs the sweep's 155) and an unresolved
+    // candidate falls through to the whole-view sweeps for coverage.
+    // Empty candidate retrieval leaves narrowing off entirely.
     let mut rows_indexed: std::collections::HashSet<PathBuf> = Default::default();
+    let mut candidate_set: std::collections::HashSet<PathBuf> = Default::default();
 
     // Open files (canonical — workspace entries for open paths are skipped).
     let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -3170,8 +3181,17 @@ pub fn refs_to(
         if let Some(idx) = module_index {
             let keys = retrieval_keys(target, &aliases);
             let candidate_paths = idx.ref_candidate_paths(&keys);
-            if !candidate_paths.is_empty() {
+            if std::env::var_os("PERL_LSP_REFS_DEBUG").is_some() {
+                eprintln!(
+                    "[refs-debug] keys={:?} candidates={} narrow={}",
+                    keys,
+                    candidate_paths.len(),
+                    narrow_enabled
+                );
+            }
+            if narrow_enabled && !candidate_paths.is_empty() {
                 rows_indexed = idx.ref_indexed_paths();
+                candidate_set = candidate_paths.iter().cloned().collect();
             }
             for path in candidate_paths {
                 if covered_paths.contains(&path) {
@@ -3229,10 +3249,10 @@ pub fn refs_to(
             if covered_paths.contains(entry.key()) {
                 continue;
             }
-            // Rows live and this file is shredded but not a candidate → it
-            // holds no matching row; the relational block already claimed
-            // every candidate. Skip the whole-view rehydration.
-            if rows_indexed.contains(entry.key()) {
+            // Shredded AND not a candidate → holds no matching row; skip
+            // the whole-view rehydration. Candidates always fall through
+            // (the relational block may have failed to resolve them).
+            if rows_indexed.contains(entry.key()) && !candidate_set.contains(entry.key()) {
                 continue;
             }
             covered_paths.insert(entry.key().clone());
@@ -3271,8 +3291,9 @@ pub fn refs_to(
                     return;
                 }
                 // Same row-narrowing skip as the workspace sweep: shredded
-                // but not a candidate ⇒ provably matchless.
-                if rows_indexed.contains(&cached.path) {
+                // but not a candidate ⇒ provably matchless; candidates
+                // always fall through.
+                if rows_indexed.contains(&cached.path) && !candidate_set.contains(&cached.path) {
                     return;
                 }
                 let key = FileKey::Path(cached.path.clone());
