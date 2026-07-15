@@ -6525,6 +6525,12 @@ impl<'a> Builder<'a> {
                     // returns only `$a`) as the whole RHS.
                 } else if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        // `my $self = bless {}, $class` — the eager TC below
+                        // bakes the RHS's MATERIALIZED type (the no-receiver
+                        // fallback, i.e. the enclosing class); the deferred
+                        // witness keeps the ctor receiver-polymorphic at
+                        // call sites (wins via reducer order).
+                        self.push_receiver_bless_witness(&vt, right);
                         self.push_type_constraint(TypeConstraint {
                             variable: vt,
                             scope: self.current_scope(),
@@ -11753,6 +11759,21 @@ impl<'a> Builder<'a> {
             Some(n) => *n,
             None => return,
         };
+        // Receiver-polymorphic statement bless — the Bugzilla::Object idiom
+        // (`bless($object, $class) if $object; return $object;`). The class
+        // is the CALL SITE's receiver, not a name resolvable here, so a
+        // concrete TC can't carry it: push the deferred witness on the
+        // VARIABLE (see `push_receiver_bless_witness`). The concrete TC
+        // below still fires when the class ALSO resolves statically
+        // (`$class` from `shift` → enclosing class via FirstParam): that
+        // concrete witness is the in-body baseline; the deferred one wins
+        // at real call sites via reducer order.
+        if obj.kind() == "scalar" {
+            if let Ok(text) = obj.utf8_text(self.source) {
+                let text = text.to_string();
+                self.push_receiver_bless_witness(&text, node);
+            }
+        }
         let class = match args.get(1) {
             Some(class_node) => match self.bless_class_of(*class_node) {
                 Some(c) => c,
@@ -11765,6 +11786,45 @@ impl<'a> Builder<'a> {
             },
         };
         self.push_var_type_constraint(obj, node, InferredType::ClassName(class));
+    }
+
+    /// If `bless_node` is a bless whose class argument denotes the RECEIVER
+    /// (`bless X, $class` / `ref $x || $x` — `bless_class_is_receiver`),
+    /// push the deferred `ReturnExpr::ReceiverOr(enclosing)` witness on
+    /// `var_name` — the receiver-polymorphic ctor's variable half. A
+    /// concrete TC can't carry "the call site's class"; the deferred
+    /// payload rides the variable, the return-arm chase reaches it through
+    /// `Edge(Variable)` with the caller's receiver threaded
+    /// (`query_variable_with_visited`), and `ReturnExprReducer` substitutes
+    /// at each call site — so an inherited `$class->new` types to the
+    /// subclass it was called on, cross-file included. Temporal: the
+    /// witness carries the bless span; pre-bless queries keep the rep type.
+    /// Returns whether a witness was pushed.
+    fn push_receiver_bless_witness(&mut self, var_name: &str, bless_node: Node<'a>) -> bool {
+        if !self.is_bless_call(bless_node) {
+            return false;
+        }
+        let args = self.extract_call_args(bless_node);
+        let Some(class_node) = args.get(1) else { return false };
+        if !self.bless_class_is_receiver(*class_node) {
+            return false;
+        }
+        let re = match self.current_package.clone() {
+            Some(pkg) => {
+                crate::witnesses::ReturnExpr::ReceiverOr(InferredType::ClassName(pkg))
+            }
+            None => crate::witnesses::ReturnExpr::Receiver,
+        };
+        self.bag.push(crate::witnesses::Witness {
+            attachment: crate::witnesses::WitnessAttachment::Variable {
+                name: var_name.to_string(),
+                scope: self.current_scope(),
+            },
+            source: crate::witnesses::WitnessSource::Builder("bless_receiver".into()),
+            payload: crate::witnesses::WitnessPayload::ReturnExpr(re),
+            span: node_to_span(bless_node),
+        });
+        true
     }
 
     /// Resolve a `bless`'s class argument to a class name. String/bareword

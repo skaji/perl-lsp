@@ -1150,6 +1150,71 @@ fn test_return_bless_anon_hash_class() {
 }
 
 #[test]
+fn test_statement_bless_receiver_types_sub_return() {
+    // The Bugzilla::Object idiom: bless in STATEMENT position with a
+    // receiver-derived class, returned as a separate statement. The sub's
+    // return must type receiver-polymorphically — enclosing class as the
+    // no-receiver fallback.
+    let src = "package Base;\nsub new {\n  my $invocant = shift;\n  my $class = ref($invocant) || $invocant;\n  my $object = $class->_init(@_);\n  bless($object, $class) if $object;\n  return $object;\n}\nsub _init { return {} }\n";
+    let fa = build_fa(src);
+    let ty = fa.sub_return_type_at_arity("new", Some(0));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Base".into())),
+        "statement bless with receiver class should type the ctor return, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_inherited_statement_bless_ctor_types_to_subclass() {
+    // `$class->new` through an inherited statement-bless ctor: the call
+    // site's receiver substitutes, so `$self` types as the SUBCLASS.
+    let src = "package Base;\nsub new {\n  my $class = shift;\n  my $object = {};\n  bless($object, $class);\n  return $object;\n}\n\npackage Kid;\nuse base qw(Base);\nsub check {\n  my ($class) = @_;\n  my $self = $class->new;\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$self", Point::new(13, 9));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Kid".into())),
+        "inherited statement-bless ctor should type to the calling subclass, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_inherited_assignment_bless_ctor_types_to_subclass() {
+    // Same polymorphism through the assignment form
+    // (`my $self = bless {}, $class; return $self`).
+    let src = "package Base;\nsub new {\n  my $class = shift;\n  my $self = bless {}, $class;\n  return $self;\n}\n\npackage Kid;\nuse base qw(Base);\nsub check {\n  my ($class) = @_;\n  my $self = $class->new;\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$self", Point::new(12, 9));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Kid".into())),
+        "inherited assignment-bless ctor should type to the calling subclass, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_statement_bless_receiver_pre_bless_query_keeps_rep() {
+    // Temporal honesty: before the bless statement the variable is still
+    // the hashref `_init` returned; only queries PAST the bless see the
+    // class.
+    let src = "package Base;\nsub new {\n  my $class = shift;\n  my $object = {};\n  bless($object, $class);\n  return $object;\n}\n";
+    let fa = build_fa(src);
+    // Point on the `bless` line's variable read is fine — the witness is
+    // at the bless span itself; probe the line BEFORE it.
+    let pre = fa.inferred_type_via_bag("$object", Point::new(3, 14));
+    assert_eq!(
+        pre,
+        Some(InferredType::HashRef),
+        "pre-bless query must keep the rep type, got {:?}",
+        pre
+    );
+}
+
+#[test]
 fn test_bless_into_ref_invocant_types_clone_return() {
     // `bless { ... }, ref $_[0]` (the clone idiom) blesses into the invocant's
     // class, so the implicit-return value types as the enclosing class.

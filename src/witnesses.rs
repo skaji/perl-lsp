@@ -1378,20 +1378,36 @@ impl WitnessReducer for ReturnExprReducer {
         // the class-keyed declarations; `Expr(_)` carries a method body's
         // own deferred return (`sub me { return $_[0] }` → `Receiver` on
         // the `$_[0]` body span), reached through the `SymbolReturnArm`
-        // edge chase. Claiming all three lets a self-returning method
-        // substitute the call's receiver at arbitrary chain depth.
+        // edge chase; `Variable{..}` carries a statement-position
+        // receiver bless (`bless $obj, $class; ...; return $obj` — the
+        // deferred class rides the VARIABLE so the return-arm chase
+        // substitutes the call site's receiver). Claiming all four lets a
+        // self-returning method substitute the call's receiver at
+        // arbitrary chain depth.
         matches!(
             w.attachment,
             WitnessAttachment::Symbol(_)
                 | WitnessAttachment::MethodOnClass { .. }
                 | WitnessAttachment::Expr(_)
+                | WitnessAttachment::Variable { .. }
         ) && matches!(w.payload, WitnessPayload::ReturnExpr(_))
     }
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
         // Highest-priority source wins; ties resolve to latest-pushed.
+        // Variable-attached witnesses are temporal like the framework
+        // fold: a bless mid-body types the variable only PAST the bless
+        // site — a query before it keeps the rep answer (HashRef pre-,
+        // instance post-bless).
+        let temporal_gate = |w: &&Witness| match (&w.attachment, q.point) {
+            (WitnessAttachment::Variable { .. }, Some(p)) => {
+                let s = w.span.start;
+                (s.row, s.column) <= (p.row, p.column)
+            }
+            _ => true,
+        };
         let mut best: Option<(&Witness, u8)> = None;
-        for w in ws.iter().rev() {
+        for w in ws.iter().rev().filter(|w| temporal_gate(w)) {
             let pr = w.source.priority();
             match best {
                 None => best = Some((*w, pr)),
@@ -2124,7 +2140,8 @@ impl ReducerRegistry {
                                 _ => scope_point(ctx.scopes, *scope),
                             };
                             self.query_variable_with_visited(
-                                bag, ctx, name, *scope, point, state,
+                                bag, ctx, name, *scope, point,
+                                q.receiver.as_ref(), state,
                             )
                         }
                         _ => {
@@ -2218,7 +2235,8 @@ impl ReducerRegistry {
                         (WitnessAttachment::Variable { name, scope }, Some(ctx)) => {
                             let point = scope_point(ctx.scopes, *scope);
                             self.query_variable_with_visited(
-                                bag, ctx, name, *scope, point, state,
+                                bag, ctx, name, *scope, point,
+                                q.receiver.as_ref(), state,
                             )
                         }
                         _ => {
@@ -2324,6 +2342,7 @@ impl ReducerRegistry {
         var: &str,
         scope: ScopeId,
         point: Point,
+        receiver: Option<&InferredType>,
         state: &mut QueryState,
     ) -> Option<InferredType> {
         let chain = crate::file_analysis::scope_chain_of(ctx.scopes, scope);
@@ -2354,7 +2373,13 @@ impl ReducerRegistry {
                 point: Some(point),
                 framework,
                 arity_hint: None,
-                receiver: None,
+                // Threaded from the chasing query so a deferred
+                // `ReturnExpr::ReceiverOr` on the variable (a statement-
+                // position `bless $obj, $class`) substitutes the CALL
+                // SITE's class — the hop that makes an inherited
+                // `$class->new; ...; return $object` ctor type to the
+                // subclass it was called on.
+                receiver: receiver.cloned(),
                 args: Vec::new(),
                 context: Some(ctx),
             };
@@ -2644,7 +2669,7 @@ pub fn query_variable_type(
 ) -> Option<InferredType> {
     let reg = ReducerRegistry::with_defaults();
     let mut state = QueryState::new();
-    reg.query_variable_with_visited(bag, ctx, var, scope, point, &mut state)
+    reg.query_variable_with_visited(bag, ctx, var, scope, point, None, &mut state)
 }
 
 /// Fold `KeyWrite`s into variable shape witnesses — the mutation-
