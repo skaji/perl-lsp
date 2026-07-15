@@ -1339,6 +1339,21 @@ impl LanguageRegistry {
         self.drivers.iter().map(|d| d.id()).collect()
     }
 
+    /// Human-facing name for a pack language id, for startup banners and
+    /// progress messages. Purely cosmetic — `for_id` still speaks the short
+    /// id everywhere else. Falls back to the id itself for a language this
+    /// mapping hasn't been told about yet (never a hard error over a
+    /// display string).
+    pub fn display_name(id: &str) -> &str {
+        match id {
+            "cpp" => "C/C++",
+            "python" => "Python",
+            "r" => "R",
+            "cmake" => "CMake",
+            _ => id,
+        }
+    }
+
     /// Union of every served language's completion trigger characters,
     /// for the LSP `completionProvider.triggerCharacters` slot.
     pub fn trigger_chars(&self) -> Vec<String> {

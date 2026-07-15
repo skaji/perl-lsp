@@ -539,21 +539,6 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
     (path, uri)
 }
 
-/// Human-facing name for a pack language id, for the startup banner.
-/// Purely cosmetic — `LanguageRegistry::for_id` still
-/// speaks the short id everywhere else; this is the one spot that prints
-/// for a human. Falls back to the id itself for a language this mapping
-/// hasn't been told about yet (never a hard error over a display string).
-fn pack_language_display_name(id: &str) -> &'static str {
-    match id {
-        "cpp" => "C/C++",
-        "python" => "Python",
-        "r" => "R",
-        "cmake" => "CMake",
-        _ => "pack-language",
-    }
-}
-
 /// Full CLI workspace setup: index the workspace, open the SQLite cache,
 /// warm cached modules, resolve missing imports + ancestors via @INC,
 /// save fresh entries back to disk. Mirrors the LSP server's startup
@@ -582,7 +567,11 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     let ws = file_store::FileStore::new();
     let indexed =
         module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None);
-    eprintln!("Indexed {} files", indexed);
+    // Label the tier: a pack-only workspace printing a bare "Indexed 0 files"
+    // reads as "indexing failed" when the pack line below says otherwise.
+    if indexed > 0 {
+        eprintln!("Indexed {} Perl files", indexed);
+    }
     // Pack languages (C++/Python/…) → per-language sub-indexes (separate
     // caches, no cross-language overlap), attached to the hub for routing.
     let pack_indexed = module_resolver::index_pack_languages(
@@ -601,7 +590,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             .languages()
             .into_iter()
             .filter(|id| *id != "perl")
-            .map(pack_language_display_name)
+            .map(language_driver::LanguageRegistry::display_name)
             .collect();
         eprintln!("Indexed {} {} files", pack_indexed, langs.join("/"));
     }

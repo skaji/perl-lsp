@@ -558,7 +558,18 @@ impl Backend {
                     token,
                     value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
                         WorkDoneProgressEnd {
-                            message: Some(format!("Indexed {} files", count)),
+                            message: Some(if want_perl {
+                                format!("Indexed {} Perl files", count)
+                            } else {
+                                let reg = crate::language_driver::LanguageRegistry::with_enabled();
+                                let langs: Vec<&str> = reg
+                                    .languages()
+                                    .into_iter()
+                                    .filter(|id| *id != "perl")
+                                    .map(crate::language_driver::LanguageRegistry::display_name)
+                                    .collect();
+                                format!("Indexed {} {} files", count, langs.join("/"))
+                            }),
                         },
                     )),
                 }));
