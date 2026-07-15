@@ -2498,6 +2498,16 @@ impl CrossFileLookup for ModuleIndex {
         .unwrap_or_default()
     }
 
+    fn ref_indexed_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.with_rows_conn(|conn| {
+            crate::module_cache::paths_with_ref_rows(conn)
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     fn cached_by_path(&self, path: &std::path::Path) -> Option<Arc<CachedModule>> {
         // Pack sub-indexes: the per-path registry is O(1). The Perl hub's
         // cache is name-keyed with unique paths — linear fallback (hub

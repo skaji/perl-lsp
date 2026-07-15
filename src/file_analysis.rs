@@ -486,6 +486,17 @@ pub trait CrossFileLookup {
     fn ref_candidate_paths(&self, _keys: &[String]) -> Vec<std::path::PathBuf> {
         Vec::new()
     }
+    /// Every path this index has SHREDDED into the relational row store
+    /// (the `files` table — the single "rows present" marker). A file in
+    /// this set but ABSENT from `ref_candidate_paths(keys)` has no ref or
+    /// sym row for those names, so — rows over-approximate references — it
+    /// provably matches nothing and the backward walk can skip rehydrating
+    /// it. Empty (default, or no row store) ⇒ no narrowing; the resident
+    /// sweep whole-views every gate-passing file as before. `docs/adr/
+    /// relational-ref-index.md`.
+    fn ref_indexed_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        std::collections::HashSet::new()
+    }
     /// Path-keyed cached-module lookup — the retrieval above hands back
     /// paths; this maps them onto the resident registration (for the
     /// visibility gate + `refs_present`). Default `None`.
@@ -669,6 +680,9 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // its own per-file closure gate; pre-narrowing here would hide sites
         // in files the textual-inclusion extension admits.
         self.inner.ref_candidate_paths(keys)
+    }
+    fn ref_indexed_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.inner.ref_indexed_paths()
     }
     fn cached_by_path(
         &self,

@@ -3101,6 +3101,25 @@ pub fn refs_to(
             || seen_by_inclusion.contains(file_str)
     };
 
+    // Row-narrowing gate: when the relational store is live for a masked
+    // dep/workspace tier, its `files` set is the complete "which files hold
+    // rows" marker. A file WITH rows but ABSENT from the candidate set has
+    // no matching ref/sym row, so — rows over-approximate references — it
+    // provably matches nothing; the resident sweeps below skip rehydrating
+    // it, leaving only rows-ABSENT files (persistence off, mid-index lag) to
+    // the whole-view fallback. Empty set (`PERL_LSP_REF_ROWS=0`, no opener,
+    // degraded) ⇒ every file is swept, exactly as before. This is what makes
+    // the pack references path cost track candidate count, not tree size.
+    let rows_active =
+        ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY);
+    let rows_indexed: std::collections::HashSet<PathBuf> = if rows_active {
+        module_index
+            .map(|idx| idx.ref_indexed_paths())
+            .unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     // Open files (canonical — workspace entries for open paths are skipped).
     let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if mask.contains(RoleMask::OPEN) {
@@ -3146,7 +3165,7 @@ pub fn refs_to(
     // declaration-only files and files without rows (degraded, persistence
     // off, mid-index lag) — composition stays at-least-as-complete whether
     // or not resident refs were evicted.
-    if ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY) {
+    if rows_active {
         if let Some(idx) = module_index {
             let keys = retrieval_keys(target, &aliases);
             for path in idx.ref_candidate_paths(&keys) {
@@ -3205,6 +3224,12 @@ pub fn refs_to(
             if covered_paths.contains(entry.key()) {
                 continue;
             }
+            // Rows live and this file is shredded but not a candidate → it
+            // holds no matching row; the relational block already claimed
+            // every candidate. Skip the whole-view rehydration.
+            if rows_indexed.contains(entry.key()) {
+                continue;
+            }
             covered_paths.insert(entry.key().clone());
             let key = FileKey::Path(entry.key().clone());
             let file_str = canonical_file_str(&key);
@@ -3238,6 +3263,11 @@ pub fn refs_to(
         if let Some(idx) = module_index {
             idx.for_each_cached_file(&mut |cached| {
                 if !covered_paths.insert(cached.path.clone()) {
+                    return;
+                }
+                // Same row-narrowing skip as the workspace sweep: shredded
+                // but not a candidate ⇒ provably matchless.
+                if rows_indexed.contains(&cached.path) {
                     return;
                 }
                 let key = FileKey::Path(cached.path.clone());
