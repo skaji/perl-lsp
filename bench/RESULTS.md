@@ -160,3 +160,16 @@ rounds 5–8: 52,882 B every round). Blocking Complete waits now also
 surface as LSP work-done progress once they exceed 500 ms
 (`bounded_wait_with_progress`), so the honest block is visible in-editor
 instead of reading as a hang.
+
+## Residual closed — 2026-07-15 — the ctor-gap 2/60 (tip 900b335)
+
+The invocant fork's residual (`my $self = $class->new(...)` through a
+cross-file base ctor → `$self` untyped) was a bug, not a fork: the
+receiver-polymorphic ctor machinery existed but the statement/assignment
+bless forms never reached it. Fixed (`push_receiver_bless_witness` +
+receiver threading through the Variable hop, EXTRACT_VERSION 166).
+Verified on real Bugzilla: goto-def on `$self->id` right after
+`my $self = $class->new($param)` in `Bug::check` resolves to
+`Bugzilla::Object::id` over five same-named decoy `sub id`s, cross-file
+through `new` → `new_from_hash` → statement bless. Gold 436/17/0/0/0
+(two new substrate rows lock the post-bless hover typing).

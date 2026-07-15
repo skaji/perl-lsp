@@ -10,6 +10,47 @@ when, why), not the contract.
 
 ---
 
+## Invocant class vs inner-scope rep narrowing — 2026-07-15 — RESOLVED (veesh, 2026-07-15)
+- **Context:** edit-bench finding (`bench/RESULTS.md`): `$self->` completion
+  returned a lone `{key} hash dereference` inside `use base` classes
+  (Bugzilla::Bug) instead of the class's methods. Root cause was NOT that
+  the invocant fails to type — a conventional invocant already types as
+  `ClassName`/`FirstParam` (via `detect_first_param_type`, independent of
+  framework). The bug: `$self->{field}` accesses inside a nested block push
+  rep witnesses (`HashRefAccess` observation + an `infer_deref_type`
+  `HashRef` TC) on the *inner* scope, while the invocant's class lives on the
+  sub scope. The scope-chain walk (`query_variable_with_visited`) returned
+  the innermost typed scope first → `HashRef`, masking the class.
+- **Options:** A — always assert every conventional invocant scalar
+  (`$self`/`$class`) as `ClassName(current_package)` via a witness
+  (aggressive; also masks a genuinely hashref-typed `$self` and needs a
+  sub-Builder confidence tier to lose to real bindings). B — framework-gate
+  the rep suppression (wrong — the bug is framework-independent). C —
+  identity-over-rep across the scope walk: class identity anywhere in the
+  chain dominates an inner scope whose answer is a *rep-observation-only*
+  projection, and `subsumes_narrowing` stops `infer_deref_type` re-deriving
+  a rep `HashRef` over an existing class identity at the access site.
+- **Picked:** C. Two small, reversible seams: (1) `subsumes_narrowing`'s
+  class-over-rep arm; (2) `query_variable_with_visited`'s weak-answer
+  deferral (`scope_binds_variable` gate). Genuine inner-scope rebindings
+  (`my $h = {…}`) stay authoritative because they BIND the variable.
+- **Resolution:** the fix landed and the one open residual — `my $self =
+  $class->new(...)` through a cross-file base ctor staying untyped — was
+  autopsied and turned out to be a plain BUG, not a fork: the
+  receiver-polymorphic machinery (`ReturnExpr::ReceiverOr`, the
+  `MethodOnClass` chase, receiver threading) existed and worked end-to-end
+  for value-position bless, but the statement/assignment bless forms
+  (`bless($object, $class); return $object` — the Bugzilla::Object idiom)
+  never minted the deferred witness, and the Variable hop dropped the
+  receiver. Fixed at the mechanism (`push_receiver_bless_witness`, the
+  `ReturnExprReducer` Variable claim with temporal gate, receiver threading
+  through `query_variable_with_visited`); option A's blanket `$self`
+  assertion was never needed. Verified: 4 unit tests, 2 substrate gold rows
+  (RobotUA / MultiPartParser post-bless hover), and the real Bugzilla case —
+  goto-def on `$self->id` after `my $self = $class->new($param)` in
+  `Bug::check` picks `Bugzilla::Object::id` over five same-named decoys,
+  through two polymorphic hops cross-file.
+
 ## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 - **Context:** storage-engine mission phase 3 (docs/adr/storage-engine.md;
   eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes

@@ -434,6 +434,36 @@
       },
       "status": "gold",
       "note": "path() tail-calls _pathify (bless [...], __PACKAGE__) -> Path::Tiny."
+    },
+    {
+      "id": "hover-robotua-assignment-bless-receiver",
+      "difficulty": "medium",
+      "semantic_area": "type-inference",
+      "file": "LWP/RobotUA.pm",
+      "line": 50,
+      "col": 4,
+      "expect": {
+        "all": [
+          "type: LWP::RobotUA"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "hover-multipartparser-statement-bless-receiver",
+      "difficulty": "medium",
+      "semantic_area": "type-inference",
+      "file": "HTTP/MultiPartParser.pm",
+      "line": 61,
+      "col": 4,
+      "expect": {
+        "all": [
+          "type: HTTP::MultiPartParser"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }
