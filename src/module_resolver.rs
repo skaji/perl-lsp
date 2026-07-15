@@ -469,7 +469,8 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 /// the resident copy drops its witness bag (the dominant share of a CPAN
 /// module's payload; `bag_present` rehydrates through the hub's LRU).
 /// Symbols and refs stay resident this slice — their reader routing for
-/// the import tier is the follow-up in `docs/open-forks.md`. Degraded
+/// the import tier is the follow-up in
+/// `docs/prompt-storage-residuals.md`. Degraded
 /// analyses keep the bag (their rows never persist).
 fn strip_import_copy(
     result: &Option<Arc<CachedModule>>,
@@ -1780,7 +1781,7 @@ fn analyze_stamped<T>(
 /// when a chunk fails to commit (disk full) or panics. The strip is licensed
 /// only by a landed blob, so a fallback keeps copies WHOLE — and a
 /// persistently failing writer would otherwise pin the ENTIRE tree resident
-/// (the docs/open-forks.md "writer fallback budget" residual). Past the cap
+/// (the docs/forks-resolved.md "writer fallback budget" entry). Past the cap
 /// we DROP the resident copy rather than register a stripped one: the chunk
 /// didn't commit, so a stripped copy's blob isn't on disk and could only
 /// rehydrate to wrong-empty. Dropping is honest absence — the file reads as

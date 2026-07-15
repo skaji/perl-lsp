@@ -293,4 +293,6 @@ why parked, what unblocks it. Prune on landing.
 
 ## Cross-references
 - Gap shapes behind open xfails: `gold-corpus/KNOWN-GAPS.md`
-- Architectural forks: `docs/open-forks.md`
+- Open architectural forks: `docs/open-forks.md`; resolved ledger:
+  `docs/forks-resolved.md`; deferred storage/residency work:
+  `docs/prompt-storage-residuals.md`

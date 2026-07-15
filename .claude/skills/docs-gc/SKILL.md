@@ -9,8 +9,9 @@ The docs tree has two kinds of design docs with OPPOSITE lifecycles:
 
 - `docs/prompt-*.md` — implementation BRIEFS. They exist to drive work.
   When the work lands, the brief is garbage: delete it. Its decisions
-  live in ADRs, its landing record in `docs/open-forks.md`, its history
-  in git.
+  live in ADRs, its landing record in `docs/forks-resolved.md`, its
+  history in git. (`docs/open-forks.md` holds ONLY still-open forks;
+  entries move to the resolved ledger when their status leaves OPEN.)
 - `docs/adr/*.md` — load-bearing DECISIONS. They live forever, but in
   house voice: they describe what IS — contracts, invariants,
   trade-offs, failure modes, measured facts — never what WAS or what
@@ -34,7 +35,7 @@ mechanical judgment, not architecture).
 For each `docs/prompt-*.md`:
 
 - **LANDED** → delete. Evidence: its own progress/status says complete;
-  `docs/open-forks.md` or an ADR records the landing; no live next
+  `docs/forks-resolved.md` or an ADR records the landing; no live next
   steps that aren't tracked elsewhere.
 - **FORWARD / PARKED** → keep unchanged (it still drives future work).
 - **MIXED** (landed phases + live next steps) → keep, but strip the
@@ -51,8 +52,8 @@ Before deleting a file, two obligations:
 2. **Repoint every reference.** Grep the ENTIRE repo (`src/`,
    `CLAUDE.md`, `docs/`, `gold-corpus/`) for the filename. Code comments
    and CLAUDE.md must point at the owning ADR instead — a dangling doc
-   link in a comment is a bug. (`docs/open-forks.md` is a historical
-   ledger — its references may stay.)
+   link in a comment is a bug. (`docs/open-forks.md` and
+   `docs/forks-resolved.md` are ledgers — their references may stay.)
 
 ## Job 2 — scrub ADRs to house voice
 

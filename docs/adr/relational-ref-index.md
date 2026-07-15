@@ -351,6 +351,9 @@ if that latency ever needs to move.
 `include_closure` rides a process-global path interner
 (`path_intern::ClosureList` — sorted `Arc<[u32]>` over a path-id table,
 4 B/entry; membership is id binary-search; the blob shape is unchanged).
+`closure_stamp` SORTS the strings before hashing: id order is global mint
+order, nondeterministic across sessions, and an order-sensitive hash
+would silently invalidate every warm row every run.
 The pack warm path streams rows one file at a time instead of decoding a
 whole table before stripping. Perl *workspace* files (not just `@INC`
 dependencies) persist blobs + rows to `modules.db` (`source='workspace'`);

@@ -101,7 +101,7 @@ fn detect_slot_perl_method_position() {
 
 /// `use |` (typing the module name) is a `ModulePath` slot on the
 /// `UseModule` detector arm — the arm, not a local bool, distinguishes it
-/// from the qualified-path drill (`docs/open-forks.md`).
+/// from the qualified-path drill (`docs/forks-resolved.md`).
 #[test]
 fn detect_slot_perl_use_module_name_is_module_path() {
     use crate::cursor_slot::DetectorArm;

@@ -342,7 +342,7 @@ pub mod path_intern {
     /// A file's `#include` closure as sorted path-ids over the global
     /// table. Semantically a set of path strings; consumers ask membership
     /// (`contains`) or iterate the strings — the representation is private
-    /// so it can keep shrinking (`docs/open-forks.md`, closure
+    /// so it can keep shrinking (`docs/forks-resolved.md`, closure
     /// representation fork).
     #[derive(Debug, Clone, Default)]
     pub struct ClosureList(Arc<[u32]>);

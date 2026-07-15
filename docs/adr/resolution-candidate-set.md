@@ -179,6 +179,15 @@ The spike's axes live in CandidateSet construction:
   closure connectivity — forward (origin reaches the defining file) and
   reverse (the defining TU includes the origin header). Hover inherits it:
   `hover_candidate()` presents the ranked winner.
+- **owner-match ranking** — `overload_arity_definitions` ranks a
+  candidate whose package genuinely agrees with the call's anchored owner
+  (both sides carry a package, tails agree) above one admitted only by
+  `pkg_agrees`' recall bias (a package-`None` free function). The family
+  is never pruned — the free decl stays in the set, ranked below. This is
+  what makes a sibling method call (`resolved_package` pinned to the
+  class) win over a same-named free function without a member-vs-free
+  branch; the owner match is the same key serving `dynamic::STRING` /
+  `logger.info` / `level::info`.
 - **Function-lane visibility gate** — a plain Sub target minted from a
   pack-routed set carries closure-keyed `def_paths` (minted in
   `resolution()`, on the routing fact — a Perl Sub cursor is the same
