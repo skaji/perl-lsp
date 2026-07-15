@@ -519,6 +519,82 @@ fn test_implicit_self_type_inference() {
 }
 
 #[test]
+fn test_invocant_class_survives_nested_hash_access() {
+    // A conventional invocant accessed as `$self->{k}` inside a nested block
+    // observes HashRef *there*, but the invocant's ClassName lives on the sub
+    // scope. Identity must dominate the inner-scope rep projection — no
+    // framework needed (Perl method-ness is conventional). Regression: this
+    // returned HashRef, so `$self->` completed a lone hash-key item instead
+    // of the class's methods.
+    let source = "package Widget;\n\
+                  sub new { my $class = shift; bless {}, $class }\n\
+                  sub helper { my ($self) = @_; return 1; }\n\
+                  sub run {\n\
+                  \x20   my ($self) = @_;\n\
+                  \x20   {\n\
+                  \x20       my $x = $self->{flag};\n\
+                  \x20       $self->helper;\n\
+                  \x20   }\n\
+                  }\n";
+    let fa = build_fa(source);
+    // `$self` at the `$self->helper` call (row 7), inside the nested block,
+    // after the `$self->{flag}` read on the previous line.
+    let inferred = fa.inferred_type_via_bag("$self", Point::new(7, 8));
+    match inferred {
+        Some(InferredType::ClassName(name)) => assert_eq!(name, "Widget"),
+        Some(InferredType::FirstParam { package }) => assert_eq!(package, "Widget"),
+        other => panic!("expected Widget class identity, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_invocant_class_survives_nested_hash_access_use_base() {
+    // Same rule for a `use base` class (framework None) — the case Bugzilla's
+    // `use base qw(Bugzilla::Object Exporter)` modules hit.
+    let source = "package Bug;\n\
+                  use base qw(Obj);\n\
+                  sub thing { my ($self) = @_; return 1; }\n\
+                  sub run {\n\
+                  \x20   my ($self) = @_;\n\
+                  \x20   if ($self->{error}) {\n\
+                  \x20       $self->thing;\n\
+                  \x20   }\n\
+                  }\n";
+    let fa = build_fa(source);
+    let inferred = fa.inferred_type_via_bag("$self", Point::new(6, 8));
+    match inferred {
+        Some(InferredType::ClassName(name)) => assert_eq!(name, "Bug"),
+        Some(InferredType::FirstParam { package }) => assert_eq!(package, "Bug"),
+        other => panic!("expected Bug class identity, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_genuine_inner_scope_hashref_binding_still_wins() {
+    // Guard: identity-over-rep defers only a *rep-observation-only* inner
+    // scope. An inner scope that actually BINDS the variable to a hashref
+    // (`my $h = { ... }` in a closure) stays authoritative — `scope_binds_
+    // variable` returns it immediately rather than falling out to any outer
+    // class identity.
+    let source = "package P;\n\
+                  sub run {\n\
+                  \x20   my ($self) = @_;\n\
+                  \x20   my $cb = sub {\n\
+                  \x20       my $h = { a => 1 };\n\
+                  \x20       return $h->{a};\n\
+                  \x20   };\n\
+                  }\n";
+    let fa = build_fa(source);
+    // `$h` at its use (row 5, `return $h->{a}`) is the hashref literal.
+    let inferred = fa.inferred_type_via_bag("$h", Point::new(5, 14));
+    assert!(
+        inferred.as_ref().is_some_and(|t| t.is_hash_shaped()),
+        "an explicit inner-scope hashref binding must stay hash-shaped, got {:?}",
+        inferred
+    );
+}
+
+#[test]
 fn test_self_completion_walks_ancestors_in_fallback() {
     // Untyped `$self` (the fallback path, no bag type — e.g. assigned via
     // `$class->SUPER::new`) must still resolve to the enclosing class AND walk

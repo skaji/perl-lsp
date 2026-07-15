@@ -2332,6 +2332,18 @@ impl ReducerRegistry {
             .find_map(|sid| ctx.scopes[sid.0 as usize].package.as_ref())
             .and_then(|pkg| ctx.package_framework.get(pkg).copied())
             .unwrap_or(FrameworkFact::Plain);
+        // A scope that only OBSERVES rep use of the variable (`$self->{k}`
+        // inside a nested block → HashRefAccess) yields a bare `HashRef`,
+        // but the variable's identity — an invocant's ClassName seeded on
+        // the sub scope — lives further out the chain. Class identity
+        // anywhere dominates such a rep-only projection: the same
+        // identity-over-rep rule `FrameworkAwareTypeFold` applies within a
+        // scope, lifted across the scope walk. A scope that actually BINDS
+        // the variable (explicit type / edge / class-or-bless observation)
+        // is authoritative and returned immediately, so genuine shadowing
+        // (`my $x = {}`) still wins. Defer the weak answer until the chain
+        // is exhausted.
+        let mut weak: Option<InferredType> = None;
         for sid in chain {
             let att = WitnessAttachment::Variable {
                 name: var.to_string(),
@@ -2347,11 +2359,46 @@ impl ReducerRegistry {
                 context: Some(ctx),
             };
             if let ReducedValue::Type(t) = &*self.query_rec(bag, &q, state) {
-                return Some(t.clone());
+                let t = t.clone();
+                if t.class_name().is_some() || scope_binds_variable(bag, var, sid, point) {
+                    return Some(t);
+                }
+                if weak.is_none() {
+                    weak = Some(t);
+                }
             }
         }
-        None
+        weak
     }
+}
+
+/// Does this scope *bind* the variable — establish its value/identity via
+/// an explicit type, an assignment edge, or a class/bless observation — as
+/// opposed to merely OBSERVING rep use (`$v->{k}` → `HashRefAccess`)? A
+/// binding scope's reduced type is authoritative; a rep-only scope's is a
+/// weak projection an outer class identity dominates (see the caller). A
+/// binding after the query point doesn't count. New value-carrying payload
+/// variants count as bindings by default — only the bare rep/scalar
+/// observations are the weak case.
+fn scope_binds_variable(bag: &WitnessBag, var: &str, scope: ScopeId, point: Point) -> bool {
+    let att = WitnessAttachment::Variable {
+        name: var.to_string(),
+        scope,
+    };
+    bag.for_attachment(&att).iter().any(|w| {
+        w.span.start <= point
+            && !matches!(
+                &w.payload,
+                WitnessPayload::Observation(
+                    TypeObservation::HashRefAccess
+                        | TypeObservation::ArrayRefAccess
+                        | TypeObservation::CodeRefInvocation
+                        | TypeObservation::NumericUse
+                        | TypeObservation::StringUse
+                        | TypeObservation::RegexpUse
+                )
+            )
+    })
 }
 
 /// Pick the "where am I asking from?" `Point` for a scope-chained

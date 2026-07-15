@@ -2665,6 +2665,19 @@ impl InferredType {
             }
             (InferredType::Sequence(_), InferredType::ArrayRef) => true,
             (a @ InferredType::Sequence(_), b @ InferredType::Sequence(_)) => a == b,
+            // Identity dominates rep: a blessed object accessed as
+            // `$self->{field}` / `$self->[i]` / `$self->()` reveals its
+            // internal REPRESENTATION, it does not narrow the object's TYPE
+            // to a bare ref. The class identity stays — the same
+            // structure-over-rep rule above, lifted to class-over-rep. So a
+            // deref-narrowing never clobbers an invocant's class at its
+            // access site (which would otherwise mask the identity at inner-
+            // scope reads, since the rep witness lands on the nested block
+            // while the class lives on the sub scope).
+            (
+                a,
+                InferredType::HashRef | InferredType::ArrayRef | InferredType::CodeRef { .. },
+            ) if a.class_name().is_some() => true,
             // An optional subsumes a narrowing only as specifically as its
             // inner does; a CONCRETE self is at least as specific as an
             // optional narrowing (the narrowing already happened). The

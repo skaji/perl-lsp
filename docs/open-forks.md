@@ -18,6 +18,50 @@ Format per entry:
 
 ---
 
+## Invocant class vs inner-scope rep narrowing — 2026-07-15 — OPEN
+- **Context:** edit-bench finding (`bench/RESULTS.md`): `$self->` completion
+  returned a lone `{key} hash dereference` inside `use base` classes
+  (Bugzilla::Bug) instead of the class's methods. Root cause was NOT that
+  the invocant fails to type — a conventional invocant already types as
+  `ClassName`/`FirstParam` (via `detect_first_param_type`, independent of
+  framework). The bug: `$self->{field}` accesses inside a nested block push
+  rep witnesses (`HashRefAccess` observation + an `infer_deref_type`
+  `HashRef` TC) on the *inner* scope, while the invocant's class lives on the
+  sub scope. The scope-chain walk (`query_variable_with_visited`) returned
+  the innermost typed scope first → `HashRef`, masking the class.
+- **Options:** A — always assert every conventional invocant scalar
+  (`$self`/`$class`) as `ClassName(current_package)` via a witness,
+  matching `invocant_type_at_node`'s build-time `$self` short-circuit
+  (aggressive; also masks a genuinely hashref-typed `$self` and needs a
+  sub-Builder confidence tier to lose to real bindings). B — framework-gate
+  the rep suppression (wrong — the bug is framework-independent). C —
+  identity-over-rep across the scope walk: class identity anywhere in the
+  chain dominates an inner scope whose answer is a *rep-observation-only*
+  projection, and `subsumes_narrowing` stops `infer_deref_type` re-deriving
+  a rep `HashRef` over an existing class identity at the access site.
+- **Picked:** C. Two small, reversible seams: (1) `subsumes_narrowing`
+  gains one arm — a class-identity `self` subsumes a `HashRef`/`ArrayRef`/
+  `CodeRef` narrowing (lifts the existing structure-over-rep rule to
+  class-over-rep); (2) `query_variable_with_visited` defers a scope answer
+  that isn't a class identity AND whose scope only OBSERVES rep use
+  (`scope_binds_variable` gate) to an outer class identity. Fixes the
+  invocant case at its true root without asserting anything about `$self`
+  that the code didn't already establish; genuine inner-scope rebindings
+  (`my $h = {…}`) stay authoritative because they BIND the variable.
+- **Undo cost:** small — both seams are localized (one match arm in
+  `file_analysis.rs::subsumes_narrowing`, one helper + walk tweak in
+  `witnesses.rs`). Removing them restores the innermost-scope-wins walk.
+- **Discussion needed:** the residual `check`-style case — a LOCAL
+  `my $self = $class->new(...)` where the cross-file base ctor
+  (`Bugzilla::Object::new`) resolves to `None` — still leaves `$self`
+  untyped→`HashRef` (2 of 60 real `$self->` sites in Bug.pm). That's a
+  cross-file constructor-return gap, not invocant typing; fixing it means
+  either resolving receiver-polymorphic `new` cross-file, or adopting
+  option A's aggressive "every `$self` is the enclosing class" assertion.
+  Worth it?
+
+---
+
 ## Freshness engine: hand-rolled reverse-dep vs Salsa — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 - **Context:** storage-engine mission phase 3 (docs/adr/storage-engine.md;
   eval on claude/salsa-incremental-eval-1bmv23). The Surface boundary makes
