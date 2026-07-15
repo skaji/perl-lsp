@@ -1,0 +1,50 @@
+{
+  "project": {
+    "repo": "https://github.com/mojolicious/mojo",
+    "root_subdir": "lib",
+    "note": "Mojolicious framework corpus — Mojo::Base classes, `has` accessors, chained method calls; root=lib so package names map to files for cross-file resolution."
+  },
+  "readiness": {"file": "Mojolicious/Controller.pm", "line": 16, "character": 47},
+  "steps": [
+    {"action": "open", "file": "Mojolicious/Controller.pm"},
+
+    {"action": "hover", "file": "Mojolicious/Controller.pm", "line": 58, "character": 23,
+     "name": "hover-has-accessor-self-app"},
+    {"action": "definition", "file": "Mojolicious/Controller.pm", "line": 16, "character": 47,
+     "name": "def-crossfile-mojobase-new"},
+    {"action": "definition", "file": "Mojolicious/Controller.pm", "line": 42, "character": 11,
+     "name": "def-has-accessor-self-res"},
+    {"action": "references", "file": "Mojolicious/Controller.pm", "line": 159, "character": 4,
+     "name": "refs-render-crossfile-expensive"},
+    {"action": "completion", "file": "Mojolicious/Controller.pm", "line": 42, "character": 11,
+     "name": "completion-self-arrow-receiver"},
+    {"action": "completion", "file": "Mojolicious/Controller.pm", "line": 91, "character": 48,
+     "name": "completion-chained-self-app-arrow"},
+
+    {"action": "rss", "name": "post-nav"},
+
+    {"action": "insert_line", "file": "Mojolicious/Controller.pm", "line": 161,
+     "text": "  my $zz_bench_a = 1;", "name": "edit1-render-body", "await_diagnostics": true},
+    {"action": "revert", "file": "Mojolicious/Controller.pm",
+     "name": "revert1-render-body", "await_diagnostics": true},
+    {"action": "insert_line", "file": "Mojolicious/Controller.pm", "line": 70,
+     "text": "  my $zz_bench_b = 2;", "name": "edit2-cookie-body", "await_diagnostics": true},
+    {"action": "revert", "file": "Mojolicious/Controller.pm",
+     "name": "revert2-cookie-body", "await_diagnostics": true},
+
+    {"action": "insert_line", "file": "Mojolicious/Controller.pm", "line": 17,
+     "text": "has 'zz_bench_attr';", "name": "contract-add-has-accessor", "await_diagnostics": true},
+    {"action": "revert", "file": "Mojolicious/Controller.pm",
+     "name": "revert-contract-has-accessor", "await_diagnostics": true},
+
+    {"action": "rss", "name": "post-edits"},
+
+    {"action": "open", "file": "Mojolicious/Plugin/DefaultHelpers.pm"},
+    {"action": "definition", "file": "Mojolicious/Plugin/DefaultHelpers.pm", "line": 212, "character": 13,
+     "name": "def-consumer-render-to-controller"},
+    {"action": "hover", "file": "Mojolicious/Plugin/DefaultHelpers.pm", "line": 212, "character": 13,
+     "name": "hover-consumer-render-to-controller"},
+
+    {"action": "rss", "name": "post-crossfile"}
+  ]
+}
