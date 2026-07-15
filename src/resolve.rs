@@ -3112,13 +3112,14 @@ pub fn refs_to(
     // the pack references path cost track candidate count, not tree size.
     let rows_active =
         ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY);
-    let rows_indexed: std::collections::HashSet<PathBuf> = if rows_active {
-        module_index
-            .map(|idx| idx.ref_indexed_paths())
-            .unwrap_or_default()
-    } else {
-        std::collections::HashSet::new()
-    };
+    // Armed by the relational block below ONLY when candidate retrieval
+    // actually produced candidates. An EMPTY candidate set for a real
+    // target smells like a retrieval gap (key minting, scoped admission,
+    // mid-shred lag) — narrowing on that evidence would under-answer
+    // (observed: curl server-warm references 4 sites vs the sweep's 155).
+    // With no candidates the sweeps run whole-view, exactly as pre-rows;
+    // the guard trades occasional slowness for never-wrong.
+    let mut rows_indexed: std::collections::HashSet<PathBuf> = Default::default();
 
     // Open files (canonical — workspace entries for open paths are skipped).
     let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -3168,7 +3169,11 @@ pub fn refs_to(
     if rows_active {
         if let Some(idx) = module_index {
             let keys = retrieval_keys(target, &aliases);
-            for path in idx.ref_candidate_paths(&keys) {
+            let candidate_paths = idx.ref_candidate_paths(&keys);
+            if !candidate_paths.is_empty() {
+                rows_indexed = idx.ref_indexed_paths();
+            }
+            for path in candidate_paths {
                 if covered_paths.contains(&path) {
                     continue;
                 }
