@@ -64,15 +64,22 @@ Format per entry:
   (`Backend::bounded_wait_with_progress` — silent under 500 ms, so
   Interactive waits never mint a token), so the block is visible in the
   editor rather than reading as a hung request.
-- **New evidence (2026-07-15), the curl server-context case:** server
-  references answer 4 sites where the CLI answers 155 —
-  warm-deterministic, predates the fixing round. Eliminated: row
-  narrowing (identical off), candidate retrieval (17 candidates, same
-  as CLI), rehydration (strict clean), block view (whole_present).
-  Remaining suspect: the OPEN doc's cached-only build mints a weaker
-  pack target than the CLI's fully-gathered staging, so the matcher
-  rejects most candidates. Repro: bench curl scenario warm +
-  PERL_LSP_REFS_DEBUG=1.
+- **The curl server-context case — RESOLVED 2026-07-16:** server
+  references answered 4 sites where the CLI answers 155. Root cause was
+  the DEGRADED-OPEN window, not target minting: `did_open` builds pack
+  docs with the cached-only gather (a fresh server's gather cache is
+  process-local and empty even when modules.db is warm), the background
+  heal replaces the analysis, but `await_open_ready` only waits for AN
+  analysis to exist — a references fired between open and heal read the
+  partial closure (repro: immediate ask 826 B, same ask 15 s later
+  32,665 B). Fixed as this fork's per-file half: `degraded_open` marks
+  the window (set at cached-only open/first-change builds, cleared by
+  the heal), and `await_open_full` — called by references / rename /
+  implementations only — bounded-waits it out (280 ms warm on curl;
+  cold pays the gather, visible via work-done progress). Per-file verbs
+  (outline/hover/completion) deliberately don't wait: their answers
+  don't read the cross-file closure, and blocking them behind a gather
+  they don't need would regress open→outline latency.
 
 ## Pack first-change diagnostics: fast-degraded-now vs correct-but-delayed — 2026-07-15 — OPEN
 - **Context:** edit-bench P1 (bench/RESULTS.md). The first didChange on a

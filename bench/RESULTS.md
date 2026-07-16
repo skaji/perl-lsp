@@ -173,3 +173,16 @@ Verified on real Bugzilla: goto-def on `$self->id` right after
 `Bugzilla::Object::id` over five same-named decoy `sub id`s, cross-file
 through `new` → `new_from_hash` → statement bless. Gold 436/17/0/0/0
 (two new substrate rows lock the post-bless hover typing).
+
+## Residual closed — 2026-07-16 — curl server-vs-CLI references (degraded-open window)
+
+The warm-deterministic 4-vs-155 references undercount was the
+DEGRADED-OPEN window: did_open's cached-only pack build answers until
+the background full-gather heal lands, and the bench's back-to-back
+open→references always asked inside it (immediate ask 826 B; the same
+ask 15 s later 32,665 B — the full warm answer). Fixed: `degraded_open`
+marks the window, `await_open_full` holds references/rename/
+implementations (Complete policy) until the heal lands — 280 ms warm on
+curl for the byte-identical full answer; cold pays the gather with
+work-done progress visible. Outline/hover/completion stay fast-path
+(no cross-file read). Server and CLI now agree.

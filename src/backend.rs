@@ -379,6 +379,16 @@ pub struct Backend {
     /// as `await_index_ready`, but for the file's own first build (a big
     /// macro-heavy C file is ~1.3 s and must not run synchronously on `did_open`).
     opening: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    /// URIs whose OPEN analysis is DEGRADED — built with the cached-only
+    /// cross-file gather (a fresh server's gather cache is empty even when
+    /// modules.db is warm), pending the background full-gather heal
+    /// (`spawn_pack_doc_refresh`). Cross-file act-on-able verbs
+    /// (references/rename/implementations) bounded-wait on the entry's
+    /// `Notify` (`await_open_full`) instead of answering from the partial
+    /// closure — the answer LOOKS complete and isn't (curl: 4 sites vs 155
+    /// inside the window). Per-file verbs (outline, hover) don't wait: their
+    /// answers don't read the cross-file closure.
+    degraded_open: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
 }
 
 /// How long a verb is willing to wait for in-flight state
@@ -431,6 +441,7 @@ impl Backend {
             .work_done_progress
             .load(std::sync::atomic::Ordering::Relaxed);
         let index_ready = Arc::clone(&self.index_ready);
+        let degraded_open = Arc::clone(&self.degraded_open);
         let bag_cache_bytes =
             self.max_cache_mb.load(std::sync::atomic::Ordering::Relaxed) as usize * 1024 * 1024;
         tokio::task::spawn_blocking(move || {
@@ -580,7 +591,14 @@ impl Backend {
             // family so pull-verb answers baked in the cached-only open window
             // (truncated cross-file closure, `None` gd/hover) self-heal without
             // the user re-triggering.
-            Self::heal_open_docs(&files, &module_index, &client, options, want_perl);
+            Self::heal_open_docs(
+                &files,
+                &module_index,
+                &client,
+                options,
+                want_perl,
+                &degraded_open,
+            );
         });
     }
 
@@ -602,6 +620,7 @@ impl Backend {
         client: &Client,
         options: symbols::DiagnosticOptions,
         want_perl: bool,
+        degraded_open: &Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
     ) {
         log::debug!(
             "cold-window heal: index landed for {} family",
@@ -641,6 +660,7 @@ impl Backend {
                     client.clone(),
                     uri,
                     options,
+                    Arc::clone(degraded_open),
                 );
             }
         }
@@ -737,6 +757,35 @@ impl Backend {
             return;
         }
         self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
+            .await;
+    }
+
+    /// Bounded wait for the open document's FULL-quality analysis — past the
+    /// degraded cached-only-gather window (`degraded_open`). Only cross-file
+    /// act-on-able verbs (references / rename / implementations) call this,
+    /// AFTER `await_open_ready`: their answers read the cross-file closure,
+    /// and inside the window they return a subset that looks complete (curl:
+    /// 4 reference sites vs 155). Per-file verbs (outline, hover, completion)
+    /// deliberately don't — their answers don't need the gather, and waiting
+    /// would regress open→outline latency for nothing. `Interactive` policy
+    /// returns immediately: fast-best-effort verbs keep today's behavior.
+    async fn await_open_full(&self, uri: &Url, policy: WaitPolicy) {
+        if !matches!(policy, WaitPolicy::Complete) {
+            return;
+        }
+        let Some(notify) = self.degraded_open.get(uri).map(|n| Arc::clone(n.value())) else {
+            return; // not degraded (perl doc, heal already landed, or never opened)
+        };
+        let cap = self.wait_cap(policy);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the re-check (lost-wakeup discipline).
+        let waited = notify.notified();
+        if !self.degraded_open.contains_key(uri) {
+            return;
+        }
+        self.bounded_wait_with_progress(cap, waited, "Waiting for cross-file analysis")
             .await;
     }
 
@@ -909,6 +958,7 @@ impl Backend {
             cold_wait_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_COLD_WAIT_MS)),
             max_cache_mb: Arc::new(std::sync::atomic::AtomicU64::new(max_cache_mb_default())),
             opening: Arc::new(dashmap::DashMap::new()),
+            degraded_open: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -922,6 +972,7 @@ impl Backend {
         let client = self.client.clone();
         let change_gen = Arc::clone(&self.change_gen);
         let options = self.diagnostic_options();
+        let degraded_open = Arc::clone(&self.degraded_open);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             let is_latest = || change_gen.get(&uri).map(|v| *v) == Some(generation);
@@ -983,7 +1034,20 @@ impl Backend {
             // snapshot guard drops the result if a newer keystroke superseded
             // this text. Perl skips inside the refresh (no gather to warm).
             if language != "perl" {
-                Self::spawn_pack_doc_refresh(files, module_index, client, uri, options);
+                // The cached-only rebuild just re-opened the degraded window
+                // for cross-file verbs; mark it so `await_open_full` holds
+                // Complete verbs until this heal lands.
+                degraded_open
+                    .entry(uri.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+                Self::spawn_pack_doc_refresh(
+                    files,
+                    module_index,
+                    client,
+                    uri,
+                    options,
+                    degraded_open,
+                );
             }
         });
     }
@@ -1003,6 +1067,7 @@ impl Backend {
             self.client.clone(),
             uri,
             self.diagnostic_options(),
+            Arc::clone(&self.degraded_open),
         );
     }
 
@@ -1015,13 +1080,25 @@ impl Backend {
         client: Client,
         uri: Url,
         options: symbols::DiagnosticOptions,
+        degraded_open: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
     ) {
+        // Clear the degraded-open mark and wake `await_open_full` waiters.
+        // Called on every terminal exit EXCEPT the text-changed bail — there
+        // the successor heal (the debounce path spawns one) owns the clear,
+        // so waiters keep waiting for an analysis that matches the live text.
+        let clear_degraded = move |map: &dashmap::DashMap<Url, Arc<tokio::sync::Notify>>,
+                                   uri: &Url| {
+            if let Some((_, n)) = map.remove(uri) {
+                n.notify_waiters();
+            }
+        };
         tokio::spawn(async move {
             let Some((text, path, language)) = files
                 .get_open(&uri)
                 .filter(|d| d.language != "perl")
                 .map(|d| (d.text.clone(), d.path.clone(), d.language))
             else {
+                clear_degraded(&degraded_open, &uri);
                 return;
             };
             let snapshot = text.clone();
@@ -1035,11 +1112,19 @@ impl Backend {
             .await
             .ok()
             .flatten();
-            let Some(analysis) = analysis else { return };
+            let Some(analysis) = analysis else {
+                // Heal failed — clear anyway: a hung mark would block
+                // Complete verbs for the full ceiling with no healer coming.
+                clear_degraded(&degraded_open, &uri);
+                return;
+            };
             // A keystroke may have landed while we gathered; the debounced
             // rebuild owns the newer text, so don't clobber it with this stale
             // build (self-heals either way, but avoids a diagnostics flicker).
             if files.get_open(&uri).map(|d| d.text != snapshot).unwrap_or(true) {
+                if files.get_open(&uri).is_none() {
+                    clear_degraded(&degraded_open, &uri);
+                }
                 return;
             }
             for imp in &analysis.imports {
@@ -1053,6 +1138,7 @@ impl Backend {
             if let Some(mut doc) = files.get_open_mut(&uri) {
                 doc.apply_rebuilt(analysis);
             }
+            clear_degraded(&degraded_open, &uri);
             let diags = files
                 .get_open(&uri)
                 .map(|doc| symbols::pack_diagnostics(&doc.analysis, options));
@@ -1075,6 +1161,7 @@ impl Backend {
         let lock = Arc::clone(&self.pack_change_lock);
         let root = self.module_index.workspace_root();
         let options = self.diagnostic_options();
+        let degraded_open = Arc::clone(&self.degraded_open);
         tokio::spawn(async move {
             let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
             {
@@ -1114,6 +1201,7 @@ impl Backend {
                     client.clone(),
                     uri,
                     options,
+                    Arc::clone(&degraded_open),
                 );
             }
         });
@@ -1652,6 +1740,12 @@ impl LanguageServer for Backend {
             self.republish_open_docs_in(&sd.dirty).await;
         }
         if needs_gather_refresh {
+            // The open build was cached-only: mark the degraded window BEFORE
+            // spawning the heal, so a cross-file verb racing this open waits
+            // for the full-gather analysis instead of the partial closure.
+            self.degraded_open
+                .entry(uri.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
             self.spawn_pack_gather_refresh(uri);
         }
     }
@@ -1732,6 +1826,11 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.files.close(&uri);
+        // Wake any degraded-window waiter — the doc is gone, there is
+        // nothing to wait for.
+        if let Some((_, n)) = self.degraded_open.remove(&uri) {
+            n.notify_waiters();
+        }
         // Release the surface record to background writers and reconcile:
         // consumers flip back to the indexed DISK copy — if the buffer died
         // with unsaved contract changes, whoever enriched against it is
@@ -1860,6 +1959,7 @@ impl LanguageServer for Backend {
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language, WaitPolicy::Complete).await;
         }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
         // Snapshot the open doc (cheap `Arc` clone) and DROP the store guard
         // before `resolve()` — it re-locks the open shards via `for_each_open`,
         // and holding the guard across that reentrant read deadlocks against a
@@ -1904,6 +2004,7 @@ impl LanguageServer for Backend {
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language, WaitPolicy::Complete).await;
         }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
@@ -2045,6 +2146,7 @@ impl LanguageServer for Backend {
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
             self.await_index_ready(language, WaitPolicy::Complete).await;
         }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
