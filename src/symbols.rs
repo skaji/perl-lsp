@@ -2800,7 +2800,7 @@ pub fn collect_diagnostics(
         // DBIC meta-methods (inherited from DBIx::Class::Core)
         "add_columns", "add_column", "set_primary_key", "table", "resultset_class",
         "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
-        "load_components",
+        "load_components", "load_own_components",
         // Moose/Moo meta-methods
         "meta",
     ];

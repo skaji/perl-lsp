@@ -4214,6 +4214,98 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
     assert!(implementations_of(&origin, Some(&idx), &pkg_target).is_empty());
 }
 
+/// A method override that lives on a SIBLING PARENT of a shared descendant
+/// (Perl multi-parent composition — `use base qw(Mixin Base)`, Moo `with`,
+/// DBIC `load_components`). The mixin is an ancestor of a concrete descendant
+/// of the target class yet is NOT itself a descendant of it, so the plain
+/// INHERITS_INV descendant sweep never reaches it. `implementations_of` must
+/// still surface it (H7-7: DBIC `Row::update` overridden by `Ordered` etc.).
+#[test]
+fn test_implementations_finds_mixin_sibling_override() {
+    use crate::module_index::{CachedModule, ModuleIndex};
+    use std::sync::Arc;
+
+    let idx = ModuleIndex::new_for_test();
+    let insert = |name: &str, src: &str| {
+        let analysis = Arc::new(parse(src));
+        idx.insert_cache(
+            name,
+            Some(Arc::new(CachedModule::new(
+                PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+                analysis,
+            ))),
+        );
+    };
+    // Base defines the contract method; Mixin overrides it WITHOUT inheriting
+    // Base; Child assembles its dispatch from both (Mixin ahead of Base).
+    insert("Base", "package Base;\nsub save { 1 }\n1;\n");
+    insert("Mixin", "package Mixin;\nsub save { 2 }\n1;\n");
+    insert("Child", "package Child;\nuse base qw(Mixin Base);\n1;\n");
+
+    let target = TargetRef {
+        name: "save".to_string(),
+        kind: TargetKind::Method { class: "Base".to_string() },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch, def_paths: Vec::new(), bare_constant: false,
+    };
+    let origin = parse("package Probe;\n1;\n");
+    let files: Vec<String> = implementations_of(&origin, Some(&idx), &target)
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.display().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["/fake/Mixin.pm"],
+        "the sibling-parent override is an implementation; Base (the contract) is excluded",
+    );
+}
+
+/// The implementations verb is seeded by a cursor ON a `sub NAME` decl too —
+/// which resolves to `Sub{package: Some(class)}`, not `Method{class}`. Perl
+/// has no sub/method distinction, so a package sub is a dispatch root exactly
+/// like a method-call target. (H7-7: the DBIC probe cursor sits on
+/// `sub update` in `DBIx::Class::Row`, a plain `sub`.)
+#[test]
+fn test_implementations_on_sub_decl_target_finds_overrides() {
+    use crate::module_index::{CachedModule, ModuleIndex};
+    use std::sync::Arc;
+
+    let idx = ModuleIndex::new_for_test();
+    let insert = |name: &str, src: &str| {
+        let analysis = Arc::new(parse(src));
+        idx.insert_cache(
+            name,
+            Some(Arc::new(CachedModule::new(
+                PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+                analysis,
+            ))),
+        );
+    };
+    insert("Base", "package Base;\nsub save { 1 }\n1;\n");
+    insert("Sub1", "package Sub1;\nuse base qw(Base);\nsub save { 2 }\n1;\n");
+
+    let target = TargetRef {
+        name: "save".to_string(),
+        kind: TargetKind::Sub { package: Some("Base".to_string()) },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch, def_paths: Vec::new(), bare_constant: false,
+    };
+    let origin = parse("package Probe;\n1;\n");
+    let files: Vec<String> = implementations_of(&origin, Some(&idx), &target)
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.display().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["/fake/Sub1.pm"],
+        "a plain-subclass override, reached from a Sub-package decl target",
+    );
+}
+
 /// The pack-language backward lanes: def→uses on the SAME key the forward
 /// (use→def) resolutions use — enum constants / members (Method{class}),
 /// macros + globals (FileScopeValue), delegation aliases.

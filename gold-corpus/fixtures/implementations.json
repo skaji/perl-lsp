@@ -60,6 +60,26 @@
       },
       "status": "gold",
       "note": "Same fan-out from $self->fetch inside the role body: the call resolves to the requires marker, then the composer walk."
+    },
+    {
+      "id": "mixin-sibling-override-from-sub-decl",
+      "difficulty": "hard",
+      "semantic_area": "inheritance",
+      "root": "gold-corpus/mixin-fixture",
+      "file": "lib/My/Base.pm",
+      "line": 4,
+      "col": 4,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"Extra.pm\",\"line\":\"4\"}",
+          "{\"col\":\"5\",\"file\":\"Mixin.pm\",\"line\":\"5\"}"
+        ],
+        "none": [
+          "Base.pm"
+        ]
+      },
+      "status": "gold",
+      "note": "goto-implementation on the `sub save` decl (a Sub{package} target, not a Method call) fans out to every override that participates in a concrete descendant's dispatch. My::Mixin overrides save on a SIBLING PARENT of My::Child (multi-parent `use base`), and My::Comp::Extra reaches My::Comp via `load_own_components` (current-package namespace) — neither is a descendant of My::Base, so the plain INHERITS_INV descendant sweep misses them (H7-7 DBIC Row::update shape). Base itself is the contract, excluded."
     }
   ]
 }

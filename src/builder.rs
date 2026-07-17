@@ -9348,9 +9348,15 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Handle `__PACKAGE__->load_components('+Full::Name', 'Short::Name')`.
-    /// Bare names are prefixed with `DBIx::Class::`, `+` prefix means fully qualified.
-    fn visit_load_components(&mut self, node: Node<'a>) {
+    /// Handle `__PACKAGE__->load_components('+Full::Name', 'Short::Name')` and
+    /// `load_own_components`. Bare names are prefixed with `base_ns`
+    /// (`DBIx::Class` for `load_components`, the CURRENT package for
+    /// `load_own_components` — DBIC's own-namespace mixin loader:
+    /// `DBIx::Class::Relationship->load_own_components('CascadeActions')` pulls
+    /// in `DBIx::Class::Relationship::CascadeActions`); `+` prefix means fully
+    /// qualified. Both register the component as a parent so method resolution
+    /// and the implementations fan-out see the composed mixin.
+    fn visit_load_components(&mut self, node: Node<'a>, base_ns: &str) {
         let pkg = match self.current_package.clone() {
             Some(p) => p,
             None => return,
@@ -9364,7 +9370,7 @@ impl<'a> Builder<'a> {
                 if let Some(stripped) = name.strip_prefix('+') {
                     stripped.to_string()
                 } else {
-                    format!("DBIx::Class::{}", name)
+                    format!("{}::{}", base_ns, name)
                 }
             })
             .collect();
@@ -10843,10 +10849,17 @@ impl<'a> Builder<'a> {
                 && invocant_text.as_ref() == self.current_package.as_ref());
         if is_pkg_call {
             if let Some(ref name) = method_name {
-                // load_components — register components as parents for method resolution
-                // Works for any class (DBIC, Catalyst, etc.) — components are mixins
+                // load_components / load_own_components — register components
+                // as parents for method resolution. Works for any class (DBIC,
+                // Catalyst, etc.) — components are mixins. `load_own_components`
+                // resolves bare names against the CURRENT package's namespace;
+                // `load_components` against `DBIx::Class`.
                 if name == "load_components" {
-                    self.visit_load_components(node);
+                    self.visit_load_components(node, "DBIx::Class");
+                } else if name == "load_own_components" {
+                    if let Some(pkg) = self.current_package.clone() {
+                        self.visit_load_components(node, &pkg);
+                    }
                 }
                 // DBIC column/relationship synthesis lives in the `dbic`
                 // plugin (`ClassIsa("DBIx::Class")`), fed `ctx.arg_names`.

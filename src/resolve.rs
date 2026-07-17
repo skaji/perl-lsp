@@ -3452,10 +3452,13 @@ pub fn refs_to(
     out
 }
 
-/// `textDocument/implementation`: local defs of `name` in every
-/// transitive descendant package of the Method target's class. On a
-/// role's `requires` marker that's "every composer's def of the
-/// contract"; on a class method it's "every subclass override".
+/// `textDocument/implementation`: defs of `name` on every class that
+/// participates in the target method's dispatch for some concrete
+/// descendant — the transitive descendants of the Method target's class
+/// PLUS their co-ancestors (sibling parents contributed by multi-parent
+/// composition: `load_components`, Moo/Moose `with`, multi-base `use base`).
+/// On a role's `requires` marker that's "every composer's def of the
+/// contract"; on a class method it's "every override that can win dispatch".
 /// Goto-def stays on the contract/def itself; call sites stay on
 /// references — this is the third verb, not a variant of either.
 ///
@@ -3474,8 +3477,16 @@ pub fn implementations_of(
     if matches!(target.kind, TargetKind::Package) {
         return specialization_family(origin, module_index, &target.name);
     }
-    let TargetKind::Method { class } = &target.kind else {
-        return Vec::new();
+    // Both class-bearing target kinds seed the dispatch fan-out: a
+    // `Method{class}` (call-site cursor) and a `Sub{package: Some}` (cursor
+    // ON a `sub NAME` decl inside a package). Perl has no sub/method
+    // distinction — any sub in a package is dispatchable as a method — so the
+    // decl of `sub update` in `DBIx::Class::Row` is as much an implementation
+    // root as an `$obj->update` call whose invocant types to that class.
+    let class = match &target.kind {
+        TargetKind::Method { class } => class,
+        TargetKind::Sub { package: Some(pkg) } => pkg,
+        _ => return Vec::new(),
     };
     let Some(idx) = module_index else {
         return Vec::new();
@@ -3495,8 +3506,53 @@ pub fn implementations_of(
             std::ops::ControlFlow::Continue(())
         },
     );
+
+    // Mixin/sibling overrides. A concrete class assembles its dispatch table
+    // from MULTIPLE parents (Perl multi-parent composition: `load_components`,
+    // Moo/Moose `with` roles, `use base` with several bases). An override of
+    // the target's method can therefore live on a SIBLING PARENT of a shared
+    // descendant — a class that is an ancestor of some concrete descendant of
+    // the target yet is NOT itself a descendant of the target, so the
+    // INHERITS_INV sweep above never reaches it (DBIC's `Ordered` sits
+    // alongside `Row` in `Track`'s MRO, not beneath it). Surface these by
+    // walking UP each descendant's full MRO and collecting every co-ancestor:
+    // a class that shares a concrete descendant with the target participates
+    // in that descendant's dispatch for the method.
+    let mut implementers: std::collections::BTreeSet<String> =
+        descendants.iter().cloned().collect();
+    for d in &descendants {
+        probe.walk(
+            crate::graph::Node::Class(d.clone()),
+            crate::graph::EdgeKindMask::INHERITS,
+            &mut |n| {
+                if let crate::graph::Node::Class(c) = n {
+                    implementers.insert(c.clone());
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+    }
+    // The target and its own ancestry are the CONTRACT side, not an
+    // implementation: goto-def lands on the target itself, and a superclass
+    // method sits BEHIND the target in every descendant's MRO (shadowed by the
+    // target's own def — it never wins). Exclude both so the verb reports only
+    // the classes that override at or ahead of the contract.
+    let mut contract_line: std::collections::HashSet<String> =
+        std::iter::once(class.clone()).collect();
+    probe.walk(
+        crate::graph::Node::Class(class.clone()),
+        crate::graph::EdgeKindMask::INHERITS,
+        &mut |n| {
+            if let crate::graph::Node::Class(c) = n {
+                contract_line.insert(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    implementers.retain(|p| !contract_line.contains(p));
+
     let mut out: Vec<RefLocation> = Vec::new();
-    for pkg in &descendants {
+    for pkg in &implementers {
         // class → home module(s): exact cache key for the common
         // single-package file; the names index covers cross-named and
         // multi-package homes.

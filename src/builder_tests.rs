@@ -3534,6 +3534,39 @@ fn test_load_components_qw() {
     assert!(parents.contains(&"DBIx::Class::Helper::ResultSet::Me".to_string()));
 }
 
+#[test]
+fn test_load_own_components_prefixes_current_package() {
+    // DBIC's `load_own_components` resolves bare names against the CURRENT
+    // package's namespace, not `DBIx::Class::` — so `Relationship`'s
+    // `load_own_components('CascadeActions')` pulls in
+    // `DBIx::Class::Relationship::CascadeActions`. Without this the composed
+    // mixin is invisible to method resolution / implementations (H7-7).
+    let fa = build_fa(
+        "
+            package DBIx::Class::Relationship;
+            use base 'DBIx::Class';
+            __PACKAGE__->load_own_components(qw(Helpers CascadeActions Base));
+        ",
+    );
+    let parents = fa.package_parents.get("DBIx::Class::Relationship").unwrap();
+    assert!(parents.contains(&"DBIx::Class::Relationship::CascadeActions".to_string()));
+    assert!(parents.contains(&"DBIx::Class::Relationship::Helpers".to_string()));
+    assert!(parents.contains(&"DBIx::Class::Relationship::Base".to_string()));
+}
+
+#[test]
+fn test_load_own_components_plus_prefix_is_fully_qualified() {
+    let fa = build_fa(
+        "
+            package My::Component;
+            __PACKAGE__->load_own_components('+Other::Ns::Thing', 'Local');
+        ",
+    );
+    let parents = fa.package_parents.get("My::Component").unwrap();
+    assert!(parents.contains(&"Other::Ns::Thing".to_string()));
+    assert!(parents.contains(&"My::Component::Local".to_string()));
+}
+
 // ---- Inheritance method resolution tests ----
 
 #[test]
