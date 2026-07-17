@@ -147,7 +147,7 @@ impl TargetRef {
     /// NEVER a framework ancestor that happens to define a real `sub` of the
     /// same name (`DBIx::Class::PK::id`). Renaming a synthesized `id` column
     /// must not reach that generic accessor nor every unrelated sibling Result
-    /// class under it (H7-6). Fixed `Hierarchy` scope: an owned accessor is
+    /// class under it. Fixed `Hierarchy` scope: an owned accessor is
     /// shared down the hierarchy by construction; the family already encodes
     /// exactly the classes that inherit it.
     pub fn owned_accessor(
@@ -2934,7 +2934,7 @@ fn group_from_projections(
         // it. A `has`/column accessor IS shared down the hierarchy, but its
         // identity is the OWNING class: `owned_accessor` roots the family at
         // `p.class` and its descendants, never upward at a framework ancestor
-        // that defines a real same-named `sub` (H7-6: an `id` column colliding
+        // that defines a real same-named `sub` (e.g. an `id` column colliding
         // with `DBIx::Class::PK::id`).
         let target = if p.field_backed {
             TargetRef::method(

@@ -25,6 +25,34 @@ why parked, what unblocks it. Prune on landing.
   `CompletionCandidate`) and semantics (enum members verbatim, front-loaded
   vs. type-matching locals kept at `PRIORITY_LOCAL`). No shared gatherer to
   factor.
+- **`class_isa_prefix` walks `parents_cached`, not `parents_of`**
+  (`file_analysis.rs`): deliberate, verdict recorded. The synthetic
+  `APP_SURFACE_CLASS` edge that `parents_of` injects is a method-dispatch
+  bridge (Mojo helpers), not an `isa` relation — a plugin `ClassIsa` gate
+  must not treat an app-surface consumer as a descendant of the surface.
+  Both isa-walk seams (`class_isa`, `class_isa_prefix`) exclude it by
+  construction; they share the local-∪-cross-file seam, just not the
+  surface edge. Not a `parents_of` drift to fix.
+- **CLI workspace-symbol dedup inlines the identity tuple**
+  (`main.rs` `workspace-symbol` vs `symbols::dedup_workspace_symbols`):
+  type-forced duplicate, leave-alone (mirrors the two-rankers precedent).
+  The LSP handler dedups a `Vec<SymbolInformation>` as a post-pass
+  (`retain`); the CLI gates inline while building `serde_json` rows from
+  raw `(name, kind, span)` before any typed Vec exists. Same 5-field
+  identity, different pipeline stage and value shape (u32 uri/line vs
+  usize path/row). A shared key helper would be a bare tuple literal each
+  caller still populates from different fields — no gatherer to factor.
+- **`load_components` DBIC-namespace default lives in core**
+  (`builder.rs::visit_load_components`, bare names default to `DBIx::Class`):
+  the `load_components` method is a general mixin idiom (Catalyst too) and
+  parent-edge registration is a core method-resolution concern, but the
+  `DBIx::Class` bare-name prefix is a DBIC convention that arguably belongs
+  to the dbic plugin. Not moved: the plugin `EmitAction` vocabulary has no
+  parent-edge/ISA primitive, so the move needs a new emit action plus
+  plugin-side arg extraction and the bare-name prefix policy — a feature
+  commit, not a mechanical fix. Unblock: add a `ParentEdge`/component
+  `EmitAction` and route DBIC-namespace policy through the dbic plugin.
+
 ## Feature tier (each is a fireable slice)
 
 - **Perl domain typing** — needs a constant-group / Type::Tiny enum-domain
@@ -96,6 +124,40 @@ why parked, what unblocks it. Prune on landing.
   "system root" generalization (perl=@INC, python=probe).
 - **Instance brands** (per-object dispatch scoping) — downstream of the
   long-distance value-provenance tier (`prompt-type-inference-residual.md`).
+- **`monkey_patch`-synthesized methods invisible** (mojo F7 — `$ua->get`):
+  `monkey_patch __PACKAGE__, lc $name, sub{...}` in a loop mints methods a
+  syntactic walk can't see. Needs loop-unrolled emission (plugin emit-hook
+  shaped) — real design work.
+- **Raw `$_[N]` / `@_` subs get no param/return inference** (mojo F4 — `on`
+  vs `once`): a sub that reads args positionally rather than via `my
+  ($self, ...) = @_` produces no arity/return facts. Unblock: an `@_`-index
+  → param binding at the walk.
+- **`emit('x')` ↔ `on(x =>)` event linking in references** (mojo F9): the
+  `dispatchers` field exists on the outline but is unreachable from the
+  references verb — emit sites and handler registrations aren't cross-linked.
+- **H7-8 inline `->search(...)->first` loses parametric row type** (DBIC F4):
+  a RowOf verb composed on a fluent-verb result inside ONE expression types
+  nothing; the same composition through an intermediate variable works.
+  Wave-3 candidate. Unblock: compose the parametric type across chained
+  method calls without an intermediate binding.
+- **H7-9 `belongs_to` references stop at the query's own file** (DBIC F10):
+  `__PACKAGE__->verb(...)` synthesized-accessor refs don't fan cross-file
+  (78 sites / ~7-8 returned; count nondeterministic between runs — a
+  separate smell). Wave-3 candidate.
+- **H7-13 cpp member-field receiver completion doesn't narrow** (leveldb
+  task 4, re2 F3): `field_->` / `field.` dumps the in-scope grab-bag instead
+  of the field's real members; parameter/local receivers narrow correctly.
+  Narrowed lists also leak private + nested-struct members and truncate
+  trailing-underscore names (`cleanup_head_` → `cleanup_head`). Wave-3
+  candidate.
+- **H7-15 DBIC resultset moniker never resolves to the FQ result class**
+  (split from H7-7): `$schema->resultset('Artist')->create(...)` types the
+  row as the literal source moniker `"Artist"`, not `DBICTest::Schema::
+  Artist`, so cross-file goto-def on the row's methods can't start its walk
+  (proven: forcing the FQ class reaches Row.pm perfectly). The schema class
+  is discarded from `ParametricType::ResultSet{base,row}`. Wave-3 candidate.
+  Unblock: moniker→class resolution (schema receiver's class + registered
+  source names + cross-file index) at the parametric-type seam.
 
 ## Residual-bug tier (pinned, xfail'd where reducible)
 
@@ -290,6 +352,31 @@ why parked, what unblocks it. Prune on landing.
   (members unattributed behind `FMT_BEGIN_NAMESPACE`) keeps prior behavior
   until the macro-guarded-namespace-open gap closes; `fmt::detail::` filters
   correctly there today. Gold: `cpp-qualified-completion.json` (4 rows).
+
+- **cpp hover renders methods field-shaped** (leveldb task 4b): a method
+  hovers as `Valid: Bool` — no signature, no `const` qualifier — because the
+  skeleton extracts members uniformly and hover has no method-vs-field split.
+  Unblock: carry a callable shape (params + qualifiers) on the extracted
+  member and render it in the cpp hover path.
+- **leveldb `db_iter.cc` `k` else-branch dark spot** (leveldb task 4c):
+  hover/def/refs all blank on `k` in one else-branch; unreduced (synthetic
+  repro attempts failed). Coordinates in `findings-leveldb.md` task 4c.
+- **Include-guard `#define`s listed as kind Variable** in outline /
+  workspace-symbol: an include-guard macro has no value semantics but mints
+  a Variable symbol. Unblock: a distinct guard/macro symbol kind (or suppress
+  guard-shaped `#define`s from the symbol table).
+- **cpp macro transform is position-blind** (re2 `simplify.cc`): `#define
+  Simplify DontCallSimplify` rewrites occurrences BEFORE the `#define` line
+  too, so the extracted `Regexp::Simplify` def at :180 and the call at :31
+  carry the expanded name — the residual 2-ref shortfall on H7-2's references
+  acceptance. Extraction itself is correct; the fix belongs in
+  `cpp_reparse`'s expansion ordering (only expand at/after the directive).
+- **cpp namespace-blind rename identity** (H7-6 cpp half, leveldb task 5b):
+  renaming a class like `Iterator` proposes edits inside vendored gtest —
+  class-name identity is bare-name, not namespace-qualified, so unrelated
+  same-named classes in other namespaces collide. The Perl owner-gate half
+  landed (`62426fa`); the cpp half needs namespace-qualified class identity
+  in the rename target. Destructive-if-applied.
 
 ## Cross-references
 - Gap shapes behind open xfails: `gold-corpus/KNOWN-GAPS.md`

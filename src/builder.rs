@@ -200,7 +200,7 @@ fn flow_query() -> Option<&'static tree_sitter::Query> {
         .as_ref()
 }
 
-/// Force the flow query to compile now, off the parallel per-file path (H7-14).
+/// Force the flow query to compile now, off the parallel per-file path.
 pub(crate) fn warm_flow_query() {
     let _ = flow_query();
 }

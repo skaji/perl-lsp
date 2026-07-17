@@ -38,7 +38,7 @@ pub fn default_plugin_registry() -> std::sync::Arc<PluginRegistry> {
         }
         // Compile every pattern query now, once, while we're single-threaded —
         // before the parallel workspace index charges `Query::new` to per-file
-        // build (H7-14). See `pattern_dispatch::warm_pattern_queries`.
+        // build. See `pattern_dispatch::warm_pattern_queries`.
         crate::builder::pattern_dispatch::warm_pattern_queries(
             reg.plugins.iter().flat_map(|p| p.patterns().iter()),
         );

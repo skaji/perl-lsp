@@ -7,7 +7,7 @@ the probes. One row per root cause; probe-report letters in parens.
 
 ## Wave-1 slices (fired)
 
-### H7-1 CRITICAL perf/hang — unbounded `expr_type_at_span` ↔ `method_call_return_type_via_bag` mutual recursion (mojo)
+### H7-1 CRITICAL perf/hang — unbounded `expr_type_at_span` ↔ `method_call_return_type_via_bag` mutual recursion (mojo) — LANDED `5ebb552`
 Full-workspace build of `/root/corpus/mojo` (112 files) spins 13–15 min wall / 25–29 min
 CPU inside a Rayon build worker. gdb stack: `stamp_method_call_targets` →
 `method_call_invocant_class` → alternating `expr_type_at_span` /
@@ -19,7 +19,7 @@ the full 112-file tree reproduces — genuine cross-file return-type cycle.
 Fix shape: termination on the dispatcher (seen-set / depth cap at the query entry),
 per the worklist-invariants rule — not special-casing a worker.
 
-### H7-2 CRITICAL cpp extraction — out-of-line definitions dropped by declarator/qualifier shape (re2 F4/F7, leveldb task-3 partial)
+### H7-2 CRITICAL cpp extraction — out-of-line definitions dropped by declarator/qualifier shape (re2 F4/F7, leveldb task-3 partial) — LANDED `73b6822`
 The cpp out-of-line-definition visitor only matches `function_definition.declarator`
 = bare `function_declarator` with a one-hop `qualified_identifier`. Dropped, silently:
 (a) pointer/reference returns — extra `pointer_declarator` wrapper
@@ -35,7 +35,7 @@ definition it renames (re2 F6 → non-compiling edit). Same-fix neighbor: regist
 out-of-line methods get `package: <namespace>` instead of owning class (re2 F8 —
 `RE2::Init` reported as package `re2`).
 
-### H7-3 CRITICAL cpp resolution — header decl ↔ out-of-line def not linked cross-file (leveldb tasks 1/3)
+### H7-3 CRITICAL cpp resolution — header decl ↔ out-of-line def not linked cross-file (leveldb tasks 1/3) — LANDED `e22a5a8`
 Even for REGISTERED defs: goto-def from a call site stops at the header declaration
 when the definition lives in another `.cc` (`WriteBatchInternal::InsertInto`
 db/db_impl.cc:1245 → stops at write_batch_internal.h:38, real def
@@ -48,7 +48,7 @@ a member method's header decl edits ONLY the decl (db/db_impl.h:133
 db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
 `DB::Put` body at db_impl.cc:1489).
 
-### H7-4 Perl small-fix bundle
+### H7-4 Perl small-fix bundle — LANDED `33061e3`
 - **hover chain-span lie** (DBIC F2): hover on `$schema` inside a multi-line chain
   returns `->first`'s POD. `file_analysis.rs` `hover_info` RefKind::Variable arm's
   dynamic-dispatch heuristic matches any MethodCall ref whose span CONTAINS the
@@ -70,7 +70,10 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
 
 ## Wave-2 candidates (encode xfail, fix after wave-1 merges)
 
-- **H7-5 ClassIsa cross-file trigger** (DBIC F1, CRITICAL, architectural): plugin
+Landed this round: H7-5/6/7 and H7-10/11/12/14. Still open (wave-3 candidates):
+H7-8, H7-9, H7-13, H7-15.
+
+- **H7-5 ClassIsa cross-file trigger** (DBIC F1, CRITICAL, architectural) — LANDED `53d6199`: plugin
   `Trigger::ClassIsa("DBIx::Class")` evaluated on local-file-only parents → DBIC
   synthesis dark for 49/54 of DBIC's own test schema (2-hop
   `Result::* → DBICTest::BaseResult → DBIx::Class::Core`). 1-hop works (proof:
@@ -78,36 +81,36 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
   `#[ignore]`d `probe_class_isa_trigger_through_cross_file_parent`
   (builder_tests.rs:11515), `docs/prompt-enrichment-inheritance-residual.md`.
   97 `->cds` call sites / 0 found; rename/completion/goto-def all dark.
-- **H7-6 rename over-reach, both engines** (DBIC F7, leveldb task 5b): Perl —
+- **H7-6 rename over-reach, both engines** (DBIC F7, leveldb task 5b) — LANDED `62426fa` (Perl owner-gate; cpp namespace-blind half parked, see PARKED.md): Perl —
   renaming a synthesized `id` column proposes 33 files incl. DBIx::Class::PK's
   generic `id()` (bare-name HashKey/accessor matching, no owner gate). Cpp —
   renaming `Iterator` proposes edits inside vendored gtest (namespace-blind class
   name identity). Destructive-if-applied class of bug.
-- **H7-7 implementations blind to mixin overrides** (DBIC F9): `load_components`
+- **H7-7 implementations blind to mixin overrides** (DBIC F9) — LANDED `f71e15b`: `load_components`
   puts overrides on sibling parents, not descendants; `implementations_of`
   (resolve.rs) walks INHERITS_INV descendants only → 0/5 real `update` overrides.
   Also goto-def on correctly-typed `$art->update({...})` (t/53lean_startup.t:180)
   never reaches Row.pm.
-- **H7-8 inline `->search(...)->first` loses parametric row type** (DBIC F4):
+- **H7-8 inline `->search(...)->first` loses parametric row type** (DBIC F4) — OPEN:
   RowOf verb composed on a fluent-verb result inside one expression → no type;
   identical composition through an intermediate variable works (matrix in report).
-- **H7-9 `belongs_to` references stop at query's own file** (DBIC F10): 78 call
+- **H7-9 `belongs_to` references stop at query's own file** (DBIC F10) — OPEN: 78 call
   sites across 43 files, ~7-8 returned (count nondeterministic between runs —
   separate smell). `__PACKAGE__->verb(...)` cross-file ref walk.
-- **H7-10 bogus `(anon) sub` completion item** (DBIC F5): unresolved-receiver
+- **H7-10 bogus `(anon) sub` completion item** (DBIC F5) — LANDED `8d0698f`: unresolved-receiver
   member slots (and even string-literal interiors) return one anonymous-sub item.
-- **H7-11 `has x => sub { $ENV{X} || 10 }` kills getter type** (mojo F5): arity-0
+- **H7-11 `has x => sub { $ENV{X} || 10 }` kills getter type** (mojo F5) — LANDED `8d0698f`: arity-0
   disappears from the map; bare-literal and `->new` defaults infer fine.
-- **H7-12 `Mojo::DOM::attr` arity-1 misprojection** (mojo F6): compound guard
+- **H7-12 `Mojo::DOM::attr` arity-1 misprojection** (mojo F6) — LANDED `8d0698f`: compound guard
   `unless @_ > 1 || ref $_[0]` mapped to wrong branch → arity 1 reports the
   fluent self-return.
-- **H7-13 cpp member-field receiver completion doesn't narrow** (leveldb task 4,
+- **H7-13 cpp member-field receiver completion doesn't narrow** — OPEN (leveldb task 4,
   re2 F3): `field_->` / `field.` dumps the in-scope grab-bag (omits the real
   members); parameter/local receivers narrow correctly. Also: narrowed lists leak
   private + nested-struct members and truncate `cleanup_head_` → `cleanup_head`
   (leveldb task 4-secondary).
 
-- **H7-14 perf — plugin pattern_dispatch dominates Perl build cost** (found
+- **H7-14 perf — plugin pattern_dispatch dominates Perl build cost** — LANDED `b3965a4` (found
   chasing the mojo `--check` wall): on a quiet 4-core box, cold `--check
   /root/corpus/mojo` = 8.4s wall (439 modules: 277 workspace incl. t/, 162
   @INC), warm = 5.9s. Slowest-module table: five files at a uniform ~1.05s
@@ -123,7 +126,7 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
   0.3ms, references 2.4ms) — this is per-file BUILD cost, so it taxes cold
   index, didChange rebuilds, and --check.
 
-- **H7-15 — DBIC resultset moniker never resolves to the FQ result class**
+- **H7-15 — DBIC resultset moniker never resolves to the FQ result class** — OPEN
   (split out of H7-7, whose implementations fix proved the ancestor walk
   correct): `$schema->resultset('Artist')->create(...)` types the row as
   literal `"Artist"` — the source moniker, not `DBICTest::Schema::Artist` —
@@ -132,11 +135,15 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
   (schema receiver's class + registered source names + cross-file index) at
   the parametric-type seam; the schema class is currently discarded from
   `ParametricType::ResultSet{base,row}`. Repro: t/53lean_startup.t:180.
-- **Pre-existing gold flake (NOT this round's)**: intermittent strict-
-  residency rehydration-miss CRASH under cold/eviction runs (panic at
-  module_index.rs:1827; documented at run.pl:80-82). H7-7 proved it
-  reproduces at base EXTRACT_VERSION 167 with cleared cache and vanishes
-  under PERL_LSP_NO_EVICT=1. Candidate for its own fix row next round.
+- **H7-16 strict-residency rehydration-miss CRASH** (pre-existing flake,
+  adopted this round) — LANDED `ca8ab85`: intermittent CRASH under
+  cold/eviction runs (panic at module_index.rs:1827; documented at
+  run.pl:80-82). Root cause was a transient `SQLITE_CANTOPEN` window while a
+  sibling writer checkpoints the WAL — a fresh read-only open can't rebuild
+  the wal-index, and `busy_timeout` doesn't cover the open. The reader now
+  retries with bounded backoff and a read-write recovery open
+  (`open_reader_retrying`), so the blob that is on disk the whole time stays
+  reachable. Eviction-on gold now runs reliably.
 
 ## Parked this round (PARKED.md gets the durable entries on round close)
 

@@ -128,7 +128,8 @@ pub fn open_cache_db_readonly(workspace_root: Option<&str>, lang: &str) -> Optio
 }
 
 /// Resilient query-path reader open (`open_reader_retrying`): retries across
-/// the transient H7-16 CANTOPEN window instead of returning an empty result.
+/// the transient CANTOPEN window a writer's WAL checkpoint opens instead of
+/// returning an empty result.
 /// Routing every reader — bag rehydration, the relational-ref reader, warm
 /// streaming — through here keeps the writer's WAL-checkpoint window from
 /// degrading their results to silent absence. `None` only when the window
@@ -140,7 +141,7 @@ pub fn open_cache_reader_at(db_path: &std::path::Path) -> Option<Connection> {
 /// Open the cache reader across the transient window a writer's WAL
 /// checkpoint/reset opens. During it a fresh open of the WAL-mode DB (SQLite
 /// setting up the `-wal`/`-shm` auxiliaries) returns `SQLITE_CANTOPEN` for
-/// BOTH read-only and read-write modes — the captured H7-16 cause — and
+/// BOTH read-only and read-write modes — and
 /// `busy_timeout` does NOT cover the open itself. Each attempt tries
 /// read-only then read-write (a read-write open additionally recovers a WAL
 /// a read-only open can't map); bounded backoff (~0.26 s total) waits the
@@ -194,7 +195,7 @@ pub fn open_readonly_at(db_path: &std::path::Path) -> Result<Connection, String>
 }
 
 /// Read-WRITE open (no CREATE) of an explicit, already-persisted DB file —
-/// the H7-16 recovery open. A fresh `SQLITE_OPEN_READ_ONLY` open of a
+/// the WAL-checkpoint recovery open. A fresh `SQLITE_OPEN_READ_ONLY` open of a
 /// WAL-mode cache DB transiently fails with `SQLITE_CANTOPEN` while a
 /// sibling writer is mid-`wal_checkpoint` (the -wal is being truncated and
 /// the -shm reset; a read-only conn can't rebuild the wal-index in that
@@ -868,7 +869,7 @@ pub fn open_and_load_diag(
 }
 
 /// Rehydrate one file from an explicit cache DB, discriminating every
-/// failure and surviving the H7-16 readonly/WAL race. Path-taking so the
+/// failure and surviving the readonly/WAL-checkpoint race. Path-taking so the
 /// whole policy is unit-testable.
 ///
 /// The captured cause: a fresh open of the WAL-mode cache DB transiently
@@ -887,7 +888,7 @@ pub fn load_with_wal_fallback(
 ) -> Result<FileAnalysis, RehydrateMiss> {
     // `open_reader_retrying` waits out the transient CANTOPEN window; the
     // rw_open closure below then handles the (rarer) opened-but-row-invisible
-    // case. Both are the H7-16 recovery.
+    // case. Both are the WAL-checkpoint recovery.
     rehydrate_from_opens(
         open_reader_retrying(db_path),
         || open_rw_shared_at(db_path),
@@ -898,7 +899,7 @@ pub fn load_with_wal_fallback(
 /// The fallback POLICY, split from the openers so the read-only-open-failure
 /// branch is deterministically testable (the real `SQLITE_CANTOPEN` race
 /// can't be forced from static file state). `ro` is the read-only open
-/// result (`Err` = the open itself failed — the captured H7-16 cause);
+/// result (`Err` = the open itself failed — the captured CANTOPEN cause);
 /// `rw_open` lazily opens the read-write recovery connection.
 fn rehydrate_from_opens(
     ro: Result<Connection, String>,

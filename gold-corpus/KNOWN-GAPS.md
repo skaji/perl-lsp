@@ -215,6 +215,23 @@ namespace reopenings attribute. Two xfail rows remain open:
 | `cpp-hitlist-marker-macro-outline` | a bodyless marker `#define` (`FMT_HEADER_ONLY`) still appears as an outline Variable; the class after it extracts fine — pure outline noise |
 | `cpp-svmacrotag-cross-file-goto-def` / `cpp-svmacrotag-cross-file-completion` | **macro-named struct tag, cross-file** (perl5 sv.h: `#define STRUCT_SV sv` then `struct STRUCT_SV {...}`). The struct is DEFINED in a header with no `STRUCT_SV` macro in scope → its symbol is named `STRUCT_SV`. A using file that DOES have the macro in scope expands a `struct STRUCT_SV *` receiver to `struct sv`, so the tag lookup misses and member gd/completion go dark. General cross-file macro-named-tag asymmetry (reproduces on a plain struct too — not member-block-specific; the member-block edge itself attaches correctly, names matching). The `SV`-typedef path is unaffected, so the daily-driver `SV *sv; sv->sv_flags` resolves — only the raw `struct STRUCT_SV *` spelling is dark. Fix needs tag-name canonicalization across the macro alias (register the struct under both spellings, or resolve the receiver's tag through known object-like macros). |
 
+**hitlist-7 note (out-of-line members):** out-of-line definition extraction
+now handles the declarator/qualifier shapes the narrow patterns dropped —
+pointer/reference returns (`Regexp* Regexp::Simplify()`), multi-level
+qualifiers (`Prog::Inst::InitAlt`, 3-level `Prefilter::Info::Walker::
+ShortVisit`), and out-of-line constructors (`RE2::RE2(...)`); registered
+out-of-line methods now carry their owning class, not the enclosing
+namespace (H7-2). A header declaration and its out-of-line definition in
+another `.cc` are now linked in goto-def, so a call site reaches the bodied
+definition across files instead of stopping at the prototype (H7-3). Gold
+locks: `cpp-oolmember-definition` / `-references` / `-rename` +
+`cpp-outline` rows. Residuals, PARKED: cpp macro
+transform is position-blind (`#define Simplify DontCallSimplify` rewrites
+occurrences before the directive too — a 2-ref shortfall on the references
+acceptance; extraction itself is correct), and cpp class-name rename
+identity is namespace-blind (renaming `Iterator` proposes edits in vendored
+gtest — needs namespace-qualified identity).
+
 **hitlist-6 Family A note:** the probe's headline finding — "a union-bearing stacked member-block loses its `(struct → macro)` parent edge, all SV member navigation dark" — did **not** reproduce at the spike tip. The member-block edge attaches correctly even with an anonymous union / nested braces in the pasted body (`svunion.c` is the gold lock: gd/hover/completion on `sv->sv_flags` via an `SV *` receiver all resolve). The probe's "dark" symptom was a bounded-root/cache artifact. The one genuine residual it surfaced is the macro-named-tag row above (a distinct, general seam).
 
 ### hitlist-2 fix-run residuals (dogfood round 2, slices A–E landed)

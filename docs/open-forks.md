@@ -178,7 +178,7 @@ Format per entry:
 - **Undo cost:** delete the one call in `cli_full_startup` + the
   `ModuleIndex`/`FileAnalysis` methods; the build-time recording +
   enrichment application (open-doc + overlay) stand alone.
-- **Discussion needed:** two residuals to ratify or close.
+- **Discussion needed:** three residuals to ratify or close.
   (1) **Real LSP server (not CLI):** `materialize` runs only in the CLI/batch
   startup, so a live-editor goto-def into a CLOSED dependency's gated accessor
   misses (open files enrich; the warm server evicts symbols, so materializing
@@ -192,3 +192,26 @@ Format per entry:
   working cross-file goto-def path (proven on a directly-typed invocant). The
   source-name→result-class mapping is the missing piece and is out of H7-5's
   ClassIsa scope.
+  (3) **Gated content is invisible to the Surface freshness firewall**
+  (surfaced by the round-7 sweep). `Surface::project` reads `fa.symbols` +
+  `fa.package_parents`, never `fa.gated_emissions`, and
+  `materialize_gated_emissions` swaps the cached `Arc` WITHOUT re-recording
+  the Surface / `FreshnessIndex`. So a change confined to a result class's
+  gated content (its `add_columns`/`has_many` list, whose synthesized
+  accessors live ONLY in `gated_emissions` until the cross-file gate
+  resolves) projects an IDENTICAL Surface → `SurfaceVerdict::Unchanged` →
+  consumers are not dirtied. Latent today, not a live bug: CLI is one-shot
+  (no incremental dirty-tracking), and the warm server never materializes
+  into the Surface — it answers gated classes through the per-query
+  enriched overlay. But it is a PRECONDITION of resolving residual (1) the
+  in-place way: if the server ever gets a residency-bounded in-place
+  materialize, `Surface::project` must also learn to reflect gated methods
+  (or `FreshnessIndex` must fingerprint `gated_emissions`) so incremental
+  edits to gated content dirty consumers — otherwise a server-side
+  materialize goes stale on the next edit. The question: should gated
+  emissions participate in the Surface / freshness firewall, and if so does
+  that ride with the residual-(1) server-materialize decision or land first
+  as its own equality-net arm? (No R1 violation exists today —
+  `gated_emissions` is deliberately NOT a projected Surface field, so nothing
+  smuggled a span past the equality net; this is a design question about
+  whether it SHOULD be one.)

@@ -3069,8 +3069,12 @@ pub fn class_isa(
 /// build-time local-only `transitive_parents` gate. Same MRO seam as
 /// `class_isa` (local `package_parents` ∪ `parents_cached`), so the graph
 /// is walked in one place; the only difference is the per-node predicate
-/// is a prefix test, not exact equality. Cycle-guarded; total-visit budget
-/// backstops a pathological graph.
+/// is a prefix test, not exact equality. Deliberately NOT `parents_of`: the
+/// synthetic `APP_SURFACE_CLASS` edge is a method-dispatch bridge (Mojo
+/// helpers), not an `isa` relation, so a plugin `ClassIsa` gate must not
+/// treat an app-surface consumer as a descendant of the surface. Both
+/// isa-walk seams exclude it by construction. Cycle-guarded; total-visit
+/// budget backstops a pathological graph.
 pub fn class_isa_prefix(
     class: &str,
     prefix: &str,
