@@ -185,6 +185,26 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     build_with_plugins(tree, source, default_plugin_registry())
 }
 
+/// The compiled `@flow` query (`queries/perl/flow.scm`), compiled once.
+/// `Query::new` is expensive and `build` runs per file — see `warm_flow_query`
+/// for why this is warmed at startup rather than lazily on the first build.
+fn flow_query() -> Option<&'static tree_sitter::Query> {
+    use std::sync::OnceLock;
+    static FLOW_SCM: &str = include_str!("../queries/perl/flow.scm");
+    static FLOW_QUERY: OnceLock<Option<tree_sitter::Query>> = OnceLock::new();
+    FLOW_QUERY
+        .get_or_init(|| {
+            let lang: tree_sitter::Language = ts_parser_perl::LANGUAGE.into();
+            tree_sitter::Query::new(&lang, FLOW_SCM).ok()
+        })
+        .as_ref()
+}
+
+/// Force the flow query to compile now, off the parallel per-file path (H7-14).
+pub(crate) fn warm_flow_query() {
+    let _ = flow_query();
+}
+
 /// Build with a caller-provided plugin registry. Tests use this to swap in
 /// deterministic plugin sets; the global default is otherwise shared.
 pub fn build_with_plugins(
@@ -1850,13 +1870,8 @@ impl<'a> Builder<'a> {
     /// function start of Perl-on-the-query-engine. Provenance-only for now
     /// (no lowering): the shapes' types still come from the walk.
     fn mint_flow_edges_via_query(&mut self, tree: &'a Tree) {
-        use std::sync::OnceLock;
-        use tree_sitter::{Query, QueryCursor, StreamingIterator};
-        static FLOW_SCM: &str = include_str!("../queries/perl/flow.scm");
-        // `Query::new` is expensive and `build` runs per file; compile once.
-        static FLOW_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-        let lang = tree.language();
-        let query = match FLOW_QUERY.get_or_init(|| Query::new(&lang, FLOW_SCM).ok()) {
+        use tree_sitter::{QueryCursor, StreamingIterator};
+        let query = match flow_query() {
             Some(q) => q,
             None => return,
         };

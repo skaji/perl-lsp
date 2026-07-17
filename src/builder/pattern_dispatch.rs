@@ -116,6 +116,24 @@ fn cached_pattern_query(source: &str) -> Result<&'static Query, String> {
     compiled
 }
 
+/// Compile every Perl pattern query once, up front, at plugin-registry load.
+///
+/// `cached_pattern_query`'s memo is process-wide but compiles OUTSIDE its
+/// lock and is populated lazily on first dispatch. Under the parallel cold
+/// workspace index (`par_iter` over `build()`), that lets each Rayon worker
+/// recompile the whole ~14-query set on the first file it touches — ~750ms of
+/// `Query::new` charged to a handful of files' build phase (H7-14). Warming
+/// the memo here, single-threaded before any parallel build starts, makes
+/// every per-file dispatch a pure cache hit and removes the race entirely.
+pub(crate) fn warm_pattern_queries<'a>(specs: impl Iterator<Item = &'a PatternSpec>) {
+    for spec in specs {
+        if spec.language != "perl" {
+            continue;
+        }
+        let _ = cached_pattern_query(&spec.query);
+    }
+}
+
 /// Verify a pattern's `expect` snippets against the real grammar:
 /// parse each snippet, run the query, assert the match count and any
 /// declared capture texts. This is the pattern author's guard against

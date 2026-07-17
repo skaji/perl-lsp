@@ -1022,6 +1022,13 @@ pub fn index_workspace_with_index(
             );
         });
 
+        // Force the plugin registry — plugin load AND pattern/flow query
+        // compilation (H7-14) — to initialize once, single-threaded, before
+        // the parallel build below. Otherwise the first `build()` to trigger
+        // the registry's OnceLock stalls every other Rayon worker on it,
+        // charging ~1s of one-time compile to whichever files happen to block.
+        let _ = crate::plugin::default_plugin_registry();
+
         paths.par_iter().for_each(|path| {
             // Blobs are keyed canonical (matches the warm rows + the CLI's
             // canonicalized origin staging); register under the same spelling
