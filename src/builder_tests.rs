@@ -1150,6 +1150,40 @@ fn test_return_bless_anon_hash_class() {
 }
 
 #[test]
+fn test_self_hosting_fluent_computed_receiver_not_paren() {
+    // DBIC self-hosting edge: a fluent verb analyzed inside its OWN package
+    // does `(ref $self)->new(...)`. That computed receiver is not a literal
+    // class — before the fix it froze as `ClassName("(")`, so `search` /
+    // `search_rs` reported `raw_return_type: "("`.
+    let src = "\
+package My::ResultSet;
+sub search_rs {
+  my $self = shift;
+  my $rs = (ref $self)->new($self->{attrs});
+  return $rs;
+}
+sub search {
+  my $self = shift;
+  my $rs = $self->search_rs(@_);
+  return $rs;
+}
+";
+    let fa = build_fa(src);
+    for sub in ["search", "search_rs"] {
+        for arity in [None, Some(0u32), Some(1), Some(2)] {
+            let ty = fa.sub_return_type_at_arity(sub, arity);
+            // A `(` is never a type — a plain class name or None is fine.
+            if let Some(InferredType::ClassName(ref c)) = ty {
+                assert!(
+                    crate::conventions::is_bareword_class_name(c),
+                    "{sub} at arity {arity:?} returned garbage ClassName({c:?})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_statement_bless_receiver_types_sub_return() {
     // The Bugzilla::Object idiom: bless in STATEMENT position with a
     // receiver-derived class, returned as a separate statement. The sub's
@@ -5462,6 +5496,47 @@ sub test { my $self = shift; $self->$method() }
     assert!(
         !method_refs.is_empty(),
         "dynamic method call should resolve to get_name"
+    );
+}
+
+#[test]
+fn test_hover_dynamic_dispatch_token_vs_chain_head() {
+    // The `$self->$method()` dynamic-dispatch hover must fire on the METHOD
+    // TOKEN (the `$method` variable) but NOT on a plain variable at the head
+    // of a wide chain — a multi-line chain's MethodCall ref spans the whole
+    // expression, so keying on the whole span returned the tail method's POD
+    // for the head invocant (DBIC F2).
+    let src = "\
+package Foo;
+sub get_name { my $self = shift; return $self->{name} }
+my $method = 'get_name';
+sub test { my $self = shift; $self->$method() }
+my $obj = Foo->new;
+my $chain = $obj->get_name->get_name;
+";
+    let fa = build_fa(src);
+
+    // Genuine case: hover on the `$method` token in `$self->$method()`.
+    // Line 3 (0-based): "sub test { my $self = shift; $self->$method() }"
+    // `$method` begins at column 36.
+    let line3 = src.lines().nth(3).unwrap();
+    let mcol = line3.find("$method(").unwrap();
+    let genuine = fa.hover_info(Point::new(3, mcol + 1), src, None);
+    assert!(
+        genuine.as_deref().is_some_and(|h| h.contains("resolved from")),
+        "hover on the dynamic method token should resolve the dispatch, got {:?}",
+        genuine
+    );
+
+    // Regression: hover on `$obj` at the head of the chain must NOT be
+    // attributed to the chain's tail method.
+    let line5 = src.lines().nth(5).unwrap();
+    let ocol = line5.find("$obj->").unwrap();
+    let head = fa.hover_info(Point::new(5, ocol + 1), src, None);
+    assert!(
+        !head.as_deref().unwrap_or("").contains("resolved from"),
+        "hover on the chain-head variable must not borrow the tail method, got {:?}",
+        head
     );
 }
 

@@ -182,6 +182,26 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
+/// Collapse workspace/symbol entries that share a full identity tuple
+/// (name, kind, file, line, col). Framework accessor synthesis mints twin
+/// symbols at ONE span — a getter `Method` and its fluent-writer twin carry
+/// the same name/kind/selection_span — and the same symbol can surface from
+/// both the resident sweep and the rows pass. Keying on the whole tuple
+/// collapses only byte-identical duplicates; two genuinely different symbols
+/// that merely share a name keep their distinct spans.
+pub fn dedup_workspace_symbols(results: &mut Vec<SymbolInformation>) {
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|s| {
+        seen.insert((
+            s.name.clone(),
+            format!("{:?}", s.kind),
+            s.location.uri.to_string(),
+            s.location.range.start.line,
+            s.location.range.start.character,
+        ))
+    });
+}
+
 /// The rows half of workspace/symbol: fan the query across the hub's Perl
 /// store and every pack sub-index's store. One spelling of the fan-out so
 /// the LSP handler and the CLI verb can never diverge.

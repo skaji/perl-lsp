@@ -5453,6 +5453,38 @@ sub real_sub { 1 }
     );
 }
 
+#[test]
+fn test_dedup_workspace_symbols_collapses_twins() {
+    use tower_lsp::lsp_types::{Location, Position, Range, SymbolInformation, SymbolKind, Url};
+    #[allow(deprecated)]
+    let make = |name: &str, line: u32, col: u32| SymbolInformation {
+        name: name.to_string(),
+        kind: SymbolKind::METHOD,
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri: Url::parse("file:///t.pm").unwrap(),
+            range: Range {
+                start: Position { line, character: col },
+                end: Position { line, character: col + 4 },
+            },
+        },
+        container_name: None,
+    };
+    // Two byte-identical twins (accessor getter + fluent-writer at one span)
+    // plus a same-named symbol at a different line (a real distinct decl).
+    let mut results = vec![
+        make("connect_timeout", 10, 4),
+        make("connect_timeout", 10, 4),
+        make("connect_timeout", 42, 4),
+    ];
+    dedup_workspace_symbols(&mut results);
+    assert_eq!(results.len(), 2, "twins collapse, distinct span survives: {:?}",
+        results.iter().map(|s| (s.name.clone(), s.location.range.start.line)).collect::<Vec<_>>());
+    assert!(results.iter().any(|s| s.location.range.start.line == 10));
+    assert!(results.iter().any(|s| s.location.range.start.line == 42));
+}
+
 /// `my sub helper { … }` — document symbols keep it (real in-file
 /// structure); workspace-symbol search drops it (not addressable
 /// outside its block). Plain subs surface in both.

@@ -2613,6 +2613,7 @@ impl LanguageServer for Backend {
             }
         }
 
+        symbols::dedup_workspace_symbols(&mut results);
         if results.is_empty() {
             Ok(None)
         } else {

@@ -8233,10 +8233,17 @@ impl FileAnalysis {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => {
                     // Check if this variable is also a dynamic method call target
-                    // (e.g. $self->$method() where $method is a known constant)
+                    // (e.g. $self->$method() where $method is a known constant).
+                    // Gate on the METHOD-NAME token span, not the whole call span:
+                    // a multi-line chain's MethodCall ref spans the entire
+                    // expression, so `mr.span` contains the head invocant too —
+                    // hovering `$schema` at the head of a chain would wrongly
+                    // return the tail method's POD. The dynamic-dispatch method
+                    // token IS this variable, so the point lands in
+                    // `method_name_span` only for the genuine case.
                     let method_hover = self.refs.iter()
-                        .find(|mr| matches!(mr.kind, RefKind::MethodCall { .. })
-                            && contains_point(&mr.span, point)
+                        .find(|mr| matches!(&mr.kind, RefKind::MethodCall { method_name_span, .. }
+                                if contains_point(method_name_span, point))
                             && mr.target_name != r.target_name);
                     if let Some(mr) = method_hover {
                         if matches!(mr.kind, RefKind::MethodCall { .. }) {
