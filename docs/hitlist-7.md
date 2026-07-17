@@ -123,6 +123,21 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
   0.3ms, references 2.4ms) — this is per-file BUILD cost, so it taxes cold
   index, didChange rebuilds, and --check.
 
+- **H7-15 — DBIC resultset moniker never resolves to the FQ result class**
+  (split out of H7-7, whose implementations fix proved the ancestor walk
+  correct): `$schema->resultset('Artist')->create(...)` types the row as
+  literal `"Artist"` — the source moniker, not `DBICTest::Schema::Artist` —
+  so goto-def on `$art->update` can't start its walk (probe: forcing the FQ
+  class reaches Row.pm:543 perfectly). Fix needs moniker→class resolution
+  (schema receiver's class + registered source names + cross-file index) at
+  the parametric-type seam; the schema class is currently discarded from
+  `ParametricType::ResultSet{base,row}`. Repro: t/53lean_startup.t:180.
+- **Pre-existing gold flake (NOT this round's)**: intermittent strict-
+  residency rehydration-miss CRASH under cold/eviction runs (panic at
+  module_index.rs:1827; documented at run.pl:80-82). H7-7 proved it
+  reproduces at base EXTRACT_VERSION 167 with cleared cache and vanishes
+  under PERL_LSP_NO_EVICT=1. Candidate for its own fix row next round.
+
 ## Parked this round (PARKED.md gets the durable entries on round close)
 
 - monkey_patch-synthesized methods invisible (mojo F7 — `$ua->get`): needs
