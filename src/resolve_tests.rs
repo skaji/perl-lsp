@@ -3858,6 +3858,78 @@ fn dbic_column_rename_reaches_cross_file_consumer_arg_key() {
     );
 }
 
+/// Owner-gating (H7-6): a synthesized column accessor's identity is the OWNING
+/// class, not the bare name. Renaming one class's `id` column must NOT reach a
+/// framework ancestor's real `sub id` (`DBIx::Class::PK::id`) nor an unrelated
+/// SIBLING class that carries its own independent `id` column — both merely
+/// share the name. Rooting the accessor family at the owner (not the topmost
+/// same-named ancestor) is what keeps the edit set to the owner + its typed
+/// call sites. The owner's own `$self->id` call DOES edit.
+#[test]
+fn dbic_column_rename_owner_gated_excludes_framework_and_siblings() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let base = PathBuf::from("/tmp/owngate_base.pm");
+    let widget = PathBuf::from("/tmp/owngate_widget.pm");
+    let gadget = PathBuf::from("/tmp/owngate_gadget.pm");
+    // A framework-ish base with a real generic `sub id` — the name-collision
+    // bait (stands in for `DBIx::Class::PK::id`).
+    let base_src = "package MyBase;\nsub id { my $self = shift; return $self->{_id}; }\n1;\n";
+    // Two independent DBIC subclasses (direct `DBIx::Class::Core` base so
+    // columns synthesize), each ALSO inheriting the framework `id` via MyBase,
+    // and each with its OWN `id` column. `$self->id` in Widget is a typed
+    // owner-receiver call.
+    let widget_src = "package Widget;\nuse base ('DBIx::Class::Core', 'MyBase');\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub go { my $self = shift; return $self->id; }\n1;\n";
+    let gadget_src = "package Gadget;\nuse base ('DBIx::Class::Core', 'MyBase');\n\
+        __PACKAGE__->add_columns(qw/id/);\n1;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(base.clone(), Arc::new(parse(base_src)));
+    idx.register_workspace_module(widget.clone(), Arc::new(parse(widget_src)));
+    idx.register_workspace_module(gadget.clone(), Arc::new(parse(gadget_src)));
+    store.insert_workspace(base.clone(), parse(base_src));
+    store.insert_workspace(widget.clone(), parse(widget_src));
+    store.insert_workspace(gadget.clone(), parse(gadget_src));
+
+    let widget_fa = store.workspace_raw().get(&widget).unwrap().value().clone();
+    let col = widget_src.lines().nth(2).unwrap().find("id").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&widget_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx))
+            .expect("column resolves to a group")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, Some(&idx), &FileKey::Path(widget.clone()), &local_spans, &pinned_spans,
+        &members, "renamed", RoleMask::EDITABLE,
+    );
+    let touched: std::collections::BTreeSet<&PathBuf> = edits
+        .iter()
+        .filter_map(|(l, _)| match &l.key { FileKey::Path(p) => Some(p), _ => None })
+        .collect();
+    assert!(
+        !touched.contains(&base),
+        "framework ancestor's real `sub id` must be untouched: {touched:?}",
+    );
+    assert!(
+        !touched.contains(&gadget),
+        "unrelated sibling class's own `id` column must be untouched: {touched:?}",
+    );
+    // The owner's decl + its typed `$self->id` call both edit.
+    let widget_rows: std::collections::BTreeSet<usize> = edits
+        .iter()
+        .filter(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &widget))
+        .map(|(l, _)| l.span.start.row)
+        .collect();
+    assert!(widget_rows.contains(&2), "owner column decl (row 2) edits: {edits:?}");
+    assert!(
+        widget_rows.contains(&3),
+        "owner-typed `$self->id` call (row 3) edits: {edits:?}",
+    );
+}
+
 /// Event (Handler) rename. A literal event-name site is rewritable
 /// and its span is the **inside-the-quotes** name (so rename keeps the quotes);
 /// a folded site — variable (`my $e='connect'; on($e)`) OR constant

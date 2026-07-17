@@ -141,6 +141,32 @@ impl TargetRef {
         }
     }
 
+    /// Build a `Method` target for a class-OWNED synthesized accessor (a Moo
+    /// `has` reader, a DBIC column/relationship accessor). Its override family
+    /// is `owned_accessor_family` — the owning class and its descendants only,
+    /// NEVER a framework ancestor that happens to define a real `sub` of the
+    /// same name (`DBIx::Class::PK::id`). Renaming a synthesized `id` column
+    /// must not reach that generic accessor nor every unrelated sibling Result
+    /// class under it (H7-6). Fixed `Hierarchy` scope: an owned accessor is
+    /// shared down the hierarchy by construction; the family already encodes
+    /// exactly the classes that inherit it.
+    pub fn owned_accessor(
+        name: String,
+        class: String,
+        origin: &FileAnalysis,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Self {
+        let method_classes = origin.owned_accessor_family(&class, module_index);
+        TargetRef {
+            name,
+            kind: TargetKind::Method { class },
+            method_classes,
+            scope: OverrideScope::Hierarchy,
+            def_paths: Vec::new(),
+            bare_constant: false,
+        }
+    }
+
     /// Build a non-Method target (no inheritance fan-out for declarations).
     pub fn new(name: String, kind: TargetKind) -> Self {
         debug_assert!(
@@ -2901,20 +2927,29 @@ fn group_from_projections(
         // A Corinna `field`'s reader is per-class (private storage), so scope it
         // precisely (Dispatch) — never fan to an ancestor's same-named reader,
         // which would rewrite that class's own private field decl and corrupt
-        // it. A `has`/column accessor IS shared down the hierarchy → family.
-        let reader_scope = if p.field_backed {
-            OverrideScope::Dispatch
-        } else {
-            OverrideScope::Hierarchy
-        };
-        members.push(GroupMember {
-            target: TargetRef::method(
+        // it. A `has`/column accessor IS shared down the hierarchy, but its
+        // identity is the OWNING class: `owned_accessor` roots the family at
+        // `p.class` and its descendants, never upward at a framework ancestor
+        // that defines a real same-named `sub` (H7-6: an `id` column colliding
+        // with `DBIx::Class::PK::id`).
+        let target = if p.field_backed {
+            TargetRef::method(
                 p.bare.clone(),
                 p.class.clone(),
                 class_analysis,
                 module_index,
-                reader_scope,
-            ),
+                OverrideScope::Dispatch,
+            )
+        } else {
+            TargetRef::owned_accessor(
+                p.bare.clone(),
+                p.class.clone(),
+                class_analysis,
+                module_index,
+            )
+        };
+        members.push(GroupMember {
+            target,
             rename: MemberRename::Bare,
         });
     }
@@ -2952,13 +2987,15 @@ fn group_from_projections(
         });
     }
     for m in &p.mapped {
+        // Name-mapped accessors (`has_size` for attr `size`) are class-owned
+        // too — same owner-rooted family as the reader (never a framework
+        // ancestor's same-named `sub`).
         members.push(GroupMember {
-            target: TargetRef::method(
+            target: TargetRef::owned_accessor(
                 m.method.clone(),
                 p.class.clone(),
                 class_analysis,
                 module_index,
-                OverrideScope::Hierarchy,
             ),
             rename: match &m.affix {
                 Some((pre, suf)) => MemberRename::Affixed {

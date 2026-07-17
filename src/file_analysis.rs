@@ -10503,6 +10503,40 @@ impl FileAnalysis {
         family
     }
 
+    /// The rename family for a class-OWNED synthesized accessor (a Moo `has`
+    /// reader, a DBIC column/relationship accessor): the owning class plus
+    /// every transitive descendant that inherits it. Unlike
+    /// `method_override_family`, it never searches UPWARD for a contract
+    /// root — a synthesized accessor is owned by its declaring class, and a
+    /// same-named method in a framework ancestor (`DBIx::Class::PK::id` vs a
+    /// synthesized `id` column) is a name collision, not the same symbol.
+    /// Rooting at that ancestor would fan the rename across every unrelated
+    /// sibling subclass of it (rule #10: gate on the owner axis, never the
+    /// bare name). The declaring class is already resolved by
+    /// `attr_group_via_ancestors` before the group is minted, so `class_name`
+    /// is the true owner even when the cursor sat on an inheriting subclass.
+    pub fn owned_accessor_family(
+        &self,
+        class_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
+        let mut family = vec![class_name.to_string()];
+        let graph = crate::graph::GraphView::new(self, module_index);
+        graph.walk(
+            crate::graph::Node::Class(class_name.to_string()),
+            crate::graph::EdgeKindMask::INHERITS_INV,
+            &mut |n| {
+                if let crate::graph::Node::Class(c) = n {
+                    if !family.iter().any(|f| f == c) {
+                        family.push(c.clone());
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        family
+    }
+
     pub fn method_rename_chain(
         &self,
         class_name: &str,
