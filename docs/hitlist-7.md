@@ -107,6 +107,22 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
   private + nested-struct members and truncate `cleanup_head_` → `cleanup_head`
   (leveldb task 4-secondary).
 
+- **H7-14 perf — plugin pattern_dispatch dominates Perl build cost** (found
+  chasing the mojo `--check` wall): on a quiet 4-core box, cold `--check
+  /root/corpus/mojo` = 8.4s wall (439 modules: 277 workspace incl. t/, 162
+  @INC), warm = 5.9s. Slowest-module table: five files at a uniform ~1.05s
+  build each. Isolated t/mojo/date.t (84 LINES): `build::pattern_dispatch`
+  758ms + `flow_query` 114ms vs walk 13.5ms + fold 6.8ms.
+  `PERL_LSP_PLUGIN_STATS=1` shows 14 patterns, **0 matched / 0 dispatched**
+  — the cost is query EXECUTION, not match handling or Rhai. Suspects: per-
+  node/per-call-site cursor runs instead of one pass per tree, per-file query
+  recompilation, or predicate-heavy unanchored patterns degenerating on
+  string-dense files. Fix target: `builder.rs::pattern_dispatch` /
+  `dispatch_pattern_plugins`. NOT the H7-1 recursion (fold is ms on these
+  files). Editor-verb latencies are unaffected (bench: mojo warm hover
+  0.3ms, references 2.4ms) — this is per-file BUILD cost, so it taxes cold
+  index, didChange rebuilds, and --check.
+
 ## Parked this round (PARKED.md gets the durable entries on round close)
 
 - monkey_patch-synthesized methods invisible (mojo F7 — `$ua->get`): needs
