@@ -76,6 +76,35 @@ Brief each slice with the repo's architecture rules that bite: rule #1
 edges-not-values, clear-and-emit for re-emittable passes. Agents commit to
 their worktree branch and do NOT push.
 
+### Operational discipline (learned the hard way — sandbox restarts EAT unpushed work)
+
+- **Push slice branches as backup refs.** The moment a slice commits, push its
+  branch (`git push -u origin <slice-branch>`) — side refs never touch the main
+  branch, and a container restart/filesystem rollback then costs nothing. A
+  round-7 rollback vaporized three COMPLETED slices that existed only in local
+  worktrees. Delete the remote ref at cleanup (`git push origin :<branch>`).
+  Same for the coordinator: push the main branch after EVERY gated merge, and
+  commit+push docs (hitlists, briefs) the moment they're written.
+- **Gates run foreground with explicit timeouts.** Never park a merge gate in
+  an unbounded background task and "wait for the notification" — a silent
+  worker restart kills the task AND the notification, and the wait becomes
+  forever. Foreground with `timeout`, or if backgrounded, record the task id
+  and CHECK LIVENESS (process table + output mtime) before assuming progress.
+- **Agents: no background waits, ever.** Subagents that background a build and
+  end their turn "waiting for the notification" never wake — backgrounded
+  children die with the turn. Every agent brief gets: "run everything
+  foreground and sequential; no monitors, no background waits." (Three agents
+  stalled on this in one round.)
+- **Version-constant bumps are per-slice declarations.** Parallel slices WILL
+  collide on EXTRACT_VERSION/STUB_VERSION (three same-value collisions in one
+  round — one poisoned a shared substrate cache into a 163-row crash storm).
+  Briefs say "bump and DECLARE it"; the coordinator reconciles to max+1 at
+  each cherry-pick.
+- **Worktree bases lie.** The Agent tool's managed worktrees may be cut from
+  stale main. Prefer self-worktreeing in the brief: `git fetch origin <branch>
+  && git worktree add <path> -b <slice> origin/<branch>` as step 0, and have
+  the agent VERIFY the tip commit subject before working.
+
 Architectural forks mid-slice: pick the loosely-coupled/reversible option,
 log in `docs/open-forks.md` (options / picked / undo cost / question),
 keep moving — never block on ratification.

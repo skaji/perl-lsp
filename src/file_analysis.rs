@@ -7785,9 +7785,14 @@ impl FileAnalysis {
         }
         // Access-specifier gate: visible from outside
         // `class_name`'s own body only when NOT tagged non-public.
+        // Callability gate on the same closure so every enumeration loop in
+        // this walk (local, plugin-namespace, cross-file) shares it: an
+        // anonymous sub (`*__HM_DEDUP = sub () {0}`) is a symbol in the
+        // class but not a name a method call can ever spell.
         let visible = |sym: &Symbol| {
-            requesting_class == Some(class_name)
-                || !sym.attributes.iter().any(|a| a == "non_public")
+            crate::conventions::is_callable_sub_name(&sym.name)
+                && (requesting_class == Some(class_name)
+                    || !sym.attributes.iter().any(|a| a == "non_public"))
         };
 
         // Local methods in this class

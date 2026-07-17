@@ -3590,6 +3590,27 @@ fn test_inherited_method_completion() {
 }
 
 #[test]
+fn resolved_class_completion_excludes_anon_subs() {
+    // `*__HM_DEDUP = sub () { 0 }` (DBIx::Class::ResultSet.pm) mints an
+    // anonymous-sub symbol inside the package; a method-completion list on
+    // the RESOLVED class must not offer it — no call can spell `(anon)`.
+    let fa = build_fa(
+        "
+            package Widget;
+            BEGIN { *__HM_DEDUP = sub () { 0 }; }
+            sub spin { }
+        ",
+    );
+    let methods = fa.complete_methods_for_class("Widget", None);
+    let names: Vec<&str> = methods.iter().map(|c| c.label.as_str()).collect();
+    assert!(names.contains(&"spin"), "real method offered");
+    assert!(
+        !names.iter().any(|n| n.contains("(anon)")),
+        "anonymous sub leaked into resolved-class completion: {names:?}"
+    );
+}
+
+#[test]
 fn test_child_method_overrides_parent() {
     let fa = build_fa(
         "
