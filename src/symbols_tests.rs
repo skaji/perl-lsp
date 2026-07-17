@@ -5453,6 +5453,33 @@ sub real_sub { 1 }
     );
 }
 
+/// H7-10(a): an anonymous sub is never a method-completion candidate. With
+/// an unresolvable receiver, `complete_methods` falls back to enumerating
+/// file subs — but `$obj->(anon)` isn't callable, so the synthetic `(anon)`
+/// symbol must be filtered at the source (gated on "has a callable name",
+/// not the literal spelling).
+#[test]
+fn test_anon_sub_not_a_method_completion_candidate() {
+    let src = "\
+my $cb = sub { return 42 };
+sub real_method { 1 }
+";
+    let analysis = parse_analysis(src);
+    // `$unknown` doesn't resolve to a class → the file-subs fallback path.
+    let cands = analysis.complete_methods("$unknown", Point::new(2, 0), None);
+    let labels: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.iter().any(|l| l.contains("anon")),
+        "anon sub must not be a method candidate: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"real_method"),
+        "named subs are still candidates: {:?}",
+        labels
+    );
+}
+
 #[test]
 fn test_dedup_workspace_symbols_collapses_twins() {
     use tower_lsp::lsp_types::{Location, Position, Range, SymbolInformation, SymbolKind, Url};

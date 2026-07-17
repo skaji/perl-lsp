@@ -502,6 +502,20 @@ pub fn detect_cursor_context_tree_with_index(
                                 }
                             }
                         }
+                        // Only a cursor in the method-NAME slot completes a
+                        // method. When the method token is fully typed and the
+                        // cursor sits BEYOND it — inside the argument list,
+                        // e.g. `$schema->resultset('Arti|st')` — this is an
+                        // argument position, not a method slot; fall through so
+                        // a string interior doesn't masquerade as `$obj->`.
+                        // An incomplete `$obj->|` has no method child and still
+                        // wants Method.
+                        if let Some(method) = current.child_by_field_name("method") {
+                            if point > method.end_position() {
+                                current = current.parent()?;
+                                continue;
+                            }
+                        }
                         let invocant_text = invocant_node.utf8_text(source).unwrap_or("").to_string();
                         let invocant_type = resolve_node_type(invocant_node, source, analysis, point, module_index);
                         return Some(CursorContext::Method { invocant_type, invocant_text });

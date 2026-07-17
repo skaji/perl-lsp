@@ -365,6 +365,10 @@ pub enum ArgGuard {
     Empty,
     Exact(u32),
     AtLeast(u32),
+    /// Arity ≤ N — the `unless @_ > N` band (a low-arity getter guard,
+    /// including the compound `unless @_ > N || <non-arity>` where `@_ ≤ N`
+    /// is the sound necessary condition).
+    AtMost(u32),
     Any,
 }
 
@@ -382,6 +386,7 @@ impl ArgGuard {
             (ArgGuard::Empty, Some(0)) => true,
             (ArgGuard::Exact(n), Some(h)) => n == h,
             (ArgGuard::AtLeast(n), Some(h)) => h >= n,
+            (ArgGuard::AtMost(n), Some(h)) => h <= n,
             (ArgGuard::Any, _) => true,
             _ => false,
         }
@@ -582,6 +587,28 @@ impl WitnessBag {
         self.witnesses.retain(|w| match &w.source {
             WitnessSource::Builder(s) => s != tag,
             _ => true,
+        });
+        let removed = before - self.witnesses.len();
+        if removed > 0 {
+            self.rebuild_index();
+        }
+        removed
+    }
+
+    /// Drop `Builder(tag)`-sourced witnesses on ONE attachment. Targeted
+    /// sibling of `remove_by_source_tag`: an arity-discriminated sub retracts
+    /// its own non-arity `return_arm_chain` fallback (so the arity union is
+    /// the authoritative answer) without disturbing any other symbol's
+    /// witnesses.
+    pub fn remove_attachment_source(
+        &mut self,
+        att: &WitnessAttachment,
+        tag: &str,
+    ) -> usize {
+        let before = self.witnesses.len();
+        self.witnesses.retain(|w| {
+            !(&w.attachment == att
+                && matches!(&w.source, WitnessSource::Builder(s) if s == tag))
         });
         let removed = before - self.witnesses.len();
         if removed > 0 {
@@ -952,13 +979,40 @@ impl WitnessReducer for BranchArmFold {
 
     fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
         let mut typed: Vec<InferredType> = Vec::new();
+        // `||` / `//` fallback (RHS) arms — the guaranteed floor, tagged with
+        // a distinct source at emission so this fold can prefer them.
+        let mut fallback: Vec<InferredType> = Vec::new();
         let mut undef_arms = 0usize;
         for w in ws {
+            let is_fallback =
+                matches!(&w.source, WitnessSource::Builder(t) if t == "fallback_arm");
             match &w.payload {
+                WitnessPayload::InferredType(t) if is_fallback => fallback.push(t.clone()),
                 WitnessPayload::InferredType(t) => typed.push(t.clone()),
                 WitnessPayload::Fact { family, .. } if family == "undef_arm" => undef_arms += 1,
                 _ => {}
             }
+        }
+        // `||` / `//`: the RHS floor is returned whenever the LHS is
+        // falsy/undef, so the expression's type is at least the fallback's.
+        // Prefer agreement across all known arms; else the known floor; else
+        // the known LHS. This is what lets `$ENV{X} || 10` type to `Numeric`
+        // even when the LHS hash access can't be resolved — an honest,
+        // reachable type beats the entry vanishing.
+        if !fallback.is_empty() {
+            let all: Vec<&InferredType> = typed.iter().chain(fallback.iter()).collect();
+            if let Some((first, rest)) = all.split_first() {
+                if rest.iter().all(|t| *t == *first) {
+                    return ReducedValue::Type((*first).clone());
+                }
+            }
+            if let Some(fb) = fallback.into_iter().next() {
+                return ReducedValue::Type(fb);
+            }
+            if let Some(l) = typed.into_iter().next() {
+                return ReducedValue::Type(l);
+            }
+            return ReducedValue::None;
         }
         // Both arms must have contributed — the ≥2 rule guards a single
         // materialized arm from masquerading as agreement.

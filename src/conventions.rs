@@ -62,6 +62,17 @@ pub fn is_current_package_token(text: &str) -> bool {
     text == "__PACKAGE__"
 }
 
+/// A name that can be written as a method / sub call — a syntactically valid
+/// Perl identifier (or `::`-qualified chain of them). Synthetic symbols the
+/// analyzer mints for value-carrying constructs — an anonymous `sub { ... }`
+/// gets the placeholder name `(anon)` — are NOT callable by name, so they must
+/// never surface as method-completion candidates (`$obj->(anon)` is not a
+/// thing). Gate completion sources on this property, not on the literal
+/// `(anon)` spelling (rule #10).
+pub fn is_callable_sub_name(name: &str) -> bool {
+    is_bareword_class_name(name)
+}
+
 /// A method-call invocant in canonical spelling: variable invocants are
 /// sigil + bare varname (`${ sner }` stores as `$sner`, via the grammar's
 /// `varname` child), `__PACKAGE__` resolved to the enclosing package,

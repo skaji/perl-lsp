@@ -161,7 +161,7 @@
         ],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "completion-self-http-response",

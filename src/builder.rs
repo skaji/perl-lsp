@@ -857,6 +857,17 @@ enum ArityBranch {
     /// `return X if @_ == N;` / `if scalar(@_) == N;` / explicit
     /// `if (@_ == N) { return X }`. Exact-N match.
     Exact(u32),
+    /// `return X unless @_ > N;` — fires only at arity ≤ N. Arrives from a
+    /// relational arity guard (`@_ > N` / `@_ < N` / …), and — the load-
+    /// bearing case — from a COMPOUND guard `unless @_ > N || <non-arity>`
+    /// where `@_ ≤ N` is the sound NECESSARY condition (the non-arity
+    /// disjunct only narrows it further). An over-approximation of the arm's
+    /// true firing domain, but tighter than the fluent `Default`/`Any` arm,
+    /// so an honest low-arity type beats the wrong fluent one.
+    AtMost(u32),
+    /// `return X if @_ > N;` — fires only at arity ≥ N+1. The relational
+    /// mirror of `AtMost`; a fluent writer guarded by a magnitude test.
+    AtLeast(u32),
     /// Fall-through `return X;` with no condition wrapper — fires
     /// when no earlier arity-gated branch matched.
     Default,
@@ -968,14 +979,99 @@ fn classify_arity_condition(
         if !counts_args {
             return None;
         }
-        match (keyword, op.as_str()) {
+        return match (keyword, op.as_str()) {
             ("if", "==") => Some(ArityBranch::Exact(n)),
             ("unless", "!=") => Some(ArityBranch::Exact(n)),
             _ => None, // != / >= / etc. — not a single Exact fact.
-        }
-    } else {
-        None
+        };
     }
+    // Shape 4: `@_ > N` / `@_ < N` / `@_ >= N` / `@_ <= N` → relational.
+    if cond.kind() == "relational_expression" {
+        return classify_relational_arity(cond, source, keyword);
+    }
+    // Shape 5: compound `A || B` / `A && B` — one side is an arity test, the
+    // other an unrelated predicate. Keep ONLY the sound constraint:
+    //   - `unless (A || B)` fires ⟺ `!A && !B` ⇒ `!A` (arity side classified
+    //     under `unless`) is necessary — `!B` only narrows further.
+    //   - `if (A && B)` fires ⟺ `A && B` ⇒ the arity conjunct under `if` is
+    //     necessary.
+    // The other two (`if (A||B)`, `unless (A&&B)`) can fire via the non-arity
+    // term at any arity, so no sound arity constraint — punt.
+    if cond.kind() == "binary_expression" {
+        let op = raw_mid_op(cond, source);
+        let sound = matches!(
+            (keyword, op.as_str()),
+            ("unless", "||") | ("unless", "or") | ("if", "&&") | ("if", "and")
+        );
+        if !sound {
+            return None;
+        }
+        let left = cond.child_by_field_name("left")?;
+        let right = cond.child_by_field_name("right")?;
+        // Either operand may carry the arity test; the other is the
+        // unrelated predicate. First sound classification wins.
+        return classify_arity_condition(left, source, keyword)
+            .or_else(|| classify_arity_condition(right, source, keyword));
+    }
+    None
+}
+
+/// Classify `@_ CMP N` (relational). Arity magnitude must be the LEFT
+/// operand, a literal the right. `if @_ > 1` fires at arity ≥ 2
+/// (`AtLeast(2)`); `unless @_ > 1` fires at arity ≤ 1 (`AtMost(1)`), the
+/// Mojo `attr`-style getter guard.
+fn classify_relational_arity(
+    cond: tree_sitter::Node,
+    source: &[u8],
+    keyword: &str,
+) -> Option<ArityBranch> {
+    let op = raw_mid_op(cond, source);
+    let left = cond.child_by_field_name("left")?;
+    let right = cond.child_by_field_name("right")?;
+    if !node_is_arity_magnitude(left, source) {
+        return None;
+    }
+    let n = extract_numeric(right, source)?;
+    // `keyword`-fires semantics: `if COND` fires when COND holds; `unless
+    // COND` fires when it doesn't. Map each to the arity band it guarantees.
+    match (keyword, op.as_str()) {
+        // @_ > N: if → ≥ N+1; unless → ≤ N
+        ("if", ">") => n.checked_add(1).map(ArityBranch::AtLeast),
+        ("unless", ">") => Some(ArityBranch::AtMost(n)),
+        // @_ >= N: if → ≥ N; unless → ≤ N-1
+        ("if", ">=") => Some(ArityBranch::AtLeast(n)),
+        ("unless", ">=") => n.checked_sub(1).map(ArityBranch::AtMost),
+        // @_ < N: if → ≤ N-1; unless → ≥ N
+        ("if", "<") => n.checked_sub(1).map(ArityBranch::AtMost),
+        ("unless", "<") => Some(ArityBranch::AtLeast(n)),
+        // @_ <= N: if → ≤ N; unless → ≥ N+1
+        ("if", "<=") => Some(ArityBranch::AtMost(n)),
+        ("unless", "<=") => n.checked_add(1).map(ArityBranch::AtLeast),
+        _ => None,
+    }
+}
+
+/// Do the return arms agree in a way that is the sub's genuine return type —
+/// as opposed to the lossy Object-subsumes-HashRef *dominance* that
+/// `resolve_return_type` also accepts? Decides whether an arity-discriminated
+/// sub keeps its non-arity `return_arm_chain` fallback (agree → the arm-join
+/// is the right answer at every arity and at a no-hint query) or retracts it
+/// (disagree → a gap arity must answer None, not the fluent-class leak).
+fn arms_genuinely_agree(types: &[InferredType]) -> Option<InferredType> {
+    let first = types.first()?;
+    if types.iter().all(|t| t == first) {
+        return Some(first.clone());
+    }
+    if types.iter().all(|t| t.is_hash_shaped()) {
+        return Some(InferredType::HashRef);
+    }
+    if types.iter().all(|t| t.is_array_shaped()) {
+        return Some(InferredType::ArrayRef);
+    }
+    if types.iter().all(|t| matches!(t, InferredType::Bool | InferredType::Numeric)) {
+        return Some(InferredType::Numeric);
+    }
+    None
 }
 
 /// True if `node` evaluates to the length of `@_` — either `@_`
@@ -7166,6 +7262,23 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A `shift` call or `$_[N]` positional read — a PARAMETER pull. The
+    /// `||`/`//` fold treats these LHSes as the param-default idiom (the
+    /// value is the unknown parameter, not the fallback literal's type).
+    fn is_param_pull(&self, node: Node<'a>) -> bool {
+        if self.is_shift_call(node) {
+            return true;
+        }
+        if node.kind() == "array_element_expression" {
+            if let Some(array) = node.child_by_field_name("array") {
+                return array.kind() == "container_variable"
+                    && array.named_child(0).and_then(|v| v.utf8_text(self.source).ok())
+                        == Some("_");
+            }
+        }
+        false
+    }
+
     /// `$_[0]` — the positional-receiver pseudo-invocant of a method
     /// body. Shared by `invocant_type_at_node`'s array-element arm and
     /// `expr_payload`'s `Receiver` emission so both agree on the shape.
@@ -7235,6 +7348,52 @@ impl<'a> Builder<'a> {
                 span,
             });
             return;
+        }
+        // `LHS || RHS` / `LHS // RHS` — a short-circuit whose value is the
+        // LHS when truthy/defined, else the RHS. The RHS is the guaranteed
+        // FLOOR (`$ENV{X} || 10` returns the literal default whenever the
+        // env var is unset), so it rides a distinct `fallback_arm` source;
+        // `BranchArmFold` prefers it when the arms disagree or the LHS can't
+        // be typed. Reuses the ternary's BranchArm machinery — one speller
+        // for "this expression's value is one of these arms."
+        //
+        // EXCEPT a `shift`/`$_[N]`-LHS: `my $x = shift // 'd'` is the param-
+        // DEFAULT idiom — the value IS the parameter (unknown type); the
+        // literal is a definedness fallback, not a type claim. Folding it to
+        // the literal poisons downstream narrowed uses (`return $x if
+        // $x->isa(...)`). Leave it untyped so the param stays open.
+        if node.kind() == "binary_expression"
+            && matches!(self.get_operator_text(node).as_deref(), Some("||") | Some("//"))
+            && node
+                .child_by_field_name("left")
+                .is_some_and(|lhs| !self.is_param_pull(lhs))
+        {
+            if let (Some(lhs), Some(rhs)) =
+                (node.child_by_field_name("left"), node.child_by_field_name("right"))
+            {
+                let arm_att = WitnessAttachment::BranchArm(span);
+                self.emit_expr_witness(lhs);
+                self.bag.push(Witness {
+                    attachment: arm_att.clone(),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(lhs))),
+                    span: node_to_span(lhs),
+                });
+                self.emit_expr_witness(rhs);
+                self.bag.push(Witness {
+                    attachment: arm_att.clone(),
+                    source: WitnessSource::Builder("fallback_arm".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(rhs))),
+                    span: node_to_span(rhs),
+                });
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Expr(span),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Edge(arm_att),
+                    span,
+                });
+                return;
+            }
         }
         // Idempotent per span: the walk reaches many expressions twice
         // (child visit first, then the enclosing assignment/invocant
@@ -13552,7 +13711,13 @@ impl<'a> Builder<'a> {
             std::collections::HashSet::new();
         for ri in &self.return_infos {
             let Some(branch) = ri.arity_branch else { continue };
-            if matches!(branch, ArityBranch::Zero | ArityBranch::Exact(_)) {
+            if matches!(
+                branch,
+                ArityBranch::Zero
+                    | ArityBranch::Exact(_)
+                    | ArityBranch::AtMost(_)
+                    | ArityBranch::AtLeast(_)
+            ) {
                 discriminated.insert(ri.scope);
             }
             if let Some(span) = ri.body_span {
@@ -13561,6 +13726,13 @@ impl<'a> Builder<'a> {
         }
 
         let mut to_push: Vec<Witness> = Vec::new();
+        // Symbols whose arity union governs: their non-arity `return_arm_chain`
+        // fallback must be retracted so a query at an arity the union DOESN'T
+        // cover honestly answers None instead of the arm-join's arity-blind
+        // merge (which subsumes `HashRef` under a fluent `$self` return — the
+        // exact leak that made Mojo::DOM::attr report the invocant class at
+        // arity 1).
+        let mut authoritative_syms: Vec<SymbolId> = Vec::new();
         for scope in &discriminated {
             let arms = match by_scope.get(scope) {
                 Some(a) => a,
@@ -13570,8 +13742,17 @@ impl<'a> Builder<'a> {
             // ReturnExprReducer's UnionOnArgs picks first-match.
             // Empty / Exact(N) before Default; ties broken by
             // source order (stable).
+            // The KNOWN arm types (drop the unresolvable ones). Whether they
+            // genuinely agree decides if the arity union must be authoritative
+            // (retract the non-arity fallback) — see the retraction below.
+            let known_arm_types: Vec<InferredType> = arms
+                .iter()
+                .filter_map(|(_, body_span)| self.bag_query_expr_span(*body_span))
+                .collect();
             let mut sorted: Vec<(ArgGuard, ReturnExpr)> = Vec::new();
-            // Pass 1: Zero / Exact arms.
+            // Pass 1a: exact-match guards (Empty / Exact) — most specific,
+            // must precede the magnitude bands so a point arity claims its own
+            // arm first (`unless @_` before `unless @_ > 1` at arity 0).
             for (branch, body_span) in arms {
                 let Some(t) = self.bag_query_expr_span(*body_span) else { continue };
                 match branch {
@@ -13581,14 +13762,44 @@ impl<'a> Builder<'a> {
                     ArityBranch::Exact(n) => {
                         sorted.push((ArgGuard::Exact(*n), ReturnExpr::Concrete(t)));
                     }
-                    ArityBranch::Default => {} // pass 2
+                    _ => {}
                 }
             }
-            // Pass 2: Default arm(s). Fold to a single Any branch
+            // Pass 1b: magnitude bands (AtMost / AtLeast) — narrower than the
+            // fluent Any arm, broader than an exact point.
+            for (branch, body_span) in arms {
+                let Some(t) = self.bag_query_expr_span(*body_span) else { continue };
+                match branch {
+                    ArityBranch::AtMost(n) => {
+                        sorted.push((ArgGuard::AtMost(*n), ReturnExpr::Concrete(t)));
+                    }
+                    ArityBranch::AtLeast(n) => {
+                        sorted.push((ArgGuard::AtLeast(*n), ReturnExpr::Concrete(t)));
+                    }
+                    _ => {}
+                }
+            }
+            // Pass 2: Default arm(s). Fold to a single fall-through branch
             // — multiple Default arms with disagreeing types lose
             // their disagreement signal here; the per-arm fold
             // runs separately (`seed_return_types_from_bag`) and is
             // what surfaces ambiguity in the writeback.
+            //
+            // The fall-through fires only when NO earlier `unless`-guarded
+            // arm returned. When an `AtMost(N)` early-return arm precedes it
+            // (the Mojo `attr` getter guard), the fall-through can't fire at
+            // arity ≤ N — so its guard is `AtLeast(N+1)`, not `Any`. This is
+            // what keeps the fluent `return $self` from wrongly claiming the
+            // low-arity getter slot: if the `AtMost` arm's own type didn't
+            // resolve (dynamic key), that arity honestly answers None rather
+            // than the fluent class. Without an AtMost peel, `Any` stands.
+            let atmost_ceiling = arms
+                .iter()
+                .filter_map(|(b, _)| match b {
+                    ArityBranch::AtMost(n) => Some(*n),
+                    _ => None,
+                })
+                .max();
             let mut default_t: Option<InferredType> = None;
             for (branch, body_span) in arms {
                 if matches!(branch, ArityBranch::Default) {
@@ -13598,12 +13809,27 @@ impl<'a> Builder<'a> {
                 }
             }
             if let Some(t) = default_t {
-                sorted.push((ArgGuard::Any, ReturnExpr::Concrete(t)));
+                let guard = match atmost_ceiling {
+                    Some(n) => ArgGuard::AtLeast(n.saturating_add(1)),
+                    None => ArgGuard::Any,
+                };
+                sorted.push((guard, ReturnExpr::Concrete(t)));
             }
             if sorted.is_empty() {
                 continue;
             }
             let Some(sym_id) = self.find_sub_symbol_for_scope(*scope) else { continue };
+            // Retract the non-arity `return_arm_chain` fallback ONLY when the
+            // known arms genuinely DISAGREE (Mojo::DOM::attr: HashRef vs the
+            // fluent $self). Then a gap arity honestly answers None instead of
+            // the arm-join's fluent leak. When the arms AGREE (Path::Tiny::path
+            // — every branch returns the invocant class), the arm-join is the
+            // correct answer at any arity AND at the no-hint query hover uses,
+            // so the fallback must stay. "Agree" excludes the lossy
+            // Object-subsumes-HashRef dominance — that's a merge, not agreement.
+            if arms_genuinely_agree(&known_arm_types).is_none() {
+                authoritative_syms.push(sym_id);
+            }
             let return_expr = ReturnExpr::UnionOnArgs { branches: sorted };
             // The Symbol attachment carries it for in-file Symbol-
             // keyed lookups. The MethodOnClass attachment mirrors
@@ -13629,6 +13855,12 @@ impl<'a> Builder<'a> {
                     });
                 }
             }
+        }
+        for sym_id in authoritative_syms {
+            self.bag.remove_attachment_source(
+                &WitnessAttachment::Symbol(sym_id),
+                "return_arm_chain",
+            );
         }
         for w in to_push {
             self.bag.push(w);

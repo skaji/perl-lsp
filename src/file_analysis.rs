@@ -12244,6 +12244,9 @@ impl FileAnalysis {
         self.symbols
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            // An anonymous sub (name `(anon)`) has no callable name — never a
+            // method candidate. Gate on callability, not the `(anon)` spelling.
+            .filter(|s| crate::conventions::is_callable_sub_name(&s.name))
             .filter(|s| !s.namespace.is_framework())
             .filter(|s| seen.insert(s.name.clone()))
             .map(|s| CompletionCandidate {
@@ -12494,7 +12497,9 @@ impl FileAnalysis {
 
         // Subs
         for sym in &self.symbols {
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                && crate::conventions::is_callable_sub_name(&sym.name)
+            {
                 candidates.push(CompletionCandidate {
                     label: sym.name.clone(),
                     kind: sym.kind,

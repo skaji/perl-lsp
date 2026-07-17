@@ -4378,6 +4378,148 @@ has app;               # no default; getter has no return type
     }
 }
 
+/// H7-11: a Mojo `has`-default sub whose body is a `$ENV{X} || <literal>`
+/// (or `//`) fallback must type the getter to the literal's type — the
+/// fallback (RHS) is the guaranteed floor. Pre-fix the two-branch `||`
+/// killed inference and the getter's arity-0 entry vanished entirely.
+#[test]
+fn test_mojo_has_default_or_fallback_types_to_literal() {
+    let fa = build_fa(
+        "
+package My::UA;
+use Mojo::Base -base;
+
+has connect_timeout => sub { $ENV{MOJO_CONNECT_TIMEOUT} || 10 };
+has max_redirects   => sub { $ENV{MOJO_MAX_REDIRECTS} // 5 };
+has ioloop          => sub { My::IOLoop->new };
+",
+    );
+    // `$ENV{X} || 10` → the literal floor is Numeric even though the LHS
+    // env-hash access can't be typed.
+    assert_eq!(
+        fa.sub_return_type_at_arity("connect_timeout", Some(0)),
+        Some(InferredType::Numeric),
+        "|| fallback getter types to the literal floor"
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("max_redirects", Some(0)),
+        Some(InferredType::Numeric),
+        "// fallback getter types to the literal floor"
+    );
+    // A non-`||` default (a class constructor) still types to the class —
+    // the fold only kicks in for the short-circuit operators.
+    assert_eq!(
+        fa.sub_return_type_at_arity("ioloop", Some(0)),
+        Some(InferredType::ClassName("My::IOLoop".into())),
+        "class-constructor default is unaffected by the || fold"
+    );
+}
+
+/// H7-12: an arity-discriminated sub whose 1-arg branch is guarded by a
+/// COMPOUND `unless @_ > 1 || ref $_[0]` (the Mojo::DOM::attr shape). Only
+/// the `@_ > 1` disjunct is arity-decidable; the arm fires at arity ≤ 1, so
+/// the fluent `return $self` must NOT claim arity 1. Pre-fix the compound
+/// guard was unclassifiable, the 1-arg arm dropped, and the fluent `Any`
+/// arm wrongly reported the invocant class at arity 1.
+#[test]
+fn test_compound_arity_guard_does_not_leak_fluent_to_arity_one() {
+    let fa = build_fa(
+        "
+package My::DOM;
+use Mojo::Base -base;
+
+sub attr {
+  my $self = shift;
+  my $attrs = { title => 'x' };
+  return $attrs unless @_;
+  return $attrs->{$_[0]} unless @_ > 1 || ref $_[0];
+  $attrs->{$_[0]} = $_[1];
+  return $self;
+}
+",
+    );
+    // arity 0 → the whole hashref (structural shape, not the fluent class).
+    assert!(
+        fa.sub_return_type_at_arity("attr", Some(0))
+            .is_some_and(|t| t.is_hash_shaped()),
+        "0-arg attr returns the attrs hashref, got {:?}",
+        fa.sub_return_type_at_arity("attr", Some(0))
+    );
+    // arity 1 → the hash VALUE (get), never the fluent invocant class. An
+    // honest None is acceptable; ClassName(My::DOM) is the regression.
+    assert_ne!(
+        fa.sub_return_type_at_arity("attr", Some(1)),
+        Some(InferredType::ClassName("My::DOM".into())),
+        "1-arg attr is the getter branch, not the fluent $self branch"
+    );
+    // arity ≥ 2 → the fluent invocant (set).
+    assert_eq!(
+        fa.sub_return_type_at_arity("attr", Some(2)),
+        Some(InferredType::ClassName("My::DOM".into())),
+        "2-arg attr returns the invocant class for fluent chaining"
+    );
+}
+
+/// H7-12 companion: an arity-discriminated sub whose branches all AGREE on
+/// the return type (Path::Tiny::path — every branch yields the invocant
+/// class) must still answer a NO-HINT query with the agreed type. The
+/// arity-union retraction that keeps a genuinely-disagreeing gap honest
+/// (attr) must NOT fire here, or hover on the declaration loses "returns: X".
+#[test]
+fn test_arity_discriminated_all_arms_agree_answers_no_hint() {
+    // `if ( !@_ && ... )` makes this arity-discriminated (a Zero arm), but
+    // both the early-return and the fall-through yield the same class.
+    let fa = build_fa(
+        "
+package My::Path;
+sub path {
+  my $self = shift;
+  return $self if !@_ && ref($self) eq __PACKAGE__;
+  return bless {}, __PACKAGE__;
+}
+",
+    );
+    // No-hint query (what hover uses) must fold across the agreeing arms.
+    assert_eq!(
+        fa.sub_return_type_at_arity("path", None),
+        Some(InferredType::ClassName("My::Path".into())),
+        "all-arms-agree discriminated sub answers the agreed type at no-hint"
+    );
+    // And every concrete arity agrees too — no gap, no leak.
+    for arity in [Some(0u32), Some(1)] {
+        assert_eq!(
+            fa.sub_return_type_at_arity("path", arity),
+            Some(InferredType::ClassName("My::Path".into())),
+            "agreeing arms answer the same type at arity {arity:?}"
+        );
+    }
+}
+
+/// H7-12 companion: the `||`/`//` fold must NOT type a `shift`/`$_[N]`-LHS
+/// param-default idiom (`my $x = shift // ''`). The value is the unknown
+/// parameter, not the fallback literal — typing it `String` poisoned the
+/// arm-join of subs whose narrowed returns depend on the param (the
+/// Mojolicious url_for regression).
+#[test]
+fn test_shift_default_does_not_poison_param_type() {
+    let fa = build_fa(
+        "
+package My::C;
+sub build {
+  my ($self, $target) = (shift, shift // '');
+  return $self;
+}
+",
+    );
+    // `$target` stays open (the param), not the literal's String — so a
+    // downstream arm-join that expects the real arg type isn't poisoned.
+    assert_ne!(
+        fa.inferred_type_via_bag("$target", Point::new(4, 2)),
+        Some(InferredType::String),
+        "shift-default LHS must not brand the param as the fallback literal's type"
+    );
+}
+
 /// Mirror of B1 for Moo `is => 'rw'` writers — same shape, isa-typed
 /// rather than fluent. The writer reads back the isa type at arity=1.
 #[test]
