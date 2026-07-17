@@ -95,6 +95,14 @@ their worktree branch and do NOT push.
   children die with the turn. Every agent brief gets: "run everything
   foreground and sequential; no monitors, no background waits." (Three agents
   stalled on this in one round.)
+- **Gate chains: strict `&&`, no pipes over the verdict.** Two real failures:
+  a stray `;` mid-chain let a push run after a timeout-killed suite, and
+  `run.pl | grep TALLY` masked run.pl's exit (pipeline exit = grep's) so a
+  CRASH-22 run pushed anyway. Every gate step's exit must gate the next:
+  capture output to a file and test the command's own exit (`run.pl >out;
+  E=$?`), or `set -o pipefail`. Also: two runs sharing a substrate/cache
+  (sibling worktree gates) can CRASH each other transiently — a dirty tally
+  under sibling contention needs one quiet re-run before it's believed.
 - **Version-constant bumps are per-slice declarations.** Parallel slices WILL
   collide on EXTRACT_VERSION/STUB_VERSION (three same-value collisions in one
   round — one poisoned a shared substrate cache into a 163-row crash storm).
