@@ -4322,6 +4322,93 @@ mod pack_symmetry {
         );
     }
 
+    /// Cross-file MEMBER decl→def (H7-3): a class member's out-of-line body
+    /// (`void C::m(){}` in another TU) is NOT linkage-visible, so the name-keyed
+    /// def-candidates table never pulls it in — the free-function decl→def hop
+    /// misses it. The member fallback in `preferred_definitions` sweeps the
+    /// closure-connected cached files directly. Two entry shapes, one axis:
+    /// an explicitly-qualified call (`C::m(...)`, owner-anchored path) and a
+    /// cursor sitting on the header declaration itself.
+    #[test]
+    fn goto_def_links_member_decl_to_out_of_line_def_cross_file() {
+        use std::sync::Arc;
+        // No enclosing namespace, so the def's `package` stays the qualifier's
+        // class (the container-reanchor never fires) — exercises resolution/
+        // linking on a shape whose extraction packages the member correctly.
+        let header_src = "struct MemTable {\n  void Add(int s);\n};\n";
+        let def_src = "void MemTable::Add(int s) { return; }\n";
+        let caller_src = "void writer() {\n  MemTable::Add(3);\n}\n";
+
+        let header = cpp(header_src);
+        let mut def_tu = cpp(def_src);
+        def_tu.include_closure = crate::file_analysis::path_intern::ClosureList::from_iter(
+            std::iter::once("/fake/mt/memtable.h"),
+        );
+        let mut caller = cpp(caller_src);
+        caller.include_closure = crate::file_analysis::path_intern::ClosureList::from_iter(
+            std::iter::once("/fake/mt/memtable.h"),
+        );
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        idx.register_symbols(PathBuf::from("/fake/mt/memtable.h"), Arc::new(header));
+        idx.register_symbols(PathBuf::from("/fake/mt/memtable.cc"), Arc::new(def_tu));
+        idx.register_symbols(PathBuf::from("/fake/mt/writer.cc"), Arc::new(caller));
+        let store = FileStore::new();
+
+        // (1) Explicitly-qualified cross-file call: `MemTable::Add(3)`.
+        let origin = idx
+            .get_cached_scoped(
+                "writer",
+                &["/fake/mt/memtable.h".to_string()].iter().cloned().collect(),
+            )
+            .expect("writer.cc registered");
+        assert!(origin.path.ends_with("writer.cc"));
+        let cs = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/mt/writer.cc")),
+            tree_sitter::Point { row: 1, column: 12 }, // on `Add`
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(caller_src)
+        .pack_routed();
+        let defs = cs.definitions();
+        assert!(
+            defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.cc"))),
+            "the out-of-line body is present (def must be reachable): {defs:?}"
+        );
+        assert!(
+            matches!(&defs[0].key, FileKey::Path(p) if p.ends_with("memtable.cc")),
+            "the bodied def ranks first: {defs:?}"
+        );
+        assert!(
+            defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.h"))),
+            "the header decl is kept, never pruned: {defs:?}"
+        );
+
+        // (2) Cursor ON the header declaration: still offers the body first.
+        let hdr_origin = idx
+            .get_cached("MemTable")
+            .expect("MemTable class registered");
+        assert!(hdr_origin.path.ends_with("memtable.h"));
+        let cs2 = resolve(
+            &store,
+            &hdr_origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/mt/memtable.h")),
+            tree_sitter::Point { row: 1, column: 7 }, // on `Add` in the decl
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(header_src)
+        .pack_routed();
+        let defs2 = cs2.definitions();
+        assert!(
+            defs2.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.cc"))),
+            "goto-def on the decl reaches the out-of-line body: {defs2:?}"
+        );
+    }
+
     /// The visibility gate's textual-inclusion extension: a file whose own
     /// closure reaches no def path still joins the references image when a
     /// DIRECT seer includes it (`ae.c: #include "ae_epoll.c"`); a genuinely

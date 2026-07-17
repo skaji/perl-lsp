@@ -1,0 +1,23 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "cpp-h73-member-call-reaches-out-of-line-def",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture/oolmember",
+      "file": "caller.cc", "line": 2, "col": 12,
+      "comment": "Qualified cross-file member call MemTable::Add(3) must reach the out-of-line body (table.cc), not stop at the header prototype. Decl kept but def must be present (H7-3).",
+      "expect": { "all": ["table.cc:2:16"], "none": [] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-h73-member-decl-reaches-out-of-line-def",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture/oolmember",
+      "file": "table.h", "line": 3, "col": 7,
+      "comment": "goto-def with the cursor ON the in-class prototype offers the out-of-line body first (decl->def sibling axis), decl kept.",
+      "expect": { "all": ["table.cc:2:16"], "none": [] },
+      "status": "gold"
+    }
+  ]
+}

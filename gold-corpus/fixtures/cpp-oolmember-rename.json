@@ -1,0 +1,29 @@
+{
+  "capability": "rename",
+  "rows": [
+    {
+      "id": "cpp-h73-member-rename-from-decl",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture/oolmember",
+      "file": "table.h", "line": 3, "col": 7, "newname": "Insert",
+      "comment": "Rename anchored at the header prototype must edit decl + out-of-line def + call site — a member decl<->def link missing in this direction produced the 1-edit non-compiling set (H7-3 bug 2).",
+      "expect": { "all": [
+        "oolmember/caller.cc", "oolmember/table.cc", "oolmember/table.h",
+        "\"new_text\":\"Insert\""
+      ], "none": [] },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-h73-member-rename-from-def",
+      "difficulty": "hard", "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp", "root": "gold-corpus/cpp-fixture/oolmember",
+      "file": "table.cc", "line": 1, "col": 15, "newname": "Insert",
+      "comment": "Same three-site edit anchored at the out-of-line definition.",
+      "expect": { "all": [
+        "oolmember/caller.cc", "oolmember/table.cc", "oolmember/table.h",
+        "\"new_text\":\"Insert\""
+      ], "none": [] },
+      "status": "gold"
+    }
+  ]
+}

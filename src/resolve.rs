@@ -1292,33 +1292,74 @@ impl<'a> CandidateSet<'a> {
                 let self_str = self_path.to_string_lossy().into_owned();
                 let decl_path = key_for_sort(&decl.key);
                 let decl_str = decl_path.to_string_lossy().into_owned();
+                // Connected when the origin sees the def, when the def's TU
+                // includes the origin (the reverse `server.c` ⊇ `server.h`
+                // link), OR when the def's TU includes the DECL's file. The
+                // last is the general C separate-compilation link: a body's
+                // TU includes the header that declares the same identity —
+                // and the decl is the proven-same-symbol waypoint the origin
+                // already resolved to. A THIRD TU calling through a shared
+                // header (`t_string.c` → `server.h` proto, body in `db.c`)
+                // reaches the body via this clause though it never sees
+                // `db.c` textually.
+                let connected = |cached: &std::sync::Arc<crate::file_analysis::CachedModule>| {
+                    let p = cached.path.to_string_lossy();
+                    cached.path != decl_path
+                        && (visible.contains(p.as_ref())
+                            || cached.analysis.include_closure.contains(&self_str)
+                            || cached.analysis.include_closure.contains(&decl_str))
+                };
                 let mut cands = idx.def_candidates(&sym.name);
                 cands.sort_by(|a, b| a.path.cmp(&b.path));
-                for cached in cands {
-                    if cached.path == decl_path {
-                        continue;
-                    }
-                    let p = cached.path.to_string_lossy().into_owned();
-                    // Connected when the origin sees the def, when the def's TU
-                    // includes the origin (the reverse `server.c` ⊇ `server.h`
-                    // link), OR when the def's TU includes the DECL's file. The
-                    // last is the general C separate-compilation link: a body's
-                    // TU includes the header that declares the same identity —
-                    // and the decl is the proven-same-symbol waypoint the origin
-                    // already resolved to. A THIRD TU calling through a shared
-                    // header (`t_string.c` → `server.h` proto, body in `db.c`)
-                    // reaches the body via this clause though it never sees
-                    // `db.c` textually.
-                    let connected = visible.contains(&p)
-                        || cached.analysis.include_closure.contains(&self_str)
-                        || cached.analysis.include_closure.contains(&decl_str);
-                    if !connected {
+                for cached in &cands {
+                    if !connected(cached) {
                         continue;
                     }
                     let key = FileKey::Path(cached.path.clone());
-                    let whole = idx.whole_present(&cached);
+                    let whole = idx.whole_present(cached);
                     for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
                         push(&mut defs, &key, s.selection_span);
+                    }
+                }
+                // Member fallback: a class member's out-of-line body is NOT
+                // linkage-visible, so the name-keyed `def_candidates` table
+                // never pulls its TU in (the same gap `member_def_location`'s
+                // broad scan and `overload_arity_definitions`' `get_cached`
+                // seed cover). When the identity is a class-owned callable and
+                // no bodied def surfaced above, sweep the connected cached
+                // files directly. Gated on the empty result so free-function /
+                // static decl→def (already covered) never pays the broad scan.
+                let is_member_callable = matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                    && sym.package.is_some();
+                if defs.is_empty() && is_member_callable {
+                    let mut hits: Vec<(String, RefLocation)> = Vec::new();
+                    idx.for_each_cached_file(&mut |cached| {
+                        if !connected(cached) {
+                            return;
+                        }
+                        let key = FileKey::Path(cached.path.clone());
+                        let whole = idx.whole_present(cached);
+                        for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
+                            if s.selection_span.start == decl.span.start
+                                && file_key_eq(&key, &decl.key)
+                            {
+                                continue;
+                            }
+                            hits.push((
+                                cached.path.to_string_lossy().into_owned(),
+                                RefLocation {
+                                    key: key.clone(),
+                                    span: s.selection_span,
+                                    access: AccessKind::Declaration,
+                                    rewritable: true,
+                                    label: None,
+                                },
+                            ));
+                        }
+                    });
+                    hits.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (_, loc) in hits {
+                        push(&mut defs, &loc.key, loc.span);
                     }
                 }
             }
@@ -1328,6 +1369,32 @@ impl<'a> CandidateSet<'a> {
         }
         defs.push(decl);
         defs
+    }
+
+    /// Route a member/method goto-def location through the decl→def sibling
+    /// axis. `member_def_location` and the cross-file inherited-method path both
+    /// land on the class's DECLARATION (the header's in-class prototype); a
+    /// `ClassName::method(){}` body lives out-of-line in another TU. The
+    /// free-function by-name tail already hops decl→def through
+    /// `preferred_definitions`; members went straight to the decl because their
+    /// resolution enters through the owner-anchored / inherited-method paths
+    /// instead. Feed the SAME axis by resolving the decl's own FileAnalysis
+    /// (origin, or the cross-file cached copy) so the bodied def ranks first,
+    /// decl kept. A decl whose analysis is unreachable degrades to the decl.
+    fn prefer_member_defs(&self, decl: RefLocation) -> Vec<RefLocation> {
+        if !self.pack {
+            return vec![decl];
+        }
+        if file_key_eq(&decl.key, &self.origin_key) {
+            return self.preferred_definitions(decl, self.origin);
+        }
+        if let (Some(idx), FileKey::Path(p)) = (self.idx(), decl.key.clone()) {
+            if let Some(cached) = idx.cached_by_path(&p) {
+                let whole = idx.whole_present(&cached);
+                return self.preferred_definitions(decl, &whole);
+            }
+        }
+        vec![decl]
     }
 
     /// Overload arity ranking (pack): a call to a name with MULTIPLE callable
@@ -1526,7 +1593,9 @@ impl<'a> CandidateSet<'a> {
                 if let Some(owner) = qualifier_at_point(source, point) {
                     if let Some(name) = word_at_point(source, point) {
                         if let Some(loc) = self.member_def_location(owner, name) {
-                            return vec![loc];
+                            // The member lookup lands on the class DECLARATION;
+                            // hop to the out-of-line body (decl→def axis).
+                            return self.prefer_member_defs(loc);
                         }
                     }
                 }
@@ -1943,6 +2012,29 @@ impl<'a> CandidateSet<'a> {
                             let whole = idx.whole_present(&cached);
                             if let Some(sub_info) = whole.sub_info_view(method) {
                                 if Url::from_file_path(&cached.path).is_ok() {
+                                    // A pack member call lands on the class
+                                    // module's DECLARATION; hop to the
+                                    // out-of-line body (decl→def axis) like the
+                                    // free-function tail. The decl's own symbol
+                                    // span (not just `def_line`) is what the
+                                    // axis matches on. Perl subs keep the
+                                    // `def_line` jump (`prefer_member_defs` is a
+                                    // no-op off-pack anyway).
+                                    if self.pack {
+                                        if let Some(sym) = whole.symbols.iter().find(|s| {
+                                            s.name == method
+                                                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                                                && pkg_agrees(true, s.package.as_deref(), Some(class))
+                                        }) {
+                                            return self.prefer_member_defs(RefLocation {
+                                                key: FileKey::Path(cached.path.clone()),
+                                                span: sym.selection_span,
+                                                access: AccessKind::Declaration,
+                                                rewritable: true,
+                                                label: None,
+                                            });
+                                        }
+                                    }
                                     return vec![line_loc(
                                         cached.path.clone(),
                                         sub_info.def_line(),
