@@ -122,3 +122,9 @@ db/db_impl.cc:1199 goto-def → header pure-virtual, not the same-file
 - include-guard `#define`s listed as kind Variable in outline/workspace-symbol.
 - `Modules: N resolved` counter static across a 40-min session (DBIC note) —
   possible contributor to H7-9.
+- cpp macro transform is position-blind: `#define Simplify DontCallSimplify`
+  (re2/simplify.cc:201) renames occurrences BEFORE the `#define` line too, so
+  the extracted `Regexp::Simplify` def at simplify.cc:180 and the call at :31
+  carry the expanded name — the residual 2-ref shortfall on H7-2's references
+  acceptance. Surfaced by H7-2; extraction itself is correct. Fix belongs in
+  cpp_reparse's expansion ordering (only expand at/after the directive).
