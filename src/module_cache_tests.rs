@@ -950,3 +950,121 @@ fn refresh_deps_stamp_revalidates_consumer_rows() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// H7-16 regression: the bag-rehydration reader must survive the transient
+/// `SQLITE_CANTOPEN` a fresh read-only open hits while a sibling writer is
+/// mid-`wal_checkpoint` on the WAL-mode cache DB — a read-only connection
+/// can't rebuild the wal-index in that window. The captured flake was a
+/// strict-residency PANIC: the read-only open failed, the loader reported the
+/// blob absent, and the tripwire aborted the run though the row was on disk
+/// the whole time. `load_with_wal_fallback` recovers through a read-write open
+/// (which waits the writer out via `busy_timeout`), so a live blob is never
+/// mislabeled absent.
+#[test]
+fn readonly_open_failure_recovers_through_read_write() {
+    // The captured H7-16 cause is a fresh read-only open transiently returning
+    // SQLITE_CANTOPEN while a sibling writer is mid-checkpoint on the WAL DB —
+    // an OS/SQLite timing race that can't be forced from static file state.
+    // Inject it: a read-only open result of `Err` (open failed) with a working
+    // read-write recovery connection. The fix loads the row through RW instead
+    // of mislabeling the live blob absent; without the RW fallback this same
+    // input yields OpenerFailed and the strict tripwire panics.
+    let dir = std::env::temp_dir().join(format!("h716_inject_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("modules.db");
+    let pm = dir.join("Seed.pm");
+    std::fs::write(&pm, "package Seed;\nsub f { my $s = shift; return 'x'; }\n1;\n").unwrap();
+    let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
+    let pm_str = pm.to_string_lossy().into_owned();
+    {
+        let w = Connection::open(&db).unwrap();
+        w.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        init_schema(&w).unwrap();
+        save_to_db(&w, &pm_str, &Some(cached.clone()), "workspace");
+    }
+
+    // Read-only "open failed", RW open works → recovered, full bag present.
+    let recovered = rehydrate_from_opens(
+        Err("simulated SQLITE_CANTOPEN".to_string()),
+        || open_rw_shared_at(&db),
+        std::slice::from_ref(&pm_str),
+    )
+    .expect("RW fallback must recover the row a failed read-only open couldn't reach");
+    assert!(!recovered.bag_is_evicted());
+    assert_eq!(recovered.witnesses.len(), cached.analysis.witnesses.len());
+
+    // Read-only "open failed" AND no RW recovery conn → honest OpenerFailed,
+    // NOT a fabricated presence: the strict tripwire must still fire on a
+    // genuinely unreadable DB.
+    let miss = rehydrate_from_opens(
+        Err("simulated SQLITE_CANTOPEN".to_string()),
+        || None,
+        std::slice::from_ref(&pm_str),
+    )
+    .unwrap_err();
+    assert!(matches!(miss, RehydrateMiss::OpenerFailed(_)), "got {miss}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The fix must never trade a false absence for a fabricated presence: a row
+/// that is genuinely missing stays a discriminated miss so the strict
+/// tripwire keeps firing on real invariant breaks.
+#[test]
+fn rehydrate_absent_row_is_honest_miss() {
+    let dir = std::env::temp_dir().join(format!("h716_absent_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("modules.db");
+    {
+        let w = Connection::open(&db).unwrap();
+        init_schema(&w).unwrap();
+    }
+    // Row truly absent (present DB, no matching row) → NoRow, via both opens.
+    let miss = load_with_wal_fallback(&db, &["/no/such.pm".to_string()]).unwrap_err();
+    assert!(matches!(miss, RehydrateMiss::NoRow), "got {miss}");
+    // No DB file at all → OpenerFailed (neither read-only nor read-write open).
+    let none = load_with_wal_fallback(&dir.join("nope.db"), &["/x.pm".to_string()]).unwrap_err();
+    assert!(matches!(none, RehydrateMiss::OpenerFailed(_)), "got {none}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `load_one_diag` names each on-disk reality distinctly so the tripwire can
+/// point at a mechanism instead of a collapsed "None".
+#[test]
+fn load_one_diag_discriminates_failures() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("h716_diag.pm");
+    std::fs::write(&pm, "package D;\nsub f { 1 }\n1;\n").unwrap();
+    let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
+    let pm_str = pm.to_string_lossy().into_owned();
+    save_to_db(&conn, &pm_str, &Some(cached), "workspace");
+    assert!(load_one_diag(&conn, &pm_str).is_ok());
+    assert!(matches!(
+        load_one_diag(&conn, "/absent.pm").unwrap_err(),
+        RehydrateMiss::NoRow
+    ));
+    conn.execute(
+        "INSERT INTO modules (module_name, path, mtime_secs, file_size, source, \
+         analysis, extract_version, deps_stamp) VALUES ('E','/empty.pm',0,0,'import',NULL,?1,0)",
+        params![EXTRACT_VERSION],
+    )
+    .unwrap();
+    assert!(matches!(
+        load_one_diag(&conn, "/empty.pm").unwrap_err(),
+        RehydrateMiss::EmptyBlob
+    ));
+    conn.execute(
+        "INSERT INTO modules (module_name, path, mtime_secs, file_size, source, \
+         analysis, extract_version, deps_stamp) VALUES ('G','/garbage.pm',0,0,'import',?1,?2,0)",
+        params![Some(vec![9u8, 9, 9, 9]), EXTRACT_VERSION],
+    )
+    .unwrap();
+    assert!(matches!(
+        load_one_diag(&conn, "/garbage.pm").unwrap_err(),
+        RehydrateMiss::DecodeFailed
+    ));
+    let _ = std::fs::remove_file(&pm);
+}

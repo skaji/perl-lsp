@@ -27,8 +27,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::file_analysis::FileAnalysis;
+use crate::module_cache::RehydrateMiss;
 
-type Loader = Box<dyn Fn(&Path) -> Option<FileAnalysis> + Send + Sync>;
+type Loader = Box<dyn Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync>;
 
 pub struct PackBagCache {
     /// Rehydrated, bag-present analyses keyed by canonical path.
@@ -54,7 +55,7 @@ pub struct PackBagCache {
 impl PackBagCache {
     pub fn new(
         cap_bytes: usize,
-        loader: impl Fn(&Path) -> Option<FileAnalysis> + Send + Sync + 'static,
+        loader: impl Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
     ) -> Self {
         PackBagCache {
             entries: DashMap::new(),
@@ -76,16 +77,23 @@ impl PackBagCache {
     /// `None` only when the loader can't produce the file (no row / decode
     /// failure) — the caller then degrades to the bag-less resident copy.
     pub fn bag_for(&self, path: &Path) -> Option<Arc<FileAnalysis>> {
+        self.bag_for_diag(path).ok()
+    }
+
+    /// `bag_for` that surfaces the loader's discriminated failure so the
+    /// strict-residency tripwire can name WHY rehydration missed instead of
+    /// collapsing every cause into "loader returned None".
+    pub fn bag_for_diag(&self, path: &Path) -> Result<Arc<FileAnalysis>, RehydrateMiss> {
         if let Some(hit) = self.entries.get(path) {
             let arc = hit.value().clone();
             drop(hit);
             self.recency.insert(path.to_path_buf(), self.tick());
-            return Some(arc);
+            return Ok(arc);
         }
         let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
         let fa = Arc::new((self.loader)(path)?);
         if self.cap_bytes == 0 {
-            return Some(fa); // rehydrate-and-drop
+            return Ok(fa); // rehydrate-and-drop
         }
         // Retain only if no invalidation landed during the decode — the
         // decoded copy may be the generation the invalidate was erasing.
@@ -93,14 +101,14 @@ impl PackBagCache {
         // just must not be pinned.
         let gen_after = self.generation.get(path).map(|g| *g).unwrap_or(0);
         if gen_after != gen_before {
-            return Some(fa);
+            return Ok(fa);
         }
         let sz = fa.heap_estimate().total();
         self.entries.insert(path.to_path_buf(), fa.clone());
         self.recency.insert(path.to_path_buf(), self.tick());
         self.bytes.fetch_add(sz, Ordering::Relaxed);
         self.evict_to_cap(path);
-        Some(fa)
+        Ok(fa)
     }
 
     /// Drop LRU-tail entries until the retained byte total is within cap. Never
@@ -156,7 +164,7 @@ mod tests {
         let c = calls.clone();
         let cache = PackBagCache::new(0, move |_p| {
             c.fetch_add(1, Ordering::Relaxed);
-            Some(empty_fa())
+            Ok(empty_fa())
         });
         let p = PathBuf::from("/x/a.h");
         assert!(cache.bag_for(&p).is_some());
@@ -172,7 +180,7 @@ mod tests {
         let c = calls.clone();
         let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| {
             c.fetch_add(1, Ordering::Relaxed);
-            Some(empty_fa())
+            Ok(empty_fa())
         });
         let p = PathBuf::from("/x/a.h");
         assert!(cache.bag_for(&p).is_some());
@@ -186,7 +194,7 @@ mod tests {
         // only one so inserting a second evicts the first.
         let one = empty_fa().heap_estimate().total();
         assert!(one > 0);
-        let cache = PackBagCache::new(one, move |_p| Some(empty_fa()));
+        let cache = PackBagCache::new(one, move |_p| Ok(empty_fa()));
         let a = PathBuf::from("/x/a.h");
         let b = PathBuf::from("/x/b.h");
         cache.bag_for(&a);
@@ -209,7 +217,7 @@ mod tests {
             if let Some(c) = c2.get() {
                 c.invalidate(&p2);
             }
-            Some(empty_fa())
+            Ok(empty_fa())
         });
         let _ = cache.set(built);
         let c = cache.get().unwrap();
@@ -222,7 +230,7 @@ mod tests {
 
     #[test]
     fn invalidate_drops_entry() {
-        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| Some(empty_fa()));
+        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| Ok(empty_fa()));
         let p = PathBuf::from("/x/a.h");
         cache.bag_for(&p);
         assert!(cache.entries.contains_key(&p));

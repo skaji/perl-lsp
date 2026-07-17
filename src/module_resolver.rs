@@ -1347,15 +1347,20 @@ pub fn index_pack_languages(
         // decodes the one requested file's full bag.
         let bag_cache = {
             let cache_key_owned = cache_key.map(|s| s.to_string());
-            let loader = move |path: &std::path::Path| -> Option<crate::file_analysis::FileAnalysis> {
-                let conn = module_cache::open_cache_db_readonly(cache_key_owned.as_deref(), lang)?;
+            let loader = move |path: &std::path::Path| {
                 // The blob is persisted under the CANONICAL path (both feed
                 // paths write `canon`), while the resident copy may be
                 // registered under the walk's raw path — canonicalize so the
                 // keyed decode matches regardless of which form the caller holds.
+                // The discriminated helper survives the readonly-open
+                // CANTOPEN/WAL race and names every other miss cause.
                 let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                module_cache::load_one(&conn, &canon.to_string_lossy())
-                    .or_else(|| module_cache::load_one(&conn, &path.to_string_lossy()))
+                let mut spellings = vec![canon.to_string_lossy().into_owned()];
+                let raw = path.to_string_lossy().into_owned();
+                if raw != spellings[0] {
+                    spellings.push(raw);
+                }
+                module_cache::open_and_load_diag(cache_key_owned.as_deref(), lang, &spellings)
             };
             Arc::new(crate::pack_bag_cache::PackBagCache::new(bag_cache_bytes, loader))
         };

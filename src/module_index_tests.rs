@@ -39,7 +39,7 @@ fn bag_present_rehydrates_evicted_at_both_caps() {
         // Loader hands back the FULL analysis (as SQLite would after decode).
         let full_for_loader = full.analysis.clone();
         let cache = Arc::new(PackBagCache::new(cap, move |_p| {
-            Some((*full_for_loader).clone())
+            Ok((*full_for_loader).clone())
         }));
         let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
         let got = idx.bag_present(&stripped_cached);
@@ -517,7 +517,7 @@ fn register_symbols_stripping_feeds_before_evict() {
     // whole_present rehydrates symbols through the LRU.
     let full_for_loader = full.analysis.clone();
     let cache = std::sync::Arc::new(PackBagCache::new(1024 * 1024, move |_p| {
-        Some((*full_for_loader).clone())
+        Ok((*full_for_loader).clone())
     }));
     let idx2 = ModuleIndex::new_for_cli().with_bag_cache(cache);
     let whole = idx2.whole_present(&hit);
@@ -1057,7 +1057,11 @@ fn foreign_path_rehydrates_through_the_owning_sibling() {
     hub.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
         128 * 1024 * 1024,
         move |p: &std::path::Path| {
-            (p == std::path::Path::new("/fake/hub/Ghost.pm")).then(|| (*served).clone())
+            if p == std::path::Path::new("/fake/hub/Ghost.pm") {
+                Ok((*served).clone())
+            } else {
+                Err(crate::module_cache::RehydrateMiss::NoRow)
+            }
         },
     )));
 

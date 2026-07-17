@@ -124,9 +124,87 @@ pub fn open_cache_db(_workspace_root: Option<&str>, _lang: &str) -> Option<Conne
 #[cfg(not(test))]
 pub fn open_cache_db_readonly(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
     let dir = cache_dir_for_workspace(workspace_root)?;
+    open_cache_reader_at(&db_path_for(&dir, lang))
+}
+
+/// Resilient query-path reader open (`open_reader_retrying`): retries across
+/// the transient H7-16 CANTOPEN window instead of returning an empty result.
+/// Routing every reader — bag rehydration, the relational-ref reader, warm
+/// streaming — through here keeps the writer's WAL-checkpoint window from
+/// degrading their results to silent absence. `None` only when the window
+/// never clears (DB absent / truly unreadable).
+pub fn open_cache_reader_at(db_path: &std::path::Path) -> Option<Connection> {
+    open_reader_retrying(db_path).ok()
+}
+
+/// Open the cache reader across the transient window a writer's WAL
+/// checkpoint/reset opens. During it a fresh open of the WAL-mode DB (SQLite
+/// setting up the `-wal`/`-shm` auxiliaries) returns `SQLITE_CANTOPEN` for
+/// BOTH read-only and read-write modes — the captured H7-16 cause — and
+/// `busy_timeout` does NOT cover the open itself. Each attempt tries
+/// read-only then read-write (a read-write open additionally recovers a WAL
+/// a read-only open can't map); bounded backoff (~0.26 s total) waits the
+/// window out. `Err` only when the window never clears — a genuinely
+/// unreadable DB, a real invariant break the strict tripwire should catch.
+pub fn open_reader_retrying(db_path: &std::path::Path) -> Result<Connection, String> {
+    let mut delay = std::time::Duration::from_millis(2);
+    let mut last = String::new();
+    for attempt in 0..10 {
+        match open_readonly_at(db_path) {
+            Ok(c) => {
+                if attempt > 0 {
+                    log::warn!(
+                        "cache reader open {db_path:?} recovered read-only after \
+                         {attempt} retr{} (transient WAL-checkpoint CANTOPEN window)",
+                        if attempt == 1 { "y" } else { "ies" }
+                    );
+                }
+                return Ok(c);
+            }
+            Err(e) => last = e,
+        }
+        // Reaching here means the read-only open just failed; a read-write
+        // open that succeeds recovered the transient window. Log even on
+        // attempt 0 so an RW recovery is observable, never silent.
+        if let Some(c) = open_rw_shared_at(db_path) {
+            log::warn!(
+                "cache reader open {db_path:?} recovered read-write on attempt \
+                 {attempt} (read-only hit the transient CANTOPEN window)"
+            );
+            return Ok(c);
+        }
+        if attempt < 9 {
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+    Err(last)
+}
+
+/// Read-only open of an explicit DB file. Path-taking so the rehydration
+/// logic is unit-testable without the cache-dir plumbing.
+pub fn open_readonly_at(db_path: &std::path::Path) -> Result<Connection, String> {
     let conn = Connection::open_with_flags(
-        db_path_for(&dir, lang),
+        db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("readonly open {db_path:?}: {e}"))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+    Ok(conn)
+}
+
+/// Read-WRITE open (no CREATE) of an explicit, already-persisted DB file —
+/// the H7-16 recovery open. A fresh `SQLITE_OPEN_READ_ONLY` open of a
+/// WAL-mode cache DB transiently fails with `SQLITE_CANTOPEN` while a
+/// sibling writer is mid-`wal_checkpoint` (the -wal is being truncated and
+/// the -shm reset; a read-only conn can't rebuild the wal-index in that
+/// window). A read-write open recovers the WAL and, via `busy_timeout`,
+/// waits the writer out — so the blob that is on disk the whole time stays
+/// reachable. The captured cause of the strict-residency crash.
+pub fn open_rw_shared_at(db_path: &std::path::Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
@@ -136,6 +214,34 @@ pub fn open_cache_db_readonly(workspace_root: Option<&str>, lang: &str) -> Optio
 #[cfg(test)]
 pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Option<Connection> {
     None
+}
+
+/// Discriminated rehydration failure — the honest replacement for the
+/// collapsed "loader returned None". Every arm names a distinct on-disk
+/// reality so the strict-residency panic points at a mechanism, not a
+/// shrug.
+#[derive(Debug, Clone)]
+pub enum RehydrateMiss {
+    /// Couldn't even open the cache DB read-only (SQLite error text).
+    OpenerFailed(String),
+    /// The `modules` table has no row for any candidate path spelling — not
+    /// even through a read-write open (so not the recoverable WAL race).
+    NoRow,
+    /// Row(s) exist but every candidate blob is NULL/empty.
+    EmptyBlob,
+    /// Blob present but zstd/bincode decode failed (shape/version skew).
+    DecodeFailed,
+}
+
+impl std::fmt::Display for RehydrateMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RehydrateMiss::OpenerFailed(e) => write!(f, "opener failed: {e}"),
+            RehydrateMiss::NoRow => write!(f, "no row for path (read-only and read-write both empty)"),
+            RehydrateMiss::EmptyBlob => write!(f, "row present but blob empty/NULL"),
+            RehydrateMiss::DecodeFailed => write!(f, "blob decode failed"),
+        }
+    }
 }
 
 /// Bumped when the ROW format of the relational ref index changes shape.
@@ -687,6 +793,12 @@ pub fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
 /// No mtime/closure validation: the caller (`PackBagCache`) invalidates its
 /// entry on file change, and the row's shape is EXTRACT_VERSION-pinned.
 pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
+    load_one_diag(conn, path).ok()
+}
+
+/// `load_one` that discriminates the failure (see `RehydrateMiss`) instead
+/// of collapsing to `None`, so the rehydration tripwire can name the cause.
+pub fn load_one_diag(conn: &Connection, path: &str) -> Result<FileAnalysis, RehydrateMiss> {
     // A dual-homed project-lib file has TWO rows for one path (name-keyed
     // import + path-keyed workspace). Prefer a row whose stamp matches the
     // disk (one tier's persist may have failed or lagged, leaving a stale
@@ -699,7 +811,7 @@ pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
             "SELECT analysis, mtime_secs, file_size FROM modules WHERE path = ?1 \
              ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END",
         )
-        .ok()?;
+        .map_err(|_| RehydrateMiss::NoRow)?;
     let rows: Vec<(Option<Vec<u8>>, i64, i64)> = stmt
         .query_map(params![path], |row| {
             Ok((
@@ -708,9 +820,12 @@ pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
                 row.get::<_, i64>(2)?,
             ))
         })
-        .ok()?
+        .map_err(|_| RehydrateMiss::NoRow)?
         .flatten()
         .collect();
+    if rows.is_empty() {
+        return Err(RehydrateMiss::NoRow);
+    }
     let pick = |require_stamp: bool| -> Option<&Vec<u8>> {
         rows.iter().find_map(|(blob, m, sz)| {
             let blob = blob.as_ref().filter(|b| !b.is_empty())?;
@@ -720,8 +835,105 @@ pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
             Some(blob)
         })
     };
-    let blob = pick(rows.len() > 1).or_else(|| pick(false))?;
-    decode_analysis(blob)
+    let blob = pick(rows.len() > 1)
+        .or_else(|| pick(false))
+        .ok_or(RehydrateMiss::EmptyBlob)?;
+    decode_analysis(blob).ok_or(RehydrateMiss::DecodeFailed)
+}
+
+/// The bag-cache rehydration loader body, shared by every per-lang loader
+/// closure (Perl hub + pack sub-indexes). Tries each candidate path spelling
+/// (canonical vs raw walk path — the blob is written canonical but a
+/// resident copy may be keyed raw) and survives the readonly-open CANTOPEN
+/// race via `load_with_wal_fallback`'s read-write recovery. Every failure is
+/// discriminated for the strict-residency tripwire.
+#[cfg(not(test))]
+pub fn open_and_load_diag(
+    cache_key: Option<&str>,
+    lang: &str,
+    paths: &[String],
+) -> Result<FileAnalysis, RehydrateMiss> {
+    let dir = cache_dir_for_workspace(cache_key)
+        .ok_or_else(|| RehydrateMiss::OpenerFailed("no cache dir for workspace".into()))?;
+    load_with_wal_fallback(&db_path_for(&dir, lang), paths)
+}
+
+#[cfg(test)]
+pub fn open_and_load_diag(
+    _cache_key: Option<&str>,
+    _lang: &str,
+    _paths: &[String],
+) -> Result<FileAnalysis, RehydrateMiss> {
+    Err(RehydrateMiss::NoRow)
+}
+
+/// Rehydrate one file from an explicit cache DB, discriminating every
+/// failure and surviving the H7-16 readonly/WAL race. Path-taking so the
+/// whole policy is unit-testable.
+///
+/// The captured cause: a fresh open of the WAL-mode cache DB transiently
+/// returns `SQLITE_CANTOPEN` for BOTH read-only and read-write modes while a
+/// sibling writer is mid-`wal_checkpoint`/WAL-reset — SQLite can't set up the
+/// `-wal`/`-shm` auxiliaries in that window, and `busy_timeout` doesn't cover
+/// the open. The blob is on disk the whole time. `open_reader_retrying` waits
+/// the window out with bounded backoff; a recovering read-write read then
+/// `wal_checkpoint`s so the next open faces a folded WAL. The strict-residency
+/// tripwire still fires only when the window never clears or even a read-write
+/// open can't produce the row — a genuinely unreadable/absent blob, a real
+/// invariant break.
+pub fn load_with_wal_fallback(
+    db_path: &std::path::Path,
+    paths: &[String],
+) -> Result<FileAnalysis, RehydrateMiss> {
+    // `open_reader_retrying` waits out the transient CANTOPEN window; the
+    // rw_open closure below then handles the (rarer) opened-but-row-invisible
+    // case. Both are the H7-16 recovery.
+    rehydrate_from_opens(
+        open_reader_retrying(db_path),
+        || open_rw_shared_at(db_path),
+        paths,
+    )
+}
+
+/// The fallback POLICY, split from the openers so the read-only-open-failure
+/// branch is deterministically testable (the real `SQLITE_CANTOPEN` race
+/// can't be forced from static file state). `ro` is the read-only open
+/// result (`Err` = the open itself failed — the captured H7-16 cause);
+/// `rw_open` lazily opens the read-write recovery connection.
+fn rehydrate_from_opens(
+    ro: Result<Connection, String>,
+    rw_open: impl FnOnce() -> Option<Connection>,
+    paths: &[String],
+) -> Result<FileAnalysis, RehydrateMiss> {
+    let ro_err = ro.as_ref().err().cloned();
+    let mut last = RehydrateMiss::NoRow;
+    if let Ok(conn) = &ro {
+        for p in paths {
+            match load_one_diag(conn, p) {
+                Ok(fa) => return Ok(fa),
+                Err(RehydrateMiss::NoRow) => {}
+                Err(other) => last = other,
+            }
+        }
+    }
+    // RW fallback covers BOTH a failed readonly open (CANTOPEN race) and a
+    // readonly conn that opened but couldn't see the row. Skip it only when
+    // readonly gave a definitive non-NoRow verdict (empty/undecodable blob).
+    if ro_err.is_some() || matches!(last, RehydrateMiss::NoRow) {
+        if let Some(rw) = rw_open() {
+            for p in paths {
+                if let Ok(fa) = load_one_diag(&rw, p) {
+                    let _ = rw.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+                    return Ok(fa);
+                }
+            }
+        } else if let Some(e) = ro_err {
+            // Neither open worked: surface the readonly error text so the
+            // tripwire names it (a truly unreadable DB is a real break).
+            return Err(RehydrateMiss::OpenerFailed(e));
+        }
+    }
+    Err(last)
 }
 
 

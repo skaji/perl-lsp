@@ -719,8 +719,21 @@ impl ModuleIndex {
         // rehydrate through this, same as the pack sub-indexes. Fixed
         // 128 MiB cap (Perl analyses are 10-100x smaller than cpp ones).
         let loader = move |path: &std::path::Path| {
-            let conn = crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")?;
-            crate::module_cache::load_one(&conn, &path.to_string_lossy())
+            // Raw walk path first (preserves the pre-diag behavior), canonical
+            // as a fallback spelling; the discriminated helper survives the
+            // readonly-open CANTOPEN/WAL race behind both.
+            let raw = path.to_string_lossy().into_owned();
+            let canon = path
+                .canonicalize()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let mut spellings = vec![raw.clone()];
+            if let Some(c) = canon {
+                if c != raw {
+                    spellings.push(c);
+                }
+            }
+            crate::module_cache::open_and_load_diag(key.as_deref(), "perl", &spellings)
         };
         self.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
             128 * 1024 * 1024,
@@ -1838,12 +1851,14 @@ impl ModuleIndex {
     /// panics so a run serving absence-as-answer fails loudly instead of
     /// scoring wrong results.
     fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        let mut stage = "no bag cache installed on this index";
+        let mut stage = "no bag cache installed on this index".to_string();
         if let Some(bc) = self.bag_cache_ref() {
-            if let Some(full) = bc.bag_for(&cached.path) {
-                return full;
+            match bc.bag_for_diag(&cached.path) {
+                Ok(full) => return full,
+                // Discriminated cause (see `RehydrateMiss`) so the tripwire
+                // below names the mechanism instead of shrugging.
+                Err(miss) => stage = format!("loader miss: {miss}"),
             }
-            stage = "loader returned None (opener failed / no row / decode failed)";
         }
         // Foreign route: sweeps mint `CachedModule`s from FileStore entries
         // and ask whatever index the query routed to — this index's own
