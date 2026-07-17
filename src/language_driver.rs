@@ -697,6 +697,7 @@ fn inject_member_blocks(
                 deref_stack: m.deref_stack.clone(),
                 attributes: Vec::new(),
                 arity: None,
+                qualifier_owned: false,
             });
             // The role member emits the SAME `TypeName` edge an expanded field
             // does — the edge is canonical (the hover leaf + the type chase
@@ -1037,6 +1038,7 @@ fn remap_spans(
             deref_stack: _,
             attributes: _,
             arity: _,
+            qualifier_owned: _,
         } = s;
         *start = r(*start);
         *end = r(*end);

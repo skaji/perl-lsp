@@ -19,7 +19,7 @@ const SCHEMA_VERSION: &str = "9";
 /// Bumped when the builder's analysis output changes shape in a way that
 /// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
 /// the table — stale entries are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 166;
+pub const EXTRACT_VERSION: i64 = 167;
 
 /// zstd compression level for the `analysis` blob. Lower numbers are faster;
 /// 3 is zstd's default and gives a solid space/speed tradeoff.
@@ -572,7 +572,7 @@ pub struct WarmStub {
 /// Bump when the stub's MEANING changes without breaking its bincode
 /// decode (a decode break self-heals to the full-blob path). Mismatch
 /// wipes the `stubs` table; the next warm backfills from full decodes.
-const STUB_VERSION: &str = "2";
+const STUB_VERSION: &str = "3";
 
 /// Gate the `stubs` table on the current stub generation — call once
 /// before a stub-consuming warm scan.

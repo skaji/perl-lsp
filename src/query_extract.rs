@@ -79,6 +79,12 @@ pub struct SkelSymbol {
     /// def's parameter list (`@arity.sig`). `None` for non-callables and defs
     /// whose parameter list the query didn't capture. Flows to `Symbol.arity`.
     pub arity: Option<crate::file_analysis::ParamArity>,
+    /// The `package` came from an explicit `::` qualifier on an out-of-line def
+    /// (`Ret Class::m(){}`), not from lexical/sticky context. The class the
+    /// qualifier names is authoritative EVEN when its body lives in another file
+    /// (a header), so `reanchor_truncated_containers` must not re-attribute it to
+    /// the enclosing namespace. Not serialized — a driver-internal marker.
+    pub qualifier_owned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -374,6 +380,12 @@ impl SkeletonAnalysis {
         }
 
         for s in self.symbols.iter_mut() {
+            // An explicit `::` qualifier is authoritative — the owning class it
+            // names may live in a header not present here, so its absence as a
+            // local container is NOT a truncation fall-through to recover.
+            if s.qualifier_owned {
+                continue;
+            }
             let sb = pt(s.start);
             // innermost = the smallest container range strictly enclosing sb.
             let Some(t0) = containers
@@ -1290,6 +1302,10 @@ pub struct LangPack {
     /// node a domain comparison — the pack owns which operators mean
     /// "equality against a domain value" (rule #10). Empty = feature off.
     pub domain_compare_ops: &'static [&'static str],
+    /// Out-of-line-definition extraction (`@ool.def` — a `Ret Class::method(...)`
+    /// body owned by a `::` qualifier). The grammar the canonical declarator
+    /// unwrap + qualifier walk consume; `OutOfLineSpec::OFF` = feature off.
+    pub oolfn: OutOfLineSpec,
 }
 
 /// A declarative peel: descend a wrapper chain tree-sitter's fixed-depth
@@ -1311,6 +1327,91 @@ pub struct PeelSpec {
     pub leaf_to_def: &'static [(&'static str, &'static str)],
     /// Accumulate the per-level `DerefStep` stack (pointer depth) vs descend only.
     pub record_stack: bool,
+}
+
+/// Out-of-line-definition extraction (`Ret Class::method(...) {...}` bodies —
+/// the owner is named by a `::` qualifier, not lexical nesting). Declares the
+/// three grammar shapes the driver's canonical unwrap + qualifier walk consume:
+/// the declarator WRAPPERS peeled (any depth) to reach the function declarator,
+/// the FUNCTION-DECLARATOR node whose `declarator` field carries the (possibly
+/// multi-level) qualified name, and the QUALIFIED-NAME node kind the walk
+/// descends. Empty `declarator_wrappers` = feature off (a pack that mints no
+/// `@ool.def` capture).
+#[derive(Clone, Copy)]
+pub struct OutOfLineSpec {
+    pub declarator_wrappers: &'static [&'static str],
+    pub function_declarator: &'static str,
+    pub qualified_name: &'static str,
+}
+
+impl OutOfLineSpec {
+    pub const OFF: OutOfLineSpec = OutOfLineSpec {
+        declarator_wrappers: &[],
+        function_declarator: "",
+        qualified_name: "",
+    };
+}
+
+/// Peel declarator wrappers (`pointer_declarator`/`reference_declarator`/
+/// `parenthesized_declarator`, ANY depth) to the inner function declarator —
+/// the arbitrary nesting S-queries can't express (`Foo**& Class::m()`). THE
+/// out-of-line unwrap, spelled once so no call site enumerates wrapper kinds.
+/// `None` when no function declarator is reachable (not a function-def shape).
+fn unwrap_to_function_declarator<'a>(
+    mut node: tree_sitter::Node<'a>,
+    spec: &OutOfLineSpec,
+) -> Option<tree_sitter::Node<'a>> {
+    for _ in 0..32 {
+        if node.kind() == spec.function_declarator {
+            return Some(node);
+        }
+        if !spec.declarator_wrappers.contains(&node.kind()) {
+            return None;
+        }
+        // pointer_declarator carries its inner under `declarator:`; a
+        // reference/parenthesized declarator holds it as the first named child
+        // (the `&`/parens are anonymous tokens).
+        node = node
+            .child_by_field_name("declarator")
+            .or_else(|| node.named_child(0))?;
+    }
+    None
+}
+
+/// Walk a qualified-name chain (`A::B::c`) to its leaf name token, returning the
+/// full scope text (`A::B`) and the leaf node. THE out-of-line owner walk: the
+/// owning class is the innermost scope — `rsplit("::")` of the returned text, as
+/// the `def.` handler already does for single-hop qualifiers — and the leaf is
+/// the member/ctor/dtor/operator name. A scope segment whose kind is in
+/// `peel_kinds` (a templated owner `Buf<T>`) contributes its `name` field's text
+/// (`Buf`), the same structural peel the single-capture qualifier path applies —
+/// never a string split on `<`. `None` when the node is not a qualified name (a
+/// free function / in-class method — its own pattern owns it).
+fn walk_qualifier_chain<'a>(
+    mut node: tree_sitter::Node<'a>,
+    qualified_kind: &str,
+    peel_kinds: &[&str],
+    src: &[u8],
+) -> Option<(String, tree_sitter::Node<'a>)> {
+    if node.kind() != qualified_kind {
+        return None;
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    for _ in 0..32 {
+        if node.kind() != qualified_kind {
+            return Some((scopes.join("::"), node));
+        }
+        if let Some(scope) = node.child_by_field_name("scope") {
+            let seg = if peel_kinds.contains(&scope.kind()) {
+                scope.child_by_field_name("name").unwrap_or(scope)
+            } else {
+                scope
+            };
+            scopes.push(seg.utf8_text(src).unwrap_or("").to_string());
+        }
+        node = node.child_by_field_name("name")?;
+    }
+    None
 }
 
 /// The declarator peel for C/C++ struct fields and locals: pointer/reference
@@ -1384,6 +1485,7 @@ pub fn perl_pack() -> LangPack {
         call_kinds: &[],
         domain_compare_kinds: &[],
         domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
     }
 }
 
@@ -1432,6 +1534,7 @@ pub fn python_pack() -> LangPack {
         call_kinds: &["call"],
         domain_compare_kinds: &[],
         domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
     }
 }
 
@@ -1469,6 +1572,7 @@ pub fn r_pack() -> LangPack {
         call_kinds: &[],
         domain_compare_kinds: &[],
         domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
     }
 }
 
@@ -1519,6 +1623,7 @@ pub fn cmake_pack() -> LangPack {
         call_kinds: &[],
         domain_compare_kinds: &[],
         domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
     }
 }
 
@@ -1642,6 +1747,18 @@ pub fn cpp_pack() -> LangPack {
         call_kinds: &["call_expression"],
         domain_compare_kinds: &["binary_expression"],
         domain_compare_ops: &["==", "!="],
+        // out-of-line defs (`Ret Class::m(){}`): peel pointer/reference/
+        // parenthesized returns to the function declarator, then walk the
+        // qualified name to its leaf + owning class.
+        oolfn: OutOfLineSpec {
+            declarator_wrappers: &[
+                "pointer_declarator",
+                "reference_declarator",
+                "parenthesized_declarator",
+            ],
+            function_declarator: "function_declarator",
+            qualified_name: "qualified_identifier",
+        },
     }
 }
 
@@ -1825,6 +1942,57 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
         for c in m.captures {
             let node = c.node;
             let cap = cap_names[c.index as usize].as_str();
+            // `@ool.def`: an out-of-line definition (`Ret Class::method(...) {}`).
+            // The one general capture (fires for EVERY function_definition) —
+            // peel the declarator to the function declarator, walk its qualified
+            // name to the leaf + owning class, and synthesize the same
+            // `def.method` / `def.method.name` / `qualifier` events the narrow
+            // per-shape patterns used to emit. A non-qualified declarator (free
+            // function / in-class method) yields nothing here — its own pattern
+            // owns it. Arbitrary declarator nesting + multi-level qualifiers
+            // (which fixed-depth S-queries can't express) work by construction.
+            if cap == "ool.def" {
+                if let Some((scope_text, leaf)) = node
+                    .child_by_field_name("declarator")
+                    .and_then(|d| unwrap_to_function_declarator(d, &pack.oolfn))
+                    .and_then(|fd| fd.child_by_field_name("declarator"))
+                    .and_then(|q| {
+                        walk_qualifier_chain(q, pack.oolfn.qualified_name, pack.qualifier_peel, source)
+                    })
+                {
+                    let leaf_text = leaf.utf8_text(source).unwrap_or("").to_string();
+                    // the def symbol spans the whole function_definition; name +
+                    // owner come from the qualified declarator's leaf + scope.
+                    events.push(Event {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        start: node.start_position(),
+                        end: node.end_position(),
+                        cap: "def.method".to_string(),
+                        text: leaf_text.clone(),
+                        match_id: match_counter,
+                    });
+                    events.push(Event {
+                        start_byte: leaf.start_byte(),
+                        end_byte: leaf.end_byte(),
+                        start: leaf.start_position(),
+                        end: leaf.end_position(),
+                        cap: "def.method.name".to_string(),
+                        text: leaf_text,
+                        match_id: match_counter,
+                    });
+                    events.push(Event {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        start: node.start_position(),
+                        end: node.end_position(),
+                        cap: "qualifier".to_string(),
+                        text: scope_text,
+                        match_id: match_counter,
+                    });
+                }
+                continue;
+            }
             // `@nested.target`: a pointer/reference declarator CHAIN of any
             // depth. Peel it (where the node is live) to the leaf identifier
             // + the deref stack, then emit the leaf as if the query had
@@ -2379,6 +2547,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                     // Filled by span association in `into_file_analysis` — the
                     // `@arity.sig` match fires separately from this def name.
                     arity: None,
+                    qualifier_owned: qualifier_by_match.contains_key(&e.match_id),
                 });
             }
             "ref.label" => {
@@ -2772,6 +2941,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                             deref_stack: Vec::new(),
                             attributes: Vec::new(),
                             arity: None,
+                            qualifier_owned: false,
                         });
                     }
                 }

@@ -923,6 +923,7 @@ fn sksym(src: &str, kind: &str, name: &str, occ: usize, package: Option<&str>) -
         deref_stack: Vec::new(),
         attributes: Vec::new(),
         arity: None,
+        qualifier_owned: false,
     }
 }
 
@@ -2294,6 +2295,80 @@ template <typename T> void Buf<T>::grow(int n) { int local_g = n; }
             "the template qualifier peels to the base class — decl and def unify"
         );
     }
+}
+
+/// Out-of-line definitions whose declarator or qualifier the narrow per-shape
+/// patterns missed (hitlist H7-2): a pointer/reference return wraps the
+/// function_declarator in a `pointer_declarator`; a nested class owner nests the
+/// `qualified_identifier`; a constructor/destructor has no return type at all.
+/// The general `@ool.def` capture + the driver's canonical declarator unwrap +
+/// qualifier walk mint the method with its OWNING class (the innermost `::`
+/// segment), not the enclosing namespace.
+#[test]
+fn cpp_out_of_line_pointer_return_def_extracted() {
+    let skel = cpp_skel("Regexp* Regexp::Simplify() { return 0; }\n");
+    let m = skel
+        .symbols
+        .iter()
+        .find(|s| s.name == "Simplify")
+        .expect("pointer-returning out-of-line def is extracted");
+    assert_eq!(m.kind, "method");
+    assert_eq!(m.package.as_deref(), Some("Regexp"));
+}
+
+#[test]
+fn cpp_out_of_line_multilevel_qualifier_def_owns_inner_class() {
+    // `Prog::Inst::InitAlt` — the qualified_identifier nests (scope: Prog,
+    // name: (Inst::InitAlt)); the owner is the INNERMOST class `Inst`.
+    let skel = cpp_skel("void Prog::Inst::InitAlt(int a) { }\n");
+    let m = skel
+        .symbols
+        .iter()
+        .find(|s| s.name == "InitAlt")
+        .expect("multi-level-qualified out-of-line def is extracted");
+    assert_eq!(m.package.as_deref(), Some("Inst"));
+    assert!(m.qualifier_owned, "package came from the `::` qualifier");
+}
+
+#[test]
+fn cpp_out_of_line_constructors_extracted() {
+    // A constructor has NO return type (`!type`); the multi-level form owns the
+    // inner class.
+    let skel = cpp_skel("RE2::RE2(const char* p) { }\nRE2::Options::Options(int x) { }\n");
+    let ctor = skel.symbols.iter().find(|s| s.name == "RE2" && s.kind == "method");
+    assert_eq!(ctor.map(|s| s.package.as_deref()), Some(Some("RE2")));
+    let nested = skel.symbols.iter().find(|s| s.name == "Options" && s.kind == "method");
+    assert_eq!(nested.map(|s| s.package.as_deref()), Some(Some("Options")));
+}
+
+#[test]
+fn cpp_out_of_line_arbitrary_declarator_nesting_and_qualifier_depth() {
+    // Double-pointer return (`Foo**`) + 3-level qualifier — the S-query can't
+    // enumerate this shape; the driver's unwrap + walk reach it by construction.
+    let skel = cpp_skel("Foo** Outer::Mid::Inner::make() { return 0; }\n");
+    let m = skel
+        .symbols
+        .iter()
+        .find(|s| s.name == "make")
+        .expect("nested-pointer + 3-level qualifier out-of-line def is extracted");
+    assert_eq!(m.package.as_deref(), Some("Inner"));
+}
+
+/// F8: an out-of-line method whose owning class is declared in a HEADER (absent
+/// here) is NOT a truncation fall-through — the `::` qualifier is authoritative,
+/// so re-anchoring must leave `RE2::Init`'s package as `RE2`, not upgrade it to
+/// the enclosing `re2` namespace (the bug: an absent local container read as
+/// "non-computable scope → recover").
+#[test]
+fn reanchor_keeps_qualifier_owner_when_class_body_absent() {
+    let src = "namespace re2 {\nvoid RE2::Init(const char* p) { }\n}\n";
+    let mut init = sksym(src, "method", "Init", 0, Some("RE2"));
+    init.qualifier_owned = true;
+    let mut skel = SkeletonAnalysis::default();
+    skel.symbols = vec![sksym(src, "package", "re2", 0, None), init];
+    skel.reanchor_truncated_containers(src);
+    let got = skel.symbols.iter().find(|s| s.name == "Init").unwrap();
+    assert_eq!(got.package.as_deref(), Some("RE2"), "qualifier owner survives re-anchor");
 }
 
 #[test]
