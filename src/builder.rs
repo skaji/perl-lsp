@@ -306,6 +306,7 @@ fn build_with_plugins_inner(
         flow_edges: Vec::new(),
         any_requires_action_attr: false,
         provisional_dispatches: Vec::new(),
+        gated_emissions: Vec::new(),
         gated_param_types: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         attr_projections: Vec::new(),
@@ -601,6 +602,7 @@ fn build_with_plugins_inner(
         witnesses: b.bag,
         package_framework: b.package_framework,
         provisional_dispatches: b.provisional_dispatches,
+        gated_emissions: b.gated_emissions,
         guard_sites: b.guard_sites,
         arrow_deref_sites: b.arrow_deref_sites,
         attr_projections: b.attr_projections,
@@ -1666,6 +1668,11 @@ struct Builder<'a> {
     /// enrichment once the receiver's cross-file class is known. See
     /// `file_analysis::ProvisionalDispatch`.
     provisional_dispatches: Vec<crate::file_analysis::ProvisionalDispatch>,
+    /// Plugin pattern emissions deferred because a `ClassIsa` trigger
+    /// couldn't be confirmed against LOCAL ancestry at build (rule #1). Each
+    /// is re-fired at enrichment when the package's ancestry resolves the
+    /// gate prefix cross-file. See `file_analysis::GatedEmission`.
+    gated_emissions: Vec<crate::file_analysis::GatedEmission>,
     /// `param_types()` role-contract TCs, emitted ungated at the sub walk and
     /// gated on the enclosing package's `isa in_role` (checked cross-file at
     /// query time). See `FileAnalysis::gated_param_types`.

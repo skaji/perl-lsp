@@ -10,6 +10,26 @@
       "col": 17,
       "status": "gold",
       "expect": { "none": ["NestedRow.pm"] }
+    },
+    {
+      "id": "dbic-2hop-has-many-crossfile",
+      "comment": "H7-5: a 2-hop DBIC result class (DeepRow -> DeepBase -> DBIx::Class::Core) synthesizes its has_many accessor only via CROSS-FILE ClassIsa resolution; goto-def on the call site reaches the has_many line in DeepRow.pm.",
+      "root": "gold-corpus/nested-fixture",
+      "file": "deep.pl",
+      "line": 9,
+      "col": 16,
+      "status": "gold",
+      "expect": { "all": ["DeepRow.pm:16:"], "none": [] }
+    },
+    {
+      "id": "dbic-2hop-column-crossfile",
+      "comment": "H7-5: the column accessor of a 2-hop DBIC result class resolves cross-file to its add_columns declaration.",
+      "root": "gold-corpus/nested-fixture",
+      "file": "deep.pl",
+      "line": 10,
+      "col": 16,
+      "status": "gold",
+      "expect": { "all": ["DeepRow.pm:12:"], "none": [] }
     }
   ]
 }

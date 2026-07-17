@@ -11759,10 +11759,12 @@ mod param_types_manifest {
     /// Enrichment can't help: plugin emit hooks fire at parse time, inside
     /// `build()`, before any module index exists.
     ///
-    /// Architectural gap, NOT a contained fix — documented as a latent
-    /// hazard. See the doc.
+    /// Landed via the `GatedEmission` seam: the build defers the
+    /// syntactically-matched emission (its `ClassIsa` trigger can't see the
+    /// cross-file parent, rule #1), and `enrich_imported_types_with_keys`
+    /// re-fires it once `class_isa_prefix` confirms the ancestry against the
+    /// module index. See `docs/adr/receiver-gated-dispatch.md` (Phase 2).
     #[test]
-    #[ignore = "cross-file ClassIsa trigger: architectural, see docs/prompt-enrichment-inheritance-residual.md"]
     fn probe_class_isa_trigger_through_cross_file_parent() {
         use crate::module_index::ModuleIndex;
         use std::path::PathBuf;
@@ -11790,6 +11792,112 @@ mod param_types_manifest {
         assert_eq!(
             ready, 1,
             "mojo-events ClassIsa trigger should fire via cross-file parent chain"
+        );
+    }
+
+    /// The DBIC flagship shape, TWO cross-file hops: a result class `Leaf`
+    /// extends `Mid` (file 2) which extends `Base` + `DBIx::Class::Core`
+    /// (file 3 chain) — the `DBICTest::Schema::Artist → DBICTest::BaseResult
+    /// → DBIx::Class::Core` idiom. `Leaf`'s `add_columns` / `has_many` are
+    /// syntactically matched at build but the `ClassIsa("DBIx::Class")`
+    /// trigger can't see the cross-file ancestry (rule #1), so the emission
+    /// is DEFERRED. Enrichment re-fires it once `class_isa_prefix` walks
+    /// `Leaf → Mid → DBIx::Class::Core` (prefix hit) through the module
+    /// index. The 1-hop case (direct `use base 'DBIx::Class::Core'`) already
+    /// fired at build; this proves the multi-hop path converges to the same
+    /// synthesis.
+    #[test]
+    fn dbic_class_isa_synthesis_through_two_cross_file_hops() {
+        use crate::module_index::ModuleIndex;
+        use std::path::PathBuf;
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        // File 3-ish: the intermediate base whose OWN parent list carries
+        // `DBIx::Class::Core` (mirrors `DBICTest::BaseResult`'s
+        // `use base qw(DBICTest::Base DBIx::Class::Core)`).
+        idx.insert_cache(
+            "Mid",
+            Some(fake_cached_for_class(
+                "Mid",
+                &PathBuf::from("/fake/Mid.pm"),
+                &[],
+                &["Base", "DBIx::Class::Core"],
+            )),
+        );
+        // Leaf: the result class, two hops from `DBIx::Class`.
+        let src = "package Leaf;\nuse base 'Mid';\n__PACKAGE__->add_columns(qw/id name/);\n__PACKAGE__->has_many(comments => 'Schema::Comment', 'post_id');\n1;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut fa = crate::builder::build(&tree, src.as_bytes());
+        // Nothing synthesized yet — the ClassIsa gate saw only local `Mid`.
+        assert_eq!(
+            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            0,
+            "the relationship accessor must NOT synthesize before enrichment \
+             (the gate can't see cross-file ancestry at build)",
+        );
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        let col = fa.symbols.iter().find(|s| {
+            s.name == "name"
+                && s.kind == SymKind::Method
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "dbic")
+        });
+        assert!(
+            col.is_some(),
+            "the `name` column accessor should synthesize via 2-hop cross-file \
+             DBIx::Class ancestry after enrichment",
+        );
+        let rel = fa.symbols.iter().find(|s| {
+            s.name == "comments"
+                && s.kind == SymKind::Method
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "dbic")
+        });
+        assert!(rel.is_some(), "the `comments` has_many accessor should synthesize");
+        let rt = fa.symbol_return_type_via_bag(rel.unwrap().id, None);
+        assert!(
+            matches!(&rt, Some(InferredType::ClassName(c)) if c == "DBIx::Class::ResultSet"),
+            "has_many accessor must return a ResultSet, got {:?}",
+            rt,
+        );
+        // Idempotent: a second enrichment must not double the accessors.
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        assert_eq!(
+            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            1,
+            "re-enrichment must not stack a second `comments` accessor \
+             (truncate-to-baseline idempotency)",
+        );
+    }
+
+    /// A class with NO cross-file route to `DBIx::Class` must not get DBIC
+    /// synthesis, even though it calls `has_many` syntactically — the gate is
+    /// ancestry, never the call name (rule #10).
+    #[test]
+    fn dbic_synthesis_not_applied_without_ancestry() {
+        use crate::module_index::ModuleIndex;
+        use std::path::PathBuf;
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        idx.insert_cache(
+            "Mid",
+            Some(fake_cached_for_class(
+                "Mid",
+                &PathBuf::from("/fake/Mid.pm"),
+                &[],
+                &["Some::Unrelated::Base"],
+            )),
+        );
+        let src = "package Leaf;\nuse base 'Mid';\n__PACKAGE__->has_many(comments => 'Schema::Comment');\n1;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut fa = crate::builder::build(&tree, src.as_bytes());
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        assert_eq!(
+            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            0,
+            "no DBIx::Class ancestry ⇒ no synthesis, even with a has_many call",
         );
     }
 

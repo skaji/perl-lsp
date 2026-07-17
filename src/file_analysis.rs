@@ -3062,6 +3062,54 @@ pub fn class_isa(
     false
 }
 
+/// Does `class`, or any of its transitive ancestors (cross-file), satisfy
+/// a plugin `ClassIsa(prefix)` trigger? The trigger's PREFIX semantics —
+/// exact match OR a `prefix::`-namespaced descendant — mirror
+/// `plugin::trigger_fires`, so this is the cross-file-aware analog of the
+/// build-time local-only `transitive_parents` gate. Same MRO seam as
+/// `class_isa` (local `package_parents` ∪ `parents_cached`), so the graph
+/// is walked in one place; the only difference is the per-node predicate
+/// is a prefix test, not exact equality. Cycle-guarded; total-visit budget
+/// backstops a pathological graph.
+pub fn class_isa_prefix(
+    class: &str,
+    prefix: &str,
+    package_parents: &HashMap<String, Vec<String>>,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> bool {
+    let ns = format!("{prefix}::");
+    let hits = |c: &str| c == prefix || c.starts_with(&ns);
+    if hits(class) {
+        return true;
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![class.to_string()];
+    let mut budget = 0;
+    while let Some(cur) = stack.pop() {
+        if budget > 200 {
+            break;
+        }
+        budget += 1;
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        if hits(&cur) {
+            return true;
+        }
+        if let Some(parents) = package_parents.get(&cur) {
+            for p in parents {
+                stack.push(p.clone());
+            }
+        }
+        if let Some(idx) = module_index {
+            for p in idx.parents_cached(&cur) {
+                stack.push(p);
+            }
+        }
+    }
+    false
+}
+
 /// Three-way outcome of resolving a [`ReceiverGated`] value against a
 /// concrete receiver class. Splitting "doesn't apply" from "can't tell"
 /// is load-bearing: `DoesNotApply` is a settled negative (the receiver
@@ -3303,6 +3351,83 @@ impl ProvisionalDispatch {
     fn dispatcher(&self) -> &str {
         &self.inner.dispatcher
     }
+}
+
+/// A plugin PATTERN emission (`on_match` output) deferred at build because
+/// its `ClassIsa` trigger couldn't be confirmed against the file's
+/// LOCAL-only ancestry (rule #1: the builder is index-free, so
+/// `transitive_parents` sees only in-file parents). The idiomatic case is a
+/// DBIC result class whose `isa DBIx::Class` route runs through an
+/// intermediate base in another file (`Artist → BaseResult → DBIx::Class::
+/// Core`), so the syntactically-matched `has_many`/`add_columns` synthesis
+/// never fires.
+///
+/// The build records the already-computed emission (tree-free,
+/// file-analysis-native — the `on_match` result translated in
+/// `pattern_dispatch`, which speaks `EmitAction`) plus the gate prefixes.
+/// `enrich_imported_types_with_keys` re-fires it when the package's ancestry
+/// resolves ANY gate prefix CROSS-FILE (`class_isa_prefix`, the same MRO
+/// seam as every other ancestry walk). Idempotent by construction: the
+/// re-fired symbols/refs land ABOVE `base_symbol_count` / `base_ref_count`
+/// and are truncated + re-derived every enrichment cycle, so a file whose
+/// ancestry resolves late converges to the same analysis as one built with
+/// it known — the same discipline as `ReceiverGated` dispatch, but for
+/// symbol emission (which feeds every symbol-table consumer, so it can't be
+/// gated at one query seam — it must materialize into the analysis).
+/// See `docs/adr/receiver-gated-dispatch.md` (Phase 2) and
+/// `docs/prompt-enrichment-inheritance-residual.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatedEmission {
+    /// Any of these `ClassIsa` prefixes holding cross-file re-fires the
+    /// emission — trigger semantics are OR across a plugin's triggers, and
+    /// only `ClassIsa` triggers can newly-fire cross-file (`UsesModule` /
+    /// `Always` are settled locally at build).
+    pub gate_prefixes: Vec<String>,
+    /// The package whose cross-file ancestry is checked against the gate.
+    pub package: String,
+    /// Match-site point; the re-fired symbols/refs attach to the scope here.
+    #[serde(with = "PointDef")]
+    pub scope_point: Point,
+    /// The plugin id — namespace-tags the re-fired symbols (`Framework{id}`).
+    pub plugin_id: String,
+    /// Symbols the pattern's `on_match` produced (columns, relationship
+    /// accessors, event handlers, …).
+    pub symbols: Vec<GatedSymbol>,
+    /// Refs the pattern produced (dispatch-call / method-call / hash-key
+    /// access sites) so cross-file references reach the re-fired symbols.
+    pub refs: Vec<GatedRef>,
+}
+
+/// One symbol inside a [`GatedEmission`] — the file-analysis-native
+/// projection of a symbol-emitting `EmitAction` (`Method` / `HashKeyDef` /
+/// `Handler` / `Symbol`). The `SymbolId` is minted at apply time (it must
+/// equal the symbol's positional index — `FileAnalysis::symbol` indexes by
+/// it), so it is deliberately absent here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatedSymbol {
+    pub name: String,
+    pub kind: SymKind,
+    pub span: Span,
+    pub selection_span: Span,
+    pub detail: SymbolDetail,
+    /// Explicit owning class (`EmitAction::Method.on_class`); when `None` the
+    /// symbol is keyed under the emission's match-site package.
+    pub on_class: Option<String>,
+    /// Return type → a `Symbol(sid) → InferredType` Plugin-priority bag
+    /// witness pushed at apply (plus a `MethodOnClass{class,name}` mirror for
+    /// class-scoped methods, so cross-file return-type queries reach it).
+    pub return_type: Option<InferredType>,
+}
+
+/// One ref inside a [`GatedEmission`]. Scope is resolved at apply from the
+/// emission's `scope_point`; `resolves_to` is left for the enrichment
+/// re-index to link (HashKeyAccess → HashKeyDef) the same way build does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatedRef {
+    pub kind: RefKind,
+    pub span: Span,
+    pub target_name: String,
+    pub access: AccessKind,
 }
 
 /// A confirmed dispatch — a gated candidate whose receiver isa-resolved at
@@ -3984,6 +4109,14 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
 
+    /// Plugin pattern emissions deferred because a `ClassIsa` trigger
+    /// couldn't be confirmed against LOCAL-only ancestry at build (rule #1).
+    /// Re-fired by `enrich_imported_types_with_keys` when the package's
+    /// cross-file ancestry resolves a gate prefix — the emission analog of
+    /// `provisional_dispatches`. See `GatedEmission`.
+    #[serde(default)]
+    pub gated_emissions: Vec<GatedEmission>,
+
     /// Guard conditions recognized by the narrowing engine, recorded for the
     /// redundant/contradictory-guard diagnostics (D3/D4). Open-doc only in
     /// practice (we don't diagnose deps), but rides the cache blob like every
@@ -4206,6 +4339,7 @@ pub struct FileAnalysisParts {
     pub witnesses: crate::witnesses::WitnessBag,
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
+    pub gated_emissions: Vec<GatedEmission>,
     pub guard_sites: Vec<GuardSite>,
     pub arrow_deref_sites: Vec<ArrowDerefSite>,
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
@@ -4488,6 +4622,7 @@ impl FileAnalysis {
             mut witnesses,
             package_framework,
             provisional_dispatches,
+            gated_emissions,
             guard_sites,
             arrow_deref_sites,
             gated_param_types,
@@ -4541,6 +4676,7 @@ impl FileAnalysis {
             base_witness_count: 0,
             base_ref_count: 0,
             provisional_dispatches,
+            gated_emissions,
             guard_sites,
             arrow_deref_sites,
             gated_param_types,
@@ -5935,6 +6071,123 @@ impl FileAnalysis {
         }
     }
 
+    /// Materialize deferred plugin pattern emissions ([`GatedEmission`])
+    /// whose `ClassIsa` gate is now satisfied CROSS-FILE. Called from
+    /// `enrich_imported_types_with_keys` after the symbol/ref/witness
+    /// truncation, so the re-fired content sits above the baselines and is
+    /// re-derived every enrichment cycle (idempotent). Deterministic: gate
+    /// resolution goes through `class_isa_prefix` (the single MRO seam), and
+    /// symbols are minted with positional `SymbolId`s exactly as the builder
+    /// would have — a file enriched late converges to one built with the
+    /// ancestry known. Rule #10: the "should this synthesis apply?" question
+    /// is answered by asking the ancestry graph, never by a shape branch.
+    fn apply_gated_emissions(&mut self, module_index: Option<&dyn CrossFileLookup>) {
+        if self.gated_emissions.is_empty() {
+            return;
+        }
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        // Snapshot: the borrow of `self.gated_emissions` can't overlap the
+        // `&mut self` symbol/ref/witness pushes below.
+        let emissions = std::mem::take(&mut self.gated_emissions);
+        for em in &emissions {
+            let fires = em.gate_prefixes.iter().any(|prefix| {
+                class_isa_prefix(&em.package, prefix, &self.package_parents, module_index)
+            });
+            if !fires {
+                continue;
+            }
+            let scope = self.scope_at(em.scope_point).unwrap_or(ScopeId(0));
+            let ns = Namespace::framework(em.plugin_id.clone());
+            for gs in &em.symbols {
+                let pkg = gs.on_class.clone().or_else(|| Some(em.package.clone()));
+                // Same dedup the builder's `apply_emit_action` runs: never
+                // stack a second identical synthesized symbol.
+                let dup = self.symbols.iter().any(|s| {
+                    s.name == gs.name
+                        && s.kind == gs.kind
+                        && s.package == pkg
+                        && s.namespace == ns
+                });
+                if dup {
+                    continue;
+                }
+                let id = SymbolId(self.symbols.len() as u32);
+                self.symbols.push(Symbol {
+                    id,
+                    name: gs.name.clone(),
+                    kind: gs.kind,
+                    span: gs.span,
+                    selection_span: gs.selection_span,
+                    scope,
+                    package: pkg.clone(),
+                    detail: gs.detail.clone(),
+                    namespace: ns.clone(),
+                    outline_label: None,
+                    attributes: Vec::new(),
+                    deref_stack: Vec::new(),
+                    arity: None,
+                });
+                if let Some(rt) = &gs.return_type {
+                    // Plugin-priority `Symbol(sid) → InferredType`, matching
+                    // the builder's Method emit. Class-scoped methods also get
+                    // the `MethodOnClass{class,name} → Edge(Symbol(sid))`
+                    // mirror the fold writeback would have pushed, so cross-
+                    // file return-type queries resolve the relationship shape.
+                    self.witnesses.push(Witness {
+                        attachment: WitnessAttachment::Symbol(id),
+                        source: WitnessSource::Plugin(em.plugin_id.clone()),
+                        payload: WitnessPayload::InferredType(rt.clone()),
+                        span: gs.span,
+                    });
+                    if matches!(gs.kind, SymKind::Method | SymKind::Sub) {
+                        if let Some(class) = &pkg {
+                            self.witnesses.push(Witness {
+                                attachment: WitnessAttachment::MethodOnClass {
+                                    class: class.clone(),
+                                    name: gs.name.clone(),
+                                },
+                                source: WitnessSource::Plugin(em.plugin_id.clone()),
+                                payload: WitnessPayload::Edge(WitnessAttachment::Symbol(id)),
+                                span: gs.span,
+                            });
+                        }
+                    }
+                }
+            }
+            for gr in &em.refs {
+                self.refs.push(Ref {
+                    kind: gr.kind.clone(),
+                    span: gr.span,
+                    scope,
+                    target_name: gr.target_name.clone(),
+                    access: gr.access,
+                    resolves_to: None,
+                    resolved_method_target: None,
+                    folded_from: None,
+                    arg_count: None,
+                });
+            }
+        }
+        self.gated_emissions = emissions;
+    }
+
+    /// Materialize deferred gated emissions into a WORKSPACE-resident cached
+    /// copy, standalone (not inside the full enrichment pass). Used by the
+    /// index-completion pass so `whole_present` — the view every cross-file
+    /// goto-def / references reader consults — sees a DBIC result class's
+    /// synthesized accessors WITHOUT paying the per-query enriched overlay.
+    /// Idempotent: `apply_gated_emissions` dedups against existing symbols, so
+    /// a second call is a no-op; the emissions sit above `base_symbol_count`
+    /// and a later full enrichment re-derives them the same way. Rebuilds the
+    /// name/scope indices so `symbols_named` / `sub_info_view` find them.
+    pub fn materialize_gated_emissions(&mut self, module_index: &dyn CrossFileLookup) {
+        if self.gated_emissions.is_empty() {
+            return;
+        }
+        self.apply_gated_emissions(Some(module_index));
+        self.rebuild_enrichment_indices();
+    }
+
     pub fn enrich_imported_types_with_keys(
         &mut self,
         module_index: Option<&dyn CrossFileLookup>,
@@ -5951,6 +6204,13 @@ impl FileAnalysis {
         // query time (`applicable_dispatches`), so a `$minion->enqueue('T')`
         // surfaces by the receiver's type whether or not its file is open.
         // See `docs/adr/receiver-gated-dispatch.md`.
+
+        // Re-fire plugin pattern emissions whose `ClassIsa` trigger the
+        // build couldn't confirm against LOCAL ancestry (DBIC result classes
+        // reaching `DBIx::Class` through a cross-file intermediate base).
+        // Runs first so the synthesized symbols exist for the rest of the
+        // pass and the final `rebuild_enrichment_indices`. See `GatedEmission`.
+        self.apply_gated_emissions(module_index);
 
         // Loader-config param typing: join my `loader_config_params`
         // markers with caller-side `PluginLoad` facts across the index.
@@ -10635,6 +10895,14 @@ impl FileAnalysis {
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
                 }
+                // A cross-file DBIC result class's column/relationship accessors
+                // are DEFERRED plugin emissions (`gated_emissions`) that the raw
+                // cached copy doesn't carry. They are MATERIALIZED into the whole
+                // cached copy at index completion
+                // (`ModuleIndex::materialize_gated_emissions`), so the
+                // `has_member` check above already sees them — no per-query
+                // enrichment hop here (that nested a full enrichment per hop and
+                // overflowed the stack on deep dep graphs). See `GatedEmission`.
             }
             // Cross-package typeglob install: the method is attributed to `cls`
             // but lives in a differently-named module file (`*{'DateTime::'.

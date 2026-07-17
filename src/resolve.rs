@@ -2035,6 +2035,10 @@ impl<'a> CandidateSet<'a> {
                         // either way.
                         let module = def_module.as_deref().unwrap_or(class);
                         if let Some(cached) = idx.get_cached(module) {
+                            // A cross-file DBIC accessor is a deferred emission
+                            // MATERIALIZED into the whole cached copy at index
+                            // completion (`materialize_gated_emissions`), so the
+                            // whole view carries it — no per-query enrichment.
                             let whole = idx.whole_present(&cached);
                             if let Some(sub_info) = whole.sub_info_view(method) {
                                 if Url::from_file_path(&cached.path).is_ok() {

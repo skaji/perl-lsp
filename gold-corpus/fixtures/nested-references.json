@@ -10,6 +10,16 @@
       "col": 17,
       "status": "gold",
       "expect": { "none": ["\"file\":\"NestedRow.pm\""] }
+    },
+    {
+      "id": "dbic-2hop-has-many-refs-crossfile",
+      "comment": "H7-5: references on a 2-hop DBIC has_many accessor (synthesized only via cross-file ClassIsa) reach the call site in deep.pl.",
+      "root": "gold-corpus/nested-fixture",
+      "file": "lib/DeepRow.pm",
+      "line": 15,
+      "col": 23,
+      "status": "gold",
+      "expect": { "all": ["\"file\":\"deep.pl\""], "none": [] }
     }
   ]
 }

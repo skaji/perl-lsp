@@ -1187,6 +1187,45 @@ impl ModuleIndex {
     }
 
     /// Insert a module directly into the cache (for CLI and testing).
+    /// After indexing completes (cross-file ancestry fully populated),
+    /// MATERIALIZE deferred gated plugin emissions (`GatedEmission`) into each
+    /// cached copy whose gate now resolves cross-file. A DBIC result class's
+    /// column/relationship accessors are recorded but not applied at build
+    /// (the `ClassIsa` trigger can't see the cross-file base, rule #1); this
+    /// pass applies them once the index knows the ancestry, so `whole_present`
+    /// — the view every cross-file goto-def / references reader consults —
+    /// sees them WITHOUT a per-query enriched-overlay hop.
+    ///
+    /// The cheap gate — `gated_emissions` is NOT an eviction axis, so an
+    /// evicted resident copy still carries it — decides whether a file needs
+    /// materializing; the whole (rehydrated) view is only pulled for those.
+    /// The re-registered copy is whole (symbols resident); this is the
+    /// one-shot CLI's deterministic path (re-pinning is harmless when the
+    /// process is about to answer one query and exit). The warm server never
+    /// calls this — it has the enriched-overlay fallback in
+    /// `method_resolution_on_class`. Idempotent (`materialize_gated_emissions`
+    /// dedups against already-present symbols).
+    pub fn materialize_gated_emissions(&self) {
+        let mut updates: Vec<(String, std::path::PathBuf, Arc<FileAnalysis>)> = Vec::new();
+        for entry in self.cache.iter() {
+            let Some(cached) = entry.value() else { continue };
+            if cached.analysis.gated_emissions.is_empty() {
+                continue;
+            }
+            // Rehydrate the whole view (the resident copy may be
+            // symbols-evicted) before appending the synthesized accessors.
+            let whole = crate::file_analysis::CrossFileLookup::whole_present(self, cached);
+            let mut copy = (*whole).clone();
+            copy.materialize_gated_emissions(self);
+            updates.push((entry.key().clone(), cached.path.clone(), Arc::new(copy)));
+        }
+        for (name, path, analysis) in updates {
+            let cm = Arc::new(CachedModule::new(path.clone(), analysis));
+            self.all_files.insert(path, cm.clone());
+            self.cache.insert(name, Some(cm));
+        }
+    }
+
     pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
         if let Some(ref m) = cached {
             self.edges.feed(module_name, &m.analysis);
