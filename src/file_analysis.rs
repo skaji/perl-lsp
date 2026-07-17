@@ -4366,6 +4366,99 @@ struct FieldGroup {
     has_reader: bool,
 }
 
+/// Occurs-check + memo node for the `expr_type_at_span` ⇄
+/// `method_call_return_type_via_bag` mutual recursion. The pair hops
+/// across FileAnalysis instances (a chained cross-file return-type query
+/// re-enters the receiver's file) and mints a fresh `ReducerRegistry`
+/// query per hop, so the registry's own bag-keyed visited set never sees
+/// the repeat — only this outer guard can. Keyed by (FileAnalysis
+/// identity, span/ref) just as the registry keys on the bag pointer.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum ResolveNode {
+    /// `expr_type_at_span(span)` on a given FileAnalysis instance.
+    Expr(usize, Span),
+    /// `method_call_return_type_via_bag(ref_idx)` on a given instance.
+    MethodCall(usize, usize),
+}
+
+thread_local! {
+    /// Per-thread active-resolution stack (the occurs check). Rayon build
+    /// workers each own one; never a shared field (these are `&self`
+    /// methods).
+    static RESOLVE_STACK: std::cell::RefCell<Vec<ResolveNode>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread memo, alive only for the duration of one outermost
+    /// resolution (cleared when the stack drains). Collapses the
+    /// exponential re-computation of a node reached through many parents
+    /// in a dense cross-file return-type graph — the cycle guard bounds
+    /// *depth*, this bounds *work*. Within one outermost resolution the
+    /// FileAnalyses are immutable, so a node's answer is stable and safe
+    /// to reuse; on-path (cycle-blocked) answers are never memoized.
+    static RESOLVE_MEMO: std::cell::RefCell<HashMap<ResolveNode, Option<InferredType>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Depth backstop for a genuinely (non-cyclic) deep chain — the occurs
+/// check is the primary termination guarantee; this only guards the
+/// stack against a pathological linear descent.
+const RESOLVE_DEPTH_CAP: usize = 256;
+
+/// Entry cap on the stack-scoped memo. A dense workspace's reachable
+/// return-type graph is bounded by its ref count; this only fires on a
+/// pathological blow-up, degrading to recompute (still terminating via
+/// the occurs check) rather than growing unbounded.
+const RESOLVE_MEMO_CAP: usize = 50_000;
+
+/// RAII stack frame. `enter` returns `None` when `node` is already on
+/// the active stack (a return-type cycle → answer `None` instead of
+/// re-entering) or the depth cap is hit; otherwise pushes and pops on
+/// unwind. When the stack drains back to empty the memo is cleared, so
+/// it never outlives the outermost resolution.
+struct ResolveGuard;
+
+impl ResolveGuard {
+    fn enter(node: ResolveNode) -> Option<Self> {
+        RESOLVE_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            if st.len() >= RESOLVE_DEPTH_CAP || st.contains(&node) {
+                None
+            } else {
+                st.push(node);
+                Some(ResolveGuard)
+            }
+        })
+    }
+
+    /// Memo lookup for `node` — hits only survive within one outermost
+    /// resolution (the guard clears the map on drain).
+    fn memo_get(node: &ResolveNode) -> Option<Option<InferredType>> {
+        RESOLVE_MEMO.with(|m| m.borrow().get(node).cloned())
+    }
+
+    /// Record `node`'s resolved answer for reuse by later parents in this
+    /// same outermost resolution.
+    fn memo_put(node: ResolveNode, ty: Option<InferredType>) {
+        RESOLVE_MEMO.with(|m| {
+            let mut mm = m.borrow_mut();
+            if mm.len() < RESOLVE_MEMO_CAP {
+                mm.insert(node, ty);
+            }
+        });
+    }
+}
+
+impl Drop for ResolveGuard {
+    fn drop(&mut self) {
+        RESOLVE_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            st.pop();
+            if st.is_empty() {
+                RESOLVE_MEMO.with(|m| m.borrow_mut().clear());
+            }
+        });
+    }
+}
+
 impl FileAnalysis {
     /// Create a new FileAnalysis with indices built from the raw tables.
     /// `finalize_post_walk` runs on the builder path to seal baseline
@@ -5337,6 +5430,28 @@ impl FileAnalysis {
         ref_idx: usize,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<InferredType> {
+        // Occurs check + stack-scoped memo for the mutual recursion with
+        // `expr_type_at_span` (the receiver chase re-enters it). A call
+        // ref already on the stack is a cross-file return-type cycle →
+        // answer None; one resolved earlier in this outermost query is
+        // reused (see `expr_type_at_span` for the exponential rationale).
+        let node = ResolveNode::MethodCall(self as *const Self as usize, ref_idx);
+        if let Some(hit) = ResolveGuard::memo_get(&node) {
+            return hit;
+        }
+        let Some(_guard) = ResolveGuard::enter(node) else {
+            return None;
+        };
+        let result = self.method_call_return_type_via_bag_uncached(ref_idx, module_index);
+        ResolveGuard::memo_put(node, result.clone());
+        result
+    }
+
+    fn method_call_return_type_via_bag_uncached(
+        &self,
+        ref_idx: usize,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
         use crate::witnesses::{
             FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
@@ -5454,33 +5569,30 @@ impl FileAnalysis {
         span: Span,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<InferredType> {
-        // Depth backstop for the `expr_type_at_span` ⇄
-        // `method_call_return_type_via_bag` mutual recursion (the latter
-        // resolves a chained call's receiver by recursing here on the
-        // receiver's span). Spans shrink monotonically per hop, so a
-        // healthy chain bottoms out fast; this cap guards against a
-        // degenerate ref topology (overlapping same-span refs the
-        // builder can emit for route-branded chains) spinning the stack.
-        thread_local! {
-            static EXPR_SPAN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        // Occurs check + stack-scoped memo for the `expr_type_at_span` ⇄
+        // `method_call_return_type_via_bag` mutual recursion. A span
+        // already on the stack is a return-type cycle (A::foo's return
+        // depends on B->bar whose return depends on A->foo) → answer
+        // None; a span resolved earlier in this same outermost query is
+        // reused rather than recomputed (the graph is a dense DAG in mojo,
+        // so recomputation is exponential without the memo).
+        let node = ResolveNode::Expr(self as *const Self as usize, span);
+        if let Some(hit) = ResolveGuard::memo_get(&node) {
+            return hit;
         }
-        const EXPR_SPAN_DEPTH_CAP: u32 = 64;
-        let depth = EXPR_SPAN_DEPTH.with(|d| {
-            let n = d.get();
-            d.set(n + 1);
-            n
-        });
-        struct DepthGuard;
-        impl Drop for DepthGuard {
-            fn drop(&mut self) {
-                EXPR_SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            }
-        }
-        let _guard = DepthGuard;
-        if depth >= EXPR_SPAN_DEPTH_CAP {
+        let Some(_guard) = ResolveGuard::enter(node) else {
             return None;
-        }
+        };
+        let result = self.expr_type_at_span_uncached(span, module_index);
+        ResolveGuard::memo_put(node, result.clone());
+        result
+    }
 
+    fn expr_type_at_span_uncached(
+        &self,
+        span: Span,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
         // A call whose span IS this expression — its return type. The
         // exact-span match is what distinguishes "the value of
         // `$f->get_bar()->get_name()`" (the outer call's return) from
