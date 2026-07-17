@@ -1,4 +1,12 @@
-# Hitlist — round 8
+# Hitlist — round 8 — ROUND CLOSED, all rows LANDED
+
+Final tip gate: cpp 1428/0, default 1374/0, gold 438 PASS / 0 FAIL / 0 XPASS
+/ 0 CRASH both modes armed. Landing SHAs: H7-9 `df663b5`, H7-8/15 `6a02ad0`,
+H7-13 `557a84b`, H8-1 `56b6a77`, H8-2 `bb4551a`, H8-3 `5d69fad`, parks
+(macro position + include guards) `88a91e8`+`73994d5`. Close spot-checks:
+implementations Iterator::Seek 11 sites, references Regexp::Simplify 9
+(incl. the formerly macro-renamed pair), proxy.pl inner-closure `$c` →
+Mojolicious::Controller, `->cds` references 80.
 
 Wave-3 fix slices (H7-8/15, H7-9, H7-13 — briefs in hitlist-7) ran alongside a
 verification re-probe of all round-7 fixes: **12 HOLDS, 1 PARTIAL, zero
