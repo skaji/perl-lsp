@@ -1871,7 +1871,7 @@ impl ModuleIndex {
     /// LRU, degrading to the (evicted) resident copy on a miss rather than
     /// fabricating — the caller's query then answers as it would for a
     /// genuinely fact-less file. One body serves `bag_present` and
-    /// `refs_present`: the miss policy and LRU selection must never diverge
+    /// `whole_present`: the miss policy and LRU selection must never diverge
     /// between the type path and the reference path.
     ///
     /// A miss here is ALWAYS an invariant break in-session: eviction is
@@ -2615,12 +2615,6 @@ impl CrossFileLookup for ModuleIndex {
         self.get_cached_scoped(module_name, visible)
     }
 
-    fn refs_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        if !cached.analysis.refs_are_evicted() {
-            return cached.analysis.clone();
-        }
-        self.rehydrate_or_resident(cached)
-    }
 
     fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         if cached.analysis.is_fully_resident() {

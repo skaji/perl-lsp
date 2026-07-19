@@ -435,22 +435,6 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
     }
-    /// A cached module's analysis with its `refs` GUARANTEED present — the
-    /// refs twin of `bag_present` (`docs/adr/relational-ref-index.md`).
-    /// Resident index copies have refs evicted after persist; the backward
-    /// walk rehydrates the exact persisted analysis for candidate files.
-    /// Default (never-evicted impls): a cheap `Arc` bump.
-    // The refs-axis twin of `bag_present`, kept for trait-family symmetry and
-    // exercised via the eviction tests; the backward walk currently reaches
-    // refs through `whole_present` / `ref_candidate_paths`, so no production
-    // caller dispatches this seam today.
-    #[allow(dead_code)]
-    fn refs_present(
-        &self,
-        cached: &std::sync::Arc<CachedModule>,
-    ) -> std::sync::Arc<FileAnalysis> {
-        cached.analysis.clone()
-    }
     /// A cached WORKSPACE module's analysis with cross-file ENRICHMENT
     /// applied (`docs/adr/storage-engine.md`, the always-enriched
     /// tier): imported return types propagated, synthetic hash-key defs
@@ -500,7 +484,7 @@ pub trait CrossFileLookup {
     }
     /// Path-keyed cached-module lookup — the retrieval above hands back
     /// paths; this maps them onto the resident registration (for the
-    /// visibility gate + `refs_present`). Default `None`.
+    /// visibility gate + whole-copy rehydration). Default `None`.
     fn cached_by_path(
         &self,
         _path: &std::path::Path,
@@ -653,13 +637,6 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // hit the trait default and read the evicted bag — silent Slice-2
         // type regressions while goto/refs stay green.
         self.inner.bag_present(cached)
-    }
-    fn refs_present(
-        &self,
-        cached: &std::sync::Arc<CachedModule>,
-    ) -> std::sync::Arc<FileAnalysis> {
-        // Same delegation rule as `bag_present` — the inner index owns the LRU.
-        self.inner.refs_present(cached)
     }
     fn enriched_present(
         &self,
@@ -4108,7 +4085,7 @@ pub struct FileAnalysis {
     /// `evict_refs` stripped this resident copy's `refs` after the blob +
     /// relational rows were persisted. `#[serde(skip)]` — a rehydrated
     /// analysis is refs-present. Consumers that would read a foreign file's
-    /// refs route through `CrossFileLookup::refs_present` when set; an empty
+    /// refs route through `whole_present` (rehydrating on miss); an empty
     /// `refs` here is "on disk", never "no references".
     #[serde(skip, default)]
     refs_evicted: bool,
@@ -4795,7 +4772,7 @@ impl FileAnalysis {
     /// index copy whose blob + relational rows are persisted — the refs twin
     /// of `evict_witness_bag`. Lossless: the on-disk analysis keeps the full
     /// vec; the backward walk retrieves candidates from the relational index
-    /// and rehydrates through `refs_present`. Touches no other pinned field.
+    /// and rehydrates through `whole_present`. Touches no other pinned field.
     /// Idempotent.
     pub fn evict_refs(&mut self) {
         self.refs = Vec::new();
