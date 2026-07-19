@@ -1,4 +1,8 @@
-# Hitlist — round 9 (seeded by the first-change storm assessment, 2026-07-17)
+# Hitlist — round 9 — CLOSED, all rows LANDED
+
+H9-1/H9-2 landed `41a77cb` (generation guard + deferred reconcile);
+H9-3 landed `d0ec2ac` (GatherCache: single-flight + byte-capped LRU ×4).
+Final gate: cpp 1446/0, default 1391/0, gold 438/0/0/0 armed.
 
 Dogfood-tier rows (behavior fixes — NOT tighten scope). Evidence from the
 first-change slice's part-3 assessment (branch `first-change-notify`,
