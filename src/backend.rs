@@ -544,7 +544,6 @@ impl Backend {
         let client = self.client.clone();
         let module_index = Arc::clone(&self.module_index);
         let root = self.module_index.workspace_root();
-        let options = self.diagnostic_options();
         // Server-initiated progress requires the client capability; a client
         // that never advertised it may also never ANSWER the create request —
         // and indexing must proceed regardless (LSP spec).
