@@ -6,25 +6,33 @@ why parked, what unblocks it. Prune on landing.
 
 ## Design-debt tier (candidates for a tightening round)
 
+All entries below re-ratified by the tighten-2 drain (2026-07-17) unless
+marked otherwise; the drain re-derived each rationale against current code.
+
 - **Two include-BFS walkers + two `file_stamp` fns** (cpp_reparse vs
-  module_cache): twice examined, twice left (different contracts/layers);
-  verdicts recorded so sweeps don't re-litigate. Merge only with a reason.
+  module_cache): thrice examined, thrice left (different contracts/layers:
+  parse-heavy macro gather vs memoized line-scan closure; `(hash,size)`
+  columns vs folded i64 stamp). Merge only with a reason. [re-ratified
+  2026-07-17]
 - **Two C-comment strippers in cpp_reparse** (`strip_c_comments` vs
   `blank_comments_in_range`): distinct contracts — the former COLLAPSES
   whitespace to produce clean body text, the latter is length-preserving
   (spaces over comment bytes, newlines kept) so byte offsets stay in
   original coordinates for member positioning. Not a merge target.
+  [re-ratified 2026-07-17]
 - **Two "enclosing class" notions in `emit_return_fuel`**: the implicit-
   field half reads the ref's own `scope.package`; the sibling-CALL half
   walks up to the enclosing method SYMBOL's package (so out-of-line bodies,
   whose body scope carries no package, still resolve). Deliberately
-  different robustness; unifying is a behavior change, not a cleanup.
+  different robustness; unifying is a behavior change, not a cleanup
+  (out-of-line bodies would gain implicit-field edges). [re-ratified
+  2026-07-17]
 - **Two domain/type completion rankers** (`backend::rank_domain_members`
   for pack enum members vs `symbols::rank_candidates_by_expected_type` for
   Perl scope vars): different item types (`CompletionItem` vs
   `CompletionCandidate`) and semantics (enum members verbatim, front-loaded
   vs. type-matching locals kept at `PRIORITY_LOCAL`). No shared gatherer to
-  factor.
+  factor. [re-ratified 2026-07-17]
 - **`class_isa_prefix` walks `parents_cached`, not `parents_of`**
   (`file_analysis.rs`): deliberate, verdict recorded. The synthetic
   `APP_SURFACE_CLASS` edge that `parents_of` injects is a method-dispatch
@@ -32,7 +40,9 @@ why parked, what unblocks it. Prune on landing.
   must not treat an app-surface consumer as a descendant of the surface.
   Both isa-walk seams (`class_isa`, `class_isa_prefix`) exclude it by
   construction; they share the local-∪-cross-file seam, just not the
-  surface edge. Not a `parents_of` drift to fix.
+  surface edge. Not a `parents_of` drift to fix. [re-ratified 2026-07-17;
+  T2-A consolidated all three isa walks onto one `walk_ancestry` — the
+  seam distinction is now a parameter, not a copy]
 - **CLI workspace-symbol dedup inlines the identity tuple**
   (`main.rs` `workspace-symbol` vs `symbols::dedup_workspace_symbols`):
   type-forced duplicate, leave-alone (mirrors the two-rankers precedent).
@@ -42,16 +52,41 @@ why parked, what unblocks it. Prune on landing.
   identity, different pipeline stage and value shape (u32 uri/line vs
   usize path/row). A shared key helper would be a bare tuple literal each
   caller still populates from different fields — no gatherer to factor.
+  [re-ratified 2026-07-17; note the CLI has THREE inline `seen.insert`
+  dedups with three deliberately different keys — the third at the
+  single-file outline gates framework twin accessors on
+  `(kind,name,row,col)` — none a shared-helper candidate]
 - **`load_components` DBIC-namespace default lives in core**
   (`builder.rs::visit_load_components`, bare names default to `DBIx::Class`):
-  the `load_components` method is a general mixin idiom (Catalyst too) and
-  parent-edge registration is a core method-resolution concern, but the
-  `DBIx::Class` bare-name prefix is a DBIC convention that arguably belongs
-  to the dbic plugin. Not moved: the plugin `EmitAction` vocabulary has no
-  parent-edge/ISA primitive, so the move needs a new emit action plus
-  plugin-side arg extraction and the bare-name prefix policy — a feature
-  commit, not a mechanical fix. Unblock: add a `ParentEdge`/component
-  `EmitAction` and route DBIC-namespace policy through the dbic plugin.
+  KEEP IN CORE, rationale rewritten 2026-07-17 (the old blocker — no
+  parent-edge EmitAction — is obsolete: `EmitAction::PackageParent` exists
+  and is wired). The standing reason: `load_components` is generic mixin
+  machinery (Catalyst too) and the dbic plugin is `ClassIsa`-gated, so
+  moving registration there would drop non-DBIC callers; only the bare-name
+  `DBIx::Class` prefix string is DBIC-specific. If ever promoted (est M):
+  plugin emits fully-qualified parents via `PackageParent`, core keeps a
+  generic non-prefixing fallback; identity risk — the plugin's `+`-strip and
+  prefix policy must reproduce core's exact strings or inherited-component
+  goto-def/rename silently breaks.
+- **Four→one ancestry walkers, GraphView as the end state**
+  (`file_analysis.rs::walk_ancestry`, T2-A 2026-07-17): the three isa DFSes
+  now share one predicate-parameterized walker (per-call-site budgets 200/
+  200/40 and seam scopes preserved). The recorded end state is collapsing
+  `walk_ancestry` onto `GraphView`'s lazy walk (docs/adr/graph-walking.md) —
+  do that, not a fifth bespoke helper. The DBIC base-name set
+  (`class_is_dbic_result`'s Core/Row-vs-Schema/ResultSet polarity) still
+  lives in the Model layer; its plugin-manifest move rides the
+  `role_makers` precedent (follow-on, est M).
+- **`class_is_dbic_result` vs `class_isa_prefix("DBIx::Class")`**: NOT a
+  merge — the result gate encodes row-vs-schema POLARITY (accepts Core/Row
+  roots, rejects `::Schema`/`::ResultSet`) that a prefix test cannot; a
+  schema class is a DBIx::Class descendant but not a result class.
+  [recorded 2026-07-17]
+- **`RESOLVE_MEMO` vs `PackBagCache`**: same surface shape ("cache of
+  computed values"), OPPOSITE contracts — thread-local stack-scoped
+  correctness memo cleared on resolve-stack drain vs long-lived
+  byte-accounted LRU invalidated on content change. Never unify under one
+  cache abstraction. [recorded 2026-07-17]
 
 ## Feature tier (each is a fireable slice)
 
