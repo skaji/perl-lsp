@@ -116,6 +116,24 @@ fn cached_pattern_query(source: &str) -> Result<&'static Query, String> {
     compiled
 }
 
+/// Compile every Perl pattern query once, up front, at plugin-registry load.
+///
+/// `cached_pattern_query`'s memo is process-wide but compiles OUTSIDE its
+/// lock and is populated lazily on first dispatch. Under the parallel cold
+/// workspace index (`par_iter` over `build()`), that lets each Rayon worker
+/// recompile the whole ~14-query set on the first file it touches — ~750ms of
+/// `Query::new` charged to a handful of files' build phase. Warming
+/// the memo here, single-threaded before any parallel build starts, makes
+/// every per-file dispatch a pure cache hit and removes the race entirely.
+pub(crate) fn warm_pattern_queries<'a>(specs: impl Iterator<Item = &'a PatternSpec>) {
+    for spec in specs {
+        if spec.language != "perl" {
+            continue;
+        }
+        let _ = cached_pattern_query(&spec.query);
+    }
+}
+
 /// Verify a pattern's `expect` snippets against the real grammar:
 /// parse each snippet, run the query, assert the match count and any
 /// declared capture texts. This is the pattern author's guard against
@@ -286,7 +304,20 @@ impl<'a> Builder<'a> {
                             package_uses: &uses,
                             package_parents: &parents,
                         };
-                        if !plugin::trigger_fires(p.triggers(), &tq) {
+                        let fires = plugin::trigger_fires(p.triggers(), &tq);
+                        // Trigger didn't fire locally, but a `ClassIsa` gate may
+                        // still hold CROSS-FILE (the package has ancestry the
+                        // index-free builder can't resolve). Run `on_match` and
+                        // DEFER the emission — enrichment re-fires it once the
+                        // module index confirms the gate. No parents ⇒ no
+                        // cross-file ancestor possible, so nothing to defer.
+                        let gate_prefixes = if fires {
+                            Vec::new()
+                        } else {
+                            Self::cross_file_gate_prefixes(p.triggers())
+                        };
+                        let defer = !fires && !gate_prefixes.is_empty() && !parents.is_empty();
+                        if !fires && !defer {
                             continue;
                         }
                         dispatched.insert(key);
@@ -296,6 +327,7 @@ impl<'a> Builder<'a> {
                         // state (constant folds via the current package,
                         // `__PACKAGE__` receivers) see the match site's
                         // package, exactly as the walk would have.
+                        let pkg_for_gate = pkg.clone();
                         let saved =
                             std::mem::replace(&mut self.current_package, Some(pkg.clone()));
                         let mctx = self.build_match_context(
@@ -310,6 +342,17 @@ impl<'a> Builder<'a> {
                             None,
                         );
                         let actions = p.on_match(&spec.name, &mctx);
+                        if defer {
+                            self.record_gated_pattern_emission(
+                                p.id(),
+                                gate_prefixes,
+                                pkg_for_gate,
+                                mspan.start,
+                                actions,
+                            );
+                            self.current_package = saved;
+                            continue;
+                        }
                         // A #receiver-isa? gate defers DispatchCall
                         // emissions to query time. The build-time
                         // receiver type is a HINT on the candidate
@@ -502,12 +545,21 @@ impl<'a> Builder<'a> {
                 package_uses: &uses,
                 package_parents: &parents,
             };
-            if !plugin::trigger_fires(p.triggers(), &tq) {
+            let fires = plugin::trigger_fires(p.triggers(), &tq);
+            // Cross-file `ClassIsa` deferral, same rule as the walk phase.
+            let gate_prefixes = if fires {
+                Vec::new()
+            } else {
+                Self::cross_file_gate_prefixes(p.triggers())
+            };
+            let defer = !fires && !gate_prefixes.is_empty() && !parents.is_empty();
+            if !fires && !defer {
                 continue;
             }
             dispatched.insert(key);
             crate::timings::record_pattern_dispatch(p.id(), &spec.name);
 
+            let pkg_for_gate = pkg.clone();
             let saved = std::mem::replace(&mut self.current_package, Some(pkg.clone()));
             let mctx = self.build_match_context(
                 spec,
@@ -521,6 +573,17 @@ impl<'a> Builder<'a> {
                 current_base.as_deref(),
             );
             let actions = p.on_match(&spec.name, &mctx);
+            if defer {
+                self.record_gated_pattern_emission(
+                    p.id(),
+                    gate_prefixes,
+                    pkg_for_gate,
+                    mspan.start,
+                    actions,
+                );
+                self.current_package = saved;
+                continue;
+            }
             let gate = receiver_gate_for(query, pattern_index);
             let receiver_hint = gate.as_ref().and_then(|g| {
                 let node = caps
@@ -584,6 +647,156 @@ impl<'a> Builder<'a> {
             self.scope_stack.pop();
             self.current_package = saved;
         }
+    }
+
+    /// A pattern matched syntactically but its `ClassIsa` trigger did NOT
+    /// fire against LOCAL ancestry (rule #1: the builder is index-free, so
+    /// `transitive_parents` sees only in-file parents). The match may still
+    /// belong to the framework via a CROSS-FILE ancestor — the DBIC result
+    /// class reaching `DBIx::Class` through an intermediate base in another
+    /// file. Record the already-computed `on_match` output, translated to
+    /// file-analysis-native symbols/refs, as a [`GatedEmission`] the
+    /// enrichment pass re-fires once the module index can confirm the gate
+    /// (`class_isa_prefix`). Trigger semantics are OR, and only `ClassIsa`
+    /// triggers can newly-fire cross-file — `gate_prefixes` is exactly that
+    /// subset of the plugin's triggers.
+    ///
+    /// Symbol-emitting actions (`Method`/`HashKeyDef`/`Handler`/`Symbol`) and
+    /// the reference actions that link call sites to them
+    /// (`DispatchCall`/`HashKeyAccess`) are captured; other kinds under a
+    /// deferred gate are logged and skipped (out of scope — none are emitted
+    /// by the bundled `ClassIsa` plugins on this path).
+    fn record_gated_pattern_emission(
+        &mut self,
+        plugin_id: &str,
+        gate_prefixes: Vec<String>,
+        package: String,
+        scope_point: tree_sitter::Point,
+        actions: Vec<plugin::EmitAction>,
+    ) {
+        use crate::file_analysis::{
+            GatedEmission, GatedRef, GatedSymbol, RefKind, SymKind, SymbolDetail,
+        };
+        use plugin::EmitAction;
+        let mut symbols: Vec<GatedSymbol> = Vec::new();
+        let mut refs: Vec<GatedRef> = Vec::new();
+        for a in actions {
+            match a {
+                EmitAction::Method {
+                    name, span, selection_span, params, is_method, return_type, doc,
+                    on_class, display, hide_in_outline, opaque_return, ..
+                } => {
+                    symbols.push(GatedSymbol {
+                        name,
+                        kind: SymKind::Method,
+                        span,
+                        selection_span,
+                        detail: SymbolDetail::Sub {
+                            params: params.into_iter().map(Into::into).collect(),
+                            is_method,
+                            doc,
+                            display,
+                            hide_in_outline,
+                            opaque_return,
+                            is_constant: false,
+                            lexical: false,
+                        },
+                        on_class,
+                        return_type,
+                    });
+                }
+                EmitAction::HashKeyDef { name, owner, span, selection_span } => {
+                    symbols.push(GatedSymbol {
+                        name,
+                        kind: SymKind::HashKeyDef,
+                        span,
+                        selection_span,
+                        detail: SymbolDetail::HashKeyDef { owner, is_dynamic: false },
+                        on_class: None,
+                        return_type: None,
+                    });
+                }
+                EmitAction::Handler {
+                    name, owner, dispatchers, params, span, selection_span,
+                    display, hide_in_outline, ..
+                } => {
+                    symbols.push(GatedSymbol {
+                        name,
+                        kind: SymKind::Handler,
+                        span,
+                        selection_span,
+                        detail: SymbolDetail::Handler {
+                            owner,
+                            dispatchers,
+                            params: params.into_iter().map(Into::into).collect(),
+                            display,
+                            hide_in_outline,
+                        },
+                        on_class: None,
+                        return_type: None,
+                    });
+                }
+                EmitAction::Symbol { name, kind, span, selection_span, detail, return_type } => {
+                    symbols.push(GatedSymbol {
+                        name,
+                        kind,
+                        span,
+                        selection_span,
+                        detail,
+                        on_class: None,
+                        return_type,
+                    });
+                }
+                EmitAction::DispatchCall { name, dispatcher, owner, span, .. } => {
+                    refs.push(GatedRef {
+                        kind: RefKind::DispatchCall { dispatcher, owner: Some(owner) },
+                        span,
+                        target_name: name,
+                        access: crate::file_analysis::AccessKind::Read,
+                    });
+                }
+                EmitAction::HashKeyAccess { name, owner, var_text, span, access } => {
+                    refs.push(GatedRef {
+                        kind: RefKind::HashKeyAccess { var_text, owner: Some(owner) },
+                        span,
+                        target_name: name,
+                        access,
+                    });
+                }
+                other => {
+                    log::debug!(
+                        "plugin `{}`: deferred cross-file ClassIsa emission drops \
+                         unsupported action {:?}",
+                        plugin_id,
+                        std::mem::discriminant(&other),
+                    );
+                }
+            }
+        }
+        if symbols.is_empty() && refs.is_empty() {
+            return;
+        }
+        self.gated_emissions.push(GatedEmission {
+            gate_prefixes,
+            package,
+            scope_point,
+            plugin_id: plugin_id.to_string(),
+            symbols,
+            refs,
+        });
+    }
+
+    /// The `ClassIsa` trigger prefixes of `triggers` — the only trigger
+    /// shape that can newly-fire once cross-file ancestry is known (a
+    /// `UsesModule` / `Always` verdict is settled locally at build).
+    fn cross_file_gate_prefixes(triggers: &[plugin::Trigger]) -> Vec<String> {
+        triggers
+            .iter()
+            .filter_map(|t| match t {
+                plugin::Trigger::ClassIsa(prefix) => Some(prefix.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]

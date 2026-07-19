@@ -161,6 +161,9 @@ fn workspace_search_visible(kind: &crate::file_analysis::SymKind, hidden: bool, 
         && !lexical
 }
 
+// `SymbolInformation::deprecated` is a deprecated-but-required field of the
+// tower-lsp struct; we must supply it to construct the value.
+#[allow(deprecated)]
 pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
     if !workspace_search_visible(
         &sym.kind,
@@ -182,6 +185,26 @@ pub fn symbol_to_workspace_info(sym: &crate::file_analysis::Symbol, uri: Url) ->
     })
 }
 
+/// Collapse workspace/symbol entries that share a full identity tuple
+/// (name, kind, file, line, col). Framework accessor synthesis mints twin
+/// symbols at ONE span — a getter `Method` and its fluent-writer twin carry
+/// the same name/kind/selection_span — and the same symbol can surface from
+/// both the resident sweep and the rows pass. Keying on the whole tuple
+/// collapses only byte-identical duplicates; two genuinely different symbols
+/// that merely share a name keep their distinct spans.
+pub fn dedup_workspace_symbols(results: &mut Vec<SymbolInformation>) {
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|s| {
+        seen.insert((
+            s.name.clone(),
+            format!("{:?}", s.kind),
+            s.location.uri.to_string(),
+            s.location.range.start.line,
+            s.location.range.start.character,
+        ))
+    });
+}
+
 /// The rows half of workspace/symbol: fan the query across the hub's Perl
 /// store and every pack sub-index's store. One spelling of the fan-out so
 /// the LSP handler and the CLI verb can never diverge.
@@ -198,6 +221,8 @@ pub fn sym_row_search(
 
 /// `symbol_to_workspace_info`'s row twin — identical kind gate and
 /// hidden/lexical suppressions, sourced from the baked row flags.
+// `SymbolInformation::deprecated` is a deprecated-but-required field.
+#[allow(deprecated)]
 pub fn sym_row_to_workspace_info(
     hit: &crate::module_cache::SymRowHit,
 ) -> Option<SymbolInformation> {
@@ -630,8 +655,8 @@ pub fn completion_items_for_test(
     completion_items(&files, &key, analysis, tree, source, pos, module_index, stable_packages)
 }
 
-/// Original native completion path. Renamed from `completion_items`
-/// so the plugin-aware wrapper above can fall through to it.
+/// The native completion path — the plugin-aware `completion_items`
+/// wrapper above falls through to it.
 #[allow(clippy::too_many_arguments)]
 fn completion_items_native(
     files: &crate::file_store::FileStore,
@@ -2780,7 +2805,7 @@ pub fn collect_diagnostics(
         // DBIC meta-methods (inherited from DBIx::Class::Core)
         "add_columns", "add_column", "set_primary_key", "table", "resultset_class",
         "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
-        "load_components",
+        "load_components", "load_own_components",
         // Moose/Moo meta-methods
         "meta",
     ];

@@ -5453,6 +5453,65 @@ sub real_sub { 1 }
     );
 }
 
+/// H7-10(a): an anonymous sub is never a method-completion candidate. With
+/// an unresolvable receiver, `complete_methods` falls back to enumerating
+/// file subs — but `$obj->(anon)` isn't callable, so the synthetic `(anon)`
+/// symbol must be filtered at the source (gated on "has a callable name",
+/// not the literal spelling).
+#[test]
+fn test_anon_sub_not_a_method_completion_candidate() {
+    let src = "\
+my $cb = sub { return 42 };
+sub real_method { 1 }
+";
+    let analysis = parse_analysis(src);
+    // `$unknown` doesn't resolve to a class → the file-subs fallback path.
+    let cands = analysis.complete_methods("$unknown", Point::new(2, 0), None);
+    let labels: Vec<&str> = cands.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        !labels.iter().any(|l| l.contains("anon")),
+        "anon sub must not be a method candidate: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"real_method"),
+        "named subs are still candidates: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn test_dedup_workspace_symbols_collapses_twins() {
+    use tower_lsp::lsp_types::{Location, Position, Range, SymbolInformation, SymbolKind, Url};
+    #[allow(deprecated)]
+    let make = |name: &str, line: u32, col: u32| SymbolInformation {
+        name: name.to_string(),
+        kind: SymbolKind::METHOD,
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri: Url::parse("file:///t.pm").unwrap(),
+            range: Range {
+                start: Position { line, character: col },
+                end: Position { line, character: col + 4 },
+            },
+        },
+        container_name: None,
+    };
+    // Two byte-identical twins (accessor getter + fluent-writer at one span)
+    // plus a same-named symbol at a different line (a real distinct decl).
+    let mut results = vec![
+        make("connect_timeout", 10, 4),
+        make("connect_timeout", 10, 4),
+        make("connect_timeout", 42, 4),
+    ];
+    dedup_workspace_symbols(&mut results);
+    assert_eq!(results.len(), 2, "twins collapse, distinct span survives: {:?}",
+        results.iter().map(|s| (s.name.clone(), s.location.range.start.line)).collect::<Vec<_>>());
+    assert!(results.iter().any(|s| s.location.range.start.line == 10));
+    assert!(results.iter().any(|s| s.location.range.start.line == 42));
+}
+
 /// `my sub helper { … }` — document symbols keep it (real in-file
 /// structure); workspace-symbol search drops it (not addressable
 /// outside its block). Plain subs surface in both.

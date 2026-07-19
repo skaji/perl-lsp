@@ -1,0 +1,28 @@
+{
+  "project": {"repo": "https://github.com/fmtlib/fmt", "root_subdir": "",
+    "note": "template-heavy header-mostly C++; 19 .h/.cc in include/fmt + src (71 C/C++ files repo-wide, 72 indexed). spine = report_system_error (non-template free fn declared include/fmt/format.h:4315, defined format-inl.h, called in os.cc + tests). os.cc/format.cc both include the fmt/ headers, so the format.h contract edit invalidates both TUs. ONE deliberate template probe (dragonbox::to_decimal explicit instantiation in format.cc) tagged -knownweak: goto-def returns empty (lazy template projection edge)."},
+  "readiness": {"file": "src/os.cc", "line": 171, "character": 10},
+  "steps": [
+    {"action": "open", "file": "src/os.cc"},
+    {"action": "rss", "name": "post-open"},
+    {"action": "hover", "file": "src/os.cc", "line": 171, "character": 10, "name": "hover-report_system_error-header-fn"},
+    {"action": "definition", "file": "src/os.cc", "line": 151, "character": 26, "name": "def-to_utf8-cross-tu-format-h"},
+    {"action": "references", "file": "src/os.cc", "line": 171, "character": 10, "name": "refs-report_system_error-widely-used"},
+    {"action": "completion", "file": "src/os.cc", "line": 175, "character": 49, "name": "complete-cstring_view-member"},
+    {"action": "rss", "name": "post-nav"},
+    {"action": "open", "file": "src/format.cc"},
+    {"action": "definition", "file": "src/format.cc", "line": 17, "character": 33, "name": "def-dragonbox-to_decimal-template-knownweak"},
+    {"action": "hover", "file": "src/format.cc", "line": 17, "character": 33, "name": "hover-dragonbox-to_decimal-template-knownweak"},
+    {"action": "rss", "name": "post-template-probe"},
+    {"action": "insert_line", "file": "src/os.cc", "line": 184, "text": "  int zz_bench_tmp = 0;", "name": "body-edit-1", "await_diagnostics": true},
+    {"action": "insert_line", "file": "src/os.cc", "line": 185, "text": "  zz_bench_tmp += 1;", "name": "body-edit-2", "await_diagnostics": true},
+    {"action": "revert", "file": "src/os.cc", "name": "revert-body-edits", "await_diagnostics": true},
+    {"action": "rss", "name": "post-body-edits"},
+    {"action": "open", "file": "include/fmt/format.h"},
+    {"action": "insert_line", "file": "include/fmt/format.h", "line": 4315, "text": "int zz_bench_probe();", "name": "header-contract-edit", "await_diagnostics": true},
+    {"action": "revert", "file": "include/fmt/format.h", "name": "revert-header-edit", "await_diagnostics": true},
+    {"action": "rss", "name": "post-header-edit"},
+    {"action": "hover", "file": "src/os.cc", "line": 171, "character": 10, "name": "hover-report_system_error-post-header-invalidation"},
+    {"action": "definition", "file": "src/os.cc", "line": 151, "character": 26, "name": "def-to_utf8-post-header-invalidation"}
+  ]
+}

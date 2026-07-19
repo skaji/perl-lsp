@@ -3858,6 +3858,78 @@ fn dbic_column_rename_reaches_cross_file_consumer_arg_key() {
     );
 }
 
+/// Owner-gating (H7-6): a synthesized column accessor's identity is the OWNING
+/// class, not the bare name. Renaming one class's `id` column must NOT reach a
+/// framework ancestor's real `sub id` (`DBIx::Class::PK::id`) nor an unrelated
+/// SIBLING class that carries its own independent `id` column — both merely
+/// share the name. Rooting the accessor family at the owner (not the topmost
+/// same-named ancestor) is what keeps the edit set to the owner + its typed
+/// call sites. The owner's own `$self->id` call DOES edit.
+#[test]
+fn dbic_column_rename_owner_gated_excludes_framework_and_siblings() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    let store = FileStore::new();
+    let base = PathBuf::from("/tmp/owngate_base.pm");
+    let widget = PathBuf::from("/tmp/owngate_widget.pm");
+    let gadget = PathBuf::from("/tmp/owngate_gadget.pm");
+    // A framework-ish base with a real generic `sub id` — the name-collision
+    // bait (stands in for `DBIx::Class::PK::id`).
+    let base_src = "package MyBase;\nsub id { my $self = shift; return $self->{_id}; }\n1;\n";
+    // Two independent DBIC subclasses (direct `DBIx::Class::Core` base so
+    // columns synthesize), each ALSO inheriting the framework `id` via MyBase,
+    // and each with its OWN `id` column. `$self->id` in Widget is a typed
+    // owner-receiver call.
+    let widget_src = "package Widget;\nuse base ('DBIx::Class::Core', 'MyBase');\n\
+        __PACKAGE__->add_columns(qw/id name/);\n\
+        sub go { my $self = shift; return $self->id; }\n1;\n";
+    let gadget_src = "package Gadget;\nuse base ('DBIx::Class::Core', 'MyBase');\n\
+        __PACKAGE__->add_columns(qw/id/);\n1;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(base.clone(), Arc::new(parse(base_src)));
+    idx.register_workspace_module(widget.clone(), Arc::new(parse(widget_src)));
+    idx.register_workspace_module(gadget.clone(), Arc::new(parse(gadget_src)));
+    store.insert_workspace(base.clone(), parse(base_src));
+    store.insert_workspace(widget.clone(), parse(widget_src));
+    store.insert_workspace(gadget.clone(), parse(gadget_src));
+
+    let widget_fa = store.workspace_raw().get(&widget).unwrap().value().clone();
+    let col = widget_src.lines().nth(2).unwrap().find("id").unwrap();
+    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+        resolve_symbol(&widget_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx))
+            .expect("column resolves to a group")
+    else {
+        panic!("expected a column attr Group")
+    };
+    let edits = group_rename_edits(
+        &store, Some(&idx), &FileKey::Path(widget.clone()), &local_spans, &pinned_spans,
+        &members, "renamed", RoleMask::EDITABLE,
+    );
+    let touched: std::collections::BTreeSet<&PathBuf> = edits
+        .iter()
+        .filter_map(|(l, _)| match &l.key { FileKey::Path(p) => Some(p), _ => None })
+        .collect();
+    assert!(
+        !touched.contains(&base),
+        "framework ancestor's real `sub id` must be untouched: {touched:?}",
+    );
+    assert!(
+        !touched.contains(&gadget),
+        "unrelated sibling class's own `id` column must be untouched: {touched:?}",
+    );
+    // The owner's decl + its typed `$self->id` call both edit.
+    let widget_rows: std::collections::BTreeSet<usize> = edits
+        .iter()
+        .filter(|(l, _)| matches!(&l.key, FileKey::Path(p) if p == &widget))
+        .map(|(l, _)| l.span.start.row)
+        .collect();
+    assert!(widget_rows.contains(&2), "owner column decl (row 2) edits: {edits:?}");
+    assert!(
+        widget_rows.contains(&3),
+        "owner-typed `$self->id` call (row 3) edits: {edits:?}",
+    );
+}
+
 /// Event (Handler) rename. A literal event-name site is rewritable
 /// and its span is the **inside-the-quotes** name (so rename keeps the quotes);
 /// a folded site — variable (`my $e='connect'; on($e)`) OR constant
@@ -4142,6 +4214,163 @@ fn test_implementations_of_role_requires_fans_out_to_composers() {
     assert!(implementations_of(&origin, Some(&idx), &pkg_target).is_empty());
 }
 
+/// A method override that lives on a SIBLING PARENT of a shared descendant
+/// (Perl multi-parent composition — `use base qw(Mixin Base)`, Moo `with`,
+/// DBIC `load_components`). The mixin is an ancestor of a concrete descendant
+/// of the target class yet is NOT itself a descendant of it, so the plain
+/// INHERITS_INV descendant sweep never reaches it. `implementations_of` must
+/// still surface it (H7-7: DBIC `Row::update` overridden by `Ordered` etc.).
+#[test]
+fn test_implementations_finds_mixin_sibling_override() {
+    use crate::module_index::{CachedModule, ModuleIndex};
+    use std::sync::Arc;
+
+    let idx = ModuleIndex::new_for_test();
+    let insert = |name: &str, src: &str| {
+        let analysis = Arc::new(parse(src));
+        idx.insert_cache(
+            name,
+            Some(Arc::new(CachedModule::new(
+                PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+                analysis,
+            ))),
+        );
+    };
+    // Base defines the contract method; Mixin overrides it WITHOUT inheriting
+    // Base; Child assembles its dispatch from both (Mixin ahead of Base).
+    insert("Base", "package Base;\nsub save { 1 }\n1;\n");
+    insert("Mixin", "package Mixin;\nsub save { 2 }\n1;\n");
+    insert("Child", "package Child;\nuse base qw(Mixin Base);\n1;\n");
+
+    let target = TargetRef {
+        name: "save".to_string(),
+        kind: TargetKind::Method { class: "Base".to_string() },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch, def_paths: Vec::new(), bare_constant: false,
+    };
+    let origin = parse("package Probe;\n1;\n");
+    let files: Vec<String> = implementations_of(&origin, Some(&idx), &target)
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.display().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["/fake/Mixin.pm"],
+        "the sibling-parent override is an implementation; Base (the contract) is excluded",
+    );
+}
+
+/// H7-9: `references` on a framework verb (`belongs_to`/`has_many`/…) defined
+/// in a component/mixin ancestor, seeded from a cursor ON the `sub` decl, must
+/// reach every `__PACKAGE__->verb(...)` call site in descendant classes across
+/// files. The receiver of each call is `__PACKAGE__` (the descendant class),
+/// which `isa` the verb's owner only through a CROSS-FILE parent edge — the
+/// matcher must confirm that ancestry via the index, exactly as the real DBIC
+/// `CD → BaseResult → …Core → …Relationship::BelongsTo` chain does.
+#[test]
+fn refs_to_package_verb_reaches_cross_file_call_sites() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let idx = ModuleIndex::new_for_test();
+
+    let comp_path = PathBuf::from("/tmp/h9/Comp.pm");
+    let a_path = PathBuf::from("/tmp/h9/ClassA.pm");
+    let b_path = PathBuf::from("/tmp/h9/ClassB.pm");
+
+    // Component defines the verb. Two classes inherit it and invoke it via
+    // `__PACKAGE__->verb(...)` — the invocant is the descendant class, which
+    // reaches Comp only cross-file.
+    let comp_src = "package Comp;\nsub my_rel { my ($class, $rel, $target) = @_; 1 }\n1;\n";
+    let a_src = "package ClassA;\nuse base 'Comp';\n__PACKAGE__->my_rel( alpha => 'ClassA::Alpha' );\n1;\n";
+    let b_src = "package ClassB;\nuse base 'Comp';\n__PACKAGE__->my_rel( beta => 'ClassB::Beta' );\n1;\n";
+
+    for (path, src) in [(&comp_path, comp_src), (&a_path, a_src), (&b_path, b_src)] {
+        store.insert_workspace(path.clone(), parse(src));
+        idx.register_workspace_module(path.clone(), Arc::new(parse(src)));
+    }
+
+    // Seed the query exactly as the CLI does: cursor ON the `sub my_rel` decl
+    // token in Comp → `resolve()` → the `references()` projection.
+    let origin = parse(comp_src);
+    let decl_col = comp_src.lines().nth(1).unwrap().find("my_rel").unwrap() + 1;
+    let cs = resolve(
+        &store,
+        &origin,
+        FileKey::Path(comp_path.clone()),
+        tree_sitter::Point { row: 1, column: decl_col },
+        Some(&idx),
+        OverrideScope::default(),
+    );
+    let refs = cs.references();
+    let files: std::collections::HashSet<String> = refs
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.file_name().unwrap().to_str().unwrap().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+
+    assert!(files.contains("Comp.pm"), "verb decl missing: {:?}", files);
+    assert!(
+        files.contains("ClassA.pm"),
+        "__PACKAGE__->my_rel in ClassA (cross-file descendant) dropped: {:?}",
+        files,
+    );
+    assert!(
+        files.contains("ClassB.pm"),
+        "__PACKAGE__->my_rel in ClassB (cross-file descendant) dropped: {:?}",
+        files,
+    );
+}
+
+/// The implementations verb is seeded by a cursor ON a `sub NAME` decl too —
+/// which resolves to `Sub{package: Some(class)}`, not `Method{class}`. Perl
+/// has no sub/method distinction, so a package sub is a dispatch root exactly
+/// like a method-call target. (H7-7: the DBIC probe cursor sits on
+/// `sub update` in `DBIx::Class::Row`, a plain `sub`.)
+#[test]
+fn test_implementations_on_sub_decl_target_finds_overrides() {
+    use crate::module_index::{CachedModule, ModuleIndex};
+    use std::sync::Arc;
+
+    let idx = ModuleIndex::new_for_test();
+    let insert = |name: &str, src: &str| {
+        let analysis = Arc::new(parse(src));
+        idx.insert_cache(
+            name,
+            Some(Arc::new(CachedModule::new(
+                PathBuf::from(format!("/fake/{}.pm", name.replace("::", "/"))),
+                analysis,
+            ))),
+        );
+    };
+    insert("Base", "package Base;\nsub save { 1 }\n1;\n");
+    insert("Sub1", "package Sub1;\nuse base qw(Base);\nsub save { 2 }\n1;\n");
+
+    let target = TargetRef {
+        name: "save".to_string(),
+        kind: TargetKind::Sub { package: Some("Base".to_string()) },
+        method_classes: Vec::new(), scope: OverrideScope::Dispatch, def_paths: Vec::new(), bare_constant: false,
+    };
+    let origin = parse("package Probe;\n1;\n");
+    let files: Vec<String> = implementations_of(&origin, Some(&idx), &target)
+        .iter()
+        .map(|r| match &r.key {
+            FileKey::Path(p) => p.display().to_string(),
+            FileKey::Url(u) => u.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        files,
+        vec!["/fake/Sub1.pm"],
+        "a plain-subclass override, reached from a Sub-package decl target",
+    );
+}
+
 /// The pack-language backward lanes: def→uses on the SAME key the forward
 /// (use→def) resolutions use — enum constants / members (Method{class}),
 /// macros + globals (FileScopeValue), delegation aliases.
@@ -4319,6 +4548,93 @@ mod pack_symmetry {
         assert!(
             defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("state.h"))),
             "the extern decl is kept: {defs:?}"
+        );
+    }
+
+    /// Cross-file MEMBER decl→def (H7-3): a class member's out-of-line body
+    /// (`void C::m(){}` in another TU) is NOT linkage-visible, so the name-keyed
+    /// def-candidates table never pulls it in — the free-function decl→def hop
+    /// misses it. The member fallback in `preferred_definitions` sweeps the
+    /// closure-connected cached files directly. Two entry shapes, one axis:
+    /// an explicitly-qualified call (`C::m(...)`, owner-anchored path) and a
+    /// cursor sitting on the header declaration itself.
+    #[test]
+    fn goto_def_links_member_decl_to_out_of_line_def_cross_file() {
+        use std::sync::Arc;
+        // No enclosing namespace, so the def's `package` stays the qualifier's
+        // class (the container-reanchor never fires) — exercises resolution/
+        // linking on a shape whose extraction packages the member correctly.
+        let header_src = "struct MemTable {\n  void Add(int s);\n};\n";
+        let def_src = "void MemTable::Add(int s) { return; }\n";
+        let caller_src = "void writer() {\n  MemTable::Add(3);\n}\n";
+
+        let header = cpp(header_src);
+        let mut def_tu = cpp(def_src);
+        def_tu.include_closure = crate::file_analysis::path_intern::ClosureList::from_iter(
+            std::iter::once("/fake/mt/memtable.h"),
+        );
+        let mut caller = cpp(caller_src);
+        caller.include_closure = crate::file_analysis::path_intern::ClosureList::from_iter(
+            std::iter::once("/fake/mt/memtable.h"),
+        );
+
+        let idx = crate::module_index::ModuleIndex::new_for_test();
+        idx.register_symbols(PathBuf::from("/fake/mt/memtable.h"), Arc::new(header));
+        idx.register_symbols(PathBuf::from("/fake/mt/memtable.cc"), Arc::new(def_tu));
+        idx.register_symbols(PathBuf::from("/fake/mt/writer.cc"), Arc::new(caller));
+        let store = FileStore::new();
+
+        // (1) Explicitly-qualified cross-file call: `MemTable::Add(3)`.
+        let origin = idx
+            .get_cached_scoped(
+                "writer",
+                &["/fake/mt/memtable.h".to_string()].iter().cloned().collect(),
+            )
+            .expect("writer.cc registered");
+        assert!(origin.path.ends_with("writer.cc"));
+        let cs = resolve(
+            &store,
+            &origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/mt/writer.cc")),
+            tree_sitter::Point { row: 1, column: 12 }, // on `Add`
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(caller_src)
+        .pack_routed();
+        let defs = cs.definitions();
+        assert!(
+            defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.cc"))),
+            "the out-of-line body is present (def must be reachable): {defs:?}"
+        );
+        assert!(
+            matches!(&defs[0].key, FileKey::Path(p) if p.ends_with("memtable.cc")),
+            "the bodied def ranks first: {defs:?}"
+        );
+        assert!(
+            defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.h"))),
+            "the header decl is kept, never pruned: {defs:?}"
+        );
+
+        // (2) Cursor ON the header declaration: still offers the body first.
+        let hdr_origin = idx
+            .get_cached("MemTable")
+            .expect("MemTable class registered");
+        assert!(hdr_origin.path.ends_with("memtable.h"));
+        let cs2 = resolve(
+            &store,
+            &hdr_origin.analysis,
+            FileKey::Path(PathBuf::from("/fake/mt/memtable.h")),
+            tree_sitter::Point { row: 1, column: 7 }, // on `Add` in the decl
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .with_source(header_src)
+        .pack_routed();
+        let defs2 = cs2.definitions();
+        assert!(
+            defs2.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.cc"))),
+            "goto-def on the decl reaches the out-of-line body: {defs2:?}"
         );
     }
 

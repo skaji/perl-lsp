@@ -41,9 +41,36 @@ pub fn is_constructor_name(name: &str) -> bool {
     name == "new"
 }
 
+/// A syntactically valid bareword package/class name: `Foo`, `Foo::Bar`,
+/// `_Private`. The tolerant grammar hands `->new`'s invocant back as raw
+/// text, and a computed receiver — `(ref $self)->new`, the DBIC
+/// receiver-polymorphic constructor idiom — parses to a leading `(`, which
+/// must NEVER be frozen as a class name (that produced `return_type: "("`).
+/// A class here is `InferredType::ClassName(text)`; only accept text a
+/// package could actually be spelled as.
+pub fn is_bareword_class_name(text: &str) -> bool {
+    !text.is_empty()
+        && text.split("::").all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
 /// `__PACKAGE__` — the compile-time token for the enclosing package.
 pub fn is_current_package_token(text: &str) -> bool {
     text == "__PACKAGE__"
+}
+
+/// A name that can be written as a method / sub call — a syntactically valid
+/// Perl identifier (or `::`-qualified chain of them). Synthetic symbols the
+/// analyzer mints for value-carrying constructs — an anonymous `sub { ... }`
+/// gets the placeholder name `(anon)` — are NOT callable by name, so they must
+/// never surface as method-completion candidates (`$obj->(anon)` is not a
+/// thing). Gate completion sources on this property, not on the literal
+/// `(anon)` spelling (rule #10).
+pub fn is_callable_sub_name(name: &str) -> bool {
+    is_bareword_class_name(name)
 }
 
 /// A method-call invocant in canonical spelling: variable invocants are
@@ -303,7 +330,18 @@ impl<'a> MethodToken<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvocantText, MethodToken};
+    use super::{is_bareword_class_name, InvocantText, MethodToken};
+
+    #[test]
+    fn bareword_class_name_rejects_computed_receivers() {
+        for ok in ["Foo", "Foo::Bar", "_Private", "DBIx::Class::ResultSet", "a1"] {
+            assert!(is_bareword_class_name(ok), "{ok} should be a class name");
+        }
+        // The DBIC `(ref $self)->new` idiom parses to these — never a class.
+        for bad in ["(ref $self)", "(", "(ref $self", "$self", "1Foo", "Foo::", "::Foo", ""] {
+            assert!(!is_bareword_class_name(bad), "{bad:?} must NOT be a class name");
+        }
+    }
 
     #[test]
     fn invocant_text_variants() {

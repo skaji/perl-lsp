@@ -490,9 +490,16 @@ fn render_interior_sequence(node: Node, source: &[u8]) -> String {
                 // Bare URL: L<http://example.com>
                 format!("[{}]({})", content, content)
             } else if content.contains('/') {
-                // L<Module/section> → Module (section)
                 let parts: Vec<&str> = content.splitn(2, '/').collect();
-                format!("{} ({})", parts[0], parts[1].trim_matches('"'))
+                let section = parts[1].trim_matches('"');
+                if parts[0].is_empty() {
+                    // L</section> or L</"section"> — same-document section
+                    // link; there's no module to name, just the section.
+                    section.to_string()
+                } else {
+                    // L<Module/section> → Module (section)
+                    format!("{} ({})", parts[0], section)
+                }
             } else {
                 // L<Module::Name> → link to metacpan
                 format!("[{}](https://metacpan.org/pod/{})", content, content)

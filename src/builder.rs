@@ -185,6 +185,26 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     build_with_plugins(tree, source, default_plugin_registry())
 }
 
+/// The compiled `@flow` query (`queries/perl/flow.scm`), compiled once.
+/// `Query::new` is expensive and `build` runs per file — see `warm_flow_query`
+/// for why this is warmed at startup rather than lazily on the first build.
+fn flow_query() -> Option<&'static tree_sitter::Query> {
+    use std::sync::OnceLock;
+    static FLOW_SCM: &str = include_str!("../queries/perl/flow.scm");
+    static FLOW_QUERY: OnceLock<Option<tree_sitter::Query>> = OnceLock::new();
+    FLOW_QUERY
+        .get_or_init(|| {
+            let lang: tree_sitter::Language = ts_parser_perl::LANGUAGE.into();
+            tree_sitter::Query::new(&lang, FLOW_SCM).ok()
+        })
+        .as_ref()
+}
+
+/// Force the flow query to compile now, off the parallel per-file path.
+pub(crate) fn warm_flow_query() {
+    let _ = flow_query();
+}
+
 /// Build with a caller-provided plugin registry. Tests use this to swap in
 /// deterministic plugin sets; the global default is otherwise shared.
 pub fn build_with_plugins(
@@ -286,6 +306,7 @@ fn build_with_plugins_inner(
         flow_edges: Vec::new(),
         any_requires_action_attr: false,
         provisional_dispatches: Vec::new(),
+        gated_emissions: Vec::new(),
         gated_param_types: Vec::new(),
         method_call_invocant: std::collections::HashMap::new(),
         attr_projections: Vec::new(),
@@ -296,6 +317,7 @@ fn build_with_plugins_inner(
         dynamic_dispatch_sites: 0,
         role_maker_modules: std::collections::HashSet::new(),
         role_packages: std::collections::HashSet::new(),
+        dbic_source_name: None,
         topic_group_spans: Vec::new(),
         plugin_diagnostics: Vec::new(),
         topic_dsls,
@@ -581,6 +603,7 @@ fn build_with_plugins_inner(
         witnesses: b.bag,
         package_framework: b.package_framework,
         provisional_dispatches: b.provisional_dispatches,
+        gated_emissions: b.gated_emissions,
         guard_sites: b.guard_sites,
         arrow_deref_sites: b.arrow_deref_sites,
         attr_projections: b.attr_projections,
@@ -592,6 +615,7 @@ fn build_with_plugins_inner(
         dynamic_parent_packages: b.dynamic_parent_packages,
         dynamic_dispatch_sites: b.dynamic_dispatch_sites,
         role_packages: b.role_packages,
+        dbic_source_name: b.dbic_source_name,
         column_keyed_verbs: b.plugins.column_keyed_verbs().map(|s| s.to_string()).collect(),
         plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
@@ -837,6 +861,17 @@ enum ArityBranch {
     /// `return X if @_ == N;` / `if scalar(@_) == N;` / explicit
     /// `if (@_ == N) { return X }`. Exact-N match.
     Exact(u32),
+    /// `return X unless @_ > N;` — fires only at arity ≤ N. Arrives from a
+    /// relational arity guard (`@_ > N` / `@_ < N` / …), and — the load-
+    /// bearing case — from a COMPOUND guard `unless @_ > N || <non-arity>`
+    /// where `@_ ≤ N` is the sound NECESSARY condition (the non-arity
+    /// disjunct only narrows it further). An over-approximation of the arm's
+    /// true firing domain, but tighter than the fluent `Default`/`Any` arm,
+    /// so an honest low-arity type beats the wrong fluent one.
+    AtMost(u32),
+    /// `return X if @_ > N;` — fires only at arity ≥ N+1. The relational
+    /// mirror of `AtMost`; a fluent writer guarded by a magnitude test.
+    AtLeast(u32),
     /// Fall-through `return X;` with no condition wrapper — fires
     /// when no earlier arity-gated branch matched.
     Default,
@@ -948,14 +983,99 @@ fn classify_arity_condition(
         if !counts_args {
             return None;
         }
-        match (keyword, op.as_str()) {
+        return match (keyword, op.as_str()) {
             ("if", "==") => Some(ArityBranch::Exact(n)),
             ("unless", "!=") => Some(ArityBranch::Exact(n)),
             _ => None, // != / >= / etc. — not a single Exact fact.
-        }
-    } else {
-        None
+        };
     }
+    // Shape 4: `@_ > N` / `@_ < N` / `@_ >= N` / `@_ <= N` → relational.
+    if cond.kind() == "relational_expression" {
+        return classify_relational_arity(cond, source, keyword);
+    }
+    // Shape 5: compound `A || B` / `A && B` — one side is an arity test, the
+    // other an unrelated predicate. Keep ONLY the sound constraint:
+    //   - `unless (A || B)` fires ⟺ `!A && !B` ⇒ `!A` (arity side classified
+    //     under `unless`) is necessary — `!B` only narrows further.
+    //   - `if (A && B)` fires ⟺ `A && B` ⇒ the arity conjunct under `if` is
+    //     necessary.
+    // The other two (`if (A||B)`, `unless (A&&B)`) can fire via the non-arity
+    // term at any arity, so no sound arity constraint — punt.
+    if cond.kind() == "binary_expression" {
+        let op = raw_mid_op(cond, source);
+        let sound = matches!(
+            (keyword, op.as_str()),
+            ("unless", "||") | ("unless", "or") | ("if", "&&") | ("if", "and")
+        );
+        if !sound {
+            return None;
+        }
+        let left = cond.child_by_field_name("left")?;
+        let right = cond.child_by_field_name("right")?;
+        // Either operand may carry the arity test; the other is the
+        // unrelated predicate. First sound classification wins.
+        return classify_arity_condition(left, source, keyword)
+            .or_else(|| classify_arity_condition(right, source, keyword));
+    }
+    None
+}
+
+/// Classify `@_ CMP N` (relational). Arity magnitude must be the LEFT
+/// operand, a literal the right. `if @_ > 1` fires at arity ≥ 2
+/// (`AtLeast(2)`); `unless @_ > 1` fires at arity ≤ 1 (`AtMost(1)`), the
+/// Mojo `attr`-style getter guard.
+fn classify_relational_arity(
+    cond: tree_sitter::Node,
+    source: &[u8],
+    keyword: &str,
+) -> Option<ArityBranch> {
+    let op = raw_mid_op(cond, source);
+    let left = cond.child_by_field_name("left")?;
+    let right = cond.child_by_field_name("right")?;
+    if !node_is_arity_magnitude(left, source) {
+        return None;
+    }
+    let n = extract_numeric(right, source)?;
+    // `keyword`-fires semantics: `if COND` fires when COND holds; `unless
+    // COND` fires when it doesn't. Map each to the arity band it guarantees.
+    match (keyword, op.as_str()) {
+        // @_ > N: if → ≥ N+1; unless → ≤ N
+        ("if", ">") => n.checked_add(1).map(ArityBranch::AtLeast),
+        ("unless", ">") => Some(ArityBranch::AtMost(n)),
+        // @_ >= N: if → ≥ N; unless → ≤ N-1
+        ("if", ">=") => Some(ArityBranch::AtLeast(n)),
+        ("unless", ">=") => n.checked_sub(1).map(ArityBranch::AtMost),
+        // @_ < N: if → ≤ N-1; unless → ≥ N
+        ("if", "<") => n.checked_sub(1).map(ArityBranch::AtMost),
+        ("unless", "<") => Some(ArityBranch::AtLeast(n)),
+        // @_ <= N: if → ≤ N; unless → ≥ N+1
+        ("if", "<=") => Some(ArityBranch::AtMost(n)),
+        ("unless", "<=") => n.checked_add(1).map(ArityBranch::AtLeast),
+        _ => None,
+    }
+}
+
+/// Do the return arms agree in a way that is the sub's genuine return type —
+/// as opposed to the lossy Object-subsumes-HashRef *dominance* that
+/// `resolve_return_type` also accepts? Decides whether an arity-discriminated
+/// sub keeps its non-arity `return_arm_chain` fallback (agree → the arm-join
+/// is the right answer at every arity and at a no-hint query) or retracts it
+/// (disagree → a gap arity must answer None, not the fluent-class leak).
+fn arms_genuinely_agree(types: &[InferredType]) -> Option<InferredType> {
+    let first = types.first()?;
+    if types.iter().all(|t| t == first) {
+        return Some(first.clone());
+    }
+    if types.iter().all(|t| t.is_hash_shaped()) {
+        return Some(InferredType::HashRef);
+    }
+    if types.iter().all(|t| t.is_array_shaped()) {
+        return Some(InferredType::ArrayRef);
+    }
+    if types.iter().all(|t| matches!(t, InferredType::Bool | InferredType::Numeric)) {
+        return Some(InferredType::Numeric);
+    }
+    None
 }
 
 /// True if `node` evaluates to the length of `@_` — either `@_`
@@ -1550,6 +1670,11 @@ struct Builder<'a> {
     /// enrichment once the receiver's cross-file class is known. See
     /// `file_analysis::ProvisionalDispatch`.
     provisional_dispatches: Vec<crate::file_analysis::ProvisionalDispatch>,
+    /// Plugin pattern emissions deferred because a `ClassIsa` trigger
+    /// couldn't be confirmed against LOCAL ancestry at build (rule #1). Each
+    /// is re-fired at enrichment when the package's ancestry resolves the
+    /// gate prefix cross-file. See `file_analysis::GatedEmission`.
+    gated_emissions: Vec<crate::file_analysis::GatedEmission>,
     /// `param_types()` role-contract TCs, emitted ungated at the sub walk and
     /// gated on the enclosing package's `isa in_role` (checked cross-file at
     /// query time). See `FileAnalysis::gated_param_types`.
@@ -1622,6 +1747,10 @@ struct Builder<'a> {
     /// `FileAnalysis.role_packages`; `is_role_package` reads the baked
     /// set, never re-derives from use lists.
     role_packages: std::collections::HashSet<String>,
+
+    /// DBIC `__PACKAGE__->source_name('X')` override captured during the
+    /// walk (see `FileAnalysis::dbic_source_name`).
+    dbic_source_name: Option<String>,
 
     /// Spans of topic-DSL group-scope calls (`group { … }` in lite),
     /// recorded during the walk so the fold-phase pattern dispatch can
@@ -1850,13 +1979,8 @@ impl<'a> Builder<'a> {
     /// function start of Perl-on-the-query-engine. Provenance-only for now
     /// (no lowering): the shapes' types still come from the walk.
     fn mint_flow_edges_via_query(&mut self, tree: &'a Tree) {
-        use std::sync::OnceLock;
-        use tree_sitter::{Query, QueryCursor, StreamingIterator};
-        static FLOW_SCM: &str = include_str!("../queries/perl/flow.scm");
-        // `Query::new` is expensive and `build` runs per file; compile once.
-        static FLOW_QUERY: OnceLock<Option<Query>> = OnceLock::new();
-        let lang = tree.language();
-        let query = match FLOW_QUERY.get_or_init(|| Query::new(&lang, FLOW_SCM).ok()) {
+        use tree_sitter::{QueryCursor, StreamingIterator};
+        let query = match flow_query() {
             Some(q) => q,
             None => return,
         };
@@ -2560,7 +2684,55 @@ impl<'a> Builder<'a> {
                 if Self::is_route_type(call_ty.as_ref()) {
                     return Some(self.brand_route_call(node, invocant_ty.as_ref(), call_ty));
                 }
-                call_ty
+                if call_ty.is_some() {
+                    return call_ty;
+                }
+                // The `Expression(refidx)` chase came up empty. Two
+                // receiver-relative fallbacks let a chain hop resolve
+                // DURING the fold — before `emit_method_call_return_edges`
+                // / `emit_invocant_expr_witnesses` (both post-fold) publish
+                // this call's edge. Without them, the variable a fluent /
+                // projecting chain is bound to (`my $art = $rs->search(
+                // ...)->first`) never gets a build-time TC, so hover /
+                // goto-def on it (which read the TC) stay dark.
+                //
+                // (a) Fluent verb (`$rs->search`) — returns its invocant's
+                //     type unchanged, so the receiver IS the answer.
+                if self.is_fluent_verb_call(node) {
+                    if invocant_ty.is_some() {
+                        return invocant_ty;
+                    }
+                }
+                // (b) Receiver-relative projection (`->first`/`->create` →
+                //     RowOf) declared on `MethodOnClass{recv.class, method}`
+                //     by `emit_parametric_return_expr_decls` (published in
+                //     the live walk, so it IS in the bag now). Query it with
+                //     the receiver threaded so `RowOf(Receiver)` projects to
+                //     the row class.
+                if let Some(recv) = &invocant_ty {
+                    if let Some(cls) = recv.class_name() {
+                        if let Some(mtext) = node
+                            .child_by_field_name("method")
+                            .and_then(|m| m.utf8_text(self.source).ok())
+                        {
+                            let method = crate::conventions::MethodToken::parse(mtext)
+                                .name()
+                                .to_string();
+                            let moc = crate::witnesses::WitnessAttachment::MethodOnClass {
+                                class: cls.to_string(),
+                                name: method,
+                            };
+                            if let Some(t) = self.bag_query_attachment_with(
+                                &moc,
+                                Some(arity),
+                                invocant_ty.clone(),
+                            ) {
+                                return Some(t);
+                            }
+                        }
+                    }
+                }
+                None
             }
             "coderef_call_expression" => {
                 // `$cb->(args)` — value-type IS whatever the operand's
@@ -6525,6 +6697,12 @@ impl<'a> Builder<'a> {
                     // returns only `$a`) as the whole RHS.
                 } else if let Some(it) = inferred {
                     if let Some(vt) = self.get_var_text_from_lhs(left) {
+                        // `my $self = bless {}, $class` — the eager TC below
+                        // bakes the RHS's MATERIALIZED type (the no-receiver
+                        // fallback, i.e. the enclosing class); the deferred
+                        // witness keeps the ctor receiver-polymorphic at
+                        // call sites (wins via reducer order).
+                        self.push_receiver_bless_witness(&vt, right);
                         self.push_type_constraint(TypeConstraint {
                             variable: vt,
                             scope: self.current_scope(),
@@ -7145,6 +7323,23 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A `shift` call or `$_[N]` positional read — a PARAMETER pull. The
+    /// `||`/`//` fold treats these LHSes as the param-default idiom (the
+    /// value is the unknown parameter, not the fallback literal's type).
+    fn is_param_pull(&self, node: Node<'a>) -> bool {
+        if self.is_shift_call(node) {
+            return true;
+        }
+        if node.kind() == "array_element_expression" {
+            if let Some(array) = node.child_by_field_name("array") {
+                return array.kind() == "container_variable"
+                    && array.named_child(0).and_then(|v| v.utf8_text(self.source).ok())
+                        == Some("_");
+            }
+        }
+        false
+    }
+
     /// `$_[0]` — the positional-receiver pseudo-invocant of a method
     /// body. Shared by `invocant_type_at_node`'s array-element arm and
     /// `expr_payload`'s `Receiver` emission so both agree on the shape.
@@ -7214,6 +7409,52 @@ impl<'a> Builder<'a> {
                 span,
             });
             return;
+        }
+        // `LHS || RHS` / `LHS // RHS` — a short-circuit whose value is the
+        // LHS when truthy/defined, else the RHS. The RHS is the guaranteed
+        // FLOOR (`$ENV{X} || 10` returns the literal default whenever the
+        // env var is unset), so it rides a distinct `fallback_arm` source;
+        // `BranchArmFold` prefers it when the arms disagree or the LHS can't
+        // be typed. Reuses the ternary's BranchArm machinery — one speller
+        // for "this expression's value is one of these arms."
+        //
+        // EXCEPT a `shift`/`$_[N]`-LHS: `my $x = shift // 'd'` is the param-
+        // DEFAULT idiom — the value IS the parameter (unknown type); the
+        // literal is a definedness fallback, not a type claim. Folding it to
+        // the literal poisons downstream narrowed uses (`return $x if
+        // $x->isa(...)`). Leave it untyped so the param stays open.
+        if node.kind() == "binary_expression"
+            && matches!(self.get_operator_text(node).as_deref(), Some("||") | Some("//"))
+            && node
+                .child_by_field_name("left")
+                .is_some_and(|lhs| !self.is_param_pull(lhs))
+        {
+            if let (Some(lhs), Some(rhs)) =
+                (node.child_by_field_name("left"), node.child_by_field_name("right"))
+            {
+                let arm_att = WitnessAttachment::BranchArm(span);
+                self.emit_expr_witness(lhs);
+                self.bag.push(Witness {
+                    attachment: arm_att.clone(),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(lhs))),
+                    span: node_to_span(lhs),
+                });
+                self.emit_expr_witness(rhs);
+                self.bag.push(Witness {
+                    attachment: arm_att.clone(),
+                    source: WitnessSource::Builder("fallback_arm".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::Expr(node_to_span(rhs))),
+                    span: node_to_span(rhs),
+                });
+                self.bag.push(Witness {
+                    attachment: WitnessAttachment::Expr(span),
+                    source: WitnessSource::Builder("branch_arm".into()),
+                    payload: WitnessPayload::Edge(arm_att),
+                    span,
+                });
+                return;
+            }
         }
         // Idempotent per span: the walk reaches many expressions twice
         // (child visit first, then the enclosing assignment/invocant
@@ -9342,9 +9583,15 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Handle `__PACKAGE__->load_components('+Full::Name', 'Short::Name')`.
-    /// Bare names are prefixed with `DBIx::Class::`, `+` prefix means fully qualified.
-    fn visit_load_components(&mut self, node: Node<'a>) {
+    /// Handle `__PACKAGE__->load_components('+Full::Name', 'Short::Name')` and
+    /// `load_own_components`. Bare names are prefixed with `base_ns`
+    /// (`DBIx::Class` for `load_components`, the CURRENT package for
+    /// `load_own_components` — DBIC's own-namespace mixin loader:
+    /// `DBIx::Class::Relationship->load_own_components('CascadeActions')` pulls
+    /// in `DBIx::Class::Relationship::CascadeActions`); `+` prefix means fully
+    /// qualified. Both register the component as a parent so method resolution
+    /// and the implementations fan-out see the composed mixin.
+    fn visit_load_components(&mut self, node: Node<'a>, base_ns: &str) {
         let pkg = match self.current_package.clone() {
             Some(p) => p,
             None => return,
@@ -9358,7 +9605,7 @@ impl<'a> Builder<'a> {
                 if let Some(stripped) = name.strip_prefix('+') {
                     stripped.to_string()
                 } else {
-                    format!("DBIx::Class::{}", name)
+                    format!("{}::{}", base_ns, name)
                 }
             })
             .collect();
@@ -10724,6 +10971,26 @@ impl<'a> Builder<'a> {
                     }
                 }
 
+                // `__PACKAGE__->source_name('X')` overrides this result
+                // class's DBIC source moniker (default = class basename).
+                // Class-level call only; the string arg is the moniker.
+                if name == "source_name" {
+                    let pkg_receiver = node
+                        .child_by_field_name("invocant")
+                        .and_then(|inv| inv.utf8_text(self.source).ok())
+                        .is_some_and(|t| {
+                            crate::conventions::is_current_package_token(t)
+                                || self.current_package.as_deref() == Some(t)
+                        });
+                    if pkg_receiver {
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            if let Some(sn) = self.first_string_literal_arg(args) {
+                                self.dbic_source_name = Some(sn);
+                            }
+                        }
+                    }
+                }
+
                 // `recv->resultset('Foo')` is closed under syntax: push the
                 // `Parametric` type at the call's `Expression(refidx)`, and
                 // mark the ref so `emit_method_call_return_edges` skips its
@@ -10837,10 +11104,17 @@ impl<'a> Builder<'a> {
                 && invocant_text.as_ref() == self.current_package.as_ref());
         if is_pkg_call {
             if let Some(ref name) = method_name {
-                // load_components — register components as parents for method resolution
-                // Works for any class (DBIC, Catalyst, etc.) — components are mixins
+                // load_components / load_own_components — register components
+                // as parents for method resolution. Works for any class (DBIC,
+                // Catalyst, etc.) — components are mixins. `load_own_components`
+                // resolves bare names against the CURRENT package's namespace;
+                // `load_components` against `DBIx::Class`.
                 if name == "load_components" {
-                    self.visit_load_components(node);
+                    self.visit_load_components(node, "DBIx::Class");
+                } else if name == "load_own_components" {
+                    if let Some(pkg) = self.current_package.clone() {
+                        self.visit_load_components(node, &pkg);
+                    }
                 }
                 // DBIC column/relationship synthesis lives in the `dbic`
                 // plugin (`ClassIsa("DBIx::Class")`), fed `ctx.arg_names`.
@@ -11561,6 +11835,62 @@ impl<'a> Builder<'a> {
         None
     }
 
+    /// The scalar variable names in a paren-list LHS (`my ($a, $b)` /
+    /// `($a, $b) = ...`) — the list-context binding sites. Empty for a
+    /// scalar LHS (`my $x`) or a non-declaration. Arrays/hashes in the list
+    /// are skipped (they slurp, not bind a single row).
+    fn paren_list_scalars(&self, lhs: Node<'a>) -> Vec<String> {
+        let mut out = Vec::new();
+        // `my ($a, $b)` parses as a `variable_declaration` with one
+        // `variables` FIELD PER scalar (not a single list node), so walk the
+        // fielded children. A bare paren/list expression on the LHS holds its
+        // scalars as named children directly.
+        let mut cursor = lhs.walk();
+        match lhs.kind() {
+            "variable_declaration" => {
+                for c in lhs.children_by_field_name("variables", &mut cursor) {
+                    if c.kind() == "scalar" {
+                        if let Ok(t) = c.utf8_text(self.source) {
+                            out.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            "parenthesized_expression" | "list_expression" => {
+                for i in 0..lhs.named_child_count() {
+                    if let Some(c) = lhs.named_child(i) {
+                        if c.kind() == "scalar" {
+                            if let Ok(t) = c.utf8_text(self.source) {
+                                out.push(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Innermost scope id containing `point` (the same smallest-span rule
+    /// `apply_chain_typing_assignments` uses), `ScopeId(0)` when none.
+    fn innermost_scope_id_at(&self, point: Point) -> ScopeId {
+        self.scopes
+            .iter()
+            .filter(|s| crate::file_analysis::contains_point(&s.span, point))
+            .min_by_key(|s| {
+                let r = (s.span.end.row.saturating_sub(s.span.start.row)) as u64;
+                let c = if s.span.start.row == s.span.end.row {
+                    s.span.end.column.saturating_sub(s.span.start.column) as u64
+                } else {
+                    0
+                };
+                r * 1_000_000 + c
+            })
+            .map(|s| s.id)
+            .unwrap_or(ScopeId(0))
+    }
+
     fn get_var_text_from_lhs(&self, lhs: Node<'a>) -> Option<String> {
         if lhs.kind() == "variable_declaration" {
             if let Some(var) = lhs.child_by_field_name("variable") {
@@ -11753,6 +12083,21 @@ impl<'a> Builder<'a> {
             Some(n) => *n,
             None => return,
         };
+        // Receiver-polymorphic statement bless — the Bugzilla::Object idiom
+        // (`bless($object, $class) if $object; return $object;`). The class
+        // is the CALL SITE's receiver, not a name resolvable here, so a
+        // concrete TC can't carry it: push the deferred witness on the
+        // VARIABLE (see `push_receiver_bless_witness`). The concrete TC
+        // below still fires when the class ALSO resolves statically
+        // (`$class` from `shift` → enclosing class via FirstParam): that
+        // concrete witness is the in-body baseline; the deferred one wins
+        // at real call sites via reducer order.
+        if obj.kind() == "scalar" {
+            if let Ok(text) = obj.utf8_text(self.source) {
+                let text = text.to_string();
+                self.push_receiver_bless_witness(&text, node);
+            }
+        }
         let class = match args.get(1) {
             Some(class_node) => match self.bless_class_of(*class_node) {
                 Some(c) => c,
@@ -11765,6 +12110,45 @@ impl<'a> Builder<'a> {
             },
         };
         self.push_var_type_constraint(obj, node, InferredType::ClassName(class));
+    }
+
+    /// If `bless_node` is a bless whose class argument denotes the RECEIVER
+    /// (`bless X, $class` / `ref $x || $x` — `bless_class_is_receiver`),
+    /// push the deferred `ReturnExpr::ReceiverOr(enclosing)` witness on
+    /// `var_name` — the receiver-polymorphic ctor's variable half. A
+    /// concrete TC can't carry "the call site's class"; the deferred
+    /// payload rides the variable, the return-arm chase reaches it through
+    /// `Edge(Variable)` with the caller's receiver threaded
+    /// (`query_variable_with_visited`), and `ReturnExprReducer` substitutes
+    /// at each call site — so an inherited `$class->new` types to the
+    /// subclass it was called on, cross-file included. Temporal: the
+    /// witness carries the bless span; pre-bless queries keep the rep type.
+    /// Returns whether a witness was pushed.
+    fn push_receiver_bless_witness(&mut self, var_name: &str, bless_node: Node<'a>) -> bool {
+        if !self.is_bless_call(bless_node) {
+            return false;
+        }
+        let args = self.extract_call_args(bless_node);
+        let Some(class_node) = args.get(1) else { return false };
+        if !self.bless_class_is_receiver(*class_node) {
+            return false;
+        }
+        let re = match self.current_package.clone() {
+            Some(pkg) => {
+                crate::witnesses::ReturnExpr::ReceiverOr(InferredType::ClassName(pkg))
+            }
+            None => crate::witnesses::ReturnExpr::Receiver,
+        };
+        self.bag.push(crate::witnesses::Witness {
+            attachment: crate::witnesses::WitnessAttachment::Variable {
+                name: var_name.to_string(),
+                scope: self.current_scope(),
+            },
+            source: crate::witnesses::WitnessSource::Builder("bless_receiver".into()),
+            payload: crate::witnesses::WitnessPayload::ReturnExpr(re),
+            span: node_to_span(bless_node),
+        });
+        true
     }
 
     /// Resolve a `bless`'s class argument to a class name. String/bareword
@@ -12688,8 +13072,70 @@ impl<'a> Builder<'a> {
                 node.child_by_field_name("left"),
                 node.child_by_field_name("right"),
             ) else { continue };
-            let Some(var) = self.get_var_text_from_lhs(left) else { continue };
             let span = node_to_span(node);
+
+            // List-context row extraction: `my ($a, $b, ...) = $rs->search(
+            // ...)` / `= $rs->all` — a resultset evaluated in LIST context
+            // yields ROWS, so each scalar binds a row (not the resultset).
+            // Runs BEFORE `get_var_text_from_lhs` (which returns None for a
+            // paren-list decl, so these sites got no typing at all before).
+            // The row moniker resolves to the FQ class at query time exactly
+            // like the `->first`/`->create` scalar case.
+            let list_scalars = self.paren_list_scalars(left);
+            if !list_scalars.is_empty() {
+                let saved = self.current_package.clone();
+                self.current_package = self.package_at_pos(span.start).map(|s| s.to_string());
+                let rhs = self.invocant_type_at_node(right);
+                // The row class the list binds to: the RHS is either the
+                // resultset itself (fluent `->search` / a bare `$rs`) or a
+                // row-list verb (`->all`/`->populate`) whose INVOCANT is the
+                // resultset — both yield rows of that resultset's row class.
+                // (Row-list verbs are DBIC's; this small set lives here with
+                // `extract_resultset_parametric` until the DBIC plugin owns
+                // the parametric semantics.)
+                let row_from = |t: &Option<InferredType>| match t {
+                    Some(InferredType::Parametric(
+                        crate::file_analysis::ParametricType::ResultSet { row, .. },
+                    )) => Some(row.clone()),
+                    _ => None,
+                };
+                let row = row_from(&rhs).or_else(|| {
+                    if right.kind() != "method_call_expression" {
+                        return None;
+                    }
+                    let m = right
+                        .child_by_field_name("method")
+                        .and_then(|m| m.utf8_text(self.source).ok())?;
+                    if m != "all" && m != "populate" {
+                        return None;
+                    }
+                    let inv_ty = right
+                        .child_by_field_name("invocant")
+                        .and_then(|inv| self.invocant_type_at_node(inv));
+                    row_from(&inv_ty)
+                });
+                self.current_package = saved;
+                if let Some(row) = row {
+                    let row_ty = InferredType::ClassName(row);
+                    let sid = self.innermost_scope_id_at(span.start);
+                    for name in list_scalars {
+                        let already = self.bag.all().iter().any(|w| {
+                            let crate::witnesses::WitnessPayload::InferredType(t) = &w.payload else {
+                                return false;
+                            };
+                            matches!(&w.attachment, crate::witnesses::WitnessAttachment::Variable { name: n, .. } if n == &name)
+                                && w.span.start == span.start
+                                && t.subsumes_narrowing(&row_ty)
+                        });
+                        if !already {
+                            to_push.push((name, sid, span, row_ty.clone()));
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let Some(var) = self.get_var_text_from_lhs(left) else { continue };
             // Compute the fresh type up front so the idempotency check
             // can compare informativeness. (Cheap: a bag chase on the
             // already-resolved RHS.)
@@ -13464,7 +13910,13 @@ impl<'a> Builder<'a> {
             std::collections::HashSet::new();
         for ri in &self.return_infos {
             let Some(branch) = ri.arity_branch else { continue };
-            if matches!(branch, ArityBranch::Zero | ArityBranch::Exact(_)) {
+            if matches!(
+                branch,
+                ArityBranch::Zero
+                    | ArityBranch::Exact(_)
+                    | ArityBranch::AtMost(_)
+                    | ArityBranch::AtLeast(_)
+            ) {
                 discriminated.insert(ri.scope);
             }
             if let Some(span) = ri.body_span {
@@ -13473,6 +13925,13 @@ impl<'a> Builder<'a> {
         }
 
         let mut to_push: Vec<Witness> = Vec::new();
+        // Symbols whose arity union governs: their non-arity `return_arm_chain`
+        // fallback must be retracted so a query at an arity the union DOESN'T
+        // cover honestly answers None instead of the arm-join's arity-blind
+        // merge (which subsumes `HashRef` under a fluent `$self` return — the
+        // exact leak that made Mojo::DOM::attr report the invocant class at
+        // arity 1).
+        let mut authoritative_syms: Vec<SymbolId> = Vec::new();
         for scope in &discriminated {
             let arms = match by_scope.get(scope) {
                 Some(a) => a,
@@ -13482,8 +13941,17 @@ impl<'a> Builder<'a> {
             // ReturnExprReducer's UnionOnArgs picks first-match.
             // Empty / Exact(N) before Default; ties broken by
             // source order (stable).
+            // The KNOWN arm types (drop the unresolvable ones). Whether they
+            // genuinely agree decides if the arity union must be authoritative
+            // (retract the non-arity fallback) — see the retraction below.
+            let known_arm_types: Vec<InferredType> = arms
+                .iter()
+                .filter_map(|(_, body_span)| self.bag_query_expr_span(*body_span))
+                .collect();
             let mut sorted: Vec<(ArgGuard, ReturnExpr)> = Vec::new();
-            // Pass 1: Zero / Exact arms.
+            // Pass 1a: exact-match guards (Empty / Exact) — most specific,
+            // must precede the magnitude bands so a point arity claims its own
+            // arm first (`unless @_` before `unless @_ > 1` at arity 0).
             for (branch, body_span) in arms {
                 let Some(t) = self.bag_query_expr_span(*body_span) else { continue };
                 match branch {
@@ -13493,14 +13961,44 @@ impl<'a> Builder<'a> {
                     ArityBranch::Exact(n) => {
                         sorted.push((ArgGuard::Exact(*n), ReturnExpr::Concrete(t)));
                     }
-                    ArityBranch::Default => {} // pass 2
+                    _ => {}
                 }
             }
-            // Pass 2: Default arm(s). Fold to a single Any branch
+            // Pass 1b: magnitude bands (AtMost / AtLeast) — narrower than the
+            // fluent Any arm, broader than an exact point.
+            for (branch, body_span) in arms {
+                let Some(t) = self.bag_query_expr_span(*body_span) else { continue };
+                match branch {
+                    ArityBranch::AtMost(n) => {
+                        sorted.push((ArgGuard::AtMost(*n), ReturnExpr::Concrete(t)));
+                    }
+                    ArityBranch::AtLeast(n) => {
+                        sorted.push((ArgGuard::AtLeast(*n), ReturnExpr::Concrete(t)));
+                    }
+                    _ => {}
+                }
+            }
+            // Pass 2: Default arm(s). Fold to a single fall-through branch
             // — multiple Default arms with disagreeing types lose
             // their disagreement signal here; the per-arm fold
             // runs separately (`seed_return_types_from_bag`) and is
             // what surfaces ambiguity in the writeback.
+            //
+            // The fall-through fires only when NO earlier `unless`-guarded
+            // arm returned. When an `AtMost(N)` early-return arm precedes it
+            // (the Mojo `attr` getter guard), the fall-through can't fire at
+            // arity ≤ N — so its guard is `AtLeast(N+1)`, not `Any`. This is
+            // what keeps the fluent `return $self` from wrongly claiming the
+            // low-arity getter slot: if the `AtMost` arm's own type didn't
+            // resolve (dynamic key), that arity honestly answers None rather
+            // than the fluent class. Without an AtMost peel, `Any` stands.
+            let atmost_ceiling = arms
+                .iter()
+                .filter_map(|(b, _)| match b {
+                    ArityBranch::AtMost(n) => Some(*n),
+                    _ => None,
+                })
+                .max();
             let mut default_t: Option<InferredType> = None;
             for (branch, body_span) in arms {
                 if matches!(branch, ArityBranch::Default) {
@@ -13510,12 +14008,27 @@ impl<'a> Builder<'a> {
                 }
             }
             if let Some(t) = default_t {
-                sorted.push((ArgGuard::Any, ReturnExpr::Concrete(t)));
+                let guard = match atmost_ceiling {
+                    Some(n) => ArgGuard::AtLeast(n.saturating_add(1)),
+                    None => ArgGuard::Any,
+                };
+                sorted.push((guard, ReturnExpr::Concrete(t)));
             }
             if sorted.is_empty() {
                 continue;
             }
             let Some(sym_id) = self.find_sub_symbol_for_scope(*scope) else { continue };
+            // Retract the non-arity `return_arm_chain` fallback ONLY when the
+            // known arms genuinely DISAGREE (Mojo::DOM::attr: HashRef vs the
+            // fluent $self). Then a gap arity honestly answers None instead of
+            // the arm-join's fluent leak. When the arms AGREE (Path::Tiny::path
+            // — every branch returns the invocant class), the arm-join is the
+            // correct answer at any arity AND at the no-hint query hover uses,
+            // so the fallback must stay. "Agree" excludes the lossy
+            // Object-subsumes-HashRef dominance — that's a merge, not agreement.
+            if arms_genuinely_agree(&known_arm_types).is_none() {
+                authoritative_syms.push(sym_id);
+            }
             let return_expr = ReturnExpr::UnionOnArgs { branches: sorted };
             // The Symbol attachment carries it for in-file Symbol-
             // keyed lookups. The MethodOnClass attachment mirrors
@@ -13541,6 +14054,12 @@ impl<'a> Builder<'a> {
                     });
                 }
             }
+        }
+        for sym_id in authoritative_syms {
+            self.bag.remove_attachment_source(
+                &WitnessAttachment::Symbol(sym_id),
+                "return_arm_chain",
+            );
         }
         for w in to_push {
             self.bag.push(w);

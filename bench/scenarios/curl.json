@@ -1,0 +1,23 @@
+{
+  "project": {"repo": "https://github.com/curl/curl", "root_subdir": "lib",
+    "note": "root at lib/ (the library C sources, ~134 .c TUs + headers → 380 C/C++ files indexed); urldata.h/url.h resolve from here. Repo root would add src/ (the curl tool) + tests/ and bloat the index without adding library coverage. Config-macro heavy (curl_setup.h), many small TUs — a contrast to redis's fewer-but-bigger TUs."},
+  "readiness": {"file": "url.c", "line": 502, "character": 10},
+  "steps": [
+    {"action": "open", "file": "url.c"},
+    {"action": "hover", "file": "url.c", "line": 204, "character": 36, "name": "hover-field-data-multi"},
+    {"action": "definition", "file": "url.c", "line": 502, "character": 10, "name": "def-crossfile-Curl_conn_cf_discard_all"},
+    {"action": "references", "file": "url.c", "line": 681, "character": 10, "name": "refs-Curl_conn_meta_get"},
+    {"action": "completion", "file": "url.c", "line": 204, "character": 12, "name": "completion-after-data-arrow"},
+    {"action": "definition", "file": "url.c", "line": 221, "character": 2, "name": "def-macro-DEBUGASSERT"},
+    {"action": "rss", "name": "post-nav"},
+    {"action": "insert_line", "file": "url.c", "line": 204, "text": "  long zz_bench_tmp = 0;", "name": "body-edit-1", "await_diagnostics": true},
+    {"action": "insert_line", "file": "url.c", "line": 205, "text": "  zz_bench_tmp += 1;", "name": "body-edit-2", "await_diagnostics": true},
+    {"action": "rss", "name": "post-edits"},
+    {"action": "revert", "file": "url.c", "name": "revert-body-edits", "await_diagnostics": true},
+    {"action": "open", "file": "urldata.h"},
+    {"action": "insert_line", "file": "urldata.h", "line": 1289, "text": "int zz_bench_probe(void);", "name": "header-contract-edit", "await_diagnostics": true},
+    {"action": "rss", "name": "post-header-edit"},
+    {"action": "hover", "file": "url.c", "line": 204, "character": 36, "name": "hover-post-invalidation"},
+    {"action": "revert", "file": "urldata.h", "name": "revert-header-edit", "await_diagnostics": true}
+  ]
+}

@@ -51,6 +51,25 @@ fn test_link_section() {
 }
 
 #[test]
+fn test_link_same_doc_section() {
+    // L</section> is a same-document link — no module part, so render just
+    // the section text (not a stray leading space + empty module).
+    let pod = "=head2 test\n\nSee L</search>\n\n=cut\n";
+    let md = pod_to_markdown(pod);
+    assert!(md.contains("search"), "got: {}", md);
+    assert!(!md.contains(" (search)"), "empty module leaked: {}", md);
+}
+
+#[test]
+fn test_link_same_doc_section_quoted() {
+    let pod = "=head2 test\n\nSee L</\"search\">\n\n=cut\n";
+    let md = pod_to_markdown(pod);
+    assert!(md.contains("search"), "got: {}", md);
+    assert!(!md.contains('"'), "quotes not stripped: {}", md);
+    assert!(!md.contains(" (search)"), "empty module leaked: {}", md);
+}
+
+#[test]
 fn test_escape() {
     let pod = "=head2 test\n\nE<lt>tag E<gt>\n\n=cut\n";
     let md = pod_to_markdown(pod);

@@ -101,7 +101,7 @@ framework (Salsa): the design already owns the reverse-index discipline
 elsewhere in `ModuleIndex`, and the choice sits entirely behind the
 Surface/`SurfaceVerdict` boundary — swapping engines later touches only
 the recording sites, not consumers. This trade-off is ratified in
-`docs/open-forks.md` ("Freshness engine: hand-rolled reverse-dep vs
+`docs/forks-resolved.md` ("Freshness engine: hand-rolled reverse-dep vs
 Salsa"); revisit if the query graph deepens past what a dirty-set walk
 comfortably serves (e.g. the phase-4 materialized views below).
 
@@ -143,6 +143,21 @@ rewrite deletes the path's stub (inside `save_to_db`/
 
 Measured (abseil): warm start 0.4 s, warm peak RSS 34 MB (cold unchanged);
 references byte-identical, `--refs-parity` clean, gold unaffected.
+
+## Registration inverse under symbol eviction
+
+`unregister_file` cannot walk `old.analysis.symbols` for the names to
+remove — under symbol eviction that vec is empty, and rehydrating would
+fetch the NEW generation's names (a wrong inverse after an edit
+persists). `ModuleIndex.registered_names` records the (name, is-class)
+pairs per path at registration time: an exact inverse by construction
+with no read-path cost, and the class-rank source for the cache-slot
+tie-break (which also read evicted symbols). Cost: one
+`Vec<(String, bool)>` per registered file, bounded and measured into the
+resident floor. The map is private to `module_index.rs`; a self-healing
+read-side validation could replace it without touching call sites
+outside registration/unregister (`docs/forks-resolved.md`, "Unregister
+inverse under symbol eviction").
 
 ## Deferred
 

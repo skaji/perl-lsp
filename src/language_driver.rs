@@ -398,6 +398,18 @@ impl PackDriver {
             for (field, span) in body_refs.member_refs {
                 skel.macro_body_member_reads.push((field, span));
             }
+            // Include-guard `#define`s (`#ifndef X` / `#define X`) are pure
+            // compilation plumbing, not program entities — mark their symbol so
+            // outline / workspace-symbol fold it away (goto-def / references
+            // still resolve it). Object-like macro symbols carry kind "var".
+            let guards = crate::cpp_reparse::collect_include_guard_names(parser, source);
+            if !guards.is_empty() {
+                for s in skel.symbols.iter_mut() {
+                    if s.kind == "var" && guards.contains(&s.name) {
+                        s.attributes.push("include_guard".to_string());
+                    }
+                }
+            }
         }
         // Function-like macro typing (the expansion flip's payoff): a
         // left-unexpanded macro call parses as `call_expression`, so the
@@ -697,6 +709,7 @@ fn inject_member_blocks(
                 deref_stack: m.deref_stack.clone(),
                 attributes: Vec::new(),
                 arity: None,
+                qualifier_owned: false,
             });
             // The role member emits the SAME `TypeName` edge an expanded field
             // does — the edge is canonical (the hover leaf + the type chase
@@ -1037,6 +1050,7 @@ fn remap_spans(
             deref_stack: _,
             attributes: _,
             arity: _,
+            qualifier_owned: _,
         } = s;
         *start = r(*start);
         *end = r(*end);
@@ -1337,6 +1351,21 @@ impl LanguageRegistry {
     /// Configured language ids — what this distribution serves.
     pub fn languages(&self) -> Vec<&'static str> {
         self.drivers.iter().map(|d| d.id()).collect()
+    }
+
+    /// Human-facing name for a pack language id, for startup banners and
+    /// progress messages. Purely cosmetic — `for_id` still speaks the short
+    /// id everywhere else. Falls back to the id itself for a language this
+    /// mapping hasn't been told about yet (never a hard error over a
+    /// display string).
+    pub fn display_name(id: &str) -> &str {
+        match id {
+            "cpp" => "C/C++",
+            "python" => "Python",
+            "r" => "R",
+            "cmake" => "CMake",
+            _ => id,
+        }
     }
 
     /// Union of every served language's completion trigger characters,

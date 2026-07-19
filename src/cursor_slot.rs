@@ -94,7 +94,7 @@ pub enum Slot {
     /// there's no callee and no index — but both shapes ask the identical
     /// `expected_type` question of the identical consumer, and a dedicated
     /// `Slot::Comparison` variant would sprawl the closed vocabulary for
-    /// one producer. Ratified as-is (docs/open-forks.md); split only if a
+    /// one producer. Ratified as-is (docs/forks-resolved.md); split only if a
     /// comparison ever needs consumer behavior a call-arg doesn't share.
     ArgPosition {
         callee: Option<CalleeCtx>,

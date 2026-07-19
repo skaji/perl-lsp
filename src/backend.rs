@@ -215,6 +215,28 @@ fn closure_symbol_completion(
 
 /// Identifier-context macro completion (C preprocessor): the `#define`s
 /// reachable through `#include`s — the API surface (perl5: `Newx`/`SvPV`).
+/// Does this language's pack declare `#include`-style path tokens (the
+/// header-is-the-module reference goto-def resolves and references reverses)?
+/// Asked of the pack via the single `for_id` lookup — Perl's driver has no
+/// `LangPack` so it answers false without a language-name branch (rule #10).
+fn language_has_include_tokens(language: &str) -> bool {
+    crate::language_driver::LanguageRegistry::with_enabled()
+        .for_id(language)
+        .and_then(|d| d.lang_pack())
+        .is_some_and(|p| p.include_path_tokens)
+}
+
+/// Does this language's pack declare a C-style preprocessor — `#define` macros
+/// reachable through `#include`s that identifier-context completion offers?
+/// Asked of the pack via the single `for_id` lookup — Perl's driver has no
+/// `LangPack` so it answers false without a language-name branch (rule #10).
+fn language_has_preprocessor(language: &str) -> bool {
+    crate::language_driver::LanguageRegistry::with_enabled()
+        .for_id(language)
+        .and_then(|d| d.lang_pack())
+        .is_some_and(|p| p.preprocessor_macros)
+}
+
 /// The file's OWN `#define`s are already symbols (in `items`); this adds the
 /// cross-file ones. Prefix-filtered server-side (a macro-heavy include
 /// closure reaches thousands — perl.h alone is ~2000), and the header cache
@@ -230,8 +252,8 @@ fn macro_completion(
     path: Option<&std::path::Path>,
     items: &mut Vec<CompletionItem>,
 ) -> bool {
-    if language != "cpp" {
-        return false; // only C/C++ have a preprocessor
+    if !language_has_preprocessor(language) {
+        return false; // the pack declares its preprocessor; asked, never named
     }
     let Some(p) = path else { return false };
     let reg = crate::language_driver::LanguageRegistry::with_enabled();
@@ -355,6 +377,12 @@ pub struct Backend {
     /// Serializes pack-file invalidation runs (did_save + watcher events can
     /// race on the same header; unregister/register swaps must not interleave).
     pack_change_lock: Arc<std::sync::Mutex<()>>,
+    /// Defers watcher invalidations that arrive DURING the initial pack bulk
+    /// index and reconciles them once at completion (H9-2). During the index
+    /// the pack sub-indexes aren't attached, so a live `pack_file_changed`
+    /// would drop the save; deferral + the H9-1 generation guard make the
+    /// end-of-index reconcile both complete and safe.
+    pack_coord: Arc<crate::module_resolver::PackChangeCoordinator>,
     /// Opt-in diagnostic toggles, set from `initializationOptions.diagnostics`.
     /// Shared with the resolver refresh callback (which also publishes
     /// diagnostics), hence the `Arc<Mutex<_>>`. `DiagnosticOptions` is `Copy`,
@@ -379,6 +407,133 @@ pub struct Backend {
     /// as `await_index_ready`, but for the file's own first build (a big
     /// macro-heavy C file is ~1.3 s and must not run synchronously on `did_open`).
     opening: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    /// URIs whose OPEN analysis is DEGRADED — built with the cached-only
+    /// cross-file gather (a fresh server's gather cache is empty even when
+    /// modules.db is warm), pending the background full-gather heal
+    /// (`PackHealCtx::run_gather_once`). Cross-file act-on-able verbs
+    /// (references/rename/implementations) bounded-wait on the entry's
+    /// `Notify` (`await_open_full`) instead of answering from the partial
+    /// closure — the answer LOOKS complete and isn't (curl: 4 sites vs 155
+    /// inside the window). Per-file verbs (outline, hover) don't wait: their
+    /// answers don't read the cross-file closure.
+    degraded_open: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    /// Live work-done progress token per degraded URI — the LSP-visible
+    /// announcement that the cross-file gather is still warming and the
+    /// published diagnostics are provisional. Reserved once per degraded
+    /// window (subsequent keystrokes reuse it, no spam), ended when the heal
+    /// lands and full-quality diagnostics publish. Absent when the client
+    /// never advertised `window/workDoneProgress`. See docs/forks-resolved.md
+    /// (Part 1 of the first-change-diagnostics follow-ups).
+    degraded_progress: Arc<dashmap::DashMap<Url, NumberOrString>>,
+    /// Per-URI single-flight coordinator for the cross-file gather heal
+    /// (`docs/forks-resolved.md` Part 2). A gather already running for a URI
+    /// is not re-spawned by a fresh heal request; the request coalesces into
+    /// it, and the running loop re-runs at most ONCE more if the buffer moved
+    /// while it gathered — N keystrokes collapse to one re-gather, not N
+    /// abandoned gathers. Holds only bookkeeping counters, never analyses.
+    gather_reg: Arc<GatherRegistry>,
+}
+
+/// Single-flight bookkeeping for one in-flight gather (see `GatherRegistry`).
+/// `running` is the request generation the active gather is servicing;
+/// `wanted` is the highest generation requested. `wanted > running` at
+/// completion means a request landed mid-gather → re-run once against the
+/// latest buffer, coalescing every intervening request into that one re-run.
+#[derive(Clone, Copy)]
+struct GatherState {
+    running: u64,
+    wanted: u64,
+}
+
+/// Per-URI single-flight gather coordinator — pure bookkeeping, no I/O and no
+/// analyses (residency-safe). Entry present ⇒ a gather loop owns this URI.
+#[derive(Default)]
+struct GatherRegistry {
+    inner: dashmap::DashMap<Url, GatherState>,
+}
+
+impl GatherRegistry {
+    /// Register a gather request. Returns `true` when the caller must SPAWN a
+    /// gather loop (the URI was idle); `false` when a loop is already running
+    /// and this request coalesced into it (its `wanted` generation bumped).
+    fn request(&self, uri: &Url) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(uri.clone()) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().wanted += 1;
+                false
+            }
+            Entry::Vacant(v) => {
+                v.insert(GatherState { running: 1, wanted: 1 });
+                true
+            }
+        }
+    }
+
+    /// A gather iteration finished. Returns `true` when the loop must RE-RUN
+    /// (a request arrived while it gathered — advance `running` to the latest
+    /// `wanted`, so any number of intervening requests collapse into one
+    /// re-run); `false` when the entry retired (removed — bounded, no leak).
+    fn finish(&self, uri: &Url) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(uri.clone()) {
+            Entry::Occupied(mut e) => {
+                let s = e.get_mut();
+                if s.wanted > s.running {
+                    s.running = s.wanted;
+                    true
+                } else {
+                    e.remove();
+                    false
+                }
+            }
+            // `forget` (didClose) already retired us — stop, don't re-run.
+            Entry::Vacant(_) => false,
+        }
+    }
+
+    /// Drop the URI's entry (didClose). The running loop's next `finish` sees
+    /// `Vacant` and stops without re-running — no leak on close.
+    fn forget(&self, uri: &Url) {
+        self.inner.remove(uri);
+    }
+
+    #[cfg(test)]
+    fn is_inflight(&self, uri: &Url) -> bool {
+        self.inner.contains_key(uri)
+    }
+}
+
+/// Shared clones a background pack-gather heal needs. Built from `&self` on the
+/// message loop, then moved into the spawned heal task — so the heal owns its
+/// own handles and never touches `Backend`. Holds Arcs/counters only.
+#[derive(Clone)]
+struct PackHealCtx {
+    files: Arc<FileStore>,
+    module_index: Arc<ModuleIndex>,
+    client: Client,
+    options: symbols::DiagnosticOptions,
+    degraded_open: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    degraded_progress: Arc<dashmap::DashMap<Url, NumberOrString>>,
+    gather_reg: Arc<GatherRegistry>,
+    work_done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long a verb is willing to wait for in-flight state
+/// (`docs/open-forks.md` "Answer honesty under index/enrichment
+/// windows"). The policy is DATA at each call site: a verb whose answer
+/// is act-on-able (rename edits, a references sweep) declares
+/// `Complete`; latency-critical interactive verbs stay `Interactive`.
+/// Redirecting a verb later is a one-word change at its call site.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitPolicy {
+/// Bounded by `cold_wait_ms` (~400 ms default): serve best-effort
+/// fast, heal via refresh channels where they exist.
+Interactive,
+/// Wait for the in-flight build/index to actually land (generous
+/// ceiling so a wedged task can't hang the verb forever). Answers
+/// must not be silently partial.
+Complete,
 }
 
 impl Backend {
@@ -406,7 +561,6 @@ impl Backend {
         let client = self.client.clone();
         let module_index = Arc::clone(&self.module_index);
         let root = self.module_index.workspace_root();
-        let options = self.diagnostic_options();
         // Server-initiated progress requires the client capability; a client
         // that never advertised it may also never ANSWER the create request —
         // and indexing must proceed regardless (LSP spec).
@@ -414,8 +568,18 @@ impl Backend {
             .work_done_progress
             .load(std::sync::atomic::Ordering::Relaxed);
         let index_ready = Arc::clone(&self.index_ready);
+        let heal_ctx = self.pack_heal_ctx();
         let bag_cache_bytes =
             self.max_cache_mb.load(std::sync::atomic::Ordering::Relaxed) as usize * 1024 * 1024;
+        // H9-2: mark the pack index in flight BEFORE it is scheduled, so a save
+        // racing the scheduling defers into the reconcile set instead of hitting
+        // an unattached (no-op) `pack_file_changed`. Perl uses the direct
+        // re-index path and never touches the coordinator.
+        let pack_coord = (!want_perl).then(|| Arc::clone(&self.pack_coord));
+        if let Some(ref coord) = pack_coord {
+            coord.begin_index();
+        }
+        let pack_change_lock = Arc::clone(&self.pack_change_lock);
         tokio::task::spawn_blocking(move || {
             // Announces completion (or the no-root early-out) to bounded waiters
             // on Drop — every exit path of this closure, panic included.
@@ -541,10 +705,46 @@ impl Backend {
                     token,
                     value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
                         WorkDoneProgressEnd {
-                            message: Some(format!("Indexed {} files", count)),
+                            message: Some(if want_perl {
+                                format!("Indexed {} Perl files", count)
+                            } else {
+                                let reg = crate::language_driver::LanguageRegistry::with_enabled();
+                                let langs: Vec<&str> = reg
+                                    .languages()
+                                    .into_iter()
+                                    .filter(|id| *id != "perl")
+                                    .map(crate::language_driver::LanguageRegistry::display_name)
+                                    .collect();
+                                format!("Indexed {} {} files", count, langs.join("/"))
+                            }),
                         },
                     )),
                 }));
+            }
+            // H9-2: the pack sub-indexes are now attached. Reconcile every save
+            // that arrived DURING the index (deferred to avoid the no-op /
+            // uncoordinated-double-work window) exactly once, off the same
+            // serialization lock steady-state invalidations use. The H9-1
+            // generation guard makes this safe: each reconcile reads current
+            // disk (the freshest generation) and outranks whatever the bulk pass
+            // registered from earlier bytes.
+            if let Some(coord) = pack_coord {
+                let deferred = coord.finish_index();
+                if !deferred.is_empty() {
+                    log::debug!(
+                        "pack index complete: reconciling {} deferred change(s)",
+                        deferred.len()
+                    );
+                    let _g = pack_change_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    for (path, deleted) in deferred {
+                        crate::module_resolver::pack_file_changed(
+                            Some(root_uri.as_str()),
+                            &module_index,
+                            &path,
+                            deleted,
+                        );
+                    }
+                }
             }
             // Heal the cold-open degraded window: the index this file's family
             // needs has now ATTACHED (the latch marked KICKOFF; this is the
@@ -552,7 +752,7 @@ impl Backend {
             // family so pull-verb answers baked in the cached-only open window
             // (truncated cross-file closure, `None` gd/hover) self-heal without
             // the user re-triggering.
-            Self::heal_open_docs(&files, &module_index, &client, options, want_perl);
+            Self::heal_open_docs(&heal_ctx, want_perl);
         });
     }
 
@@ -564,36 +764,31 @@ impl Backend {
     ///
     /// FileStore guard discipline: pack URIs are collected under a read guard
     /// that is DROPPED before any re-analysis, and each re-analysis snapshots
-    /// text off the lock (`spawn_pack_doc_refresh`). The perl branch enriches
+    /// text off the lock (`PackHealCtx::run_gather_once`). The perl branch enriches
     /// under the write guard but touches only `module_index` (never re-locks the
     /// store) and publishes after the guard drops — the same shape the resolver
     /// `on_refresh` callback already uses safely.
-    fn heal_open_docs(
-        files: &Arc<FileStore>,
-        module_index: &Arc<ModuleIndex>,
-        client: &Client,
-        options: symbols::DiagnosticOptions,
-        want_perl: bool,
-    ) {
+    fn heal_open_docs(ctx: &PackHealCtx, want_perl: bool) {
         log::debug!(
             "cold-window heal: index landed for {} family",
             if want_perl { "perl" } else { "pack" }
         );
         if want_perl {
             let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
-            files.for_each_open_mut(|uri, doc| {
+            ctx.files.for_each_open_mut(|uri, doc| {
                 if doc.language != "perl" {
                     return;
                 }
                 std::sync::Arc::make_mut(&mut doc.analysis)
-                    .enrich_imported_types_with_keys(Some(module_index.as_ref()));
-                let diags = symbols::collect_diagnostics(&doc.analysis, module_index, options);
+                    .enrich_imported_types_with_keys(Some(ctx.module_index.as_ref()));
+                let diags =
+                    symbols::collect_diagnostics(&doc.analysis, &ctx.module_index, ctx.options);
                 pending.push((uri.clone(), diags));
             });
             if pending.is_empty() {
                 return;
             }
-            let client = client.clone();
+            let client = ctx.client.clone();
             tokio::spawn(async move {
                 for (uri, diags) in pending {
                     client.publish_diagnostics(uri, diags, None).await;
@@ -601,19 +796,15 @@ impl Backend {
             });
         } else {
             let mut uris: Vec<Url> = Vec::new();
-            files.for_each_open(|uri, doc| {
+            ctx.files.for_each_open(|uri, doc| {
                 if doc.language != "perl" {
                     uris.push(uri.clone());
                 }
             });
+            // Route each through the single-flight registry: a doc already
+            // mid-gather coalesces instead of double-gathering its cone.
             for uri in uris {
-                Self::spawn_pack_doc_refresh(
-                    Arc::clone(files),
-                    Arc::clone(module_index),
-                    client.clone(),
-                    uri,
-                    options,
-                );
+                ctx.request_gather(uri);
             }
         }
     }
@@ -638,7 +829,22 @@ impl Backend {
     /// a `get_open` guard that DROPS before this await, and snapshot `analysis`
     /// fresh AFTER it, picking up any heal (see the hazard note on
     /// `FileStore::for_each_open`).
-    async fn await_index_ready(&self, language: &str) {
+    /// `WaitPolicy` → millisecond cap. `cold_wait_ms == 0` is the global
+    /// "never block" opt-out and wins over any policy.
+    fn wait_cap(&self, policy: WaitPolicy) -> u64 {
+        let interactive = self
+            .cold_wait_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match policy {
+            _ if interactive == 0 => 0,
+            WaitPolicy::Interactive => interactive,
+            // Generous ceiling: bounded (a wedged index can't hang the verb
+            // forever) but far beyond any real build/index time.
+            WaitPolicy::Complete => 120_000,
+        }
+    }
+
+    async fn await_index_ready(&self, language: &str, policy: WaitPolicy) {
         use std::sync::atomic::Ordering;
         let want_perl = language == "perl";
         let latch = if want_perl { &self.perl_indexed } else { &self.pack_indexed };
@@ -651,7 +857,7 @@ impl Backend {
         if !latch.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
             return;
         }
-        let cap = self.cold_wait_ms.load(Ordering::Relaxed);
+        let cap = self.wait_cap(policy);
         if cap == 0 {
             return; // opt-out
         }
@@ -662,7 +868,8 @@ impl Backend {
         if done.load(Ordering::Relaxed) {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
+        self.bounded_wait_with_progress(cap, waited, "Waiting for workspace index")
+            .await;
     }
 
     /// Bounded wait for a freshly-opened document's INITIAL build, when it is
@@ -675,14 +882,14 @@ impl Backend {
     /// GUARD DISCIPLINE: holds NO FileStore / DashMap guard across the await —
     /// it snapshots the `Notify` Arc out of the `opening` map and drops that
     /// guard before awaiting. Callers snapshot `analysis` fresh AFTER it.
-    async fn await_open_ready(&self, uri: &Url) {
+    async fn await_open_ready(&self, uri: &Url, policy: WaitPolicy) {
         if self.files.get_open(uri).is_some() {
             return; // already built
         }
         let Some(notify) = self.opening.get(uri).map(|n| Arc::clone(n.value())) else {
             return; // not an in-flight open (unknown/closed file)
         };
-        let cap = self.cold_wait_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let cap = self.wait_cap(policy);
         if cap == 0 {
             return; // opt-out
         }
@@ -692,11 +899,298 @@ impl Backend {
         if self.files.get_open(uri).is_some() {
             return;
         }
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(cap), waited).await;
+        self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
+            .await;
+    }
+
+    /// Bounded wait for the open document's FULL-quality analysis — past the
+    /// degraded cached-only-gather window (`degraded_open`). Only cross-file
+    /// act-on-able verbs (references / rename / implementations) call this,
+    /// AFTER `await_open_ready`: their answers read the cross-file closure,
+    /// and inside the window they return a subset that looks complete (curl:
+    /// 4 reference sites vs 155). Per-file verbs (outline, hover, completion)
+    /// deliberately don't — their answers don't need the gather, and waiting
+    /// would regress open→outline latency for nothing. `Interactive` policy
+    /// returns immediately: fast-best-effort verbs keep today's behavior.
+    async fn await_open_full(&self, uri: &Url, policy: WaitPolicy) {
+        if !matches!(policy, WaitPolicy::Complete) {
+            return;
+        }
+        let Some(notify) = self.degraded_open.get(uri).map(|n| Arc::clone(n.value())) else {
+            return; // not degraded (perl doc, heal already landed, or never opened)
+        };
+        let cap = self.wait_cap(policy);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the re-check (lost-wakeup discipline).
+        let waited = notify.notified();
+        if !self.degraded_open.contains_key(uri) {
+            return;
+        }
+        self.bounded_wait_with_progress(cap, waited, "Waiting for cross-file analysis")
+            .await;
+    }
+
+    /// Bounded wait that surfaces as client progress once it actually
+    /// BLOCKS. Silent for the first 500 ms — warm paths and every
+    /// `Interactive` wait (cap ≤ ~400 ms) resolve inside it, so no UI
+    /// noise; only a `Complete` wait that outlives the quiet window mints
+    /// a work-done token, keeping the honest-answer block visible instead
+    /// of reading as a hung request.
+    async fn bounded_wait_with_progress<F>(&self, cap_ms: u64, wait: F, title: &str)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::time::Duration;
+        const QUIET_MS: u64 = 500;
+        tokio::pin!(wait);
+        let quiet = cap_ms.min(QUIET_MS);
+        if tokio::time::timeout(Duration::from_millis(quiet), &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let remaining = cap_ms.saturating_sub(quiet);
+        if remaining == 0 {
+            return;
+        }
+        // Server-initiated progress requires the client capability; a client
+        // that never advertised it may also never answer the create request.
+        if !self
+            .work_done_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = tokio::time::timeout(Duration::from_millis(remaining), &mut wait).await;
+            return;
+        }
+        static WAIT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let token = NumberOrString::String(format!(
+            "perl-lsp/wait-{}",
+            WAIT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        progress_create_and_begin(&self.client, &token, title).await;
+        let _ = tokio::time::timeout(Duration::from_millis(remaining), &mut wait).await;
+        progress_end(&self.client, token).await;
+    }
+}
+
+/// The one spelling of "create + begin a work-done progress" — reused by the
+/// blocking-wait announcement (`bounded_wait_with_progress`) and the degraded
+/// diagnostics announcement (`PackHealCtx::begin_progress`). The detached
+/// create-request task keeps the oneshot receiver alive past the 2 s timeout,
+/// so a late reply can't panic tower-lsp's pending map (#36). Capability
+/// gating is the caller's responsibility — a token minted here presumes the
+/// client advertised `window/workDoneProgress`.
+async fn progress_create_and_begin(client: &Client, token: &NumberOrString, title: &str) {
+    let create = tokio::spawn({
+        let client = client.clone();
+        let token = token.clone();
+        async move {
+            let _ = client
+                .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                    token,
+                })
+                .await;
+        }
+    });
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), create).await;
+    client
+        .send_notification::<notification::Progress>(ProgressParams {
+            token: token.clone(),
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: title.into(),
+                cancellable: Some(false),
+                message: None,
+                percentage: None,
+            })),
+        })
+        .await;
+}
+
+/// Reserve the per-window progress slot for `uri` atomically. Returns `true`
+/// exactly once per window — the first caller mints the token; every later
+/// caller reuses it (returns `false`), so a keystroke burst inside one degraded
+/// window announces itself with a single Begin, not one per change. Releasing
+/// the slot (`clear_degraded`/close removes the entry) lets the next window
+/// reserve again. The DashMap entry guard is dropped before return — no lock is
+/// held across the caller's subsequent `.await`.
+fn reserve_degraded_token(
+    map: &dashmap::DashMap<Url, NumberOrString>,
+    uri: &Url,
+    token: NumberOrString,
+) -> bool {
+    use dashmap::mapref::entry::Entry;
+    match map.entry(uri.clone()) {
+        Entry::Occupied(_) => false,
+        Entry::Vacant(v) => {
+            v.insert(token);
+            true
+        }
+    }
+}
+
+/// The one spelling of "end a work-done progress".
+async fn progress_end(client: &Client, token: NumberOrString) {
+    client
+        .send_notification::<notification::Progress>(ProgressParams {
+            token,
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                message: None,
+            })),
+        })
+        .await;
+}
+
+impl PackHealCtx {
+    /// Single-flight gather request. If a gather loop is already running for
+    /// `uri`, coalesces into it (no new task); otherwise registers the URI and
+    /// spawns the loop. Never awaits a gather — the change path stays
+    /// cached-only + fire-and-forget.
+    fn request_gather(&self, uri: Url) {
+        if !self.gather_reg.request(&uri) {
+            return; // a loop already owns this URI; the request coalesced in
+        }
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            ctx.run_gather_loop(uri).await;
+        });
+    }
+
+    /// One gather owner per URI: gather → (maybe) re-run once if the buffer
+    /// moved mid-gather → retire. When the loop retires it clears the degraded
+    /// window and ends the provisional-diagnostics progress — i.e. progress
+    /// ends exactly when full-quality diagnostics have published.
+    async fn run_gather_loop(self, uri: Url) {
+        loop {
+            self.run_gather_once(&uri).await;
+            if !self.gather_reg.finish(&uri) {
+                break;
+            }
+        }
+        self.clear_degraded(&uri).await;
+    }
+
+    /// Announce the degraded window: begin a work-done progress that says the
+    /// gather is warming and diagnostics are provisional. Idempotent per
+    /// window — the token is reserved once and reused across keystrokes (no
+    /// spam), and released by `clear_degraded`/close. Capability-gated: a no-op
+    /// when the client never advertised `window/workDoneProgress`.
+    async fn begin_progress(&self, uri: &Url, language: &str) {
+        if !self.work_done.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        static DEGRADED_TOKEN: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let token = NumberOrString::String(format!(
+            "perl-lsp/degraded-{}",
+            DEGRADED_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // Reserve the slot atomically so two concurrent begins for the same
+        // URI mint exactly one token.
+        if !reserve_degraded_token(&self.degraded_progress, uri, token.clone()) {
+            return; // this window already announced itself; reuse the token
+        }
+        let title = format!("{language} index warming — diagnostics are provisional");
+        progress_create_and_begin(&self.client, &token, &title).await;
+    }
+
+    /// End the degraded window's progress if one is live (removes the token —
+    /// bounded, one End per Begin).
+    async fn end_progress(&self, uri: &Url) {
+        if let Some((_, token)) = self.degraded_progress.remove(uri) {
+            progress_end(&self.client, token).await;
+        }
+    }
+
+    /// Clear the degraded-open mark, wake `await_open_full` waiters, and end
+    /// the provisional-diagnostics progress. The window is over.
+    async fn clear_degraded(&self, uri: &Url) {
+        if let Some((_, n)) = self.degraded_open.remove(uri) {
+            n.notify_waiters();
+        }
+        self.end_progress(uri).await;
+    }
+
+    /// One cross-file gather + full-quality re-analyze + re-publish for an open
+    /// pack document. Cold gather allowed (this task has cached-only OFF).
+    /// Does NOT clear the degraded window or spawn a successor — the enclosing
+    /// `run_gather_loop` owns retirement. A stale-text result is dropped
+    /// (no clobber); the loop's `finish` decides whether to re-run.
+    async fn run_gather_once(&self, uri: &Url) {
+        let Some((text, path, language)) = self
+            .files
+            .get_open(uri)
+            .filter(|d| d.language != "perl")
+            .map(|d| (d.text.clone(), d.path.clone(), d.language))
+        else {
+            return;
+        };
+        let snapshot = text.clone();
+        // Full analyze on a blocking thread so the ~1.5 s gather never stalls
+        // the executor.
+        let analysis = tokio::task::spawn_blocking(move || {
+            crate::language_driver::LanguageRegistry::with_enabled()
+                .for_id(language)
+                .map(|d| d.analyze_with_path(&text, path.as_deref()))
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(analysis) = analysis else {
+            return;
+        };
+        // A keystroke may have landed while we gathered; the debounced rebuild
+        // owns the newer text, so don't clobber it with this stale build (the
+        // loop re-runs against the latest text — the gather cache stays warm
+        // for unchanged included files, so the re-run is cheap).
+        if self
+            .files
+            .get_open(uri)
+            .map(|d| d.text != snapshot)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        for imp in &analysis.imports {
+            self.module_index.request_resolve(&imp.module_name);
+        }
+        for parents in analysis.package_parents.values() {
+            for parent in parents {
+                self.module_index.request_resolve(parent);
+            }
+        }
+        if let Some(mut doc) = self.files.get_open_mut(uri) {
+            doc.apply_rebuilt(analysis);
+        }
+        let diags = self
+            .files
+            .get_open(uri)
+            .map(|doc| symbols::pack_diagnostics(&doc.analysis, self.options));
+        if let Some(diags) = diags {
+            self.client
+                .publish_diagnostics(uri.clone(), diags, None)
+                .await;
+        }
     }
 }
 
 impl Backend {
+    /// Build the shared context a background pack-gather heal runs with.
+    fn pack_heal_ctx(&self) -> PackHealCtx {
+        PackHealCtx {
+            files: Arc::clone(&self.files),
+            module_index: Arc::clone(&self.module_index),
+            client: self.client.clone(),
+            options: self.diagnostic_options(),
+            degraded_open: Arc::clone(&self.degraded_open),
+            degraded_progress: Arc::clone(&self.degraded_progress),
+            gather_reg: Arc::clone(&self.gather_reg),
+            work_done: Arc::clone(&self.work_done_progress),
+        }
+    }
+
     pub fn new(client: Client) -> Self {
         let files: Arc<FileStore> = Arc::new(FileStore::new());
 
@@ -779,12 +1273,16 @@ impl Backend {
             pack_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_done_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pack_change_lock: Arc::new(std::sync::Mutex::new(())),
+            pack_coord: Arc::new(crate::module_resolver::PackChangeCoordinator::default()),
             diag_options,
             rename_options: Arc::new(std::sync::Mutex::new(crate::resolve::RenameOptions::default())),
             index_ready: Arc::new(IndexReady::default()),
             cold_wait_ms: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_COLD_WAIT_MS)),
             max_cache_mb: Arc::new(std::sync::atomic::AtomicU64::new(max_cache_mb_default())),
             opening: Arc::new(dashmap::DashMap::new()),
+            degraded_open: Arc::new(dashmap::DashMap::new()),
+            degraded_progress: Arc::new(dashmap::DashMap::new()),
+            gather_reg: Arc::new(GatherRegistry::default()),
         }
     }
 
@@ -798,6 +1296,8 @@ impl Backend {
         let client = self.client.clone();
         let change_gen = Arc::clone(&self.change_gen);
         let options = self.diagnostic_options();
+        let degraded_open = Arc::clone(&self.degraded_open);
+        let heal_ctx = self.pack_heal_ctx();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             let is_latest = || change_gen.get(&uri).map(|v| *v) == Some(generation);
@@ -812,10 +1312,20 @@ impl Backend {
             else {
                 return;
             };
+            // A pack file's cross-file GATHER is cold on the first change after
+            // a cold open (did_open's gather bails once the text changes, so it
+            // can't warm us). Paying the ~24 s cold gather HERE would make the
+            // first keystroke's diagnostics land 24 s late. Run CACHED-ONLY for
+            // fast, degraded diagnostics — same as did_open — then heal via a
+            // background gather refresh below. The flag is a thread-local no-op
+            // for perl. See docs/open-forks.md.
             let analysis = tokio::task::spawn_blocking(move || {
-                crate::language_driver::LanguageRegistry::with_enabled()
+                crate::cpp_reparse::set_gather_cached_only(true);
+                let a = crate::language_driver::LanguageRegistry::with_enabled()
                     .for_id(language)
-                    .map(|d| d.analyze_with_path(&text, path.as_deref()))
+                    .map(|d| d.analyze_with_path(&text, path.as_deref()));
+                crate::cpp_reparse::set_gather_cached_only(false);
+                a
             })
             .await
             .ok()
@@ -841,81 +1351,22 @@ impl Backend {
                 .get_open(&uri)
                 .map(|doc| symbols::pack_diagnostics(&doc.analysis, options));
             if let Some(diags) = diags {
-                client.publish_diagnostics(uri, diags, None).await;
+                client.publish_diagnostics(uri.clone(), diags, None).await;
             }
-        });
-    }
-
-
-    /// Warm the cross-file macro gather for a freshly-opened pack file OFF the
-    /// open path, then re-analyze + re-publish (the async-refresh). `did_open`
-    /// runs the first analyze in cached-only mode (instant, degraded — no cold
-    /// gather), so hover/goto-def are live immediately; this task pays the cold
-    /// gather in the background (like the workspace index) and refreshes the
-    /// document when it lands. A no-op-fast on a warm gather (the analyze just
-    /// re-runs against the cache). Perl needs no gather and is skipped.
-    fn spawn_pack_gather_refresh(&self, uri: Url) {
-        Self::spawn_pack_doc_refresh(
-            Arc::clone(&self.files),
-            Arc::clone(&self.module_index),
-            self.client.clone(),
-            uri,
-            self.diagnostic_options(),
-        );
-    }
-
-    /// The body of the gather refresh, associated-fn shaped so background
-    /// tasks (the pack-file invalidation path) can refresh open documents
-    /// with their own clones.
-    fn spawn_pack_doc_refresh(
-        files: Arc<FileStore>,
-        module_index: Arc<ModuleIndex>,
-        client: Client,
-        uri: Url,
-        options: symbols::DiagnosticOptions,
-    ) {
-        tokio::spawn(async move {
-            let Some((text, path, language)) = files
-                .get_open(&uri)
-                .filter(|d| d.language != "perl")
-                .map(|d| (d.text.clone(), d.path.clone(), d.language))
-            else {
-                return;
-            };
-            let snapshot = text.clone();
-            // Full analyze (cold gather allowed — this thread has cached-only OFF)
-            // on a blocking thread so the ~1.5s gather never stalls the executor.
-            let analysis = tokio::task::spawn_blocking(move || {
-                crate::language_driver::LanguageRegistry::with_enabled()
-                    .for_id(language)
-                    .map(|d| d.analyze_with_path(&text, path.as_deref()))
-            })
-            .await
-            .ok()
-            .flatten();
-            let Some(analysis) = analysis else { return };
-            // A keystroke may have landed while we gathered; the debounced
-            // rebuild owns the newer text, so don't clobber it with this stale
-            // build (self-heals either way, but avoids a diagnostics flicker).
-            if files.get_open(&uri).map(|d| d.text != snapshot).unwrap_or(true) {
-                return;
-            }
-            for imp in &analysis.imports {
-                module_index.request_resolve(&imp.module_name);
-            }
-            for parents in analysis.package_parents.values() {
-                for parent in parents {
-                    module_index.request_resolve(parent);
-                }
-            }
-            if let Some(mut doc) = files.get_open_mut(&uri) {
-                doc.apply_rebuilt(analysis);
-            }
-            let diags = files
-                .get_open(&uri)
-                .map(|doc| symbols::pack_diagnostics(&doc.analysis, options));
-            if let Some(diags) = diags {
-                client.publish_diagnostics(uri, diags, None).await;
+            // Heal: warm the cross-file gather off this task and re-publish
+            // full-quality diagnostics when it lands. The cached-only rebuild
+            // just re-opened the degraded window for cross-file verbs; mark it
+            // (so `await_open_full` holds Complete verbs until the heal lands),
+            // announce it via progress (Part 1), then route the heal through
+            // the single-flight registry (Part 2) so a typing burst coalesces
+            // into ONE gather instead of abandoning one per keystroke. Perl has
+            // no gather and is skipped.
+            if language != "perl" {
+                degraded_open
+                    .entry(uri.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+                heal_ctx.begin_progress(&uri, language).await;
+                heal_ctx.request_gather(uri);
             }
         });
     }
@@ -929,12 +1380,19 @@ impl Backend {
     fn schedule_pack_invalidate(&self, path: PathBuf, deleted: bool) {
         let files = Arc::clone(&self.files);
         let module_index = Arc::clone(&self.module_index);
-        let client = self.client.clone();
         let lock = Arc::clone(&self.pack_change_lock);
         let root = self.module_index.workspace_root();
-        let options = self.diagnostic_options();
+        let heal_ctx = self.pack_heal_ctx();
+        let pack_coord = Arc::clone(&self.pack_coord);
         tokio::spawn(async move {
             let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            // H9-2: if the initial pack index is still running, the sub-index
+            // isn't attached — invalidating now would be a no-op that drops the
+            // save. Defer it; the end-of-index reconcile re-runs it against
+            // current disk, and `heal_open_docs` re-publishes the open docs.
+            if pack_coord.note_change(&canon, deleted) {
+                return;
+            }
             {
                 let module_index = Arc::clone(&module_index);
                 let canon = canon.clone();
@@ -965,14 +1423,11 @@ impl Backend {
                     }
                 }
             });
+            // Route through the single-flight registry (Part 2): a consumer
+            // already mid-gather coalesces (re-runs once against the freshly
+            // evicted caches) instead of double-gathering the same cone.
             for uri in to_refresh {
-                Self::spawn_pack_doc_refresh(
-                    Arc::clone(&files),
-                    Arc::clone(&module_index),
-                    client.clone(),
-                    uri,
-                    options,
-                );
+                heal_ctx.request_gather(uri);
             }
         });
     }
@@ -1434,7 +1889,7 @@ impl LanguageServer for Backend {
         // a 16k-line macro-heavy C file that is ~1.3 s even cached-only, and
         // running it here would head-of-line block every request the client
         // fires on open. cached-only skips the cross-file GATHER (a further
-        // ~1.5 s, warmed later by `spawn_pack_gather_refresh`); the per-file
+        // ~1.5 s, warmed later by the single-flight gather heal); the per-file
         // build is intrinsic and must simply not block the loop.
         //
         // A per-URI `Notify` marks the build in flight so read verbs bounded-wait
@@ -1510,7 +1965,22 @@ impl LanguageServer for Backend {
             self.republish_open_docs_in(&sd.dirty).await;
         }
         if needs_gather_refresh {
-            self.spawn_pack_gather_refresh(uri);
+            // The open build was cached-only: mark the degraded window BEFORE
+            // spawning the heal, so a cross-file verb racing this open waits
+            // for the full-gather analysis instead of the partial closure.
+            self.degraded_open
+                .entry(uri.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+            // Announce the degraded window (Part 1) and route the initial
+            // gather through the single-flight registry (Part 2) — so the
+            // first change's heal coalesces into THIS gather instead of
+            // spawning a redundant second one.
+            let heal_ctx = self.pack_heal_ctx();
+            let language = self.files.get_open(&uri).map(|d| d.language);
+            if let Some(language) = language {
+                heal_ctx.begin_progress(&uri, language).await;
+            }
+            heal_ctx.request_gather(uri);
         }
     }
 
@@ -1590,6 +2060,18 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         self.files.close(&uri);
+        // Wake any degraded-window waiter — the doc is gone, there is
+        // nothing to wait for.
+        if let Some((_, n)) = self.degraded_open.remove(&uri) {
+            n.notify_waiters();
+        }
+        // Retire any in-flight gather single-flight entry (no leak on close;
+        // the running loop's next `finish` sees Vacant and stops) and end the
+        // degraded-window progress if one is still live.
+        self.gather_reg.forget(&uri);
+        if let Some((_, token)) = self.degraded_progress.remove(&uri) {
+            progress_end(&self.client, token).await;
+        }
         // Release the surface record to background writers and reconcile:
         // consumers flip back to the indexed DISK copy — if the buffer died
         // with unsaved contract changes, whoever enriched against it is
@@ -1606,7 +2088,7 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = &params.text_document.uri;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -1626,9 +2108,9 @@ impl LanguageServer for Backend {
         // — so the query resolves warm instead of returning the one degraded
         // answer the user never re-triggers. Guards dropped before each await;
         // analysis snapshotted AFTER so any heal is picked up.
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
-            self.await_index_ready(language).await;
+            self.await_index_ready(language, WaitPolicy::Interactive).await;
         }
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
@@ -1654,8 +2136,9 @@ impl LanguageServer for Backend {
         let idx: &dyn crate::file_analysis::CrossFileLookup = &scoped;
         // `#include "x.h"` path → the resolved header (`#include` = `use`).
         // A path token, not a name — slot-shaped, so it stays ahead of the
-        // set (the ADR's honest boundary).
-        if language == "cpp" {
+        // set (the ADR's honest boundary). The pack declares whether it has
+        // include tokens; asked, never named.
+        if language_has_include_tokens(&language) {
             if let Some(loc) = symbols::pack_include_definition(
                 &analysis, symbols::position_to_point(pos), self_path.as_deref())
             {
@@ -1714,10 +2197,11 @@ impl LanguageServer for Backend {
         let pos = params.text_document_position_params.position;
         // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
         // the file's own initial build, then an in-flight family index.
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
-            self.await_index_ready(language).await;
+            self.await_index_ready(language, WaitPolicy::Complete).await;
         }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
         // Snapshot the open doc (cheap `Arc` clone) and DROP the store guard
         // before `resolve()` — it re-locks the open shards via `for_each_open`,
         // and holding the guard across that reentrant read deadlocks against a
@@ -1758,10 +2242,11 @@ impl LanguageServer for Backend {
         // the file's own initial build, then an in-flight family index so
         // cross-file references resolve warm (the in-window `op_free` 1 → 118
         // heal) instead of returning def-only.
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
-            self.await_index_ready(language).await;
+            self.await_index_ready(language, WaitPolicy::Complete).await;
         }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
@@ -1782,8 +2267,9 @@ impl LanguageServer for Backend {
         };
         let self_path = uri.to_file_path().ok();
         // `#include` reverse — "who includes this header" — owns the path
-        // token exclusively (the backward mirror of include goto-def).
-        if language == "cpp" {
+        // token exclusively (the backward mirror of include goto-def). The
+        // pack declares whether it has include tokens; asked, never named.
+        if language_has_include_tokens(&language) {
             if let Some(incs) = symbols::pack_include_references(
                 &analysis, point, self_path.as_deref(), base_idx)
             {
@@ -1838,7 +2324,7 @@ impl LanguageServer for Backend {
         &self,
         params: TextDocumentPositionParams,
     ) -> Result<Option<PrepareRenameResponse>> {
-        self.await_open_ready(&params.text_document.uri).await;
+        self.await_open_ready(&params.text_document.uri, WaitPolicy::Interactive).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(&params.text_document.uri) {
@@ -1897,7 +2383,13 @@ impl LanguageServer for Backend {
                 "rename: the new name must not be empty or whitespace",
             ));
         }
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        // Cross-file rename edits are act-on-able: a cold-index rename that
+        // silently missed files would corrupt the workspace. Wait Complete.
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Complete).await;
+        }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
@@ -1956,9 +2448,9 @@ impl LanguageServer for Backend {
         // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
         // the file's own initial build, then an in-flight family index so hover
         // resolves warm.
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
-            self.await_index_ready(language).await;
+            self.await_index_ready(language, WaitPolicy::Interactive).await;
         }
         // Snapshot + drop the store guard before `resolve()` (reentrant
         // `for_each_open`); see `Document::analysis`.
@@ -2023,7 +2515,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         // Snapshot + drop the store guard before completion resolves (both the
         // pack and Perl paths gather cross-file candidates through `resolve()`,
         // which re-locks the open shards via `for_each_open`); see
@@ -2106,7 +2598,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SignatureHelp>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2123,7 +2615,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<DocumentHighlight>>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2141,7 +2633,7 @@ impl LanguageServer for Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2162,7 +2654,7 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2237,7 +2729,7 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2255,7 +2747,7 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2269,7 +2761,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2364,6 +2856,7 @@ impl LanguageServer for Backend {
             }
         }
 
+        symbols::dedup_workspace_symbols(&mut results);
         if results.is_empty() {
             Ok(None)
         } else {
@@ -2525,7 +3018,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<LinkedEditingRanges>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        self.await_open_ready(uri).await;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
             None => return Ok(None),
@@ -2571,4 +3064,158 @@ async fn run_perltidy(input: String) -> std::io::Result<std::process::Output> {
     let output = child.wait_with_output().await;
     let _ = writer.await;
     output
+}
+
+#[cfg(test)]
+mod first_change_tests {
+    //! Part 1 (degraded-window progress) + Part 2 (single-flight gather)
+    //! bookkeeping — the pure coordinators, exercised without a live LSP
+    //! Client. The full progress-notification + heal path is covered by the
+    //! e2e/acceptance harness; here we pin the invariants the ruling names.
+    use super::*;
+
+    fn uri(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    // ---- Part 2: single-flight gather registry ----
+
+    #[test]
+    fn concurrent_requests_spawn_exactly_one_gather() {
+        // Many heal requests for one URI while a gather is in flight → exactly
+        // one caller is told to SPAWN; the rest coalesce.
+        let reg = GatherRegistry::default();
+        let u = uri("file:///a.c");
+        assert!(reg.request(&u), "first request must spawn");
+        for _ in 0..50 {
+            assert!(!reg.request(&u), "in-flight requests must coalesce, not spawn");
+        }
+        assert!(reg.is_inflight(&u));
+    }
+
+    #[test]
+    fn stale_generation_completion_reruns_exactly_once() {
+        // N keystrokes during a running gather bump `wanted`; the loop must
+        // re-run ONCE (coalescing all N), then retire — never N re-runs.
+        let reg = GatherRegistry::default();
+        let u = uri("file:///a.c");
+        assert!(reg.request(&u)); // spawn: running=1, wanted=1
+        // 5 keystrokes land while the first gather runs.
+        for _ in 0..5 {
+            assert!(!reg.request(&u)); // wanted climbs to 6
+        }
+        // First gather completes: wanted(6) > running(1) → re-run once.
+        assert!(reg.finish(&u), "stale generation must re-run");
+        // No requests during the re-run: it completes and retires.
+        assert!(!reg.finish(&u), "up-to-date generation must retire, not re-run");
+        assert!(!reg.is_inflight(&u), "entry retired — no leak");
+    }
+
+    #[test]
+    fn quiescent_completion_retires_entry() {
+        let reg = GatherRegistry::default();
+        let u = uri("file:///a.c");
+        assert!(reg.request(&u));
+        assert!(!reg.finish(&u), "no intervening request → retire");
+        assert!(!reg.is_inflight(&u));
+        // A later request after retirement spawns a fresh loop.
+        assert!(reg.request(&u), "post-retirement request spawns anew");
+    }
+
+    #[test]
+    fn forget_stops_the_loop_and_cleans_the_entry() {
+        // didClose: forget removes the entry; the running loop's next finish
+        // sees Vacant and stops (returns false), no re-run, no leak.
+        let reg = GatherRegistry::default();
+        let u = uri("file:///a.c");
+        assert!(reg.request(&u));
+        assert!(!reg.request(&u)); // a keystroke bumped wanted — would normally re-run
+        reg.forget(&u);
+        assert!(!reg.is_inflight(&u), "close cleaned the entry");
+        assert!(
+            !reg.finish(&u),
+            "closed URI must not re-run even with a pending wanted bump"
+        );
+    }
+
+    #[test]
+    fn registries_are_independent_per_uri() {
+        let reg = GatherRegistry::default();
+        let a = uri("file:///a.c");
+        let b = uri("file:///b.c");
+        assert!(reg.request(&a));
+        assert!(reg.request(&b), "a second URI spawns its own gather");
+        assert!(!reg.finish(&a), "a retires with no intervening request");
+        assert!(!reg.is_inflight(&a));
+        assert!(reg.is_inflight(&b), "retiring a must not touch b");
+    }
+
+    #[test]
+    fn many_threads_race_to_one_spawn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reg = Arc::new(GatherRegistry::default());
+        let u = uri("file:///race.c");
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let reg = Arc::clone(&reg);
+            let u = u.clone();
+            let spawns = Arc::clone(&spawns);
+            handles.push(std::thread::spawn(move || {
+                if reg.request(&u) {
+                    spawns.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            spawns.load(Ordering::Relaxed),
+            1,
+            "exactly one thread wins the spawn under contention"
+        );
+    }
+
+    // ---- Part 1: degraded-window progress token reservation ----
+
+    #[test]
+    fn one_begin_per_window_reused_across_keystrokes() {
+        // The progress token is reserved once per degraded window; subsequent
+        // didChanges inside the same window reuse it (no per-keystroke Begin).
+        let map: dashmap::DashMap<Url, NumberOrString> = dashmap::DashMap::new();
+        let u = uri("file:///a.c");
+        let t0 = NumberOrString::String("perl-lsp/degraded-0".into());
+        assert!(
+            reserve_degraded_token(&map, &u, t0.clone()),
+            "first reservation mints the token"
+        );
+        for i in 1..10 {
+            let t = NumberOrString::String(format!("perl-lsp/degraded-{i}"));
+            assert!(
+                !reserve_degraded_token(&map, &u, t),
+                "reservations within the same window reuse the open token"
+            );
+        }
+        // The stored token is still the first one (later mints were discarded).
+        assert_eq!(map.get(&u).map(|v| v.clone()), Some(t0));
+    }
+
+    #[test]
+    fn releasing_the_window_allows_a_fresh_begin() {
+        let map: dashmap::DashMap<Url, NumberOrString> = dashmap::DashMap::new();
+        let u = uri("file:///a.c");
+        assert!(reserve_degraded_token(
+            &map,
+            &u,
+            NumberOrString::String("t0".into())
+        ));
+        // clear_degraded / close removes the entry (window over).
+        assert!(map.remove(&u).is_some());
+        // Next degraded window mints a fresh token.
+        assert!(
+            reserve_degraded_token(&map, &u, NumberOrString::String("t1".into())),
+            "a new window announces itself with a new token"
+        );
+    }
 }

@@ -212,7 +212,7 @@
       "semantic_area": "cpp-hitlist2",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #6: a macro-attributed move ctor whose noexcept(... && ...) clause and member-initializer both span multiple lines (a nested brace-init inside a ternary) desyncs scope tracking for the rest of the class — a ref-qualified method right after it, and the access-specifier labels, leak.",
+      "comment": "hitlist-2 #6: a macro-attributed move ctor whose noexcept(... && ...) clause and member-initializer both span multiple lines (a nested brace-init inside a ternary) desyncs scope tracking for the rest of the class \u2014 a ref-qualified method right after it, and the access-specifier labels, leak.",
       "file": "scope_desync.cpp",
       "line": 0,
       "col": 0,
@@ -233,7 +233,7 @@
       "semantic_area": "cpp-hitlist2",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #7 reduction note: a PLAIN reopened namespace (no macro guard) already attributes both openings correctly today. json.hpp/fmt's real orphaning needs the SPDLOG/NLOHMANN-style macro-wrapped namespace-open idiom (NS_BEGIN/NS_END unresolved locally) — the same root cause as the macro-before-class gap (ns_macro.cpp), generalized to `namespace`: even the FIRST opening goes dark, not just later reopenings.",
+      "comment": "hitlist-2 #7 reduction note: a PLAIN reopened namespace (no macro guard) already attributes both openings correctly today. json.hpp/fmt's real orphaning needs the SPDLOG/NLOHMANN-style macro-wrapped namespace-open idiom (NS_BEGIN/NS_END unresolved locally) \u2014 the same root cause as the macro-before-class gap (ns_macro.cpp), generalized to `namespace`: even the FIRST opening goes dark, not just later reopenings.",
       "file": "reopen_ns.cpp",
       "line": 0,
       "col": 0,
@@ -251,7 +251,7 @@
       "semantic_area": "cpp-hitlist2",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #8: `using Base::insert;` re-exports Base's member into Derived's public API but mints no outline entry for it — Derived's member list silently drops the re-exported name (gd from a call site is unaffected — verified separately it already reaches Base::insert, not the unrelated `Other::insert` plant).",
+      "comment": "hitlist-2 #8: `using Base::insert;` re-exports Base's member into Derived's public API but mints no outline entry for it \u2014 Derived's member list silently drops the re-exported name (gd from a call site is unaffected \u2014 verified separately it already reaches Base::insert, not the unrelated `Other::insert` plant).",
       "file": "using_reexport.cpp",
       "line": 0,
       "col": 0,
@@ -269,7 +269,7 @@
       "semantic_area": "cpp-hitlist2",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #9: `struct T *make_t(int a);` (pointer-returning prototype, no body) is dropped from the outline entirely — the declarator-ambiguity misparse leaks its param `a` as an orphan top-level Variable instead.",
+      "comment": "hitlist-2 #9: `struct T *make_t(int a);` (pointer-returning prototype, no body) is dropped from the outline entirely \u2014 the declarator-ambiguity misparse leaks its param `a` as an orphan top-level Variable instead.",
       "file": "ptr_proto.cpp",
       "line": 0,
       "col": 0,
@@ -289,7 +289,7 @@
       "semantic_area": "cpp-hitlist2",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-2 #12: operator overloads (member `operator+`, free `operator<<`) are a total outline blind spot — neither appears at all. Expected name form (our choice): the member spells as `operator+` under package `Vec2`; the free operator spells as bare `operator<<` with no package.",
+      "comment": "hitlist-2 #12: operator overloads (member `operator+`, free `operator<<`) are a total outline blind spot \u2014 neither appears at all. Expected name form (our choice): the member spells as `operator+` under package `Vec2`; the free operator spells as bare `operator<<` with no package.",
       "file": "operators.cpp",
       "line": 0,
       "col": 0,
@@ -299,6 +299,30 @@
           "\"name\":\"operator<<\""
         ],
         "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-hitlist7-out-of-line-defs-declarator-and-qualifier",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-hitlist",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "file": "outofline_defs.cpp",
+      "line": 0,
+      "col": 0,
+      "comment": "H7-2: out-of-line definitions the narrow per-shape patterns dropped \u2014 (a) pointer return `Regexp* Regexp::Simplify()` wraps the function_declarator in a pointer_declarator; (b) multi-level qualifier `Prog::Inst::InitAlt` nests the qualified_identifier (owner = inner Inst); (c) out-of-line constructors `RE2::RE2` / `RE2::Options::Options` have no return type. Each attributes to its OWNING class named by the `::` qualifier, not the enclosing `app` namespace (F8).",
+      "expect": {
+        "all": [
+          "\"kind\":\"Method\",\"line\":\"7\",\"name\":\"Simplify\",\"package\":\"Regexp\"",
+          "\"kind\":\"Method\",\"line\":\"10\",\"name\":\"InitAlt\",\"package\":\"Inst\"",
+          "\"kind\":\"Method\",\"line\":\"13\",\"name\":\"RE2\",\"package\":\"RE2\"",
+          "\"kind\":\"Method\",\"line\":\"16\",\"name\":\"Options\",\"package\":\"Options\""
+        ],
+        "none": [
+          "\"name\":\"Simplify\",\"package\":\"app\"",
+          "\"name\":\"InitAlt\",\"package\":\"app\""
+        ]
       },
       "status": "gold"
     }

@@ -147,6 +147,34 @@
   name: [(type_identifier) (template_type)] @def.class.name
   (base_class_clause
     (qualified_identifier name: (type_identifier) @parent)))
+; out-of-line nested class WITH a base (`class Block::Iter : public Iterator`,
+; `class Version::LevelFileNumIterator : public Iterator`): the class NAME is a
+; qualified_identifier (the def pattern above files it under its inner
+; type_identifier). The base patterns above only match a bare/template name, so
+; a qualified-named subclass never minted its `@parent` edge — invisible to the
+; INHERITS_INV implementations walk. Capture the SAME inner name as
+; @def.class.name (so the child edge joins the identity the class filed under)
+; plus every base spelling (bare / template / namespace-qualified).
+(class_specifier
+  name: (qualified_identifier name: (type_identifier) @def.class.name)
+  (base_class_clause (type_identifier) @parent))
+(struct_specifier
+  name: (qualified_identifier name: (type_identifier) @def.class.name)
+  (base_class_clause (type_identifier) @parent))
+(class_specifier
+  name: (qualified_identifier name: (type_identifier) @def.class.name)
+  (base_class_clause (template_type name: (type_identifier) @parent) @parent))
+(struct_specifier
+  name: (qualified_identifier name: (type_identifier) @def.class.name)
+  (base_class_clause (template_type name: (type_identifier) @parent) @parent))
+(class_specifier
+  name: (qualified_identifier name: (type_identifier) @def.class.name)
+  (base_class_clause
+    (qualified_identifier name: (type_identifier) @parent)))
+(struct_specifier
+  name: (qualified_identifier name: (type_identifier) @def.class.name)
+  (base_class_clause
+    (qualified_identifier name: (type_identifier) @parent)))
 (union_specifier name: (type_identifier) @def.class.name) @def.class
 ; a BODIED named union additionally scopes its members (outline nesting +
 ; the hover overlay's sibling group) and tags them with the union's name.
@@ -298,15 +326,18 @@
   declarator: (function_declarator
     declarator: (field_identifier) @def.method.name
     (trailing_return_type (type_descriptor type: (_) @rettype)))) @def.method
-; out-of-line definition `RetT Class::method(...) { ... }` — @qualifier
-; carries the `Class::` so the method attributes to its class, not the
-; enclosing namespace.
-(function_definition
-  type: (_) @rettype
-  declarator: (function_declarator
-    declarator: (qualified_identifier
-      scope: (_) @qualifier
-      name: (identifier) @def.method.name))) @def.method
+; out-of-line definitions `RetT Class::method(...) { ... }` (incl.
+; pointer/reference returns, multi-level qualifiers `A::B::m`, and
+; ctors/dtors with no return type). ONE general capture per return-type
+; presence — the driver peels the declarator (pointer/reference/parenthesized,
+; any depth) to the function declarator, then walks the qualified name to its
+; leaf (the member name) + owning class. This fires for EVERY function_definition;
+; a non-qualified declarator (free function / in-class method, owned by the
+; patterns above/below) yields nothing. `!type` splits the ctor/dtor shape off
+; (a `?`-quantified type capture would kill the sibling capture). No @scope here
+; — the universal `(function_definition) @scope.sub` mints it.
+(function_definition type: (_) @rettype) @ool.def
+(function_definition !type) @ool.def
 (function_definition
   declarator: (pointer_declarator
     declarator: (function_declarator
@@ -466,26 +497,6 @@
   declarator: (pointer_declarator
     declarator: (function_declarator
       declarator: (operator_name) @def.sub.name))) @def.sub
-(function_definition
-  declarator: (function_declarator
-    declarator: (qualified_identifier
-      scope: (_) @qualifier
-      name: (operator_name) @def.method.name))) @def.method
-; out-of-line ref-/pointer-returning operator defs (`T& Vec2::operator[](...)`)
-(function_definition
-  type: (_) @rettype
-  declarator: (reference_declarator
-    (function_declarator
-      declarator: (qualified_identifier
-        scope: (_) @qualifier
-        name: (operator_name) @def.method.name)))) @def.method
-(function_definition
-  type: (_) @rettype
-  declarator: (pointer_declarator
-    declarator: (function_declarator
-      declarator: (qualified_identifier
-        scope: (_) @qualifier
-        name: (operator_name) @def.method.name)))) @def.method
 ; pointer-/reference-returning operator decls (`Vec2& operator+=(...)`)
 (field_declaration
   type: (_) @rettype
@@ -508,13 +519,9 @@
 (declaration
   declarator: (function_declarator
     declarator: (destructor_name) @def.sub.name)) @def.sub
-; out-of-line `Class::~Class() {...}` / `Class::Class() {...}` definitions.
-; (@scope comes from the universal `(function_definition) @scope` above.)
-(function_definition
-  declarator: (function_declarator
-    declarator: (qualified_identifier
-      scope: (_) @qualifier
-      name: (destructor_name) @def.method.name))) @def.method
+; (out-of-line `Class::~Class() {...}` / `Class::Class() {...}` definitions are
+; captured by the general `@ool.def` patterns above — the qualifier walk reaches
+; a `destructor_name` / ctor-`identifier` leaf like any other member name.)
 
 ; ---- explicit instantiation (`template struct X<int>;` / `template void
 ; f<char>(..);` — fmt's src/format.cc is entirely this shape). It is a USE

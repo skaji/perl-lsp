@@ -746,8 +746,12 @@ pub(crate) fn constructor_invocant<'a>(node: Node<'a>, src: &'a [u8]) -> Option<
     }
     let inv = call.invocant()?.text(src)?;
     match InvocantText::parse(inv) {
-        InvocantText::Bareword(_) | InvocantText::CurrentPackage => Some(inv),
-        InvocantText::Scalar(_)
+        InvocantText::CurrentPackage => Some(inv),
+        // A computed receiver (`(ref $self)->new`) parses to a leading `(`
+        // that classifies as Bareword; only a real package name is a class.
+        InvocantText::Bareword(b) if crate::conventions::is_bareword_class_name(b) => Some(inv),
+        InvocantText::Bareword(_)
+        | InvocantText::Scalar(_)
         | InvocantText::NonScalar(_)
         | InvocantText::PositionalReceiver => None,
     }

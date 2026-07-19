@@ -99,9 +99,29 @@ fn detect_slot_perl_method_position() {
     }
 }
 
+/// H7-10(b): a cursor INSIDE a string argument to a method call
+/// (`$schema->resultset('Arti|st')`) is not a member-access slot — the
+/// method token is fully typed and the cursor sits past it, in the arg
+/// list. Pre-fix the loose "cursor after invocant" check reported a bogus
+/// `$schema->` Member slot, dumping method candidates into the string.
+#[test]
+fn detect_slot_string_arg_of_method_call_is_not_member() {
+    let src = "package main;\nmy $x = $schema->resultset('Artist');\n";
+    let (tree, analysis) = build(src);
+    let line = src.lines().nth(1).unwrap();
+    let col = line.find("Artist").unwrap() + 2; // inside 'Artist'
+    let point = Point::new(1, col);
+    let slot = detect_slot(&analysis, &tree, src, point, "perl", None).slot;
+    assert!(
+        !matches!(slot, Slot::Member { .. }),
+        "cursor inside a string call-arg must not be a Member slot, got {:?}",
+        slot
+    );
+}
+
 /// `use |` (typing the module name) is a `ModulePath` slot on the
 /// `UseModule` detector arm — the arm, not a local bool, distinguishes it
-/// from the qualified-path drill (`docs/open-forks.md`).
+/// from the qualified-path drill (`docs/forks-resolved.md`).
 #[test]
 fn detect_slot_perl_use_module_name_is_module_path() {
     use crate::cursor_slot::DetectorArm;

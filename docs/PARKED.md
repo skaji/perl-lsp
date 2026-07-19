@@ -6,25 +6,105 @@ why parked, what unblocks it. Prune on landing.
 
 ## Design-debt tier (candidates for a tightening round)
 
+All entries below re-ratified by the tighten-2 drain (2026-07-17) unless
+marked otherwise; the drain re-derived each rationale against current code.
+
 - **Two include-BFS walkers + two `file_stamp` fns** (cpp_reparse vs
-  module_cache): twice examined, twice left (different contracts/layers);
-  verdicts recorded so sweeps don't re-litigate. Merge only with a reason.
+  module_cache): thrice examined, thrice left (different contracts/layers:
+  parse-heavy macro gather vs memoized line-scan closure; `(hash,size)`
+  columns vs folded i64 stamp). Merge only with a reason. [re-ratified
+  2026-07-17]
 - **Two C-comment strippers in cpp_reparse** (`strip_c_comments` vs
   `blank_comments_in_range`): distinct contracts — the former COLLAPSES
   whitespace to produce clean body text, the latter is length-preserving
   (spaces over comment bytes, newlines kept) so byte offsets stay in
   original coordinates for member positioning. Not a merge target.
+  [re-ratified 2026-07-17]
 - **Two "enclosing class" notions in `emit_return_fuel`**: the implicit-
   field half reads the ref's own `scope.package`; the sibling-CALL half
   walks up to the enclosing method SYMBOL's package (so out-of-line bodies,
   whose body scope carries no package, still resolve). Deliberately
-  different robustness; unifying is a behavior change, not a cleanup.
+  different robustness; unifying is a behavior change, not a cleanup
+  (out-of-line bodies would gain implicit-field edges). [re-ratified
+  2026-07-17]
 - **Two domain/type completion rankers** (`backend::rank_domain_members`
   for pack enum members vs `symbols::rank_candidates_by_expected_type` for
   Perl scope vars): different item types (`CompletionItem` vs
   `CompletionCandidate`) and semantics (enum members verbatim, front-loaded
   vs. type-matching locals kept at `PRIORITY_LOCAL`). No shared gatherer to
-  factor.
+  factor. [re-ratified 2026-07-17]
+- **`class_isa_prefix` walks `parents_cached`, not `parents_of`**
+  (`file_analysis.rs`): deliberate, verdict recorded. The synthetic
+  `APP_SURFACE_CLASS` edge that `parents_of` injects is a method-dispatch
+  bridge (Mojo helpers), not an `isa` relation — a plugin `ClassIsa` gate
+  must not treat an app-surface consumer as a descendant of the surface.
+  Both isa-walk seams (`class_isa`, `class_isa_prefix`) exclude it by
+  construction; they share the local-∪-cross-file seam, just not the
+  surface edge. Not a `parents_of` drift to fix. [re-ratified 2026-07-17;
+  T2-A consolidated all three isa walks onto one `walk_ancestry` — the
+  seam distinction is now a parameter, not a copy]
+- **CLI workspace-symbol dedup inlines the identity tuple**
+  (`main.rs` `workspace-symbol` vs `symbols::dedup_workspace_symbols`):
+  type-forced duplicate, leave-alone (mirrors the two-rankers precedent).
+  The LSP handler dedups a `Vec<SymbolInformation>` as a post-pass
+  (`retain`); the CLI gates inline while building `serde_json` rows from
+  raw `(name, kind, span)` before any typed Vec exists. Same 5-field
+  identity, different pipeline stage and value shape (u32 uri/line vs
+  usize path/row). A shared key helper would be a bare tuple literal each
+  caller still populates from different fields — no gatherer to factor.
+  [re-ratified 2026-07-17; note the CLI has THREE inline `seen.insert`
+  dedups with three deliberately different keys — the third at the
+  single-file outline gates framework twin accessors on
+  `(kind,name,row,col)` — none a shared-helper candidate]
+- **`load_components` DBIC-namespace default lives in core**
+  (`builder.rs::visit_load_components`, bare names default to `DBIx::Class`):
+  KEEP IN CORE, rationale rewritten 2026-07-17 (the old blocker — no
+  parent-edge EmitAction — is obsolete: `EmitAction::PackageParent` exists
+  and is wired). The standing reason: `load_components` is generic mixin
+  machinery (Catalyst too) and the dbic plugin is `ClassIsa`-gated, so
+  moving registration there would drop non-DBIC callers; only the bare-name
+  `DBIx::Class` prefix string is DBIC-specific. If ever promoted (est M):
+  plugin emits fully-qualified parents via `PackageParent`, core keeps a
+  generic non-prefixing fallback; identity risk — the plugin's `+`-strip and
+  prefix policy must reproduce core's exact strings or inherited-component
+  goto-def/rename silently breaks.
+- **Four→one ancestry walkers, GraphView as the end state**
+  (`file_analysis.rs::walk_ancestry`, T2-A 2026-07-17): the three isa DFSes
+  now share one predicate-parameterized walker (per-call-site budgets 200/
+  200/40 and seam scopes preserved). The recorded end state is collapsing
+  `walk_ancestry` onto `GraphView`'s lazy walk (docs/adr/graph-walking.md) —
+  do that, not a fifth bespoke helper. The DBIC base-name set
+  (`class_is_dbic_result`'s Core/Row-vs-Schema/ResultSet polarity) still
+  lives in the Model layer; its plugin-manifest move rides the
+  `role_makers` precedent (follow-on, est M).
+- **`class_is_dbic_result` vs `class_isa_prefix("DBIx::Class")`**: NOT a
+  merge — the result gate encodes row-vs-schema POLARITY (accepts Core/Row
+  roots, rejects `::Schema`/`::ResultSet`) that a prefix test cannot; a
+  schema class is a DBIx::Class descendant but not a result class.
+  [recorded 2026-07-17]
+- **Two boolean pack-capability askers** (`language_has_include_tokens`,
+  `language_has_preprocessor` — backend.rs): identical body shape, fine at
+  two per the rule of three. The THIRD boolean capability asker is the
+  tripwire: collapse to a generic `pack_cap(lang, sel)` then. [recorded
+  2026-07-19, tighten-4 audit]
+- **Three byte-capped LRU eviction cores** (PackBagCache plain; enrichment
+  overlay adds entry-count cap; GatherCache adds single-flight condvar):
+  shared discipline (`evict_to_cap`, never-evict-just-inserted), genuinely
+  different surrounding contracts — forced unification would
+  over-parameterize. Strongest DRY signal on the books; re-examine only if
+  a FOURTH appears. [recorded 2026-07-19]
+- **Deleted-path canonicalization fallback** (`forget_source_gen` /
+  `unregister_file` use `canonicalize().unwrap_or(path)`; `remove_surface`
+  reconstructs via parent-dir + filename): a delete under a symlinked
+  parent leaves a stale entry (one i64 / one registration). Pre-existing
+  shared convention, no new hazard class; consistency nit — route all
+  three through the reconstruction if ever touched. [recorded 2026-07-19]
+- **`RESOLVE_MEMO` vs `PackBagCache`**: same surface shape ("cache of
+  computed values"), OPPOSITE contracts — thread-local stack-scoped
+  correctness memo cleared on resolve-stack drain vs long-lived
+  byte-accounted LRU invalidated on content change. Never unify under one
+  cache abstraction. [recorded 2026-07-17]
+
 ## Feature tier (each is a fireable slice)
 
 - **Perl domain typing** — needs a constant-group / Type::Tiny enum-domain
@@ -96,6 +176,36 @@ why parked, what unblocks it. Prune on landing.
   "system root" generalization (perl=@INC, python=probe).
 - **Instance brands** (per-object dispatch scoping) — downstream of the
   long-distance value-provenance tier (`prompt-type-inference-residual.md`).
+- **`monkey_patch`-synthesized methods invisible** (mojo F7 — `$ua->get`):
+  `monkey_patch __PACKAGE__, lc $name, sub{...}` in a loop mints methods a
+  syntactic walk can't see. Needs loop-unrolled emission (plugin emit-hook
+  shaped) — real design work.
+- **Raw `$_[N]` / `@_` subs get no param/return inference** (mojo F4 — `on`
+  vs `once`): a sub that reads args positionally rather than via `my
+  ($self, ...) = @_` produces no arity/return facts. Unblock: an `@_`-index
+  → param binding at the walk.
+- **`emit('x')` ↔ `on(x =>)` event linking in references** (mojo F9): the
+  `dispatchers` field exists on the outline but is unreachable from the
+  references verb — emit sites and handler registrations aren't cross-linked.
+- **H7-8 inline `->search(...)->first` loses parametric row type** (DBIC F4):
+  a RowOf verb composed on a fluent-verb result inside ONE expression types
+  nothing; the same composition through an intermediate variable works.
+  Wave-3 candidate. Unblock: compose the parametric type across chained
+  method calls without an intermediate binding.
+- **H7-13 cpp member-field receiver completion doesn't narrow** (leveldb
+  task 4, re2 F3): `field_->` / `field.` dumps the in-scope grab-bag instead
+  of the field's real members; parameter/local receivers narrow correctly.
+  Narrowed lists also leak private + nested-struct members and truncate
+  trailing-underscore names (`cleanup_head_` → `cleanup_head`). Wave-3
+  candidate.
+- **H7-15 DBIC resultset moniker never resolves to the FQ result class**
+  (split from H7-7): `$schema->resultset('Artist')->create(...)` types the
+  row as the literal source moniker `"Artist"`, not `DBICTest::Schema::
+  Artist`, so cross-file goto-def on the row's methods can't start its walk
+  (proven: forcing the FQ class reaches Row.pm perfectly). The schema class
+  is discarded from `ParametricType::ResultSet{base,row}`. Wave-3 candidate.
+  Unblock: moniker→class resolution (schema receiver's class + registered
+  source names + cross-file index) at the parametric-type seam.
 
 ## Residual-bug tier (pinned, xfail'd where reducible)
 
@@ -291,6 +401,23 @@ why parked, what unblocks it. Prune on landing.
   until the macro-guarded-namespace-open gap closes; `fmt::detail::` filters
   correctly there today. Gold: `cpp-qualified-completion.json` (4 rows).
 
+- **cpp hover renders methods field-shaped** (leveldb task 4b): a method
+  hovers as `Valid: Bool` — no signature, no `const` qualifier — because the
+  skeleton extracts members uniformly and hover has no method-vs-field split.
+  Unblock: carry a callable shape (params + qualifiers) on the extracted
+  member and render it in the cpp hover path.
+- **leveldb `db_iter.cc` `k` else-branch dark spot** (leveldb task 4c):
+  hover/def/refs all blank on `k` in one else-branch; unreduced (synthetic
+  repro attempts failed). Coordinates in `findings-leveldb.md` task 4c.
+- **cpp namespace-blind rename identity** (H7-6 cpp half, leveldb task 5b):
+  renaming a class like `Iterator` proposes edits inside vendored gtest —
+  class-name identity is bare-name, not namespace-qualified, so unrelated
+  same-named classes in other namespaces collide. The Perl owner-gate half
+  landed (`62426fa`); the cpp half needs namespace-qualified class identity
+  in the rename target. Destructive-if-applied.
+
 ## Cross-references
 - Gap shapes behind open xfails: `gold-corpus/KNOWN-GAPS.md`
-- Architectural forks: `docs/open-forks.md`
+- Open architectural forks: `docs/open-forks.md`; resolved ledger:
+  `docs/forks-resolved.md`; deferred storage/residency work:
+  `docs/prompt-storage-residuals.md`

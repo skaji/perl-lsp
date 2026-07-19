@@ -113,13 +113,22 @@ types its `$c`. The gated TC is a *value read through one query seam*
 (`inferred_type_via_bag_ctx`), which is what makes the single-seam gate
 sufficient.
 
+**`ClassIsa` triggers** (mojo-events `$self->on('ready')` / DBIC `has_many`
+through a cross-file parent chain). Landed since (H7-5). Unlike `param_types`,
+these synthesize symbols feeding every symbol-table consumer, so there is no
+single query seam to gate — the answer is DEFERRAL, not gating. The build
+records the syntactically-matched-but-ungated `on_match` emission as a
+`file_analysis::GatedEmission` (file-analysis-native `GatedSymbol`/`GatedRef`
++ the unfired `ClassIsa` prefixes), and two index-aware consumers re-fire it
+once `class_isa_prefix` resolves the ancestry: `enrich_imported_types_with_keys`
+(open docs + enriched overlay) and `ModuleIndex::materialize_gated_emissions`
+(post-index, so `whole_present` carries it for cross-file goto-def /
+references). Idempotent (truncate-to-baseline / dedup) and deterministic. See
+`docs/prompt-enrichment-inheritance-residual.md` and the cross-file visibility
+fork in `docs/open-forks.md`.
+
 Still deferred:
 
-- `ClassIsa` triggers (mojo-events `$self->on('ready')` through a
-  cross-file parent chain). Unlike `param_types`, these fire EMIT HOOKS
-  that synthesize symbols feeding every symbol-table consumer — there's no
-  single query seam to gate. Needs an overlay-symbols mechanism; see
-  `docs/open-problems.md` and the graph-walking pillar.
 - the app-surface consumer set (already isa-shaped via `parents_of` +
   `app_surface_consumers`; folding it onto `resolve_for` is a small
   consolidation, not a correctness gap).

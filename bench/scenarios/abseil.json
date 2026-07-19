@@ -1,0 +1,23 @@
+{
+  "project": {"repo": "https://github.com/abseil/abseil-cpp", "root_subdir": "",
+    "note": "873 .cc/.h; spine = absl::Status::code() (header-declared, 50+ call sites in status.cc)"},
+  "readiness": {"file": "absl/status/status.cc", "line": 209, "character": 16},
+  "steps": [
+    {"action": "open", "file": "absl/status/status.cc"},
+    {"action": "hover", "file": "absl/status/status.cc", "line": 209, "character": 16, "name": "hover-code-member"},
+    {"action": "definition", "file": "absl/status/status.cc", "line": 213, "character": 16, "name": "def-code-cross-tu"},
+    {"action": "references", "file": "absl/status/status.cc", "line": 209, "character": 16, "name": "refs-code-widely-used"},
+    {"action": "completion", "file": "absl/status/status.cc", "line": 209, "character": 16, "name": "complete-status-member"},
+    {"action": "rss", "name": "post-nav"},
+    {"action": "insert_line", "file": "absl/status/status.cc", "line": 210, "text": "  int zz_bench_tmp = 0;", "name": "body-edit-1", "await_diagnostics": true},
+    {"action": "insert_line", "file": "absl/status/status.cc", "line": 211, "text": "  zz_bench_tmp += 1;", "name": "body-edit-2", "await_diagnostics": true},
+    {"action": "revert", "file": "absl/status/status.cc", "name": "revert-body-edits", "await_diagnostics": true},
+    {"action": "rss", "name": "post-edits"},
+    {"action": "open", "file": "absl/status/status.h"},
+    {"action": "insert_line", "file": "absl/status/status.h", "line": 295, "text": "int zz_bench_probe();", "name": "header-contract-edit", "await_diagnostics": true},
+    {"action": "revert", "file": "absl/status/status.h", "name": "revert-header-edit", "await_diagnostics": true},
+    {"action": "rss", "name": "post-header-edit"},
+    {"action": "hover", "file": "absl/status/status.cc", "line": 209, "character": 16, "name": "hover-code-post-header"},
+    {"action": "definition", "file": "absl/status/status.cc", "line": 213, "character": 16, "name": "def-code-post-header"}
+  ]
+}

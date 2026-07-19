@@ -539,21 +539,6 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
     (path, uri)
 }
 
-/// Human-facing name for a pack language id, for the startup banner.
-/// Purely cosmetic — `LanguageRegistry::for_id` still
-/// speaks the short id everywhere else; this is the one spot that prints
-/// for a human. Falls back to the id itself for a language this mapping
-/// hasn't been told about yet (never a hard error over a display string).
-fn pack_language_display_name(id: &str) -> &'static str {
-    match id {
-        "cpp" => "C/C++",
-        "python" => "Python",
-        "r" => "R",
-        "cmake" => "CMake",
-        _ => "pack-language",
-    }
-}
-
 /// Full CLI workspace setup: index the workspace, open the SQLite cache,
 /// warm cached modules, resolve missing imports + ancestors via @INC,
 /// save fresh entries back to disk. Mirrors the LSP server's startup
@@ -582,7 +567,11 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     let ws = file_store::FileStore::new();
     let indexed =
         module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None);
-    eprintln!("Indexed {} files", indexed);
+    // Label the tier: a pack-only workspace printing a bare "Indexed 0 files"
+    // reads as "indexing failed" when the pack line below says otherwise.
+    if indexed > 0 {
+        eprintln!("Indexed {} Perl files", indexed);
+    }
     // Pack languages (C++/Python/…) → per-language sub-indexes (separate
     // caches, no cross-language overlap), attached to the hub for routing.
     let pack_indexed = module_resolver::index_pack_languages(
@@ -601,7 +590,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             .languages()
             .into_iter()
             .filter(|id| *id != "perl")
-            .map(pack_language_display_name)
+            .map(language_driver::LanguageRegistry::display_name)
             .collect();
         eprintln!("Indexed {} {} files", pack_indexed, langs.join("/"));
     }
@@ -691,6 +680,13 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // full `func → modules` index from the cache so `find_exporters` answers
     // identically on cold and warm runs (B6 export-attribution regression).
     module_index.rebuild_reverse_index_from_cache();
+
+    // Ancestry is now fully populated: materialize deferred cross-file
+    // `ClassIsa` plugin emissions (DBIC column/relationship accessors reached
+    // through a cross-file base) into the whole resident cached copies, so
+    // cross-file goto-def / references see them via `whole_present`. See
+    // `ModuleIndex::materialize_gated_emissions` / `GatedEmission`.
+    module_index.materialize_gated_emissions();
 
     (ws, module_index)
 }
@@ -847,16 +843,34 @@ fn editor_to_internal_point(source: Option<&str>, line1: usize, col1: usize) -> 
     tree_sitter::Point::new(row, byte_col)
 }
 
+/// Resolve a cursor-verb file argument to a path that exists on disk.
+/// Tries the argument as-is first (CWD-relative or absolute), then falls
+/// back to `<root>`-relative — so a root-relative path works when invoked
+/// from outside the project root. When neither exists, the original is
+/// returned unchanged (downstream reports the honest "file not found").
+fn resolve_cursor_file(file: &str, root: &str) -> String {
+    if std::path::Path::new(file).exists() {
+        return file.to_string();
+    }
+    let joined = std::path::Path::new(root).join(file);
+    if joined.exists() {
+        return joined.to_string_lossy().into_owned();
+    }
+    file.to_string()
+}
+
 /// Parse the cursor arguments that follow `<root>` for a single-mode query.
 /// Two forms, disambiguated by the leading `--at`:
 ///   positional:  `<file> <line> <col>`      → 0-based, byte column (engine)
 ///   editor:      `--at <file>:<line>:<col>` → 1-based, char column (editor)
 /// The chosen `CoordFmt` rides along so the query's output renders in the same
-/// dialect the input used.
-fn parse_cursor_target(rest: &[String]) -> Option<CursorTarget> {
+/// dialect the input used. The file argument is resolved CWD-first then
+/// `<root>`-relative via `resolve_cursor_file`.
+fn parse_cursor_target(rest: &[String], root: &str) -> Option<CursorTarget> {
     match rest {
         [flag, spec] if flag == "--at" => {
             let (file, line1, col1) = split_at_spec(spec)?;
+            let file = resolve_cursor_file(&file, root);
             let source = std::fs::read_to_string(&file).ok();
             let point = editor_to_internal_point(source.as_deref(), line1, col1);
             Some(CursorTarget { file, point, fmt: CoordFmt::EditorOneBasedChar, raw: spec.clone() })
@@ -865,7 +879,7 @@ fn parse_cursor_target(rest: &[String]) -> Option<CursorTarget> {
             let row: usize = line.parse().ok()?;
             let column: usize = col.parse().ok()?;
             Some(CursorTarget {
-                file: file.clone(),
+                file: resolve_cursor_file(file, root),
                 point: tree_sitter::Point::new(row, column),
                 fmt: CoordFmt::ZeroBasedByte,
                 raw: format!("{} {} {}", file, line, col),
@@ -919,29 +933,34 @@ fn emit_pos_annotation(target: &CursorTarget) {
         "[pos] input {}  read as {} ({})  ->  internal {}:{}",
         target.raw, label, dialect, row, bc
     );
-    let source = std::fs::read_to_string(&target.file).ok();
-    match source.as_deref().and_then(|s| s.lines().nth(row)) {
-        Some(line) => {
-            match token_at_byte(line, bc) {
-                Some(tok) => eprintln!("      landed on token: {:?}", tok),
-                None => {
-                    // Whitespace / no token — name the likely fix in the OTHER base.
-                    let hint = match target.fmt {
-                        CoordFmt::EditorOneBasedChar => format!(
-                            "if these are 0-based engine coords, drop --at and pass: {} {} {}",
-                            target.file, row, bc
-                        ),
-                        CoordFmt::ZeroBasedByte => format!(
-                            "if these are 1-based editor coords, use: --at {}:{}:{}",
-                            target.file, row + 1, bc + 1
-                        ),
-                    };
-                    eprintln!("      landed on whitespace / no token — {}", hint);
+    // Distinguish "couldn't open the file" from "line past EOF": the old
+    // code collapsed both into a "past the end" message, which lied about
+    // files it never read (unresolved path, permissions).
+    match std::fs::read_to_string(&target.file) {
+        Err(e) => eprintln!("      (could not read {}: {})", target.file, e),
+        Ok(text) => match text.lines().nth(row) {
+            Some(line) => {
+                match token_at_byte(line, bc) {
+                    Some(tok) => eprintln!("      landed on token: {:?}", tok),
+                    None => {
+                        // Whitespace / no token — name the likely fix in the OTHER base.
+                        let hint = match target.fmt {
+                            CoordFmt::EditorOneBasedChar => format!(
+                                "if these are 0-based engine coords, drop --at and pass: {} {} {}",
+                                target.file, row, bc
+                            ),
+                            CoordFmt::ZeroBasedByte => format!(
+                                "if these are 1-based editor coords, use: --at {}:{}:{}",
+                                target.file, row + 1, bc + 1
+                            ),
+                        };
+                        eprintln!("      landed on whitespace / no token — {}", hint);
+                    }
                 }
+                eprintln!("      line {}: {}", row + 1, line);
             }
-            eprintln!("      line {}: {}", row + 1, line);
-        }
-        None => eprintln!("      (line {} is past the end of {})", row + 1, target.file),
+            None => eprintln!("      (line {} is past the end of {})", row + 1, target.file),
+        },
     }
 }
 
@@ -1118,7 +1137,7 @@ fn print_run_one(
 /// dialect selects the output `CoordFmt`, and a `[pos]` annotation goes to
 /// stderr so the 0-vs-1-based interpretation is never silent.
 fn cli_cursor(q: &str, root: &str, rest: &[String]) {
-    let target = parse_cursor_target(rest).unwrap_or_else(|| {
+    let target = parse_cursor_target(rest, root).unwrap_or_else(|| {
         eprintln!(
             "perl-lsp --{q}: expected `<root> <file> <line> <col>` or `<root> --at <file>:<line>:<col>`"
         );
@@ -1609,8 +1628,21 @@ fn run_one(
         "workspace-symbol" => {
             let q = req.query.clone().unwrap_or_default().to_lowercase();
             let mut results = Vec::new();
+            // Same identity-tuple dedup as the LSP handler's
+            // `dedup_workspace_symbols`: twin accessor synthesis (getter +
+            // fluent-writer) mints two symbols at one span, and a path can be
+            // seen by both the resident sweep and the rows pass.
+            let mut seen: std::collections::HashSet<(String, String, String, usize, usize)> =
+                std::collections::HashSet::new();
             let mut push = |name: &str, kind: &file_analysis::SymKind, file: String, span: file_analysis::Span| {
                 if name.to_lowercase().contains(&q) {
+                    let key = (
+                        name.to_string(), format!("{:?}", kind), file.clone(),
+                        span.start.row, span.start.column,
+                    );
+                    if !seen.insert(key) {
+                        return;
+                    }
                     results.push(serde_json::json!({
                         "name": name, "kind": format!("{:?}", kind),
                         "file": file,
@@ -1632,6 +1664,9 @@ fn run_one(
                     covered.insert(entry.key().clone());
                 }
                 for sym in &entry.value().symbols {
+                    if sym.hidden_in_outline() {
+                        continue;
+                    }
                     push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
             }
@@ -1644,12 +1679,18 @@ fn run_one(
                     covered.insert(path.to_path_buf());
                 }
                 for sym in &analysis.symbols {
+                    if sym.hidden_in_outline() {
+                        continue;
+                    }
                     push(&sym.name, &sym.kind, file.clone(), sym.selection_span);
                 }
             });
             for hit in symbols::sym_row_search(idx, &q) {
                 let path = std::path::PathBuf::from(&hit.path);
                 if covered.contains(&path) {
+                    continue;
+                }
+                if hit.flags & file_analysis::SymRowSeed::FLAG_HIDDEN_IN_OUTLINE != 0 {
                     continue;
                 }
                 let Some(kind) = file_analysis::sym_kind_from_code(hit.kind) else { continue };
@@ -1945,7 +1986,7 @@ fn cli_batch(root: &str) {
 /// `cursor` is the args between `<root>` and `<new>`. Output edit coordinates
 /// match the input dialect.
 fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
-    let target = parse_cursor_target(cursor).unwrap_or_else(|| {
+    let target = parse_cursor_target(cursor, root).unwrap_or_else(|| {
         eprintln!(
             "perl-lsp --rename: expected `<root> <file> <line> <col> <new>` or `<root> --at <file>:<line>:<col> <new>`"
         );
@@ -3209,18 +3250,42 @@ mod coord_tests {
         // Positional → engine dialect.
         let pos = parse_cursor_target(&[
             "f.pm".to_string(), "2".to_string(), "4".to_string(),
-        ])
+        ], ".")
         .unwrap();
         assert_eq!(pos.fmt, CoordFmt::ZeroBasedByte);
         assert_eq!((pos.point.row, pos.point.column), (2, 4));
         // `--at` (missing file on disk) → editor dialect, char col used as byte.
         let at = parse_cursor_target(&[
             "--at".to_string(), "does/not/exist.pm:6:1".to_string(),
-        ])
+        ], ".")
         .unwrap();
         assert_eq!(at.fmt, CoordFmt::EditorOneBasedChar);
         assert_eq!((at.point.row, at.point.column), (5, 0));
         // Malformed → None.
-        assert!(parse_cursor_target(&["only-one".to_string()]).is_none());
+        assert!(parse_cursor_target(&["only-one".to_string()], ".").is_none());
+    }
+
+    #[test]
+    fn resolve_cursor_file_prefers_cwd_then_root() {
+        let dir = std::env::temp_dir().join(format!("perl-lsp-rcf-{}", std::process::id()));
+        let sub = dir.join("lib");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rel = "lib/Thing.pm";
+        let abs = dir.join(rel);
+        std::fs::write(&abs, "package Thing;\n1;\n").unwrap();
+
+        // Root-relative path that does NOT exist against CWD resolves via <root>.
+        let resolved = resolve_cursor_file(rel, dir.to_str().unwrap());
+        assert!(std::path::Path::new(&resolved).exists(), "root fallback failed: {}", resolved);
+
+        // An absolute/CWD-existing path is kept verbatim (root not consulted).
+        let kept = resolve_cursor_file(abs.to_str().unwrap(), "/nonexistent-root");
+        assert_eq!(kept, abs.to_str().unwrap());
+
+        // Neither exists → original returned unchanged for an honest downstream miss.
+        let missing = resolve_cursor_file("no/such.pm", dir.to_str().unwrap());
+        assert_eq!(missing, "no/such.pm");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

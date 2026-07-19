@@ -45,7 +45,9 @@ static REHYDRATION_MISSES: std::sync::atomic::AtomicUsize =
 /// How many evicted copies failed to rehydrate this process (each was
 /// served as a stripped resident — quietly incomplete answers). Zero in a
 /// healthy session; the strict gate (`PERL_LSP_STRICT_RESIDENCY`) panics
-/// at the first miss instead of counting.
+/// at the first miss instead of counting. Observability hook read by the
+/// residency tests; production reacts via the strict gate, not this reader.
+#[cfg(test)]
 pub fn rehydration_miss_count() -> usize {
     REHYDRATION_MISSES.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -509,8 +511,6 @@ pub struct ModuleIndex {
     queue: Arc<ResolveQueue>,
     resolved: Arc<ResolveNotify>,
     workspace_root: Arc<WorkspaceRootChannel>,
-    /// Callback to trigger diagnostic re-publish after module resolution.
-    refresh_diagnostics: Arc<dyn Fn() + Send + Sync>,
     /// Per-language sub-indexes (`"cpp"`, `"python"`, …) — kept SEPARATE
     /// (own cache, own `modules-{lang}.db`) so names never comingle across
     /// languages. The Perl index is the hub; query routing picks the right
@@ -570,6 +570,18 @@ pub struct ModuleIndex {
     /// evicted, and rehydration after an edit persists would fetch the NEW
     /// generation's names.
     registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
+    /// The SOURCE generation (`module_cache::file_mtime_nanos`) the currently
+    /// registered pack analysis for a path was built from — the H9-1
+    /// stale-winner guard. `pack_file_changed`'s swap claims a path at its
+    /// event generation and registers only when the claim succeeds
+    /// (`incoming >= registered`), so a re-analysis that read pre-save bytes
+    /// (a lower generation) can never revert a fresher registration, and a
+    /// deferred-invalidation reconcile (H9-2) safely overrides only paths
+    /// whose registered generation is older than the save it reconciles. Empty
+    /// for a path the swap never touched (bulk/warm register ungated — they
+    /// are the baseline every real edit outranks, and the reconcile's
+    /// unregister+register replaces their entry outright).
+    registered_source_gen: Arc<DashMap<std::path::PathBuf, i64>>,
     /// Slice-2 rehydration store. Pack sub-indexes get theirs at
     /// construction (keyed to `modules-{lang}.db`); the Perl hub gets its
     /// own in `set_workspace_root` (keyed to `modules.db` — workspace
@@ -629,8 +641,7 @@ impl ModuleIndex {
             condvar: Condvar::new(),
         });
 
-        let refresh = Arc::new(on_diagnostics_refresh);
-        let refresh_clone = Arc::clone(&refresh);
+        let refresh_clone = Arc::new(on_diagnostics_refresh);
         let long_lived = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let bag_cache: Arc<
             std::sync::RwLock<Option<Arc<crate::pack_bag_cache::PackBagCache>>>,
@@ -666,6 +677,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
+            registered_source_gen: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
             registration_gen,
@@ -684,7 +696,6 @@ impl ModuleIndex {
             queue,
             resolved,
             workspace_root,
-            refresh_diagnostics: refresh,
         }
     }
 
@@ -719,8 +730,21 @@ impl ModuleIndex {
         // rehydrate through this, same as the pack sub-indexes. Fixed
         // 128 MiB cap (Perl analyses are 10-100x smaller than cpp ones).
         let loader = move |path: &std::path::Path| {
-            let conn = crate::module_cache::open_cache_db_readonly(key.as_deref(), "perl")?;
-            crate::module_cache::load_one(&conn, &path.to_string_lossy())
+            // Raw walk path first (preserves the pre-diag behavior), canonical
+            // as a fallback spelling; the discriminated helper survives the
+            // readonly-open CANTOPEN/WAL race behind both.
+            let raw = path.to_string_lossy().into_owned();
+            let canon = path
+                .canonicalize()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
+            let mut spellings = vec![raw.clone()];
+            if let Some(c) = canon {
+                if c != raw {
+                    spellings.push(c);
+                }
+            }
+            crate::module_cache::open_and_load_diag(key.as_deref(), "perl", &spellings)
         };
         self.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
             128 * 1024 * 1024,
@@ -1056,6 +1080,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
+            registered_source_gen: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
             registration_gen,
@@ -1074,7 +1099,6 @@ impl ModuleIndex {
             queue,
             resolved,
             workspace_root,
-            refresh_diagnostics: Arc::new(|| {}),
         }
     }
 
@@ -1147,6 +1171,7 @@ impl ModuleIndex {
             all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
+            registered_source_gen: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
             registration_gen,
@@ -1165,7 +1190,6 @@ impl ModuleIndex {
             queue,
             resolved,
             workspace_root,
-            refresh_diagnostics: Arc::new(|| {}),
         };
         // Unit nets exercise the seams' retries; production defaults OFF
         // (the server enables at initialize).
@@ -1187,6 +1211,67 @@ impl ModuleIndex {
     }
 
     /// Insert a module directly into the cache (for CLI and testing).
+    /// After indexing completes (cross-file ancestry fully populated),
+    /// MATERIALIZE deferred gated plugin emissions (`GatedEmission`) into each
+    /// cached copy whose gate now resolves cross-file. A DBIC result class's
+    /// column/relationship accessors are recorded but not applied at build
+    /// (the `ClassIsa` trigger can't see the cross-file base, rule #1); this
+    /// pass applies them once the index knows the ancestry, so `whole_present`
+    /// — the view every cross-file goto-def / references reader consults —
+    /// sees them WITHOUT a per-query enriched-overlay hop.
+    ///
+    /// The cheap gate — `gated_emissions` is NOT an eviction axis, so an
+    /// evicted resident copy still carries it — decides whether a file needs
+    /// materializing; the whole (rehydrated) view is only pulled for those.
+    /// The re-registered copy is whole (symbols resident); this is the
+    /// one-shot CLI's deterministic path (re-pinning is harmless when the
+    /// process is about to answer one query and exit). The warm server never
+    /// calls this — it has the enriched-overlay fallback in
+    /// `method_resolution_on_class`. Idempotent (`materialize_gated_emissions`
+    /// dedups against already-present symbols).
+    pub fn materialize_gated_emissions(&self) {
+        let mut updates: Vec<(String, std::path::PathBuf, Arc<FileAnalysis>)> = Vec::new();
+        for entry in self.cache.iter() {
+            let Some(cached) = entry.value() else { continue };
+            if cached.analysis.gated_emissions.is_empty() {
+                continue;
+            }
+            // Rehydrate the whole view (the resident copy may be
+            // symbols-evicted) before appending the synthesized accessors.
+            let whole = crate::file_analysis::CrossFileLookup::whole_present(self, cached);
+            let mut copy = (*whole).clone();
+            copy.materialize_gated_emissions(self);
+            updates.push((entry.key().clone(), cached.path.clone(), Arc::new(copy)));
+        }
+        for (name, path, analysis) in updates {
+            let cm = Arc::new(CachedModule::new(path.clone(), analysis));
+            self.register_materialized_whole(name, path, cm);
+        }
+    }
+
+    /// Re-register a WHOLE (non-stripped) cached copy carrying materialized
+    /// gated emissions. The cache slot routes through `insert_cache` — the
+    /// canonical registration seam — so `edges.feed` publishes the freshly
+    /// synthesized accessors' name records (making them cross-file-visible)
+    /// and the loader-shape / import-gen bookkeeping runs; the path-keyed
+    /// registry pins the whole copy so `whole_present` answers with the
+    /// emissions and no per-query enriched-overlay hop is needed.
+    ///
+    /// WHOLE-COPY residency here is a deliberate, bounded exception (visible
+    /// to `whole_copy_registration_sites_are_allowlisted`): gated emissions
+    /// exist only for plugin-triggered files whose `ClassIsa` gate resolves
+    /// cross-file (sparse by construction), and materialization is
+    /// CLI/batch-only (one-shot startup) — the warm server never calls it.
+    fn register_materialized_whole(
+        &self,
+        name: String,
+        path: std::path::PathBuf,
+        cm: Arc<CachedModule>,
+    ) {
+        self.all_files.insert(path, cm.clone());
+        self.insert_cache(&name, Some(cm));
+    }
+
     pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
         if let Some(ref m) = cached {
             self.edges.feed(module_name, &m.analysis);
@@ -1786,7 +1871,7 @@ impl ModuleIndex {
     /// LRU, degrading to the (evicted) resident copy on a miss rather than
     /// fabricating — the caller's query then answers as it would for a
     /// genuinely fact-less file. One body serves `bag_present` and
-    /// `refs_present`: the miss policy and LRU selection must never diverge
+    /// `whole_present`: the miss policy and LRU selection must never diverge
     /// between the type path and the reference path.
     ///
     /// A miss here is ALWAYS an invariant break in-session: eviction is
@@ -1799,12 +1884,14 @@ impl ModuleIndex {
     /// panics so a run serving absence-as-answer fails loudly instead of
     /// scoring wrong results.
     fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        let mut stage = "no bag cache installed on this index";
+        let mut stage = "no bag cache installed on this index".to_string();
         if let Some(bc) = self.bag_cache_ref() {
-            if let Some(full) = bc.bag_for(&cached.path) {
-                return full;
+            match bc.bag_for_diag(&cached.path) {
+                Ok(full) => return full,
+                // Discriminated cause (see `RehydrateMiss`) so the tripwire
+                // below names the mechanism instead of shrugging.
+                Err(miss) => stage = format!("loader miss: {miss}"),
             }
-            stage = "loader returned None (opener failed / no row / decode failed)";
         }
         // Foreign route: sweeps mint `CachedModule`s from FileStore entries
         // and ask whatever index the query routed to — this index's own
@@ -2145,6 +2232,60 @@ impl ModuleIndex {
                 v.push(spec.clone());
             }
         }
+        // Inverse inheritance edges: parent → child NAMES, so
+        // `direct_children_of` (the INHERITS_INV cross-file leg the
+        // implementations verb walks) can find the subclasses of a base. The
+        // Perl `feed()` path populates `children` via `parent_classes`; the
+        // pack path builds it here (it bypasses `feed`). Symmetric with the
+        // spec map above: the child NAME is a by-name key `get_cached`
+        // resolves, and `direct_children_of` re-checks each candidate's CURRENT
+        // `package_parents`, so a stale entry (an edit dropped a base)
+        // self-heals at read. `package_parents` survives every strip
+        // (`evict_axes` leaves it) and rides the warm-stub skeleton, so the arc
+        // carries it on the fresh, warm, and whole paths alike.
+        for (child, parents) in &analysis.package_parents {
+            for parent in parents {
+                let mut v = self.edges.children.entry(parent.clone()).or_default();
+                if !v.iter().any(|m| m == child) {
+                    v.push(child.clone());
+                }
+            }
+        }
+    }
+
+    /// Claim `path` at source generation `gen` (H9-1). Succeeds — recording
+    /// `gen` — iff `gen >= the generation already registered` (empty ⇒ the
+    /// baseline `i64::MIN`, so a first claim always wins). A tie succeeds so a
+    /// serialized fresh re-registration (the deferred-invalidation reconcile
+    /// running after the bulk index) still lands; only a STRICTLY older
+    /// generation — a re-analysis that read pre-save bytes — is rejected. The
+    /// check-and-update is atomic under the DashMap entry lock, so two racing
+    /// swaps can't both read-then-clobber. Callers that get `false` must NOT
+    /// register: they would revert a fresher copy.
+    pub(crate) fn claim_source_gen(&self, path: &std::path::Path, gen: i64) -> bool {
+        use dashmap::mapref::entry::Entry;
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match self.registered_source_gen.entry(canon) {
+            Entry::Occupied(mut e) => {
+                if gen >= *e.get() {
+                    *e.get_mut() = gen;
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(gen);
+                true
+            }
+        }
+    }
+
+    /// Forget `path`'s source generation (H9-1) — a genuine delete, so a later
+    /// recreation claims from the baseline again.
+    pub(crate) fn forget_source_gen(&self, path: &std::path::Path) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.registered_source_gen.remove(&canon);
     }
 
     /// Remove a pack file's registrations: its `all_files` entry, its
@@ -2474,12 +2615,6 @@ impl CrossFileLookup for ModuleIndex {
         self.get_cached_scoped(module_name, visible)
     }
 
-    fn refs_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        if !cached.analysis.refs_are_evicted() {
-            return cached.analysis.clone();
-        }
-        self.rehydrate_or_resident(cached)
-    }
 
     fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         if cached.analysis.is_fully_resident() {
@@ -2491,6 +2626,16 @@ impl CrossFileLookup for ModuleIndex {
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         self.with_rows_conn(|conn| {
             crate::module_cache::ref_candidate_files(conn, keys)
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    fn ref_indexed_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.with_rows_conn(|conn| {
+            crate::module_cache::paths_with_ref_rows(conn)
                 .into_iter()
                 .map(std::path::PathBuf::from)
                 .collect()

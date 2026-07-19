@@ -145,6 +145,70 @@ sub register {
     );
 }
 
+/// A variable typed in an outer scope (both a plain `my $x = Foo->new`
+/// assignment and a plugin-synthesized route-handler param) keeps its
+/// type when captured by a nested closure body — the scope-chain walk
+/// ascends through the closure boundary. The plugin case additionally
+/// exercises the Mojo::Lite route form with an intermediate
+/// default-values hash between the path and the handler sub
+/// (`any '/x' => {k => ''} => sub ($c) {...}`): the route-decl query's
+/// `@handler` capture must bind the trailing anonymous sub, not the
+/// intervening hash — otherwise the param list is empty and no
+/// controller type is synthesized (H8-1).
+#[test]
+fn closure_captured_typed_variable_survives_into_nested_sub() {
+    // Plain assignment shape: outer `my $x = Foo->new` captured by an
+    // inner `sub { $x->method }`.
+    let plain = r#"
+package Foo;
+sub new { bless {}, shift }
+sub method { return 42 }
+
+package main;
+my $x = Foo->new;
+my $cb = sub {
+    $x->method;
+};
+"#;
+    let fa = build_fa(plain);
+    // `$x` inside the closure body (row 8) resolves to Foo, same as at
+    // its declaration (row 6).
+    for (row, col) in [(6usize, 3usize), (8, 4)] {
+        let ty = fa.inferred_type_via_bag("$x", Point::new(row, col));
+        assert_eq!(
+            ty.and_then(|t| t.class_name().map(str::to_string)),
+            Some("Foo".to_string()),
+            "plain-assignment typed $x should resolve to Foo at {row}:{col}",
+        );
+    }
+
+    // Plugin-synthesized route param, with an intermediate defaults hash
+    // between path and handler — the H8-1 shape.
+    let route = r#"
+use Mojolicious::Lite -signatures;
+
+any '/*whatever' => {whatever => ''} => sub ($c) {
+    $c->render(text => 'ok');
+    my $cb = sub ($err) {
+        $c->render(data => $err, status => 400);
+    };
+};
+"#;
+    let fa = build_fa(route);
+    // `$c` in the outer route body (row 4) and inside the nested
+    // `->catch`-style closure body (row 6) both resolve to the
+    // controller.
+    for (row, col) in [(4usize, 4usize), (6, 8)] {
+        let ty = fa.inferred_type_via_bag("$c", Point::new(row, col));
+        assert_eq!(
+            ty.and_then(|t| t.class_name().map(str::to_string)),
+            Some("Mojolicious::Controller".to_string()),
+            "route-param typed $c should resolve to Mojolicious::Controller at {row}:{col} \
+             (intermediate defaults hash must not steal the @handler capture)",
+        );
+    }
+}
+
 /// The honest boundary: a helper name that is NOT statically decidable —
 /// a function call (`compute()`), or an interpolation over an unknown
 /// variable (`"x_$unknown"`) — synthesizes NOTHING. No guess, no
@@ -516,6 +580,82 @@ fn test_implicit_self_type_inference() {
         InferredType::FirstParam { package } => assert_eq!(package, "Point"),
         other => panic!("expected ClassName or FirstParam, got {:?}", other),
     }
+}
+
+#[test]
+fn test_invocant_class_survives_nested_hash_access() {
+    // A conventional invocant accessed as `$self->{k}` inside a nested block
+    // observes HashRef *there*, but the invocant's ClassName lives on the sub
+    // scope. Identity must dominate the inner-scope rep projection — no
+    // framework needed (Perl method-ness is conventional). Regression: this
+    // returned HashRef, so `$self->` completed a lone hash-key item instead
+    // of the class's methods.
+    let source = "package Widget;\n\
+                  sub new { my $class = shift; bless {}, $class }\n\
+                  sub helper { my ($self) = @_; return 1; }\n\
+                  sub run {\n\
+                  \x20   my ($self) = @_;\n\
+                  \x20   {\n\
+                  \x20       my $x = $self->{flag};\n\
+                  \x20       $self->helper;\n\
+                  \x20   }\n\
+                  }\n";
+    let fa = build_fa(source);
+    // `$self` at the `$self->helper` call (row 7), inside the nested block,
+    // after the `$self->{flag}` read on the previous line.
+    let inferred = fa.inferred_type_via_bag("$self", Point::new(7, 8));
+    match inferred {
+        Some(InferredType::ClassName(name)) => assert_eq!(name, "Widget"),
+        Some(InferredType::FirstParam { package }) => assert_eq!(package, "Widget"),
+        other => panic!("expected Widget class identity, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_invocant_class_survives_nested_hash_access_use_base() {
+    // Same rule for a `use base` class (framework None) — the case Bugzilla's
+    // `use base qw(Bugzilla::Object Exporter)` modules hit.
+    let source = "package Bug;\n\
+                  use base qw(Obj);\n\
+                  sub thing { my ($self) = @_; return 1; }\n\
+                  sub run {\n\
+                  \x20   my ($self) = @_;\n\
+                  \x20   if ($self->{error}) {\n\
+                  \x20       $self->thing;\n\
+                  \x20   }\n\
+                  }\n";
+    let fa = build_fa(source);
+    let inferred = fa.inferred_type_via_bag("$self", Point::new(6, 8));
+    match inferred {
+        Some(InferredType::ClassName(name)) => assert_eq!(name, "Bug"),
+        Some(InferredType::FirstParam { package }) => assert_eq!(package, "Bug"),
+        other => panic!("expected Bug class identity, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_genuine_inner_scope_hashref_binding_still_wins() {
+    // Guard: identity-over-rep defers only a *rep-observation-only* inner
+    // scope. An inner scope that actually BINDS the variable to a hashref
+    // (`my $h = { ... }` in a closure) stays authoritative — `scope_binds_
+    // variable` returns it immediately rather than falling out to any outer
+    // class identity.
+    let source = "package P;\n\
+                  sub run {\n\
+                  \x20   my ($self) = @_;\n\
+                  \x20   my $cb = sub {\n\
+                  \x20       my $h = { a => 1 };\n\
+                  \x20       return $h->{a};\n\
+                  \x20   };\n\
+                  }\n";
+    let fa = build_fa(source);
+    // `$h` at its use (row 5, `return $h->{a}`) is the hashref literal.
+    let inferred = fa.inferred_type_via_bag("$h", Point::new(5, 14));
+    assert!(
+        inferred.as_ref().is_some_and(|t| t.is_hash_shaped()),
+        "an explicit inner-scope hashref binding must stay hash-shaped, got {:?}",
+        inferred
+    );
 }
 
 #[test]
@@ -1070,6 +1210,105 @@ fn test_return_bless_anon_hash_class() {
         Some(InferredType::ClassName("Maker".into())),
         "return bless should type the sub return, got {:?}",
         ty
+    );
+}
+
+#[test]
+fn test_self_hosting_fluent_computed_receiver_not_paren() {
+    // DBIC self-hosting edge: a fluent verb analyzed inside its OWN package
+    // does `(ref $self)->new(...)`. That computed receiver is not a literal
+    // class — before the fix it froze as `ClassName("(")`, so `search` /
+    // `search_rs` reported `raw_return_type: "("`.
+    let src = "\
+package My::ResultSet;
+sub search_rs {
+  my $self = shift;
+  my $rs = (ref $self)->new($self->{attrs});
+  return $rs;
+}
+sub search {
+  my $self = shift;
+  my $rs = $self->search_rs(@_);
+  return $rs;
+}
+";
+    let fa = build_fa(src);
+    for sub in ["search", "search_rs"] {
+        for arity in [None, Some(0u32), Some(1), Some(2)] {
+            let ty = fa.sub_return_type_at_arity(sub, arity);
+            // A `(` is never a type — a plain class name or None is fine.
+            if let Some(InferredType::ClassName(ref c)) = ty {
+                assert!(
+                    crate::conventions::is_bareword_class_name(c),
+                    "{sub} at arity {arity:?} returned garbage ClassName({c:?})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_statement_bless_receiver_types_sub_return() {
+    // The Bugzilla::Object idiom: bless in STATEMENT position with a
+    // receiver-derived class, returned as a separate statement. The sub's
+    // return must type receiver-polymorphically — enclosing class as the
+    // no-receiver fallback.
+    let src = "package Base;\nsub new {\n  my $invocant = shift;\n  my $class = ref($invocant) || $invocant;\n  my $object = $class->_init(@_);\n  bless($object, $class) if $object;\n  return $object;\n}\nsub _init { return {} }\n";
+    let fa = build_fa(src);
+    let ty = fa.sub_return_type_at_arity("new", Some(0));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Base".into())),
+        "statement bless with receiver class should type the ctor return, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_inherited_statement_bless_ctor_types_to_subclass() {
+    // `$class->new` through an inherited statement-bless ctor: the call
+    // site's receiver substitutes, so `$self` types as the SUBCLASS.
+    let src = "package Base;\nsub new {\n  my $class = shift;\n  my $object = {};\n  bless($object, $class);\n  return $object;\n}\n\npackage Kid;\nuse base qw(Base);\nsub check {\n  my ($class) = @_;\n  my $self = $class->new;\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$self", Point::new(13, 9));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Kid".into())),
+        "inherited statement-bless ctor should type to the calling subclass, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_inherited_assignment_bless_ctor_types_to_subclass() {
+    // Same polymorphism through the assignment form
+    // (`my $self = bless {}, $class; return $self`).
+    let src = "package Base;\nsub new {\n  my $class = shift;\n  my $self = bless {}, $class;\n  return $self;\n}\n\npackage Kid;\nuse base qw(Base);\nsub check {\n  my ($class) = @_;\n  my $self = $class->new;\n  return $self;\n}\n";
+    let fa = build_fa(src);
+    let ty = fa.inferred_type_via_bag("$self", Point::new(12, 9));
+    assert_eq!(
+        ty,
+        Some(InferredType::ClassName("Kid".into())),
+        "inherited assignment-bless ctor should type to the calling subclass, got {:?}",
+        ty
+    );
+}
+
+#[test]
+fn test_statement_bless_receiver_pre_bless_query_keeps_rep() {
+    // Temporal honesty: before the bless statement the variable is still
+    // the hashref `_init` returned; only queries PAST the bless see the
+    // class.
+    let src = "package Base;\nsub new {\n  my $class = shift;\n  my $object = {};\n  bless($object, $class);\n  return $object;\n}\n";
+    let fa = build_fa(src);
+    // Point on the `bless` line's variable read is fine — the witness is
+    // at the bless span itself; probe the line BEFORE it.
+    let pre = fa.inferred_type_via_bag("$object", Point::new(3, 14));
+    assert_eq!(
+        pre,
+        Some(InferredType::HashRef),
+        "pre-bless query must keep the rep type, got {:?}",
+        pre
     );
 }
 
@@ -3359,6 +3598,39 @@ fn test_load_components_qw() {
     assert!(parents.contains(&"DBIx::Class::Helper::ResultSet::Me".to_string()));
 }
 
+#[test]
+fn test_load_own_components_prefixes_current_package() {
+    // DBIC's `load_own_components` resolves bare names against the CURRENT
+    // package's namespace, not `DBIx::Class::` — so `Relationship`'s
+    // `load_own_components('CascadeActions')` pulls in
+    // `DBIx::Class::Relationship::CascadeActions`. Without this the composed
+    // mixin is invisible to method resolution / implementations (H7-7).
+    let fa = build_fa(
+        "
+            package DBIx::Class::Relationship;
+            use base 'DBIx::Class';
+            __PACKAGE__->load_own_components(qw(Helpers CascadeActions Base));
+        ",
+    );
+    let parents = fa.package_parents.get("DBIx::Class::Relationship").unwrap();
+    assert!(parents.contains(&"DBIx::Class::Relationship::CascadeActions".to_string()));
+    assert!(parents.contains(&"DBIx::Class::Relationship::Helpers".to_string()));
+    assert!(parents.contains(&"DBIx::Class::Relationship::Base".to_string()));
+}
+
+#[test]
+fn test_load_own_components_plus_prefix_is_fully_qualified() {
+    let fa = build_fa(
+        "
+            package My::Component;
+            __PACKAGE__->load_own_components('+Other::Ns::Thing', 'Local');
+        ",
+    );
+    let parents = fa.package_parents.get("My::Component").unwrap();
+    assert!(parents.contains(&"Other::Ns::Thing".to_string()));
+    assert!(parents.contains(&"My::Component::Local".to_string()));
+}
+
 // ---- Inheritance method resolution tests ----
 
 #[test]
@@ -3379,6 +3651,27 @@ fn test_inherited_method_completion() {
     assert!(names.contains(&"fetch"), "own method");
     assert!(names.contains(&"speak"), "inherited from Animal");
     assert!(names.contains(&"eat"), "inherited from Animal");
+}
+
+#[test]
+fn resolved_class_completion_excludes_anon_subs() {
+    // `*__HM_DEDUP = sub () { 0 }` (DBIx::Class::ResultSet.pm) mints an
+    // anonymous-sub symbol inside the package; a method-completion list on
+    // the RESOLVED class must not offer it — no call can spell `(anon)`.
+    let fa = build_fa(
+        "
+            package Widget;
+            BEGIN { *__HM_DEDUP = sub () { 0 }; }
+            sub spin { }
+        ",
+    );
+    let methods = fa.complete_methods_for_class("Widget", None);
+    let names: Vec<&str> = methods.iter().map(|c| c.label.as_str()).collect();
+    assert!(names.contains(&"spin"), "real method offered");
+    assert!(
+        !names.iter().any(|n| n.contains("(anon)")),
+        "anonymous sub leaked into resolved-class completion: {names:?}"
+    );
 }
 
 #[test]
@@ -4168,6 +4461,148 @@ has app;               # no default; getter has no return type
         }
         other => panic!("getter provenance must be FrameworkSynthesis, got {other:?}"),
     }
+}
+
+/// H7-11: a Mojo `has`-default sub whose body is a `$ENV{X} || <literal>`
+/// (or `//`) fallback must type the getter to the literal's type — the
+/// fallback (RHS) is the guaranteed floor. Pre-fix the two-branch `||`
+/// killed inference and the getter's arity-0 entry vanished entirely.
+#[test]
+fn test_mojo_has_default_or_fallback_types_to_literal() {
+    let fa = build_fa(
+        "
+package My::UA;
+use Mojo::Base -base;
+
+has connect_timeout => sub { $ENV{MOJO_CONNECT_TIMEOUT} || 10 };
+has max_redirects   => sub { $ENV{MOJO_MAX_REDIRECTS} // 5 };
+has ioloop          => sub { My::IOLoop->new };
+",
+    );
+    // `$ENV{X} || 10` → the literal floor is Numeric even though the LHS
+    // env-hash access can't be typed.
+    assert_eq!(
+        fa.sub_return_type_at_arity("connect_timeout", Some(0)),
+        Some(InferredType::Numeric),
+        "|| fallback getter types to the literal floor"
+    );
+    assert_eq!(
+        fa.sub_return_type_at_arity("max_redirects", Some(0)),
+        Some(InferredType::Numeric),
+        "// fallback getter types to the literal floor"
+    );
+    // A non-`||` default (a class constructor) still types to the class —
+    // the fold only kicks in for the short-circuit operators.
+    assert_eq!(
+        fa.sub_return_type_at_arity("ioloop", Some(0)),
+        Some(InferredType::ClassName("My::IOLoop".into())),
+        "class-constructor default is unaffected by the || fold"
+    );
+}
+
+/// H7-12: an arity-discriminated sub whose 1-arg branch is guarded by a
+/// COMPOUND `unless @_ > 1 || ref $_[0]` (the Mojo::DOM::attr shape). Only
+/// the `@_ > 1` disjunct is arity-decidable; the arm fires at arity ≤ 1, so
+/// the fluent `return $self` must NOT claim arity 1. Pre-fix the compound
+/// guard was unclassifiable, the 1-arg arm dropped, and the fluent `Any`
+/// arm wrongly reported the invocant class at arity 1.
+#[test]
+fn test_compound_arity_guard_does_not_leak_fluent_to_arity_one() {
+    let fa = build_fa(
+        "
+package My::DOM;
+use Mojo::Base -base;
+
+sub attr {
+  my $self = shift;
+  my $attrs = { title => 'x' };
+  return $attrs unless @_;
+  return $attrs->{$_[0]} unless @_ > 1 || ref $_[0];
+  $attrs->{$_[0]} = $_[1];
+  return $self;
+}
+",
+    );
+    // arity 0 → the whole hashref (structural shape, not the fluent class).
+    assert!(
+        fa.sub_return_type_at_arity("attr", Some(0))
+            .is_some_and(|t| t.is_hash_shaped()),
+        "0-arg attr returns the attrs hashref, got {:?}",
+        fa.sub_return_type_at_arity("attr", Some(0))
+    );
+    // arity 1 → the hash VALUE (get), never the fluent invocant class. An
+    // honest None is acceptable; ClassName(My::DOM) is the regression.
+    assert_ne!(
+        fa.sub_return_type_at_arity("attr", Some(1)),
+        Some(InferredType::ClassName("My::DOM".into())),
+        "1-arg attr is the getter branch, not the fluent $self branch"
+    );
+    // arity ≥ 2 → the fluent invocant (set).
+    assert_eq!(
+        fa.sub_return_type_at_arity("attr", Some(2)),
+        Some(InferredType::ClassName("My::DOM".into())),
+        "2-arg attr returns the invocant class for fluent chaining"
+    );
+}
+
+/// H7-12 companion: an arity-discriminated sub whose branches all AGREE on
+/// the return type (Path::Tiny::path — every branch yields the invocant
+/// class) must still answer a NO-HINT query with the agreed type. The
+/// arity-union retraction that keeps a genuinely-disagreeing gap honest
+/// (attr) must NOT fire here, or hover on the declaration loses "returns: X".
+#[test]
+fn test_arity_discriminated_all_arms_agree_answers_no_hint() {
+    // `if ( !@_ && ... )` makes this arity-discriminated (a Zero arm), but
+    // both the early-return and the fall-through yield the same class.
+    let fa = build_fa(
+        "
+package My::Path;
+sub path {
+  my $self = shift;
+  return $self if !@_ && ref($self) eq __PACKAGE__;
+  return bless {}, __PACKAGE__;
+}
+",
+    );
+    // No-hint query (what hover uses) must fold across the agreeing arms.
+    assert_eq!(
+        fa.sub_return_type_at_arity("path", None),
+        Some(InferredType::ClassName("My::Path".into())),
+        "all-arms-agree discriminated sub answers the agreed type at no-hint"
+    );
+    // And every concrete arity agrees too — no gap, no leak.
+    for arity in [Some(0u32), Some(1)] {
+        assert_eq!(
+            fa.sub_return_type_at_arity("path", arity),
+            Some(InferredType::ClassName("My::Path".into())),
+            "agreeing arms answer the same type at arity {arity:?}"
+        );
+    }
+}
+
+/// H7-12 companion: the `||`/`//` fold must NOT type a `shift`/`$_[N]`-LHS
+/// param-default idiom (`my $x = shift // ''`). The value is the unknown
+/// parameter, not the fallback literal — typing it `String` poisoned the
+/// arm-join of subs whose narrowed returns depend on the param (the
+/// Mojolicious url_for regression).
+#[test]
+fn test_shift_default_does_not_poison_param_type() {
+    let fa = build_fa(
+        "
+package My::C;
+sub build {
+  my ($self, $target) = (shift, shift // '');
+  return $self;
+}
+",
+    );
+    // `$target` stays open (the param), not the literal's String — so a
+    // downstream arm-join that expects the real arg type isn't poisoned.
+    assert_ne!(
+        fa.inferred_type_via_bag("$target", Point::new(4, 2)),
+        Some(InferredType::String),
+        "shift-default LHS must not brand the param as the fallback literal's type"
+    );
 }
 
 /// Mirror of B1 for Moo `is => 'rw'` writers — same shape, isa-typed
@@ -5321,6 +5756,47 @@ sub test { my $self = shift; $self->$method() }
     assert!(
         !method_refs.is_empty(),
         "dynamic method call should resolve to get_name"
+    );
+}
+
+#[test]
+fn test_hover_dynamic_dispatch_token_vs_chain_head() {
+    // The `$self->$method()` dynamic-dispatch hover must fire on the METHOD
+    // TOKEN (the `$method` variable) but NOT on a plain variable at the head
+    // of a wide chain — a multi-line chain's MethodCall ref spans the whole
+    // expression, so keying on the whole span returned the tail method's POD
+    // for the head invocant (DBIC F2).
+    let src = "\
+package Foo;
+sub get_name { my $self = shift; return $self->{name} }
+my $method = 'get_name';
+sub test { my $self = shift; $self->$method() }
+my $obj = Foo->new;
+my $chain = $obj->get_name->get_name;
+";
+    let fa = build_fa(src);
+
+    // Genuine case: hover on the `$method` token in `$self->$method()`.
+    // Line 3 (0-based): "sub test { my $self = shift; $self->$method() }"
+    // `$method` begins at column 36.
+    let line3 = src.lines().nth(3).unwrap();
+    let mcol = line3.find("$method(").unwrap();
+    let genuine = fa.hover_info(Point::new(3, mcol + 1), src, None);
+    assert!(
+        genuine.as_deref().is_some_and(|h| h.contains("resolved from")),
+        "hover on the dynamic method token should resolve the dispatch, got {:?}",
+        genuine
+    );
+
+    // Regression: hover on `$obj` at the head of the chain must NOT be
+    // attributed to the chain's tail method.
+    let line5 = src.lines().nth(5).unwrap();
+    let ocol = line5.find("$obj->").unwrap();
+    let head = fa.hover_info(Point::new(5, ocol + 1), src, None);
+    assert!(
+        !head.as_deref().unwrap_or("").contains("resolved from"),
+        "hover on the chain-head variable must not borrow the tail method, got {:?}",
+        head
     );
 }
 
@@ -11368,10 +11844,12 @@ mod param_types_manifest {
     /// Enrichment can't help: plugin emit hooks fire at parse time, inside
     /// `build()`, before any module index exists.
     ///
-    /// Architectural gap, NOT a contained fix — documented as a latent
-    /// hazard. See the doc.
+    /// Landed via the `GatedEmission` seam: the build defers the
+    /// syntactically-matched emission (its `ClassIsa` trigger can't see the
+    /// cross-file parent, rule #1), and `enrich_imported_types_with_keys`
+    /// re-fires it once `class_isa_prefix` confirms the ancestry against the
+    /// module index. See `docs/adr/receiver-gated-dispatch.md` (Phase 2).
     #[test]
-    #[ignore = "cross-file ClassIsa trigger: architectural, see docs/prompt-enrichment-inheritance-residual.md"]
     fn probe_class_isa_trigger_through_cross_file_parent() {
         use crate::module_index::ModuleIndex;
         use std::path::PathBuf;
@@ -11399,6 +11877,112 @@ mod param_types_manifest {
         assert_eq!(
             ready, 1,
             "mojo-events ClassIsa trigger should fire via cross-file parent chain"
+        );
+    }
+
+    /// The DBIC flagship shape, TWO cross-file hops: a result class `Leaf`
+    /// extends `Mid` (file 2) which extends `Base` + `DBIx::Class::Core`
+    /// (file 3 chain) — the `DBICTest::Schema::Artist → DBICTest::BaseResult
+    /// → DBIx::Class::Core` idiom. `Leaf`'s `add_columns` / `has_many` are
+    /// syntactically matched at build but the `ClassIsa("DBIx::Class")`
+    /// trigger can't see the cross-file ancestry (rule #1), so the emission
+    /// is DEFERRED. Enrichment re-fires it once `class_isa_prefix` walks
+    /// `Leaf → Mid → DBIx::Class::Core` (prefix hit) through the module
+    /// index. The 1-hop case (direct `use base 'DBIx::Class::Core'`) already
+    /// fired at build; this proves the multi-hop path converges to the same
+    /// synthesis.
+    #[test]
+    fn dbic_class_isa_synthesis_through_two_cross_file_hops() {
+        use crate::module_index::ModuleIndex;
+        use std::path::PathBuf;
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        // File 3-ish: the intermediate base whose OWN parent list carries
+        // `DBIx::Class::Core` (mirrors `DBICTest::BaseResult`'s
+        // `use base qw(DBICTest::Base DBIx::Class::Core)`).
+        idx.insert_cache(
+            "Mid",
+            Some(fake_cached_for_class(
+                "Mid",
+                &PathBuf::from("/fake/Mid.pm"),
+                &[],
+                &["Base", "DBIx::Class::Core"],
+            )),
+        );
+        // Leaf: the result class, two hops from `DBIx::Class`.
+        let src = "package Leaf;\nuse base 'Mid';\n__PACKAGE__->add_columns(qw/id name/);\n__PACKAGE__->has_many(comments => 'Schema::Comment', 'post_id');\n1;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut fa = crate::builder::build(&tree, src.as_bytes());
+        // Nothing synthesized yet — the ClassIsa gate saw only local `Mid`.
+        assert_eq!(
+            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            0,
+            "the relationship accessor must NOT synthesize before enrichment \
+             (the gate can't see cross-file ancestry at build)",
+        );
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        let col = fa.symbols.iter().find(|s| {
+            s.name == "name"
+                && s.kind == SymKind::Method
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "dbic")
+        });
+        assert!(
+            col.is_some(),
+            "the `name` column accessor should synthesize via 2-hop cross-file \
+             DBIx::Class ancestry after enrichment",
+        );
+        let rel = fa.symbols.iter().find(|s| {
+            s.name == "comments"
+                && s.kind == SymKind::Method
+                && matches!(&s.namespace, Namespace::Framework { id } if id == "dbic")
+        });
+        assert!(rel.is_some(), "the `comments` has_many accessor should synthesize");
+        let rt = fa.symbol_return_type_via_bag(rel.unwrap().id, None);
+        assert!(
+            matches!(&rt, Some(InferredType::ClassName(c)) if c == "DBIx::Class::ResultSet"),
+            "has_many accessor must return a ResultSet, got {:?}",
+            rt,
+        );
+        // Idempotent: a second enrichment must not double the accessors.
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        assert_eq!(
+            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            1,
+            "re-enrichment must not stack a second `comments` accessor \
+             (truncate-to-baseline idempotency)",
+        );
+    }
+
+    /// A class with NO cross-file route to `DBIx::Class` must not get DBIC
+    /// synthesis, even though it calls `has_many` syntactically — the gate is
+    /// ancestry, never the call name (rule #10).
+    #[test]
+    fn dbic_synthesis_not_applied_without_ancestry() {
+        use crate::module_index::ModuleIndex;
+        use std::path::PathBuf;
+        let idx = ModuleIndex::new_for_test();
+        idx.set_workspace_root(None);
+        idx.insert_cache(
+            "Mid",
+            Some(fake_cached_for_class(
+                "Mid",
+                &PathBuf::from("/fake/Mid.pm"),
+                &[],
+                &["Some::Unrelated::Base"],
+            )),
+        );
+        let src = "package Leaf;\nuse base 'Mid';\n__PACKAGE__->has_many(comments => 'Schema::Comment');\n1;\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let mut fa = crate::builder::build(&tree, src.as_bytes());
+        fa.enrich_imported_types_with_keys(Some(&idx));
+        assert_eq!(
+            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            0,
+            "no DBIx::Class ancestry ⇒ no synthesis, even with a has_many call",
         );
     }
 

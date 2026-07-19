@@ -469,7 +469,8 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 /// the resident copy drops its witness bag (the dominant share of a CPAN
 /// module's payload; `bag_present` rehydrates through the hub's LRU).
 /// Symbols and refs stay resident this slice — their reader routing for
-/// the import tier is the follow-up in `docs/open-forks.md`. Degraded
+/// the import tier is the follow-up in
+/// `docs/prompt-storage-residuals.md`. Degraded
 /// analyses keep the bag (their rows never persist).
 fn strip_import_copy(
     result: &Option<Arc<CachedModule>>,
@@ -1021,6 +1022,13 @@ pub fn index_workspace_with_index(
             );
         });
 
+        // Force the plugin registry — plugin load AND pattern/flow query
+        // compilation — to initialize once, single-threaded, before
+        // the parallel build below. Otherwise the first `build()` to trigger
+        // the registry's OnceLock stalls every other Rayon worker on it,
+        // charging ~1s of one-time compile to whichever files happen to block.
+        let _ = crate::plugin::default_plugin_registry();
+
         paths.par_iter().for_each(|path| {
             // Blobs are keyed canonical (matches the warm rows + the CLI's
             // canonicalized origin staging); register under the same spelling
@@ -1339,15 +1347,20 @@ pub fn index_pack_languages(
         // decodes the one requested file's full bag.
         let bag_cache = {
             let cache_key_owned = cache_key.map(|s| s.to_string());
-            let loader = move |path: &std::path::Path| -> Option<crate::file_analysis::FileAnalysis> {
-                let conn = module_cache::open_cache_db_readonly(cache_key_owned.as_deref(), lang)?;
+            let loader = move |path: &std::path::Path| {
                 // The blob is persisted under the CANONICAL path (both feed
                 // paths write `canon`), while the resident copy may be
                 // registered under the walk's raw path — canonicalize so the
                 // keyed decode matches regardless of which form the caller holds.
+                // The discriminated helper survives the readonly-open
+                // CANTOPEN/WAL race and names every other miss cause.
                 let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                module_cache::load_one(&conn, &canon.to_string_lossy())
-                    .or_else(|| module_cache::load_one(&conn, &path.to_string_lossy()))
+                let mut spellings = vec![canon.to_string_lossy().into_owned()];
+                let raw = path.to_string_lossy().into_owned();
+                if raw != spellings[0] {
+                    spellings.push(raw);
+                }
+                module_cache::open_and_load_diag(cache_key_owned.as_deref(), lang, &spellings)
             };
             Arc::new(crate::pack_bag_cache::PackBagCache::new(bag_cache_bytes, loader))
         };
@@ -1780,7 +1793,7 @@ fn analyze_stamped<T>(
 /// when a chunk fails to commit (disk full) or panics. The strip is licensed
 /// only by a landed blob, so a fallback keeps copies WHOLE — and a
 /// persistently failing writer would otherwise pin the ENTIRE tree resident
-/// (the docs/open-forks.md "writer fallback budget" residual). Past the cap
+/// (the docs/forks-resolved.md "writer fallback budget" entry). Past the cap
 /// we DROP the resident copy rather than register a stripped one: the chunk
 /// didn't commit, so a stripped copy's blob isn't on disk and could only
 /// rehydrate to wrong-empty. Dropping is honest absence — the file reads as
@@ -1867,6 +1880,64 @@ fn run_persist_writer<E>(
     process(&mut batch);
 }
 
+/// Coordinates watcher invalidations against the INITIAL pack bulk index
+/// (`index_pack_languages`) — H9-2. While that index is in flight the pack
+/// sub-indexes aren't attached to the hub yet, so a `pack_file_changed` would
+/// find no `pack_index` and silently drop the save (and even once attached,
+/// racing the bulk cone re-analyzes it twice, uncoordinated). Instead a save
+/// arriving during the index is DEFERRED into a bounded set (one entry per
+/// distinct path changed during the index) and reconciled ONCE at completion:
+/// the caller re-runs `pack_file_changed` per deferred path against current
+/// disk, and the H9-1 source-generation guard makes that safe — the reconcile
+/// reads the freshest bytes (highest generation) and outranks whatever the
+/// bulk pass registered.
+#[derive(Default)]
+pub struct PackChangeCoordinator {
+    in_flight: std::sync::atomic::AtomicBool,
+    // path -> deleted. A HashMap so repeated saves of one path collapse to a
+    // single reconcile (the reconcile reads current disk regardless).
+    deferred: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
+}
+
+impl PackChangeCoordinator {
+    /// Mark the initial pack index in flight. Call synchronously before the
+    /// index is scheduled so a save racing the scheduling is still deferred.
+    pub fn begin_index(&self) {
+        self.in_flight
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a watched-file change. Returns `true` when the caller should
+    /// DEFER (the index is in flight → the change is queued for reconcile);
+    /// `false` when it should run `pack_file_changed` now. The flag check and
+    /// the queue insert are one critical section with `finish_index`'s clear +
+    /// drain, so a save can never be both dropped from the queue AND skipped by
+    /// the normal path.
+    pub fn note_change(&self, canon: &std::path::Path, deleted: bool) -> bool {
+        let mut q = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if self.in_flight.load(std::sync::atomic::Ordering::Relaxed) {
+            q.insert(canon.to_path_buf(), deleted);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the in-flight flag and drain the deferred set, atomically w.r.t.
+    /// `note_change`. The returned pairs are the paths to reconcile once.
+    pub fn finish_index(&self) -> Vec<(PathBuf, bool)> {
+        let mut q = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        q.drain().collect()
+    }
+
+    #[cfg(test)]
+    pub fn is_in_flight(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// In-session invalidation for a changed (saved/watched) or deleted pack
 /// file — the H1 seam. The include closure is the cross-file visibility
 /// key, so it is also the REVERSE-dependency key: a consumer is any
@@ -1894,6 +1965,20 @@ pub fn pack_file_changed(
     let canon_str = canon.to_string_lossy().into_owned();
     let pack = hub.pack_index(lang);
 
+    // The source generation this invalidation registers under (H9-1): the
+    // changed file's mtime, captured at call time. Every result (the changed
+    // file AND its consumers) is claimed at this generation, so a later save's
+    // invalidation — a strictly greater mtime — outranks it and a straggling
+    // stale re-analysis (a smaller mtime) is rejected at the swap. A delete has
+    // no mtime; use wall-clock now, which is monotone-forward past any prior
+    // save and lets the deletion win.
+    let event_gen = module_cache::file_mtime_nanos(&canon).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(i64::MAX)
+    });
+
     let mut consumers: Vec<PathBuf> = Vec::new();
     // Closures ride along for the Unchanged case: the consumers' persisted
     // deps_stamps must be recomputed (the edited header's mtime moved) or
@@ -1918,6 +2003,7 @@ pub fn pack_file_changed(
         if let Some(ref pack) = pack {
             pack.unregister_file(&canon);
             pack.remove_surface(&canon);
+            pack.forget_source_gen(&canon);
         }
     }
 
@@ -2030,6 +2116,23 @@ pub fn pack_file_changed(
     };
     if let Some(ref pack) = pack {
         for (p, arc) in &results {
+            // H9-1 generation guard: claim BEFORE unregistering, so a rejected
+            // (strictly-older) result leaves the fresher registration intact
+            // rather than tearing it down. A stale re-analysis that read
+            // pre-save bytes loses to nothing — it simply isn't registered, and
+            // the writer that read post-save bytes (or a later save's event)
+            // wins. This also closes hazard 3: an under-invalidated consumer the
+            // bulk pass registered from pre-save bytes carries a lower generation
+            // than the reconcile that reads current disk, so the reconcile wins
+            // and no pre-save bytes are silently served.
+            if !pack.claim_source_gen(p, event_gen) {
+                log::debug!(
+                    "pack swap: skip stale re-register of {:?} (event gen {} < registered)",
+                    p,
+                    event_gen
+                );
+                continue;
+            }
             pack.unregister_file(p);
             // Drop the stale LRU pin BEFORE the new stripped copy becomes
             // reachable — a query racing this re-register must not

@@ -365,6 +365,10 @@ pub enum ArgGuard {
     Empty,
     Exact(u32),
     AtLeast(u32),
+    /// Arity ≤ N — the `unless @_ > N` band (a low-arity getter guard,
+    /// including the compound `unless @_ > N || <non-arity>` where `@_ ≤ N`
+    /// is the sound necessary condition).
+    AtMost(u32),
     Any,
 }
 
@@ -382,6 +386,7 @@ impl ArgGuard {
             (ArgGuard::Empty, Some(0)) => true,
             (ArgGuard::Exact(n), Some(h)) => n == h,
             (ArgGuard::AtLeast(n), Some(h)) => h >= n,
+            (ArgGuard::AtMost(n), Some(h)) => h <= n,
             (ArgGuard::Any, _) => true,
             _ => false,
         }
@@ -582,6 +587,28 @@ impl WitnessBag {
         self.witnesses.retain(|w| match &w.source {
             WitnessSource::Builder(s) => s != tag,
             _ => true,
+        });
+        let removed = before - self.witnesses.len();
+        if removed > 0 {
+            self.rebuild_index();
+        }
+        removed
+    }
+
+    /// Drop `Builder(tag)`-sourced witnesses on ONE attachment. Targeted
+    /// sibling of `remove_by_source_tag`: an arity-discriminated sub retracts
+    /// its own non-arity `return_arm_chain` fallback (so the arity union is
+    /// the authoritative answer) without disturbing any other symbol's
+    /// witnesses.
+    pub fn remove_attachment_source(
+        &mut self,
+        att: &WitnessAttachment,
+        tag: &str,
+    ) -> usize {
+        let before = self.witnesses.len();
+        self.witnesses.retain(|w| {
+            !(&w.attachment == att
+                && matches!(&w.source, WitnessSource::Builder(s) if s == tag))
         });
         let removed = before - self.witnesses.len();
         if removed > 0 {
@@ -952,13 +979,40 @@ impl WitnessReducer for BranchArmFold {
 
     fn reduce(&self, ws: &[&Witness], _q: &ReducerQuery) -> ReducedValue {
         let mut typed: Vec<InferredType> = Vec::new();
+        // `||` / `//` fallback (RHS) arms — the guaranteed floor, tagged with
+        // a distinct source at emission so this fold can prefer them.
+        let mut fallback: Vec<InferredType> = Vec::new();
         let mut undef_arms = 0usize;
         for w in ws {
+            let is_fallback =
+                matches!(&w.source, WitnessSource::Builder(t) if t == "fallback_arm");
             match &w.payload {
+                WitnessPayload::InferredType(t) if is_fallback => fallback.push(t.clone()),
                 WitnessPayload::InferredType(t) => typed.push(t.clone()),
                 WitnessPayload::Fact { family, .. } if family == "undef_arm" => undef_arms += 1,
                 _ => {}
             }
+        }
+        // `||` / `//`: the RHS floor is returned whenever the LHS is
+        // falsy/undef, so the expression's type is at least the fallback's.
+        // Prefer agreement across all known arms; else the known floor; else
+        // the known LHS. This is what lets `$ENV{X} || 10` type to `Numeric`
+        // even when the LHS hash access can't be resolved — an honest,
+        // reachable type beats the entry vanishing.
+        if !fallback.is_empty() {
+            let all: Vec<&InferredType> = typed.iter().chain(fallback.iter()).collect();
+            if let Some((first, rest)) = all.split_first() {
+                if rest.iter().all(|t| *t == *first) {
+                    return ReducedValue::Type((*first).clone());
+                }
+            }
+            if let Some(fb) = fallback.into_iter().next() {
+                return ReducedValue::Type(fb);
+            }
+            if let Some(l) = typed.into_iter().next() {
+                return ReducedValue::Type(l);
+            }
+            return ReducedValue::None;
         }
         // Both arms must have contributed — the ≥2 rule guards a single
         // materialized arm from masquerading as agreement.
@@ -1378,20 +1432,36 @@ impl WitnessReducer for ReturnExprReducer {
         // the class-keyed declarations; `Expr(_)` carries a method body's
         // own deferred return (`sub me { return $_[0] }` → `Receiver` on
         // the `$_[0]` body span), reached through the `SymbolReturnArm`
-        // edge chase. Claiming all three lets a self-returning method
-        // substitute the call's receiver at arbitrary chain depth.
+        // edge chase; `Variable{..}` carries a statement-position
+        // receiver bless (`bless $obj, $class; ...; return $obj` — the
+        // deferred class rides the VARIABLE so the return-arm chase
+        // substitutes the call site's receiver). Claiming all four lets a
+        // self-returning method substitute the call's receiver at
+        // arbitrary chain depth.
         matches!(
             w.attachment,
             WitnessAttachment::Symbol(_)
                 | WitnessAttachment::MethodOnClass { .. }
                 | WitnessAttachment::Expr(_)
+                | WitnessAttachment::Variable { .. }
         ) && matches!(w.payload, WitnessPayload::ReturnExpr(_))
     }
 
     fn reduce(&self, ws: &[&Witness], q: &ReducerQuery) -> ReducedValue {
         // Highest-priority source wins; ties resolve to latest-pushed.
+        // Variable-attached witnesses are temporal like the framework
+        // fold: a bless mid-body types the variable only PAST the bless
+        // site — a query before it keeps the rep answer (HashRef pre-,
+        // instance post-bless).
+        let temporal_gate = |w: &&Witness| match (&w.attachment, q.point) {
+            (WitnessAttachment::Variable { .. }, Some(p)) => {
+                let s = w.span.start;
+                (s.row, s.column) <= (p.row, p.column)
+            }
+            _ => true,
+        };
         let mut best: Option<(&Witness, u8)> = None;
-        for w in ws.iter().rev() {
+        for w in ws.iter().rev().filter(|w| temporal_gate(w)) {
             let pr = w.source.priority();
             match best {
                 None => best = Some((*w, pr)),
@@ -2124,7 +2194,8 @@ impl ReducerRegistry {
                                 _ => scope_point(ctx.scopes, *scope),
                             };
                             self.query_variable_with_visited(
-                                bag, ctx, name, *scope, point, state,
+                                bag, ctx, name, *scope, point,
+                                q.receiver.as_ref(), state,
                             )
                         }
                         _ => {
@@ -2218,7 +2289,8 @@ impl ReducerRegistry {
                         (WitnessAttachment::Variable { name, scope }, Some(ctx)) => {
                             let point = scope_point(ctx.scopes, *scope);
                             self.query_variable_with_visited(
-                                bag, ctx, name, *scope, point, state,
+                                bag, ctx, name, *scope, point,
+                                q.receiver.as_ref(), state,
                             )
                         }
                         _ => {
@@ -2324,6 +2396,7 @@ impl ReducerRegistry {
         var: &str,
         scope: ScopeId,
         point: Point,
+        receiver: Option<&InferredType>,
         state: &mut QueryState,
     ) -> Option<InferredType> {
         let chain = crate::file_analysis::scope_chain_of(ctx.scopes, scope);
@@ -2332,6 +2405,18 @@ impl ReducerRegistry {
             .find_map(|sid| ctx.scopes[sid.0 as usize].package.as_ref())
             .and_then(|pkg| ctx.package_framework.get(pkg).copied())
             .unwrap_or(FrameworkFact::Plain);
+        // A scope that only OBSERVES rep use of the variable (`$self->{k}`
+        // inside a nested block → HashRefAccess) yields a bare `HashRef`,
+        // but the variable's identity — an invocant's ClassName seeded on
+        // the sub scope — lives further out the chain. Class identity
+        // anywhere dominates such a rep-only projection: the same
+        // identity-over-rep rule `FrameworkAwareTypeFold` applies within a
+        // scope, lifted across the scope walk. A scope that actually BINDS
+        // the variable (explicit type / edge / class-or-bless observation)
+        // is authoritative and returned immediately, so genuine shadowing
+        // (`my $x = {}`) still wins. Defer the weak answer until the chain
+        // is exhausted.
+        let mut weak: Option<InferredType> = None;
         for sid in chain {
             let att = WitnessAttachment::Variable {
                 name: var.to_string(),
@@ -2342,16 +2427,57 @@ impl ReducerRegistry {
                 point: Some(point),
                 framework,
                 arity_hint: None,
-                receiver: None,
+                // Threaded from the chasing query so a deferred
+                // `ReturnExpr::ReceiverOr` on the variable (a statement-
+                // position `bless $obj, $class`) substitutes the CALL
+                // SITE's class — the hop that makes an inherited
+                // `$class->new; ...; return $object` ctor type to the
+                // subclass it was called on.
+                receiver: receiver.cloned(),
                 args: Vec::new(),
                 context: Some(ctx),
             };
             if let ReducedValue::Type(t) = &*self.query_rec(bag, &q, state) {
-                return Some(t.clone());
+                let t = t.clone();
+                if t.class_name().is_some() || scope_binds_variable(bag, var, sid, point) {
+                    return Some(t);
+                }
+                if weak.is_none() {
+                    weak = Some(t);
+                }
             }
         }
-        None
+        weak
     }
+}
+
+/// Does this scope *bind* the variable — establish its value/identity via
+/// an explicit type, an assignment edge, or a class/bless observation — as
+/// opposed to merely OBSERVING rep use (`$v->{k}` → `HashRefAccess`)? A
+/// binding scope's reduced type is authoritative; a rep-only scope's is a
+/// weak projection an outer class identity dominates (see the caller). A
+/// binding after the query point doesn't count. New value-carrying payload
+/// variants count as bindings by default — only the bare rep/scalar
+/// observations are the weak case.
+fn scope_binds_variable(bag: &WitnessBag, var: &str, scope: ScopeId, point: Point) -> bool {
+    let att = WitnessAttachment::Variable {
+        name: var.to_string(),
+        scope,
+    };
+    bag.for_attachment(&att).iter().any(|w| {
+        w.span.start <= point
+            && !matches!(
+                &w.payload,
+                WitnessPayload::Observation(
+                    TypeObservation::HashRefAccess
+                        | TypeObservation::ArrayRefAccess
+                        | TypeObservation::CodeRefInvocation
+                        | TypeObservation::NumericUse
+                        | TypeObservation::StringUse
+                        | TypeObservation::RegexpUse
+                )
+            )
+    })
 }
 
 /// Pick the "where am I asking from?" `Point` for a scope-chained
@@ -2597,7 +2723,7 @@ pub fn query_variable_type(
 ) -> Option<InferredType> {
     let reg = ReducerRegistry::with_defaults();
     let mut state = QueryState::new();
-    reg.query_variable_with_visited(bag, ctx, var, scope, point, &mut state)
+    reg.query_variable_with_visited(bag, ctx, var, scope, point, None, &mut state)
 }
 
 /// Fold `KeyWrite`s into variable shape witnesses — the mutation-

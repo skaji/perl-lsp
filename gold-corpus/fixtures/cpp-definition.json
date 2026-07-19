@@ -1495,6 +1495,42 @@
         "none": []
       },
       "status": "xfail"
+    },
+    {
+      "id": "c-cross-tu-call-ranks-def-above-header-prototype",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "The redis/curl C-tier defect: goto-def on a C free-function call (c_combine in capp.c) whose only visible declaration is a header PROTOTYPE (cjoin.h, reached via capp.c's include closure) must rank the bodied DEFINITION in the defining TU (cjoin.c) FIRST, prototype kept. capp.c never #includes cjoin.c textually — the def's TU includes the shared header the caller resolved to, so the decl→def hunt links them through that waypoint (docs/adr/resolution-candidate-set.md, 'decl→def ranking'). Before the fix the call stopped at the prototype (lookupKeyReadOrReply → server.h, addReplyBulk → server.h).",
+      "file": "cmultitu/capp.c",
+      "line": 2,
+      "col": 9,
+      "expect": {
+        "all": [
+          "cjoin.c:2:5\ncjoin.h:3:5"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-cross-tu-free-fn-call-ranks-def-above-prototype",
+      "difficulty": "moderate",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "The fmt-style C++ mirror of the C decl→def row: an unqualified free-function call (rpt::report_error from inside namespace rpt in reportcaller.cc) resolves to the bodied DEFINITION (report_inl.h) FIRST, header prototype (report.h) kept. The same mechanism as the C row — the fix is not language-gated (rule #10); C++ free-function decl→def rides the identical decl-connectivity clause and keeps landing on definitions.",
+      "file": "cppmultitu/reportcaller.cc",
+      "line": 3,
+      "col": 2,
+      "expect": {
+        "all": [
+          "report_inl.h:3:6\nreport.h:4:6"
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

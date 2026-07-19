@@ -2332,3 +2332,76 @@ sub tag  { my $self = shift; return $self->{name}; }
         assert_eq!(*s, want, "inherited field converges on the declaring parent subject");
     }
 }
+
+/// A cross-file return-type cycle must terminate fast: `A::foo` returns a
+/// chained call whose type flows through `B`, and `B::bar` returns a
+/// chained call whose type flows back through `A`. Before the occurs
+/// check on the `expr_type_at_span` ⇄ `method_call_return_type_via_bag`
+/// pair this spun for minutes (the registry guards each single query, but
+/// the receiver chase mints a fresh query per FA hop, so the cross-file
+/// cycle re-entered unbounded). The guard makes a node already on the
+/// active resolution stack answer None instead of recursing.
+#[test]
+fn test_cross_file_return_type_cycle_terminates() {
+    use crate::module_index::ModuleIndex;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    // `foo`'s return is the chained call `$b->bar->foo` (receiver is
+    // itself a method call → exercises the FA-level mutual recursion, not
+    // just the registry's internal guard). `bar` symmetrically returns
+    // `$a->foo->bar`, closing the cross-file cycle.
+    let a = build_fa_from_source(
+        r#"
+        package A;
+        sub new { return bless {}, shift }
+        sub foo {
+            my $self = shift;
+            my $b = B->new;
+            return $b->bar->foo;
+        }
+        1;
+        "#,
+    );
+    let b = build_fa_from_source(
+        r#"
+        package B;
+        sub new { return bless {}, shift }
+        sub bar {
+            my $self = shift;
+            my $a = A->new;
+            return $a->foo->bar;
+        }
+        1;
+        "#,
+    );
+
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(std::path::PathBuf::from("/tmp/B.pm"), Arc::new(b));
+
+    // The outer `->foo` MethodCall in A whose receiver is the chain
+    // `$b->bar` — resolving its return type walks straight into the cycle.
+    let (foo_call_idx, _) = a
+        .refs
+        .iter()
+        .enumerate()
+        .find(|(_, r)| {
+            r.target_name == "foo" && matches!(r.kind, RefKind::MethodCall { .. })
+        })
+        .expect("chained `$b->bar->foo` emits a MethodCall ref for `foo`");
+
+    let start = Instant::now();
+    let ty = a.method_call_return_type_via_bag(foo_call_idx, Some(&idx));
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cross-file return-type cycle should short-circuit, took {elapsed:?}",
+    );
+    // Sane answer: either unresolved (cycle broken → None) or a concrete
+    // class — never a hang, never a panic.
+    assert!(
+        ty.is_none() || ty.as_ref().and_then(|t| t.class_name_lenient()).is_some(),
+        "expected None or a class type from the cycle, got {ty:?}",
+    );
+}

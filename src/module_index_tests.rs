@@ -39,7 +39,7 @@ fn bag_present_rehydrates_evicted_at_both_caps() {
         // Loader hands back the FULL analysis (as SQLite would after decode).
         let full_for_loader = full.analysis.clone();
         let cache = Arc::new(PackBagCache::new(cap, move |_p| {
-            Some((*full_for_loader).clone())
+            Ok((*full_for_loader).clone())
         }));
         let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
         let got = idx.bag_present(&stripped_cached);
@@ -461,6 +461,91 @@ fn unregister_file_removes_defs_and_repicks_winner() {
     assert!(idx.get_cached("Box").is_none(), "no survivors: slot removed");
 }
 
+/// H9-1 source-generation guard: a claim succeeds iff its generation is ≥ the
+/// one already registered, so a stale re-analysis (built from pre-save bytes →
+/// a lower generation) can never revert a fresher registration, while a
+/// serialized fresh re-registration (an equal-generation reconcile) still lands.
+#[test]
+fn claim_source_gen_orders_by_generation() {
+    let idx = ModuleIndex::new_for_test();
+    let p = std::path::Path::new("/fake/gen.cpp");
+    // First claim wins from the baseline.
+    assert!(idx.claim_source_gen(p, 5));
+    // Strictly-older is REJECTED (the stale-winner race).
+    assert!(!idx.claim_source_gen(p, 3));
+    // Equal generation ties succeed (the reconcile running after the bulk pass).
+    assert!(idx.claim_source_gen(p, 5));
+    // Newer wins and advances the watermark.
+    assert!(idx.claim_source_gen(p, 9));
+    assert!(!idx.claim_source_gen(p, 8));
+    // A different path is independent.
+    let q = std::path::Path::new("/fake/other.cpp");
+    assert!(idx.claim_source_gen(q, 1));
+    assert!(idx.claim_source_gen(p, 10));
+    // Forget resets to the baseline — a recreated file claims cleanly.
+    idx.forget_source_gen(p);
+    assert!(idx.claim_source_gen(p, 1));
+}
+
+/// The guard applied at the `pack_file_changed` swap: a re-analysis whose event
+/// generation is OLDER than the one registered leaves the fresher registration
+/// untouched (H9-1). Simulated by pre-claiming the max generation, so the real
+/// (mtime-derived) event generation of the edit loses.
+#[cfg(feature = "cpp")]
+#[test]
+fn pack_swap_skips_stale_generation() {
+    let dir = std::env::temp_dir().join(format!("pack-gen-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hdr = dir.join("box.h");
+    let tu = dir.join("use.cpp");
+    std::fs::write(&hdr, "class Box { public: int width() { return 1; } };\n").unwrap();
+    std::fs::write(
+        &tu,
+        "#include \"box.h\"\nint f() { Box b; return b.width(); }\n",
+    )
+    .unwrap();
+
+    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let driver = reg.for_id("cpp").expect("cpp driver");
+    let hub = ModuleIndex::new_for_test();
+    let pack = Arc::new(ModuleIndex::new_for_test());
+    hub.attach_pack_index("cpp", pack.clone());
+    for p in [&hdr, &tu] {
+        let src = std::fs::read_to_string(p).unwrap();
+        pack.register_symbols(p.clone(), Arc::new(driver.analyze_with_path(&src, Some(p))));
+    }
+    let canon_hdr = std::fs::canonicalize(&hdr).unwrap();
+    let canon_tu = std::fs::canonicalize(&tu).unwrap();
+    let arc_of = |path: &std::path::Path| {
+        let mut found = None;
+        pack.for_each_registered_file(&mut |cm| {
+            if cm.path == path {
+                found = Some(Arc::as_ptr(&cm.analysis) as usize);
+            }
+        });
+        found.expect("registered")
+    };
+    let hdr_before = arc_of(&canon_hdr);
+    let tu_before = arc_of(&canon_tu);
+
+    // A fresher writer already claimed the maximum generation for both paths.
+    assert!(pack.claim_source_gen(&canon_hdr, i64::MAX));
+    assert!(pack.claim_source_gen(&canon_tu, i64::MAX));
+
+    // A cross-file-visible edit whose event generation (mtime) is < MAX must be
+    // rejected at the swap — the stale re-analysis loses to nothing.
+    std::fs::write(
+        &hdr,
+        "class Box { public: int width() { return 2; } int height() { return 3; } };\n",
+    )
+    .unwrap();
+    crate::module_resolver::pack_file_changed(None, &hub, &hdr, false);
+    assert_eq!(arc_of(&canon_hdr), hdr_before, "stale header re-register skipped");
+    assert_eq!(arc_of(&canon_tu), tu_before, "stale consumer re-register skipped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A changed file re-registers via unregister-then-register (the
 /// `pack_file_changed` swap): names its new version no longer defines
 /// must not linger in any view.
@@ -517,7 +602,7 @@ fn register_symbols_stripping_feeds_before_evict() {
     // whole_present rehydrates symbols through the LRU.
     let full_for_loader = full.analysis.clone();
     let cache = std::sync::Arc::new(PackBagCache::new(1024 * 1024, move |_p| {
-        Some((*full_for_loader).clone())
+        Ok((*full_for_loader).clone())
     }));
     let idx2 = ModuleIndex::new_for_cli().with_bag_cache(cache);
     let whole = idx2.whole_present(&hit);
@@ -1057,7 +1142,11 @@ fn foreign_path_rehydrates_through_the_owning_sibling() {
     hub.set_bag_cache(Arc::new(crate::pack_bag_cache::PackBagCache::new(
         128 * 1024 * 1024,
         move |p: &std::path::Path| {
-            (p == std::path::Path::new("/fake/hub/Ghost.pm")).then(|| (*served).clone())
+            if p == std::path::Path::new("/fake/hub/Ghost.pm") {
+                Ok((*served).clone())
+            } else {
+                Err(crate::module_cache::RehydrateMiss::NoRow)
+            }
         },
     )));
 

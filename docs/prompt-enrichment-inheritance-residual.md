@@ -13,19 +13,20 @@ The short verdict:
   optimize the common path; the `query_rec` structural fallback is the
   floor for any FA that skipped enrichment.
 
-- **Plugin EMISSION gated on the class's ancestry** (`ClassIsa` triggers;
-  `param_types` `in_role`) is **NOT cross-file aware**, and can't be
-  without changing the index-free-builder contract (rule #1). Latent
-  hazard, documented, deferred.
+- **Plugin EMISSION gated on the class's ancestry** — both axes now landed.
+  `param_types` `in_role` rides the `ReceiverGated` query seam;
+  the **`ClassIsa` trigger** axis (H7-5) rides the `GatedEmission` deferral:
+  the build records the syntactically-matched-but-ungated emission and
+  enrichment re-fires it once `class_isa_prefix` resolves the ancestry
+  cross-file (plus `ModuleIndex::materialize_gated_emissions` so cross-file
+  readers see it through `whole_present`). See "The `ClassIsa` trigger axis"
+  below and `docs/open-forks.md` (Cross-file gated-emission visibility).
 
 - **Dispatch-verb promotion in non-open files** WAS a real gap caused by
   the resolver lifecycle (only OPEN documents enriched). **Landed:** the
   `ReceiverGated<DispatchCandidate>` seam resolves the receiver isa-check at
   query time (`docs/adr/receiver-gated-dispatch.md`), so call sites in non-
   open workspace/dependency files surface like open ones.
-
-Two `#[ignore]`-d failing repros pin the two real gaps
-(`builder_tests.rs::param_types_manifest::probe_*`).
 
 ---
 
@@ -48,33 +49,42 @@ cross-file/isa-based already, or (iii) BROKEN.
 
 Several bundled plugins fire on `ClassIsa` triggers (mojo-events
 `Mojo::EventEmitter`, minion `Minion`, mojo-helpers / mojo-routes
-`Mojolicious`, …). `PluginRegistry::applicable` (`plugin/mod.rs:991`)
+`Mojolicious`, …). `PluginRegistry::applicable` (`plugin/mod.rs:1460`)
 matches the trigger against the `parents` list, which the builder fills
-from `transitive_parents` — **local `package_parents` only**
-(`builder.rs:2121`, `:2175`, `:2200`).
+from `transitive_parents` (`builder.rs:3140`) — **local `package_parents`
+only** — at the dispatch sites (`builder/pattern_dispatch.rs:302`, `:543`).
 
-Consequence: a class whose trigger-class ancestry is established
-cross-file does NOT get the plugin's emit hooks. E.g. `package Leaf; use
+Consequence WAS: a class whose trigger-class ancestry is established
+cross-file did NOT get the plugin's emit hooks. E.g. `package Leaf; use
 parent 'Mid';` where `Mid` (another file) extends `Mojo::EventEmitter` —
-`$self->on('ready', …)` in `Leaf` synthesizes no Handler symbol, because
-the `ClassIsa("Mojo::EventEmitter")` trigger sees only `Mid`.
+`$self->on('ready', …)` in `Leaf` synthesized no Handler symbol, because
+the `ClassIsa("Mojo::EventEmitter")` trigger saw only `Mid`. The DBIC
+flagship: `Result::* → DBICTest::BaseResult → DBIx::Class::Core`, dark for
+49/54 of DBIC's own test schema.
 
-Confirmed by `probe_class_isa_trigger_through_cross_file_parent` (FAILS).
+**Landed (H7-5) via `GatedEmission`.** Plugin PATTERN emit runs at PARSE
+TIME inside `build()`, index-free (rule #1) — so a pattern whose `ClassIsa`
+trigger doesn't fire against LOCAL `transitive_parents` no longer drops its
+`on_match` output. The build runs `on_match` anyway, translates the
+symbol/ref emissions to file-analysis-native `GatedSymbol`/`GatedRef`, and
+records a `GatedEmission` tagged with the unfired `ClassIsa` prefixes
+(`file_analysis::GatedEmission`; recorded in `builder/pattern_dispatch.rs`).
+Two index-aware consumers re-fire it, both idempotent (truncate-to-baseline
+/ dedup) and deterministic (gate = `class_isa_prefix`, the single MRO seam):
 
-**Why it can't be a contained fix.** Plugin emit hooks (`on_method_call`,
-`on_function_call`, `on_use`) run at PARSE TIME inside `build()`, where the
-builder is index-free by rule #1. There is no module index to consult
-mid-walk, and even if one were threaded in, indexing order isn't
-guaranteed (the dependency carrying `Mojo::EventEmitter` may not be indexed
-yet). The `dispatch_verbs` path answers this by deferring the receiver
-isa-check to QUERY time (the `ReceiverGated` seam, `applicable_dispatches`),
-which owns the module index. Making `ClassIsa` cross-file-aware is the same
-move for *emission*: a gated producer resolved post-index. Phase 2 mints it
-on the same seam — see `docs/adr/receiver-gated-dispatch.md`.
+- `enrich_imported_types_with_keys` (`apply_gated_emissions`) — OPEN docs +
+  the `--dump-package` / diagnostics enriched overlay.
+- `ModuleIndex::materialize_gated_emissions` (post-index, `cli_full_startup`
+  / `--batch`) — applies into the whole cached copy so cross-file goto-def /
+  references see it via `whole_present` (the enriched-overlay per-query
+  fallback was tried and reverted — it re-entered enrichment per hop and
+  overflowed the stack; see `docs/open-forks.md`).
 
-The in-file case composes correctly today
+The in-file case composes as before
 (`plugin_mojo_events_triggers_through_transitive_parent` — Mid + Leaf same
-file). It's strictly the cross-file ancestry that's missed.
+file). The residual (real-corpus `->cds` call-site invocant typing through
+the resultset source-name chain) is out of the ClassIsa scope — see the
+fork ledger.
 
 ---
 
@@ -138,24 +148,24 @@ payload unreadable without the isa filter (`docs/adr/receiver-gated-dispatch.md`
   walk). The structural `query_rec` fallback is the deliberate floor for
   enrichment-bypassing callers.
 
-- **Latent hazard (deferred):** cross-file `ClassIsa`-trigger emission and
-  `param_types` `in_role` via a cross-file ancestor. Both stem from
-  `transitive_parents` being local-only, which is forced by the
-  index-free-builder contract. Fixing means moving emit-hook firing into a
-  post-index pass — the same migration `dispatch_verbs` already made.
-
 - **Landed:** dispatch-verb resolution in non-open files, via the
-  query-time `ReceiverGated` seam (`docs/adr/receiver-gated-dispatch.md`).
-  References-to-handler and dispatch goto-def now reach call sites in
-  unenriched workspace/dependency files.
+  query-time `ReceiverGated` seam (`docs/adr/receiver-gated-dispatch.md`);
+  `param_types` `in_role` cross-file, on the same seam; and cross-file
+  `ClassIsa`-trigger emission (H7-5), via the `GatedEmission` deferral +
+  post-index `materialize_gated_emissions`. All three moved the
+  ancestry check off the index-free build onto a post-index / query seam.
 
 ## Repros
 
 `src/builder_tests.rs`:
 
 - `param_types_manifest::probe_class_isa_trigger_through_cross_file_parent`
-  — `#[ignore]`, FAILS. Cross-file `ClassIsa` trigger. STILL OPEN; Phase 2
-  mints this on the same `ReceiverGated` seam.
+  — PASSES (un-ignored). Cross-file `ClassIsa` trigger, now green via the
+  `GatedEmission` deferral.
+- `param_types_manifest::dbic_class_isa_synthesis_through_two_cross_file_hops`
+  / `dbic_synthesis_not_applied_without_ancestry` — PASS. The DBIC 2-hop
+  flagship: synthesis fires through `A → B → DBIx::Class::Core` and is
+  correctly withheld from a class with no `DBIx::Class` ancestry.
 - `param_types_manifest::dispatch_resolves_query_time_in_unenriched_workspace_file`
   — PASSES (un-ignored). The dispatch gap's acceptance test, now green via
   query-time gated resolution.

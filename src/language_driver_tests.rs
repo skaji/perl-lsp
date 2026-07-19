@@ -54,6 +54,27 @@ fn cpp_deprecated_attribute_macro_signals_the_recovered_class() {
 
 #[cfg(feature = "cpp")]
 #[test]
+fn cpp_include_guard_define_is_hidden_from_outline_but_resolvable() {
+    // `#ifndef X` / `#define X` include guards are compilation plumbing —
+    // folded from outline / workspace-symbol, but the symbol survives so
+    // goto-def / references still resolve (rule #7).
+    let src = "#ifndef FOO_BAR_H_\n#define FOO_BAR_H_\nint real_thing;\n#endif\n";
+    let fa = cpp_driver().analyze(src);
+    let guard = fa.symbols.iter().find(|s| s.name == "FOO_BAR_H_")
+        .expect("guard symbol still exists (resolvable)");
+    assert!(guard.hidden_in_outline(), "include guard hidden from listing views");
+    assert!(guard.attributes.iter().any(|a| a == "include_guard"),
+        "guard carries the value-borne marker: {:?}", guard.attributes);
+    // A non-guard object-like macro stays visible.
+    let src2 = "#define MAXLEN 100\nint real_thing;\n";
+    let fa2 = cpp_driver().analyze(src2);
+    if let Some(m) = fa2.symbols.iter().find(|s| s.name == "MAXLEN") {
+        assert!(!m.hidden_in_outline(), "a plain object-like macro is NOT hidden");
+    }
+}
+
+#[cfg(feature = "cpp")]
+#[test]
 fn registry_serves_cpp_when_enabled() {
     let reg = LanguageRegistry::with_enabled();
     assert!(reg.languages().contains(&"cpp"));
@@ -597,6 +618,22 @@ fn implicit_field_read_pass_gated_by_pack_capability() {
         "python: a bare name is never self.field");
     assert!(crate::query_extract::cpp_pack().implicit_this_members,
         "cpp: methods read members with implicit this->");
+
+    // Include-token capability: only C/C++ has `#include`-style path tokens;
+    // name-keyed-import languages answer false, so goto-def / references gate
+    // on the pack, never a language name.
+    assert!(crate::query_extract::cpp_pack().include_path_tokens,
+        "cpp: #include path tokens resolve to headers");
+    assert!(!crate::query_extract::python_pack().include_path_tokens,
+        "python: imports are name-keyed, no path tokens");
+
+    // Preprocessor capability: only C/C++ has `#define` macros; other packs
+    // answer false, so macro completion gates on the pack, never a language
+    // name.
+    assert!(crate::query_extract::cpp_pack().preprocessor_macros,
+        "cpp: #define macros are a completion surface");
+    assert!(!crate::query_extract::python_pack().preprocessor_macros,
+        "python: no C preprocessor");
 }
 
 // Implicit-`this` sibling method CALLs — the call half of the same
@@ -667,4 +704,210 @@ struct Gadget { void run() { helper(); } };\n";
     let (mut fa_off, sites2) = build();
     emit_return_fuel(&mut fa_off, &sites2, false);
     assert_eq!(pin_of(&fa_off, "paint"), Some(None), "capability off → no sibling-call pin");
+}
+
+// H7-13: a CLASS FIELD used as a member-access receiver must type to its
+// declared class, exactly like a function PARAMETER receiver does — the
+// asymmetry that made `iter_->` dump the in-scope grab-bag while `iter->`
+// (a param) narrowed. A C++ data member is visible class-wide regardless of
+// declaration order, so a field declared in a `private:` section BELOW the
+// method that reads it must still resolve (the witness-bag temporal filter,
+// correct for sequential locals, must not reject a class-wide member).
+#[cfg(feature = "cpp")]
+#[test]
+fn h13_field_receiver_types_like_param_receiver() {
+    use crate::file_analysis::{InferredType, RefKind};
+    let src = "\
+class Iterator { public: int value(); };\n\
+class DBIter : public Iterator {\n\
+ public:\n\
+  DBIter(Iterator* iter) : iter_(iter) {}\n\
+  int value() const override { return iter_->value(); }\n\
+  int b(Iterator* p) const { return p->value(); }\n\
+ private:\n\
+  Iterator* const iter_;\n\
+};\n";
+    let fa = cpp_driver().analyze(src);
+    let recv_ty = |name: &str, row: usize| -> Option<InferredType> {
+        let r = fa.refs.iter().find(|r| {
+            matches!(r.kind, RefKind::Variable) && r.target_name == name && r.span.start.row == row
+        })?;
+        fa.expr_type_at_span(r.span, None)
+    };
+    // The field receiver `iter_` (declared line 8, read line 5 — decl BELOW
+    // the read) types to its class, matching the param receiver `p`.
+    assert_eq!(
+        recv_ty("iter_", 4),
+        Some(InferredType::ClassName("Iterator".into())),
+        "field receiver types to its declared class regardless of decl order",
+    );
+    assert_eq!(
+        recv_ty("p", 5),
+        Some(InferredType::ClassName("Iterator".into())),
+        "param receiver control: unchanged",
+    );
+}
+
+// The completion-slot end-to-end: `iter_->|` detects a Member slot whose
+// receiver resolves to the field's class, so the narrowed member list (not
+// the in-scope grab-bag) is served. Drives `detect_slot` — the same entry
+// backend completion uses.
+#[cfg(feature = "cpp")]
+#[test]
+fn h13_field_receiver_member_slot_resolves() {
+    use crate::cursor_slot::{detect_slot, Slot};
+    // Cursor point right after `marker` in `src` (byte offset → Point).
+    let point_after = |src: &str, marker: &str| -> tree_sitter::Point {
+        let byte = src.find(marker).unwrap() + marker.len();
+        let mut row = 0;
+        let mut col = 0;
+        for (i, ch) in src.char_indices() {
+            if i == byte {
+                break;
+            }
+            if ch == '\n' {
+                row += 1;
+                col = 0;
+            } else {
+                col += ch.len_utf8();
+            }
+        }
+        tree_sitter::Point::new(row, col)
+    };
+    let member_class = |src: &str, marker: &str| -> Option<String> {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let fa = cpp_driver().analyze(src);
+        let detected = detect_slot(&fa, &tree, src, point_after(src, marker), "cpp", None);
+        match detected.slot {
+            Slot::Member { receiver, .. } => receiver
+                .receiver_type
+                .as_ref()
+                .and_then(|t| t.class_name())
+                .map(str::to_string),
+            other => panic!("expected Member slot for `{marker}`, got {other:?}"),
+        }
+    };
+    // Pointer field receiver `iter_->|value()`.
+    let src = "\
+class Iterator { public: int value(); };\n\
+class DBIter : public Iterator {\n\
+  int value() const override { return iter_->value(); }\n\
+  Iterator* const iter_;\n\
+};\n";
+    assert_eq!(
+        member_class(src, "iter_->").as_deref(),
+        Some("Iterator"),
+        "pointer-field receiver's Member slot resolves to the field's class",
+    );
+    // Value field receiver `options_.|n` narrows the same way (dot access).
+    let src2 = "\
+struct Options { int n; };\n\
+struct RE {\n\
+  int f() const { return options_.n; }\n\
+  Options options_;\n\
+};\n";
+    assert_eq!(
+        member_class(src2, "options_.").as_deref(),
+        Some("Options"),
+        "value-field receiver resolves to its class",
+    );
+}
+
+// Member completion: a data member keeps its trailing underscore
+// (`cleanup_head_`, not `cleanup_head`), and a bodiless method DECLARATION's
+// parameters (`arg1`/`arg2` of `RegisterCleanup`) — which land on the class
+// body scope with the sticky class package — do NOT leak in as data members.
+// Visibility: the access-specifier gate stands (non-public members offer only
+// from inside their own class); a private member the access-region stamp
+// missed harmlessly over-offers, matching clangd, which surfaces privates in
+// many completion contexts.
+#[cfg(feature = "cpp")]
+#[test]
+fn h13_member_completion_no_param_leak_keeps_underscore() {
+    let src = "\
+class Iterator {\n\
+ public:\n\
+  int value() const;\n\
+  void RegisterCleanup(void* arg1, void* arg2);\n\
+ private:\n\
+  struct CleanupNode { void* arg1; void* arg2; };\n\
+  CleanupNode cleanup_head_;\n\
+};\n";
+    let fa = cpp_driver().analyze(src);
+    // `requesting`: None = completing from OUTSIDE the class (public only);
+    // Some("Iterator") = from a method of the SAME class (privates too).
+    let has = |n: &str, requesting: Option<&str>| {
+        fa.complete_members_for_class("Iterator", None, requesting)
+            .iter()
+            .any(|c| c.label == n)
+    };
+    assert!(has("value", None), "public method offered from outside");
+    // The private field keeps its trailing underscore; it offers from inside
+    // the class (the access-specifier gate — non-public members are self-only,
+    // matching clangd's context sensitivity), and never as a truncated label.
+    assert!(
+        has("cleanup_head_", Some("Iterator")),
+        "private data member keeps its trailing underscore (self-access)",
+    );
+    assert!(!has("cleanup_head", Some("Iterator")), "no truncated label");
+    assert!(
+        !has("cleanup_head_", None),
+        "private member is not offered from outside the class",
+    );
+    // A bodiless method DECLARATION's parameters land on the class body scope
+    // with the sticky class package; they must NOT leak as data members from
+    // any vantage.
+    for requesting in [None, Some("Iterator")] {
+        assert!(
+            !has("arg1", requesting) && !has("arg2", requesting),
+            "declaration parameters do not leak as data members ({requesting:?})",
+        );
+    }
+}
+
+// The cross-file implicit-`this` member: an out-of-line method body
+// (`void C::m() { field_->x(); }`) reads a field DECLARED in another file. No
+// local witness exists, and a member reassignment (`field_ = f(...*2/3)`)
+// leaves a phantom-local flow witness that would mis-type the receiver — so
+// receiver typing resolves the member on the enclosing class, ahead of the
+// bag. A genuine local/param is untouched (it has a Variable symbol).
+#[cfg(feature = "cpp")]
+#[test]
+fn h13_implicit_receiver_class_and_local_discriminator() {
+    let src = "\
+struct Prog { int Size() const; };\n\
+struct RE {\n\
+  void Init();\n\
+  Prog* prog_;\n\
+};\n\
+void RE::Init() {\n\
+  prog_ = new Prog();\n\
+  int local = prog_->Size() * 2 / 3;\n\
+  (void)local;\n\
+}\n";
+    let fa = cpp_driver().analyze(src);
+    // The out-of-line body's enclosing class is read off the peeled method sym.
+    let at_prog = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "prog_" && r.span.start.row == 7)
+        .map(|r| r.span.start)
+        .expect("prog_ receiver ref on the `prog_->Size()` line");
+    assert_eq!(
+        fa.implicit_receiver_class_at(at_prog).as_deref(),
+        Some("RE"),
+        "out-of-line method body's implicit-this class is its peeled class",
+    );
+    // `prog_` (a member write, no declarator) has no local Variable symbol;
+    // `local` (a real declaration) does.
+    assert!(
+        !fa.has_local_variable_at("prog_", at_prog),
+        "a member-assigned name has no local Variable declaration",
+    );
+    assert!(
+        fa.has_local_variable_at("local", at_prog),
+        "a genuinely declared local is recognised as local",
+    );
 }

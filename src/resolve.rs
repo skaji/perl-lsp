@@ -141,6 +141,32 @@ impl TargetRef {
         }
     }
 
+    /// Build a `Method` target for a class-OWNED synthesized accessor (a Moo
+    /// `has` reader, a DBIC column/relationship accessor). Its override family
+    /// is `owned_accessor_family` — the owning class and its descendants only,
+    /// NEVER a framework ancestor that happens to define a real `sub` of the
+    /// same name (`DBIx::Class::PK::id`). Renaming a synthesized `id` column
+    /// must not reach that generic accessor nor every unrelated sibling Result
+    /// class under it. Fixed `Hierarchy` scope: an owned accessor is
+    /// shared down the hierarchy by construction; the family already encodes
+    /// exactly the classes that inherit it.
+    pub fn owned_accessor(
+        name: String,
+        class: String,
+        origin: &FileAnalysis,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Self {
+        let method_classes = origin.owned_accessor_family(&class, module_index);
+        TargetRef {
+            name,
+            kind: TargetKind::Method { class },
+            method_classes,
+            scope: OverrideScope::Hierarchy,
+            def_paths: Vec::new(),
+            bare_constant: false,
+        }
+    }
+
     /// Build a non-Method target (no inheritance fan-out for declarations).
     pub fn new(name: String, kind: TargetKind) -> Self {
         debug_assert!(
@@ -1044,7 +1070,17 @@ impl<'a> CandidateSet<'a> {
         let mut out: Vec<RefLocation> = Vec::new();
         if let Some(idx) = self.module_index {
             if let Some(sym) = self.origin.symbol_at(self.point) {
-                if matches!(sym.kind, SymKind::Class) {
+                // Enums are `SymKind::Class` in cpp (no distinct kind), so gate
+                // the enum→field-slot bridge on the Class actually HAVING
+                // enumerators — otherwise a plain class fires it, and any field
+                // member whose owning class shares the class's name resolves as
+                // a bogus "enumerator of this enum" (leveldb `Iterator` matched
+                // SkipList::Iterator's `node_` field). An empty/real class has
+                // no enumerators → no domain sites key to it anyway, so this
+                // never suppresses a genuine enum result.
+                if matches!(sym.kind, SymKind::Class)
+                    && !self.origin.enum_members(&sym.name, Some(idx)).is_empty()
+                {
                     let enum_name = sym.name.clone();
                     idx.for_each_cached_file(&mut |cached| {
                         // `resolve_enumerator_enum`'s local arm reads the
@@ -1291,22 +1327,75 @@ impl<'a> CandidateSet<'a> {
             if let Some((self_path, visible)) = idx.visibility_scope() {
                 let self_str = self_path.to_string_lossy().into_owned();
                 let decl_path = key_for_sort(&decl.key);
+                let decl_str = decl_path.to_string_lossy().into_owned();
+                // Connected when the origin sees the def, when the def's TU
+                // includes the origin (the reverse `server.c` ⊇ `server.h`
+                // link), OR when the def's TU includes the DECL's file. The
+                // last is the general C separate-compilation link: a body's
+                // TU includes the header that declares the same identity —
+                // and the decl is the proven-same-symbol waypoint the origin
+                // already resolved to. A THIRD TU calling through a shared
+                // header (`t_string.c` → `server.h` proto, body in `db.c`)
+                // reaches the body via this clause though it never sees
+                // `db.c` textually.
+                let connected = |cached: &std::sync::Arc<crate::file_analysis::CachedModule>| {
+                    let p = cached.path.to_string_lossy();
+                    cached.path != decl_path
+                        && (visible.contains(p.as_ref())
+                            || cached.analysis.include_closure.contains(&self_str)
+                            || cached.analysis.include_closure.contains(&decl_str))
+                };
                 let mut cands = idx.def_candidates(&sym.name);
                 cands.sort_by(|a, b| a.path.cmp(&b.path));
-                for cached in cands {
-                    if cached.path == decl_path {
-                        continue;
-                    }
-                    let p = cached.path.to_string_lossy().into_owned();
-                    let connected = visible.contains(&p)
-                        || cached.analysis.include_closure.contains(&self_str);
-                    if !connected {
+                for cached in &cands {
+                    if !connected(cached) {
                         continue;
                     }
                     let key = FileKey::Path(cached.path.clone());
-                    let whole = idx.whole_present(&cached);
+                    let whole = idx.whole_present(cached);
                     for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
                         push(&mut defs, &key, s.selection_span);
+                    }
+                }
+                // Member fallback: a class member's out-of-line body is NOT
+                // linkage-visible, so the name-keyed `def_candidates` table
+                // never pulls its TU in (the same gap `member_def_location`'s
+                // broad scan and `overload_arity_definitions`' `get_cached`
+                // seed cover). When the identity is a class-owned callable and
+                // no bodied def surfaced above, sweep the connected cached
+                // files directly. Gated on the empty result so free-function /
+                // static decl→def (already covered) never pays the broad scan.
+                let is_member_callable = matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                    && sym.package.is_some();
+                if defs.is_empty() && is_member_callable {
+                    let mut hits: Vec<(String, RefLocation)> = Vec::new();
+                    idx.for_each_cached_file(&mut |cached| {
+                        if !connected(cached) {
+                            return;
+                        }
+                        let key = FileKey::Path(cached.path.clone());
+                        let whole = idx.whole_present(cached);
+                        for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
+                            if s.selection_span.start == decl.span.start
+                                && file_key_eq(&key, &decl.key)
+                            {
+                                continue;
+                            }
+                            hits.push((
+                                cached.path.to_string_lossy().into_owned(),
+                                RefLocation {
+                                    key: key.clone(),
+                                    span: s.selection_span,
+                                    access: AccessKind::Declaration,
+                                    rewritable: true,
+                                    label: None,
+                                },
+                            ));
+                        }
+                    });
+                    hits.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (_, loc) in hits {
+                        push(&mut defs, &loc.key, loc.span);
                     }
                 }
             }
@@ -1316,6 +1405,32 @@ impl<'a> CandidateSet<'a> {
         }
         defs.push(decl);
         defs
+    }
+
+    /// Route a member/method goto-def location through the decl→def sibling
+    /// axis. `member_def_location` and the cross-file inherited-method path both
+    /// land on the class's DECLARATION (the header's in-class prototype); a
+    /// `ClassName::method(){}` body lives out-of-line in another TU. The
+    /// free-function by-name tail already hops decl→def through
+    /// `preferred_definitions`; members went straight to the decl because their
+    /// resolution enters through the owner-anchored / inherited-method paths
+    /// instead. Feed the SAME axis by resolving the decl's own FileAnalysis
+    /// (origin, or the cross-file cached copy) so the bodied def ranks first,
+    /// decl kept. A decl whose analysis is unreachable degrades to the decl.
+    fn prefer_member_defs(&self, decl: RefLocation) -> Vec<RefLocation> {
+        if !self.pack {
+            return vec![decl];
+        }
+        if file_key_eq(&decl.key, &self.origin_key) {
+            return self.preferred_definitions(decl, self.origin);
+        }
+        if let (Some(idx), FileKey::Path(p)) = (self.idx(), decl.key.clone()) {
+            if let Some(cached) = idx.cached_by_path(&p) {
+                let whole = idx.whole_present(&cached);
+                return self.preferred_definitions(decl, &whole);
+            }
+        }
+        vec![decl]
     }
 
     /// Overload arity ranking (pack): a call to a name with MULTIPLE callable
@@ -1514,7 +1629,9 @@ impl<'a> CandidateSet<'a> {
                 if let Some(owner) = qualifier_at_point(source, point) {
                     if let Some(name) = word_at_point(source, point) {
                         if let Some(loc) = self.member_def_location(owner, name) {
-                            return vec![loc];
+                            // The member lookup lands on the class DECLARATION;
+                            // hop to the out-of-line body (decl→def axis).
+                            return self.prefer_member_defs(loc);
                         }
                     }
                 }
@@ -1928,9 +2045,36 @@ impl<'a> CandidateSet<'a> {
                         // either way.
                         let module = def_module.as_deref().unwrap_or(class);
                         if let Some(cached) = idx.get_cached(module) {
+                            // A cross-file DBIC accessor is a deferred emission
+                            // MATERIALIZED into the whole cached copy at index
+                            // completion (`materialize_gated_emissions`), so the
+                            // whole view carries it — no per-query enrichment.
                             let whole = idx.whole_present(&cached);
                             if let Some(sub_info) = whole.sub_info_view(method) {
                                 if Url::from_file_path(&cached.path).is_ok() {
+                                    // A pack member call lands on the class
+                                    // module's DECLARATION; hop to the
+                                    // out-of-line body (decl→def axis) like the
+                                    // free-function tail. The decl's own symbol
+                                    // span (not just `def_line`) is what the
+                                    // axis matches on. Perl subs keep the
+                                    // `def_line` jump (`prefer_member_defs` is a
+                                    // no-op off-pack anyway).
+                                    if self.pack {
+                                        if let Some(sym) = whole.symbols.iter().find(|s| {
+                                            s.name == method
+                                                && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                                                && pkg_agrees(true, s.package.as_deref(), Some(class))
+                                        }) {
+                                            return self.prefer_member_defs(RefLocation {
+                                                key: FileKey::Path(cached.path.clone()),
+                                                span: sym.selection_span,
+                                                access: AccessKind::Declaration,
+                                                rewritable: true,
+                                                label: None,
+                                            });
+                                        }
+                                    }
                                     return vec![line_loc(
                                         cached.path.clone(),
                                         sub_info.def_line(),
@@ -2797,20 +2941,29 @@ fn group_from_projections(
         // A Corinna `field`'s reader is per-class (private storage), so scope it
         // precisely (Dispatch) — never fan to an ancestor's same-named reader,
         // which would rewrite that class's own private field decl and corrupt
-        // it. A `has`/column accessor IS shared down the hierarchy → family.
-        let reader_scope = if p.field_backed {
-            OverrideScope::Dispatch
-        } else {
-            OverrideScope::Hierarchy
-        };
-        members.push(GroupMember {
-            target: TargetRef::method(
+        // it. A `has`/column accessor IS shared down the hierarchy, but its
+        // identity is the OWNING class: `owned_accessor` roots the family at
+        // `p.class` and its descendants, never upward at a framework ancestor
+        // that defines a real same-named `sub` (e.g. an `id` column colliding
+        // with `DBIx::Class::PK::id`).
+        let target = if p.field_backed {
+            TargetRef::method(
                 p.bare.clone(),
                 p.class.clone(),
                 class_analysis,
                 module_index,
-                reader_scope,
-            ),
+                OverrideScope::Dispatch,
+            )
+        } else {
+            TargetRef::owned_accessor(
+                p.bare.clone(),
+                p.class.clone(),
+                class_analysis,
+                module_index,
+            )
+        };
+        members.push(GroupMember {
+            target,
             rename: MemberRename::Bare,
         });
     }
@@ -2848,13 +3001,15 @@ fn group_from_projections(
         });
     }
     for m in &p.mapped {
+        // Name-mapped accessors (`has_size` for attr `size`) are class-owned
+        // too — same owner-rooted family as the reader (never a framework
+        // ancestor's same-named `sub`).
         members.push(GroupMember {
-            target: TargetRef::method(
+            target: TargetRef::owned_accessor(
                 m.method.clone(),
                 p.class.clone(),
                 class_analysis,
                 module_index,
-                OverrideScope::Hierarchy,
             ),
             rename: match &m.affix {
                 Some((pre, suf)) => MemberRename::Affixed {
@@ -3089,6 +3244,37 @@ pub fn refs_to(
             || seen_by_inclusion.contains(file_str)
     };
 
+    // Row-narrowing gate: when the relational store is live for a masked
+    // dep/workspace tier, its `files` set is the complete "which files hold
+    // rows" marker. A file WITH rows but ABSENT from the candidate set has
+    // no matching ref/sym row, so — rows over-approximate references — it
+    // provably matches nothing; the resident sweeps below skip rehydrating
+    // it, leaving only rows-ABSENT files (persistence off, mid-index lag) to
+    // the whole-view fallback. Empty set (`PERL_LSP_REF_ROWS=0`, no opener,
+    // degraded) ⇒ every file is swept, exactly as before. This is what makes
+    // the pack references path cost track candidate count, not tree size.
+    // Sweep-narrowing kill-switch (`PERL_LSP_REFS_NARROW=0`), the A/B lever
+    // for the row-narrowed backward walk. Answer-preservation verified:
+    // abseil narrowed vs swept byte-identical; curl identical either way
+    // (its server-warm under-answer PREDATES narrowing — the open-doc
+    // cached-only target-minting divergence, ledgered separately in
+    // docs/open-forks.md "Answer honesty under index/enrichment windows").
+    let narrow_enabled = std::env::var_os("PERL_LSP_REFS_NARROW")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let rows_active =
+        ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY);
+    // Armed by the relational block below. The sweep-skip is sound ONLY
+    // for files that hold rows AND are NOT candidates (provably matchless).
+    // A CANDIDATE must never be skipped by the sweeps even though it holds
+    // rows: the relational block can fail to RESOLVE it (`cached_by_path`
+    // path-spelling gaps under warm-stub registration — observed on curl:
+    // server-warm references 4 sites vs the sweep's 155) and an unresolved
+    // candidate falls through to the whole-view sweeps for coverage.
+    // Empty candidate retrieval leaves narrowing off entirely.
+    let mut rows_indexed: std::collections::HashSet<PathBuf> = Default::default();
+    let mut candidate_set: std::collections::HashSet<PathBuf> = Default::default();
+
     // Open files (canonical — workspace entries for open paths are skipped).
     let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     if mask.contains(RoleMask::OPEN) {
@@ -3134,10 +3320,23 @@ pub fn refs_to(
     // declaration-only files and files without rows (degraded, persistence
     // off, mid-index lag) — composition stays at-least-as-complete whether
     // or not resident refs were evicted.
-    if ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY) {
+    if rows_active {
         if let Some(idx) = module_index {
             let keys = retrieval_keys(target, &aliases);
-            for path in idx.ref_candidate_paths(&keys) {
+            let candidate_paths = idx.ref_candidate_paths(&keys);
+            if std::env::var_os("PERL_LSP_REFS_DEBUG").is_some() {
+                eprintln!(
+                    "[refs-debug] keys={:?} candidates={} narrow={}",
+                    keys,
+                    candidate_paths.len(),
+                    narrow_enabled
+                );
+            }
+            if narrow_enabled && !candidate_paths.is_empty() {
+                rows_indexed = idx.ref_indexed_paths();
+                candidate_set = candidate_paths.iter().cloned().collect();
+            }
+            for path in candidate_paths {
                 if covered_paths.contains(&path) {
                     continue;
                 }
@@ -3193,6 +3392,12 @@ pub fn refs_to(
             if covered_paths.contains(entry.key()) {
                 continue;
             }
+            // Shredded AND not a candidate → holds no matching row; skip
+            // the whole-view rehydration. Candidates always fall through
+            // (the relational block may have failed to resolve them).
+            if rows_indexed.contains(entry.key()) && !candidate_set.contains(entry.key()) {
+                continue;
+            }
             covered_paths.insert(entry.key().clone());
             let key = FileKey::Path(entry.key().clone());
             let file_str = canonical_file_str(&key);
@@ -3228,6 +3433,12 @@ pub fn refs_to(
                 if !covered_paths.insert(cached.path.clone()) {
                     return;
                 }
+                // Same row-narrowing skip as the workspace sweep: shredded
+                // but not a candidate ⇒ provably matchless; candidates
+                // always fall through.
+                if rows_indexed.contains(&cached.path) && !candidate_set.contains(&cached.path) {
+                    return;
+                }
                 let key = FileKey::Path(cached.path.clone());
                 let file_str = canonical_file_str(&key);
                 if !gate(&cached.analysis, &file_str) {
@@ -3255,10 +3466,13 @@ pub fn refs_to(
     out
 }
 
-/// `textDocument/implementation`: local defs of `name` in every
-/// transitive descendant package of the Method target's class. On a
-/// role's `requires` marker that's "every composer's def of the
-/// contract"; on a class method it's "every subclass override".
+/// `textDocument/implementation`: defs of `name` on every class that
+/// participates in the target method's dispatch for some concrete
+/// descendant — the transitive descendants of the Method target's class
+/// PLUS their co-ancestors (sibling parents contributed by multi-parent
+/// composition: `load_components`, Moo/Moose `with`, multi-base `use base`).
+/// On a role's `requires` marker that's "every composer's def of the
+/// contract"; on a class method it's "every override that can win dispatch".
 /// Goto-def stays on the contract/def itself; call sites stay on
 /// references — this is the third verb, not a variant of either.
 ///
@@ -3275,10 +3489,62 @@ pub fn implementations_of(
     // gr on the primary stays "uses of the primary"; the family is this
     // verb's answer (fork 4, docs/adr/cpp-templates.md).
     if matches!(target.kind, TargetKind::Package) {
-        return specialization_family(origin, module_index, &target.name);
+        let mut out = specialization_family(origin, module_index, &target.name);
+        // A plain base class (not a template primary): its "implementations"
+        // are the concrete subclasses — the INHERITS_INV descendants' class
+        // def sites. The edge graph gates this: an unrelated same-named nested
+        // class (SkipList::Iterator) has no INHERITS edge to the target, so it
+        // never appears in the descendant set even though the by-name index
+        // holds a Class of the same spelling.
+        if let Some(idx) = module_index {
+            let probe = crate::graph::GraphView::new(origin, Some(idx));
+            let mut descendants: Vec<String> = Vec::new();
+            probe.walk(
+                crate::graph::Node::Class(target.name.clone()),
+                crate::graph::EdgeKindMask::INHERITS_INV,
+                &mut |n| {
+                    if let crate::graph::Node::Class(c) = n {
+                        descendants.push(c.clone());
+                    }
+                    std::ops::ControlFlow::Continue(())
+                },
+            );
+            for pkg in &descendants {
+                for cached in idx.def_candidates(pkg) {
+                    let whole = idx.whole_present(&cached);
+                    for s in &whole.symbols {
+                        if &s.name == pkg && matches!(s.kind, SymKind::Class) {
+                            out.push(RefLocation {
+                                key: FileKey::Path(cached.path.clone()),
+                                span: s.selection_span,
+                                access: AccessKind::Declaration,
+                                rewritable: false,
+                                label: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            key_for_sort(&a.key).cmp(&key_for_sort(&b.key)).then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+        });
+        out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+        return out;
     }
-    let TargetKind::Method { class } = &target.kind else {
-        return Vec::new();
+    // Both class-bearing target kinds seed the dispatch fan-out: a
+    // `Method{class}` (call-site cursor) and a `Sub{package: Some}` (cursor
+    // ON a `sub NAME` decl inside a package). Perl has no sub/method
+    // distinction — any sub in a package is dispatchable as a method — so the
+    // decl of `sub update` in `DBIx::Class::Row` is as much an implementation
+    // root as an `$obj->update` call whose invocant types to that class.
+    let class = match &target.kind {
+        TargetKind::Method { class } => class,
+        TargetKind::Sub { package: Some(pkg) } => pkg,
+        _ => return Vec::new(),
     };
     let Some(idx) = module_index else {
         return Vec::new();
@@ -3298,8 +3564,53 @@ pub fn implementations_of(
             std::ops::ControlFlow::Continue(())
         },
     );
+
+    // Mixin/sibling overrides. A concrete class assembles its dispatch table
+    // from MULTIPLE parents (Perl multi-parent composition: `load_components`,
+    // Moo/Moose `with` roles, `use base` with several bases). An override of
+    // the target's method can therefore live on a SIBLING PARENT of a shared
+    // descendant — a class that is an ancestor of some concrete descendant of
+    // the target yet is NOT itself a descendant of the target, so the
+    // INHERITS_INV sweep above never reaches it (DBIC's `Ordered` sits
+    // alongside `Row` in `Track`'s MRO, not beneath it). Surface these by
+    // walking UP each descendant's full MRO and collecting every co-ancestor:
+    // a class that shares a concrete descendant with the target participates
+    // in that descendant's dispatch for the method.
+    let mut implementers: std::collections::BTreeSet<String> =
+        descendants.iter().cloned().collect();
+    for d in &descendants {
+        probe.walk(
+            crate::graph::Node::Class(d.clone()),
+            crate::graph::EdgeKindMask::INHERITS,
+            &mut |n| {
+                if let crate::graph::Node::Class(c) = n {
+                    implementers.insert(c.clone());
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+    }
+    // The target and its own ancestry are the CONTRACT side, not an
+    // implementation: goto-def lands on the target itself, and a superclass
+    // method sits BEHIND the target in every descendant's MRO (shadowed by the
+    // target's own def — it never wins). Exclude both so the verb reports only
+    // the classes that override at or ahead of the contract.
+    let mut contract_line: std::collections::HashSet<String> =
+        std::iter::once(class.clone()).collect();
+    probe.walk(
+        crate::graph::Node::Class(class.clone()),
+        crate::graph::EdgeKindMask::INHERITS,
+        &mut |n| {
+            if let crate::graph::Node::Class(c) = n {
+                contract_line.insert(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    implementers.retain(|p| !contract_line.contains(p));
+
     let mut out: Vec<RefLocation> = Vec::new();
-    for pkg in &descendants {
+    for pkg in &implementers {
         // class → home module(s): exact cache key for the common
         // single-package file; the names index covers cross-named and
         // multi-package homes.
@@ -4600,7 +4911,18 @@ fn collect_from_analysis(
                 let method = r.unqualified_target_name();
                 {
                     let resolved_class = match r.resolved_method_target.as_ref() {
-                        Some(edge) => Some(edge.invocant_class().to_string()),
+                        // The frozen edge can carry an UNRESOLVED DBIC source
+                        // moniker (`Artist`) when it was stamped at build with
+                        // no index (a closed call-site file — enrichment
+                        // re-stamps OPEN docs only). Map it to the FQ result
+                        // class here, index in hand, so `$row->cds` sites match
+                        // the same target goto-def reaches. No-op for a class
+                        // that already resolves.
+                        Some(edge) => Some(analysis.resolve_dbic_source_moniker(
+                            edge.invocant_class().to_string(),
+                            None,
+                            module_index,
+                        )),
                         None => analysis.method_call_invocant_class(r, module_index),
                     };
                     match (resolved_class, scope) {

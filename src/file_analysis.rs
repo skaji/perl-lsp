@@ -342,7 +342,7 @@ pub mod path_intern {
     /// A file's `#include` closure as sorted path-ids over the global
     /// table. Semantically a set of path strings; consumers ask membership
     /// (`contains`) or iterate the strings — the representation is private
-    /// so it can keep shrinking (`docs/open-forks.md`, closure
+    /// so it can keep shrinking (`docs/forks-resolved.md`, closure
     /// representation fork).
     #[derive(Debug, Clone, Default)]
     pub struct ClosureList(Arc<[u32]>);
@@ -371,10 +371,6 @@ pub mod path_intern {
 
         pub fn is_empty(&self) -> bool {
             self.0.is_empty()
-        }
-
-        pub fn len(&self) -> usize {
-            self.0.len()
         }
 
         /// The member paths as shared strings (save path, visibility sets).
@@ -439,17 +435,6 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
     }
-    /// A cached module's analysis with its `refs` GUARANTEED present — the
-    /// refs twin of `bag_present` (`docs/adr/relational-ref-index.md`).
-    /// Resident index copies have refs evicted after persist; the backward
-    /// walk rehydrates the exact persisted analysis for candidate files.
-    /// Default (never-evicted impls): a cheap `Arc` bump.
-    fn refs_present(
-        &self,
-        cached: &std::sync::Arc<CachedModule>,
-    ) -> std::sync::Arc<FileAnalysis> {
-        cached.analysis.clone()
-    }
     /// A cached WORKSPACE module's analysis with cross-file ENRICHMENT
     /// applied (`docs/adr/storage-engine.md`, the always-enriched
     /// tier): imported return types propagated, synthetic hash-key defs
@@ -486,9 +471,20 @@ pub trait CrossFileLookup {
     fn ref_candidate_paths(&self, _keys: &[String]) -> Vec<std::path::PathBuf> {
         Vec::new()
     }
+    /// Every path this index has SHREDDED into the relational row store
+    /// (the `files` table — the single "rows present" marker). A file in
+    /// this set but ABSENT from `ref_candidate_paths(keys)` has no ref or
+    /// sym row for those names, so — rows over-approximate references — it
+    /// provably matches nothing and the backward walk can skip rehydrating
+    /// it. Empty (default, or no row store) ⇒ no narrowing; the resident
+    /// sweep whole-views every gate-passing file as before. `docs/adr/
+    /// relational-ref-index.md`.
+    fn ref_indexed_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        std::collections::HashSet::new()
+    }
     /// Path-keyed cached-module lookup — the retrieval above hands back
     /// paths; this maps them onto the resident registration (for the
-    /// visibility gate + `refs_present`). Default `None`.
+    /// visibility gate + whole-copy rehydration). Default `None`.
     fn cached_by_path(
         &self,
         _path: &std::path::Path,
@@ -642,13 +638,6 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // type regressions while goto/refs stay green.
         self.inner.bag_present(cached)
     }
-    fn refs_present(
-        &self,
-        cached: &std::sync::Arc<CachedModule>,
-    ) -> std::sync::Arc<FileAnalysis> {
-        // Same delegation rule as `bag_present` — the inner index owns the LRU.
-        self.inner.refs_present(cached)
-    }
     fn enriched_present(
         &self,
         cached: &std::sync::Arc<CachedModule>,
@@ -669,6 +658,9 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // its own per-file closure gate; pre-narrowing here would hide sites
         // in files the textual-inclusion extension admits.
         self.inner.ref_candidate_paths(keys)
+    }
+    fn ref_indexed_paths(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.inner.ref_indexed_paths()
     }
     fn cached_by_path(
         &self,
@@ -1327,11 +1319,14 @@ impl Symbol {
     /// view that enumerates symbols for humans (outline, workspace-symbol,
     /// usage heatmap) asks the symbol this rather than re-matching the detail.
     pub fn hidden_in_outline(&self) -> bool {
-        matches!(
-            &self.detail,
-            SymbolDetail::Sub { hide_in_outline: true, .. }
-                | SymbolDetail::Handler { hide_in_outline: true, .. }
-        )
+        // An include-guard `#define` is compilation plumbing, not a program
+        // entity — folded from listing views but still resolvable (rule #7).
+        self.attributes.iter().any(|a| a == "include_guard")
+            || matches!(
+                &self.detail,
+                SymbolDetail::Sub { hide_in_outline: true, .. }
+                    | SymbolDetail::Handler { hide_in_outline: true, .. }
+            )
     }
 }
 
@@ -2665,6 +2660,19 @@ impl InferredType {
             }
             (InferredType::Sequence(_), InferredType::ArrayRef) => true,
             (a @ InferredType::Sequence(_), b @ InferredType::Sequence(_)) => a == b,
+            // Identity dominates rep: a blessed object accessed as
+            // `$self->{field}` / `$self->[i]` / `$self->()` reveals its
+            // internal REPRESENTATION, it does not narrow the object's TYPE
+            // to a bare ref. The class identity stays — the same
+            // structure-over-rep rule above, lifted to class-over-rep. So a
+            // deref-narrowing never clobbers an invocant's class at its
+            // access site (which would otherwise mask the identity at inner-
+            // scope reads, since the rep witness lands on the nested block
+            // while the class lives on the sub scope).
+            (
+                a,
+                InferredType::HashRef | InferredType::ArrayRef | InferredType::CodeRef { .. },
+            ) if a.class_name().is_some() => true,
             // An optional subsumes a narrowing only as specifically as its
             // inner does; a CONCRETE self is at least as specific as an
             // optional narrowing (the narrowing already happened). The
@@ -2989,50 +2997,129 @@ pub fn parents_of(
     parents
 }
 
-/// Does `class` equal `target` or descend from it? Walks local
-/// `package_parents` first, then the cross-file inheritance graph via
-/// `module_index.parents_cached`. The single isa-walk seam — both the
-/// `ReceiverGated` gate and `FileAnalysis::class_isa` route here, so the
-/// MRO is enumerated in exactly one place. Cycle-guarded by `seen`;
-/// `budget` caps TOTAL classes visited (not ancestry depth) — a backstop
-/// against a pathological graph, set well above any real MRO.
-/// `parents_cached` is keyed by module name, which coincides with the
-/// class name here.
+/// Per-node classification returned by an ancestry-walk predicate.
+enum WalkVerdict {
+    /// This class satisfies the query — short-circuit the walk to `true`.
+    Hit,
+    /// Not a match; keep walking its parents.
+    Miss,
+    /// Disqualifier — short-circuit the traversal (the walk returns `false`;
+    /// a predicate that needs to distinguish reject-from-exhaust reads its
+    /// own captured state, as `class_is_dbic_result` does).
+    Reject,
+}
+
+/// The single bounded ancestry DFS — `class_isa`, `class_isa_prefix`, and
+/// `class_is_dbic_result` all route here, so the inheritance graph is
+/// enumerated in exactly one place. `parents_of` supplies the per-node
+/// parent seam (local `package_parents` ∪ cross-file `parents_cached`, or
+/// cross-file-only for the DBIC gate); `predicate` classifies each visited
+/// class; `budget` caps TOTAL classes visited (not ancestry depth) — a
+/// per-call-site backstop against a pathological graph, set well above any
+/// real MRO. Returns `true` iff a `Hit` verdict terminated the walk; a
+/// `Reject` or exhaustion returns `false`. Cycle-guarded by `seen`.
+/// Long-term collapse target: GraphView's lazy `walk` over the inheritance
+/// edges (docs/adr/graph-walking.md).
+fn walk_ancestry(
+    origin: &str,
+    budget: usize,
+    mut parents_of: impl FnMut(&str) -> Vec<String>,
+    mut predicate: impl FnMut(&str) -> WalkVerdict,
+) -> bool {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![origin.to_string()];
+    let mut visited = 0;
+    while let Some(cur) = stack.pop() {
+        if visited > budget {
+            break;
+        }
+        visited += 1;
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        match predicate(&cur) {
+            WalkVerdict::Hit => return true,
+            WalkVerdict::Reject => return false,
+            WalkVerdict::Miss => {}
+        }
+        for p in parents_of(&cur) {
+            stack.push(p);
+        }
+    }
+    false
+}
+
+/// The local+cross-file parent seam for the isa walkers: `package_parents`
+/// first (preserving push order under a budget truncation), then the
+/// cross-file graph via `module_index.parents_cached` (keyed by module
+/// name, which coincides with the class name here).
+fn isa_parents(
+    cur: &str,
+    package_parents: &HashMap<String, Vec<String>>,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Vec<String> {
+    let mut v = package_parents.get(cur).cloned().unwrap_or_default();
+    if let Some(idx) = module_index {
+        v.extend(idx.parents_cached(cur));
+    }
+    v
+}
+
+/// Does `class` equal `target` or descend from it? The single isa-walk seam
+/// — both the `ReceiverGated` gate and `FileAnalysis::class_isa` route
+/// through the shared [`walk_ancestry`] over the local+cross-file parent
+/// graph, so the MRO is enumerated in exactly one place.
 pub fn class_isa(
     class: &str,
     target: &str,
     package_parents: &HashMap<String, Vec<String>>,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> bool {
-    if class == target {
-        return true;
-    }
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = vec![class.to_string()];
-    let mut budget = 0;
-    while let Some(cur) = stack.pop() {
-        if budget > 200 {
-            break;
-        }
-        budget += 1;
-        if !seen.insert(cur.clone()) {
-            continue;
-        }
-        if cur == target {
-            return true;
-        }
-        if let Some(parents) = package_parents.get(&cur) {
-            for p in parents {
-                stack.push(p.clone());
+    walk_ancestry(
+        class,
+        200,
+        |cur| isa_parents(cur, package_parents, module_index),
+        |c| {
+            if c == target {
+                WalkVerdict::Hit
+            } else {
+                WalkVerdict::Miss
             }
-        }
-        if let Some(idx) = module_index {
-            for p in idx.parents_cached(&cur) {
-                stack.push(p);
+        },
+    )
+}
+
+/// Does `class`, or any of its transitive ancestors (cross-file), satisfy
+/// a plugin `ClassIsa(prefix)` trigger? The trigger's PREFIX semantics —
+/// exact match OR a `prefix::`-namespaced descendant — mirror
+/// `plugin::trigger_fires`, so this is the cross-file-aware analog of the
+/// build-time local-only `transitive_parents` gate. Shares [`walk_ancestry`]
+/// (the same local+cross-file seam as `class_isa`), so the graph is walked
+/// in one place; the only difference is the per-node predicate is a prefix
+/// test, not exact equality. Deliberately NOT `parents_of`: the synthetic
+/// `APP_SURFACE_CLASS` edge is a method-dispatch bridge (Mojo helpers), not
+/// an `isa` relation, so a plugin `ClassIsa` gate must not treat an
+/// app-surface consumer as a descendant of the surface. Both isa-walk seams
+/// exclude it by construction.
+pub fn class_isa_prefix(
+    class: &str,
+    prefix: &str,
+    package_parents: &HashMap<String, Vec<String>>,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> bool {
+    let ns = format!("{prefix}::");
+    walk_ancestry(
+        class,
+        200,
+        |cur| isa_parents(cur, package_parents, module_index),
+        |c| {
+            if c == prefix || c.starts_with(&ns) {
+                WalkVerdict::Hit
+            } else {
+                WalkVerdict::Miss
             }
-        }
-    }
-    false
+        },
+    )
 }
 
 /// Three-way outcome of resolving a [`ReceiverGated`] value against a
@@ -3276,6 +3363,83 @@ impl ProvisionalDispatch {
     fn dispatcher(&self) -> &str {
         &self.inner.dispatcher
     }
+}
+
+/// A plugin PATTERN emission (`on_match` output) deferred at build because
+/// its `ClassIsa` trigger couldn't be confirmed against the file's
+/// LOCAL-only ancestry (rule #1: the builder is index-free, so
+/// `transitive_parents` sees only in-file parents). The idiomatic case is a
+/// DBIC result class whose `isa DBIx::Class` route runs through an
+/// intermediate base in another file (`Artist → BaseResult → DBIx::Class::
+/// Core`), so the syntactically-matched `has_many`/`add_columns` synthesis
+/// never fires.
+///
+/// The build records the already-computed emission (tree-free,
+/// file-analysis-native — the `on_match` result translated in
+/// `pattern_dispatch`, which speaks `EmitAction`) plus the gate prefixes.
+/// `enrich_imported_types_with_keys` re-fires it when the package's ancestry
+/// resolves ANY gate prefix CROSS-FILE (`class_isa_prefix`, the same MRO
+/// seam as every other ancestry walk). Idempotent by construction: the
+/// re-fired symbols/refs land ABOVE `base_symbol_count` / `base_ref_count`
+/// and are truncated + re-derived every enrichment cycle, so a file whose
+/// ancestry resolves late converges to the same analysis as one built with
+/// it known — the same discipline as `ReceiverGated` dispatch, but for
+/// symbol emission (which feeds every symbol-table consumer, so it can't be
+/// gated at one query seam — it must materialize into the analysis).
+/// See `docs/adr/receiver-gated-dispatch.md` (Phase 2) and
+/// `docs/prompt-enrichment-inheritance-residual.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatedEmission {
+    /// Any of these `ClassIsa` prefixes holding cross-file re-fires the
+    /// emission — trigger semantics are OR across a plugin's triggers, and
+    /// only `ClassIsa` triggers can newly-fire cross-file (`UsesModule` /
+    /// `Always` are settled locally at build).
+    pub gate_prefixes: Vec<String>,
+    /// The package whose cross-file ancestry is checked against the gate.
+    pub package: String,
+    /// Match-site point; the re-fired symbols/refs attach to the scope here.
+    #[serde(with = "PointDef")]
+    pub scope_point: Point,
+    /// The plugin id — namespace-tags the re-fired symbols (`Framework{id}`).
+    pub plugin_id: String,
+    /// Symbols the pattern's `on_match` produced (columns, relationship
+    /// accessors, event handlers, …).
+    pub symbols: Vec<GatedSymbol>,
+    /// Refs the pattern produced (dispatch-call / method-call / hash-key
+    /// access sites) so cross-file references reach the re-fired symbols.
+    pub refs: Vec<GatedRef>,
+}
+
+/// One symbol inside a [`GatedEmission`] — the file-analysis-native
+/// projection of a symbol-emitting `EmitAction` (`Method` / `HashKeyDef` /
+/// `Handler` / `Symbol`). The `SymbolId` is minted at apply time (it must
+/// equal the symbol's positional index — `FileAnalysis::symbol` indexes by
+/// it), so it is deliberately absent here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatedSymbol {
+    pub name: String,
+    pub kind: SymKind,
+    pub span: Span,
+    pub selection_span: Span,
+    pub detail: SymbolDetail,
+    /// Explicit owning class (`EmitAction::Method.on_class`); when `None` the
+    /// symbol is keyed under the emission's match-site package.
+    pub on_class: Option<String>,
+    /// Return type → a `Symbol(sid) → InferredType` Plugin-priority bag
+    /// witness pushed at apply (plus a `MethodOnClass{class,name}` mirror for
+    /// class-scoped methods, so cross-file return-type queries reach it).
+    pub return_type: Option<InferredType>,
+}
+
+/// One ref inside a [`GatedEmission`]. Scope is resolved at apply from the
+/// emission's `scope_point`; `resolves_to` is left for the enrichment
+/// re-index to link (HashKeyAccess → HashKeyDef) the same way build does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatedRef {
+    pub kind: RefKind,
+    pub span: Span,
+    pub target_name: String,
+    pub access: AccessKind,
 }
 
 /// A confirmed dispatch — a gated candidate whose receiver isa-resolved at
@@ -3921,7 +4085,7 @@ pub struct FileAnalysis {
     /// `evict_refs` stripped this resident copy's `refs` after the blob +
     /// relational rows were persisted. `#[serde(skip)]` — a rehydrated
     /// analysis is refs-present. Consumers that would read a foreign file's
-    /// refs route through `CrossFileLookup::refs_present` when set; an empty
+    /// refs route through `whole_present` (rehydrating on miss); an empty
     /// `refs` here is "on disk", never "no references".
     #[serde(skip, default)]
     refs_evicted: bool,
@@ -3956,6 +4120,14 @@ pub struct FileAnalysis {
     /// without that check. See `docs/adr/receiver-gated-dispatch.md`.
     #[serde(default)]
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
+
+    /// Plugin pattern emissions deferred because a `ClassIsa` trigger
+    /// couldn't be confirmed against LOCAL-only ancestry at build (rule #1).
+    /// Re-fired by `enrich_imported_types_with_keys` when the package's
+    /// cross-file ancestry resolves a gate prefix — the emission analog of
+    /// `provisional_dispatches`. See `GatedEmission`.
+    #[serde(default)]
+    pub gated_emissions: Vec<GatedEmission>,
 
     /// Guard conditions recognized by the narrowing engine, recorded for the
     /// redundant/contradictory-guard diagnostics (D3/D4). Open-doc only in
@@ -4028,6 +4200,16 @@ pub struct FileAnalysis {
     /// `is_role_package`. Fed by the builder's open role-maker set.
     #[serde(default)]
     pub role_packages: HashSet<String>,
+
+    /// DBIC `__PACKAGE__->source_name('X')` override for this file's result
+    /// class — the registered SOURCE moniker when it differs from the class
+    /// basename. `None` = the moniker is the basename (the common case).
+    /// Consulted by `resolve_dbic_source_moniker` so a `resultset('X')`
+    /// whose `X` is a source_name (not a basename) still finds its class.
+    /// Per-file: the DBIC one-result-class-per-file convention makes this
+    /// unambiguous in practice.
+    #[serde(default)]
+    pub dbic_source_name: Option<String>,
 
     /// Method verbs whose first hashref arg is keyed by the receiver class's
     /// columns (DBIC `search`/`create`/…). The plugin-declared verb set, baked
@@ -4179,6 +4361,7 @@ pub struct FileAnalysisParts {
     pub witnesses: crate::witnesses::WitnessBag,
     pub package_framework: HashMap<String, crate::witnesses::FrameworkFact>,
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
+    pub gated_emissions: Vec<GatedEmission>,
     pub guard_sites: Vec<GuardSite>,
     pub arrow_deref_sites: Vec<ArrowDerefSite>,
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
@@ -4189,6 +4372,7 @@ pub struct FileAnalysisParts {
     pub contract_symbols: HashSet<SymbolId>,
     pub dynamic_parent_packages: HashSet<String>,
     pub role_packages: HashSet<String>,
+    pub dbic_source_name: Option<String>,
     pub column_keyed_verbs: HashSet<String>,
     pub dynamic_dispatch_sites: u32,
     pub plugin_loads: Vec<PluginLoadFact>,
@@ -4339,6 +4523,99 @@ struct FieldGroup {
     has_reader: bool,
 }
 
+/// Occurs-check + memo node for the `expr_type_at_span` ⇄
+/// `method_call_return_type_via_bag` mutual recursion. The pair hops
+/// across FileAnalysis instances (a chained cross-file return-type query
+/// re-enters the receiver's file) and mints a fresh `ReducerRegistry`
+/// query per hop, so the registry's own bag-keyed visited set never sees
+/// the repeat — only this outer guard can. Keyed by (FileAnalysis
+/// identity, span/ref) just as the registry keys on the bag pointer.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+enum ResolveNode {
+    /// `expr_type_at_span(span)` on a given FileAnalysis instance.
+    Expr(usize, Span),
+    /// `method_call_return_type_via_bag(ref_idx)` on a given instance.
+    MethodCall(usize, usize),
+}
+
+thread_local! {
+    /// Per-thread active-resolution stack (the occurs check). Rayon build
+    /// workers each own one; never a shared field (these are `&self`
+    /// methods).
+    static RESOLVE_STACK: std::cell::RefCell<Vec<ResolveNode>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Per-thread memo, alive only for the duration of one outermost
+    /// resolution (cleared when the stack drains). Collapses the
+    /// exponential re-computation of a node reached through many parents
+    /// in a dense cross-file return-type graph — the cycle guard bounds
+    /// *depth*, this bounds *work*. Within one outermost resolution the
+    /// FileAnalyses are immutable, so a node's answer is stable and safe
+    /// to reuse; on-path (cycle-blocked) answers are never memoized.
+    static RESOLVE_MEMO: std::cell::RefCell<HashMap<ResolveNode, Option<InferredType>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Depth backstop for a genuinely (non-cyclic) deep chain — the occurs
+/// check is the primary termination guarantee; this only guards the
+/// stack against a pathological linear descent.
+const RESOLVE_DEPTH_CAP: usize = 256;
+
+/// Entry cap on the stack-scoped memo. A dense workspace's reachable
+/// return-type graph is bounded by its ref count; this only fires on a
+/// pathological blow-up, degrading to recompute (still terminating via
+/// the occurs check) rather than growing unbounded.
+const RESOLVE_MEMO_CAP: usize = 50_000;
+
+/// RAII stack frame. `enter` returns `None` when `node` is already on
+/// the active stack (a return-type cycle → answer `None` instead of
+/// re-entering) or the depth cap is hit; otherwise pushes and pops on
+/// unwind. When the stack drains back to empty the memo is cleared, so
+/// it never outlives the outermost resolution.
+struct ResolveGuard;
+
+impl ResolveGuard {
+    fn enter(node: ResolveNode) -> Option<Self> {
+        RESOLVE_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            if st.len() >= RESOLVE_DEPTH_CAP || st.contains(&node) {
+                None
+            } else {
+                st.push(node);
+                Some(ResolveGuard)
+            }
+        })
+    }
+
+    /// Memo lookup for `node` — hits only survive within one outermost
+    /// resolution (the guard clears the map on drain).
+    fn memo_get(node: &ResolveNode) -> Option<Option<InferredType>> {
+        RESOLVE_MEMO.with(|m| m.borrow().get(node).cloned())
+    }
+
+    /// Record `node`'s resolved answer for reuse by later parents in this
+    /// same outermost resolution.
+    fn memo_put(node: ResolveNode, ty: Option<InferredType>) {
+        RESOLVE_MEMO.with(|m| {
+            let mut mm = m.borrow_mut();
+            if mm.len() < RESOLVE_MEMO_CAP {
+                mm.insert(node, ty);
+            }
+        });
+    }
+}
+
+impl Drop for ResolveGuard {
+    fn drop(&mut self) {
+        RESOLVE_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            st.pop();
+            if st.is_empty() {
+                RESOLVE_MEMO.with(|m| m.borrow_mut().clear());
+            }
+        });
+    }
+}
+
 impl FileAnalysis {
     /// Create a new FileAnalysis with indices built from the raw tables.
     /// `finalize_post_walk` runs on the builder path to seal baseline
@@ -4368,6 +4645,7 @@ impl FileAnalysis {
             mut witnesses,
             package_framework,
             provisional_dispatches,
+            gated_emissions,
             guard_sites,
             arrow_deref_sites,
             gated_param_types,
@@ -4378,6 +4656,7 @@ impl FileAnalysis {
             contract_symbols,
             dynamic_parent_packages,
             role_packages,
+            dbic_source_name,
             column_keyed_verbs,
             dynamic_dispatch_sites,
             plugin_loads,
@@ -4421,6 +4700,7 @@ impl FileAnalysis {
             base_witness_count: 0,
             base_ref_count: 0,
             provisional_dispatches,
+            gated_emissions,
             guard_sites,
             arrow_deref_sites,
             gated_param_types,
@@ -4431,6 +4711,7 @@ impl FileAnalysis {
             contract_symbols,
             dynamic_parent_packages,
             role_packages,
+            dbic_source_name,
             column_keyed_verbs,
             dynamic_dispatch_sites,
             plugin_loads,
@@ -4491,7 +4772,7 @@ impl FileAnalysis {
     /// index copy whose blob + relational rows are persisted — the refs twin
     /// of `evict_witness_bag`. Lossless: the on-disk analysis keeps the full
     /// vec; the backward walk retrieves candidates from the relational index
-    /// and rehydrates through `refs_present`. Touches no other pinned field.
+    /// and rehydrates through `whole_present`. Touches no other pinned field.
     /// Idempotent.
     pub fn evict_refs(&mut self) {
         self.refs = Vec::new();
@@ -4503,6 +4784,9 @@ impl FileAnalysis {
 
     /// True when `evict_refs` stripped this copy's refs: empty means "on
     /// disk, not resident", never "no references".
+    // Asserted by the eviction tests and read by the (currently unwired)
+    // `refs_present` seam; keep in step with `symbols_are_evicted`.
+    #[allow(dead_code)]
     pub fn refs_are_evicted(&self) -> bool {
         self.refs_evicted
     }
@@ -5310,6 +5594,28 @@ impl FileAnalysis {
         ref_idx: usize,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<InferredType> {
+        // Occurs check + stack-scoped memo for the mutual recursion with
+        // `expr_type_at_span` (the receiver chase re-enters it). A call
+        // ref already on the stack is a cross-file return-type cycle →
+        // answer None; one resolved earlier in this outermost query is
+        // reused (see `expr_type_at_span` for the exponential rationale).
+        let node = ResolveNode::MethodCall(self as *const Self as usize, ref_idx);
+        if let Some(hit) = ResolveGuard::memo_get(&node) {
+            return hit;
+        }
+        let Some(_guard) = ResolveGuard::enter(node) else {
+            return None;
+        };
+        let result = self.method_call_return_type_via_bag_uncached(ref_idx, module_index);
+        ResolveGuard::memo_put(node, result.clone());
+        result
+    }
+
+    fn method_call_return_type_via_bag_uncached(
+        &self,
+        ref_idx: usize,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
         use crate::witnesses::{
             FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
@@ -5354,23 +5660,58 @@ impl FileAnalysis {
             point: None,
             framework: FrameworkFact::Plain,
             arity_hint: None,
-            receiver,
+            receiver: receiver.clone(),
             args: Vec::new(),
             context: Some(&ctx),
         };
-        match reg.query(&self.witnesses, &q) {
-            ReducedValue::Type(t) => {
-                // If the return is FirstParam, surface it as the
-                // ClassName of the enclosing package — callers chain
-                // against a concrete class, not a role.
-                if let InferredType::FirstParam { package } = t {
-                    Some(InferredType::ClassName(package))
-                } else {
-                    Some(t)
-                }
-            }
+        let primary = match reg.query(&self.witnesses, &q) {
+            ReducedValue::Type(t) => Some(t),
             _ => None,
-        }
+        };
+        // Fallback for a chain receiver whose class the BUILDER couldn't
+        // pin (so `emit_method_call_return_edges` never emitted the
+        // `Expression → Edge(MethodOnClass{class, method})` for this
+        // call): resolve the method's return via the receiver's class at
+        // QUERY time. This is what lets a receiver-relative projection
+        // — `$rs->search({...})->first` (RowOf on the fluent-search
+        // result, class only known once the fluent chain resolves) —
+        // type the row without an intermediate variable. Only fires when
+        // the primary Expression query is empty AND the receiver's class
+        // is known, so ordinary calls (whose build edge already answered)
+        // are untouched.
+        let resolved = primary.or_else(|| {
+            let class = receiver.as_ref()?.class_name()?.to_string();
+            let method = crate::conventions::MethodToken::parse(
+                &self.refs[ref_idx].target_name,
+            )
+            .name()
+            .to_string();
+            let arity = self.refs[ref_idx].arg_count.map(|c| c as u32);
+            let moc = WitnessAttachment::MethodOnClass { class, name: method };
+            let mq = ReducerQuery {
+                attachment: &moc,
+                point: None,
+                framework: FrameworkFact::Plain,
+                arity_hint: arity,
+                receiver,
+                args: Vec::new(),
+                context: Some(&ctx),
+            };
+            match reg.query(&self.witnesses, &mq) {
+                ReducedValue::Type(t) => Some(t),
+                _ => None,
+            }
+        });
+        resolved.map(|t| {
+            // If the return is FirstParam, surface it as the ClassName of
+            // the enclosing package — callers chain against a concrete
+            // class, not a role.
+            if let InferredType::FirstParam { package } = t {
+                InferredType::ClassName(package)
+            } else {
+                t
+            }
+        })
     }
 
     /// Registry query against `Expr(span)` — the bag attachment the
@@ -5427,33 +5768,30 @@ impl FileAnalysis {
         span: Span,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<InferredType> {
-        // Depth backstop for the `expr_type_at_span` ⇄
-        // `method_call_return_type_via_bag` mutual recursion (the latter
-        // resolves a chained call's receiver by recursing here on the
-        // receiver's span). Spans shrink monotonically per hop, so a
-        // healthy chain bottoms out fast; this cap guards against a
-        // degenerate ref topology (overlapping same-span refs the
-        // builder can emit for route-branded chains) spinning the stack.
-        thread_local! {
-            static EXPR_SPAN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        // Occurs check + stack-scoped memo for the `expr_type_at_span` ⇄
+        // `method_call_return_type_via_bag` mutual recursion. A span
+        // already on the stack is a return-type cycle (A::foo's return
+        // depends on B->bar whose return depends on A->foo) → answer
+        // None; a span resolved earlier in this same outermost query is
+        // reused rather than recomputed (the graph is a dense DAG in mojo,
+        // so recomputation is exponential without the memo).
+        let node = ResolveNode::Expr(self as *const Self as usize, span);
+        if let Some(hit) = ResolveGuard::memo_get(&node) {
+            return hit;
         }
-        const EXPR_SPAN_DEPTH_CAP: u32 = 64;
-        let depth = EXPR_SPAN_DEPTH.with(|d| {
-            let n = d.get();
-            d.set(n + 1);
-            n
-        });
-        struct DepthGuard;
-        impl Drop for DepthGuard {
-            fn drop(&mut self) {
-                EXPR_SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-            }
-        }
-        let _guard = DepthGuard;
-        if depth >= EXPR_SPAN_DEPTH_CAP {
+        let Some(_guard) = ResolveGuard::enter(node) else {
             return None;
-        }
+        };
+        let result = self.expr_type_at_span_uncached(span, module_index);
+        ResolveGuard::memo_put(node, result.clone());
+        result
+    }
 
+    fn expr_type_at_span_uncached(
+        &self,
+        span: Span,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<InferredType> {
         // A call whose span IS this expression — its return type. The
         // exact-span match is what distinguishes "the value of
         // `$f->get_bar()->get_name()`" (the outer call's return) from
@@ -5796,6 +6134,123 @@ impl FileAnalysis {
         }
     }
 
+    /// Materialize deferred plugin pattern emissions ([`GatedEmission`])
+    /// whose `ClassIsa` gate is now satisfied CROSS-FILE. Called from
+    /// `enrich_imported_types_with_keys` after the symbol/ref/witness
+    /// truncation, so the re-fired content sits above the baselines and is
+    /// re-derived every enrichment cycle (idempotent). Deterministic: gate
+    /// resolution goes through `class_isa_prefix` (the single MRO seam), and
+    /// symbols are minted with positional `SymbolId`s exactly as the builder
+    /// would have — a file enriched late converges to one built with the
+    /// ancestry known. Rule #10: the "should this synthesis apply?" question
+    /// is answered by asking the ancestry graph, never by a shape branch.
+    fn apply_gated_emissions(&mut self, module_index: Option<&dyn CrossFileLookup>) {
+        if self.gated_emissions.is_empty() {
+            return;
+        }
+        use crate::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
+        // Snapshot: the borrow of `self.gated_emissions` can't overlap the
+        // `&mut self` symbol/ref/witness pushes below.
+        let emissions = std::mem::take(&mut self.gated_emissions);
+        for em in &emissions {
+            let fires = em.gate_prefixes.iter().any(|prefix| {
+                class_isa_prefix(&em.package, prefix, &self.package_parents, module_index)
+            });
+            if !fires {
+                continue;
+            }
+            let scope = self.scope_at(em.scope_point).unwrap_or(ScopeId(0));
+            let ns = Namespace::framework(em.plugin_id.clone());
+            for gs in &em.symbols {
+                let pkg = gs.on_class.clone().or_else(|| Some(em.package.clone()));
+                // Same dedup the builder's `apply_emit_action` runs: never
+                // stack a second identical synthesized symbol.
+                let dup = self.symbols.iter().any(|s| {
+                    s.name == gs.name
+                        && s.kind == gs.kind
+                        && s.package == pkg
+                        && s.namespace == ns
+                });
+                if dup {
+                    continue;
+                }
+                let id = SymbolId(self.symbols.len() as u32);
+                self.symbols.push(Symbol {
+                    id,
+                    name: gs.name.clone(),
+                    kind: gs.kind,
+                    span: gs.span,
+                    selection_span: gs.selection_span,
+                    scope,
+                    package: pkg.clone(),
+                    detail: gs.detail.clone(),
+                    namespace: ns.clone(),
+                    outline_label: None,
+                    attributes: Vec::new(),
+                    deref_stack: Vec::new(),
+                    arity: None,
+                });
+                if let Some(rt) = &gs.return_type {
+                    // Plugin-priority `Symbol(sid) → InferredType`, matching
+                    // the builder's Method emit. Class-scoped methods also get
+                    // the `MethodOnClass{class,name} → Edge(Symbol(sid))`
+                    // mirror the fold writeback would have pushed, so cross-
+                    // file return-type queries resolve the relationship shape.
+                    self.witnesses.push(Witness {
+                        attachment: WitnessAttachment::Symbol(id),
+                        source: WitnessSource::Plugin(em.plugin_id.clone()),
+                        payload: WitnessPayload::InferredType(rt.clone()),
+                        span: gs.span,
+                    });
+                    if matches!(gs.kind, SymKind::Method | SymKind::Sub) {
+                        if let Some(class) = &pkg {
+                            self.witnesses.push(Witness {
+                                attachment: WitnessAttachment::MethodOnClass {
+                                    class: class.clone(),
+                                    name: gs.name.clone(),
+                                },
+                                source: WitnessSource::Plugin(em.plugin_id.clone()),
+                                payload: WitnessPayload::Edge(WitnessAttachment::Symbol(id)),
+                                span: gs.span,
+                            });
+                        }
+                    }
+                }
+            }
+            for gr in &em.refs {
+                self.refs.push(Ref {
+                    kind: gr.kind.clone(),
+                    span: gr.span,
+                    scope,
+                    target_name: gr.target_name.clone(),
+                    access: gr.access,
+                    resolves_to: None,
+                    resolved_method_target: None,
+                    folded_from: None,
+                    arg_count: None,
+                });
+            }
+        }
+        self.gated_emissions = emissions;
+    }
+
+    /// Materialize deferred gated emissions into a WORKSPACE-resident cached
+    /// copy, standalone (not inside the full enrichment pass). Used by the
+    /// index-completion pass so `whole_present` — the view every cross-file
+    /// goto-def / references reader consults — sees a DBIC result class's
+    /// synthesized accessors WITHOUT paying the per-query enriched overlay.
+    /// Idempotent: `apply_gated_emissions` dedups against existing symbols, so
+    /// a second call is a no-op; the emissions sit above `base_symbol_count`
+    /// and a later full enrichment re-derives them the same way. Rebuilds the
+    /// name/scope indices so `symbols_named` / `sub_info_view` find them.
+    pub fn materialize_gated_emissions(&mut self, module_index: &dyn CrossFileLookup) {
+        if self.gated_emissions.is_empty() {
+            return;
+        }
+        self.apply_gated_emissions(Some(module_index));
+        self.rebuild_enrichment_indices();
+    }
+
     pub fn enrich_imported_types_with_keys(
         &mut self,
         module_index: Option<&dyn CrossFileLookup>,
@@ -5812,6 +6267,13 @@ impl FileAnalysis {
         // query time (`applicable_dispatches`), so a `$minion->enqueue('T')`
         // surfaces by the receiver's type whether or not its file is open.
         // See `docs/adr/receiver-gated-dispatch.md`.
+
+        // Re-fire plugin pattern emissions whose `ClassIsa` trigger the
+        // build couldn't confirm against LOCAL ancestry (DBIC result classes
+        // reaching `DBIx::Class` through a cross-file intermediate base).
+        // Runs first so the synthesized symbols exist for the rest of the
+        // pass and the final `rebuild_enrichment_indices`. See `GatedEmission`.
+        self.apply_gated_emissions(module_index);
 
         // Loader-config param typing: join my `loader_config_params`
         // markers with caller-side `PluginLoad` facts across the index.
@@ -6801,9 +7263,25 @@ impl FileAnalysis {
                 matches!(s.kind, SymKind::Sub | SymKind::Method) && self.symbol_in_class(s.id, cls)
             })
             .map(|m| m.scope);
+        // A bodiless method DECLARATION (`void f(int arg1, int arg2);`) or a
+        // function-pointer typedef (`using F = void(*)(void* arg1)`) carries no
+        // `@scope.sub` body, so its parameters land directly on the class body
+        // scope with the sticky class package — indistinguishable from a data
+        // member by scope/kind alone (they're `Variable`, like inline-union
+        // members we DO want). A parameter's selection span sits inside a
+        // recorded parameter-list region; that's the value-borne discriminator
+        // (same idiom the use-after-move param check uses).
+        let contains = |outer: &Span, inner: &Span| {
+            (outer.start.row, outer.start.column) <= (inner.start.row, inner.start.column)
+                && (inner.end.row, inner.end.column) <= (outer.end.row, outer.end.column)
+        };
         for sym in &self.symbols {
             if matches!(sym.kind, SymKind::Variable | SymKind::Field)
                 && self.symbol_in_class(sym.id, cls)
+                && !self
+                    .param_regions
+                    .iter()
+                    .any(|pr| contains(pr, &sym.selection_span))
                 // the class body itself, or a nested container body inside it
                 // (an inline union's members complete flat on the struct) —
                 // but never a method body (its locals carry the sticky class
@@ -7382,9 +7860,14 @@ impl FileAnalysis {
         }
         // Access-specifier gate: visible from outside
         // `class_name`'s own body only when NOT tagged non-public.
+        // Callability gate on the same closure so every enumeration loop in
+        // this walk (local, plugin-namespace, cross-file) shares it: an
+        // anonymous sub (`*__HM_DEDUP = sub () {0}`) is a symbol in the
+        // class but not a name a method call can ever spell.
         let visible = |sym: &Symbol| {
-            requesting_class == Some(class_name)
-                || !sym.attributes.iter().any(|a| a == "non_public")
+            crate::conventions::is_callable_sub_name(&sym.name)
+                && (requesting_class == Some(class_name)
+                    || !sym.attributes.iter().any(|a| a == "non_public"))
         };
 
         // Local methods in this class
@@ -8206,10 +8689,17 @@ impl FileAnalysis {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => {
                     // Check if this variable is also a dynamic method call target
-                    // (e.g. $self->$method() where $method is a known constant)
+                    // (e.g. $self->$method() where $method is a known constant).
+                    // Gate on the METHOD-NAME token span, not the whole call span:
+                    // a multi-line chain's MethodCall ref spans the entire
+                    // expression, so `mr.span` contains the head invocant too —
+                    // hovering `$schema` at the head of a chain would wrongly
+                    // return the tail method's POD. The dynamic-dispatch method
+                    // token IS this variable, so the point lands in
+                    // `method_name_span` only for the genuine case.
                     let method_hover = self.refs.iter()
-                        .find(|mr| matches!(mr.kind, RefKind::MethodCall { .. })
-                            && contains_point(&mr.span, point)
+                        .find(|mr| matches!(&mr.kind, RefKind::MethodCall { method_name_span, .. }
+                                if contains_point(method_name_span, point))
                             && mr.target_name != r.target_name);
                     if let Some(mr) = method_hover {
                         if matches!(mr.kind, RefKind::MethodCall { .. }) {
@@ -9762,6 +10252,22 @@ impl FileAnalysis {
         r: &Ref,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
+        let cn = self.method_call_invocant_class_raw(r, module_index)?;
+        // A DBIC resultset row projects to `ClassName(<source moniker>)` —
+        // the short registration name (`Artist`), not the FQ result class
+        // (`DBICTest::Schema::Artist`) where methods/columns live. Resolve
+        // it here (query time, index in hand) so goto-def / references on
+        // `$row->method` start the ancestor walk from a real class. Only a
+        // single-segment name that names no real class is a moniker
+        // candidate, so ordinary class receivers are untouched.
+        Some(self.resolve_dbic_source_moniker(cn, None, module_index))
+    }
+
+    fn method_call_invocant_class_raw(
+        &self,
+        r: &Ref,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Option<String> {
         let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
             return None;
         };
@@ -9935,6 +10441,129 @@ impl FileAnalysis {
         }
 
         Some(invocant.to_string())
+    }
+
+    /// Resolve a DBIC source moniker (`Artist`) to the FQ result class
+    /// (`DBICTest::Schema::Artist`). DBIC's `$schema->resultset('Artist')`
+    /// names a row by its registered SOURCE moniker — by convention the
+    /// basename of a result class registered under a schema
+    /// (`load_classes`/`load_namespaces`), or its `source_name` override.
+    /// The row projection (`->find`/`->first`/`->create`) types the value
+    /// as `ClassName(moniker)`, which is not a real class; this maps it
+    /// back so downstream method/column resolution works.
+    ///
+    /// The convention (moniker = last `::` segment / source_name) is DBIC
+    /// knowledge, resolved GENERICALLY here via the cross-file index: a
+    /// candidate is any indexed class that (a) is a DBIC result class
+    /// (transitively isa `DBIx::Class`) and (b) whose basename or declared
+    /// `source_name` equals the moniker. When several match, `schema_hint`
+    /// (the receiver's concrete schema class, when known) scopes to sources
+    /// under it; otherwise the largest source family wins (the workspace's
+    /// primary schema), lexicographic tie-break. The residual — picking a
+    /// source when the `$schema` value is untyped — is the value-provenance
+    /// fork logged in `docs/open-forks.md`.
+    ///
+    /// `cn` passes through unchanged unless it is a single-segment name
+    /// that names no known class (the only moniker shape), so ordinary
+    /// receivers pay only a `class_exists` check.
+    pub(crate) fn resolve_dbic_source_moniker(
+        &self,
+        cn: String,
+        schema_hint: Option<&str>,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> String {
+        if cn.contains("::") {
+            return cn;
+        }
+        let Some(mi) = module_index else { return cn };
+        if self.class_exists(&cn, module_index) {
+            return cn;
+        }
+        // Gather candidate result classes by basename / source_name match.
+        let mut candidates: Vec<String> = Vec::new();
+        mi.for_each_cached(&mut |name, cached| {
+            let basename = name.rsplit("::").next().unwrap_or(name);
+            let hits = basename == cn
+                || cached.analysis.dbic_source_name.as_deref() == Some(cn.as_str());
+            if hits && Self::class_is_dbic_result(name, mi) {
+                candidates.push(name.to_string());
+            }
+        });
+        if candidates.is_empty() {
+            return cn;
+        }
+        // Scope to the receiver's schema when it is a concrete schema whose
+        // namespace actually contains matches.
+        if let Some(sch) = schema_hint {
+            let scoped: Vec<String> = candidates
+                .iter()
+                .filter(|c| c.starts_with(&format!("{sch}::")))
+                .cloned()
+                .collect();
+            if !scoped.is_empty() {
+                candidates = scoped;
+            }
+        }
+        if candidates.len() == 1 {
+            return candidates.into_iter().next().unwrap();
+        }
+        // Ambiguous: prefer the candidate in the largest source family
+        // (the parent namespace shared by the most indexed classes — a
+        // proxy for the workspace's primary schema), lexicographic tie.
+        // Family sizes precomputed in ONE index sweep before the sort —
+        // the comparator otherwise called `for_each_cached` per comparison.
+        let prefixes: Vec<(String, String)> = candidates
+            .iter()
+            .map(|c| {
+                let parent = c.rsplit_once("::").map(|(p, _)| p).unwrap_or(c);
+                (c.clone(), format!("{parent}::"))
+            })
+            .collect();
+        let mut fam_size: HashMap<String, usize> =
+            candidates.iter().map(|c| (c.clone(), 0usize)).collect();
+        mi.for_each_cached(&mut |name, _| {
+            for (cand, prefix) in &prefixes {
+                if name.starts_with(prefix) {
+                    *fam_size.get_mut(cand).unwrap() += 1;
+                }
+            }
+        });
+        candidates.sort_by(|a, b| fam_size[b].cmp(&fam_size[a]).then_with(|| a.cmp(b)));
+        candidates.into_iter().next().unwrap()
+    }
+
+    /// Is `class` a DBIC result class — transitively `isa DBIx::Class`
+    /// (through the cross-file parent graph) but NOT itself a schema or
+    /// resultset base? Depth-capped like the MRO walk. Used to gate
+    /// source-moniker resolution so a stray same-basename non-DBIC class
+    /// can't be mistaken for a row source.
+    fn class_is_dbic_result(class: &str, mi: &dyn CrossFileLookup) -> bool {
+        // A result class descends from DBIx::Class::Core / ::Row (the
+        // row-behavior roots), never from ::Schema or ::ResultSet. The
+        // Core/Row `Hit` is captured (not short-circuited) because a later
+        // ::Schema/::ResultSet ancestor must still be able to disqualify;
+        // `Reject` short-circuits that negative, and `rejected` distinguishes
+        // it from plain exhaustion. Deliberately cross-file-only (no local
+        // `package_parents` seam), depth-capped tighter than the isa walkers.
+        let mut isa_dbic = false;
+        let mut rejected = false;
+        walk_ancestry(
+            class,
+            40,
+            |c| mi.parents_cached(c),
+            |c| {
+                if c == "DBIx::Class::Core" || c == "DBIx::Class::Row" {
+                    isa_dbic = true;
+                    WalkVerdict::Miss
+                } else if c == "DBIx::Class::Schema" || c == "DBIx::Class::ResultSet" {
+                    rejected = true;
+                    WalkVerdict::Reject
+                } else {
+                    WalkVerdict::Miss
+                }
+            },
+        );
+        isa_dbic && !rejected
     }
 
     /// Resolve a plugin-bridged invocant *class key* to the workspace class
@@ -10112,6 +10741,38 @@ impl FileAnalysis {
             }
         }
         None
+    }
+
+    /// The class of the method enclosing `point` — the implicit-`this` class
+    /// for a bare member access in a method body. Read off the innermost
+    /// containing Sub/Method SYMBOL's package (not the body scope): an
+    /// out-of-line body (`Status DBImpl::Recover(...) { ... }`) is lexically at
+    /// file scope, so its body scope carries no package, but the peeled method
+    /// symbol does — reading it off the symbol covers in-class AND out-of-line
+    /// with one rule (the same seam `emit_return_fuel`'s sibling-call pin uses).
+    pub(crate) fn implicit_receiver_class_at(&self, point: Point) -> Option<String> {
+        self.symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Method | SymKind::Sub))
+            .filter(|s| contains_point(&s.span, point))
+            .min_by_key(|s| span_size(&s.span))
+            .and_then(|s| s.package.clone())
+    }
+
+    /// Is `name` a genuine LOCAL variable declaration (param or `Type x = …`)
+    /// visible at `point` — as opposed to a bare implicit-`this` member? A
+    /// member write (`prog_ = f()`, no declarator) mints flow witnesses but no
+    /// Variable SYMBOL, so the presence of a scope-visible Variable symbol is
+    /// the discriminator: a member never has one. Used to route receiver typing
+    /// — a local trusts its (flow-narrowed) value; a member resolves on the
+    /// enclosing class, dodging the phantom-local flow witnesses a member's
+    /// reassignment leaves behind.
+    pub(crate) fn has_local_variable_at(&self, name: &str, point: Point) -> bool {
+        let Some(scope) = self.scope_at(point) else { return false };
+        let chain = self.scope_chain(scope);
+        self.symbols.iter().any(|s| {
+            matches!(s.kind, SymKind::Variable) && s.name == name && chain.contains(&s.scope)
+        })
     }
 
     /// Test-only wrapper over the private `resolve_invocant_class`.
@@ -10340,6 +11001,20 @@ impl FileAnalysis {
             std::ops::ControlFlow::Continue(())
         });
         // Root + all transitive descendants (`walk` excludes the origin).
+        self.descendant_family(root, module_index)
+    }
+
+    /// A root class plus every transitive descendant that inherits from it,
+    /// over PROVEN inheritance edges only (`GraphView`'s `INHERITS_INV`
+    /// walk, which excludes the origin — re-added as the family head).
+    /// The shared descendant-walk tail of `method_override_family` and
+    /// `owned_accessor_family`; the two differ only in how they choose the
+    /// root (contract-root search UP vs the owning class itself).
+    fn descendant_family(
+        &self,
+        root: String,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
         let mut family = vec![root.clone()];
         let graph = crate::graph::GraphView::new(self, module_index);
         graph.walk(
@@ -10355,6 +11030,26 @@ impl FileAnalysis {
             },
         );
         family
+    }
+
+    /// The rename family for a class-OWNED synthesized accessor (a Moo `has`
+    /// reader, a DBIC column/relationship accessor): the owning class plus
+    /// every transitive descendant that inherits it. Unlike
+    /// `method_override_family`, it never searches UPWARD for a contract
+    /// root — a synthesized accessor is owned by its declaring class, and a
+    /// same-named method in a framework ancestor (`DBIx::Class::PK::id` vs a
+    /// synthesized `id` column) is a name collision, not the same symbol.
+    /// Rooting at that ancestor would fan the rename across every unrelated
+    /// sibling subclass of it (rule #10: gate on the owner axis, never the
+    /// bare name). The declaring class is already resolved by
+    /// `attr_group_via_ancestors` before the group is minted, so `class_name`
+    /// is the true owner even when the cursor sat on an inheriting subclass.
+    pub fn owned_accessor_family(
+        &self,
+        class_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<String> {
+        self.descendant_family(class_name.to_string(), module_index)
     }
 
     pub fn method_rename_chain(
@@ -10455,6 +11150,14 @@ impl FileAnalysis {
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
                 }
+                // A cross-file DBIC result class's column/relationship accessors
+                // are DEFERRED plugin emissions (`gated_emissions`) that the raw
+                // cached copy doesn't carry. They are MATERIALIZED into the whole
+                // cached copy at index completion
+                // (`ModuleIndex::materialize_gated_emissions`), so the
+                // `has_member` check above already sees them — no per-query
+                // enrichment hop here (that nested a full enrichment per hop and
+                // overflowed the stack on deep dep graphs). See `GatedEmission`.
             }
             // Cross-package typeglob install: the method is attributed to `cls`
             // but lives in a differently-named module file (`*{'DateTime::'.
@@ -12064,6 +12767,9 @@ impl FileAnalysis {
         self.symbols
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+            // An anonymous sub (name `(anon)`) has no callable name — never a
+            // method candidate. Gate on callability, not the `(anon)` spelling.
+            .filter(|s| crate::conventions::is_callable_sub_name(&s.name))
             .filter(|s| !s.namespace.is_framework())
             .filter(|s| seen.insert(s.name.clone()))
             .map(|s| CompletionCandidate {
@@ -12314,7 +13020,9 @@ impl FileAnalysis {
 
         // Subs
         for sym in &self.symbols {
-            if matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            if matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                && crate::conventions::is_callable_sub_name(&sym.name)
+            {
                 candidates.push(CompletionCandidate {
                     label: sym.name.clone(),
                     kind: sym.kind,
