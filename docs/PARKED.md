@@ -82,6 +82,23 @@ marked otherwise; the drain re-derived each rationale against current code.
   roots, rejects `::Schema`/`::ResultSet`) that a prefix test cannot; a
   schema class is a DBIx::Class descendant but not a result class.
   [recorded 2026-07-17]
+- **Two boolean pack-capability askers** (`language_has_include_tokens`,
+  `language_has_preprocessor` — backend.rs): identical body shape, fine at
+  two per the rule of three. The THIRD boolean capability asker is the
+  tripwire: collapse to a generic `pack_cap(lang, sel)` then. [recorded
+  2026-07-19, tighten-4 audit]
+- **Three byte-capped LRU eviction cores** (PackBagCache plain; enrichment
+  overlay adds entry-count cap; GatherCache adds single-flight condvar):
+  shared discipline (`evict_to_cap`, never-evict-just-inserted), genuinely
+  different surrounding contracts — forced unification would
+  over-parameterize. Strongest DRY signal on the books; re-examine only if
+  a FOURTH appears. [recorded 2026-07-19]
+- **Deleted-path canonicalization fallback** (`forget_source_gen` /
+  `unregister_file` use `canonicalize().unwrap_or(path)`; `remove_surface`
+  reconstructs via parent-dir + filename): a delete under a symlinked
+  parent leaves a stale entry (one i64 / one registration). Pre-existing
+  shared convention, no new hazard class; consistency nit — route all
+  three through the reconstruction if ever touched. [recorded 2026-07-19]
 - **`RESOLVE_MEMO` vs `PackBagCache`**: same surface shape ("cache of
   computed values"), OPPOSITE contracts — thread-local stack-scoped
   correctness memo cleared on resolve-stack drain vs long-lived
