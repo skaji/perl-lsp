@@ -16,7 +16,6 @@ designs live in `docs/prompt-storage-residuals.md`.
 | Fork | Since | The question |
 | --- | --- | --- |
 | [Answer honesty under index/enrichment windows](#answer-honesty-under-indexenrichment-windows--2026-07-14--open-claude) | 07-14 | which verbs block for honest answers vs stay fast-best-effort — now that honest cold references costs ~27 s on abseil? |
-| [Pack first-change diagnostics](#pack-first-change-diagnostics-fast-degraded-now-vs-correct-but-delayed--2026-07-15--open) | 07-15 | is stale-but-fast the right default for the first change after a cold open? |
 | [Decl→def ranking on QUALIFIED / member goto-def](#decldef-ranking-on-qualified--member-goto-def--2026-07-15--open-claude) | 07-15 | should qualified goto-def rank def-over-decl, via the shared seam (B) or a local patch (A)? |
 | [Cross-file gated-emission visibility](#cross-file-gated-emission-visibility--2026-07-17--open-claude) | 07-17 | how do cross-file readers see a DBIC result class's deferred accessors — index-time materialize (picked) vs a per-query enriched overlay? |
 
@@ -82,34 +81,6 @@ Format per entry:
   don't read the cross-file closure, and blocking them behind a gather
   they don't need would regress open→outline latency.
 
-## Pack first-change diagnostics: fast-degraded-now vs correct-but-delayed — 2026-07-15 — OPEN
-- **Context:** edit-bench P1 (bench/RESULTS.md). The first didChange on a
-  cold-opened C++ file published diagnostics in ~24 s (warm 193 ms). Root
-  cause: `spawn_debounced_rebuild` ran the pack analyze with the cross-file
-  GATHER enabled, so the first keystroke after a cold open paid the whole
-  cold gather synchronously inside the debounce task — and did_open's
-  background `spawn_pack_gather_refresh` couldn't warm it because that task
-  bails once the buffer text changes.
-- **Options:** A — first change rebuilds CACHED-ONLY (instant, degraded
-  diagnostics), then a background gather refresh heals full-quality
-  diagnostics when the cold gather lands (the same async-refresh did_open
-  uses). B — share the in-flight open gather via a per-URI completion token
-  and have the change path await it (correct diagnostics, but the first
-  change still waits ~24 s and the token/registry is new shared state).
-- **Picked:** A. Loosest-coupled: reuses the existing
-  `set_gather_cached_only` thread-local and `spawn_pack_doc_refresh` heal;
-  no new shared state, no cross-task handshake. The change path is symmetric
-  with the open path. Cost: the first change's diagnostics are DEGRADED
-  (cached-only macro table) for the ~24 s until the background gather warms
-  the shared `pre_expanded_cache`; every rebuild after that is fast AND
-  full-quality (cache hit). One redundant cold gather can run (did_open's G0
-  bails, the change's heal G1 recomputes) — bounded, warm-cache-idempotent.
-- **Undo cost:** trivial to revert to B's shape — drop the cached-only
-  wrap + heal spawn, add a shared token; the seam is one function.
-- **Discussion needed:** is stale-but-fast the right default for pack
-  first-change, or should the first change block on correct diagnostics?
-  If a shared-gather token is wanted anyway (to also kill the redundant
-  double gather), that's the B upgrade — additive on top of A.
 
 ## Decl→def ranking on QUALIFIED / member goto-def — 2026-07-15 — OPEN (Claude)
 - **Context:** the C-tier bench finding "C goto-def stops at the header

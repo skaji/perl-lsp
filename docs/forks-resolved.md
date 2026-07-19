@@ -605,3 +605,45 @@ and lose the type-carrying edges the witness bag already has (`graph.rs`
 derives edges on demand). Net more bookkeeping, not less; the typed-edge
 `GraphView` is the better generalization. Revisit only if stack graphs
 gain value/type-flow semantics AND an upstream Perl TSG definition ships.
+
+## Pack first-change diagnostics: fast-degraded-now vs correct-but-delayed — 2026-07-15 — RATIFIED 2026-07-17 (veesh)
+- **Context:** edit-bench P1 (bench/RESULTS.md). The first didChange on a
+  cold-opened C++ file published diagnostics in ~24 s (warm 193 ms). Root
+  cause: `spawn_debounced_rebuild` ran the pack analyze with the cross-file
+  GATHER enabled, so the first keystroke after a cold open paid the whole
+  cold gather synchronously inside the debounce task — and did_open's
+  background `spawn_pack_gather_refresh` couldn't warm it because that task
+  bails once the buffer text changes.
+- **Options:** A — first change rebuilds CACHED-ONLY (instant, degraded
+  diagnostics), then a background gather refresh heals full-quality
+  diagnostics when the cold gather lands (the same async-refresh did_open
+  uses). B — share the in-flight open gather via a per-URI completion token
+  and have the change path await it (correct diagnostics, but the first
+  change still waits ~24 s and the token/registry is new shared state).
+- **Picked:** A. Loosest-coupled: reuses the existing
+  `set_gather_cached_only` thread-local and `spawn_pack_doc_refresh` heal;
+  no new shared state, no cross-task handshake. The change path is symmetric
+  with the open path. Cost: the first change's diagnostics are DEGRADED
+  (cached-only macro table) for the ~24 s until the background gather warms
+  the shared `pre_expanded_cache`; every rebuild after that is fast AND
+  full-quality (cache hit). One redundant cold gather can run (did_open's G0
+  bails, the change's heal G1 recomputes) — bounded, warm-cache-idempotent.
+- **Undo cost:** trivial to revert to B's shape — drop the cached-only
+  wrap + heal spawn, add a shared token; the seam is one function.
+- **Discussion needed:** is stale-but-fast the right default for pack
+  first-change, or should the first change block on correct diagnostics?
+  If a shared-gather token is wanted anyway (to also kill the redundant
+  double gather), that's the B upgrade — additive on top of A.
+- **Ruling (veesh, 2026-07-17):** A stands — degraded immediate is the right
+  default — WITH an LSP-visible notification that indexing/gather is still
+  loading (work-done progress or equivalent; the degraded window must be
+  announced, not silent). The shared-gather token (B's machinery) is NOT
+  excluded: wanted as the additive upgrade that kills the redundant double
+  gather and single-flights concurrent gathers — it just never blocks the
+  change path.
+- **Follow-ups commissioned:** (1) first-change degraded window announces
+  itself via progress/notification; (2) per-URI single-flight gather token,
+  additive on A; (3) Chromium-scale editing-during-cold-gather storm
+  mitigations assessed (abandoned-heal churn, save-during-index invalidation
+  cone, pre-expanded-cache cap thrash) — see the slice brief of 2026-07-17.
+
