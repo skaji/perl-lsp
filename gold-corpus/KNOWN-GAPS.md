@@ -215,7 +215,7 @@ namespace reopenings attribute. Two xfail rows remain open:
 | `cpp-hitlist-marker-macro-outline` | a bodyless marker `#define` (`FMT_HEADER_ONLY`) still appears as an outline Variable; the class after it extracts fine — pure outline noise |
 | `cpp-svmacrotag-cross-file-goto-def` / `cpp-svmacrotag-cross-file-completion` | **macro-named struct tag, cross-file** (perl5 sv.h: `#define STRUCT_SV sv` then `struct STRUCT_SV {...}`). The struct is DEFINED in a header with no `STRUCT_SV` macro in scope → its symbol is named `STRUCT_SV`. A using file that DOES have the macro in scope expands a `struct STRUCT_SV *` receiver to `struct sv`, so the tag lookup misses and member gd/completion go dark. General cross-file macro-named-tag asymmetry (reproduces on a plain struct too — not member-block-specific; the member-block edge itself attaches correctly, names matching). The `SV`-typedef path is unaffected, so the daily-driver `SV *sv; sv->sv_flags` resolves — only the raw `struct STRUCT_SV *` spelling is dark. Fix needs tag-name canonicalization across the macro alias (register the struct under both spellings, or resolve the receiver's tag through known object-like macros). |
 
-**hitlist-7 note (out-of-line members):** out-of-line definition extraction
+**Out-of-line members:** out-of-line definition extraction
 now handles the declarator/qualifier shapes the narrow patterns dropped —
 pointer/reference returns (`Regexp* Regexp::Simplify()`), multi-level
 qualifiers (`Prog::Inst::InitAlt`, 3-level `Prefilter::Info::Walker::

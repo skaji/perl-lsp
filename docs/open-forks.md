@@ -120,7 +120,7 @@ Format per entry:
 ---
 
 ## Cross-file gated-emission visibility — 2026-07-17 — OPEN (Claude)
-- **Context:** H7-5 (`docs/hitlist-7.md`). A `ClassIsa` plugin trigger
+- **Context:** H7-5. A `ClassIsa` plugin trigger
   (DBIC `has_many`/`add_columns` synthesis) can't fire at build for a result
   class whose `isa DBIx::Class` route runs through a cross-file intermediate
   base (rule #1: index-free builder). The build records the emission as a
@@ -190,7 +190,7 @@ Format per entry:
 ---
 
 ## DBIC source-moniker disambiguation without a typed `$schema` — 2026-07-17 — OPEN (Claude)
-- **Context:** H7-15 (`docs/hitlist-7.md`). `$schema->resultset('Artist')`
+- **Context:** H7-15. `$schema->resultset('Artist')`
   names a row by its DBIC SOURCE MONIKER (`Artist`), not the FQ result class
   (`DBICTest::Schema::Artist`). `resolve_dbic_source_moniker`
   (`file_analysis.rs`) resolves it at query time: a candidate is any indexed
