@@ -6,6 +6,14 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+## v0.6.1 - 2026-07-20
+
+### No linked-editing
+
+- linked editing is no longer a capability advertised by the server; turns out the DX is
+  bad since the feature is far too agressive when on by default (prevents having variables
+  with shared prefixes). 
+
 ## v0.6.0 — 2026-07-05
 
 ### Type narrowing

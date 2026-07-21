@@ -174,7 +174,6 @@ PERL5LIB=./my-libs/perl5 nvim lib/MyApp.pm
 | **Highlights** | Read/write distinction |
 | **Selection range** | Tree-sitter node hierarchy |
 | **Folding** | Blocks, subs, classes, POD |
-| **Linked editing** | Simultaneous editing of references in scope |
 
 ### POD Documentation
 
