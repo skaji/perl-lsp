@@ -9,6 +9,7 @@ use tower_lsp::{Client, LanguageServer};
 use crate::lsp::cursor_slot::identifier_prefix;
 use crate::index::file_store::{FileKey, FileStore};
 use crate::index::module_index::ModuleIndex;
+use crate::lsp::perl_compile;
 use crate::lsp::symbols;
 
 mod completion;
@@ -79,6 +80,9 @@ pub struct Backend {
     client: Client,
     files: Arc<FileStore>,
     module_index: Arc<ModuleIndex>,
+    /// Last successful `perl -c` result for each open Perl file. These
+    /// diagnostics are merged into every diagnostics publication path.
+    compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>>,
     /// Per-document rebuild debounce (`DebouncedLatest`): each `did_change`
     /// fires it, and only the fire that survives the settle window rebuilds —
     /// so a burst of keystrokes triggers ONE analysis (~0.7s on a big
@@ -246,6 +250,7 @@ struct PackHealCtx {
     module_index: Arc<ModuleIndex>,
     client: Client,
     options: symbols::DiagnosticOptions,
+    compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>>,
     degraded_open: Arc<dashmap::DashMap<Url, Arc<ReadyGate>>>,
     degraded_progress: Arc<dashmap::DashMap<Url, NumberOrString>>,
     gather_reg: Arc<GatherRegistry>,

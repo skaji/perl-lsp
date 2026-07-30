@@ -147,6 +147,7 @@ impl Backend {
             module_index: Arc::clone(&self.module_index),
             client: self.client.clone(),
             options: self.diagnostic_options(),
+            compile_diagnostics: Arc::clone(&self.compile_diagnostics),
             degraded_open: Arc::clone(&self.degraded_open),
             degraded_progress: Arc::clone(&self.degraded_progress),
             gather_reg: Arc::clone(&self.gather_reg),
@@ -161,6 +162,8 @@ impl Backend {
         // Two-phase init: create ModuleIndex whose refresh callback references
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
         let diag_options = Arc::new(std::sync::Mutex::new(symbols::DiagnosticOptions::default()));
+        let compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>> =
+            Arc::new(dashmap::DashMap::new());
 
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -170,6 +173,7 @@ impl Backend {
             Arc::clone(&files),
             Arc::clone(&module_index_holder),
             Arc::clone(&diag_options),
+            Arc::clone(&compile_diagnostics),
         );
 
         let module_index = Arc::new(ModuleIndex::new(client.clone(), on_refresh));
@@ -179,6 +183,7 @@ impl Backend {
             module_index,
             client,
             files,
+            compile_diagnostics,
             change_debounce: Arc::new(dashmap::DashMap::new()),
             diag_debounce: Arc::new(dashmap::DashMap::new()),
             perl_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -195,6 +200,48 @@ impl Backend {
             degraded_open: Arc::new(dashmap::DashMap::new()),
             degraded_progress: Arc::new(dashmap::DashMap::new()),
             gather_reg: Arc::new(GatherRegistry::default()),
+        }
+    }
+
+    fn workspace_root_path(&self) -> Option<PathBuf> {
+        let root = self.module_index.workspace_root()?;
+        Url::parse(&root).ok()?.to_file_path().ok()
+    }
+
+    /// Refresh the saved-file `perl -c` diagnostics for one open Perl file.
+    /// The cache is cleared for non-Perl files and whenever the subprocess
+    /// cannot produce a trustworthy result.
+    pub(super) async fn update_compile_diagnostics(&self, uri: &Url) {
+        let Some((text, language)) = self
+            .files
+            .get_open(uri)
+            .map(|doc| (doc.text.clone(), doc.language))
+        else {
+            self.compile_diagnostics.remove(uri);
+            return;
+        };
+        if language != "perl" {
+            self.compile_diagnostics.remove(uri);
+            return;
+        }
+        let Ok(path) = uri.to_file_path() else {
+            self.compile_diagnostics.remove(uri);
+            return;
+        };
+        let workspace_root = self.workspace_root_path();
+        let include_paths = perl_compile::workspace_include_paths(workspace_root.as_deref());
+
+        match perl_compile::check(&path, &text, &include_paths).await {
+            Ok(diagnostics) if diagnostics.is_empty() => {
+                self.compile_diagnostics.remove(uri);
+            }
+            Ok(diagnostics) => {
+                self.compile_diagnostics.insert(uri.clone(), diagnostics);
+            }
+            Err(error) => {
+                log::warn!("perl -c skipped for {}: {}", uri, error);
+                self.compile_diagnostics.remove(uri);
+            }
         }
     }
 
@@ -333,6 +380,7 @@ impl Backend {
             module_index: Arc::clone(&self.module_index),
             client: self.client.clone(),
             options: self.diagnostic_options(),
+            compile_diagnostics: Arc::clone(&self.compile_diagnostics),
             perl_indexed: Arc::clone(&self.perl_indexed),
             index_ready: Arc::clone(&self.index_ready),
         }
@@ -400,6 +448,7 @@ pub(super) struct DiagCtx {
     module_index: Arc<ModuleIndex>,
     client: Client,
     options: symbols::DiagnosticOptions,
+    compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>>,
     perl_indexed: Arc<std::sync::atomic::AtomicBool>,
     index_ready: Arc<IndexReady>,
 }
@@ -470,7 +519,7 @@ impl DiagCtx {
     pub(super) async fn publish(&self, uri: &Url) {
         crate::util::ghost_stats::count("publish_diagnostics");
         let language = self.files.get_open(uri).map(|d| d.language);
-        let diagnostics = match language {
+        let mut diagnostics = match language {
             Some(l) if crate::build::language_driver::LanguageRegistry::caps(l).hub_enrichment => {
                 // Deferred while the Perl workspace index is landing: an
                 // enrichment cascade started mid-registration builds the
@@ -517,6 +566,9 @@ impl DiagCtx {
                 .unwrap_or_default(),
             None => vec![],
         };
+        if let Some(compile) = self.compile_diagnostics.get(uri) {
+            diagnostics.extend(compile.iter().cloned());
+        }
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
@@ -543,6 +595,7 @@ fn make_on_refresh(
     files: Arc<FileStore>,
     holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>>,
     diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
+    compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>>,
 ) -> impl Fn() + Send + Sync + 'static {
     let debounce = Arc::new(DebouncedLatest::default());
     let run = Arc::new(tokio::sync::Mutex::new(()));
@@ -552,6 +605,7 @@ fn make_on_refresh(
         let files = Arc::clone(&files);
         let holder = Arc::clone(&holder);
         let diag_options = Arc::clone(&diag_options);
+        let compile_diagnostics = Arc::clone(&compile_diagnostics);
         let run = Arc::clone(&run);
         crate::util::ghost_stats::count("on_refresh.fired");
         log::debug!("diag-refresh fired");
@@ -577,8 +631,15 @@ fn make_on_refresh(
             let pending = {
                 let files = Arc::clone(&files);
                 let module_index = Arc::clone(module_index);
+                let compile_diagnostics = Arc::clone(&compile_diagnostics);
                 tokio::task::spawn_blocking(move || {
-                    refresh_open_diagnostics(&files, &module_index, options, OpenDocScope::All)
+                    refresh_open_diagnostics(
+                        &files,
+                        &module_index,
+                        &compile_diagnostics,
+                        options,
+                        OpenDocScope::All,
+                    )
                 })
                 .await
                 .unwrap_or_default()
@@ -608,6 +669,7 @@ pub(super) enum OpenDocScope {
 pub(super) fn refresh_open_diagnostics(
     files: &FileStore,
     module_index: &ModuleIndex,
+    compile_diagnostics: &dashmap::DashMap<Url, Vec<Diagnostic>>,
     options: symbols::DiagnosticOptions,
     scope: OpenDocScope,
 ) -> Vec<(Url, Vec<Diagnostic>)> {
@@ -623,7 +685,7 @@ pub(super) fn refresh_open_diagnostics(
     });
     let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
     for (uri, language) in docs {
-        let diagnostics = if hub(language) {
+        let mut diagnostics = if hub(language) {
             match files.enrich_open(&uri, module_index) {
                 Some(analysis) => symbols::collect_diagnostics(&analysis, module_index, options),
                 None => continue, // closed mid-iteration
@@ -634,6 +696,9 @@ pub(super) fn refresh_open_diagnostics(
                 None => continue,
             }
         };
+        if let Some(compile) = compile_diagnostics.get(&uri) {
+            diagnostics.extend(compile.iter().cloned());
+        }
         pending.push((uri, diagnostics));
     }
     pending

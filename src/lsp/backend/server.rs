@@ -421,6 +421,7 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        self.update_compile_diagnostics(&uri).await;
         self.schedule_diag_refresh(uri.clone());
         if needs_gather_refresh {
             // The open build was cached-only: mark the degraded window BEFORE
@@ -451,6 +452,9 @@ impl LanguageServer for Backend {
             Some(doc) => doc.language,
             None => return,
         };
+        // The cached result describes the saved file and becomes stale as
+        // soon as the editor buffer changes.
+        self.compile_diagnostics.remove(&uri);
         // A cheap-build language rebuilds synchronously; the rest
         // (macro-heavy C: ~0.7s/rebuild) update the tree/text immediately so
         // position features stay live, and DEBOUNCE the analysis so a burst
@@ -496,8 +500,9 @@ impl LanguageServer for Backend {
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(text);
             }
-            self.schedule_diag_refresh(uri.clone());
         }
+        self.update_compile_diagnostics(&uri).await;
+        self.schedule_diag_refresh(uri.clone());
         // The saved bytes are on disk: re-register this file's indexed copy,
         // evict the caches it participates in, and refresh its open consumers
         // (H1 — a saved dependency must become visible to its consumers
@@ -525,6 +530,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
+        self.compile_diagnostics.remove(&uri);
         self.files.close(&uri);
         // Wake any degraded-window waiter — the doc is gone, there is
         // nothing to wait for.

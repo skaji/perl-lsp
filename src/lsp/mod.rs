@@ -11,6 +11,7 @@ pub mod cursor_slot;
 // process-survival service wrapper: catches handler panics at the
 // request/notification boundary (no crate:: imports, DAG-neutral)
 pub mod panic_guard;
+pub(super) mod perl_compile;
 pub mod plugin_cli;
 // blocking-thread stdio bridge for the server transport (see its header)
 pub mod stdio_bridge;

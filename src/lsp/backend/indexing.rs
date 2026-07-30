@@ -504,6 +504,7 @@ impl Backend {
             let pending = refresh_open_diagnostics(
                 &ctx.files,
                 &ctx.module_index,
+                &ctx.compile_diagnostics,
                 ctx.options,
                 OpenDocScope::PerlFamily,
             );
