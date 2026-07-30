@@ -12,6 +12,7 @@ mod graph;
 mod module_cache;
 mod module_index;
 mod module_resolver;
+mod perl_compile;
 mod plugin;
 mod plugin_cli;
 mod pod;

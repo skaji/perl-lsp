@@ -46,6 +46,7 @@ fn layer_map() -> HashMap<&'static str, Layer> {
         ("timings", Model),
         ("builtins_pod", Index),
         ("backend", Lsp),
+        ("perl_compile", Lsp),
         ("symbols", Lsp),
         ("cursor_context", Lsp),
         ("plugin_cli", Lsp),

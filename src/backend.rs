@@ -8,12 +8,16 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::file_store::{FileKey, FileStore};
 use crate::module_index::ModuleIndex;
+use crate::perl_compile;
 use crate::symbols;
 
 pub struct Backend {
     client: Client,
     files: Arc<FileStore>,
     module_index: Arc<ModuleIndex>,
+    /// Last successful `perl -c` result for each open file. These diagnostics
+    /// are merged into every publish path, including module-index refreshes.
+    compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>>,
     /// Opt-in diagnostic toggles, set from `initializationOptions.diagnostics`.
     /// Shared with the resolver refresh callback (which also publishes
     /// diagnostics), hence the `Arc<Mutex<_>>`. `DiagnosticOptions` is `Copy`,
@@ -45,10 +49,13 @@ impl Backend {
         // Two-phase init: create ModuleIndex whose refresh callback references
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
         let diag_options = Arc::new(std::sync::Mutex::new(symbols::DiagnosticOptions::default()));
+        let compile_diagnostics: Arc<dashmap::DashMap<Url, Vec<Diagnostic>>> =
+            Arc::new(dashmap::DashMap::new());
 
         let refresh_client = client.clone();
         let refresh_files = Arc::clone(&files);
         let refresh_diag_options = Arc::clone(&diag_options);
+        let refresh_compile_diagnostics = Arc::clone(&compile_diagnostics);
 
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -62,6 +69,7 @@ impl Backend {
             let files = Arc::clone(&refresh_files);
             let holder = Arc::clone(&holder_clone);
             let diag_options = Arc::clone(&refresh_diag_options);
+            let compile_diagnostics = Arc::clone(&refresh_compile_diagnostics);
             tokio_handle.spawn(async move {
                 let module_index = match holder.get() {
                     Some(idx) => idx,
@@ -73,7 +81,11 @@ impl Backend {
                 let options = *diag_options.lock().unwrap();
                 files.for_each_open_mut(|uri, doc| {
                     doc.analysis.enrich_imported_types_with_keys(Some(module_index.as_ref()));
-                    let diagnostics = symbols::collect_diagnostics(&doc.analysis, module_index, options);
+                    let mut diagnostics =
+                        symbols::collect_diagnostics(&doc.analysis, module_index, options);
+                    if let Some(compile) = compile_diagnostics.get(uri) {
+                        diagnostics.extend(compile.iter().cloned());
+                    }
                     pending.push((uri.clone(), diagnostics));
                 });
                 for (uri, diags) in pending {
@@ -87,6 +99,7 @@ impl Backend {
 
         Backend {
             module_index,
+            compile_diagnostics,
             client,
             files,
             diag_options,
@@ -103,13 +116,47 @@ impl Backend {
     async fn publish_diagnostics(&self, uri: &Url) {
         self.enrich_analysis(uri);
         let options = self.diagnostic_options();
-        let diagnostics = match self.files.get_open(uri) {
+        let mut diagnostics = match self.files.get_open(uri) {
             Some(doc) => symbols::collect_diagnostics(&doc.analysis, &self.module_index, options),
             None => vec![],
         };
+        if let Some(compile) = self.compile_diagnostics.get(uri) {
+            diagnostics.extend(compile.iter().cloned());
+        }
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+
+    fn workspace_root_path(&self) -> Option<PathBuf> {
+        let root = self.module_index.workspace_root()?;
+        Url::parse(&root).ok()?.to_file_path().ok()
+    }
+
+    async fn update_compile_diagnostics(&self, uri: &Url) {
+        let Ok(path) = uri.to_file_path() else {
+            self.compile_diagnostics.remove(uri);
+            return;
+        };
+        let Some(text) = self.files.get_open(uri).map(|doc| doc.text.clone()) else {
+            self.compile_diagnostics.remove(uri);
+            return;
+        };
+        let workspace_root = self.workspace_root_path();
+        let include_paths = perl_compile::workspace_include_paths(workspace_root.as_deref());
+
+        match perl_compile::check(&path, &text, &include_paths).await {
+            Ok(diagnostics) if diagnostics.is_empty() => {
+                self.compile_diagnostics.remove(uri);
+            }
+            Ok(diagnostics) => {
+                self.compile_diagnostics.insert(uri.clone(), diagnostics);
+            }
+            Err(error) => {
+                log::warn!("perl -c skipped for {}: {}", uri, error);
+                self.compile_diagnostics.remove(uri);
+            }
+        }
     }
 }
 
@@ -386,6 +433,7 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        self.update_compile_diagnostics(&uri).await;
         self.publish_diagnostics(&uri).await;
     }
 
@@ -406,21 +454,28 @@ impl LanguageServer for Backend {
                 }
             }
         }
+        // The cached result describes the last on-disk version and becomes
+        // stale as soon as the editor buffer changes.
+        self.compile_diagnostics.remove(&uri);
         self.publish_diagnostics(&uri).await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
         if let Some(text) = params.text {
-            let uri = params.text_document.uri;
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(text);
             }
-            self.publish_diagnostics(&uri).await;
         }
+        self.update_compile_diagnostics(&uri).await;
+        self.publish_diagnostics(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.files.close(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        self.compile_diagnostics.remove(&uri);
+        self.files.close(&uri);
+        self.publish_diagnostics(&uri).await;
     }
 
     async fn document_symbol(
