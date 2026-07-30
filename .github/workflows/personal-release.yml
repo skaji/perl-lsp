@@ -1,0 +1,60 @@
+name: Personal Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: tar -C target/${{ matrix.target }}/release -czf perl-lsp-${{ matrix.target }}.tar.gz perl-lsp
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: perl-lsp-${{ matrix.target }}
+          path: perl-lsp-${{ matrix.target }}.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: perl-lsp-*
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        run: gh release create --repo "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" perl-lsp-*.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
