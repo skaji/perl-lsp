@@ -1,0 +1,3616 @@
+use std::collections::HashMap;
+use tower_lsp::lsp_types::*;
+use tree_sitter::{Point, Tree};
+
+use crate::lsp::cursor_context;
+use crate::lsp::cursor_slot::Slot;
+use crate::model::file_analysis::{
+    format_inferred_type, CompletionCandidate, CrossFileLookup, FileAnalysis, FoldKind,
+    GuardVerdict, HandlerOwner, InferredType, OutlineSymbol, ParamInfo, RefKind, Span,
+    SymKind as FaSymKind, SymbolDetail,
+};
+use crate::index::module_index::{ModuleIndex, SubInfo};
+use crate::index::resolve::{resolve_imported_function, ImportResolution};
+
+// ---- Coordinate conversion ----
+
+fn point_to_position(p: Point) -> Position {
+    Position {
+        line: p.row as u32,
+        character: p.column as u32,
+    }
+}
+
+pub fn position_to_point(pos: Position) -> Point {
+    Point::new(pos.line as usize, pos.character as usize)
+}
+
+pub fn span_to_range(span: Span) -> Range {
+    Range {
+        start: point_to_position(span.start),
+        end: point_to_position(span.end),
+    }
+}
+
+// ---- Symbol conversion ----
+
+fn fa_sym_kind_to_lsp(kind: &FaSymKind) -> SymbolKind {
+    match kind {
+        FaSymKind::Sub => SymbolKind::FUNCTION,
+        FaSymKind::Method => SymbolKind::METHOD,
+        FaSymKind::Variable => SymbolKind::VARIABLE,
+        FaSymKind::Field => SymbolKind::FIELD,
+        FaSymKind::Enumerator => SymbolKind::ENUM_MEMBER,
+        FaSymKind::Package => SymbolKind::NAMESPACE,
+        FaSymKind::Class => SymbolKind::CLASS,
+        FaSymKind::Module => SymbolKind::MODULE,
+        FaSymKind::HashKeyDef => SymbolKind::KEY,
+        // Handler's actual LSP kind depends on the plugin's
+        // `display` choice — this fallback only fires for paths
+        // that don't carry detail, which is rare. Event is the
+        // conservative default.
+        FaSymKind::Handler => SymbolKind::EVENT,
+        FaSymKind::Namespace => SymbolKind::NAMESPACE,
+    }
+}
+
+/// Plugin-chosen Handler display → LSP SymbolKind. Called from the
+/// outline path where OutlineSymbol carries `handler_display`.
+fn handler_display_to_symbol_kind(d: &crate::model::file_analysis::HandlerDisplay) -> SymbolKind {
+    use crate::model::file_analysis::HandlerDisplay as H;
+    match d {
+        H::Event => SymbolKind::EVENT,
+        H::Method => SymbolKind::METHOD,
+        H::Function => SymbolKind::FUNCTION,
+        H::Field => SymbolKind::FIELD,
+        H::Property => SymbolKind::PROPERTY,
+        H::Constant => SymbolKind::CONSTANT,
+        // Helper / Route / Task / Dispatch → FUNCTION. LSP's
+        // `SymbolKind` enum is frozen; the distinguishing word lives
+        // in `detail` / baked into `name` so client configs can
+        // surface it without protocol extension.
+        H::Helper | H::Route | H::Task | H::Action => SymbolKind::FUNCTION,
+    }
+}
+
+fn handler_display_to_completion_kind(d: &crate::model::file_analysis::HandlerDisplay) -> CompletionItemKind {
+    use crate::model::file_analysis::HandlerDisplay as H;
+    match d {
+        H::Event => CompletionItemKind::EVENT,
+        H::Method => CompletionItemKind::METHOD,
+        H::Function => CompletionItemKind::FUNCTION,
+        H::Field => CompletionItemKind::FIELD,
+        H::Property => CompletionItemKind::PROPERTY,
+        H::Constant => CompletionItemKind::CONSTANT,
+        H::Helper | H::Route | H::Task | H::Action => CompletionItemKind::FUNCTION,
+    }
+}
+
+/// The LSP `SymbolKind` we'd emit for an outline node. Pulled out so
+/// tests can pin behavior without reconstructing the conversion.
+pub fn outline_lsp_kind(s: &OutlineSymbol) -> SymbolKind {
+    match s.handler_display {
+        Some(ref d) => handler_display_to_symbol_kind(d),
+        None => fa_sym_kind_to_lsp(&s.kind),
+    }
+}
+
+#[allow(deprecated)]
+fn outline_to_document_symbol(s: &OutlineSymbol) -> DocumentSymbol {
+    let children: Vec<DocumentSymbol> = s.children.iter().map(outline_to_document_symbol).collect();
+    let kind = outline_lsp_kind(s);
+    DocumentSymbol {
+        name: s.name.clone(),
+        detail: s.detail.clone(),
+        kind,
+        tags: None,
+        deprecated: None,
+        range: span_to_range(s.span),
+        selection_range: span_to_range(s.selection_span),
+        children: if children.is_empty() {
+            None
+        } else {
+            Some(children)
+        },
+    }
+}
+
+// ---- Public LSP adapter functions ----
+
+#[allow(deprecated)]
+pub fn extract_symbols(analysis: &FileAnalysis) -> Vec<DocumentSymbol> {
+    analysis.document_symbols()
+        .iter()
+        .map(outline_to_document_symbol)
+        .collect()
+}
+
+#[allow(deprecated)]
+/// Surface a plugin-controlled namespace in `workspace/symbol` results.
+/// The namespace isn't a Perl symbol, but users want to jump to "where
+/// my Minion tasks live" or "the mojo app for this package" — this
+/// puts it on the same search surface as packages/subs.
+#[allow(deprecated)]
+pub fn plugin_namespace_to_workspace_info(
+    ns: &crate::model::file_analysis::PluginNamespace,
+    uri: Url,
+) -> SymbolInformation {
+    SymbolInformation {
+        name: format!("[{}] {}", ns.kind, ns.id),
+        kind: SymbolKind::NAMESPACE,
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri,
+            range: span_to_range(ns.decl_span),
+        },
+        container_name: Some(ns.plugin_id.clone()),
+    }
+}
+
+#[allow(deprecated)]
+/// The ONE workspace-search visibility rule, shared by the resident sweep
+/// (`symbol_to_workspace_info`) and the rows twin — a kind added to one
+/// gate cannot silently diverge the other.
+fn workspace_search_visible(kind: &crate::model::file_analysis::SymKind, hidden: bool, lexical: bool) -> bool {
+    use crate::model::file_analysis::SymKind as FaSymKind;
+    matches!(
+        kind,
+        FaSymKind::Sub | FaSymKind::Method | FaSymKind::Package | FaSymKind::Class
+    ) && !hidden
+        && !lexical
+}
+
+// `SymbolInformation::deprecated` is a deprecated-but-required field of the
+// tower-lsp struct; we must supply it to construct the value.
+#[allow(deprecated)]
+pub fn symbol_to_workspace_info(sym: &crate::model::file_analysis::Symbol, uri: Url) -> Option<SymbolInformation> {
+    if !workspace_search_visible(
+        &sym.kind,
+        sym.hidden_in_outline(),
+        matches!(&sym.detail, crate::model::file_analysis::SymbolDetail::Sub { lexical: true, .. }),
+    ) {
+        return None;
+    }
+    Some(SymbolInformation {
+        name: sym.name.clone(),
+        kind: fa_sym_kind_to_lsp(&sym.kind),
+        tags: None,
+        deprecated: None,
+        location: Location {
+            uri,
+            range: span_to_range(sym.selection_span),
+        },
+        container_name: sym.package.clone(),
+    })
+}
+
+/// Collapse workspace/symbol entries that share a full identity tuple
+/// (name, kind, file, line, col). Framework accessor synthesis mints twin
+/// symbols at ONE span — a getter `Method` and its fluent-writer twin carry
+/// the same name/kind/selection_span — and the same symbol can surface from
+/// both the resident sweep and the rows pass. Keying on the whole tuple
+/// collapses only byte-identical duplicates; two genuinely different symbols
+/// that merely share a name keep their distinct spans.
+pub fn dedup_workspace_symbols(results: &mut Vec<SymbolInformation>) {
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|s| {
+        seen.insert((
+            s.name.clone(),
+            format!("{:?}", s.kind),
+            s.location.uri.to_string(),
+            s.location.range.start.line,
+            s.location.range.start.character,
+        ))
+    });
+}
+
+/// The rows half of workspace/symbol: fan the query across the hub's Perl
+/// store and every pack sub-index's store. One spelling of the fan-out so
+/// the LSP handler and the CLI verb can never diverge.
+pub fn sym_row_search(
+    idx: &crate::index::module_index::ModuleIndex,
+    query: &str,
+) -> Vec<crate::index::module_cache::SymRowHit> {
+    let mut hits = idx.sym_search(query);
+    idx.for_each_pack_index(|_lang, pack| {
+        hits.extend(pack.sym_search(query));
+    });
+    hits
+}
+
+/// `symbol_to_workspace_info`'s row twin — identical kind gate and
+/// hidden/lexical suppressions, sourced from the baked row flags.
+// `SymbolInformation::deprecated` is a deprecated-but-required field.
+#[allow(deprecated)]
+pub fn sym_row_to_workspace_info(
+    hit: &crate::index::module_cache::SymRowHit,
+) -> Option<SymbolInformation> {
+    use crate::model::file_analysis::{sym_kind_from_code, SymRowSeed};
+    let kind = sym_kind_from_code(hit.kind)?;
+    if !workspace_search_visible(
+        &kind,
+        hit.flags & SymRowSeed::FLAG_HIDDEN_IN_OUTLINE != 0,
+        hit.flags & SymRowSeed::FLAG_LEXICAL_SUB != 0,
+    ) {
+        return None;
+    }
+    let path = std::path::Path::new(&hit.path);
+    let uri = Url::from_file_path(path).ok()?;
+    let span = crate::model::file_analysis::Span {
+        start: tree_sitter::Point::new(hit.start_row, hit.start_col),
+        end: tree_sitter::Point::new(hit.end_row, hit.end_col),
+    };
+    Some(SymbolInformation {
+        name: hit.name.clone(),
+        kind: fa_sym_kind_to_lsp(&kind),
+        tags: None,
+        deprecated: None,
+        location: Location { uri, range: span_to_range(span) },
+        container_name: hit.container.clone(),
+    })
+}
+
+/// Goto-definition: the forward projection of the resolution CandidateSet,
+/// adapted to LSP types. One location → Scalar; several (stacked handler
+/// registrations) → Array so the editor shows a picker. The LSP handler and
+/// CLI construct the set themselves (they carry the source/pack routing
+/// facts); this adapter serves plain-cursor consumers and tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn find_definition(
+    files: &crate::index::file_store::FileStore,
+    analysis: &FileAnalysis,
+    pos: Position,
+    uri: &Url,
+    module_index: &dyn crate::model::file_analysis::CrossFileLookup,
+) -> Option<GotoDefinitionResponse> {
+    let cs = crate::index::resolve::resolve(
+        files,
+        analysis,
+        crate::index::file_store::FileKey::Url(uri.clone()),
+        position_to_point(pos),
+        Some(module_index),
+        crate::index::resolve::OverrideScope::default(),
+    );
+    let locs: Vec<Location> = cs
+        .definitions()
+        .into_iter()
+        .filter_map(|l| {
+            let uri = l.to_url()?;
+            Some(Location { uri, range: span_to_range(l.span) })
+        })
+        .collect();
+    match locs.len() {
+        0 => None,
+        1 => Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap())),
+        _ => Some(GotoDefinitionResponse::Array(locs)),
+    }
+}
+
+/// The concrete-leaf DISPLAY for a field/variable whose declared type is a
+/// config-variant type macro (`docs/adr/macro-handling.md`, "Typing vs.
+/// display"). The type that FLOWS stays the join abstraction (`Numeric`); this
+/// recovers the human-facing leaf by walking provenance: pick the
+/// reachability-active variant of `spelling` (the SAME ranking goto-def uses),
+/// then chase that variant body's `TypeName` alias chain to its terminal
+/// concrete spelling (`PERL_BITFIELD16 → U16 → U16TYPE → unsigned short`).
+/// `None` when `spelling` isn't a config-variant macro, or the chase doesn't
+/// reach a leaf more concrete than the variant body itself — the caller then
+/// renders the flow type unchanged.
+fn config_variant_leaf_display(
+    analysis: &FileAnalysis,
+    spelling: &str,
+    module_index: &dyn CrossFileLookup,
+) -> Option<String> {
+    // Hover reads only the winning variant's BODY, never its location, so the
+    // queried file's own key is immaterial — a placeholder keys its local
+    // `macro_defs` without colliding with the real cross-file def paths.
+    let local = crate::index::file_store::FileKey::Path(std::path::PathBuf::from("/__hover_local__"));
+    let ranked = crate::index::resolve::ranked_macro_variants(analysis, spelling, &local, module_index);
+    // A single-variant (or non-) macro flows to its leaf already; only the
+    // config-variant JOIN abstraction needs the display-side variant pick.
+    if ranked.len() < 2 {
+        return None;
+    }
+    let body = ranked.first()?.0.body.trim();
+    // Walk the chosen variant body's alias chain to its terminal concrete type.
+    // Only override when the chase reached a NAMED concrete leaf (`unsigned
+    // short`) PAST the body spelling — a bare primitive family (`unsigned` →
+    // `Numeric`) carries no richer spelling than the flow abstraction already
+    // shows, so leave the flow type in place.
+    let leaf = analysis.resolve_type_name(body, Some(module_index))?;
+    let display = leaf.class_name()?;
+    if display == body {
+        return None;
+    }
+    Some(display.to_string())
+}
+
+/// Goto-def on an `#include "x.h"` / `<x.h>` path token → the resolved header
+/// file (`#include` = `use`; the header is the module). `self_path` is the
+/// including file — the search anchor for the walk-up include resolver.
+/// Returns a whole-file location (range 0:0); only cpp has an include model.
+#[cfg(feature = "cpp")]
+pub fn pack_include_definition(
+    analysis: &FileAnalysis,
+    point: Point,
+    self_path: Option<&std::path::Path>,
+) -> Option<Location> {
+    let raw = analysis
+        .include_directives
+        .iter()
+        .find(|(span, _)| crate::model::file_analysis::contains_point(span, point))
+        .map(|(_, raw)| raw.clone())?;
+    // `"foo.h"` captures the string CONTENT (no quotes); `<sys/x.h>` captures the
+    // whole token — strip the angle brackets so the resolver sees a bare path.
+    let inc = raw.trim_matches(|c| c == '<' || c == '>' || c == '"');
+    let base = self_path?;
+    let header = crate::build::cpp_reparse::resolve_include_path(base, inc)?;
+    let uri = Url::from_file_path(&header).ok()?;
+    Some(Location {
+        uri,
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+    })
+}
+#[cfg(not(feature = "cpp"))]
+pub fn pack_include_definition(
+    _analysis: &FileAnalysis,
+    _point: Point,
+    _self_path: Option<&std::path::Path>,
+) -> Option<Location> {
+    None
+}
+
+/// Find-references on an `#include` path token: every `#include` directive —
+/// across this file + the cached pack modules — that resolves to the SAME
+/// header ("who includes this header"), the backward mirror of the include
+/// goto-def on the same key (the resolved header path, so `"x.h"` and a
+/// differently-spelled directive reaching the same file group together).
+/// `None` when the cursor isn't on an include directive; both references
+/// handlers (LSP + CLI) call this before the general resolve so the path
+/// token never leaks into name-keyed resolution. Sorted (path, position)
+/// for deterministic output.
+#[cfg(feature = "cpp")]
+pub fn pack_include_references(
+    analysis: &FileAnalysis,
+    point: Point,
+    self_path: Option<&std::path::Path>,
+    module_index: &dyn CrossFileLookup,
+) -> Option<Vec<(std::path::PathBuf, crate::model::file_analysis::Span)>> {
+    let raw = analysis
+        .include_directives
+        .iter()
+        .find(|(span, _)| crate::model::file_analysis::contains_point(span, point))
+        .map(|(_, raw)| raw.clone())?;
+    let trim = |r: &str| r.trim_matches(|c| c == '<' || c == '>' || c == '"').to_string();
+    let base = self_path?;
+    let header = crate::build::cpp_reparse::resolve_include_path(base, &trim(&raw))?;
+    let mut out: Vec<(std::path::PathBuf, crate::model::file_analysis::Span)> = Vec::new();
+    let mut collect = |path: &std::path::Path, a: &FileAnalysis| {
+        for (span, r) in &a.include_directives {
+            if crate::build::cpp_reparse::resolve_include_path(path, &trim(r)).as_deref()
+                == Some(header.as_path())
+            {
+                out.push((path.to_path_buf(), *span));
+            }
+        }
+    };
+    collect(base, analysis);
+    // Per-FILE sweep; skip the cursor file (fresh copy already collected).
+    module_index.for_each_cached_file(&mut |cached| {
+        if cached.path == base {
+            return;
+        }
+        collect(&cached.path, &cached.analysis);
+    });
+    out.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            (a.1.start.row, a.1.start.column).cmp(&(b.1.start.row, b.1.start.column))
+        })
+    });
+    out.dedup();
+    Some(out)
+}
+#[cfg(not(feature = "cpp"))]
+pub fn pack_include_references(
+    _analysis: &FileAnalysis,
+    _point: Point,
+    _self_path: Option<&std::path::Path>,
+    _module_index: &dyn CrossFileLookup,
+) -> Option<Vec<(std::path::PathBuf, crate::model::file_analysis::Span)>> {
+    None
+}
+
+/// Re-export: the raw-word key lives with the resolution seam
+/// (`resolve::word_at_point`); hover and the sig-help slot share it.
+pub use crate::index::resolve::word_at_point;
+
+
+
+
+
+pub(crate) fn fa_completion_kind(kind: &FaSymKind) -> CompletionItemKind {
+    match kind {
+        FaSymKind::Sub => CompletionItemKind::FUNCTION,
+        FaSymKind::Method => CompletionItemKind::METHOD,
+        FaSymKind::Variable => CompletionItemKind::VARIABLE,
+        FaSymKind::Field => CompletionItemKind::FIELD,
+        FaSymKind::Enumerator => CompletionItemKind::ENUM_MEMBER,
+        FaSymKind::Package => CompletionItemKind::CLASS,
+        FaSymKind::Class => CompletionItemKind::CLASS,
+        FaSymKind::Module => CompletionItemKind::MODULE,
+        FaSymKind::HashKeyDef => CompletionItemKind::PROPERTY,
+        FaSymKind::Handler => CompletionItemKind::EVENT,
+        FaSymKind::Namespace => CompletionItemKind::MODULE,
+    }
+}
+
+/// Rank scope-variable candidates whose inferred type matches `expected`
+/// first, keeping every other candidate in place (never prunes). A matching
+/// variable keeps its `PRIORITY_LOCAL` slot while the non-matching locals it
+/// leads are nudged one tier down, so the client's sort_text agrees with the
+/// stable reorder the CLI/gold sees. Exact `InferredType` equality, or same
+/// class name (a `ClassName` matches by class).
+fn rank_candidates_by_expected_type(
+    candidates: &mut Vec<CompletionCandidate>,
+    expected: &InferredType,
+    analysis: &FileAnalysis,
+    point: Point,
+) {
+    use crate::model::file_analysis::PRIORITY_LOCAL;
+    let is_match = |c: &CompletionCandidate| -> bool {
+        matches!(c.kind, FaSymKind::Variable)
+            && analysis
+                .inferred_type_via_bag(&c.label, point)
+                .is_some_and(|t| inferred_type_matches(expected, &t))
+    };
+    let mut tagged: Vec<(bool, CompletionCandidate)> =
+        candidates.drain(..).map(|c| (is_match(&c), c)).collect();
+    for (m, c) in tagged.iter_mut() {
+        if !*m && matches!(c.kind, FaSymKind::Variable) && c.sort_priority == PRIORITY_LOCAL {
+            c.sort_priority = PRIORITY_LOCAL + 1;
+        }
+    }
+    tagged.sort_by_key(|(m, _)| !*m); // stable: matches (key false) lead
+    *candidates = tagged.into_iter().map(|(_, c)| c).collect();
+}
+
+/// Does `actual` satisfy the `expected` slot type — exact enum equality, or
+/// (for object types) the same class name.
+fn inferred_type_matches(expected: &InferredType, actual: &InferredType) -> bool {
+    expected == actual
+        || matches!(
+            (expected.class_name(), actual.class_name()),
+            (Some(a), Some(b)) if a == b
+        )
+}
+
+pub(crate) fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
+    let additional_text_edits = if c.additional_edits.is_empty() {
+        None
+    } else {
+        Some(
+            c.additional_edits
+                .iter()
+                .map(|(span, text)| TextEdit {
+                    range: span_to_range(*span),
+                    new_text: text.clone(),
+                })
+                .collect(),
+        )
+    };
+    // `filter_text` is what LSP clients match the typed prefix against
+    // when narrowing the completion list client-side. By default it's
+    // the label. But when `insert_text` differs (e.g. dispatch-target
+    // candidates insert `'connect'` while the label is just `connect`),
+    // some clients fall back to `insert_text` for filtering — then
+    // typing `c` after `(` stops matching because insert_text starts
+    // with `'`. Set filter_text explicitly to the bare label so
+    // client-side filtering keys on the name regardless.
+    let filter_text = Some(c.label.clone());
+
+    // Sort text places dispatch handlers ABOVE anything
+    // complete_general can produce. Both default to sort_priority 0;
+    // tied at "000" they interleave alphabetically (connect, fire,
+    // message, wire) which makes handlers look like they're mixed
+    // into noise. Prefixing with a space character ensures the
+    // handler group sorts first as a block — space (0x20) < digit
+    // (0x30) lexicographically.
+    //
+    // The label is the intra-priority tie-break in every case (module /
+    // import-list / qualified-path candidates carry it explicitly, and
+    // it's what a client falls back to for equal sortText anyway — so
+    // spelling it here is ranking-neutral for the identifier/member/key
+    // arms and lets this one projection reproduce those arms byte-for-byte).
+    let sort_text = if matches!(c.kind, FaSymKind::Handler) {
+        Some(format!(" {:03}{}", c.sort_priority, c.label))
+    } else {
+        Some(format!("{:03}{}", c.sort_priority, c.label))
+    };
+    let kind = if let Some(ref d) = c.display_override {
+        handler_display_to_completion_kind(d)
+    } else {
+        fa_completion_kind(&c.kind)
+    };
+    CompletionItem {
+        label: c.label,
+        kind: Some(kind),
+        detail: c.detail,
+        insert_text: c.insert_text,
+        filter_text,
+        sort_text,
+        additional_text_edits,
+        ..Default::default()
+    }
+}
+
+/// Language-agnostic in-scope completion: every symbol visible from
+/// `point` — top-level definitions (functions / classes / packages,
+/// globally addressable) plus locals / params / methods / fields whose
+/// declaring scope encloses the cursor — as plain CompletionItems. The
+/// client filters by the typed prefix (sigils and all). This is the
+/// pack-language completion path (half 1): no cursor context, no member
+/// resolution — the `.`/`->` receiver seam is a separate design.
+pub fn in_scope_completion(analysis: &FileAnalysis, point: Point) -> Vec<CompletionItem> {
+    use std::collections::HashSet;
+    let chain: HashSet<_> = analysis
+        .scope_at(point)
+        .map(|s| analysis.scope_chain(s).into_iter().collect())
+        .unwrap_or_default();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut items = Vec::new();
+    for sym in &analysis.symbols {
+        // Top-level defs are addressable anywhere; everything else
+        // (params, locals, a class's methods/fields) only where the
+        // declaring scope is on the cursor's scope chain.
+        let top_level = matches!(
+            sym.kind,
+            FaSymKind::Sub | FaSymKind::Class | FaSymKind::Package
+        );
+        if !top_level && !chain.contains(&sym.scope) {
+            continue;
+        }
+        if sym.name.is_empty() || !seen.insert(sym.name.as_str()) {
+            continue;
+        }
+        items.push(CompletionItem {
+            label: sym.name.clone(),
+            kind: Some(fa_completion_kind(&sym.kind)),
+            ..Default::default()
+        });
+    }
+    items
+}
+
+pub fn completion_items(
+    files: &crate::index::file_store::FileStore,
+    origin_key: &crate::index::file_store::FileKey,
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Vec<CompletionItem> {
+    let point = position_to_point(pos);
+
+    // Plugin query hook — runs BEFORE the native path. A plugin can
+    // contribute items and optionally claim exclusivity for the slot
+    // (e.g. Minion's arg-0 task-name completion: pure tasks, no
+    // Minion instance-method firehose).
+    if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, source.as_bytes(), point) {
+        let registry = crate::build::plugin::default_plugin_registry();
+        let (uses, parents) = analysis.trigger_view_at(point);
+        let query = crate::build::plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        let mut plugin_items: Vec<CompletionItem> = Vec::new();
+        let mut exclusive = false;
+        for p in registry.applicable(&query) {
+            if let Some(answer) = p.on_completion(&qctx) {
+                if answer.exclusive { exclusive = true; }
+                for c in answer.items {
+                    plugin_items.push(plugin_completion_to_item(c));
+                }
+                // Plugin-delegated dispatch-target completion: walk
+                // Handler symbols whose owner matches and contribute
+                // their names as items. Saves each plugin from
+                // reimplementing the symbol-table scan.
+                if let Some(req) = answer.dispatch_targets_for {
+                    plugin_items.extend(dispatch_target_items_for(
+                        analysis, module_index, &req.owner_class, &req.dispatcher_names,
+                    ));
+                }
+            }
+        }
+        if exclusive {
+            return plugin_items;
+        }
+        if !plugin_items.is_empty() {
+            let native = completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages);
+            let mut out = plugin_items;
+            out.extend(native);
+            return out;
+        }
+    }
+
+    completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages)
+}
+
+/// Test-only convenience: completion against a bare analysis with an empty
+/// store (gathering still routes through the CandidateSet; visibility
+/// defaults to the full VISIBLE universe).
+#[cfg(test)]
+pub fn completion_items_for_test(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Vec<CompletionItem> {
+    let files = crate::index::file_store::FileStore::new();
+    let key = crate::index::file_store::FileKey::Path(std::path::PathBuf::from("/test/origin.pl"));
+    completion_items(&files, &key, analysis, tree, source, pos, module_index, stable_packages)
+}
+
+/// The native completion path — the plugin-aware `completion_items`
+/// wrapper above falls through to it.
+#[allow(clippy::too_many_arguments)]
+fn completion_items_native(
+    files: &crate::index::file_store::FileStore,
+    origin_key: &crate::index::file_store::FileKey,
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Vec<CompletionItem> {
+    let point = position_to_point(pos);
+    // Candidate GATHERING routes through the resolution CandidateSet — the
+    // same visible universe references/rename/goto-def project from
+    // (docs/adr/resolution-candidate-set.md). The cursor-context matching
+    // below decides which slot the cursor is in; the set decides where the
+    // identifier names come from.
+    let cs = crate::index::resolve::resolve(
+        files,
+        analysis,
+        origin_key.clone(),
+        point,
+        Some(module_index),
+        crate::index::resolve::OverrideScope::default(),
+    );
+
+    // The slot verdict (`docs/adr/cursor-slots.md`) — Perl's detector
+    // wraps `cursor_context`'s tree-then-text chain unchanged.
+    let crate::lsp::cursor_slot::DetectedSlot { slot, arm: slot_arm } = crate::lsp::cursor_slot::detect_slot(
+        analysis, tree, source, point, "perl", Some(module_index));
+    // Bare-sigil trigger (`$|`/`@|`/`%|`) decoded once so the match below
+    // doesn't need a second borrow of `slot` inside its own arm.
+    let sigil_trigger = slot.sigil();
+
+    // Mid-string completion for plugin-emitted MethodCallRefs. When the
+    // cursor sits inside the span of a MethodCallRef emitted by a plugin
+    // (e.g. `->to('Users#lis|')` in mojo-routes), offer methods on the
+    // target class — prefix-filtered by whatever's been typed since the
+    // `#` (or the whole prefix if none). This generalizes: any plugin
+    // that drops a MethodCallRef at a string span gets scoped method
+    // completion for free. Runs first so it preempts the generic paths.
+    if let Some(refs) = refs_at_point_matching(analysis, point, |r|
+        matches!(r.kind, RefKind::MethodCall { .. })
+    ) {
+        for r in &refs {
+            if let RefKind::MethodCall { invocant, .. } = &r.kind {
+                let early = mid_string_methodref_completions(
+                    analysis, module_index, invocant.text(), source, point, r.span,
+                );
+                if !early.is_empty() {
+                    return early;
+                }
+            }
+        }
+    }
+
+    // Dispatch-target completions are orthogonal to the context match:
+    // inside `$obj->emit(^)` the cursor is both after a `->` (tree
+    // detects `Method`) and inside call args. Pull the call context out
+    // once, prepend handler completions at arg-0, and SUPPRESS the global
+    // sub/module firehose at arg-N>0 so comma-triggered completion in a
+    // dispatch call doesn't dump hundreds of unrelated symbols (sig help
+    // is the right affordance past arg-0).
+    //
+    // Dispatch items go in a separate vec so we can retarget their
+    // textEdit range to the string-content span mid-string, without
+    // having to filter the shared `candidates` buffer by kind later.
+    let mut dispatch_items: Vec<CompletionItem> = Vec::new();
+    let mut candidates: Vec<CompletionCandidate> = Vec::new();
+    let mut suppress_firehose = false;
+    if let Some(call_ctx) = cursor_context::find_call_context(tree, source.as_bytes(), point) {
+        if call_ctx.is_method {
+            let dispatch_class = analysis.invocant_text_to_class(call_ctx.invocant.as_deref(), point);
+            let has_any_handlers = dispatch_class.as_ref().is_some_and(|c|
+                class_has_dispatch_handlers(analysis, module_index, c, &call_ctx.name)
+            );
+            // Debug line for dispatch completion — one-shot diagnoses
+            // every "starting to type kills completion" / "no routes
+            // offered" report. Includes the four values that together
+            // determine whether dispatch fires and which handlers pass
+            // the ancestor-walk filter: call name, invocant text,
+            // resolved class (None = inferred_type miss), active_param
+            // (>0 short-circuits to vars-only), and has_any_handlers
+            // (false = bridges empty or filter mismatch).
+            log::debug!(
+                "completion dispatch: method={:?} invocant={:?} class={:?} active_param={} has_handlers={}",
+                call_ctx.name, call_ctx.invocant, dispatch_class,
+                call_ctx.active_param, has_any_handlers,
+            );
+
+            if call_ctx.active_param == 0 && has_any_handlers {
+                // arg-0 of a known dispatcher: handlers at the top,
+                // suppress the global sub/module firehose that would
+                // otherwise drown them.
+                let dispatch_cands = dispatch_target_completions(
+                    analysis,
+                    module_index,
+                    call_ctx.invocant.as_deref(),
+                    &call_ctx.name,
+                    point,
+                    tree,
+                );
+                dispatch_items.extend(
+                    dispatch_cands.into_iter().map(candidate_to_completion_item),
+                );
+                // When the cursor is inside the string arg
+                // (`url_for('/us|ers/profile')`) pin each item's
+                // textEdit to the string-content span. The client's
+                // default word-at-cursor (nvim's `iskeyword` default
+                // excludes `/`, `#`, `:`) can't see across those
+                // chars, so filter_text alone is dropped for labels
+                // like `/users/profile` or `Users#list`. textEdit.range
+                // tells the client "filter by the whole in-range
+                // text" — works regardless of keyword class.
+                if let Some(span) = string_content_span_at(tree, point) {
+                    retarget_items_to_span(&mut dispatch_items, span);
+                }
+                suppress_firehose = true;
+            } else if call_ctx.active_param > 0 && has_any_handlers
+                && !matches!(slot, Slot::Key { .. })
+            {
+                // Past arg-0 in a known dispatcher: the only sensible
+                // completion is variables-in-scope (candidates for
+                // passing as the next arg). Sig help handles shape
+                // guidance. Short-circuit the context match entirely.
+                //
+                // EXCEPT when the cursor is sitting inside a nested
+                // hash literal — that's a HashKey context and the
+                // callee (or a plugin) has real keys to offer for it
+                // (Minion's `enqueue(..., [...], { | })` options).
+                // Skipping the short-circuit there lets the HashKey
+                // match run and populate `priority`/`queue`/etc.
+                let vars_only: Vec<CompletionCandidate> = cs.complete("", false)
+                    .into_iter()
+                    .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
+                    .collect();
+                candidates.extend(vars_only);
+                return candidates.drain(..).map(candidate_to_completion_item).collect();
+            }
+        }
+    }
+
+    candidates.extend::<Vec<CompletionCandidate>>(match slot {
+        Slot::Member { ref receiver, .. } => {
+            if let Some(ref ty) = receiver.receiver_type {
+                // `class_name_lenient` peels `Optional<Foo>` to `Foo` so an
+                // unguarded optional receiver still offers its methods — the
+                // same lenient receiver projection goto/hover/refs now use.
+                if let Some(cn) = ty.class_name_lenient() {
+                    analysis.complete_methods_for_class(cn, Some(module_index))
+                } else {
+                    // Ref types get deref snippet completions (handled below)
+                    Vec::new()
+                }
+            } else {
+                let invocant_text = receiver.receiver_text.as_deref().unwrap_or("");
+                analysis.complete_methods(invocant_text, point, Some(module_index))
+            }
+        }
+        Slot::Key { ref owner } => {
+            // Keys already written in the enclosing hash literal —
+            // they shouldn't re-appear in the suggestions. Scoped to
+            // the hash_expression directly so unrelated nearby calls
+            // don't interfere. Works for both class-typed hashes and
+            // sub-owned ones.
+            let used = cursor_context::used_keys_in_enclosing_hash(tree, source.as_bytes(), point);
+            let class_name = owner.owner_type.as_ref().and_then(|t| t.class_name());
+            let candidates = if let Some(cn) = class_name {
+                analysis.complete_hash_keys_for_class(cn, point, Some(module_index))
+            } else if let Some(ref sub_name) = owner.source_sub {
+                // Routes to HashKeyOwner::Sub { name } — catches both
+                // plugin-emitted HashKeyDefs (minion enqueue options)
+                // AND body-derived keys from `$opts->{...}` accesses
+                // in a final-hashref param. Previously this branch
+                // was skipped when owner_type was None, so real hash
+                // literals at a call-arg position returned nothing.
+                analysis.complete_hash_keys_for_sub(sub_name, point, Some(module_index))
+            } else {
+                analysis.complete_hash_keys(&owner.var_text, point, Some(module_index))
+            };
+            candidates.into_iter().filter(|c| !used.contains(&c.label)).collect()
+        }
+        Slot::Import { ref module } => {
+            if let Some(ref name) = module {
+                // The export surface is entity content on `CachedModule`;
+                // the "still indexing" placeholder is a slot affordance
+                // (no entity to gather yet), so it stays adapter-side.
+                return match module_index.get_cached(name) {
+                    Some(cached) => module_index
+                        .whole_present(&cached)
+                        .import_list_candidates()
+                        .into_iter()
+                        .map(candidate_to_completion_item)
+                        .collect(),
+                    None => vec![import_list_loading_placeholder(name)],
+                };
+            }
+            Vec::new()
+        }
+        Slot::ModulePath { ref prefix } => {
+            // `use Foo::<cursor>` → the loadable-module half; `Foo::<cursor>`
+            // mid-expression → the qualified-path drill (subs + sub-packages).
+            // Both are candidate-level on the set; this branch is the answer,
+            // so it returns directly (the global firehose is suppressed). The
+            // arm (not a local field) tells the two renders apart.
+            let candidates = if slot_arm == crate::lsp::cursor_slot::DetectorArm::UseModule {
+                cs.complete_module_candidates(prefix)
+            } else {
+                cs.complete_qualified_path(module_index, prefix)
+            };
+            return candidates.into_iter().map(candidate_to_completion_item).collect();
+        }
+        Slot::Identifier { .. } if sigil_trigger.is_some() => {
+            analysis.complete_variables(point, sigil_trigger.expect("checked by guard"))
+        }
+        Slot::Identifier { .. } => {
+            let mut items = Vec::new();
+            // Keyval arg completions if inside a call at key position.
+            // (Dispatch-target completions are handled above the match
+            // regardless of context, so they apply whether the slot
+            // resolves to Member, Identifier, or anything else.)
+            if let Some(call_ctx) =
+                cursor_context::find_call_context(tree, source.as_bytes(), point)
+            {
+                if call_ctx.at_key_position {
+                    items.extend(analysis.complete_keyval_args(
+                        &call_ctx.name,
+                        call_ctx.is_method,
+                        call_ctx.invocant.as_deref(),
+                        point,
+                        &call_ctx.used_keys,
+                        Some(module_index),
+                    ));
+                }
+            }
+            // Identifier universe from the CandidateSet: in-scope names,
+            // plus the import-sourced firehose when the slot has an
+            // import affordance. The firehose is useful at top-level
+            // positions, harmful when we just offered dispatch handlers
+            // at arg-0 (they'd drown in it) — `suppress_firehose` is set
+            // above when the cursor is at arg-0 of a known dispatcher
+            // call, and withholds the affordance. The candidates carry the
+            // importable-from FACT; the edit is composed HERE, fact + slot
+            // affordance (`auto_import_span` needs the LSP-side stable
+            // outline) — placement is the adapter's, not the model's.
+            let mut import_sourced = cs.complete("", !suppress_firehose);
+            if !suppress_firehose {
+                let insert_at = auto_import_span(analysis, point, stable_packages);
+                for c in &mut import_sourced {
+                    match &c.import_fact {
+                        Some(crate::model::file_analysis::ImportFact::AddToQw { name, qw_close }) => {
+                            let at = crate::model::file_analysis::Span { start: *qw_close, end: *qw_close };
+                            c.additional_edits.push((at, format!(" {}", name)));
+                        }
+                        Some(crate::model::file_analysis::ImportFact::NewUse { module, name }) => {
+                            c.additional_edits
+                                .push((insert_at, format!("use {} qw({});\n", module, name)));
+                        }
+                        None => {}
+                    }
+                }
+            }
+            items.extend(import_sourced);
+
+            items
+        }
+        // Perl's slot detector never produces these — ArgPosition is
+        // `detect_call_slot`'s question (sig-help's), TypePosition has no
+        // Perl detector at all.
+        Slot::TypePosition { .. } | Slot::ArgPosition { .. } => Vec::new(),
+    });
+
+    // Type-constrained ranking: when the cursor sits at a call arg whose
+    // callee has a typed param, scope variables whose inferred type matches
+    // rank first (`Slot::expected_type` — the seam's Perl consumer). Purely
+    // a reorder + priority boost on the gathered candidates; nothing is
+    // pruned (a mid-refactor mismatch stays visible).
+    if let Some(expected) = crate::lsp::cursor_slot::detect_call_slot(tree, source.as_bytes(), point)
+        .and_then(|s| s.slot.expected_type(analysis, point, Some(module_index)))
+    {
+        rank_candidates_by_expected_type(&mut candidates, &expected, analysis, point);
+    }
+
+    let mut items: Vec<CompletionItem> = candidates
+        .drain(..)
+        .map(candidate_to_completion_item)
+        .collect();
+    // Dispatch items stay at the top — their sort_text already leads
+    // with a space so they group above the priority-numbered rest,
+    // but the authoritative ordering is "dispatch first" so they're
+    // prepended explicitly.
+    if !dispatch_items.is_empty() {
+        let mut with_dispatch = dispatch_items;
+        with_dispatch.extend(items);
+        items = with_dispatch;
+    }
+
+    // Ref-type deref snippets when completing after ->
+    if let Slot::Member { ref receiver, .. } = slot {
+        if let Some(ref ty) = receiver.receiver_type {
+            if !ty.is_object() {
+                items.extend(ref_type_snippet_completions(ty));
+            }
+        }
+    }
+
+    items
+}
+
+/// The `use Module qw(|)` "still indexing" affordance — shown while the
+/// named module's export surface (the entity) isn't cached yet. Not an
+/// entity candidate, so it's built here rather than via the projection.
+fn import_list_loading_placeholder(module_name: &str) -> CompletionItem {
+    CompletionItem {
+        label: format!("loading {}...", module_name),
+        kind: Some(CompletionItemKind::TEXT),
+        detail: Some("Module is being indexed".to_string()),
+        insert_text: Some(String::new()),
+        sort_text: Some("999".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Returns snippet completions for ref-type dereference after `->`.
+fn ref_type_snippet_completions(ty: &InferredType) -> Vec<CompletionItem> {
+    match ty {
+        InferredType::ArrayRef => vec![CompletionItem {
+            label: "[index]".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("array dereference".to_string()),
+            insert_text: Some("[$0]".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("000".to_string()),
+            ..Default::default()
+        }],
+        InferredType::CodeRef { .. } => vec![CompletionItem {
+            label: "(args)".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("code dereference".to_string()),
+            insert_text: Some("($0)".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("000".to_string()),
+            ..Default::default()
+        }],
+        InferredType::HashRef => vec![CompletionItem {
+            label: "{key}".to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            detail: Some("hash dereference".to_string()),
+            insert_text: Some("{$0}".to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            sort_text: Some("000".to_string()),
+            ..Default::default()
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Language-agnostic hover for pack languages: the symbol's declaration
+/// line in a language-appropriate code fence + its kind. Resolves a
+/// cursor on a def directly, or on a call/ref to the local def it names.
+/// The Perl `hover_info` renderer is Perl-specific (```perl fences,
+/// method-resolution prose); pack languages get this instead.
+/// Member completion for a pack language: the members of `class` (the
+/// type of the `.`/`->` receiver, resolved by the sentinel) as items. The
+/// tree work (sentinel reparse → receiver → type, incl. chains) happens in
+/// the backend; this is the tree-free class → members → items half.
+/// `op_fix = Some((operator_span, correct_operator))` attaches an
+/// `additionalTextEdit` to every item that swaps the typed `.`/`->` for the
+/// one the receiver's pointer depth requires (Mode A — accepting `width` on
+/// `p.` yields `p->width`). `None` leaves the items untouched (operator
+/// already correct, or DEEP receiver shown-only).
+pub fn member_completion_for_class(
+    analysis: &FileAnalysis,
+    class: &str,
+    module_index: &dyn crate::model::file_analysis::CrossFileLookup,
+    op_fix: Option<(crate::model::file_analysis::Span, String)>,
+    point: Point,
+) -> Option<Vec<CompletionItem>> {
+    // The access-specifier gate needs to know whether the
+    // CURSOR itself is lexically inside `class`'s own body — self-access
+    // sees non-public members, an external receiver doesn't.
+    let requesting_class = analysis
+        .scope_at(point)
+        .and_then(|sc| analysis.enclosing_class_for_scope(sc));
+    let candidates = analysis.complete_members_for_class(
+        class, Some(module_index), requesting_class.as_deref(),
+    );
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(
+        candidates
+            .into_iter()
+            .map(|mut c| {
+                if let Some((span, text)) = &op_fix {
+                    c.additional_edits.push((*span, text.clone()));
+                }
+                candidate_to_completion_item(c)
+            })
+            .collect(),
+    )
+}
+
+/// Hover for pack languages: a presentation of the CandidateSet's hover
+/// projection (`docs/adr/resolution-candidate-set.md` — hover presents the
+/// top-ranked candidate goto-def would jump to, so the two verbs answer one
+/// resolution and can't disagree). Presentation stays here: the member
+/// drill-downs (domain headline, storage leaf, template substitution) run
+/// first over the same invocant resolution the set's member goto-def lane
+/// uses; everything else renders the projection's candidate.
+pub fn pack_hover_markdown(
+    cs: &crate::index::resolve::CandidateSet,
+    language: &str,
+) -> Option<String> {
+    let analysis = cs.origin_analysis();
+    let source = cs.origin_source()?;
+    let point = cs.cursor();
+    let module_index = cs.scoped_index();
+    // Member access (`obj->field` / `obj->method()`): resolve the EXACT member
+    // via the invocant class + ancestor walk — the SAME resolution the set's
+    // member goto-def lane uses — so a same-file field def (or a same-named
+    // symbol on another class) can't hijack it with the wrong scope.
+    // A data field shows `field: type` (member_hover, keyed on the field's own
+    // scope); a method shows its signature.
+    if let Some(r) = analysis.ref_at(point).filter(|r| matches!(r.kind, RefKind::MethodCall { .. })) {
+        if let Some(midx) = module_index {
+            if let Some(cn) = analysis.method_call_invocant_class(r, Some(midx)) {
+                let field = r.unqualified_target_name();
+                // The receiver's full VALUE (not just its dispatch class):
+                // a template instance's args refine a param-shaped member
+                // type (`T get()` on a `Box<int>` receiver → `int`) — shown
+                // only when the substitution actually changed the answer,
+                // so non-template hovers stay byte-identical.
+                let recv_ty = match &r.kind {
+                    RefKind::MethodCall { invocant_span: Some(sp), .. } => {
+                        analysis.expr_type_at_span(*sp, Some(midx))
+                    }
+                    _ => None,
+                };
+                let substituted = |raw: Option<InferredType>| -> Option<InferredType> {
+                    let sub = recv_ty
+                        .as_ref()
+                        .and_then(|t| analysis.member_value_type(t, field, Some(midx), None))?;
+                    (raw.as_ref() != Some(&sub)).then_some(sub)
+                };
+                if let Some(crate::model::file_analysis::MethodResolution::Local { sym_id, .. }) =
+                    analysis.resolve_method_in_ancestors(&cn, field, Some(midx))
+                {
+                    let sym = analysis.symbol(sym_id);
+                    if matches!(sym.kind, FaSymKind::Method | FaSymKind::Sub) {
+                        let mut text = render_symbol_hover(
+                            sym, source, &sym.span.start, language, analysis, sym.span.start, Some(midx),
+                        );
+                        if let Some(rt) = substituted(
+                            analysis.find_method_return_type(&cn, field, Some(midx), None),
+                        ) {
+                            text.push_str(&format!(
+                                "\n\n*returns: {}*",
+                                crate::model::file_analysis::format_inferred_type(&rt)
+                            ));
+                        }
+                        return Some(text);
+                    }
+                }
+                // A param-typed member substitutes the same way (`T v_;` on
+                // `Box<int>` reads `v_: int`; a cross-file method's return
+                // lands here too, so the label stays kind-agnostic).
+                if let Some(sub) =
+                    substituted(analysis.field_type_on_class(&cn, field, Some(midx)))
+                {
+                    return Some(format!(
+                        "```{}\n{}: {}\n```\n\n*member*",
+                        language,
+                        field,
+                        crate::model::file_analysis::format_inferred_type(&sub)
+                    ));
+                }
+                // The member's declared type may be a config-variant macro whose
+                // flow type is the join abstraction (`Numeric`); display the
+                // concrete leaf from the config-active variant's alias chain.
+                let storage_leaf = analysis
+                    .member_type_spelling(&cn, field, Some(midx))
+                    .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx));
+                // Domain typing: the slot's storage type (`uint16_t`) discards
+                // its DOMAIN (`opcode`), recoverable from usage. When the
+                // usage-fold recovers one, it headlines with the storage leaf
+                // as a drill-down: `op_type: opcode (stored as uint16_t)`. The
+                // domain never overrides storage for correctness — a human
+                // surface only.
+                if let Some(dom) = analysis.field_domain(&cn, field, Some(midx)) {
+                    let stored = storage_leaf
+                        .clone()
+                        .map(|s| format!(" *(stored as `{}`)*", s))
+                        .unwrap_or_default();
+                    return Some(format!(
+                        "```{}\n{}: {}\n```\n\n*field*{}",
+                        language, field, dom.domain, stored
+                    ));
+                }
+                if let Some(leaf) = storage_leaf {
+                    return Some(format!("```{}\n{}: {}\n```\n\n*field*", language, field, leaf));
+                }
+                if let Some(h) = analysis.member_hover(&cn, field, Some(midx)) {
+                    return Some(format!("```{}\n{}\n```\n\n*field*", language, h));
+                }
+            }
+        }
+    }
+    // The projection's answer: present the top-ranked definition candidate —
+    // what goto-def would jump to — wherever it lives (macro variants,
+    // template/spec ladders, locals, cross-file functions all arrive here).
+    if let Some(loc) = cs.hover_candidate() {
+        if let Some(text) = render_candidate_hover(cs, &loc, language) {
+            return Some(text);
+        }
+    }
+    // Cursor on a decl the forward walk didn't self-resolve: render the
+    // symbol under the cursor directly (its own type point + scope).
+    if let Some(sym) = analysis.symbol_at(point) {
+        return Some(render_symbol_hover(
+            sym, source, &sym.span.start, language, analysis, point, module_index,
+        ));
+    }
+    None
+}
+
+/// Render the hover projection's candidate: the symbol declared at the
+/// location — in the origin (fresh text in hand) or a cached pack module
+/// (read from disk, suffixed with the defining file's name) — through the
+/// same renderer decl-site hovers use. A location no Symbol sits at (a
+/// macro def whose Symbol was claimed under another lane, a top-of-file
+/// landing) renders its source line, which for a `#define` IS the def.
+fn render_candidate_hover(
+    cs: &crate::index::resolve::CandidateSet,
+    loc: &crate::index::resolve::RefLocation,
+    language: &str,
+) -> Option<String> {
+    let module_index = cs.scoped_index();
+    let sym_at = |a: &FileAnalysis| -> Option<usize> {
+        a.symbols
+            .iter()
+            .position(|s| s.selection_span.start == loc.span.start)
+            .or_else(|| {
+                a.symbols
+                    .iter()
+                    .position(|s| s.selection_span.start.row == loc.span.start.row
+                        && crate::model::file_analysis::contains_point(&s.selection_span, loc.span.start))
+            })
+    };
+    if crate::index::resolve::file_key_eq(&loc.key, cs.origin_file_key()) {
+        let analysis = cs.origin_analysis();
+        let source = cs.origin_source()?;
+        if let Some(i) = sym_at(analysis) {
+            let sym = &analysis.symbols[i];
+            return Some(render_symbol_hover(
+                sym, source, &sym.span.start, language, analysis, cs.cursor(), module_index,
+            ));
+        }
+        let line = source.lines().nth(loc.span.start.row)?.trim();
+        return (!line.is_empty()).then(|| format!("```{}\n{}\n```", language, line));
+    }
+    let path = crate::index::resolve::key_for_sort(&loc.key);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let fname = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+    // The candidate's own analysis: the scoped index caches every pack file
+    // a projection can answer from.
+    let mut found: Option<std::sync::Arc<crate::model::file_analysis::CachedModule>> = None;
+    if let Some(midx) = module_index {
+        midx.for_each_cached_file(&mut |cached| {
+            if found.is_none() && cached.path == path {
+                found = Some(std::sync::Arc::clone(cached));
+            }
+        });
+    }
+    if let Some(cached) = &found {
+        let whole = module_index
+            .map(|midx| midx.whole_present(cached))
+            .unwrap_or_else(|| cached.analysis.clone());
+        if let Some(i) = sym_at(&whole) {
+            let sym = &whole.symbols[i];
+            let mut out = render_symbol_hover(
+                sym, &text, &sym.span.start, language, &whole, sym.span.start,
+                module_index,
+            );
+            out.push_str(&format!("\n\n— `{}`", fname));
+            return Some(out);
+        }
+    }
+    let line = text.lines().nth(loc.span.start.row)?.trim();
+    (!line.is_empty()).then(|| format!("```{}\n{}\n```\n\n— `{}`", language, line, fname))
+}
+
+/// Render a symbol's hover. Variables/fields show `name: type` (the inferred
+/// type — exact class for objects, generic for primitives) rather than the
+/// raw decl line, which for a PARAM is the whole function signature. Other
+/// kinds show their declaration line + kind (+ class attribute signals).
+/// The hover/label word for `sym` — one mapping shared by every render path
+/// below (the typed-variable early return AND the declaration-line
+/// fallback), so a kind never gets a different label depending on which
+/// branch happened to serve it. A `#define`-backed callable is a real
+/// `SymKind::Sub` everywhere else (dispatch/completion/goto-def), but its
+/// `"macro"` attribute (stamped at extraction) overrides the label here —
+/// the attribute is the value-borne "this Sub is macro-shaped" fact,
+/// checked before the kind match rather than re-deriving it from the name.
+fn hover_kind_label(sym: &crate::model::file_analysis::Symbol) -> &'static str {
+    if sym.attributes.iter().any(|a| a == "macro") {
+        return "macro";
+    }
+    match sym.kind {
+        FaSymKind::Sub => "function",
+        FaSymKind::Method => "method",
+        FaSymKind::Class => "class",
+        FaSymKind::Package => "namespace",
+        FaSymKind::Variable => "variable",
+        FaSymKind::Field => "field",
+        FaSymKind::Enumerator => "enumerator",
+        _ => "symbol",
+    }
+}
+
+fn render_symbol_hover(
+    sym: &crate::model::file_analysis::Symbol,
+    source: &str,
+    line_at: &Point,
+    language: &str,
+    analysis: &FileAnalysis,
+    type_point: Point,
+    module_index: Option<&dyn crate::model::file_analysis::CrossFileLookup>,
+) -> String {
+    if matches!(sym.kind, FaSymKind::Variable | FaSymKind::Field | FaSymKind::Enumerator) {
+        if let Some(ty) = analysis.inferred_type_via_bag_ctx(&sym.name, type_point, module_index) {
+            // Config-variant macro type → display the concrete leaf recovered
+            // from the config-active variant's alias chain, not the join
+            // abstraction the type flows as.
+            let display = module_index
+                .and_then(|midx| {
+                    analysis
+                        .type_name_edge_of(&sym.name, sym.scope)
+                        .and_then(|sp| config_variant_leaf_display(analysis, &sp, midx))
+                })
+                .unwrap_or_else(|| sym.display_type(&ty));
+            // A union member's def-site hover carries the storage overlay,
+            // same as the member-access path (`FileAnalysis::member_hover`).
+            let overlay = match analysis.union_overlay(sym) {
+                Some(sibs) if !sibs.is_empty() => {
+                    format!(" — union member (overlays {})", sibs.join(", "))
+                }
+                _ => String::new(),
+            };
+            return format!(
+                "```{}\n{}: {}{}\n```\n\n*{}*",
+                language, sym.name, display, overlay, hover_kind_label(sym)
+            );
+        }
+    }
+    let line = source.lines().nth(line_at.row).unwrap_or("").trim();
+    let sig = line.trim_end_matches([' ', '{', ';']).trim();
+    let mut out = format!("```{}\n{}\n```\n\n*{}*", language, sig, hover_kind_label(sym));
+    if matches!(sym.kind, FaSymKind::Class) {
+        for attr in &sym.attributes {
+            out.push_str(&format!("\n\n*{}*", attr));
+        }
+    }
+    out
+}
+
+pub fn pack_hover(cs: &crate::index::resolve::CandidateSet, language: &str) -> Option<Hover> {
+    let value = pack_hover_markdown(cs, language)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: None,
+    })
+}
+
+pub fn hover_info(
+    analysis: &FileAnalysis,
+    source: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+) -> Option<Hover> {
+    let point = position_to_point(pos);
+
+    // Try local hover first
+    if let Some(markdown) = analysis.hover_info(point, source, Some(module_index)) {
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: markdown,
+            }),
+            range: None,
+        });
+    }
+
+    // Check if cursor is on an imported function call or a Perl
+    // builtin. Builtin docs come from `module_index.builtin_doc`,
+    // which the resolver thread hydrates from SQLite (parsed from
+    // `perlfunc.pod` only on cold-cache miss).
+    if let Some(r) = analysis.ref_at(point) {
+        if matches!(r.kind, RefKind::FunctionCall { .. }) {
+            if is_perl_builtin(&r.target_name) {
+                if let Some(markdown) = module_index.builtin_doc(&r.target_name) {
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: markdown,
+                        }),
+                        range: None,
+                    });
+                }
+            }
+            if let Some((import, _path, remote_name)) =
+                resolve_imported_function(analysis, &r.target_name, module_index)
+            {
+                let mut parts = Vec::new();
+
+                // Show signature if available. Cross-file lookup uses
+                // the REMOTE name — for a renaming import (`del` →
+                // `delete`), cursor is on `del` but sub_info lives
+                // under `delete` in the cached module.
+                if let Some(cached) = module_index
+                    .defining_module_cached(&import.module_name, &remote_name)
+                    .or_else(|| module_index.get_cached(&import.module_name))
+                {
+                    let whole = module_index.bag_present(&cached);
+                    if let Some(sub_info) = whole.sub_info_view(&remote_name) {
+                        // Present the sig under the LOCAL name — that's
+                        // what the user typed and what hover should lead
+                        // with; the remote name is just how we fetched it.
+                        let sig = format_imported_signature(&r.target_name, &sub_info);
+                        parts.push(format!("```perl\n{}\n```", sig));
+                        if let Some(doc) = sub_info.doc() {
+                            parts.push(doc.to_string());
+                        }
+                    }
+                }
+
+                if remote_name != r.target_name {
+                    parts.push(format!(
+                        "*imported from `{}` (as `{}`)*",
+                        import.module_name, remote_name
+                    ));
+                } else {
+                    parts.push(format!("*imported from `{}`*", import.module_name));
+                }
+                let markdown = parts.join("\n\n");
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: markdown,
+                    }),
+                    range: None,
+                });
+            }
+
+            // Fully-qualified call with no import: resolve the sub in the
+            // package named by the qualifier (`resolved_package`).
+            if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
+                let bare = r.unqualified_target_name();
+                if let Some(cached) = module_index.get_cached(pkg) {
+                    let whole = module_index.bag_present(&cached);
+                    if let Some(sub_info) = whole.sub_info_view(bare) {
+                        let sig = format_imported_signature(bare, &sub_info);
+                        let mut parts = vec![format!("```perl\n{}\n```", sig)];
+                        if let Some(doc) = sub_info.doc() {
+                            parts.push(doc.to_string());
+                        }
+                        parts.push(format!("*from `{}`*", pkg));
+                        return Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: parts.join("\n\n"),
+                            }),
+                            range: None,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn document_highlights(analysis: &FileAnalysis, pos: Position, module_index: Option<&dyn CrossFileLookup>) -> Vec<DocumentHighlight> {
+    use crate::model::file_analysis::AccessKind;
+    analysis.find_highlights(position_to_point(pos), module_index)
+        .into_iter()
+        .map(|(span, access)| DocumentHighlight {
+            range: span_to_range(span),
+            kind: Some(match access {
+                AccessKind::Write => DocumentHighlightKind::WRITE,
+                _ => DocumentHighlightKind::READ,
+            }),
+        })
+        .collect()
+}
+
+/// Linked-editing ranges = the in-file occurrence set of the symbol at `pos`.
+/// Shared by the LSP `linked_editing_range` handler and the `--linked-editing`
+/// CLI so neither re-derives it — it's just `find_references` (the same path
+/// document-highlight/references use), surfaced as ranges. None when there's
+/// nothing to co-edit (fewer than two occurrences).
+pub fn linked_editing_ranges(
+    analysis: &FileAnalysis,
+    pos: Position,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> Option<Vec<Range>> {
+    let refs = analysis.find_references(position_to_point(pos), module_index);
+    if refs.len() < 2 {
+        return None;
+    }
+    Some(refs.into_iter().map(span_to_range).collect())
+}
+
+pub fn selection_ranges(tree: &Tree, pos: Position) -> SelectionRange {
+    let spans = cursor_context::selection_ranges(tree, position_to_point(pos));
+    // Build linked list from innermost to outermost
+    let mut result: Option<SelectionRange> = None;
+    for span in spans.into_iter().rev() {
+        result = Some(SelectionRange {
+            range: span_to_range(span),
+            parent: result.map(Box::new),
+        });
+    }
+    result.unwrap_or(SelectionRange {
+        range: Range::default(),
+        parent: None,
+    })
+}
+
+pub fn folding_ranges(analysis: &FileAnalysis) -> Vec<FoldingRange> {
+    analysis.fold_ranges
+        .iter()
+        .map(|f| FoldingRange {
+            start_line: f.start_line as u32,
+            start_character: None,
+            end_line: f.end_line as u32,
+            end_character: None,
+            kind: Some(match f.kind {
+                FoldKind::Region => FoldingRangeKind::Region,
+                FoldKind::Comment => FoldingRangeKind::Comment,
+            }),
+            collapsed_text: None,
+        })
+        .collect()
+}
+
+// ---- Signature help ----
+
+/// Does this class have ANY registered Handlers matching the method
+/// name as a declared dispatcher? Used to decide whether we're in a
+/// "known dispatch call" context — gates the noise-suppression logic
+/// around it so the firehose of unrelated subs only gets suppressed
+/// when we actually know this is a dispatcher call site.
+fn class_has_dispatch_handlers(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    class: &str,
+    dispatcher: &str,
+) -> bool {
+    // Funnels through `for_each_dispatch_handler_on_class` (the
+    // ancestor-aware bridge walker) so this predicate agrees with
+    // `dispatch_target_completions`: if completion would offer at
+    // least one handler, this returns true. `found` short-circuits
+    // semantically — the walker still visits every class, but per-
+    // class closure exits cheaply once the flag is set.
+    let mut found = false;
+    analysis.for_each_dispatch_handler_on_class(
+        class,
+        dispatcher,
+        Some(module_index),
+        |_sym, _prov| { found = true; },
+    );
+    found
+}
+
+/// Span of the string-literal's CONTENT (between the quotes) at `point`,
+/// if the cursor is inside one. Returns `None` for non-string contexts.
+///
+/// Used by mid-string completions (dispatch-target handlers, method-ref
+/// mid-string) to anchor a `TextEdit` range. Without this, the client's
+/// word-at-cursor heuristic (nvim's `iskeyword` default excludes `/`
+/// and `#`) mis-extracts the typed prefix for non-identifier labels
+/// like `/users/profile` or `Users#list` and drops valid matches.
+/// Setting `textEdit.range` to the content span makes the client match
+/// the whole in-range text against the label.
+///
+/// Empty strings (`url_for('')`): no `string_content` child exists, so
+/// fall back to a zero-width span at the cursor. Any prefix match
+/// against "" passes, which is the right answer for "user hasn't
+/// typed anything in the string yet".
+fn string_content_span_at(tree: &Tree, point: Point) -> Option<Span> {
+    let mut node = tree.root_node().descendant_for_point_range(point, point)?;
+    for _ in 0..4 {
+        match node.kind() {
+            "string_content" => {
+                return Some(Span {
+                    start: node.start_position(),
+                    end: node.end_position(),
+                });
+            }
+            "string_literal" | "interpolated_string_literal" => {
+                // Boundary case: when the cursor sits at the END of
+                // the content (just before the closing quote) or on
+                // the closing quote itself, `descendant_for_point_range`
+                // lands on the literal wrapper instead of `string_content`
+                // — content ranges are half-open, so the end column
+                // isn't "contained". Look down for a `string_content`
+                // child and use its span. Otherwise we'd return a
+                // zero-width range at cursor, which makes textEdit
+                // APPEND the label after the user's typed text
+                // (`'/fall' → '/fall/fallback'`) instead of replacing it.
+                let mut walker = node.walk();
+                for child in node.named_children(&mut walker) {
+                    if child.kind() == "string_content" {
+                        return Some(Span {
+                            start: child.start_position(),
+                            end: child.end_position(),
+                        });
+                    }
+                }
+                // Genuinely empty literal (`''` with cursor between the
+                // quotes). Zero-width range at cursor is correct here —
+                // there's nothing to replace.
+                return Some(Span { start: point, end: point });
+            }
+            _ => {}
+        }
+        let Some(p) = node.parent() else { break };
+        node = p;
+    }
+    None
+}
+
+/// Rewrite each item's replace range to `span`, materialized as a
+/// `TextEdit` on `text_edit`. Used for mid-string completions where
+/// the client's default word-extraction would otherwise misfilter the
+/// item (see `string_content_span_at`).
+///
+/// `newText` is the bare `label` — NOT `insert_text`. `insert_text`
+/// from other code paths can carry wrapping quotes (`'connect'` for
+/// the bare-parens case), and the replace range we're setting already
+/// sits INSIDE the existing string's quotes. Threading insert_text
+/// through here would insert `'connect'` inside `''` → `''connect''`.
+/// Using the label keeps the invariant simple: whatever span we're
+/// replacing, the replacement is the identifier text, no decoration.
+/// `insert_text` is also cleared — textEdit takes precedence in the
+/// LSP spec, and leaving both set confuses some clients.
+fn retarget_items_to_span(items: &mut [CompletionItem], span: Span) {
+    let range = span_to_range(span);
+    for item in items {
+        item.text_edit = Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(
+            tower_lsp::lsp_types::TextEdit { range, new_text: item.label.clone() },
+        ));
+        item.insert_text = None;
+    }
+}
+
+/// True if the cursor sits somewhere that makes wrapping-quotes in the
+/// insert_text wrong. Two cases:
+///   * cursor in a `string_literal` / `interpolated_string_literal`
+///     (the quotes are already typed)
+///   * cursor at a fat-comma LHS autoquote position (the `=>` will
+///     autoquote whatever bareword lands there)
+fn cursor_in_string_or_autoquote(tree: &Tree, point: Point) -> bool {
+    let Some(mut node) = tree.root_node().descendant_for_point_range(point, point) else {
+        return false;
+    };
+    // Walk upward a handful of levels — tree-sitter may hand back a
+    // token node first; the enclosing string_literal is typically one
+    // or two parents up.
+    for _ in 0..4 {
+        match node.kind() {
+            "string_literal" | "interpolated_string_literal"
+            | "string_content" | "autoquoted_bareword" => return true,
+            _ => {}
+        }
+        let Some(p) = node.parent() else { break };
+        node = p;
+    }
+    false
+}
+
+/// Completions for the first arg of a string-dispatched method call.
+/// Walks every Handler symbol (local + cross-file via module index),
+/// filters by (owner class matches receiver, dispatcher matches method
+/// name), and returns each as a CompletionItem. Stacked registrations
+/// dedup on name; the completion shows the param shape in detail so
+/// you know what args the handler will get.
+fn dispatch_target_completions(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    invocant: Option<&str>,
+    method_name: &str,
+    point: Point,
+    tree: &Tree,
+) -> Vec<CompletionCandidate> {
+    let class = match analysis.invocant_text_to_class(invocant, point) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    // Quote-aware insert_text. Three cases:
+    //   * cursor inside a string_literal (`->emit('|')`) — the quotes
+    //     are already there, emit bare name.
+    //   * cursor at fat-comma LHS autoquote position (`->emit(|=>...)`)
+    //     — no quotes needed, Perl auto-quotes barewords on fat-comma
+    //     LHS. (Dispatch shouldn't normally fire here, but defensive.)
+    //   * anywhere else — emit with surrounding quotes so one accept
+    //     keystroke produces `'name'` in bare parens.
+    // Implemented as a closure so the branching stays adjacent to the
+    // decision and every emitted candidate is consistent.
+    let needs_quotes = !cursor_in_string_or_autoquote(tree, point);
+
+    // Accumulate (handler_name → display_params + provenance) so stacked
+    // registrations across files appear once in the completion list.
+    // The walker funnels local + namespace-bridged + cross-file via
+    // `for_each_entity_bridged_to` (rule #8) and walks ancestors so
+    // `$c->url_for('|')` on a `Users` controller surfaces routes whose
+    // Handlers live on `Mojolicious::Controller` (the shared base).
+    let mut acc: std::collections::BTreeMap<String, (Vec<String>, String)> =
+        std::collections::BTreeMap::new();
+    analysis.for_each_dispatch_handler_on_class(
+        &class, method_name, Some(module_index),
+        |sym, provenance| {
+            let SymbolDetail::Handler { params, .. } = &sym.detail else { return };
+            let display: Vec<String> = params
+                .iter()
+                .filter(|p| !p.is_invocant)
+                .map(|p| p.name.clone())
+                .collect();
+            acc.entry(sym.name.clone()).or_insert((display, provenance.to_string()));
+        },
+    );
+
+    acc.into_iter().map(|(name, (params, provenance))| {
+        let detail = if params.is_empty() {
+            format!("handler on {}  ({})", class, provenance)
+        } else {
+            format!("handler on {} ({})  — {}", class, params.join(", "), provenance)
+        };
+        CompletionCandidate {
+            label: name.clone(),
+            // Handler kind flows to CompletionItemKind::EVENT via
+            // `fa_completion_kind` — consistent with outline and hover.
+            kind: FaSymKind::Handler,
+            detail: Some(detail),
+            // Bare inside quotes / autoquote, quoted otherwise — see
+            // `needs_quotes` above. Accepting the suggestion lands
+            // correct source text regardless of where the cursor was.
+            insert_text: Some(if needs_quotes {
+                format!("'{}'", name)
+            } else {
+                name.clone()
+            }),
+            // Top of the list: handlers are the canonical completion in
+            // this position when a dispatcher is declared for them.
+            sort_priority: 0,
+            additional_edits: Vec::new(),
+                import_fact: None,
+                display_override: None,
+        }
+    }).collect()
+}
+
+/// Collect refs whose span contains `point` and match a predicate.
+/// Small generic helper — used by mid-string completion to find the
+/// (typically unique) MethodCallRef at the cursor.
+fn refs_at_point_matching<'a>(
+    analysis: &'a FileAnalysis,
+    point: Point,
+    pred: impl Fn(&crate::model::file_analysis::Ref) -> bool,
+) -> Option<Vec<&'a crate::model::file_analysis::Ref>> {
+    let out: Vec<&crate::model::file_analysis::Ref> = analysis.refs.iter()
+        .filter(|r| span_contains_point(&r.span, point) && pred(r))
+        .collect();
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn span_contains_point(span: &crate::model::file_analysis::Span, p: Point) -> bool {
+    let a = (span.start.row, span.start.column);
+    let b = (span.end.row, span.end.column);
+    let pp = (p.row, p.column);
+    a <= pp && pp <= b
+}
+
+/// Mid-string completion for a cursor inside a plugin-emitted
+/// `MethodCallRef`. Offers methods on the invocant class (walking
+/// inheritance + workspace), prefix-filtered by whatever the user has
+/// typed since the start of the ref's span.
+///
+/// The core is deliberately ignorant of plugin-specific string formats
+/// (no `#` splitting, no `::` splitting — that's Mojo-routes syntax
+/// bleeding in). It's the plugin's job to emit a tight span that
+/// covers only the method-name portion of its string; the core just
+/// slices `source[ref.span.start..cursor]` and uses that as the prefix.
+/// If a plugin wants fuzzier matching behavior it can widen its spans;
+/// the semantics stay plugin-controlled.
+fn mid_string_methodref_completions(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    invocant_class: &str,
+    source: &str,
+    point: Point,
+    ref_span: crate::model::file_analysis::Span,
+) -> Vec<CompletionItem> {
+    // Pull the typed prefix out of the live source text — not from the
+    // parser, because during active editing the two diverge.
+    let lines: Vec<&str> = source.lines().collect();
+    if ref_span.start.row >= lines.len() || point.row >= lines.len() {
+        return Vec::new();
+    }
+    let typed = if ref_span.start.row == point.row {
+        let line = lines[point.row];
+        let start = ref_span.start.column.min(line.len());
+        let end = point.column.min(line.len());
+        &line[start..end]
+    } else {
+        // Multi-line ref spans: conservative — only use the current line.
+        let line = lines[point.row];
+        &line[..point.column.min(line.len())]
+    };
+
+    let candidates = analysis.complete_methods_for_class(invocant_class, Some(module_index));
+    let mut items: Vec<CompletionItem> = candidates
+        .into_iter()
+        .filter(|c| typed.is_empty() || c.label.starts_with(typed))
+        .map(|c| {
+            let mut item = candidate_to_completion_item(c);
+            item.sort_text = Some(format!("000{}", item.label));
+            item
+        })
+        .collect();
+    // Anchor the replace range to the ref's span (already tight on
+    // the method-name portion — plugins control its width). Without
+    // this, labels containing non-identifier chars (`Ctrl#act` past
+    // the `#`) get dropped by the client's word-match. Same fix as
+    // dispatch-target items, same reason.
+    retarget_items_to_span(&mut items, ref_span);
+    items
+}
+
+/// Materialize `PluginCompletion` items for every Handler symbol
+/// whose owner matches `owner_class` and whose `dispatchers` list
+/// contains any of `dispatcher_names`. Walks the local analysis AND
+/// every cross-file cached module. Used by plugin-delegated
+/// dispatch-name completion (Minion enqueue arg-0, Mojo emit arg-0,
+/// etc.).
+fn dispatch_target_items_for(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    owner_class: &str,
+    dispatcher_names: &[String],
+) -> Vec<CompletionItem> {
+    use crate::model::file_analysis::SymbolDetail;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<CompletionItem> = Vec::new();
+    let mut emit = |sym: &crate::model::file_analysis::Symbol| {
+        let SymbolDetail::Handler { display, .. } = &sym.detail else { return };
+        if !seen.insert(sym.name.clone()) { return; }
+        let detail = display.outline_word().map(|s| s.to_string());
+        out.push(CompletionItem {
+            label: sym.name.clone(),
+            kind: Some(handler_display_to_completion_kind(display)),
+            detail,
+            filter_text: Some(sym.name.clone()),
+            sort_text: Some(format!(" 000{}", sym.name)),
+            insert_text: Some(format!("'{}'", sym.name)),
+            ..Default::default()
+        });
+    };
+    for sym in analysis.handlers_for_owner(owner_class, dispatcher_names) {
+        emit(sym);
+    }
+    module_index.for_each_cached(|_, cached| {
+        let whole = module_index.whole_present(cached);
+        for sym in whole.handlers_for_owner(owner_class, dispatcher_names) {
+            emit(sym);
+        }
+    });
+    out
+}
+
+/// Convert a plugin's minimal `PluginSignatureHelp` to the full LSP
+/// `SignatureHelp` shape. Core fills in `active_signature` and the
+/// per-parameter scaffolding so plugin-side Rhai stays ergonomic.
+fn plugin_sig_to_lsp(p: crate::build::plugin::PluginSignatureHelp) -> SignatureHelp {
+    let parameters: Vec<ParameterInformation> = p.params.iter().cloned()
+        .map(|label| ParameterInformation {
+            label: ParameterLabel::Simple(label),
+            documentation: None,
+        })
+        .collect();
+    SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: p.label,
+            documentation: None,
+            parameters: Some(parameters),
+            active_parameter: Some(p.active_param as u32),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(p.active_param as u32),
+    }
+}
+
+/// Convert a plugin completion hint to LSP `CompletionItemKind`.
+fn plugin_completion_kind_hint(h: &crate::build::plugin::CompletionKindHint) -> CompletionItemKind {
+    use crate::build::plugin::CompletionKindHint as K;
+    match h {
+        K::Function | K::Task | K::Helper | K::Route => CompletionItemKind::FUNCTION,
+        K::Method => CompletionItemKind::METHOD,
+        K::Field => CompletionItemKind::FIELD,
+        K::Property => CompletionItemKind::PROPERTY,
+        K::Value => CompletionItemKind::VALUE,
+        K::Event => CompletionItemKind::EVENT,
+        K::Operator => CompletionItemKind::OPERATOR,
+        K::Keyword => CompletionItemKind::KEYWORD,
+    }
+}
+
+fn plugin_completion_to_item(p: crate::build::plugin::PluginCompletion) -> CompletionItem {
+    let filter_text = Some(p.label.clone());
+    let kind = plugin_completion_kind_hint(&p.kind);
+    // Map the semantic hint to an outline-style detail word so the
+    // client can distinguish Task/Helper/Route from plain Function.
+    let detail = p.detail.or_else(|| match p.kind {
+        crate::build::plugin::CompletionKindHint::Task => Some("task".into()),
+        crate::build::plugin::CompletionKindHint::Helper => Some("helper".into()),
+        crate::build::plugin::CompletionKindHint::Route => Some("route".into()),
+        _ => None,
+    });
+    CompletionItem {
+        label: p.label,
+        kind: Some(kind),
+        detail,
+        insert_text: p.insert_text,
+        filter_text,
+        sort_text: Some(" 000".into()), // space prefix sorts above digit-prefixed priorities
+        ..Default::default()
+    }
+}
+
+/// Find the enclosing method_call_expression at `point` and return any
+/// `DispatchCall` ref whose span sits inside that call's argument list.
+/// Returns `(handler_name, owner_class, dispatcher)` — all three are
+/// already plugin-resolved, so the caller inherits const-folding and
+/// receiver-type inference without re-deriving them.
+fn dispatch_info_for_enclosing_call(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    _source: &[u8],
+    point: Point,
+) -> Option<(String, String, String)> {
+    // Walk up from the cursor until we hit the enclosing method call.
+    let mut node = tree.root_node().descendant_for_point_range(point, point)?;
+    let call = loop {
+        if node.kind() == "method_call_expression" {
+            break node;
+        }
+        node = node.parent()?;
+    };
+    let call_start = crate::model::file_analysis::Span {
+        start: call.start_position(),
+        end: call.end_position(),
+    };
+
+    // First DispatchCall ref whose span is contained by this call.
+    for r in &analysis.refs {
+        let RefKind::DispatchCall { dispatcher, owner } = &r.kind else { continue };
+        if !span_contains_span(&call_start, &r.span) { continue; }
+        let Some(HandlerOwner::Class(class)) = owner.clone() else { continue };
+        return Some((r.target_name.clone(), class, dispatcher.clone()));
+    }
+    None
+}
+
+fn span_contains_span(outer: &crate::model::file_analysis::Span, inner: &crate::model::file_analysis::Span) -> bool {
+    let o_start = (outer.start.row, outer.start.column);
+    let o_end   = (outer.end.row,   outer.end.column);
+    let i_start = (inner.start.row, inner.start.column);
+    let i_end   = (inner.end.row,   inner.end.column);
+    o_start <= i_start && i_end <= o_end
+}
+
+/// Build sig help for a known (class, dispatcher, handler_name). Walks
+/// the current file's symbols AND every cached module — otherwise a
+/// consumer file that emits against a producer-defined handler gets no
+/// sig help, even though hover already walks cross-file (the two must
+/// agree — same abstraction, same reach).
+fn string_dispatch_signature_for(
+    analysis: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+    class: &str,
+    dispatcher: &str,
+    handler_name: &str,
+    active_param: usize,
+) -> Option<SignatureHelp> {
+    let mut signatures: Vec<SignatureInformation> = Vec::new();
+
+    // Shared builder — used both for in-file and cross-file symbol walks
+    // so a handler's sig is formatted identically regardless of where
+    // it lives.
+    let push_sig = |signatures: &mut Vec<SignatureInformation>,
+                    sym: &crate::model::file_analysis::Symbol,
+                    provenance: Option<&str>| {
+        let SymbolDetail::Handler { owner, dispatchers, params, .. } = &sym.detail else { return };
+        let HandlerOwner::Class(n) = owner;
+        if n != class { return; }
+        let dispatcher_ok = dispatchers.is_empty()
+            || dispatchers.iter().any(|d| d == dispatcher);
+        if !dispatcher_ok || params.is_empty() { return; }
+
+        let display: Vec<&ParamInfo> = params
+            .iter()
+            .filter(|p| !p.is_invocant)
+            .collect();
+        let labels: Vec<String> = display.iter()
+            .map(|p| match &p.default {
+                Some(d) => format!("{} = {}", p.name, d),
+                None => p.name.clone(),
+            })
+            .collect();
+        let parameters: Vec<ParameterInformation> = labels.iter()
+            .map(|l| ParameterInformation {
+                label: ParameterLabel::Simple(l.clone()),
+                documentation: None,
+            })
+            .collect();
+        let doc = match provenance {
+            Some(p) => format!(
+                "{} handler on `{}`, registered at {} line {}",
+                handler_name, class, p, sym.selection_span.start.row + 1,
+            ),
+            None => format!(
+                "{} handler on `{}`, registered at line {}",
+                handler_name, class, sym.selection_span.start.row + 1,
+            ),
+        };
+        signatures.push(SignatureInformation {
+            label: format!("{}('{}', {})", dispatcher, handler_name, labels.join(", ")),
+            documentation: Some(Documentation::String(doc)),
+            parameters: Some(parameters),
+            active_parameter: None,
+        });
+    };
+
+    for sym in &analysis.symbols {
+        if sym.name != handler_name { continue; }
+        push_sig(&mut signatures, sym, None);
+    }
+    if let Some(idx) = module_index {
+        for module_name in idx.modules_with_symbol(handler_name) {
+            let Some(cached) = idx.get_cached(&module_name) else { continue };
+            let whole = idx.whole_present(&cached);
+            for sym in &whole.symbols {
+                if sym.name != handler_name { continue; }
+                push_sig(&mut signatures, sym, Some(module_name.as_str()));
+            }
+        }
+    }
+
+    if signatures.is_empty() { return None; }
+    Some(SignatureHelp {
+        signatures,
+        active_signature: Some(0),
+        active_parameter: Some(active_param.saturating_sub(1) as u32),
+    })
+}
+
+/// Resolve the class of an invocant expression at a given cursor point.
+///   * `$self` / `__PACKAGE__`  → enclosing package at that position
+///   * bare `Pkg::Name`         → the literal class
+///   * `$var`                   → looked up via `analysis.inferred_type`
+/// Returns `None` when the expression doesn't resolve to a known class.
+/// Text-driven entry point: resolve invocant → class, then delegate to
+/// `string_dispatch_signature_for`. Used for mid-editing states where
+/// no DispatchCall ref exists yet.
+fn string_dispatch_signature(
+    analysis: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+    invocant: Option<&str>,
+    dispatcher: &str,
+    handler_name: &str,
+    active_param: usize,
+    point: Point,
+) -> Option<SignatureHelp> {
+    let class = analysis.invocant_text_to_class(invocant, point)?;
+    string_dispatch_signature_for(analysis, module_index, &class, dispatcher, handler_name, active_param)
+}
+
+pub fn signature_help(
+    analysis: &FileAnalysis,
+    tree: &Tree,
+    text: &str,
+    pos: Position,
+    module_index: &ModuleIndex,
+) -> Option<SignatureHelp> {
+    let point = position_to_point(pos);
+
+    // Plugin query hook — runs BEFORE native sig help. Plugin can
+    // show a custom sig (arrayref-wrapped handler args) OR silently
+    // claim the slot to suppress native sig (cursor in an options
+    // hash of a dispatcher — native would mis-show the task sig).
+    let mut skip_string_dispatch = false;
+    if let Some(qctx) = cursor_context::build_plugin_query_context(analysis, tree, text.as_bytes(), point) {
+        let registry = crate::build::plugin::default_plugin_registry();
+        let (uses, parents) = analysis.trigger_view_at(point);
+        let query = crate::build::plugin::TriggerQuery {
+            package_uses: &uses,
+            package_parents: &parents,
+        };
+        for p in registry.applicable(&query) {
+            match p.on_signature_help(&qctx) {
+                Some(crate::build::plugin::PluginSigHelpAnswer::Show(psig)) => {
+                    return Some(plugin_sig_to_lsp(psig));
+                }
+                Some(crate::build::plugin::PluginSigHelpAnswer::Silent) => {
+                    return None;
+                }
+                Some(crate::build::plugin::PluginSigHelpAnswer::ShowHandler {
+                    owner_class, dispatcher, handler_name, active_param,
+                }) => {
+                    // Core-side Handler lookup — same machinery the
+                    // native DispatchCall path uses, just triggered by
+                    // plugin instead of ref. `active_param` is a
+                    // displayed index; `string_dispatch_signature_for`
+                    // applies the +1 offset to match its internal
+                    // convention (params[0] is invocant, stripped).
+                    if let Some(sig) = string_dispatch_signature_for(
+                        analysis, Some(module_index),
+                        &owner_class, &dispatcher, &handler_name,
+                        active_param + 1,
+                    ) {
+                        return Some(sig);
+                    }
+                    // Plugin claimed the slot but no Handler was found
+                    // — suppress native to avoid fallthrough mis-fires.
+                    return None;
+                }
+                Some(crate::build::plugin::PluginSigHelpAnswer::ShowCallSig) => {
+                    // Plugin recognizes this call but the cursor isn't
+                    // in its args slot. Skip the native string-dispatch
+                    // fallback (which would key the task's sig off the
+                    // OUTER call's positional count) and fall through
+                    // to the method's OWN signature.
+                    skip_string_dispatch = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+    }
+
+    // Step 1: the enclosing call's ArgPosition slot (`docs/adr/cursor-slots.md`)
+    // — only the VERDICT routes through `detect_slot`'s call-slot entry;
+    // sig-help's own machinery (below) is unchanged.
+    let Slot::ArgPosition { callee: Some(call_ctx), .. } =
+        crate::lsp::cursor_slot::detect_call_slot(tree, text.as_bytes(), point)?.slot
+    else {
+        return None;
+    };
+
+    // Step 1a: string-dispatch specialization. `$x->emit('ready', CURSOR)`
+    // is a method call whose string arg routes to a registered handler;
+    // when handler_params are on record for that (class, event_name) pair,
+    // surface them instead of the emit() method's own generic signature.
+    // Stacked defs (multiple `->on('ready', sub {...})` wire-ups) each
+    // contribute one `SignatureInformation` so users see every handler
+    // shape they might be dispatching to.
+    // Arrayref-wrapped handler args (Minion's `enqueue(task, [@args])`)
+    // are handled by the plugin's `on_signature_help` IoC hook earlier
+    // in this function — the hook sees the Array container + active
+    // slot and returns the task sig. No core-side arrayref branching.
+
+    if !skip_string_dispatch && call_ctx.is_method && call_ctx.active_param >= 1 {
+        // Primary path: find the DispatchCall ref the plugin already
+        // emitted for this call site. Its `target_name`, `owner`, and
+        // `dispatcher` were all computed with the builder's full
+        // knowledge — including const-folding `$dynamic` back to
+        // `'connect'` — so sig help inherits folding for free and
+        // can't drift from what hover shows.
+        if let Some((handler_name, owner_class, dispatcher)) =
+            dispatch_info_for_enclosing_call(analysis, tree, text.as_bytes(), point)
+        {
+            if let Some(sig) = string_dispatch_signature_for(
+                analysis,
+                Some(module_index),
+                &owner_class,
+                &dispatcher,
+                &handler_name,
+                call_ctx.active_param,
+            ) {
+                return Some(sig);
+            }
+        }
+
+        // Fallback: no DispatchCall ref at this call site (e.g. no plugin
+        // declared the method as a dispatcher). Try the text-level
+        // first-arg string; this covers mid-editing states where a ref
+        // hasn't been emitted yet.
+        if let Some(ref name) = call_ctx.first_arg_string {
+            if let Some(sig) = string_dispatch_signature(
+                analysis,
+                Some(module_index),
+                call_ctx.invocant.as_deref(),
+                &call_ctx.name,
+                name,
+                call_ctx.active_param,
+                point,
+            ) {
+                return Some(sig);
+            }
+        }
+    }
+
+    // Step 2: file_analysis resolves the sub signature (local + cross-file)
+    if let Some(sig_info) = analysis.signature_for_call(
+        &call_ctx.name,
+        call_ctx.is_method,
+        call_ctx.invocant.as_deref(),
+        point,
+        Some(module_index),
+    ) {
+        // Build param labels with inferred types
+        let param_labels: Vec<String> = sig_info
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let base = if let Some(ref default) = p.default {
+                    format!("{} = {}", p.name, default)
+                } else {
+                    p.name.clone()
+                };
+                // Skip the invocant — its type is obvious. Flag first (covers
+                // plugin-marked invocants like a helper's `$c`); name
+                // convention as backstop for pre-flag cache blobs.
+                if p.is_invocant
+                    || crate::model::conventions::is_conventional_invocant_name(&p.name)
+                {
+                    return base;
+                }
+                // Cross-file: use pre-resolved param types
+                if let Some(ref types) = sig_info.param_types {
+                    if let Some(Some(ref type_tag)) = types.get(i) {
+                        return format!("{}: {}", base, type_tag);
+                    }
+                    return base;
+                }
+                // Local: look up inferred type at end of sub body —
+                // route through the witness bag so framework + branch
+                // + arity rules refine the answer.
+                if let Some(ty) = analysis.inferred_type_via_bag(&p.name, sig_info.body_end) {
+                    format!("{}: {}", base, format_inferred_type(&ty))
+                } else {
+                    base
+                }
+            })
+            .collect();
+
+        let params: Vec<ParameterInformation> = param_labels
+            .iter()
+            .map(|label| ParameterInformation {
+                label: ParameterLabel::Simple(label.clone()),
+                documentation: None,
+            })
+            .collect();
+
+        let label = format!("{}({})", sig_info.name, param_labels.join(", "));
+
+        return Some(SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label,
+                documentation: None,
+                parameters: Some(params),
+                active_parameter: Some(call_ctx.active_param as u32),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(call_ctx.active_param as u32),
+        });
+    }
+
+    None
+}
+
+// ---- Semantic tokens ----
+
+// Token type/modifier indices are defined in file_analysis.rs (TOK_*, MOD_*).
+
+pub fn semantic_token_types() -> Vec<SemanticTokenType> {
+    vec![
+        SemanticTokenType::VARIABLE,       // 0: variables
+        SemanticTokenType::PARAMETER,      // 1: sub parameters
+        SemanticTokenType::FUNCTION,       // 2: function calls
+        SemanticTokenType::METHOD,         // 3: method calls
+        SemanticTokenType::MACRO,          // 4: framework DSL keywords
+        SemanticTokenType::PROPERTY,       // 5: hash keys
+        SemanticTokenType::NAMESPACE,      // 6: package/class names
+        // No REGEXP: the TextMate `string.regexp` scope (with escape-sequence
+        // highlighting) is left to shine through — see #63.
+        SemanticTokenType::ENUM_MEMBER,    // 7: constants
+        SemanticTokenType::KEYWORD,        // 8: $self/$class
+    ]
+}
+
+pub fn semantic_token_modifiers() -> Vec<SemanticTokenModifier> {
+    vec![
+        SemanticTokenModifier::DECLARATION,      // 0
+        SemanticTokenModifier::READONLY,         // 1
+        SemanticTokenModifier::MODIFICATION,     // 2
+        SemanticTokenModifier::DEFAULT_LIBRARY,  // 3
+        SemanticTokenModifier::DEPRECATED,       // 4
+        SemanticTokenModifier::STATIC,           // 5
+        SemanticTokenModifier::new("scalar"),    // 6
+        SemanticTokenModifier::new("array"),     // 7
+        SemanticTokenModifier::new("hash"),      // 8
+    ]
+}
+
+/// Returns inlay hints for the given range.
+///
+/// Shows type annotations for variable declarations with non-obvious inferred types,
+/// and return type annotations for sub/method declarations.
+pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
+    let start = position_to_point(range.start);
+    let end = position_to_point(range.end);
+    let mut hints = Vec::new();
+
+    for sym in &analysis.symbols {
+        let decl_point = sym.selection_span.end;
+        // Skip symbols outside the requested range
+        if decl_point.row < start.row || decl_point.row > end.row {
+            continue;
+        }
+
+        match sym.kind {
+            FaSymKind::Variable => {
+                // Skip conventional invocants — always the enclosing class.
+                if crate::model::conventions::is_conventional_invocant_name(&sym.name) {
+                    continue;
+                }
+                // Skip variables whose type is written EXPLICITLY (`int c`,
+                // `Box b`) — the hint just echoes the source. Languages with
+                // explicit types mark the declaration with a `skeleton-annot`
+                // witness; inferred ones (`auto`, Perl) have none, so they
+                // still get the hint.
+                if analysis.witnesses.has_builder_source(
+                    &crate::model::witnesses::WitnessAttachment::Variable {
+                        name: sym.name.clone(),
+                        scope: sym.scope,
+                    },
+                    crate::model::witnesses::ANNOT_SOURCE,
+                ) {
+                    continue;
+                }
+                if let Some(ty) = analysis.inferred_type_via_bag(&sym.name, sym.span.start) {
+                    // Only show Object/HashRef/ArrayRef/CodeRef/Regexp — not Numeric/String
+                    if matches!(ty, InferredType::Numeric | InferredType::String) {
+                        continue;
+                    }
+                    hints.push(InlayHint {
+                        position: point_to_position(decl_point),
+                        label: InlayHintLabel::String(format!(": {}", sym.display_type(&ty))),
+                        kind: Some(InlayHintKind::TYPE),
+                        text_edits: None,
+                        tooltip: None,
+                        padding_left: Some(true),
+                        padding_right: None,
+                        data: None,
+                    });
+                }
+            }
+            FaSymKind::Sub | FaSymKind::Method => {
+                // Plugin-synthesized subs/methods often have
+                // return_type set to internal proxy classes (Mojo
+                // helpers' `_Helper::users` chain, DBIC ResultSet
+                // wrappers, etc.). The kind icon + hover already
+                // carry the useful info; the inlay hint just
+                // repeats a long dotted class name at every
+                // declaration. Suppress it for framework symbols.
+                if sym.namespace.is_framework() {
+                    continue;
+                }
+                if matches!(sym.detail, SymbolDetail::Sub { .. }) {
+                    if let Some(rt) = analysis.symbol_return_type_via_bag(sym.id, None) {
+                        // Only show non-trivial return types
+                        if matches!(rt, InferredType::Numeric | InferredType::String) {
+                            continue;
+                        }
+                        hints.push(InlayHint {
+                            position: point_to_position(decl_point),
+                            label: InlayHintLabel::String(format!(
+                                "→ {}",
+                                format_inferred_type(&rt)
+                            )),
+                            kind: Some(InlayHintKind::TYPE),
+                            text_edits: None,
+                            tooltip: None,
+                            padding_left: Some(true),
+                            padding_right: None,
+                            data: None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    hints
+}
+
+pub fn semantic_tokens(analysis: &FileAnalysis) -> Vec<SemanticToken> {
+    let tokens = analysis.semantic_tokens();
+
+    let mut result = Vec::new();
+    let mut prev_line: u32 = 0;
+    let mut prev_start: u32 = 0;
+
+    for t in &tokens {
+        let line = t.span.start.row as u32;
+        let start = t.span.start.column as u32;
+        let length = if t.span.start.row == t.span.end.row {
+            (t.span.end.column as u32).saturating_sub(start).max(1)
+        } else {
+            1
+        };
+
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 {
+            start.saturating_sub(prev_start)
+        } else {
+            start
+        };
+
+        result.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type: t.token_type,
+            token_modifiers_bitset: t.modifiers,
+        });
+
+        prev_line = line;
+        prev_start = start;
+    }
+
+    result
+}
+
+// ---- Import resolution helpers ----
+
+/// Where a completion-accepted auto-import `use` edit lands: the standard
+/// insertion position for the package under `point`, clamped to fall at or
+/// above the cursor — an edit below the cursor would import after the call
+/// being completed.
+fn auto_import_span(
+    analysis: &FileAnalysis,
+    point: Point,
+    stable_packages: Option<&[(String, usize)]>,
+) -> crate::model::file_analysis::Span {
+    let mut insert_pos = find_use_insertion_position(analysis, point, stable_packages);
+
+    // If the computed position is after the cursor, fall back to inserting
+    // after the nearest import or package statement ABOVE the cursor.
+    if insert_pos.line as usize > point.row {
+        // Find the last import above the cursor
+        let last_import_above = analysis.imports.iter().rev()
+            .find(|imp| imp.span.start.row < point.row);
+        if let Some(imp) = last_import_above {
+            insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
+        } else {
+            // Find the last package statement above the cursor
+            let last_pkg_above = analysis.symbols.iter().rev()
+                .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < point.row);
+            if let Some(pkg) = last_pkg_above {
+                insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };
+            }
+            // else: keep original position (top of file)
+        }
+    }
+
+    let p = tree_sitter::Point {
+        row: insert_pos.line as usize,
+        column: insert_pos.character as usize,
+    };
+    crate::model::file_analysis::Span { start: p, end: p }
+}
+
+fn format_imported_signature(name: &str, sub_info: &SubInfo<'_>) -> String {
+    let params_str = sub_info
+        .params()
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sig = format!("sub {}({})", name, params_str);
+    if let Some(rt) = sub_info.return_type(None) {
+        sig.push_str(&format!(" → {}", format_inferred_type(&rt)));
+    }
+    sig
+}
+
+// ---- Diagnostics ----
+
+/// Sorted list of Perl built-in functions. Used to avoid false-positive
+/// "unresolved function" diagnostics. Checked via binary_search.
+static PERL_BUILTINS: &[&str] = &[
+    // Core bareword filehandles. Uppercase sorts before the lowercase
+    // builtin names below (ASCII), so the slice stays binary-searchable.
+    // Suppresses `print DATA`, `STDOUT->autoflush`, `-t STDIN` style FPs.
+    "ARGV", "ARGVOUT", "DATA", "STDERR", "STDIN", "STDOUT",
+    "abs", "accept", "alarm", "atan2",
+    "bind", "binmode", "bless",
+    "caller", "chdir", "chmod", "chomp", "chop", "chown", "chr", "chroot", "close",
+    "closedir", "connect", "cos", "crypt",
+    "dbmclose", "dbmopen", "defined", "delete", "die", "do", "dump",
+    "each", "endgrent", "endhostent", "endnetent", "endprotoent", "endpwent",
+    "endservent", "eof", "eval", "exec", "exists", "exit",
+    "fcntl", "fileno", "flock", "fork", "format", "formline",
+    "getc", "getgrent", "getgrgid", "getgrnam", "gethostbyaddr", "gethostbyname",
+    "gethostent", "getlogin", "getnetbyaddr", "getnetbyname", "getnetent",
+    "getpeername", "getpgrp", "getppid", "getpriority", "getprotobyname",
+    "getprotobynumber", "getprotoent", "getpwent", "getpwnam", "getpwuid",
+    "getservbyname", "getservbyport", "getservent", "getsockname", "getsockopt",
+    "glob", "gmtime", "goto", "grep",
+    "hex",
+    "import", "index", "int", "ioctl",
+    "join",
+    "keys", "kill",
+    "last", "lc", "lcfirst", "length", "link", "listen", "local", "localtime", "log",
+    "lstat",
+    "map", "mkdir", "msgctl", "msgget", "msgrcv", "msgsnd",
+    "my",
+    "new", "next", "no", "not",
+    "oct", "open", "opendir", "ord", "our",
+    "pack", "pipe", "pop", "pos", "print", "printf", "prototype", "push",
+    "quotemeta",
+    "rand", "read", "readdir", "readline", "readlink", "readpipe", "recv", "redo",
+    "ref", "rename", "require", "reset", "return", "reverse", "rewinddir", "rindex",
+    "rmdir",
+    "say", "scalar", "seek", "seekdir", "select", "semctl", "semget", "semop", "send",
+    "setgrent", "sethostent", "setnetent", "setpgrp", "setpriority", "setprotoent",
+    "setpwent", "setservent", "setsockopt", "shift", "shmctl", "shmget", "shmread",
+    "shmwrite", "shutdown", "sin", "sleep", "socket", "socketpair", "sort", "splice",
+    "split", "sprintf", "sqrt", "srand", "stat", "state", "study", "sub", "substr",
+    "symlink", "syscall", "sysopen", "sysread", "sysseek", "system", "syswrite",
+    "tell", "telldir", "tie", "tied", "time", "times", "truncate",
+    "uc", "ucfirst", "umask", "undef", "unlink", "unpack", "unshift", "untie", "use",
+    "utime",
+    "values", "vec",
+    "wait", "waitpid", "wantarray", "warn", "write",
+];
+
+fn is_perl_builtin(name: &str) -> bool {
+    PERL_BUILTINS.binary_search(&name).is_ok()
+}
+
+
+/// Opt-in diagnostic toggles. Defaults are all-off for the QA/plugin-author
+/// channels (noise for end users); the always-on hints (`unresolved-function`
+/// / `unresolved-method`) ignore this.
+///
+/// **The struct is the schema.** `rename_all = "camelCase"` makes each field
+/// its own LSP key under `initializationOptions.diagnostics`, so `backend.rs`
+/// parses the whole block with one `serde_json::from_value` — no hand-mapped
+/// key strings to drift. `default` fills any absent key with `false`. The CLI
+/// surface (`DiagnosticOptions::from_cli_args`) is the one spelling serde
+/// can't derive; `cli_flags_match_diagnostic_option_fields` guards it against
+/// drift. A `Config` god-struct, a generated editor schema, and richer
+/// per-code config are a design note in `docs/prompt-config-schema.md`. See
+/// `docs/adr/receiver-gated-dispatch.md`, `docs/adr/narrowing-diagnostics.md`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiagnosticOptions {
+    /// Fire `unresolved-dispatch` when a known dispatch verb's receiver can't
+    /// be typed (`GateResult::ReceiverUntyped`) — never on a settled
+    /// `DoesNotApply`. Off by default.
+    pub unresolved_dispatch: bool,
+    /// Fire `use-after-move` on the decidable subset (straight-line, in-function,
+    /// local-only moved-then-used). Pack-language (C++) channel, off by default —
+    /// it is a heuristic-adjacent lane whose honest subset is narrow. See
+    /// `use_after_move_reads` / `docs/adr/use-after-move.md`.
+    pub use_after_move: bool,
+    /// Extend `unresolved-method` past locally-defined classes to any
+    /// cross-file-resolvable class (D8). The local case is always-on; this
+    /// opt-in lifts the `is_local_class` gate so a narrowed or otherwise
+    /// cross-file-typed receiver (`$x->isa('Some::Dep'); $x->bogus`) is
+    /// checked too, gated by the same complete-ancestry honest-silent valve.
+    /// Off by default: cross-file classes carry more codegen/XS methods the
+    /// static walker can't see (the diag-09/10 Log4perl-accessor class), so
+    /// it earns trust before promotion. See docs/adr/narrowing-diagnostics.md.
+    pub unresolved_method_cross_file: bool,
+    /// Fire `optional-deref` (D2) when a receiver is `Optional<T>` at an
+    /// unguarded use point (a possible undef deref — the strictNullChecks
+    /// analog). Narrowing strips the `Optional` under a dominating
+    /// `defined`/`blessed` guard, so a surviving `Optional` is unguarded by
+    /// construction. "May be undef", not "is" — opt-in, INFORMATION severity,
+    /// with a guard-insertion quick-fix. Off by default.
+    pub optional_deref: bool,
+    /// Fire `redundant-guard` (D3) / `contradictory-guard` (D4): a guard whose
+    /// outcome is constant given the subject's prior type (`if (defined $x)`
+    /// where `$x` is already a confident value; `$x->isa('Foo')` where `$x` is
+    /// already `Foo` or an unrelated class). Off by default — needs confident
+    /// prior types and MRO relatedness, so it earns trust before promotion.
+    pub redundant_guard: bool,
+    /// Fire `deref-shape-mismatch` (D6): a deref whose form demands one
+    /// container rep while a `ref…eq` guard proved another (`$x->{k}` on
+    /// array/code, `$x->[i]` on hash/code, `$x->()` on hash/array) — a
+    /// guaranteed runtime die. Guard-narrowed reps only; objects are never a
+    /// mismatch. Off by default.
+    pub deref_shape: bool,
+}
+
+impl DiagnosticOptions {
+    /// Parse the opt-in flags from CLI args (`--optional-deref`, …). The kebab
+    /// flag for each field mirrors its serde camelCase key; the mapping is
+    /// explicit here (serde doesn't parse argv) and pinned by
+    /// `cli_flags_match_diagnostic_option_fields`.
+    pub fn from_cli_args(args: &[String]) -> Self {
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        DiagnosticOptions {
+            unresolved_dispatch: has("--unresolved-dispatch"),
+            use_after_move: has("--use-after-move"),
+            unresolved_method_cross_file: has("--unresolved-method-cross-file"),
+            optional_deref: has("--optional-deref"),
+            redundant_guard: has("--redundant-guard"),
+            deref_shape: has("--deref-shape"),
+        }
+    }
+}
+
+pub fn collect_diagnostics(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    options: DiagnosticOptions,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // Plugin-emitted diagnostics (pattern lints) — already decided at
+    // build time; here they only render. Severity vocabulary is the
+    // plugin's; unknown strings degrade to HINT rather than shouting.
+    for pd in &analysis.plugin_diagnostics {
+        diagnostics.push(Diagnostic {
+            range: span_to_range(pd.span),
+            severity: Some(match pd.severity.as_str() {
+                "error" => DiagnosticSeverity::ERROR,
+                "warning" => DiagnosticSeverity::WARNING,
+                "info" => DiagnosticSeverity::INFORMATION,
+                _ => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(pd.code.clone())),
+            source: Some(format!("perl-lsp/{}", pd.plugin_id)),
+            message: pd.message.clone(),
+            ..Default::default()
+        });
+    }
+
+    // Snapshot each `use` once: its bound set (local→remote) and, when the
+    // producer is cached, the names on its (transitive) export surface. The
+    // resolvability verdict for a given call name is then a map lookup against
+    // this snapshot — the same logic as `classify_import`, but the surface walk
+    // and `imported_names` allocation happen once per import instead of once per
+    // (unresolved-ref × import) on every diagnostics publish (every keystroke).
+    // Diagnostics need only the import + verdict, not the producer path or the
+    // remote name `classify_import` also returns — so neither is computed here.
+    struct ImportBinding<'a> {
+        import: &'a crate::model::file_analysis::Import,
+        /// local → remote for everything this `use` brings into scope.
+        bound: HashMap<String, String>,
+        /// Names on the producer's export surface; `None` when not yet cached.
+        exported: Option<std::collections::HashSet<String>>,
+    }
+    let import_bindings: Vec<ImportBinding> = analysis
+        .imports
+        .iter()
+        .map(|import| {
+            let cached = module_index.get_cached(&import.module_name);
+            let (bound, exported) = if let Some(c) = &cached {
+                let surface = c.analysis.export_surface_with_index(module_index);
+                let bound = crate::model::file_analysis::imported_names(import, &surface)
+                    .into_iter()
+                    .collect();
+                (bound, Some(surface.all_names()))
+            } else {
+                // Producer not cached yet: only an explicitly-named import can be
+                // judged `Brought` (tags / bare-use defaults need the surface).
+                let bound = import
+                    .imported_symbols
+                    .iter()
+                    .map(|s| (s.local_name.clone(), s.remote().to_string()))
+                    .collect();
+                (bound, None)
+            };
+            ImportBinding { import, bound, exported }
+        })
+        .collect();
+
+    // Best resolution of a call name across all imports: `Brought` dominates
+    // `ExportedNotBrought`. Mirrors `resolve_imported_function_classified` over
+    // the precomputed snapshot.
+    let resolve_name = |name: &str| -> Option<(&crate::model::file_analysis::Import, ImportResolution)> {
+        let mut best: Option<(&crate::model::file_analysis::Import, ImportResolution)> = None;
+        for b in &import_bindings {
+            let res = if b.bound.contains_key(name) {
+                ImportResolution::Brought
+            } else if b.exported.as_ref().is_some_and(|e| e.contains(name)) {
+                ImportResolution::ExportedNotBrought
+            } else {
+                continue;
+            };
+            if matches!(best, Some((_, ImportResolution::Brought))) {
+                continue;
+            }
+            best = Some((b.import, res));
+        }
+        best
+    };
+
+    for r in &analysis.refs {
+        if !matches!(r.kind, RefKind::FunctionCall { .. }) {
+            continue;
+        }
+        let name = &r.target_name;
+
+        // Skip package-qualified calls like Foo::bar()
+        if crate::model::file_analysis::split_qualified(name).0.is_some() {
+            continue;
+        }
+
+        // Skip code deref calls like &{$var}()
+        if name.starts_with('&') {
+            continue;
+        }
+
+        // Skip Perl builtins
+        if is_perl_builtin(name) {
+            continue;
+        }
+
+        // Skip locally defined subs
+        if !analysis.symbols_named(name).is_empty() {
+            continue;
+        }
+
+        // Skip functions implicitly imported by OOP frameworks (has, extends, etc.)
+        if analysis.framework_imports.contains(name.as_str()) {
+            continue;
+        }
+
+        // Single resolvability verdict — the same query goto-def reads, so a
+        // name goto-def can jump to is never flagged as unresolved here (NAV
+        // § (c)). `Brought` = the name is in scope (named in qw, pulled in by a
+        // `:tag` selector against the producer surface, or auto-imported by a
+        // bare `use`); `ExportedNotBrought` = importable but not yet in the qw
+        // list → actionable hint.
+        //
+        // Bare-use auto-import deliberately treats `export_ok` as brought:
+        // runtime exporters (Moose::Exporter->setup_import_methods etc.) record
+        // their names in `export_ok` because the builder can't tell "runtime
+        // default" from "explicit opt-in" at parse time, so flagging them
+        // produced ~684 FPs (Moose::Util::TypeConstraints &c.). Traditional
+        // opt-in `@EXPORT_OK` on a bare use is suppressed too — accepted.
+        let range = span_to_range(r.span);
+        let resolution = resolve_name(name);
+        match resolution {
+            Some((_, ImportResolution::Brought)) => continue,
+            Some((import, ImportResolution::ExportedNotBrought)) => {
+                diagnostics.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::HINT),
+                    code: Some(NumberOrString::String("unresolved-function".into())),
+                    source: Some("perl-lsp".into()),
+                    message: format!(
+                        "'{}' is exported by {} but not imported",
+                        name, import.module_name,
+                    ),
+                    data: Some(serde_json::json!({
+                        "module": import.module_name,
+                        "function": name,
+                    })),
+                    ..Default::default()
+                });
+            }
+            None => {
+                // Search ALL cached modules for this function.
+                let exporters = module_index.find_exporters(name);
+                if !exporters.is_empty() {
+                    let msg = if exporters.len() == 1 {
+                        format!(
+                            "'{}' is exported by {} (not yet imported)",
+                            name, exporters[0],
+                        )
+                    } else {
+                        format!(
+                            "'{}' is exported by {} and {} other module(s)",
+                            name,
+                            exporters[0],
+                            exporters.len() - 1,
+                        )
+                    };
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::HINT),
+                        code: Some(NumberOrString::String("unresolved-function".into())),
+                        source: Some("perl-lsp".into()),
+                        message: msg,
+                        data: Some(serde_json::json!({
+                            "modules": exporters,
+                            "function": name,
+                        })),
+                        ..Default::default()
+                    });
+                } else {
+                    // HINT (not INFORMATION): an unresolved bareword call is
+                    // often a genuinely-dynamic sub (AUTOLOAD, runtime glob
+                    // install, a not-installed dep) the static walker can't see.
+                    // Keep it the quietest visible severity so a Moose/AUTOLOAD-
+                    // heavy codebase doesn't light up the Problems panel.
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::HINT),
+                        code: Some(NumberOrString::String("unresolved-function".into())),
+                        source: Some("perl-lsp".into()),
+                        message: format!("'{}' is not defined in this file", name),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
+    // 5e: Unresolved method diagnostics for locally-defined classes.
+    // Rule-#10 debt: the framework entries below (DBIC/Moose) belong to the
+    // frameworks, not core diagnostics — they move out when plugins can
+    // register meta-methods (docs/prompt-dbic-as-plugin.md) or the Openness
+    // rule lands (docs/prompt-graph-walking.md, Openness).
+    let universal_methods = [
+        "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES",
+        // Moose adds lowercase `does` alongside UNIVERSAL's uppercase DOES.
+        "does",
+        "VERSION",
+        // DBIC meta-methods (inherited from DBIx::Class::Core)
+        "add_columns", "add_column", "set_primary_key", "table", "resultset_class",
+        "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
+        "load_components", "load_own_components",
+        // Moose/Moo meta-methods
+        "meta",
+    ];
+    for r in &analysis.refs {
+        let (invocant, _invocant_span) = match &r.kind {
+            // A plugin-bridged token is plugin-resolved, not a receiver we
+            // can flag as an unresolved method — skip it.
+            RefKind::MethodCall { invocant, invocant_span, .. } => match invocant.as_name() {
+                Some(n) => (n, invocant_span),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let method_name = &r.target_name;
+
+        // Skip universal methods
+        if universal_methods.contains(&method_name.as_str()) {
+            continue;
+        }
+
+        // Skip SUPER::-qualified and other package-qualified method names.
+        // `$self->SUPER::foo()` stores `target_name = "SUPER::foo"`; trying
+        // to find a method literally named "SUPER::foo" in the MRO always
+        // fails. Caller-side package dispatch (`Class::method`) is intentional
+        // and not our job to validate here.
+        use crate::model::conventions::{InvocantText, MethodToken};
+        if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
+            continue;
+        }
+
+        // Resolve invocant to class name. Diagnostics stays bag-only for
+        // scalars — no enclosing-class fallback, which would manufacture
+        // warnings on untyped invocants — and skips everything else.
+        let class_name = match invocant.classify() {
+            InvocantText::Bareword(b) => Some(b.to_string()),
+            InvocantText::Scalar(_) => analysis.inferred_type_via_bag(invocant, r.span.start)
+                .and_then(|ty| ty.class_name().map(|s| s.to_string())),
+            _ => None,
+        };
+        let class_name = match class_name {
+            Some(cn) => cn,
+            None => continue,
+        };
+
+        // Fire for classes we can fully see. Always-on: classes defined in
+        // THIS file (high precision — you wrote it, the walker sees its
+        // methods). Opt-in (D8): also cross-file-resolvable classes, so a
+        // narrowed or cross-file-typed receiver is checked. A class that is
+        // neither local nor cached is external/uninstalled — stay silent, we
+        // can't enumerate its methods. The complete-ancestry valve below is
+        // the shared honest-silent guard for both.
+        let is_local_class = analysis.symbols.iter().any(|s| {
+            matches!(s.kind, FaSymKind::Class | FaSymKind::Package) && s.name == class_name
+        });
+        let is_cached_class =
+            options.unresolved_method_cross_file && module_index.get_cached(&class_name).is_some();
+        if !is_local_class && !is_cached_class {
+            continue;
+        }
+
+        // A local class must define ≥1 method we can see (else it's likely a
+        // forward decl / external alias re-opened here). A cached cross-file
+        // class is already a real module — its methods live in its analysis,
+        // which `resolve_method_in_ancestors` consults below.
+        let has_methods = is_cached_class
+            || analysis.symbols.iter().any(|s| {
+                matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
+                    && analysis.symbol_in_class(s.id, &class_name)
+            });
+        if !has_methods {
+            continue;
+        }
+
+        // Check if the method exists in the class (walks inheritance chain)
+        if analysis.resolve_method_in_ancestors(&class_name, method_name, Some(module_index)).is_some() {
+            continue;
+        }
+
+        // A class with `AUTOLOAD` anywhere in its MRO answers ANY method name at
+        // runtime, so the static `sub` set isn't its real surface — stay silent
+        // (the role-contracts diagnostic uses the same skip, file_analysis.rs).
+        if analysis.resolve_method_in_ancestors(&class_name, "AUTOLOAD", Some(module_index)).is_some() {
+            continue;
+        }
+
+        // Honest-silent on an incomplete ISA chain: if `class_name` (or any
+        // resolvable ancestor) names a parent we can't resolve in the
+        // workspace or @INC, the method might be inherited from there. One
+        // predicate gates EVERY invocant-typing path (`$self`/FirstParam and
+        // direct `Pkg->m` alike), so they can't drift (rule #10).
+        if analysis.class_has_unresolved_ancestor(&class_name, Some(module_index)) {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic {
+            range: span_to_range(r.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unresolved-method".into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "'{}' is not defined in {}",
+                method_name, class_name,
+            ),
+            ..Default::default()
+        });
+    }
+
+    // 5g: undef-deref (D1) — a method call or hash deref on a receiver the
+    // lattice proves is `Undef` at that point (the `else` of `if defined`,
+    // the fall-through after `return if defined`, an `unless defined` body).
+    // Runtime is a hard die. Maximal confidence — the type *is* undef, not
+    // *may be* — so this is always-on `WARNING`, the one narrowing diagnostic
+    // that doesn't wait behind an opt-in flag (rule #10: it reads the type
+    // at the use point, never the syntax). See docs/adr/narrowing-diagnostics.md.
+    // D2 (`optional-deref`) shares this same lattice read: a receiver typed
+    // `Optional<T>` at an UNGUARDED use point — narrowing already strips the
+    // `Optional` wherever a `defined`/`blessed` guard dominates, so a
+    // surviving `Optional` here is unguarded by construction. "May be undef",
+    // not "is" → opt-in, INFORMATION, with a guard-insertion quick-fix.
+    for site in analysis.deref_receiver_sites(Some(module_index)) {
+        match &site.receiver_ty {
+            InferredType::Undef => {
+                diagnostics.push(Diagnostic {
+                    range: span_to_range(site.span),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: Some(NumberOrString::String("undef-deref".into())),
+                    source: Some("perl-lsp".into()),
+                    message: format!(
+                        "'{}' is undef here; {} on it dies at runtime",
+                        site.receiver,
+                        site.form.access_phrase(),
+                    ),
+                    ..Default::default()
+                });
+            }
+            InferredType::Optional(_) if options.optional_deref => {
+                diagnostics.push(Diagnostic {
+                    range: span_to_range(site.span),
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: Some(NumberOrString::String("optional-deref".into())),
+                    source: Some("perl-lsp".into()),
+                    // The quick-fix reads the receiver back to synthesize
+                    // `return unless defined $r;`.
+                    data: Some(serde_json::json!({ "receiver": site.receiver })),
+                    message: format!(
+                        "'{}' may be undef here; {} on it could die — guard with `defined`",
+                        site.receiver,
+                        site.form.access_phrase(),
+                    ),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+
+        // D6 — a deref whose form demands one container rep while a `ref…eq`
+        // guard proved the receiver is another (a guaranteed runtime die).
+        // Read the GUARD-narrowed rep specifically: a deref self-infers its
+        // own demanded rep as a zero-extent witness at the use point, masking
+        // any conflict under the merged query, so only a guard surfaces here.
+        // `RepKind::of` answers `None` for objects (overloadable) — never a
+        // mismatch.
+        if options.deref_shape {
+            if let Some(demanded) = site.form.demands_rep() {
+                if let Some(rep) = analysis
+                    .guard_narrowed_rep(&site.receiver, site.span.start)
+                    .and_then(|t| crate::model::file_analysis::RepKind::of(&t))
+                {
+                    if rep != demanded {
+                        diagnostics.push(Diagnostic {
+                            range: span_to_range(site.span),
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            code: Some(NumberOrString::String("deref-shape-mismatch".into())),
+                            source: Some("perl-lsp".into()),
+                            message: format!(
+                                "'{}' is {} here; {} dies at runtime",
+                                site.receiver,
+                                rep.noun(),
+                                site.form.access_phrase(),
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // D3/D4 — a guard whose outcome the lattice already fixes: redundant
+    // (always true → the `else` is dead) or contradictory (always false →
+    // the `then` is dead). Opt-in; gated hard on confident prior types in
+    // `guard_redundancies` (rule #10 — the type answers, never the syntax).
+    if options.redundant_guard {
+        for g in analysis.guard_redundancies(Some(module_index)) {
+            let code = match g.verdict {
+                GuardVerdict::AlwaysTrue => "redundant-guard",
+                GuardVerdict::AlwaysFalse => "contradictory-guard",
+            };
+            let message = render_guard_message(&g);
+            diagnostics.push(Diagnostic {
+                range: span_to_range(g.span),
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                code: Some(NumberOrString::String(code.into())),
+                source: Some("perl-lsp".into()),
+                message,
+                ..Default::default()
+            });
+        }
+    }
+
+    // 5f: role-requires-unfulfilled — the composer-mismatch contract
+    // check (docs/adr/role-contracts.md). WARNING, not HINT: Perl
+    // dies at composition time for this. Anchored to the `with 'Role'`
+    // PackageRef inside the composing package; the package decl is the
+    // fallback (e.g. the parent edge came from a raw `@ISA` push).
+    for u in analysis.unfulfilled_role_requires(Some(module_index)) {
+        let span = analysis
+            .refs
+            .iter()
+            .find(|r| {
+                matches!(r.kind, RefKind::PackageRef)
+                    && r.target_name == u.via_parent
+                    && analysis.package_at(r.span.start) == Some(u.package.as_str())
+            })
+            .map(|r| r.span)
+            .or_else(|| {
+                analysis
+                    .symbols
+                    .iter()
+                    .find(|s| {
+                        matches!(s.kind, FaSymKind::Package | FaSymKind::Class)
+                            && s.name == u.package
+                    })
+                    .map(|s| s.selection_span)
+            });
+        let Some(span) = span else { continue };
+        diagnostics.push(Diagnostic {
+            range: span_to_range(span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("role-requires-unfulfilled".into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "role {} requires '{}'; {} does not provide it",
+                u.role, u.name, u.package,
+            ),
+            ..Default::default()
+        });
+    }
+
+    // 5h: helper-not-loaded — the entrypoint-scan lint
+    // (docs/prompt-helper-consumption.md phase 2). A method call whose
+    // ONLY resolution is a plugin bridge from a WORKSPACE module that
+    // no workspace file loads (imports literally or via the SyntheticUse
+    // a `plugin 'X'` line emits). Installed CPAN plugins are exempt —
+    // the "downloaded = intended" policy keeps resolution generous and
+    // makes precision this lint's job. HINT severity.
+    {
+        use crate::model::conventions::{InvocantText, MethodToken};
+        let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+        for r in &analysis.refs {
+            let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
+            // Plugin-bridged tokens are resolved by their owning plugin,
+            // not a missing-plugin hint candidate.
+            let Some(invocant) = invocant.as_name() else { continue };
+            let method_name = &r.target_name;
+            if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
+                continue;
+            }
+            let class_name = match invocant.classify() {
+                InvocantText::Bareword(b) => Some(b.to_string()),
+                InvocantText::Scalar(_) => analysis
+                    .inferred_type_via_bag(invocant, r.span.start)
+                    .and_then(|ty| ty.class_name().map(|s| s.to_string())),
+                _ => None,
+            };
+            let Some(class_name) = class_name else { continue };
+            if !seen.insert((class_name.clone(), method_name.clone())) {
+                // one hint per (class, helper) per file — the fix is
+                // one `plugin` line, not one per call site
+                continue;
+            }
+            let Some(provider) =
+                analysis.bridged_helper_provider(&class_name, method_name, Some(module_index))
+            else {
+                continue;
+            };
+            if !module_index.is_workspace_module(&provider) {
+                continue;
+            }
+            if analysis.imports.iter().any(|i| i.module_name == provider)
+                || module_index.is_module_loaded(&provider)
+            {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                range: span_to_range(r.span),
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("helper-not-loaded".into())),
+                source: Some("perl-lsp".into()),
+                message: format!(
+                    "'{}' is provided by {}, which no workspace entrypoint loads",
+                    method_name, provider,
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Opt-in `unresolved-dispatch`: a known dispatch verb whose receiver
+    // couldn't be typed, so we can't tell if the dispatch applies. Fires ONLY
+    // on `ReceiverUntyped` (a real typing gap), never on `DoesNotApply` — the
+    // 3-way `GateResult` keeps the two apart so the diagnostic can't spew on
+    // every unrelated receiver. QA/plugin-author tool, hence default-off.
+    if options.unresolved_dispatch {
+        for untyped in analysis.untyped_dispatches(Some(module_index)) {
+            diagnostics.push(Diagnostic {
+                range: span_to_range(untyped.call_span),
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                code: Some(NumberOrString::String("unresolved-dispatch".into())),
+                source: Some("perl-lsp".into()),
+                message: format!(
+                    "dispatch verb '{}' fired on an untyped receiver; can't confirm it dispatches into {}",
+                    untyped.dispatcher, untyped.gate,
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Closed-shape hash-key typo: a READ of `$config->{typo}` where
+    // `$config`'s structural literal is CLOSED (no spread, no dynamic
+    // key) and doesn't define the key. Writes are skipped — assigning a
+    // new key extends the shape, it isn't a typo. Open shapes are
+    // skipped — the spread may carry the key. The whole-story gate
+    // skips reassigned/escaped vars (the trust-gate stand-in for the
+    // unmodeled lattice widenings — docs/adr/structural-shapes.md).
+    // HINT severity, per the quiet-by-design diagnostics convention.
+    //
+    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is a DBIC Result
+    // class and `col` is a `Bridged` column — a column isn't a hash slot, so the
+    // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
+    // → class → `field_projections_named` has a bridged column for the key), but
+    // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
+    // which we don't model yet. Spec: docs/adr/narrowing-diagnostics.md (Forward work).
+    use crate::model::file_analysis::InferredType;
+    for r in &analysis.refs {
+        let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
+        // `$config->{k}` (scalar holding a hashref) and `$config{k}`
+        // (literal `%config`, canonical var_text) — same model, both
+        // spellings.
+        if !(var_text.starts_with('$') || var_text.starts_with('%')) {
+            continue;
+        }
+        if matches!(r.access, crate::model::file_analysis::AccessKind::Write) {
+            continue;
+        }
+        let Some(t) =
+            analysis.inferred_type_via_bag_ctx(var_text, r.span.start, Some(module_index))
+        else {
+            continue;
+        };
+        let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+        if keys.iter().any(|(k, _)| k == &r.target_name) {
+            continue;
+        }
+        if !analysis.closed_shape_is_whole_story(var_text) {
+            continue;
+        }
+        let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
+        if keys.len() > 5 {
+            known.push("...");
+        }
+        diagnostics.push(Diagnostic {
+            range: span_to_range(r.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unknown-hash-key".into())),
+            message: format!(
+                "key '{}' is not in {}'s literal shape (keys: {})",
+                r.target_name,
+                var_text,
+                known.join(", "),
+            ),
+            ..Default::default()
+        });
+    }
+
+    // The expression-base spelling of the same typo: `cfg()->{kye}` /
+    // `$obj->get_config->{kye}` — no variable in hand, so the ref loop
+    // above can't see it. The drill's own Projected witness encodes
+    // exactly the (base, key) pair; materialize the base (the registry
+    // chases through call returns, cross-file included) and apply the
+    // same closed-shape check. No whole-story gate: the value is
+    // freshly produced, and the producer's own mutation/escape
+    // widening already rode along on its shape.
+    {
+        use crate::model::witnesses::{ProjectionStep, WitnessAttachment, WitnessPayload};
+        let mut seen: std::collections::HashSet<(Span, &str)> = std::collections::HashSet::new();
+        for w in analysis.witnesses.all() {
+            let WitnessPayload::Projected {
+                base: WitnessAttachment::Expr(base_span),
+                step: ProjectionStep::HashKey(ref key),
+            } = w.payload
+            else {
+                continue;
+            };
+            if !seen.insert((w.span, key.as_str())) {
+                continue;
+            }
+            // A base that is a bare variable read (its Expr attachment
+            // edges to a Variable) is the ref loop's territory — it
+            // carries the whole-story gate this loop deliberately
+            // doesn't. Materializing it here would bypass the gate
+            // (the Compiler.pm conditional-reassignment FP).
+            let base_is_variable = analysis
+                .witnesses
+                .for_attachment(&WitnessAttachment::Expr(base_span))
+                .iter()
+                .any(|bw| {
+                    matches!(
+                        bw.payload,
+                        WitnessPayload::Edge(WitnessAttachment::Variable { .. })
+                    )
+                });
+            if base_is_variable {
+                continue;
+            }
+            let Some(t) = analysis.expr_type_at_span(base_span, Some(module_index)) else {
+                continue;
+            };
+            let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+            if keys.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
+            if keys.len() > 5 {
+                known.push("...");
+            }
+            diagnostics.push(Diagnostic {
+                range: span_to_range(w.span),
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("unknown-hash-key".into())),
+                message: format!(
+                    "key '{}' is not in this expression's literal shape (keys: {})",
+                    key,
+                    known.join(", "),
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    diagnostics
+}
+
+/// Render a D3/D4 verdict into its user-facing message. The phrasing lives
+/// here in the adapter, not on the neutral `FileAnalysis` IR — a per-language
+/// concern in the multi-language design (`language_driver.rs`).
+fn render_guard_message(g: &crate::model::file_analysis::GuardRedundancy) -> String {
+    use crate::model::file_analysis::GuardPredicate;
+    let subject = &g.subject;
+    match (&g.verdict, &g.predicate) {
+        (GuardVerdict::AlwaysTrue, GuardPredicate::Defined) => {
+            format!("'{subject}' is always defined here; this guard is redundant")
+        }
+        (GuardVerdict::AlwaysFalse, GuardPredicate::Defined) => {
+            format!("'{subject}' is undef here; this guard can never pass")
+        }
+        (GuardVerdict::AlwaysTrue, GuardPredicate::IsType(t)) => {
+            format!("'{subject}' is already {}; this guard is redundant", format_inferred_type(t))
+        }
+        (GuardVerdict::AlwaysFalse, GuardPredicate::IsType(t)) => {
+            format!("'{subject}' is not {} here; this guard can never pass", format_inferred_type(t))
+        }
+    }
+}
+
+// ---- Code actions ----
+
+/// Find the position to insert a new `use` statement, scoped to the package at `point`.
+/// Uses line-range approach: finds which package range the cursor is in,
+/// then inserts after the last `use` in that range.
+/// `stable_packages` provides fallback package lines from the stable outline
+/// when the current parse lost packages due to error recovery.
+fn find_use_insertion_position(
+    analysis: &FileAnalysis,
+    point: Point,
+    stable_packages: Option<&[(String, usize)]>,
+) -> Position {
+    // Collect package declaration lines from current parse
+    let mut pkg_lines: Vec<usize> = analysis.symbols.iter()
+        .filter(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class))
+        .map(|s| s.selection_span.start.row)
+        .collect();
+
+    // If the stable outline has MORE packages than the current parse,
+    // merge them in — the parse lost some due to error recovery.
+    if let Some(stable) = stable_packages {
+        if stable.len() > pkg_lines.len() {
+            for (_, line) in stable {
+                if !pkg_lines.contains(line) {
+                    pkg_lines.push(*line);
+                }
+            }
+        }
+    }
+    pkg_lines.sort();
+
+    // Find the package range containing `point`
+    let pkg_start = pkg_lines.iter().rev()
+        .find(|&&line| line <= point.row)
+        .copied()
+        .unwrap_or(0);
+    let pkg_end = pkg_lines.iter()
+        .find(|&&line| line > point.row)
+        .copied()
+        .unwrap_or(usize::MAX);
+
+    // Find the last import within this package's line range
+    let last_import = analysis.imports.iter().rev().find(|imp| {
+        imp.span.start.row >= pkg_start && imp.span.start.row < pkg_end
+    });
+
+    if let Some(imp) = last_import {
+        Position {
+            line: imp.span.end.row as u32 + 1,
+            character: 0,
+        }
+    } else {
+        // No imports in this package range — insert after the package statement
+        Position {
+            line: pkg_start as u32 + 1,
+            character: 0,
+        }
+    }
+}
+
+/// Diagnostic code for a member-access whose operator disagrees with the
+/// receiver's pointer depth (`p.member` on a `Box* p`). The fix is a
+/// single-token swap; `code_actions` reads `data.operator` for the
+/// replacement text and `range` for where to write it.
+const MEMBER_OP_CODE: &str = "member-access-operator";
+
+/// Mode B: the operator-mismatch diagnostics. One WARNING per
+/// `member_op_mismatches()` entry, each self-describing (range = the operator
+/// token, `data.operator` = the correct token) so the quick-fix needs no
+/// re-analysis. Language-agnostic: Perl's `MethodCall` refs carry no
+/// `member_op` (one operator), so the query is empty by construction — no gate.
+pub fn pack_member_op_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    analysis
+        .member_op_mismatches()
+        .into_iter()
+        .map(|m| Diagnostic {
+            range: span_to_range(m.op_span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(MEMBER_OP_CODE.into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "use `{}` here — the receiver's type requires it (you wrote `{}`)",
+                m.expected.as_str(),
+                m.typed.as_str(),
+            ),
+            data: Some(serde_json::json!({ "operator": m.expected.as_str() })),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Diagnostic code for a member-access whose receiver is too deeply indirected
+/// for a single `.`/`->` — the fix is an expression wrap (`(*pp)->m`), not a
+/// swap, so this carries NO `data.operator` and offers no quick-fix (show-only,
+/// mirroring Mode A's stance for the ambiguous case).
+const MEMBER_OP_PEEL_CODE: &str = "member-access-peel";
+
+/// Mode B (peel half): the DEEP-receiver hints. One WARNING per
+/// `member_op_deep_accesses()` entry — the case a token swap can't express
+/// (`OP** op_p; op_p->m` needs `(*op_p)->m`). Range = the written operator; the
+/// message names the peeled receiver spelling. No auto-fix.
+pub fn pack_member_op_peel_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    analysis
+        .member_op_deep_accesses()
+        .into_iter()
+        .map(|p| Diagnostic {
+            range: span_to_range(p.op_span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String(MEMBER_OP_PEEL_CODE.into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "receiver is {}-level indirect — a single `.`/`->` can't reach its members; dereference first: `{}->`",
+                p.depth, p.wrap,
+            ),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Mode C: use-after-move. One WARNING per `use_after_move_reads()` read —
+/// a variable read after a `std::move` of it, before any reassignment. The
+/// region + cutoff + honesty gates live on `FileAnalysis` (the edge-driven
+/// moved-from window, gates B/C/E); this is the thin LSP projection. Opt-in
+/// via `DiagnosticOptions.use_after_move`.
+pub fn pack_use_after_move_diagnostics(analysis: &FileAnalysis) -> Vec<Diagnostic> {
+    analysis
+        .use_after_move_reads()
+        .into_iter()
+        .map(|(name, span)| Diagnostic {
+            range: span_to_range(span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("use-after-move".into())),
+            source: Some("perl-lsp".into()),
+            message: format!("use of `{name}` after `std::move` (moved-from state)"),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Every pack-language (non-Perl) diagnostic for an analysis, concatenated.
+/// One seam so a backend dispatch never enumerates the individual checks.
+pub fn pack_diagnostics(analysis: &FileAnalysis, options: DiagnosticOptions) -> Vec<Diagnostic> {
+    let mut diags = pack_member_op_diagnostics(analysis);
+    diags.extend(pack_member_op_peel_diagnostics(analysis));
+    // use-after-move is OPT-IN (`DiagnosticOptions.use_after_move`): the wired
+    // check is the decidable subset only — gates B/C/E on `use_after_move_reads`
+    // keep it to straight-line, in-function, local moves, verified to emit ZERO
+    // false positives over the spdlog/fmt/onednn headers. The path-sensitive
+    // residuals (cross-branch use, loop-carried move, by-ref reset, subobject
+    // move) stay OUT by design, not flagged. `docs/adr/use-after-move.md`.
+    if options.use_after_move {
+        diags.extend(pack_use_after_move_diagnostics(analysis));
+    }
+    diags
+}
+
+pub fn code_actions(
+    diagnostics: &[Diagnostic],
+    analysis: &FileAnalysis,
+    uri: &Url,
+) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+
+    for diag in diagnostics {
+        // Member-access operator swap: replace the operator token (the
+        // diagnostic's range) with the correct one (`data.operator`).
+        if matches!(&diag.code, Some(NumberOrString::String(s)) if s == MEMBER_OP_CODE) {
+            if let Some(op) = diag.data.as_ref().and_then(|d| d.get("operator")).and_then(|v| v.as_str()) {
+                let mut changes = HashMap::new();
+                changes.insert(uri.clone(), vec![TextEdit { range: diag.range, new_text: op.to_string() }]);
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Change to `{}`", op),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(vec![diag.clone()]),
+                    edit: Some(WorkspaceEdit { changes: Some(changes), ..Default::default() }),
+                    is_preferred: Some(true),
+                    ..Default::default()
+                }));
+            }
+            continue;
+        }
+        // D2 guard-insertion quick-fix.
+        if matches!(&diag.code, Some(NumberOrString::String(s)) if s == "optional-deref") {
+            if let Some(action) = make_optional_guard_action(uri, diag) {
+                actions.push(action);
+            }
+            continue;
+        }
+
+        let code_matches = matches!(
+            &diag.code,
+            Some(NumberOrString::String(s)) if s == "unresolved-function"
+        );
+        if !code_matches {
+            continue;
+        }
+        let data = match &diag.data {
+            Some(d) => d,
+            None => continue,
+        };
+        let func_name = match data.get("function").and_then(|v| v.as_str()) {
+            Some(f) => f,
+            None => continue,
+        };
+
+        // Case 1: Already-imported module — add function to existing qw() list
+        if let Some(module_name) = data.get("module").and_then(|v| v.as_str()) {
+            if let Some(action) =
+                make_add_to_qw_action(analysis, uri, diag, module_name, func_name)
+            {
+                actions.push(action);
+            }
+            continue;
+        }
+
+        // Case 2: New import — add `use Module qw(func);` statement
+        if let Some(modules) = data.get("modules").and_then(|v| v.as_array()) {
+            let diag_point = position_to_point(diag.range.start);
+            let mut insert_pos = find_use_insertion_position(analysis, diag_point, None);
+            // If position is after the diagnostic, fall back to nearest import/package above
+            if insert_pos.line > diag.range.start.line {
+                let last_import_above = analysis.imports.iter().rev()
+                    .find(|imp| imp.span.start.row < diag_point.row);
+                if let Some(imp) = last_import_above {
+                    insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
+                } else {
+                    let last_pkg_above = analysis.symbols.iter().rev()
+                        .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < diag_point.row);
+                    if let Some(pkg) = last_pkg_above {
+                        insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };
+                    }
+                }
+            }
+            for (i, module_val) in modules.iter().enumerate() {
+                if let Some(module_name) = module_val.as_str() {
+                    let new_text = format!("use {} qw({});\n", module_name, func_name);
+                    let edit = TextEdit {
+                        range: Range {
+                            start: insert_pos,
+                            end: insert_pos,
+                        },
+                        new_text,
+                    };
+                    let mut changes = HashMap::new();
+                    changes.insert(uri.clone(), vec![edit]);
+
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Add 'use {} qw({})'", module_name, func_name),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diag.clone()]),
+                        edit: Some(WorkspaceEdit {
+                            changes: Some(changes),
+                            ..Default::default()
+                        }),
+                        is_preferred: Some(i == 0 && modules.len() == 1),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+
+    actions
+}
+
+/// D2 quick-fix: insert `return unless defined $r;` on its own line just
+/// before the flagged dereference. Indented to the receiver's column (the
+/// diagnostic range start), which is exact for a statement-leading deref and
+/// harmless otherwise. Produces precisely the guard the narrower then
+/// consumes to strip the `Optional`.
+fn make_optional_guard_action(uri: &Url, diag: &Diagnostic) -> Option<CodeActionOrCommand> {
+    let receiver = diag.data.as_ref()?.get("receiver")?.as_str()?;
+    let indent = " ".repeat(diag.range.start.character as usize);
+    let insert_pos = Position { line: diag.range.start.line, character: 0 };
+    let edit = TextEdit {
+        range: Range { start: insert_pos, end: insert_pos },
+        new_text: format!("{}return unless defined {};\n", indent, receiver),
+    };
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Guard: return unless defined {}", receiver),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        is_preferred: Some(true),
+        ..Default::default()
+    }))
+}
+
+/// Generate a code action that adds a function to an existing `qw()` import list.
+fn make_add_to_qw_action(
+    analysis: &FileAnalysis,
+    uri: &Url,
+    diag: &Diagnostic,
+    module_name: &str,
+    func_name: &str,
+) -> Option<CodeActionOrCommand> {
+    let import = analysis
+        .imports
+        .iter()
+        .find(|imp| imp.module_name == module_name)?;
+    let close_pos = import.qw_close_paren?;
+    let insert_pos = point_to_position(close_pos);
+    let edit = TextEdit {
+        range: Range {
+            start: insert_pos,
+            end: insert_pos,
+        },
+        new_text: format!(" {}", func_name),
+    };
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![edit]);
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: format!("Import '{}' from {}", func_name, module_name),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }),
+        is_preferred: Some(true),
+        ..Default::default()
+    }))
+}
+
+#[cfg(test)]
+#[path = "symbols_tests.rs"]
+mod tests;

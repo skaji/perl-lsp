@@ -1,52 +1,17 @@
-mod backend;
-mod builder;
-mod builtins_pod;
-mod conventions;
-mod cpanfile;
+mod build;
 mod cst;
-mod cursor_context;
-mod cursor_slot;
-mod document;
-mod file_analysis;
-mod file_store;
-mod graph;
-mod module_cache;
-mod module_index;
-mod module_resolver;
-mod pack_bag_cache;
-mod panic_guard;
-mod plugin;
-mod plugin_cli;
-mod pod;
-mod query_cache;
-mod surface;
-mod language_driver;
-// Compiled unconditionally (symbols.rs consumes the macro-model surface in
-// every build); the driver registration is feature-gated, so a perl-only
-// build leaves most of the module unreferenced — silence dead-code there
-// while keeping the all-langs build strict.
-#[cfg_attr(not(feature = "cpp"), allow(dead_code))]
-mod cpp_reparse;
-mod cpp_macro_model;
-mod cpp_toolchain;
-mod cursor_sentinel;
-#[cfg_attr(
-    not(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake")),
-    allow(dead_code)
-)]
-mod query_extract;
-// Kept-as-spike: the Perl prototype reparenthesizer that proved the
-// pre-extraction reparse seam (whose production form is cpp_reparse).
-#[allow(dead_code)]
-mod reparse;
-mod resolve;
-mod symbols;
-mod timings;
-mod witnesses;
+mod index;
+mod lsp;
+mod model;
 
 #[cfg(test)]
 #[path = "layering_tests.rs"]
 mod layering_tests;
+
+use build::{builder, language_driver, plugin};
+use index::{document, file_store, module_cache, module_index, module_resolver, resolve};
+use lsp::{backend, panic_guard, plugin_cli, symbols};
+use model::{conventions, file_analysis, timings, witnesses};
 
 use backend::Backend;
 use tower_lsp::{LspService, Server};
@@ -343,7 +308,7 @@ mod stdio_bridge {
 /// default build prints `perl`; a `cpp-lsp` build (`--features cpp`)
 /// prints `perl, cpp`.
 fn cli_languages() {
-    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
     println!(
         "perl-lsp {} — languages: {}",
         env!("CARGO_PKG_VERSION"),
@@ -356,7 +321,7 @@ fn cli_languages() {
 /// file goes through the C++ driver (macro reparse → extract) when this
 /// binary was built `--features cpp`.
 fn cli_lang_analyze(file: &str) {
-    let reg = crate::language_driver::LanguageRegistry::with_enabled();
+    let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
     let path = std::path::Path::new(file);
     let Ok(src) = std::fs::read_to_string(path) else {
         eprintln!("cannot read {file}");
@@ -373,8 +338,8 @@ fn cli_lang_analyze(file: &str) {
     // now makes a second run warm.
     if let Some(dir) = path.parent() {
         let key = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-        crate::cpp_reparse::set_macro_persist_dir(
-            crate::module_cache::cache_dir_for_workspace(Some(&key.to_string_lossy())),
+        crate::build::cpp_reparse::set_macro_persist_dir(
+            crate::index::module_cache::cache_dir_for_workspace(Some(&key.to_string_lossy())),
         );
     }
     // `PERL_LSP_BENCH_ITERS=N` re-analyzes N times in-process — the 2nd+ runs
@@ -579,7 +544,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
         Some(&root_uri),
         &module_index,
         None,
-        crate::backend::max_cache_mb_default() as usize * 1024 * 1024,
+        crate::lsp::backend::max_cache_mb_default() as usize * 1024 * 1024,
     );
     if pack_indexed > 0 {
         // Name the languages actually served rather than the
@@ -1181,7 +1146,7 @@ fn cli_semantic_tokens(root: &str, file: &str) {
 /// `[PHASE]` line when `PERL_LSP_PHASE_TIMING` is set. Sugar over `timings::phase`.
 macro_rules! tphase {
     ($label:literal, $body:expr) => {
-        $crate::timings::phase($label, || $body)
+        $crate::model::timings::phase($label, || $body)
     };
 }
 
@@ -1322,8 +1287,8 @@ fn run_one(
             let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &source)
                 .map(|d| d.id()).filter(|id| *id != "perl");
             let pack = lang_id.and_then(|lang| idx.pack_index(lang));
-            let base_idx: &dyn crate::file_analysis::CrossFileLookup =
-                pack.as_deref().map_or(idx as &dyn crate::file_analysis::CrossFileLookup, |i| i);
+            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
+                pack.as_deref().map_or(idx as &dyn crate::model::file_analysis::CrossFileLookup, |i| i);
             // `#include "x.h"` path → the resolved header (`#include` = `use`).
             // A path token, not a name — slot-shaped, stays ahead of the set.
             if lang_id == Some("cpp") {
@@ -1387,8 +1352,8 @@ fn run_one(
             let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
                 .map(|d| d.id()).filter(|id| *id != "perl");
             let pack = lang_id.and_then(|lang| idx.pack_index(lang));
-            let base_idx: &dyn crate::file_analysis::CrossFileLookup =
-                pack.as_deref().map_or(idx as &dyn crate::file_analysis::CrossFileLookup, |i| i);
+            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
+                pack.as_deref().map_or(idx as &dyn crate::model::file_analysis::CrossFileLookup, |i| i);
             // `#include` reverse — "who includes this header" — owns the path
             // token exclusively (its backward mirror of include goto-def).
             if lang_id == Some("cpp") {
@@ -1481,7 +1446,7 @@ fn run_one(
                 .map(|d| d.id()).filter(|id| *id != "perl")
             {
                 let pack = idx.pack_index(lang);
-                let base_idx: &dyn crate::file_analysis::CrossFileLookup =
+                let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
                     pack.as_deref().map_or(idx, |i| i);
                 let abs = std::fs::canonicalize(file)
                     .unwrap_or_else(|_| std::path::PathBuf::from(file));
@@ -1832,8 +1797,8 @@ fn run_rename(
     let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
         .map(|d| d.id()).filter(|id| *id != "perl");
     let pack = lang_id.and_then(|lang| idx.pack_index(lang));
-    let base_idx: &dyn crate::file_analysis::CrossFileLookup =
-        pack.as_deref().map_or(idx as &dyn crate::file_analysis::CrossFileLookup, |i| i);
+    let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
+        pack.as_deref().map_or(idx as &dyn crate::model::file_analysis::CrossFileLookup, |i| i);
     let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
     let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
         .expect("origin staged above");
@@ -2200,7 +2165,7 @@ fn cli_dump_package(root: &str, package_name: &str) {
             .map(|s| s.id);
         let mut vars_in_scope: Vec<serde_json::Value> = Vec::new();
         if let Some(sid) = sub_scope_id {
-            use crate::witnesses::{WitnessAttachment, WitnessPayload};
+            use crate::model::witnesses::{WitnessAttachment, WitnessPayload};
             for w in analysis.witnesses.all() {
                 let WitnessAttachment::Variable { name, scope } = &w.attachment else { continue };
                 if *scope != sid { continue; }
@@ -3090,7 +3055,7 @@ fn cli_parse(path: &str, lang: Option<&str>) {
     // --parse shows the SAME tree the pack extractor sees. Perl + stdin +
     // truly-unrecognized files keep the Perl grammar.
     let mut parser = if let Some(id) = lang {
-        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
         match reg.for_id(id) {
             Some(d) => d.make_parser(),
             None => {
@@ -3103,7 +3068,7 @@ fn cli_parse(path: &str, lang: Option<&str>) {
             }
         }
     } else if path != "-" {
-        let reg = crate::language_driver::LanguageRegistry::with_enabled();
+        let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
         reg.for_path_sniffed(std::path::Path::new(path), &source)
             .filter(|d| d.id() != "perl")
             .map(|d| d.make_parser())

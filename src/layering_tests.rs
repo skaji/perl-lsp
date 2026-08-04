@@ -4,6 +4,13 @@
 //! catch. (The alternative — a crate-per-layer workspace — buys the
 //! same guarantee from the compiler at the price of five published
 //! crates; the executed-and-rejected split lives on branch `workspace-split`.)
+//!
+//! The tree IS the map: a module's layer is its top-level directory
+//! (`src/model/**` = Model, `src/build/**` = Build, …), so placing a
+//! file places it in the architecture. The only non-directory members
+//! are `cst.rs` (the Cst layer is one module) and `main.rs` (the Lsp
+//! entry point); any other `.rs` directly under `src/` is unassigned
+//! and fails the walk.
 
 use std::collections::HashMap;
 use std::fs;
@@ -19,110 +26,80 @@ enum Layer {
     Lsp = 4,
 }
 
-/// Module → layer. Every non-test module must be assigned: the
-/// `unassigned module` assertion below makes adding a file without
-/// placing it in the architecture a test failure, not a drift.
-fn layer_map() -> HashMap<&'static str, Layer> {
-    use Layer::*;
-    HashMap::from([
-        ("file_analysis", Model),
-        ("witnesses", Model),
-        ("surface", Model),
-        ("conventions", Model),
-        ("graph", Model),
-        ("cst", Cst),
-        ("builder", Build),
-        ("plugin", Build),
-        ("pod", Build),
-        ("cpanfile", Build),
-        ("query_cache", Build),
-        ("query_extract", Build),
-        // multi-language serving seam (LanguageDriver keystone)
-        ("language_driver", Build),
-        // test-only C++ macro corpus consumed by query_extract_tests
-        ("cpp_obstacle", Build),
-        // stratified reparse seam (Perl prototype reparenthesizer spike)
-        ("reparse", Build),
-        // C++ reparse seam (macro expansion before extraction spike)
-        ("cpp_reparse", Build),
-        // config-variant macro model: guard trail + reachability + join
-        ("cpp_macro_model", Build),
-        // zero-config toolchain probe: shell out to cc for stdlib
-        // include roots + predefined macros + resource dir (spike)
-        ("cpp_toolchain", Build),
-        // sentinel re-parse for member-access cursor context
-        ("cursor_sentinel", Build),
-        // the shared metaprogram-projection engine (worklist + seen-set +
-        // root-chained provenance); pure std, importable from any layer
-        ("module_index", Index),
-        ("module_resolver", Index),
-        ("module_cache", Index),
-        ("pack_bag_cache", Index),
-        ("file_store", Index),
-        ("resolve", Index),
-        ("document", Index),
-        // Leaf instrumentation util (std-only, no crate imports): lives at the
-        // bottom so every layer — builder included — may import it downward.
-        ("timings", Model),
-        ("builtins_pod", Index),
-        ("backend", Lsp),
-        // process-survival service wrapper: catches handler panics at the
-        // request/notification boundary (no crate:: imports, DAG-neutral)
-        ("panic_guard", Lsp),
-        ("symbols", Lsp),
-        ("cursor_context", Lsp),
-        // one Slot vocabulary over cursor_context (Perl) + cursor_sentinel
-        // (pack); consumers switch on Slot, never on language
-        ("cursor_slot", Lsp),
-        ("plugin_cli", Lsp),
-        ("main", Lsp),
-        ("layering_tests", Lsp),
-    ])
+/// Top-level path segment → layer. `crate::build::builder::…` resolves
+/// through its first segment, so the directory name is the whole story.
+fn layer_of_segment(seg: &str) -> Option<Layer> {
+    Some(match seg {
+        "model" => Layer::Model,
+        "cst" => Layer::Cst,
+        "build" => Layer::Build,
+        "index" => Layer::Index,
+        "lsp" => Layer::Lsp,
+        _ => return None,
+    })
 }
 
-/// Source files per module, relative to `src/`. Test suites are
+/// Non-test source files with their layer and owning module, derived
+/// from the tree. A file directly under a layer dir IS its module; a
+/// file nested deeper (a split module's directory) reports the
+/// directory's module name, so a submodule can't dodge the DAG or the
+/// allowlists below. Test suites (`*_tests.rs` / `*_test.rs`) are
 /// exempt — they deliberately drive lower layers through upper ones.
-fn module_sources() -> Vec<(&'static str, Vec<PathBuf>)> {
+fn source_files() -> Vec<(PathBuf, Layer, String)> {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut out: Vec<(&'static str, Vec<PathBuf>)> = Vec::new();
-    let map = layer_map();
+    let mut out = Vec::new();
     for entry in fs::read_dir(&src).expect("read src/") {
+        let path = entry.expect("dir entry").path();
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        if path.is_dir() {
+            let layer = layer_of_segment(&stem)
+                .unwrap_or_else(|| panic!("src/{stem}/ is not a layer directory"));
+            collect_rs(&path, layer, None, &mut out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") || is_test_file(&stem) {
+            continue;
+        }
+        let layer = match stem.as_str() {
+            "main" => Layer::Lsp,
+            "cst" => Layer::Cst,
+            _ => panic!(
+                "unassigned module src/{stem}.rs — place it in a layer directory \
+                 (model/ cst build/ index/ lsp/)"
+            ),
+        };
+        out.push((path, layer, stem));
+    }
+    out
+}
+
+fn is_test_file(stem: &str) -> bool {
+    stem.ends_with("_tests") || stem.ends_with("_test") || stem == "layering_tests"
+}
+
+fn collect_rs(
+    dir: &PathBuf,
+    layer: Layer,
+    module: Option<&str>,
+    out: &mut Vec<(PathBuf, Layer, String)>,
+) {
+    for entry in fs::read_dir(dir).unwrap_or_else(|_| panic!("read {}", dir.display())) {
         let path = entry.expect("dir entry").path();
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string)
         else {
             continue;
         };
         if path.is_dir() {
-            // A module directory (`plugin/`, `builder/`) contributes its
-            // `.rs` files to that module's layer — same enforcement as the
-            // top-level `<module>.rs`, so a submodule can't dodge the DAG.
-            if let Some(name) = map.keys().copied().find(|k| *k == stem) {
-                let files = fs::read_dir(&path)
-                    .unwrap_or_else(|_| panic!("read {stem}/"))
-                    .filter_map(|e| {
-                        let p = e.ok()?.path();
-                        let s = p.file_stem()?.to_str()?;
-                        (p.extension()? == "rs" && !s.ends_with("_tests") && !s.ends_with("_test"))
-                            .then_some(p)
-                    })
-                    .collect();
-                out.push((name, files));
-            }
+            // First directory under the layer names the module; deeper
+            // nesting stays attributed to it.
+            collect_rs(&path, layer, Some(module.unwrap_or(&stem)), out);
             continue;
         }
-        if path.extension().is_none_or(|e| e != "rs") || stem.ends_with("_tests")
-            || stem.ends_with("_test")
-        {
+        if path.extension().is_none_or(|e| e != "rs") || is_test_file(&stem) {
             continue;
         }
-        let name: &'static str = map
-            .keys()
-            .copied()
-            .find(|k| *k == stem)
-            .unwrap_or_else(|| panic!("unassigned module src/{stem}.rs — add it to layer_map()"));
-        out.push((name, vec![path]));
+        out.push((path.clone(), layer, module.unwrap_or(&stem).to_string()));
     }
-    out
 }
 
 /// `crate::xxx` references in non-test code, with `use` lines and
@@ -153,25 +130,21 @@ fn crate_refs(text: &str) -> Vec<String> {
 /// Rule: every `crate::X` reference points at the same layer or lower.
 #[test]
 fn imports_flow_down_only() {
-    let map = layer_map();
     let mut violations = Vec::new();
-    for (module, files) in module_sources() {
-        let my_layer = map[module];
-        for f in &files {
-            let text = fs::read_to_string(f).expect("read source");
-            for target in crate_refs(&text) {
-                let Some(&target_layer) = map.get(target.as_str()) else {
-                    continue; // not a module path (a type/fn at crate root, etc.)
-                };
-                if target_layer > my_layer {
-                    violations.push(format!(
-                        "{} ({:?}) imports crate::{} ({:?}) — data flows down only",
-                        f.display(),
-                        my_layer,
-                        target,
-                        target_layer,
-                    ));
-                }
+    for (f, my_layer, _module) in source_files() {
+        let text = fs::read_to_string(&f).expect("read source");
+        for target in crate_refs(&text) {
+            let Some(target_layer) = layer_of_segment(&target) else {
+                continue; // not a layer path (a type/fn at crate root, etc.)
+            };
+            if target_layer > my_layer {
+                violations.push(format!(
+                    "{} ({:?}) imports crate::{} ({:?}) — data flows down only",
+                    f.display(),
+                    my_layer,
+                    target,
+                    target_layer,
+                ));
             }
         }
     }
@@ -184,49 +157,46 @@ fn imports_flow_down_only() {
 /// sanctioned tree consumers, and the model is not one.
 #[test]
 fn model_layer_cannot_walk_trees() {
-    let map = layer_map();
     let mut violations = Vec::new();
-    for (module, files) in module_sources() {
-        if map[module] != Layer::Model {
+    for (f, layer, _module) in source_files() {
+        if layer != Layer::Model {
             continue;
         }
-        for f in &files {
-            let text = fs::read_to_string(f).expect("read source");
-            for (ln, line) in text.lines().enumerate() {
-                let mut i = 0;
-                while let Some(j) = line[i..].find("tree_sitter::").map(|j| i + j) {
-                    i = j + "tree_sitter::".len();
-                    let rest = &line[i..];
-                    let end = rest
-                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                        .unwrap_or(rest.len());
-                    let name = &rest[..end];
-                    if name != "Point" {
-                        violations.push(format!(
-                            "{}:{}: tree_sitter::{} — the model is Point-only",
-                            f.display(),
-                            ln + 1,
-                            name,
-                        ));
-                    }
-                }
-                for forbidden in ["TreeCursor", "child_by_field_name", "named_child("] {
-                    if line.contains(forbidden) {
-                        violations.push(format!(
-                            "{}:{}: `{}` — tree walking belongs in the builder",
-                            f.display(),
-                            ln + 1,
-                            forbidden,
-                        ));
-                    }
+        let text = fs::read_to_string(&f).expect("read source");
+        for (ln, line) in text.lines().enumerate() {
+            let mut i = 0;
+            while let Some(j) = line[i..].find("tree_sitter::").map(|j| i + j) {
+                i = j + "tree_sitter::".len();
+                let rest = &line[i..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                let name = &rest[..end];
+                if name != "Point" {
+                    violations.push(format!(
+                        "{}:{}: tree_sitter::{} — the model is Point-only",
+                        f.display(),
+                        ln + 1,
+                        name,
+                    ));
                 }
             }
-            if text.contains("crate::cst") {
-                violations.push(format!(
-                    "{}: imports crate::cst — the typed view is for tree consumers",
-                    f.display(),
-                ));
+            for forbidden in ["TreeCursor", "child_by_field_name", "named_child("] {
+                if line.contains(forbidden) {
+                    violations.push(format!(
+                        "{}:{}: `{}` — tree walking belongs in the builder",
+                        f.display(),
+                        ln + 1,
+                        forbidden,
+                    ));
+                }
             }
+        }
+        if text.contains("crate::cst") {
+            violations.push(format!(
+                "{}: imports crate::cst — the typed view is for tree consumers",
+                f.display(),
+            ));
         }
     }
     assert!(violations.is_empty(), "rule #2 violations:\n{}", violations.join("\n"));
@@ -239,26 +209,22 @@ fn model_layer_cannot_walk_trees() {
 /// on the grammar crate, not `tree_sitter` generally.
 #[test]
 fn grammar_stays_in_the_builder_layer() {
-    let map = layer_map();
     let mut violations = Vec::new();
-    for (module, files) in module_sources() {
-        let layer = map[module];
+    for (f, layer, _module) in source_files() {
         if layer == Layer::Build || layer == Layer::Cst {
             continue;
         }
         // main.rs hosts --parse; backend/document parse via
         // builder::create_parser. Direct grammar naming outside
         // build/cst is the smell.
-        for f in &files {
-            let text = fs::read_to_string(f).expect("read source");
-            for (ln, line) in text.lines().enumerate() {
-                if line.contains("ts_parser_perl::") {
-                    violations.push(format!(
-                        "{}:{}: names the grammar directly — route through builder::create_parser",
-                        f.display(),
-                        ln + 1,
-                    ));
-                }
+        let text = fs::read_to_string(&f).expect("read source");
+        for (ln, line) in text.lines().enumerate() {
+            if line.contains("ts_parser_perl::") {
+                violations.push(format!(
+                    "{}:{}: names the grammar directly — route through builder::create_parser",
+                    f.display(),
+                    ln + 1,
+                ));
             }
         }
     }
@@ -332,33 +298,30 @@ fn whole_copy_registration_sites_are_allowlisted() {
     let mut violations: Vec<String> = Vec::new();
     for (name, files) in &allow {
         let mut seen: HashMap<String, usize> = HashMap::new();
-        for (_module, paths) in module_sources() {
-            for path in paths {
-                let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
-                let text = fs::read_to_string(&path).unwrap();
-                let needle = format!("{name}(");
-                for line in text.lines() {
-                    let t = line.trim_start();
-                    if t.starts_with("//") {
-                        continue;
+        for (path, _layer, stem) in source_files() {
+            let text = fs::read_to_string(&path).unwrap();
+            let needle = format!("{name}(");
+            for line in text.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                let mut rest = t;
+                while let Some(pos) = rest.find(&needle) {
+                    // A call site, not the definition, and not a
+                    // longer-named sibling (`register_symbols_inner(`
+                    // must not count as `register_symbols(`).
+                    let before = &rest[..pos];
+                    let defn = before.trim_end().ends_with("fn");
+                    let word_start = pos == 0
+                        || !rest[..pos]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if !defn && word_start {
+                        *seen.entry(stem.clone()).or_default() += 1;
                     }
-                    let mut rest = t;
-                    while let Some(pos) = rest.find(&needle) {
-                        // A call site, not the definition, and not a
-                        // longer-named sibling (`register_symbols_inner(`
-                        // must not count as `register_symbols(`).
-                        let before = &rest[..pos];
-                        let defn = before.trim_end().ends_with("fn");
-                        let word_start = pos == 0
-                            || !rest[..pos]
-                                .chars()
-                                .next_back()
-                                .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                        if !defn && word_start {
-                            *seen.entry(stem.clone()).or_default() += 1;
-                        }
-                        rest = &rest[pos + needle.len()..];
-                    }
+                    rest = &rest[pos + needle.len()..];
                 }
             }
         }
@@ -368,12 +331,12 @@ fn whole_copy_registration_sites_are_allowlisted() {
             match expected.get(file) {
                 Some(exp) if exp == n => {}
                 Some(exp) => violations.push(format!(
-                    "{name}() call-site count changed in src/{file}.rs: {n} (allowlisted {exp}) — \
+                    "{name}() call-site count changed in {file}: {n} (allowlisted {exp}) — \
                      if the new site registers WHOLE copies, justify its residency bound here; \
                      bulk paths use the stripping/parts APIs"
                 )),
                 None => violations.push(format!(
-                    "{name}() called from src/{file}.rs ({n} site(s)) — not allowlisted. Bulk \
+                    "{name}() called from {file} ({n} site(s)) — not allowlisted. Bulk \
                      registration must go through the stripping/parts APIs; a deliberate \
                      whole-copy site needs an entry here with its residency bound"
                 )),
@@ -382,7 +345,7 @@ fn whole_copy_registration_sites_are_allowlisted() {
         for (file, exp) in &expected {
             if !seen.contains_key(file) {
                 violations.push(format!(
-                    "{name}() allowlisted in src/{file}.rs ({exp}) but no call site found — \
+                    "{name}() allowlisted in {file} ({exp}) but no call site found — \
                      update the allowlist"
                 ));
             }

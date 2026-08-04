@@ -1,0 +1,3271 @@
+//! SPIKE: query-driven entity extraction.
+//!
+//! The question under test: can FileAnalysis's extraction be driven by
+//! declarative tree-sitter queries — entities out, procedural state
+//! managed by a generic driver + per-language predicates — such that
+//! the per-language part is DATA (a .scm query pack) rather than a
+//! hand-written walker? If yes, the core is language-agnostic the way
+//! highlights.scm/tags.scm consumers are.
+//!
+//! Architecture probed here:
+//!   - `queries/perl/skeleton.scm` — patterns whose CAPTURE NAMES form
+//!     a language-neutral entity vocabulary (`@def.*`, `@ref.*`,
+//!     `@scope`, `@context.*`, `@import`).
+//!   - `LangPack` — the per-language bundle: query source + host
+//!     predicates for what patterns can't express (name shaping,
+//!     suppression rules). The "back and forth": the driver owns
+//!     ordered traversal and state (scope stack, sticky contexts);
+//!     the pack answers point questions about text it understands.
+//!   - `extract()` — the generic driver. Knows NO Perl: it sorts
+//!     capture events, maintains the scope stack and sticky contexts,
+//!     and assembles `SkelSymbol`/`SkelRef` rows.
+//!
+//! Findings live in `docs/spike-query-extraction.md`. This module is
+//! deliberately not wired into the build pipeline — it exists to be
+//! measured against the real builder by `query_extract_tests.rs`.
+
+use crate::model::file_analysis::{InferredType, Span};
+use tree_sitter::{Language, Point, Query, QueryCursor, StreamingIterator, Tree};
+
+/// Compile each pack's skeleton query exactly once and reuse it.
+///
+/// `Query::new` is expensive (~400ms for the Perl skeleton) and `extract`
+/// runs per file, so recompiling every call dominates the workload. A pack's
+/// `query_source` is a unique `&'static str`, so its pointer identity keys the
+/// compiled query — same pack, same query, one compilation. Leaking the boxed
+/// query is bounded (one per language pack) and gives the `&'static Query` the
+/// cache needs.
+fn cached_query(language: &Language, source: &'static str) -> Result<&'static Query, String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<usize, &'static Query>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = source.as_ptr() as usize;
+    if let Some(q) = cache.lock().unwrap().get(&key) {
+        return Ok(q);
+    }
+    let query = Query::new(language, source).map_err(|e| format!("query: {e}"))?;
+    let leaked: &'static Query = Box::leak(Box::new(query));
+    cache.lock().unwrap().insert(key, leaked);
+    Ok(leaked)
+}
+
+/// The skeleton's symbol row — deliberately stringly-kinded: the kind
+/// vocabulary comes from capture names, so the driver never enumerates
+/// language entity kinds.
+#[derive(Debug, Clone)]
+pub struct SkelSymbol {
+    pub kind: String,
+    pub name: String,
+    pub start: Point,
+    pub end: Point,
+    pub name_start: Point,
+    pub name_end: Point,
+    /// Sticky `@context.package` value in force at the def site.
+    pub package: Option<String>,
+    pub scope: crate::model::file_analysis::ScopeId,
+    /// Declared return type (`@rettype`), for methods/functions — drives
+    /// method-return resolution + chaining through MethodOnClass.
+    pub return_type: Option<InferredType>,
+    /// Pointer/reference declarator stack, unravelled by `peel_nested` from
+    /// a `@nested.target` capture (empty otherwise). Flows to `Symbol.deref_stack`.
+    pub deref_stack: Vec<crate::model::file_analysis::DerefStep>,
+    /// Structural markers carried onto `Symbol.attributes`: "anonymous" when
+    /// the name came from the pack's `default_name` (not addressable by name —
+    /// completion skips it), "union" for union containers (the hover-overlay /
+    /// outline-nesting key), stamped in `into_file_analysis` from the kind.
+    pub attributes: Vec<String>,
+    /// Declared parameter arity for a callable, counted structurally from the
+    /// def's parameter list (`@arity.sig`). `None` for non-callables and defs
+    /// whose parameter list the query didn't capture. Flows to `Symbol.arity`.
+    pub arity: Option<crate::model::file_analysis::ParamArity>,
+    /// The `package` came from an explicit `::` qualifier on an out-of-line def
+    /// (`Ret Class::m(){}`), not from lexical/sticky context. The class the
+    /// qualifier names is authoritative EVEN when its body lives in another file
+    /// (a header), so `reanchor_truncated_containers` must not re-attribute it to
+    /// the enclosing namespace. Not serialized — a driver-internal marker.
+    pub qualifier_owned: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkelRef {
+    pub kind: String,
+    pub name: String,
+    pub start: Point,
+    pub end: Point,
+    pub scope: crate::model::file_analysis::ScopeId,
+    /// For a member access (`recv.field`) — the receiver subtree's (span,
+    /// text), so `into_file_analysis` mints a `RefKind::MethodCall` whose
+    /// invocant types query-time via `expr_type_at_span(span)` (text → the
+    /// `InvocantName`). `None` for plain calls / var refs.
+    pub invocant: Option<(crate::model::file_analysis::Span, String)>,
+    /// The written member operator (`.`/`->`) + its span, mapped from the
+    /// `@member.op` token's kind via the pack `op_map`, `Some` only when the
+    /// IMMEDIATE receiver is a simple variable. Rides onto the MethodCall ref
+    /// so operator-correctness is a ref query, not a separate walk.
+    pub member_op: Option<(crate::model::file_analysis::MemberOp, crate::model::file_analysis::Span)>,
+    /// Written argument count at a call ref (`call`/`qcall`/`member`), counted
+    /// structurally from the argument list. Flows to `Ref.arg_count`; `None`
+    /// for non-call refs.
+    pub arg_count: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+pub struct SkeletonAnalysis {
+    pub symbols: Vec<SkelSymbol>,
+    pub refs: Vec<SkelRef>,
+    pub imports: Vec<String>,
+    /// `#include`/`import` path tokens with spans: (raw path text, path-token
+    /// span). Goto-def on the token resolves the header; the span is what the
+    /// bare `imports` list drops. Carried onto `FileAnalysis.include_directives`.
+    pub import_sites: Vec<(String, crate::model::file_analysis::Span)>,
+    pub scope_count: usize,
+    pub scopes: Vec<crate::model::file_analysis::Scope>,
+    pub witnesses: Vec<crate::model::witnesses::Witness>,
+    /// (child class, parent class) inheritance edges — `@parent` captures.
+    pub parents: Vec<(String, String)>,
+    /// (specialization, primary) family edges — a `@spec.primary` capture in
+    /// a class-def match whose name is a template spelling. Rides onto
+    /// `FileAnalysis.specializes`; the graph's `Specializes` edge derives from
+    /// it (member resolution never traverses it — a spec REPLACES wholesale).
+    pub specializations: Vec<(String, String)>,
+    /// (owner class, param name, param position) triples from
+    /// `@tmpl.owner`/`@tmpl.param` — one per template parameter, joined per
+    /// match. Sorted by position into `FileAnalysis.template_params`
+    /// (declaration order is the `ParamOf` index axis).
+    pub template_params: Vec<(String, String, usize)>,
+    /// Variable reads (`@expr.read.var`): (name, scope, span). Each resolves
+    /// to the nearest visible Variable declaration by lexical scope walk →
+    /// local goto-def + hover. Resolution runs in `into_file_analysis`.
+    pub var_reads: Vec<(String, crate::model::file_analysis::ScopeId, crate::model::file_analysis::Span)>,
+    /// `goto LABEL` refs (`@ref.label`): (name, scope, span). Resolve to the
+    /// `LABEL:` def (a Variable symbol from `@def.label`) function-wide —
+    /// scope-chain walk WITHOUT the declared-before constraint (a forward
+    /// goto is valid C).
+    pub label_refs: Vec<(String, crate::model::file_analysis::ScopeId, crate::model::file_analysis::Span)>,
+    /// Member-access field uses recovered from inside `#define` macro bodies:
+    /// `(field name, span)`. A macro body is one opaque `preproc_arg` token, so
+    /// a `->op_next` buried in a def has no query capture. `into_file_analysis`
+    /// resolves each against THIS file's field symbols and — when the name maps
+    /// to a UNIQUE declaring class — mints a class-frozen `MethodCall` ref, so
+    /// references on the field include the in-body use (rule #7). The receiver
+    /// is a macro parameter with no type, hence the class is frozen from the
+    /// field decl rather than inferred from the (untypeable) invocant.
+    pub macro_body_member_reads: Vec<(String, crate::model::file_analysis::Span)>,
+    /// The pack's receiver param names (Python `self`/`cls`). A Variable so
+    /// named is the method receiver, not a class member — its (wrongly
+    /// sticky-tagged) class package is cleared in `into_file_analysis`.
+    pub receiver_names: Vec<String>,
+    /// Value-flow edges minted from `@flow` captures (`source → target`,
+    /// extraction). Lowered to type witnesses here; carried onto the FA as the
+    /// provenance tier.
+    pub flow_edges: Vec<crate::model::file_analysis::FlowEdge>,
+    /// `std::move(x)` sites: (moved var name, move-call span, enclosing scope).
+    /// A read of the var after the call and before its next rebind is a
+    /// use-after-move bug (`FileAnalysis::use_after_move_reads`).
+    pub moved_from: Vec<(String, crate::model::file_analysis::Span, crate::model::file_analysis::ScopeId)>,
+    /// Control-flow construct spans (`if`/`while`/`for`/`switch`/ternary/preproc
+    /// conditionals). The use-after-move check reads these to decide whether a
+    /// move is straight-line in its enclosing scope (`use_after_move_reads`).
+    pub control_regions: Vec<crate::model::file_analysis::Span>,
+    /// Parameter-list spans (`@param.region`). The use-after-move check reads
+    /// these to tell a moved parameter from a moved local (`use_after_move_reads`).
+    pub param_regions: Vec<crate::model::file_analysis::Span>,
+    /// Domain-typing sites: a `@domain.slot` field access compared/assigned
+    /// against a `@domain.value` token. Raw (value's enum resolves cross-file
+    /// at query time); folds onto `Field{owner, name}` for the int-used-as-enum
+    /// domain (`op_type` → `opcode`).
+    pub domain_sites: Vec<crate::model::file_analysis::DomainSite>,
+    /// Function-like macros the driver typed from their bodies (the expansion
+    /// flip's payoff: a left-unexpanded macro call is a `call_expression`, so
+    /// the macro IS a package-global sub the sub-return path types). Resolved to
+    /// final `SymbolId`s in `into_file_analysis`: the macro's `Symbol` gets its
+    /// return witness, and each call site an `Expr → Edge(Symbol)` so the call
+    /// reflects the body's type. `docs/adr/macro-handling.md`.
+    pub macro_returns: Vec<(String, MacroReturnHint)>,
+    /// Per-call-site argument spans for function-like macro calls, keyed by
+    /// the call-expression span (original coords). Lets a `Param(n)` macro's
+    /// call site edge `Expr(call) → Edge(Expr(arg_n))` so the parametric
+    /// return chases the argument's own value witness. Populated by the
+    /// driver's macro lane (it holds the tree); empty for languages with no
+    /// macro model.
+    pub macro_call_arg_spans: Vec<(Span, Vec<Span>)>,
+    /// Call sites (`@expr.call`): (call-expression span, callee name). The
+    /// call's VALUE is the callee's own resolution — resolved in
+    /// `into_file_analysis` against the symbol table: a `Class` callee is a
+    /// functional cast / constructor (→ an instance of that class), a
+    /// callable (sub / function-like macro) flows its return, an unresolvable
+    /// name yields NO witness (no name-case guess — `docs/adr/macro-handling.md`).
+    pub call_sites: Vec<(Span, String)>,
+    /// `return EXPR;` sites (`@expr.return.value`): (enclosing scope, the
+    /// returned expression's span). Purely structural — this tier doesn't
+    /// know what a `return` MEANS for any given language; the interpretation
+    /// (join to an owning function, decide whether it needs implicit-return
+    /// fuel) is cpp-specific and lives in `language_driver.rs`'s post-
+    /// extraction pipeline (`emit_return_fuel`).
+    pub return_sites: Vec<(crate::model::file_analysis::ScopeId, Span)>,
+    /// Callable parameter arities keyed by parameter_list span (`@arity.sig`).
+    /// Associated to def symbols by span containment in `into_file_analysis`.
+    pub param_sigs: Vec<(crate::model::file_analysis::Span, crate::model::file_analysis::ParamArity)>,
+}
+
+/// What a function-like macro's return resolves to (`SkeletonAnalysis::
+/// macro_returns`). `Delegate` reuses the existing see-through target
+/// (`MacroDef::delegate`) as a value edge (F's return = G's return);
+/// `Concrete` is a body-classified param-independent type.
+#[derive(Debug, Clone)]
+pub enum MacroReturnHint {
+    Delegate(String),
+    Concrete(InferredType),
+    /// The body is (or reduces to, under paren/cast wrappers) the macro's
+    /// `n`-th parameter — an identity/projection macro (`#define ID(x) (x)`,
+    /// `#define SEL2(a,b) (b)`). The return is the call's `n`-th argument's
+    /// type; the Symbol carries `ReturnExpr::Arg(n)` and each call site chases
+    /// the argument's own `Expr` witness. `docs/adr/macro-handling.md`.
+    Param(u32),
+}
+
+/// Locate a brace-delimited body: from byte `from`, the matching close of the
+/// first top-level `{`, skipping line/block comments and string/char/raw-string
+/// literals so their braces never miscount. Returns `(open, close)` byte
+/// offsets, or `None` when a `;` or EOF is reached before any `{` (a forward
+/// declaration — no body). The single trustworthy container-extent primitive
+/// for the re-anchor pass, run on ORIGINAL source (balanced braces).
+fn brace_body_extent(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let n = bytes.len();
+    let mut i = from;
+    let mut depth = 0i32;
+    let mut open: Option<usize> = None;
+    while i < n {
+        match bytes[i] {
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // Raw string `R"delim( ... )delim"` — a `R` immediately before the
+            // quote, not part of a longer identifier. Its body is verbatim, so
+            // braces inside must not count.
+            b'"' if i > from
+                && bytes[i - 1] == b'R'
+                && !bytes.get(i.wrapping_sub(2)).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') =>
+            {
+                let dstart = i + 1;
+                let mut j = dstart;
+                while j < n && bytes[j] != b'(' && bytes[j] != b'"' {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'(' {
+                    let delim = &bytes[dstart..j];
+                    let mut k = j + 1;
+                    i = n;
+                    while k < n {
+                        if bytes[k] == b')'
+                            && bytes[k + 1..].starts_with(delim)
+                            && bytes.get(k + 1 + delim.len()) == Some(&b'"')
+                        {
+                            i = k + 2 + delim.len();
+                            break;
+                        }
+                        k += 1;
+                    }
+                } else {
+                    i = j; // malformed; resume scan
+                }
+            }
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => {
+                if open.is_none() {
+                    open = Some(i);
+                }
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return open.map(|o| (o, i));
+                }
+                i += 1;
+            }
+            b';' if open.is_none() => return None,
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+impl SkeletonAnalysis {
+    /// Re-anchor members that lost their enclosing container to a tree-sitter
+    /// misparse — the re-anchor invariant (`docs/adr/config-superposition-declarations.md`).
+    /// When a deep misparse truncates a `class_specifier`/`namespace` node
+    /// (json.hpp's `basic_json`: a `#if` in ctor-initializer position closes
+    /// the class ~4400 lines early), every member after the truncation becomes
+    /// a sibling in the enclosing scope and loses its `package`. This recovers
+    /// them positionally.
+    ///
+    /// MUST run on ORIGINAL-coordinate symbols (post-`remap_spans`): the C++
+    /// macro-expansion transform unbalances braces (measured on json.hpp's
+    /// `basic_json`: transformed 682/710 vs original 646/646), so only the
+    /// ORIGINAL source's braces locate a container's true extent.
+    ///
+    /// Anti-fabrication: a container is only "computable" when its name span in
+    /// the source spells its own name (macro-synthesized namespaces like
+    /// `nlohmann`, whose span covers `NLOHMANN_JSON_NAMESPACE_BEGIN`, are
+    /// excluded) and it has a real brace body. Re-anchoring is UPGRADE-ONLY —
+    /// a symbol moves to the innermost container that textually encloses it
+    /// only when its current package is None, an ancestor of that container, or
+    /// a non-computable (macro/external) scope. A `::`-qualifier attribution
+    /// (out-of-line def) names a container that does NOT enclose the symbol, so
+    /// it is left untouched. No membership is invented: every target is a real
+    /// declared container whose braces enclose the member.
+    pub fn reanchor_truncated_containers(&mut self, source: &str) {
+        let bytes = source.as_bytes();
+        // Point → byte: tree-sitter columns ARE byte offsets within the line.
+        let mut line_start = Vec::with_capacity(bytes.len() / 32 + 1);
+        line_start.push(0usize);
+        for (i, b) in bytes.iter().enumerate() {
+            if *b == b'\n' {
+                line_start.push(i + 1);
+            }
+        }
+        let pt = |p: Point| -> usize {
+            line_start.get(p.row).copied().unwrap_or(bytes.len()) + p.column
+        };
+
+        // Computable containers: a declared class/union/namespace whose name
+        // span in the source spells its name AND that opens a brace body.
+        struct Container {
+            name: String,
+            open: usize,
+            close: usize,
+        }
+        let mut containers: Vec<Container> = Vec::new();
+        for s in &self.symbols {
+            if !matches!(s.kind.as_str(), "class" | "union" | "package") {
+                continue;
+            }
+            let (ns, ne) = (pt(s.name_start), pt(s.name_end));
+            if source.get(ns..ne) != Some(s.name.as_str()) {
+                continue; // macro-synthesized or shaped name: not textually locatable
+            }
+            if let Some((open, close)) = brace_body_extent(bytes, ne) {
+                containers.push(Container { name: s.name.clone(), open, close });
+            }
+        }
+        if containers.is_empty() {
+            return;
+        }
+
+        for s in self.symbols.iter_mut() {
+            // An explicit `::` qualifier is authoritative — the owning class it
+            // names may live in a header not present here, so its absence as a
+            // local container is NOT a truncation fall-through to recover.
+            if s.qualifier_owned {
+                continue;
+            }
+            let sb = pt(s.start);
+            // innermost = the smallest container range strictly enclosing sb.
+            let Some(t0) = containers
+                .iter()
+                .filter(|c| c.open < sb && sb < c.close)
+                .min_by_key(|c| c.close - c.open)
+            else {
+                continue;
+            };
+            let upgrade = match &s.package {
+                None => true,
+                Some(p) if *p == t0.name => false,
+                Some(p) => {
+                    // A `::`-qualifier names a computable container that does
+                    // NOT enclose this symbol (out-of-line def) — leave it. A
+                    // non-computable scope (macro namespace) or an enclosing
+                    // ancestor container is a truncation fall-through — upgrade.
+                    let p_computable_here =
+                        containers.iter().any(|c| c.name == *p && c.open < sb && sb < c.close);
+                    let p_is_container = containers.iter().any(|c| c.name == *p);
+                    !p_is_container || p_computable_here
+                }
+            };
+            if upgrade {
+                s.package = Some(t0.name.clone());
+            }
+        }
+    }
+
+    /// Assemble a REAL `FileAnalysis` — production model, production
+    /// indices, production reducer registry behind every query — from
+    /// nothing but capture events. The existence proof that the engine
+    /// is language-agnostic above this seam.
+    pub fn into_file_analysis(mut self) -> crate::model::file_analysis::FileAnalysis {
+        use crate::model::file_analysis::{
+            FileAnalysis, FileAnalysisParts, SymKind, Symbol, SymbolDetail, SymbolId,
+        };
+        // A NAMED typedef `typedef struct N {...} N;` matches both the
+        // struct_specifier and the type_definition → two `class N` AT THE
+        // SAME SPAN (one node, two capture patterns — e.g. the bodied
+        // pattern and the inheritance pattern both fire for `class Circle :
+        // public Shape {...}`). Key on (name, name span) rather than name
+        // alone: two class_specifiers that happen to share a
+        // bare name at DIFFERENT spans (forward decl + definition, same
+        // short name in different scopes) are genuinely distinct symbols and
+        // must both survive — only an exact same-span re-capture is the
+        // duplicate-emission bug. "class" and "union" are one type-kind
+        // family (a bodied named union matches both the generic class
+        // pattern and the union-tagged one); the union-tagged row wins at a
+        // shared span so the "union" attribute survives.
+        {
+            type ClassKey = (String, (usize, usize), (usize, usize));
+            let key_of = |s: &SkelSymbol| -> ClassKey {
+                (
+                    s.name.clone(),
+                    (s.name_start.row, s.name_start.column),
+                    (s.name_end.row, s.name_end.column),
+                )
+            };
+            let union_keys: std::collections::HashSet<ClassKey> = self
+                .symbols
+                .iter()
+                .filter(|s| s.kind == "union")
+                .map(key_of)
+                .collect();
+            let mut seen = std::collections::HashSet::new();
+            self.symbols.retain(|s| match s.kind.as_str() {
+                "class" => !union_keys.contains(&key_of(s)) && seen.insert(key_of(s)),
+                "union" => seen.insert(key_of(s)),
+                _ => true,
+            });
+        }
+        // A free function matches both the rettype-carrying and the rettype-free
+        // `@def.sub` pattern (a type-less constructor/K&R def only the latter),
+        // and a trailing-return function/method matches both its leading-`auto`
+        // pattern and the trailing sibling — one node, two SkelSymbols. Keep
+        // the one WITH a return type; dedup by the name span (same node →
+        // identical span). Per kind, so a sub and a method never cross-dedup.
+        {
+            use std::collections::HashMap;
+            let dedup_kinds = ["sub", "method"];
+            let mut best: HashMap<(&str, usize, usize, usize, usize), bool> = HashMap::new();
+            for s in &self.symbols {
+                if dedup_kinds.contains(&s.kind.as_str()) {
+                    let key = (s.kind.as_str(), s.name_start.row, s.name_start.column, s.name_end.row, s.name_end.column);
+                    let has = s.return_type.is_some();
+                    best.entry(key).and_modify(|v| *v |= has).or_insert(has);
+                }
+            }
+            let resolved: HashMap<(String, usize, usize, usize, usize), bool> = best
+                .into_iter()
+                .map(|((k, a, b, c, d), v)| ((k.to_string(), a, b, c, d), v))
+                .collect();
+            let mut kept: std::collections::HashSet<(String, usize, usize, usize, usize)> =
+                Default::default();
+            self.symbols.retain(|s| {
+                if !dedup_kinds.contains(&s.kind.as_str()) {
+                    return true;
+                }
+                let key = (s.kind.clone(), s.name_start.row, s.name_start.column, s.name_end.row, s.name_end.column);
+                // Keep the rettype-bearing copy; if none has one, keep the first.
+                if resolved.get(&key) == Some(&true) && s.return_type.is_none() {
+                    return false;
+                }
+                kept.insert(key)
+            });
+        }
+        let mut bag = crate::model::witnesses::WitnessBag::default();
+        for w in self.witnesses {
+            bag.push(w);
+        }
+        // Associate each callable def with its parameter arity: the def's OWN
+        // parameter list is the one span-contained in the def and starting
+        // earliest at/after the name token (a nested function-pointer decl or
+        // lambda param list starts later). `@arity.sig` fires a separate match
+        // from the def name, so this join is by span, not match_id.
+        {
+            let param_sigs = std::mem::take(&mut self.param_sigs);
+            let after = |a: Point, b: Point| (a.row, a.column) >= (b.row, b.column);
+            for s in self.symbols.iter_mut() {
+                if !matches!(s.kind.as_str(), "sub" | "method") {
+                    continue;
+                }
+                s.arity = param_sigs
+                    .iter()
+                    .filter(|(sp, _)| {
+                        after(sp.start, s.name_end)
+                            && after(s.end, sp.end)
+                            && after(sp.start, s.start)
+                    })
+                    .min_by_key(|(sp, _)| (sp.start.row, sp.start.column))
+                    .map(|(_, ar)| *ar);
+            }
+        }
+        let mut symbols: Vec<Symbol> = self
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Symbol {
+                id: SymbolId(i as u32),
+                name: s.name.clone(),
+                kind: match s.kind.as_str() {
+                    "package" => SymKind::Package,
+                    // "union": a named union TYPE (its members are its own).
+                    "class" | "union" => SymKind::Class,
+                    // "macro": a function-like `#define` — a real callable
+                    // Sub everywhere (dispatch/completion/goto-def), tagged
+                    // "macro" below so hover/labels say so.
+                    "sub" | "anon" | "constant" | "macro" => SymKind::Sub,
+                    // "reexport": `using Base::m;` in a class body — a Method
+                    // in the class's API surface; the "reexport" attribute
+                    // (added below) makes resolution see through it.
+                    "method" | "reexport" => SymKind::Method,
+                    // a plain struct/class data member — distinct from a
+                    // local/global Variable so hover/outline say "field".
+                    "field" => SymKind::Field,
+                    // a named enum value — distinct from both Variable and
+                    // Field.
+                    "enumerator" => SymKind::Enumerator,
+                    // "unionfield" (an inline union member-field container)
+                    // stays Variable — its "union" attribute drives the
+                    // outline-nesting branch keyed on SymKind::Variable below.
+                    _ => SymKind::Variable,
+                },
+                span: Span { start: s.start, end: s.end },
+                selection_span: Span { start: s.name_start, end: s.name_end },
+                scope: s.scope,
+                package: s.package.clone(),
+                detail: SymbolDetail::None,
+                namespace: crate::model::file_analysis::Namespace::Language,
+                outline_label: None,
+                attributes: {
+                    let mut a = s.attributes.clone();
+                    // union containers carry the marker the hover-overlay /
+                    // outline-nesting consumers key on — a value-borne
+                    // property, never a name test.
+                    if matches!(s.kind.as_str(), "union" | "unionfield") {
+                        a.push("union".to_string());
+                    }
+                    if s.kind == "reexport" {
+                        a.push("reexport".to_string());
+                    }
+                    if s.kind == "macro" {
+                        a.push("macro".to_string());
+                    }
+                    a
+                },
+                deref_stack: s.deref_stack.clone(),
+                arity: s.arity,
+            })
+            .collect();
+        // Tag a typedef-struct's members with its name. `typedef struct
+        // {...} T;` names the type AFTER its body, so @context.class can't
+        // reach the members (already walked). For each class, members
+        // directly in its body scope that are still UNTAGGED inherit the
+        // class name. Idempotent for normal classes (members already tagged
+        // via @context.class are skipped).
+        let class_bodies: Vec<(crate::model::file_analysis::ScopeId, String)> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Class))
+            .filter_map(|c| {
+                let cs = c.span;
+                self.scopes
+                    .iter()
+                    .find(|s| {
+                        s.span != cs
+                            && (s.span.start.row, s.span.start.column)
+                                >= (cs.start.row, cs.start.column)
+                            && (s.span.end.row, s.span.end.column) <= (cs.end.row, cs.end.column)
+                    })
+                    .map(|s| (s.id, c.name.clone()))
+            })
+            .collect();
+        for (body, cname) in class_bodies {
+            for s in &mut symbols {
+                if s.package.is_none() && s.scope == body {
+                    s.package = Some(cname.clone());
+                }
+            }
+        }
+
+        // Enum members carry their parent enum as BOTH container (package)
+        // and type: `enum Color { RED }` → RED's package + type is `Color`,
+        // so hover renders `RED: Color` the same `name: type` way a struct
+        // field does. The enum is the smallest Class whose span contains the
+        // enumerator (span-, not scope-contained: C enumerators leak into the
+        // enclosing scope, so they stay there — the query mints no @scope for
+        // the enum body — and a bare `x = RED` still resolves).
+        {
+            use crate::model::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
+            let class_spans: Vec<(Span, String)> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, SymKind::Class))
+                .map(|s| (s.span, s.name.clone()))
+                .collect();
+            let contains = |o: &Span, i: &Span| {
+                (o.start.row, o.start.column) <= (i.start.row, i.start.column)
+                    && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
+            };
+            for idx in 0..symbols.len() {
+                if self.symbols[idx].kind != "enumerator" {
+                    continue;
+                }
+                let esp = symbols[idx].span;
+                // Innermost containing Class = the parent enum (latest start).
+                let Some(enum_name) = class_spans
+                    .iter()
+                    .filter(|(cs, _)| contains(cs, &esp))
+                    .max_by_key(|(cs, _)| (cs.start.row, cs.start.column))
+                    .map(|(_, n)| n.clone())
+                else {
+                    continue;
+                };
+                // The enum is the tightest container, tighter than any
+                // enclosing namespace the sticky context may have tagged.
+                symbols[idx].package = Some(enum_name.clone());
+                bag.push(Witness {
+                    attachment: WA::Variable {
+                        name: symbols[idx].name.clone(),
+                        scope: symbols[idx].scope,
+                    },
+                    source: WitnessSource::Builder("cpp_enumerator".into()),
+                    payload: WP::InferredType(InferredType::ClassName(enum_name)),
+                    span: esp,
+                });
+            }
+        }
+
+        // A function whose owning package is a CLASS is a method. Covers
+        // template members, which tree-sitter parses as a plain
+        // `declaration` (identifier, not field_identifier) so they classify
+        // as Sub — but a sub owned by a class is a method, by definition.
+        let class_names: std::collections::HashSet<String> = symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Class))
+            .map(|s| s.name.clone())
+            .collect();
+        for s in &mut symbols {
+            if matches!(s.kind, SymKind::Sub)
+                && s.package.as_deref().is_some_and(|p| class_names.contains(p))
+            {
+                s.kind = SymKind::Method;
+            }
+        }
+        // Per-class template parameter lists (declaration order) — the
+        // `ParamOf` index axis. Built here so the writeback below can route
+        // param-mentioning member returns through the deferred shape; rides
+        // onto `FileAnalysis.template_params` after construction.
+        let template_params: std::collections::HashMap<String, Vec<String>> = {
+            let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
+            for (owner, param, _) in &self.template_params {
+                let v = map.entry(owner.clone()).or_default();
+                if !v.contains(param) {
+                    v.push(param.clone());
+                }
+            }
+            map
+        };
+        // Writeback-lite: route method returns through MethodOnClass so
+        // `box.getInner().` chains, inherited returns, and cross-file all
+        // resolve via the SAME chase Perl uses — no bypass. Declared
+        // returns need no fixpoint (the type is in the syntax); only the
+        // edge-minting half of the fold's writeback is needed here.
+        {
+            use crate::model::witnesses::{Witness, WitnessAttachment as WA, WitnessPayload as WP, WitnessSource};
+            let mk = |att: WA, pay: WP, span: Span| Witness {
+                attachment: att,
+                source: WitnessSource::Builder("cpp_method_return".into()),
+                payload: pay,
+                span,
+            };
+            for (i, sym) in symbols.iter().enumerate() {
+                if !matches!(sym.kind, SymKind::Method | SymKind::Sub) {
+                    continue;
+                }
+                if let Some(ret) = &self.symbols[i].return_type {
+                    // A return that MENTIONS the owning class's template
+                    // params publishes the deferred receiver-substituting
+                    // shape (`ParamOf` — lazy, like `RowOf`); a concrete
+                    // class-shaped return edges into the alias graph (it may
+                    // be a typedef) instead of committing the spelling;
+                    // primitives are leaves. `TypeName` resolves the typedef
+                    // or falls back to the same `ClassName`, so struct
+                    // returns are unchanged and aliased returns chase.
+                    // (edges-not-values)
+                    let class_params = sym
+                        .package
+                        .as_deref()
+                        .and_then(|p| template_params.get(p));
+                    let pay = match class_params.and_then(|ps| param_return_expr(ret, ps)) {
+                        Some(re) => WP::ReturnExpr(re),
+                        None => match ret {
+                            InferredType::ClassName(cn) => WP::Edge(WA::TypeName(cn.clone())),
+                            other => WP::InferredType(other.clone()),
+                        },
+                    };
+                    bag.push(mk(WA::Symbol(sym.id), pay, sym.span));
+                }
+                if matches!(sym.kind, SymKind::Method) {
+                    if let Some(class) = &sym.package {
+                        bag.push(mk(
+                            WA::MethodOnClass { class: class.clone(), name: sym.name.clone() },
+                            WP::Edge(WA::Symbol(sym.id)),
+                            sym.span,
+                        ));
+                    }
+                }
+            }
+            // A class VIEWED AS A CALLABLE (a functional cast / constructor,
+            // `Widget(x)`) produces an instance of itself. Its `Symbol` answers
+            // `ClassName(name)` so a call site edging to it materializes the
+            // instance — the ctor's value is the class's identity, asked of the
+            // resolved class rather than guessed from the callee's name case.
+            for sym in &symbols {
+                if matches!(sym.kind, SymKind::Class) {
+                    bag.push(mk(
+                        WA::Symbol(sym.id),
+                        WP::InferredType(InferredType::ClassName(sym.name.clone())),
+                        sym.span,
+                    ));
+                }
+            }
+            // Inheritance edges: MethodOnClass{child,m} → Edge(parent,m), so
+            // the registry walks the MRO for an inherited method's return.
+            for (child, parent) in &self.parents {
+                for sym in &symbols {
+                    if matches!(sym.kind, SymKind::Method)
+                        && sym.package.as_deref() == Some(parent.as_str())
+                    {
+                        bag.push(mk(
+                            WA::MethodOnClass { class: child.clone(), name: sym.name.clone() },
+                            WP::Edge(WA::MethodOnClass { class: parent.clone(), name: sym.name.clone() }),
+                            sym.span,
+                        ));
+                    }
+                }
+            }
+            // Function-like macro typing: the macro's `Symbol` carries its
+            // body's implied return (delegation → an Edge to the callee's own
+            // return, else the classified concrete type), so a left-unexpanded
+            // call `F(args)` types through the sub-return path.
+            let sub_sid: std::collections::HashMap<&str, SymbolId> = symbols
+                .iter()
+                .filter(|s| matches!(s.kind, SymKind::Sub))
+                .map(|s| (s.name.as_str(), s.id))
+                .collect();
+            use crate::build::query_extract::MacroReturnHint;
+            let hint_of: std::collections::HashMap<&str, &MacroReturnHint> =
+                self.macro_returns.iter().map(|(n, h)| (n.as_str(), h)).collect();
+            for (name, hint) in &self.macro_returns {
+                let Some(&sid) = sub_sid.get(name.as_str()) else { continue };
+                let span = symbols[sid.0 as usize].span;
+                let pay = match hint {
+                    MacroReturnHint::Delegate(g) => {
+                        sub_sid.get(g.as_str()).map(|&gsid| WP::Edge(WA::Symbol(gsid)))
+                    }
+                    MacroReturnHint::Concrete(t) => Some(WP::InferredType(t.clone())),
+                    // The parametric identity/projection return is a deferred
+                    // `Arg(n)`; a call site substitutes it by chasing its own
+                    // argument below (`Arg` alone answers `None` at a bare sym
+                    // probe, exactly like `Receiver`).
+                    MacroReturnHint::Param(n) => {
+                        Some(WP::ReturnExpr(crate::model::witnesses::ReturnExpr::Arg(*n)))
+                    }
+                };
+                if let Some(pay) = pay {
+                    bag.push(mk(WA::Symbol(sid), pay, span));
+                }
+            }
+            // Call-site value resolution: a call's value IS the callee's own
+            // resolution. A callee that names a symbol — a `Class` (functional
+            // cast / constructor → the class instance), a sub, or a function-
+            // like macro — edges `Expr(call) → Edge(Symbol(callee))`; the
+            // Symbol answers `ClassName` for a class and its return for a
+            // callable. A callee that resolves to NOTHING mints no witness (no
+            // name-case guess — an unknown uppercase macro leaves the enclosing
+            // `auto x = F(..)` honestly untyped). Prefer a `Class` over a
+            // like-named callable (the constructor is the stronger claim).
+            let callee_sid: std::collections::HashMap<&str, SymbolId> = {
+                let mut m: std::collections::HashMap<&str, SymbolId> =
+                    std::collections::HashMap::new();
+                for s in &symbols {
+                    match s.kind {
+                        SymKind::Class => {
+                            m.insert(s.name.as_str(), s.id);
+                        }
+                        SymKind::Sub | SymKind::Method => {
+                            m.entry(s.name.as_str()).or_insert(s.id);
+                        }
+                        _ => {}
+                    }
+                }
+                m
+            };
+            // Per-call-site argument spans (original coords) so a `Param(n)`
+            // call resolves to its n-th argument's value witness.
+            let call_args: std::collections::HashMap<Span, &Vec<Span>> =
+                self.macro_call_arg_spans.iter().map(|(s, a)| (*s, a)).collect();
+            for (span, name) in &self.call_sites {
+                // Identity/projection macro: the call's value IS its n-th
+                // argument. Edge to the argument's own `Expr` witness rather
+                // than the param-agnostic Symbol return (edges-not-values).
+                if let Some(MacroReturnHint::Param(n)) = hint_of.get(name.as_str()).copied() {
+                    if let Some(arg) = call_args.get(span).and_then(|a| a.get(*n as usize)) {
+                        bag.push(mk(WA::Expr(*span), WP::Edge(WA::Expr(*arg)), *span));
+                        continue;
+                    }
+                }
+                if let Some(&sid) = callee_sid.get(name.as_str()) {
+                    bag.push(mk(WA::Expr(*span), WP::Edge(WA::Symbol(sid)), *span));
+                }
+            }
+        }
+        // ---- Local/param vars: a variable READ resolves to the nearest
+        // visible Variable declaration by lexical scope walk → local
+        // goto-def + hover. Declarations are already Variable symbols
+        // (`@def.local`/`@def.var`); fields are excluded naturally (their
+        // class scope isn't on a local read's scope chain).
+        let mut defs_by_name: std::collections::HashMap<
+            String,
+            Vec<(crate::model::file_analysis::ScopeId, Span, SymbolId)>,
+        > = std::collections::HashMap::new();
+        for s in &symbols {
+            if matches!(s.kind, SymKind::Variable) {
+                defs_by_name
+                    .entry(s.name.clone())
+                    .or_default()
+                    .push((s.scope, s.selection_span, s.id));
+            }
+        }
+        let scope_parent: std::collections::HashMap<
+            crate::model::file_analysis::ScopeId,
+            Option<crate::model::file_analysis::ScopeId>,
+        > = self.scopes.iter().map(|s| (s.id, s.parent)).collect();
+        let mut local_refs: Vec<crate::model::file_analysis::Ref> = Vec::new();
+        // Reads that found no LOCAL decl — a Variable ref is still minted for
+        // each (below, once call/member spans are known) so query-time
+        // cross-file resolution can chase it by name (a file-scope value like
+        // a C enum constant or global is registered in the pack index; the use
+        // resolves the same way a bare call does). rule #7: the token gets a
+        // ref whether or not the def is local.
+        let mut unresolved_reads: Vec<(String, crate::model::file_analysis::ScopeId, Span)> = Vec::new();
+        for (name, read_scope, read_span) in &self.var_reads {
+            let rp = (read_span.start.row, read_span.start.column);
+            let resolved = defs_by_name.get(name).and_then(|cands| {
+                let mut cur = Some(*read_scope);
+                while let Some(sc) = cur {
+                    // nearest decl of this name in THIS scope level, declared at
+                    // or before the read (latest-wins for redeclaration).
+                    let mut best: Option<((usize, usize), SymbolId)> = None;
+                    for (dscope, dspan, did) in cands {
+                        let dp = (dspan.start.row, dspan.start.column);
+                        if *dscope == sc && dp <= rp && best.is_none_or(|(bp, _)| dp > bp) {
+                            best = Some((dp, *did));
+                        }
+                    }
+                    if let Some((_, did)) = best {
+                        return Some(did);
+                    }
+                    cur = scope_parent.get(&sc).copied().flatten();
+                }
+                None
+            });
+            match resolved {
+                Some(did) => local_refs.push(crate::model::file_analysis::Ref {
+                    kind: crate::model::file_analysis::RefKind::Variable,
+                    span: *read_span,
+                    scope: *read_scope,
+                    target_name: name.clone(),
+                    access: crate::model::file_analysis::AccessKind::Read,
+                    resolves_to: Some(did),
+                    resolved_method_target: None,
+                    folded_from: None,
+                    arg_count: None,
+                }),
+                None => unresolved_reads.push((name.clone(), *read_scope, *read_span)),
+            }
+        }
+        // `goto LABEL` → the `LABEL:` def, function-wide: first matching
+        // Variable on the scope chain, NO declared-before constraint (a
+        // forward goto is valid).
+        for (name, ref_scope, ref_span) in &self.label_refs {
+            let Some(cands) = defs_by_name.get(name) else { continue };
+            let mut cur = Some(*ref_scope);
+            let mut resolved: Option<SymbolId> = None;
+            while let Some(sc) = cur {
+                if let Some((_, _, did)) = cands.iter().find(|(dscope, _, _)| *dscope == sc) {
+                    resolved = Some(*did);
+                    break;
+                }
+                cur = scope_parent.get(&sc).copied().flatten();
+            }
+            if let Some(did) = resolved {
+                local_refs.push(crate::model::file_analysis::Ref {
+                    kind: crate::model::file_analysis::RefKind::Variable,
+                    span: *ref_span,
+                    scope: *ref_scope,
+                    target_name: name.clone(),
+                    access: crate::model::file_analysis::AccessKind::Read,
+                    resolves_to: Some(did),
+                    resolved_method_target: None,
+                    folded_from: None,
+                    arg_count: None,
+                });
+            }
+        }
+
+        // A `@ref.type` on a def's OWN name token (class/enum/typedef
+        // declaring itself) is the declaration, not a use — suppress by
+        // exact selection-span match so the Symbol stays the only claimant.
+        let decl_name_spans: std::collections::HashSet<(usize, usize, usize, usize)> = symbols
+            .iter()
+            .map(|s| {
+                (
+                    s.selection_span.start.row,
+                    s.selection_span.start.column,
+                    s.selection_span.end.row,
+                    s.selection_span.end.column,
+                )
+            })
+            .collect();
+        let mut refs: Vec<crate::model::file_analysis::Ref> = self
+            .refs
+            .iter()
+            .filter_map(|r| {
+                use crate::model::file_analysis::RefKind;
+                let mut span = Span { start: r.start, end: r.end };
+                let kind = match r.kind.as_str() {
+                    "call" => RefKind::FunctionCall { resolved_package: None },
+                    // Qualified call (`fmt::format_to(...)`): Perl parity —
+                    // the full path rides `target_name`, the qualifier
+                    // `resolved_package`, and the span narrows to the bare
+                    // name token (the rename/highlight unit; also what
+                    // suppresses the `@expr.read.var` duplicate at the same
+                    // start). The tail segment is an identifier, so it never
+                    // spans rows — the end-anchored column math is safe.
+                    "qcall" => {
+                        let (pkg, bare) = crate::model::file_analysis::split_qualified(&r.name);
+                        let pkg = pkg?;
+                        span.start = tree_sitter::Point {
+                            row: r.end.row,
+                            column: r.end.column.saturating_sub(bare.len()),
+                        };
+                        RefKind::FunctionCall { resolved_package: Some(pkg.to_string()) }
+                    }
+                    // `recv.field` / `recv->field`: the SAME MethodCall ref
+                    // core resolves for Perl `$obj->m`. The invocant types
+                    // query-time via `expr_type_at_span(invocant_span)`;
+                    // `find_definition`/`refs_to`/hover all flow from it.
+                    "member" => {
+                        let (inv_span, inv_text) = r.invocant.clone()?;
+                        RefKind::MethodCall {
+                            invocant: crate::model::conventions::Invocant::assume_canonical(inv_text),
+                            invocant_span: Some(inv_span),
+                            method_name_span: Span { start: r.start, end: r.end },
+                            member_op: r.member_op,
+                        }
+                    }
+                    // A type-position name (`Widget w;`, `struct op* o`, a
+                    // base-class clause): the same PackageRef a Perl package
+                    // use carries, so type gd/gr ride the Package machinery.
+                    "type" => {
+                        if decl_name_spans.contains(&(
+                            r.start.row,
+                            r.start.column,
+                            r.end.row,
+                            r.end.column,
+                        )) {
+                            return None;
+                        }
+                        RefKind::PackageRef
+                    }
+                    _ => return None,
+                };
+                Some(crate::model::file_analysis::Ref {
+                    kind,
+                    span,
+                    scope: r.scope,
+                    target_name: r.name.clone(),
+                    access: crate::model::file_analysis::AccessKind::Read,
+                    resolves_to: None,
+                    resolved_method_target: None,
+                    folded_from: None,
+                    arg_count: r.arg_count,
+                })
+            })
+            .collect();
+        // The `(identifier) @expr.read.var` catch-all also fires on a call's
+        // function-name (`foo` in `foo()`) and on a def's OWN name (`compute`
+        // in `int compute(...)`), neither of which is a bare value read — the
+        // first already carries a FunctionCall ref, the second IS the
+        // declaration. Don't shadow either with a stray unresolved Variable
+        // ref (it would displace the decl from references/highlight). Claims
+        // are NAME-keyed (a ref by its unqualified TAIL, so a qualified
+        // call's name token still claims the read at its own start): a read
+        // spelling a DIFFERENT name at the same start is a different token —
+        // the erased-macro re-mint (`ABSL_GUARDED_BY`) must survive the
+        // expansion-body ref (`guarded_by`) remapped onto the same call
+        // site, or the macro's use vanishes from gr.
+        let claimed: std::collections::HashSet<(usize, usize, String)> = refs
+            .iter()
+            .map(|r| {
+                (
+                    r.span.start.row,
+                    r.span.start.column,
+                    r.unqualified_target_name().to_string(),
+                )
+            })
+            .chain(symbols.iter().map(|s| {
+                (
+                    s.selection_span.start.row,
+                    s.selection_span.start.column,
+                    s.name.clone(),
+                )
+            }))
+            .collect();
+        for (name, scope, span) in unresolved_reads {
+            if claimed.contains(&(span.start.row, span.start.column, name.clone())) {
+                continue;
+            }
+            local_refs.push(crate::model::file_analysis::Ref {
+                kind: crate::model::file_analysis::RefKind::Variable,
+                span,
+                scope,
+                target_name: name,
+                access: crate::model::file_analysis::AccessKind::Read,
+                resolves_to: None,
+                resolved_method_target: None,
+                folded_from: None,
+                arg_count: None,
+            });
+        }
+        refs.extend(local_refs);
+        // Field/member uses recovered from `#define` bodies (`->op_next`): the
+        // receiver is a macro parameter with no type, so resolve the field to
+        // its declaring class from THIS file's own field symbols and freeze the
+        // class on the ref. Only a name that maps to ONE declaring class is
+        // minted — an ambiguous field (same name on two structs) or a
+        // cross-file-only field stays silent (documented residual), keeping the
+        // over-approximation honest. The frozen `MethodTarget` is exactly what
+        // `refs_to`'s `(Method, MethodCall)` arm reads, so references on the
+        // field include the in-body use without needing the invocant to type.
+        if !self.macro_body_member_reads.is_empty() {
+            // field name → every (declaring class, decl SymbolId). The receiver
+            // in a macro body is an untypeable macro parameter, so the class is
+            // taken from the field DECL. A name shared by several structs —
+            // overwhelmingly a member-block-replicated field (perl5 `op_next` is
+            // spliced into every OP struct via `BASEOP`) — is genuinely one
+            // logical field; attribute the use to EACH declaring class so a
+            // references query on any of them counts it. Per query that is +1
+            // (the class-frozen ref matches only that class's target); the
+            // over-approximation is only across unrelated same-named fields (a
+            // documented, references-tolerant honest over-count, not a wrong
+            // "is this a field" — the token IS a field member access).
+            let mut field_owners: std::collections::HashMap<
+                &str,
+                Vec<(&str, crate::model::file_analysis::SymbolId)>,
+            > = std::collections::HashMap::new();
+            for s in &symbols {
+                if s.kind == SymKind::Field {
+                    if let Some(pkg) = s.package.as_deref() {
+                        let v = field_owners.entry(s.name.as_str()).or_default();
+                        if !v.iter().any(|(p, _)| *p == pkg) {
+                            v.push((pkg, s.id));
+                        }
+                    }
+                }
+            }
+            let claimed: std::collections::HashSet<(usize, usize)> =
+                refs.iter().map(|r| (r.span.start.row, r.span.start.column)).collect();
+            for (field, span) in &self.macro_body_member_reads {
+                if claimed.contains(&(span.start.row, span.start.column)) {
+                    continue;
+                }
+                let Some(owners) = field_owners.get(field.as_str()) else { continue };
+                for (class, sym_id) in owners {
+                    refs.push(crate::model::file_analysis::Ref {
+                        kind: crate::model::file_analysis::RefKind::MethodCall {
+                            invocant: crate::model::conventions::Invocant::assume_canonical(String::new()),
+                            invocant_span: None,
+                            method_name_span: *span,
+                            member_op: None,
+                        },
+                        span: *span,
+                        scope: crate::model::file_analysis::ScopeId(0),
+                        target_name: field.clone(),
+                        access: crate::model::file_analysis::AccessKind::Read,
+                        resolves_to: None,
+                        // Local edge (the field decl IS in this file): references
+                        // matches on `invocant_class`, and goto-def from the
+                        // in-body use lands on `sym_id` — no query-time invocant
+                        // typing (the receiver is an untypeable macro parameter).
+                        resolved_method_target: Some(crate::model::file_analysis::MethodTarget::Local {
+                            sym_id: *sym_id,
+                            invocant_class: class.to_string(),
+                        }),
+                        folded_from: None,
+                        arg_count: None,
+                    });
+                }
+            }
+        }
+        let mut package_parents: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (child, parent) in &self.parents {
+            package_parents.entry(child.clone()).or_default().push(parent.clone());
+        }
+        let mut fa = FileAnalysis::new(FileAnalysisParts {
+            scopes: self.scopes,
+            symbols,
+            refs,
+            witnesses: bag,
+            package_parents,
+            flow_edges: std::mem::take(&mut self.flow_edges),
+            moved_from: std::mem::take(&mut self.moved_from),
+            control_regions: std::mem::take(&mut self.control_regions),
+            param_regions: std::mem::take(&mut self.param_regions),
+            domain_sites: std::mem::take(&mut self.domain_sites),
+            ..Default::default()
+        });
+        // Pack-declared receiver names ride the FA so core's member /
+        // outline filters can exclude them generically (lang semantics in
+        // the pack, generic logic in core).
+        fa.receiver_names = std::mem::take(&mut self.receiver_names);
+        // Specialization family edges (spec → primary). NOT package_parents:
+        // a spec inherits nothing from its primary (it replaces wholesale),
+        // so member resolution must never fall through this edge — only the
+        // graph's `Specializes` family view reads it.
+        fa.specializes = self.specializations.drain(..).collect();
+        // Per-class ordered template params — the substitution axis the
+        // dispatch ladder + field substitution read (methods already carry
+        // `ParamOf` witnesses from the writeback above).
+        fa.template_params = template_params;
+        // Include/import path tokens carry a span so goto-def can resolve the
+        // header (the bare `imports` list is span-less). Resolution to an
+        // absolute path happens where the file path is in hand (the driver).
+        fa.include_directives = self
+            .import_sites
+            .drain(..)
+            .map(|(raw, span)| (span, raw))
+            .collect();
+        // Seal base_*_count so a later enrich pass (the CLI/--batch path
+        // runs it unconditionally) truncates to the FULL analysis, not to
+        // zero — otherwise enrichment wipes every pack-language symbol.
+        fa.finalize_post_walk();
+        fa
+    }
+}
+
+/// Per-language bundle: the query pack plus host predicates. The
+/// predicates are the official escape hatch — kept
+/// MINIMAL on purpose so the findings honestly measure how far
+/// patterns alone go.
+pub struct LangPack {
+    pub query_source: &'static str,
+    /// Shape a captured name token's text (e.g. keep the sigil on a
+    /// Perl variable). `capture_kind` is the vocabulary name
+    /// (`def.var`, `ref.method`, ...) so one pack hook serves all.
+    pub shape_name: fn(capture_kind: &str, raw: &str) -> String,
+    /// Name for defs with no name token (anonymous subs).
+    pub default_name: fn(kind: &str) -> Option<&'static str>,
+    /// Map a `@type.annot` token's text to a type — the pack predicate
+    /// for languages whose ring 3 is partly in the tree (`x: int`).
+    pub annot_type: fn(text: &str) -> Option<InferredType>,
+    /// Module-name → workspace-relative candidate paths — the entire
+    /// per-language cross-file resolution strategy ("the one executable
+    /// line"). Python: `pkg.mod` → pkg/mod.py | pkg/mod/__init__.py.
+    /// The Index-layer consumer is future work; the cross-file spike tests
+    /// (`resolve_imports_with_pack` in query_extract_tests.rs) drive it today.
+    #[allow(dead_code)]
+    pub module_paths: fn(module: &str) -> Vec<String>,
+    /// Does a call to `callee` construct a KEYED value whose named
+    /// arguments are `$`-style accessible keys? (R: list / data.frame.)
+    pub shape_ctor: fn(callee: &str) -> bool,
+    /// Languages where imports are CALLS, not statements (R's
+    /// library()/source()): map (callee, argument) → imported module.
+    pub import_call: fn(callee: &str, arg: &str) -> Option<String>,
+    /// Command-dispatched languages (CMake): what a command DOES with
+    /// its positional arguments. The @cmd/@cmd.arg captures deliver
+    /// (name, ordered args); this predicate classifies.
+    pub cmd_effects: fn(cmd: &str) -> Vec<CmdEffect>,
+    /// Guard narrowing: given the guard token (`@narrow.guard` — a
+    /// function/operator like `isinstance`, `has_value`; `None` for the
+    /// token-less `if (opt)` truthiness form) and the type text, the
+    /// refined type that holds inside the guarded block, or `None` if this
+    /// guard doesn't narrow. The type text is the `@narrow.type` capture
+    /// when the guard names one (`dynamic_cast<Derived*>`), else the
+    /// subject's DECLARED type (the optional-engagement form reads
+    /// `std::optional<T>` off the declaration and peels `T`). The pack owns
+    /// "which guard means which refinement" (rule #10); core just scopes
+    /// the witness to the block.
+    pub narrow_guard: fn(guard: Option<&str>, type_text: &str) -> Option<InferredType>,
+    /// Does calling `method` on a variable REBIND it — putting a moved-from
+    /// object back into a known state (`clear`/`reset`/`assign`/…)? Used to end
+    /// a moved-from region (and any narrowing) at the reset call, so a use after
+    /// it is clean. Pack-owned language vocab (like `op_map`): core asks the
+    /// value, never enumerates names itself.
+    pub rebind_method: fn(method: &str) -> bool,
+    /// Can a bare, receiver-less identifier resolve through an implicit
+    /// `this->` — both a field read (`return inner_;` = `this->inner_`) AND a
+    /// sibling method call (`foo()` = `this->foo()`)? True for C/C++ (the
+    /// receiver is elided for both members and methods); false for Python/R
+    /// (the receiver is mandatory for both). One language fact, not two: no
+    /// language elides fields but not methods. Gates the member-access half of
+    /// `language_driver::emit_return_fuel` — asked of the pack, never a
+    /// language-name branch.
+    pub implicit_this_members: bool,
+    /// Does this language have `#include`-style path tokens — a source-path
+    /// reference (the header IS the module, `#include` = `use`) that goto-def
+    /// resolves to a file and references reverses ("who includes this
+    /// header")? True for C/C++; false for languages whose imports are
+    /// name-keyed (Perl `use`, Python `import`). Gates the include-token lanes
+    /// in goto-def / references — asked of the pack, never a language-name
+    /// branch (the token is path-shaped, not name-shaped, so it stays ahead of
+    /// the name-keyed CandidateSet).
+    pub include_path_tokens: bool,
+    /// Does this language have a C-style preprocessor — `#define` macros
+    /// reachable through `#include`s that identifier-context completion offers
+    /// as an API surface? True for C/C++; false for languages with no
+    /// preprocessor (Perl, Python, R, CMake). Gates `macro_completion` — asked
+    /// of the pack, never a language-name branch (rule #10).
+    pub preprocessor_macros: bool,
+    /// Container membership (class/struct/union/namespace) is delimited by
+    /// literal `{`/`}` in the source, so a member that lost its enclosing
+    /// container to a tree-sitter misparse can be re-anchored by matching the
+    /// container's body braces on the ORIGINAL source
+    /// (`reanchor_truncated_containers`). True for C/C++; false for
+    /// indentation-scoped (Python) or non-nesting packs.
+    /// `docs/adr/config-superposition-declarations.md`.
+    pub brace_scoped_members: bool,
+    /// Completion trigger characters for the LSP
+    /// `completionProvider.triggerCharacters` slot — the client auto-fires
+    /// completion (and reports the char in `CompletionContext`) when one is
+    /// typed. C++ `. > :` cover `.`/`->`/`::`; the member path keys off them.
+    pub trigger_chars: &'static [&'static str],
+    /// The language's method-RECEIVER parameter names (Python `self`/`cls`,
+    /// C++ `this`). A receiver param is lexically inside the class body, so
+    /// the sticky class context tags it — but it is NOT a member. Extraction
+    /// clears its package so it reads as a plain local. Lang-specific
+    /// semantics → the pack owns it (NOT core `conventions.rs`, which is
+    /// Perl's `$self`/`$class`).
+    pub receiver_names: &'static [&'static str],
+    /// The pointer/reference DECLARATOR peel: a `@nested.target` chain
+    /// flattened to its leaf + per-level deref stack — `Box**`, `char****`,
+    /// `Box* const&`. THE recursion S-queries can't express (unbounded depth);
+    /// the pack declares the grammar, the generic `peel` walks it.
+    pub nested_peel: PeelSpec,
+    /// The member-access RECEIVER peel: transparent expression wrappers
+    /// (`(*p)`, `(&o)`, `(p)` → `p`) dropped so the invocant types via the
+    /// inner. The SAME `peel`, no stack, any leaf.
+    pub recv_peel: PeelSpec,
+    /// Member-access node kinds (`receiver OP member`) — extraction records
+    /// each site (simple-variable receiver, operator token span, `->` vs
+    /// `.`) for the operator-DX consumer (`p.` on a `Box*` should be `->`).
+    /// The member operator's grammar token KIND → the `MemberOp` it means
+    /// (`"->"`→Arrow, `"."`→Dot). The `operator:` field of a member access is
+    /// captured as `@member.op`; the engine maps its `kind()` through this
+    /// table. An OPEN set: unmapped kinds (`.*`) get no op-DX, never a guess.
+    /// Empty = no member-operator DX (Perl, single-operator packs).
+    pub op_map: &'static [(&'static str, crate::model::file_analysis::MemberOp)],
+    /// Simple-variable node kinds (`identifier`). op-DX fires ONLY when the
+    /// IMMEDIATE member-access receiver is one — the receiver whose
+    /// `deref_stack` resolves by name to decide the expected operator. Also the
+    /// cursor-completion "is this receiver a bare variable" test.
+    pub simple_var_kinds: &'static [&'static str],
+    /// `@qualifier` node kinds whose `name` FIELD supplies the owner text —
+    /// the structural peel for a templated qualifier (`Buf<T>::grow` files
+    /// under class `Buf`, unifying the out-of-line def with the in-class
+    /// decl). Never string-splitting on `<`. Empty = qualifiers verbatim.
+    pub qualifier_peel: &'static [&'static str],
+    /// Member-access node kinds (`field_expression` / `attribute`): a `recv.m`
+    /// the cursor-completion path climbs to + types the receiver of. Empty =
+    /// no member-access completion (Perl uses `cursor_context`).
+    pub member_kinds: &'static [&'static str],
+    /// Node kinds the sentinel must NOT splice into (string/char/comment).
+    pub skip_kinds: &'static [&'static str],
+    /// Call-expression node kinds (`call_expression`/`call`) — a chained
+    /// receiver `f().attr` types through the call's inner member.
+    pub call_kinds: &'static [&'static str],
+    /// Equality-comparison node kinds (`binary_expression`) whose operand
+    /// may be a domain-typed field — the type-constrained-completion slot
+    /// (`o->op_type == |` ranks the field's DOMAIN members first,
+    /// `docs/adr/cursor-slots.md`). The operand order is either side; the
+    /// slot is the member-access operand, the value the other. Paired with
+    /// `domain_compare_ops` so a `<`/`+` binary never opens the slot. Empty
+    /// = no domain-comparison completion.
+    pub domain_compare_kinds: &'static [&'static str],
+    /// The operator tokens (`==`, `!=`) that make a `domain_compare_kinds`
+    /// node a domain comparison — the pack owns which operators mean
+    /// "equality against a domain value" (rule #10). Empty = feature off.
+    pub domain_compare_ops: &'static [&'static str],
+    /// Out-of-line-definition extraction (`@ool.def` — a `Ret Class::method(...)`
+    /// body owned by a `::` qualifier). The grammar the canonical declarator
+    /// unwrap + qualifier walk consume; `OutOfLineSpec::OFF` = feature off.
+    pub oolfn: OutOfLineSpec,
+}
+
+/// A declarative peel: descend a wrapper chain tree-sitter's fixed-depth
+/// S-expression queries cannot express, to the leaf, optionally accumulating a
+/// per-level deref stack. ONE combinator the pack parameterizes — `nested_peel`
+/// (declarators, stack, leaf→def) and `recv_peel` (expr wrappers, no stack, any
+/// leaf) are both instances of it. Empty `wrappers` = the capture is absent.
+#[derive(Clone, Copy)]
+pub struct PeelSpec {
+    /// Wrapper node kinds → the `DerefKind` each contributes (only consulted
+    /// when `record_stack`; a placeholder otherwise).
+    pub wrappers: &'static [(&'static str, crate::model::file_analysis::DerefKind)],
+    /// Per-level annotation node kinds (cv-qualifiers) collected onto a step.
+    pub annot_kinds: &'static [&'static str],
+    /// Leaf node kind → the `def.*` capture the synthetic leaf event mints
+    /// (`identifier`→`def.local`, `field_identifier`→`def.var`). EMPTY = accept
+    /// ANY leaf and mint no def (the receiver-peel case — the leaf is an
+    /// invocant, not a declaration).
+    pub leaf_to_def: &'static [(&'static str, &'static str)],
+    /// Accumulate the per-level `DerefStep` stack (pointer depth) vs descend only.
+    pub record_stack: bool,
+}
+
+/// Out-of-line-definition extraction (`Ret Class::method(...) {...}` bodies —
+/// the owner is named by a `::` qualifier, not lexical nesting). Declares the
+/// three grammar shapes the driver's canonical unwrap + qualifier walk consume:
+/// the declarator WRAPPERS peeled (any depth) to reach the function declarator,
+/// the FUNCTION-DECLARATOR node whose `declarator` field carries the (possibly
+/// multi-level) qualified name, and the QUALIFIED-NAME node kind the walk
+/// descends. Empty `declarator_wrappers` = feature off (a pack that mints no
+/// `@ool.def` capture).
+#[derive(Clone, Copy)]
+pub struct OutOfLineSpec {
+    pub declarator_wrappers: &'static [&'static str],
+    pub function_declarator: &'static str,
+    pub qualified_name: &'static str,
+}
+
+impl OutOfLineSpec {
+    pub const OFF: OutOfLineSpec = OutOfLineSpec {
+        declarator_wrappers: &[],
+        function_declarator: "",
+        qualified_name: "",
+    };
+}
+
+/// Peel declarator wrappers (`pointer_declarator`/`reference_declarator`/
+/// `parenthesized_declarator`, ANY depth) to the inner function declarator —
+/// the arbitrary nesting S-queries can't express (`Foo**& Class::m()`). THE
+/// out-of-line unwrap, spelled once so no call site enumerates wrapper kinds.
+/// `None` when no function declarator is reachable (not a function-def shape).
+fn unwrap_to_function_declarator<'a>(
+    mut node: tree_sitter::Node<'a>,
+    spec: &OutOfLineSpec,
+) -> Option<tree_sitter::Node<'a>> {
+    for _ in 0..32 {
+        if node.kind() == spec.function_declarator {
+            return Some(node);
+        }
+        if !spec.declarator_wrappers.contains(&node.kind()) {
+            return None;
+        }
+        // pointer_declarator carries its inner under `declarator:`; a
+        // reference/parenthesized declarator holds it as the first named child
+        // (the `&`/parens are anonymous tokens).
+        node = node
+            .child_by_field_name("declarator")
+            .or_else(|| node.named_child(0))?;
+    }
+    None
+}
+
+/// Walk a qualified-name chain (`A::B::c`) to its leaf name token, returning the
+/// full scope text (`A::B`) and the leaf node. THE out-of-line owner walk: the
+/// owning class is the innermost scope — `rsplit("::")` of the returned text, as
+/// the `def.` handler already does for single-hop qualifiers — and the leaf is
+/// the member/ctor/dtor/operator name. A scope segment whose kind is in
+/// `peel_kinds` (a templated owner `Buf<T>`) contributes its `name` field's text
+/// (`Buf`), the same structural peel the single-capture qualifier path applies —
+/// never a string split on `<`. `None` when the node is not a qualified name (a
+/// free function / in-class method — its own pattern owns it).
+fn walk_qualifier_chain<'a>(
+    mut node: tree_sitter::Node<'a>,
+    qualified_kind: &str,
+    peel_kinds: &[&str],
+    src: &[u8],
+) -> Option<(String, tree_sitter::Node<'a>)> {
+    if node.kind() != qualified_kind {
+        return None;
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    for _ in 0..32 {
+        if node.kind() != qualified_kind {
+            return Some((scopes.join("::"), node));
+        }
+        if let Some(scope) = node.child_by_field_name("scope") {
+            let seg = if peel_kinds.contains(&scope.kind()) {
+                scope.child_by_field_name("name").unwrap_or(scope)
+            } else {
+                scope
+            };
+            scopes.push(seg.utf8_text(src).unwrap_or("").to_string());
+        }
+        node = node.child_by_field_name("name")?;
+    }
+    None
+}
+
+/// The declarator peel for C/C++ struct fields and locals: pointer/reference
+/// wrappers, `field_identifier`/`identifier` leaves, recording the deref stack.
+/// The cpp pack's `nested_peel` AND the member-block synth lane
+/// (`cpp_reparse::synth_base`) both peel through this, so a pointer field's
+/// `*`s are extracted by ONE walker whether the field was written plainly or
+/// pasted from a `#define BASEOP` body (rule #10 — no second deref walker).
+pub(crate) const C_FIELD_DECL_PEEL: PeelSpec = PeelSpec {
+    wrappers: &[
+        ("pointer_declarator", crate::model::file_analysis::DerefKind::Pointer),
+        ("reference_declarator", crate::model::file_analysis::DerefKind::Reference),
+    ],
+    annot_kinds: &["type_qualifier"],
+    leaf_to_def: &[("identifier", "def.local"), ("field_identifier", "def.field")],
+    record_stack: true,
+};
+
+/// One effect of a command-dispatched statement.
+// Variants are constructed only by `cmake_pack` (command languages) and read by
+// the generic cmd-effect match; both absent in a build without that feature.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub enum CmdEffect {
+    /// Argument `name_arg` declares an entity of `kind` ("var",
+    /// "sub", ...).
+    Def { kind: &'static str, name_arg: usize },
+    /// Arguments from `from` onward are name references (all-caps
+    /// keyword arguments like PRIVATE/STATIC are skipped — CMake's
+    /// keyword convention; a finer filter is a later predicate).
+    RefArgsFrom { from: usize },
+    /// Argument `arg` names an imported module (joins import_call's
+    /// role for command languages).
+    Import { arg: usize },
+}
+
+/// The Perl-on-query-engine seam (go-live map ARC 3, the builder.rs shrink):
+/// not registered as a driver — the native builder still owns Perl — but the
+/// parity tests in query_extract_tests.rs measure it against the builder so
+/// the migration path stays proven.
+#[allow(dead_code)]
+pub fn perl_pack() -> LangPack {
+    LangPack {
+        query_source: include_str!("../../queries/perl/skeleton.scm"),
+        shape_name: |kind, raw| match kind {
+            // The builder stores variable symbols WITH sigil; varname
+            // captures are sigil-less. Predicate re-attaches nothing —
+            // def.var captures the whole `(scalar)` node so raw text
+            // already carries the sigil.
+            _ => raw.to_string(),
+        },
+        default_name: |kind| match kind {
+            "anon" => Some("(anon)"),
+            _ => None,
+        },
+        annot_type: |_| None,
+        module_paths: |m| vec![format!("{}.pm", m.replace("::", "/"))],
+        shape_ctor: |_| false,
+        import_call: |_, _| None,
+        cmd_effects: |_| vec![],
+        narrow_guard: |_, _| None,
+        rebind_method: |_| false,
+        implicit_this_members: false,
+        include_path_tokens: false,
+        preprocessor_macros: false,
+        brace_scoped_members: false,
+        trigger_chars: &["$", "@", "%", ">", ":", "{"],
+        receiver_names: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
+        op_map: &[],
+        simple_var_kinds: &[],
+        qualifier_peel: &[],
+        member_kinds: &[],
+        skip_kinds: &[],
+        call_kinds: &[],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
+    }
+}
+
+// Registered by `python_driver` only under `feature = "python"` (and driven by
+// the pack tests); dead weight in a single-language build like `cpp`-only.
+#[allow(dead_code)]
+pub fn python_pack() -> LangPack {
+    LangPack {
+        query_source: include_str!("../../queries/python/skeleton.scm"),
+        shape_name: |_, raw| raw.to_string(),
+        default_name: |_| None,
+        annot_type: |text| match text.trim() {
+            "str" => Some(InferredType::String),
+            "int" | "float" => Some(InferredType::Numeric),
+            "list" => Some(InferredType::ArrayRef),
+            "dict" => Some(InferredType::HashRef),
+            t if t.chars().next().is_some_and(|c| c.is_uppercase()) => {
+                Some(InferredType::ClassName(t.to_string()))
+            }
+            _ => None,
+        },
+        module_paths: |m| {
+            let base = m.replace('.', "/");
+            vec![format!("{base}.py"), format!("{base}/__init__.py")]
+        },
+        shape_ctor: |_| false,
+        import_call: |_, _| None,
+        cmd_effects: |_| vec![],
+        // `isinstance(x, Foo)` narrows x to Foo inside the guard.
+        narrow_guard: |guard, ty| (guard == Some("isinstance")).then(|| InferredType::ClassName(ty.to_string())),
+        rebind_method: |_| false,
+        implicit_this_members: false,
+        include_path_tokens: false,
+        preprocessor_macros: false,
+        brace_scoped_members: false,
+        trigger_chars: &["."],
+        receiver_names: &["self", "cls"],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec {
+            wrappers: &[("parenthesized_expression", crate::model::file_analysis::DerefKind::Pointer)],
+            annot_kinds: &[],
+            leaf_to_def: &[],
+            record_stack: false,
+        },
+        // Python has one member operator (`.`), so no op-DX (op_map empty).
+        op_map: &[],
+        simple_var_kinds: &["identifier"],
+        qualifier_peel: &[],
+        member_kinds: &["attribute"],
+        skip_kinds: &["string", "string_content", "comment", "concatenated_string"],
+        call_kinds: &["call"],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
+    }
+}
+
+// Live only under `feature = "r"` (or the pack tests); see `python_pack`.
+#[allow(dead_code)]
+pub fn r_pack() -> LangPack {
+    LangPack {
+        query_source: include_str!("../../queries/r/skeleton.scm"),
+        shape_name: |_, raw| raw.to_string(),
+        default_name: |_| None,
+        annot_type: |_| None,
+        // No reliable lexical ctor convention in R (S4/R5 exist but
+        // rare); class typing arrives via shapes and S3 later.
+        // source("util.R") hands us the path verbatim; library(pkg)
+        // resolves into the installed-library tree (a real install
+        // would consult .libPaths() — not modeled here).
+        module_paths: |m| vec![m.to_string()],
+        shape_ctor: |callee| matches!(callee, "list" | "data.frame" | "tibble"),
+        import_call: |callee, arg| match callee {
+            "library" | "require" | "source" => Some(arg.to_string()),
+            _ => None,
+        },
+        cmd_effects: |_| vec![],
+        narrow_guard: |_, _| None,
+        rebind_method: |_| false,
+        implicit_this_members: false,
+        include_path_tokens: false,
+        preprocessor_macros: false,
+        brace_scoped_members: false,
+        trigger_chars: &["$", "@", ":"],
+        receiver_names: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
+        op_map: &[],
+        simple_var_kinds: &[],
+        qualifier_peel: &[],
+        member_kinds: &[],
+        skip_kinds: &[],
+        call_kinds: &[],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
+    }
+}
+
+// Live only under `feature = "cmake"` (or the pack tests); see `python_pack`.
+// Sole constructor of the `CmdEffect` variants.
+#[allow(dead_code)]
+pub fn cmake_pack() -> LangPack {
+    LangPack {
+        query_source: include_str!("../../queries/cmake/skeleton.scm"),
+        shape_name: |_, raw| raw.to_string(),
+        default_name: |_| None,
+        annot_type: |_| None,
+        // include(util.cmake) is a literal path; add_subdirectory(src)
+        // means src/CMakeLists.txt. The whole resolution strategy.
+        module_paths: |m| {
+            if m.ends_with(".cmake") {
+                vec![m.to_string()]
+            } else {
+                vec![format!("{m}/CMakeLists.txt"), format!("{m}.cmake")]
+            }
+        },
+        shape_ctor: |_| false,
+        import_call: |_, _| None,
+        cmd_effects: |cmd| match cmd.to_ascii_lowercase().as_str() {
+            "set" | "option" => vec![CmdEffect::Def { kind: "var", name_arg: 0 }],
+            "add_library" | "add_executable" | "add_custom_target" => {
+                // Targets. SymKind::Target is the real future; "sub"
+                // rides the full rename/refs machinery today.
+                vec![CmdEffect::Def { kind: "sub", name_arg: 0 }]
+            }
+            "target_link_libraries" | "target_include_directories"
+            | "target_compile_definitions" | "target_sources" => vec![
+                CmdEffect::RefArgsFrom { from: 0 },
+            ],
+            "include" | "add_subdirectory" => vec![CmdEffect::Import { arg: 0 }],
+            _ => vec![],
+        },
+        narrow_guard: |_, _| None,
+        rebind_method: |_| false,
+        implicit_this_members: false,
+        include_path_tokens: false,
+        preprocessor_macros: false,
+        brace_scoped_members: false,
+        trigger_chars: &["{", "("],
+        receiver_names: &[],
+        nested_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: true },
+        recv_peel: PeelSpec { wrappers: &[], annot_kinds: &[], leaf_to_def: &[], record_stack: false },
+        op_map: &[],
+        simple_var_kinds: &[],
+        qualifier_peel: &[],
+        member_kinds: &[],
+        skip_kinds: &[],
+        call_kinds: &[],
+        domain_compare_kinds: &[],
+        domain_compare_ops: &[],
+        oolfn: OutOfLineSpec::OFF,
+    }
+}
+
+pub fn cpp_pack() -> LangPack {
+    LangPack {
+        query_source: include_str!("../../queries/cpp/skeleton.scm"),
+        // Template spellings get ONE canonical whitespace form so a
+        // specialization's identity (`formatter<int, char>`) matches
+        // however the source wrapped it. Identity for every non-template
+        // name (no whitespace, no comma → unchanged).
+        shape_name: |_, raw| canonical_template_spelling(raw),
+        // an anonymous inline union has no name token of its own; the
+        // synthetic container is outline structure, not an addressable
+        // member (the "anonymous" attribute keeps it out of completion).
+        default_name: |kind| match kind {
+            "unionfield" => Some("(union)"),
+            _ => None,
+        },
+        // C++ declared types ARE the witness source. Primitives → the
+        // value lattice; `auto`/`void` defer (None → edge carries);
+        // anything else identifier-shaped is a class instance.
+        annot_type: |text| {
+            use InferredType::*;
+            match text.trim() {
+                "int" | "long" | "short" | "unsigned" | "size_t" | "int32_t" | "int64_t"
+                | "uint32_t" | "uint64_t" | "double" | "float" | "char" => Some(Numeric),
+                "bool" => Some(Bool),
+                "std::string" | "string" | "std::string_view" => Some(String),
+                "auto" | "void" => None,
+                t => {
+                    // Elaborated type specifier `struct op` / `union u` /
+                    // `enum e` — the dominant C spelling (`struct op* o`).
+                    // The tag names the type; strip the keyword so it resolves
+                    // the same as the bare/typedef'd name.
+                    let tag = t
+                        .strip_prefix("struct ")
+                        .or_else(|| t.strip_prefix("union "))
+                        .or_else(|| t.strip_prefix("enum "))
+                        .unwrap_or(t)
+                        .trim();
+                    // A template spelling (`Box<Widget>`, `vector<int>`)
+                    // peels into the Instance flavor: dispatch keys the
+                    // BASE so members resolve through the plain-class
+                    // machinery; the args ride along for substitution.
+                    if let Some(p) =
+                        crate::model::file_analysis::ParametricType::instance_from_spelling(tag)
+                    {
+                        return Some(Parametric(p));
+                    }
+                    let typeish = !tag.is_empty()
+                        && !tag.contains(' ')
+                        && tag.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_');
+                    // Strip the namespace qualifier — classes/members are
+                    // keyed by the unqualified name (@context.class), so
+                    // `geo::Circle` must type as `Circle` to resolve.
+                    typeish.then(|| ClassName(tag.rsplit("::").next().unwrap_or(tag).to_string()))
+                }
+            }
+        },
+        // #include "a/b.h" / <vector>: strip the delimiters; a quoted
+        // path is workspace-relative verbatim, a system header resolves
+        // through include dirs (library_roots, later). Tier 1: identity.
+        module_paths: |m| {
+            let p = m.trim_matches(|c: char| c == '"' || c == '<' || c == '>');
+            vec![p.to_string()]
+        },
+        shape_ctor: |_| false,
+        import_call: |_, _| None,
+        cmd_effects: |_| vec![],
+        // Two narrowings, both keyed on what the value IS, not a name allowlist:
+        //   `if (dynamic_cast<Derived*>(b))` — b is a Derived inside (ty is the
+        //     template arg; pointer-ness dropped for navigation, like locals).
+        //   `if (opt)` / `if (opt.has_value())` — an engaged std::optional<T>
+        //     holds a T inside (ty is opt's DECLARED type; peel the inner T).
+        //     The bare form carries no guard token; `.has_value()` gates the
+        //     method so `opt.value_or(x)` (not an engagement test) won't narrow.
+        narrow_guard: |guard, ty| {
+            let class = match guard {
+                Some("dynamic_cast") => ty.to_string(),
+                None | Some("has_value") => optional_inner(ty)?,
+                _ => return None,
+            };
+            Some(InferredType::ClassName(class))
+        },
+        // Rebinding methods: a moved-from object is put back into a known state
+        // by these std container/optional/smart-ptr resets, so a use after one
+        // is NOT a use-after-move. (An ordinary `x.use()` is not here, so the
+        // canonical bug still flags.)
+        rebind_method: |m| {
+            matches!(m, "clear" | "reset" | "assign" | "emplace" | "swap")
+        },
+        // C/C++ methods read members with an implicit `this->`.
+        implicit_this_members: true,
+        include_path_tokens: true,
+        preprocessor_macros: true,
+        brace_scoped_members: true,
+        trigger_chars: &[".", ">", ":"],
+        receiver_names: &["this"],
+        // `field_identifier` only ever names a struct/class member (the
+        // grammar's own distinction from a plain `identifier` local), so
+        // "def.field" matches the plain (non-pointer) field pattern above.
+        // Shared with the member-block synth lane (rule #10).
+        nested_peel: C_FIELD_DECL_PEEL,
+        // DerefKind placeholder — record_stack false, so it's never read.
+        recv_peel: PeelSpec {
+            wrappers: &[
+                ("parenthesized_expression", crate::model::file_analysis::DerefKind::Pointer),
+                ("pointer_expression", crate::model::file_analysis::DerefKind::Pointer),
+            ],
+            annot_kinds: &[],
+            leaf_to_def: &[],
+            record_stack: false,
+        },
+        op_map: &[
+            ("->", crate::model::file_analysis::MemberOp::Arrow),
+            (".", crate::model::file_analysis::MemberOp::Dot),
+        ],
+        simple_var_kinds: &["identifier"],
+        // a templated qualifier (`Buf<T>::grow`) owns by its BASE class name
+        qualifier_peel: &["template_type"],
+        member_kinds: &["field_expression"],
+        skip_kinds: &["string_literal", "char_literal", "raw_string_literal", "comment"],
+        call_kinds: &["call_expression"],
+        domain_compare_kinds: &["binary_expression"],
+        domain_compare_ops: &["==", "!="],
+        // out-of-line defs (`Ret Class::m(){}`): peel pointer/reference/
+        // parenthesized returns to the function declarator, then walk the
+        // qualified name to its leaf + owning class.
+        oolfn: OutOfLineSpec {
+            declarator_wrappers: &[
+                "pointer_declarator",
+                "reference_declarator",
+                "parenthesized_declarator",
+            ],
+            function_declarator: "function_declarator",
+            qualified_name: "qualified_identifier",
+        },
+    }
+}
+
+/// Translate a member's declared return type into the deferred
+/// receiver-substituting `ReturnExpr` when it MENTIONS one of the owning
+/// class's template params: a bare param (`T get()`) becomes
+/// `ParamOf(i, Receiver)`; a param one hop under a template spelling
+/// (`vector<T> all()`) becomes `InstanceOf { base, args }` with the
+/// param positions deferred and the literal positions baked. `None` when
+/// no param occurs — the concrete-return path handles it.
+fn param_return_expr(
+    ret: &InferredType,
+    params: &[String],
+) -> Option<crate::model::witnesses::ReturnExpr> {
+    use crate::model::witnesses::{ParametricOp, ReturnExpr};
+    match ret {
+        InferredType::ClassName(n) => {
+            params.iter().position(|p| p == n).map(|i| {
+                ReturnExpr::Operator(ParametricOp::ParamOf {
+                    index: i as u32,
+                    of: Box::new(ReturnExpr::Receiver),
+                })
+            })
+        }
+        InferredType::Parametric(p) => match p {
+            crate::model::file_analysis::ParametricType::ResultSet { .. } => None,
+            crate::model::file_analysis::ParametricType::Instance { base, args } => {
+                if !args.iter().any(|a| param_return_expr(a, params).is_some()) {
+                    return None;
+                }
+                let exprs = args
+                    .iter()
+                    .map(|a| {
+                        param_return_expr(a, params)
+                            .unwrap_or_else(|| ReturnExpr::Concrete(a.clone()))
+                    })
+                    .collect();
+                Some(ReturnExpr::Operator(ParametricOp::InstanceOf {
+                    base: base.clone(),
+                    args: exprs,
+                }))
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Peel `T` out of a `std::optional<T>` declared-type text, unqualified
+/// (matching how `annot_type` keys classes by their last `::` segment). `None`
+/// when the text isn't an optional — the type-side gate that keeps the
+/// token-less `if (opt)` narrowing from firing on non-optional subjects.
+fn optional_inner(ty: &str) -> Option<String> {
+    let inner = ty
+        .trim()
+        .strip_prefix("std::optional<")
+        .or_else(|| ty.trim().strip_prefix("optional<"))?
+        .strip_suffix('>')?
+        .trim();
+    let leaf = inner.rsplit("::").next().unwrap_or(inner).trim();
+    (!leaf.is_empty()
+        && !leaf.contains(' ')
+        && leaf.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_'))
+    .then(|| leaf.to_string())
+}
+
+/// `expr.lit.<t>` suffix → type. ENGINE-side vocabulary, not per-pack:
+/// the suffix set names the engine's value lattice, packs just choose
+/// which nodes carry each suffix.
+fn lit_type(suffix: &str) -> Option<InferredType> {
+    match suffix {
+        "string" => Some(InferredType::String),
+        "number" => Some(InferredType::Numeric),
+        "bool" => Some(InferredType::Bool),
+        "arrayref" => Some(InferredType::ArrayRef),
+        "hashref" => Some(InferredType::HashRef),
+        _ => None,
+    }
+}
+
+/// One capture event, flattened from query matches and sorted by
+/// position so the driver can run its state machine in source order.
+struct Event {
+    start_byte: usize,
+    end_byte: usize,
+    start: Point,
+    end: Point,
+    /// Capture vocabulary name, e.g. "def.sub", "def.sub.name",
+    /// "scope", "context.package", "ref.call", "import.name".
+    cap: String,
+    text: String,
+    /// Query match id — name captures join their parent def through it.
+    match_id: usize,
+}
+
+/// Flatten a wrapper chain — the recursion tree-sitter's fixed-depth queries
+/// cannot express — to its leaf, recording a `DerefStep` per level when
+/// `spec.record_stack`. A non-empty `leaf_to_def` REQUIRES the leaf to match
+/// (returns its def capture); an empty one accepts ANY leaf and mints nothing
+/// (the receiver peel — the leaf is an invocant). Outermost level first
+/// (left-to-right display order, `Box*&` → `[Pointer, Reference]`). Depth-
+/// capped. The ONE peel: `nested_peel` and `recv_peel` are both this.
+pub(crate) fn peel<'a>(
+    mut node: tree_sitter::Node<'a>,
+    spec: &PeelSpec,
+    src: &[u8],
+) -> Option<(tree_sitter::Node<'a>, Vec<crate::model::file_analysis::DerefStep>, Option<&'static str>)> {
+    use crate::model::file_analysis::DerefStep;
+    let is_leaf = |k: &str| spec.leaf_to_def.iter().find(|(lk, _)| *lk == k);
+    let mut stack = Vec::new();
+    for _ in 0..32 {
+        if let Some((_, dk)) = spec.wrappers.iter().find(|(k, _)| *k == node.kind()) {
+            let mut annotations = Vec::new();
+            let mut inner = None;
+            let mut cur = node.walk();
+            for ch in node.children(&mut cur) {
+                if spec.annot_kinds.contains(&ch.kind()) {
+                    if let Ok(t) = ch.utf8_text(src) {
+                        annotations.push(t.to_string());
+                    }
+                } else if inner.is_none()
+                    && (spec.wrappers.iter().any(|(k, _)| *k == ch.kind())
+                        || is_leaf(ch.kind()).is_some()
+                        || (spec.leaf_to_def.is_empty() && ch.is_named()))
+                {
+                    inner = Some(ch);
+                }
+            }
+            if spec.record_stack {
+                stack.push(DerefStep { kind: *dk, annotations });
+            }
+            node = inner?;
+        } else if spec.leaf_to_def.is_empty() {
+            // receiver peel: the leaf is an invocant of any shape, no def minted.
+            return Some((node, stack, None));
+        } else if let Some((_, def_cap)) = is_leaf(node.kind()) {
+            // `identifier`→`def.local` (param/local), `field_identifier`→
+            // `def.var` (a class member), so a pointer field outlines as a member.
+            return Some((node, stack, Some(def_cap)));
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAnalysis, String> {
+    let language = tree.language();
+    let query = cached_query(&language, pack.query_source)?;
+    let cap_names: Vec<String> = query
+        .capture_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // ---- flatten matches into ordered events ----
+    let mut events: Vec<Event> = Vec::new();
+    // match_id → the pointer/reference declarator stack a `@nested.target`
+    // capture unravelled to. Read by the `def.*` handler to stamp the symbol.
+    let mut nested_stacks: std::collections::HashMap<usize, Vec<crate::model::file_analysis::DerefStep>> =
+        std::collections::HashMap::new();
+    // match_id → was the IMMEDIATE member-access receiver a simple variable?
+    // Recorded at construction (the un-peeled node); gates op-DX at the mint.
+    let mut member_simple: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+    // A call's written arg count, keyed by its argument_list's START point
+    // (the `(`), which is adjacent to the callee/method name token's END — so
+    // a ref finds its arity by `ref.end == arglist.start` without a match join
+    // (member calls fire a separate match from their arg list). One entry per
+    // `@arity.args`.
+    let mut arg_counts_by_start: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    // A callable's declared parameter arity, keyed by the parameter_list span.
+    // Associated to its def symbol by span containment in `into_file_analysis`
+    // (`@arity.sig` fires a separate match from the def name).
+    let mut param_sigs: Vec<(crate::model::file_analysis::Span, crate::model::file_analysis::ParamArity)> =
+        Vec::new();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), source);
+    let mut match_counter = 0usize;
+    while let Some(m) = matches.next() {
+        match_counter += 1;
+        for c in m.captures {
+            let node = c.node;
+            let cap = cap_names[c.index as usize].as_str();
+            // `@ool.def`: an out-of-line definition (`Ret Class::method(...) {}`).
+            // The one general capture (fires for EVERY function_definition) —
+            // peel the declarator to the function declarator, walk its qualified
+            // name to the leaf + owning class, and synthesize the
+            // `def.method` / `def.method.name` / `qualifier` events downstream
+            // extraction consumes — the same vocabulary the narrow per-shape
+            // patterns emit for the shapes they own. A non-qualified declarator
+            // (free function / in-class method) yields nothing here — its own
+            // pattern owns it. Arbitrary declarator nesting + multi-level
+            // qualifiers (which fixed-depth S-queries can't express) work by
+            // construction.
+            if cap == "ool.def" {
+                if let Some((scope_text, leaf)) = node
+                    .child_by_field_name("declarator")
+                    .and_then(|d| unwrap_to_function_declarator(d, &pack.oolfn))
+                    .and_then(|fd| fd.child_by_field_name("declarator"))
+                    .and_then(|q| {
+                        walk_qualifier_chain(q, pack.oolfn.qualified_name, pack.qualifier_peel, source)
+                    })
+                {
+                    let leaf_text = leaf.utf8_text(source).unwrap_or("").to_string();
+                    // the def symbol spans the whole function_definition; name +
+                    // owner come from the qualified declarator's leaf + scope.
+                    events.push(Event {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        start: node.start_position(),
+                        end: node.end_position(),
+                        cap: "def.method".to_string(),
+                        text: leaf_text.clone(),
+                        match_id: match_counter,
+                    });
+                    events.push(Event {
+                        start_byte: leaf.start_byte(),
+                        end_byte: leaf.end_byte(),
+                        start: leaf.start_position(),
+                        end: leaf.end_position(),
+                        cap: "def.method.name".to_string(),
+                        text: leaf_text,
+                        match_id: match_counter,
+                    });
+                    events.push(Event {
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                        start: node.start_position(),
+                        end: node.end_position(),
+                        cap: "qualifier".to_string(),
+                        text: scope_text,
+                        match_id: match_counter,
+                    });
+                }
+                continue;
+            }
+            // `@nested.target`: a pointer/reference declarator CHAIN of any
+            // depth. Peel it (where the node is live) to the leaf identifier
+            // + the deref stack, then emit the leaf as if the query had
+            // captured it directly — downstream join/symbol/witness paths are
+            // unchanged, and arbitrary nesting works without enumerating it.
+            if cap == "nested.target" {
+                if let Some((leaf, stack, Some(def_cap))) = peel(node, &pack.nested_peel, source) {
+                    nested_stacks.insert(match_counter, stack);
+                    let ltext = leaf.utf8_text(source).unwrap_or("").to_string();
+                    for syn in ["flow.target", def_cap] {
+                        events.push(Event {
+                            start_byte: leaf.start_byte(),
+                            end_byte: leaf.end_byte(),
+                            start: leaf.start_position(),
+                            end: leaf.end_position(),
+                            cap: syn.to_string(),
+                            text: ltext.clone(),
+                            match_id: match_counter,
+                        });
+                    }
+                }
+                continue;
+            }
+            // `@member.recv`: a member access receiver. Peel transparent
+            // wrappers (`(*p)`, `(&o)`, `(p)`) to the typed inner where the
+            // node is live, so the minted MethodCall ref's invocant_span lands
+            // on the inner expression `expr_type_at_span` already types.
+            if cap == "member.recv" {
+                // op-DX applies only to a bare-variable immediate receiver
+                // (its deref_stack resolves by name); a wrapper/chain doesn't.
+                member_simple.insert(match_counter, pack.simple_var_kinds.contains(&node.kind()));
+                let inner = peel(node, &pack.recv_peel, source)
+                    .map(|(leaf, _, _)| leaf)
+                    .unwrap_or(node);
+                events.push(Event {
+                    start_byte: inner.start_byte(),
+                    end_byte: inner.end_byte(),
+                    start: inner.start_position(),
+                    end: inner.end_position(),
+                    cap: cap.to_string(),
+                    text: inner.utf8_text(source).unwrap_or("").to_string(),
+                    match_id: match_counter,
+                });
+                continue;
+            }
+            // `@arity.args`: a call's argument_list — count its arguments (the
+            // named children; the C `...` at a CALL site never appears here).
+            // Keyed by the list's start so the callee ref finds it by adjacency.
+            if cap == "arity.args" {
+                arg_counts_by_start
+                    .insert((node.start_position().row, node.start_position().column),
+                            node.named_child_count());
+                continue;
+            }
+            // `@arity.sig`: a callable's parameter_list — count declared params
+            // structurally. `optional_parameter_declaration` carries a default
+            // (counts toward `total`, not `required`); a template pack
+            // (`variadic_parameter_declaration`) or a C `...` token makes the
+            // signature variadic.
+            if cap == "arity.sig" {
+                let mut total = 0usize;
+                let mut required = 0usize;
+                let mut variadic = false;
+                let mut c = node.walk();
+                for ch in node.children(&mut c) {
+                    match ch.kind() {
+                        "parameter_declaration" => { total += 1; required += 1; }
+                        "optional_parameter_declaration" => { total += 1; }
+                        "variadic_parameter_declaration" | "..." => variadic = true,
+                        _ => {}
+                    }
+                }
+                param_sigs.push((
+                    crate::model::file_analysis::Span {
+                        start: node.start_position(),
+                        end: node.end_position(),
+                    },
+                    crate::model::file_analysis::ParamArity { total, required, variadic },
+                ));
+                continue;
+            }
+            // `@qualifier` on a templated owner (`Buf<T>::grow`): the class
+            // the def joins is the BASE name — peel the `name` field where
+            // the node is live (structural, never a string split on `<`).
+            let text = if cap == "qualifier" && pack.qualifier_peel.contains(&node.kind()) {
+                node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .unwrap_or(node.utf8_text(source).unwrap_or(""))
+                    .to_string()
+            } else {
+                node.utf8_text(source).unwrap_or("").to_string()
+            };
+            events.push(Event {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                start: node.start_position(),
+                end: node.end_position(),
+                cap: cap.to_string(),
+                text,
+                match_id: match_counter,
+            });
+        }
+    }
+    // Source order; outermost first on ties so scopes push before their
+    // contents. A `@scope` on the SAME node as a `@def` (a function_definition
+    // carries its own body scope) must open AFTER the def is recorded, so the
+    // symbol attributes to its ENCLOSING scope, not its own body — hence scope
+    // sorts last among identical-span ties.
+    events.sort_by(|a, b| {
+        a.start_byte
+            .cmp(&b.start_byte)
+            .then(b.end_byte.cmp(&a.end_byte))
+            .then(a.cap.starts_with("scope").cmp(&b.cap.starts_with("scope")))
+    });
+
+    // ---- join def name-captures to their def event ----
+    use std::collections::HashMap;
+    let mut names_by_match: HashMap<(usize, String), (String, Point, Point)> = HashMap::new();
+    // `@qualifier` (a `Class::` on an out-of-line def) and `@rettype` (a
+    // method's declared return type) — pre-collected like names because the
+    // `@def` event fires before these inner captures.
+    let mut qualifier_by_match: HashMap<usize, String> = HashMap::new();
+    let mut rettype_by_match: HashMap<usize, String> = HashMap::new();
+    // `@sym.attr` — a token whose TEXT rides onto the match's def symbol as
+    // an attribute (cpp: a declaration's storage class, so "extern" is a
+    // symbol-borne fact goto-def's decl→def ranking can ask the value for).
+    let mut attrs_by_match: HashMap<usize, Vec<String>> = HashMap::new();
+    // `@member.recv` → the receiver span of a `recv.field` access, joined to
+    // its `@ref.member` by match_id so the minted MethodCall ref carries it.
+    let mut member_recv: HashMap<usize, (crate::model::file_analysis::Span, String)> = HashMap::new();
+    // `@member.op` → the written operator mapped through `pack.op_map` + its
+    // span; joined to `@ref.member` so op-DX rides the minted ref.
+    let mut member_op_raw: HashMap<usize, (crate::model::file_analysis::MemberOp, crate::model::file_analysis::Span)> =
+        HashMap::new();
+    for e in &events {
+        if let Some(prefix) = e.cap.strip_suffix(".name") {
+            names_by_match
+                .insert((e.match_id, prefix.to_string()), (e.text.clone(), e.start, e.end));
+        }
+        if e.cap == "qualifier" {
+            qualifier_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "rettype" {
+            rettype_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "sym.attr" {
+            attrs_by_match.entry(e.match_id).or_default().push(e.text.clone());
+        }
+    }
+    // `@ns.inline` — an inline namespace's NAME token, fired by a name-only
+    // sibling pattern (its def/scope/context come from the base namespace
+    // pattern, a different match). Joined to the Package symbol by name span
+    // in a post-pass below, tagging it "inline" so the qualified-completion
+    // gather can lift its members into the enclosing namespace.
+    let inline_ns_spans: Vec<(Point, Point)> = events
+        .iter()
+        .filter(|e| e.cap == "ns.inline")
+        .map(|e| (e.start, e.end))
+        .collect();
+    // (var name, declaring scope) → its declared-type text, joined per
+    // declaration match. Feeds the token-less optional-engagement narrowing
+    // (`if (opt)`): the guard names no type, so the refinement reads the
+    // subject's declared `std::optional<T>`. Keyed by SCOPE (not bare name), so
+    // two functions each declaring an `opt` of a DIFFERENT `optional<T>` peel
+    // the right inner type — resolved by the guard's scope chain at consumption.
+    // Populated inside the main loop (a decl's scope is only known there); the
+    // type-annot half is pre-collected here since it precedes the declarator.
+    let mut annot_by_match: HashMap<usize, String> = HashMap::new();
+    // `@alias.name` (a typedef/using type alias) + `@alias.of` (its
+    // underlying type text), joined per match → `TypeName` alias witnesses.
+    let mut alias_name_by_match: HashMap<usize, String> = HashMap::new();
+    let mut alias_of_by_match: HashMap<usize, String> = HashMap::new();
+    // Object-like `#define X body` alias halves — kept SEPARATE from the
+    // typedef alias so the emission can gate on a type-shaped body (a
+    // macro-heavy header has thousands of value macros we must NOT mint
+    // TypeName witnesses for).
+    let mut macro_alias_name_by_match: HashMap<usize, String> = HashMap::new();
+    let mut macro_alias_of_by_match: HashMap<usize, String> = HashMap::new();
+    // `@spec.primary` — the base name a class-spec def specializes; joined to
+    // its `@def.class` by match to mint the (spec, primary) family edge.
+    let mut spec_primary_by_match: HashMap<usize, String> = HashMap::new();
+    // `@domain.value` — the operand a field slot is compared/assigned
+    // against. Joined to its `@domain.slot` by match_id (the slot event
+    // pushes the site); the value's own enum resolves cross-file later. Only
+    // an identifier-shaped operand can name an enumerator, so anything else
+    // (a literal, arithmetic, a call — the capture is ungated) is stored as
+    // the empty sentinel: it stays a SITE (counter-evidence in the coherence
+    // vote's denominator) without persisting arbitrary expression text.
+    let mut domain_value_by_match: HashMap<usize, String> = HashMap::new();
+    // `@tmpl.param`/`@tmpl.owner` — one template parameter + the class it
+    // parameterizes per match; joined below into ordered per-class lists.
+    let mut tmpl_param_by_match: HashMap<usize, (String, usize)> = HashMap::new();
+    let mut tmpl_owner_by_match: HashMap<usize, String> = HashMap::new();
+    for e in &events {
+        if e.cap == "type.annot" {
+            annot_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "domain.value" {
+            let v = if is_identifier_text(&e.text) { e.text.clone() } else { String::new() };
+            domain_value_by_match.insert(e.match_id, v);
+        }
+        if e.cap == "alias.name" {
+            alias_name_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "alias.of" {
+            alias_of_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "macro.alias.name" {
+            macro_alias_name_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "macro.alias.of" {
+            macro_alias_of_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "spec.primary" {
+            spec_primary_by_match.insert(e.match_id, e.text.clone());
+        }
+        if e.cap == "tmpl.param" {
+            tmpl_param_by_match.insert(e.match_id, (e.text.clone(), e.start_byte));
+        }
+        if e.cap == "tmpl.owner" {
+            tmpl_owner_by_match.insert(e.match_id, e.text.clone());
+        }
+    }
+    let mut annot_text_by_var: HashMap<(String, crate::model::file_analysis::ScopeId), String> =
+        HashMap::new();
+
+    // ---- the state machine: scope stack + sticky contexts ----
+    let mut out = SkeletonAnalysis::default();
+    out.receiver_names = pack.receiver_names.iter().map(|s| s.to_string()).collect();
+    // Template params joined to their owner class — the owner shaped like a
+    // def name (a partial spec's spelling canonicalizes) so the key matches
+    // the Class symbol's identity. Source order = the `ParamOf` index axis.
+    {
+        let mut rows: Vec<(String, String, usize)> = tmpl_param_by_match
+            .iter()
+            .filter_map(|(mid, (param, pos))| {
+                let owner = tmpl_owner_by_match.get(mid)?;
+                Some(((pack.shape_name)("tmpl.owner", owner), param.clone(), *pos))
+            })
+            .collect();
+        rows.sort_by_key(|&(_, _, pos)| pos);
+        rows.dedup();
+        out.template_params = rows;
+    }
+    // (end_byte, ScopeId) — real Scope rows are minted as we go so the
+    // resulting FileAnalysis carries a genuine lexical tree.
+    let mut scope_stack: Vec<(usize, crate::model::file_analysis::ScopeId)> = Vec::new();
+    // (registered_at_depth, value) — a context set inside a scope pops
+    // with it (Python class blocks); one set at file depth is sticky
+    // (Perl's flat `package Foo;`).
+    let mut context_stack: Vec<(usize, String)> = Vec::new();
+    let mut def_name_spans: Vec<(usize, usize)> = Vec::new();
+
+    use crate::model::file_analysis::{Scope, ScopeId, ScopeKind};
+    out.scopes.push(Scope {
+        id: ScopeId(0),
+        parent: None,
+        kind: ScopeKind::File,
+        span: Span { start: tree.root_node().start_position(), end: tree.root_node().end_position() },
+        package: None,
+    });
+    scope_stack.push((tree.root_node().end_byte(), ScopeId(0)));
+
+    // flow.assign joins: match_id → (target name+scope, source span)
+    let mut flow_targets: HashMap<usize, (String, ScopeId, Point)> = HashMap::new();
+    let mut flow_sources: HashMap<usize, Span> = HashMap::new();
+    // Rebind shapes with no inflowing value (loop vars: `for x in …`,
+    // `for (auto x : …)`) — they mint a `Rebind` FlowEdge so the narrowing
+    // cutoff sees them, exactly like Perl's `foreach` var.
+    let mut flow_rebinds: Vec<(String, ScopeId, Point)> = Vec::new();
+    let mut annots: HashMap<usize, String> = HashMap::new();
+    // keyed-shape collection: ctor + keys grouped per @expr.shape span
+    let mut shape_spans: Vec<(usize, usize, Span)> = Vec::new();
+    let mut shape_ctors: HashMap<(usize, usize), String> = HashMap::new();
+    let mut shape_keys: Vec<(usize, usize, String)> = Vec::new();
+    // command-dispatch collection: per match, the command identifier
+    // and its ordered arguments
+    let mut cmd_names: std::collections::BTreeMap<usize, (String, Span, crate::model::file_analysis::ScopeId)> =
+        Default::default();
+    let mut cmd_args: std::collections::BTreeMap<usize, Vec<(String, Span)>> = Default::default();
+    // import-call halves, joined per match (BTreeMap: match ids are
+    // source-ordered, so imports come out deterministic)
+    let mut import_fns: std::collections::BTreeMap<usize, String> = Default::default();
+    let mut import_args: std::collections::BTreeMap<usize, String> = Default::default();
+    // expr-literal spans, for narrowing an Edge target onto the actual
+    // literal when the rhs node wraps it.
+    let mut lit_spans: Vec<(usize, usize, Span)> = Vec::new();
+    // guard narrowing: match_id → (var, narrowed-type-text). A guard
+    // (`isinstance(x, Foo)`, `ref $x eq 'Foo'`, `dynamic_cast<Foo>`) and
+    // its guarded `@scope` share a match; when that scope is pushed we
+    // emit a Variable witness scoped to the block — so the narrowed type
+    // holds INSIDE the guard and nowhere else (scope = the refinement's
+    // extent). The condition's captures precede the block in source, so
+    // by the time the `@scope` event fires these are populated.
+    let mut narrow_var: HashMap<usize, String> = HashMap::new();
+    let mut narrow_type: HashMap<usize, String> = HashMap::new();
+    let mut narrow_guard: HashMap<usize, String> = HashMap::new();
+    // Recognized narrowings deferred to after flow-edge minting, so the region
+    // cutoff can read the edges (`apply` below) — (subject, refined type, FULL
+    // guarded-block region, block scope).
+    let mut pending_narrow: Vec<(String, crate::model::file_analysis::InferredType, Span, ScopeId)> =
+        Vec::new();
+    // `std::move(x)` halves, joined per match: the qualifier (`std`) + name
+    // (`move`) verify the call IS std::move (no query predicates), the var is
+    // the moved subject, the call span the region start + enclosing scope.
+    let mut move_scope_txt: HashMap<usize, String> = HashMap::new();
+    let mut move_name_txt: HashMap<usize, String> = HashMap::new();
+    let mut move_var_txt: HashMap<usize, String> = HashMap::new();
+    let mut move_call: HashMap<usize, (Span, ScopeId)> = HashMap::new();
+    // A context whose same-match `@scope` starts AFTER it (C++ namespace:
+    // `@context` is on the name, `@scope` on the body `{`) must be
+    // registered at the BODY depth, not the file depth — else it goes
+    // sticky and leaks past the closing brace. Pre-index each match's
+    // scope start; defer such contexts to the scope push.
+    let mut scope_start_by_match: HashMap<usize, usize> = HashMap::new();
+    for e in &events {
+        if e.cap.starts_with("scope") {
+            scope_start_by_match.entry(e.match_id).or_insert(e.start_byte);
+        }
+    }
+    let mut pending_context: HashMap<usize, String> = HashMap::new();
+    // A guard narrowing tags its consequence block `@narrow.block` (NOT `@scope`)
+    // so the block mints exactly one scope from the general arm-scope pattern;
+    // this maps a block's start byte → the narrow match, so when that arm @scope
+    // is pushed we recover the guard's var/type/token by block position.
+    let mut narrow_block_start: HashMap<usize, usize> = HashMap::new();
+    for e in &events {
+        if e.cap == "narrow.block" {
+            narrow_block_start.entry(e.start_byte).or_insert(e.match_id);
+        }
+    }
+    // Unevaluated-operand regions (`noexcept(...)`/`sizeof(...)`/`decltype(...)`):
+    // a `std::move` whose call sits inside one is a type-trait, not a move.
+    let unevaluated: Vec<(usize, usize)> = events
+        .iter()
+        .filter(|e| e.cap == "unevaluated")
+        .map(|e| (e.start_byte, e.end_byte))
+        .collect();
+    // Control-flow construct spans (`@guard.region`): the use-after-move check
+    // reads these to decide whether a move is straight-line in its scope.
+    out.control_regions = events
+        .iter()
+        .filter(|e| e.cap == "guard.region")
+        .map(|e| Span { start: e.start, end: e.end })
+        .collect();
+    // Parameter-list spans (`@param.region`): the use-after-move check reads
+    // these to tell a moved parameter (not flagged) from a moved local.
+    out.param_regions = events
+        .iter()
+        .filter(|e| e.cap == "param.region")
+        .map(|e| Span { start: e.start, end: e.end })
+        .collect();
+
+    for e in &events {
+        while scope_stack.len() > 1
+            && scope_stack.last().is_some_and(|&(end, _)| e.start_byte >= end)
+        {
+            scope_stack.pop();
+            while context_stack.last().is_some_and(|&(d, _)| d > scope_stack.len()) {
+                context_stack.pop();
+            }
+        }
+        let cur_scope = scope_stack.last().unwrap().1;
+        let package: Option<String> = context_stack.last().map(|(_, p)| p.clone());
+        match e.cap.as_str() {
+            // `@scope` = a plain lexical Block; `@scope.sub` = sub-body
+            // content (function bodies, prototype signatures, explicit
+            // instantiations, requires-expressions) — the kind
+            // `scope_within_sub_body` reads to shield params/locals from the
+            // outline and the class-content lane. Pack subs carry no name on
+            // the scope (the Symbol holds identity).
+            "scope" | "scope.sub" => {
+                let id = ScopeId(out.scopes.len() as u32);
+                out.scopes.push(Scope {
+                    id,
+                    parent: Some(cur_scope),
+                    kind: if e.cap == "scope.sub" {
+                        ScopeKind::Sub { name: String::new() }
+                    } else {
+                        ScopeKind::Block
+                    },
+                    span: Span { start: e.start, end: e.end },
+                    package: package.clone(),
+                });
+                scope_stack.push((e.end_byte, id));
+                out.scope_count += 1;
+                // a context deferred to THIS scope (C++ namespace) →
+                // register at the body depth so it pops with the block.
+                if let Some(text) = pending_context.remove(&e.match_id) {
+                    while context_stack.last().is_some_and(|&(d, _)| d >= scope_stack.len()) {
+                        context_stack.pop();
+                    }
+                    context_stack.push((scope_stack.len(), text));
+                }
+                // a guard narrowing whose block is THIS scope → the refined type
+                // holds within `id` (invisible outside it). Two join shapes:
+                // the narrow condition either shares this @scope's match (python:
+                // `consequence: (block) @scope`), or tagged the block by position
+                // (`@narrow.block`) so the refinement rides a general arm @scope
+                // without a fragile duplicate (cpp if/else arms).
+                let narrow_mid = narrow_block_start
+                    .get(&e.start_byte)
+                    .copied()
+                    .filter(|nmid| narrow_var.contains_key(nmid))
+                    .or_else(|| narrow_var.contains_key(&e.match_id).then_some(e.match_id));
+                if let Some((nmid, var)) =
+                    narrow_mid.and_then(|nmid| narrow_var.get(&nmid).map(|v| (nmid, v.clone())))
+                {
+                    let subject = (pack.shape_name)("ref.var", &var);
+                    // Type text: the guard's own `@narrow.type` when it names one
+                    // (`dynamic_cast<Derived*>`), else the subject's declared type
+                    // (the optional-engagement form peels `T` from it). The guard
+                    // token is absent for the bare `if (opt)` truthiness form.
+                    // Resolve the subject's declared type up the guard's scope
+                    // chain (innermost first), so a same-named var in a sibling
+                    // function never supplies the inner type — the nearest
+                    // enclosing declaration of `subject` wins.
+                    let ty = narrow_type.get(&nmid).cloned().or_else(|| {
+                        scope_stack.iter().rev().find_map(|&(_, sid)| {
+                            annot_text_by_var.get(&(subject.clone(), sid)).cloned()
+                        })
+                    });
+                    let guard = narrow_guard.get(&nmid).map(String::as_str);
+                    if let Some(refined) = ty.and_then(|t| (pack.narrow_guard)(guard, &t)) {
+                        // Defer: the region cutoff (first rebind edge) needs the
+                        // FlowEdges, minted after this loop. Carry the FULL
+                        // guarded-block region [start, end]; the post-pass
+                        // truncates it at the earliest rebind.
+                        pending_narrow.push((
+                            subject,
+                            refined,
+                            Span { start: e.start, end: e.end },
+                            id,
+                        ));
+                    }
+                }
+            }
+            "narrow.var" => {
+                narrow_var.insert(e.match_id, e.text.clone());
+            }
+            "narrow.type" => {
+                narrow_type.insert(e.match_id, e.text.clone());
+            }
+            "narrow.guard" => {
+                narrow_guard.insert(e.match_id, e.text.clone());
+            }
+            "move.scope" => {
+                move_scope_txt.insert(e.match_id, e.text.clone());
+            }
+            "move.name" => {
+                move_name_txt.insert(e.match_id, e.text.clone());
+            }
+            "move.var" => {
+                move_var_txt.insert(e.match_id, e.text.clone());
+            }
+            "move.call" => {
+                // Drop moves inside an unevaluated operand — they never execute,
+                // so nothing is moved-from (rule #10: the property is "does this
+                // move run", asked of the region, not a shape-branch downstream).
+                let unevaluated_move = unevaluated
+                    .iter()
+                    .any(|&(s, en)| e.start_byte >= s && e.end_byte <= en);
+                if !unevaluated_move {
+                    move_call
+                        .insert(e.match_id, (Span { start: e.start, end: e.end }, cur_scope));
+                }
+            }
+            cap if cap.starts_with("context.") => {
+                // Shape the context like a def name (cpp canonicalizes a
+                // spec's template spelling) so members' `package` matches
+                // the container Symbol's identity exactly.
+                let text = (pack.shape_name)(&e.cap, &e.text);
+                // If this match's `@scope` starts AFTER this context, the
+                // context belongs to that (not-yet-pushed) body — defer it
+                // so it registers at the body depth and pops with the block.
+                if scope_start_by_match.get(&e.match_id).is_some_and(|&s| s > e.start_byte) {
+                    pending_context.insert(e.match_id, text);
+                } else {
+                    // Replace any context at the same depth; deeper ones
+                    // were already popped with their scopes.
+                    while context_stack
+                        .last()
+                        .is_some_and(|&(d, _)| d >= scope_stack.len())
+                    {
+                        context_stack.pop();
+                    }
+                    context_stack.push((scope_stack.len(), e.text.clone()));
+                }
+            }
+            "parent" => {
+                // `@parent` (a base class) pairs with the `@def.class.name`
+                // in the same match — record the inheritance edge.
+                if let Some((child, _, _)) =
+                    names_by_match.get(&(e.match_id, "def.class".to_string()))
+                {
+                    // Shaped like the child's def name (cpp canonicalizes a
+                    // template-spelled base) so the edge joins the identity
+                    // the target class was filed under.
+                    out.parents
+                        .push((child.clone(), (pack.shape_name)("parent", &e.text)));
+                }
+            }
+            cap if cap.starts_with("def.") && !cap.ends_with(".name") => {
+                let kind = cap.strip_prefix("def.").unwrap().to_string();
+                let (name, name_start, name_end, defaulted) = names_by_match
+                    .get(&(e.match_id, e.cap.clone()))
+                    .cloned()
+                    .map(|(n, s, en)| (n, s, en, false))
+                    .or_else(|| {
+                        (pack.default_name)(&kind)
+                            .map(|n| (n.to_string(), e.start, e.start, true))
+                    })
+                    .unwrap_or((e.text.clone(), e.start, e.end, false));
+                def_name_spans.push((e.start_byte, e.end_byte));
+                // An out-of-line def's `Class::` qualifier names its owner
+                // (the LAST `::` segment, the unqualified class the engine
+                // keys by) — override the enclosing-namespace context.
+                let pkg = qualifier_by_match
+                    .get(&e.match_id)
+                    .map(|q| q.rsplit("::").next().unwrap_or(q).to_string())
+                    .or_else(|| package.clone());
+                let shaped = (pack.shape_name)(&format!("def.{kind}"), &name);
+                // A class-spec def carries its primary's name — the
+                // (spec, primary) family edge `Specializes` derives from.
+                if let Some(primary) = spec_primary_by_match.get(&e.match_id) {
+                    out.specializations
+                        .push((shaped.clone(), (pack.shape_name)("spec.primary", primary)));
+                }
+                out.symbols.push(SkelSymbol {
+                    name: shaped,
+                    kind,
+                    start: e.start,
+                    end: e.end,
+                    name_start,
+                    name_end,
+                    package: pkg,
+                    scope: cur_scope,
+                    return_type: rettype_by_match
+                        .get(&e.match_id)
+                        .and_then(|t| (pack.annot_type)(t)),
+                    deref_stack: nested_stacks.get(&e.match_id).cloned().unwrap_or_default(),
+                    attributes: {
+                        let mut a =
+                            attrs_by_match.get(&e.match_id).cloned().unwrap_or_default();
+                        // a default-named symbol is structure, not an
+                        // addressable name — completion skips it.
+                        if defaulted {
+                            a.push("anonymous".to_string());
+                        }
+                        a
+                    },
+                    // Filled by span association in `into_file_analysis` — the
+                    // `@arity.sig` match fires separately from this def name.
+                    arity: None,
+                    qualifier_owned: qualifier_by_match.contains_key(&e.match_id),
+                });
+            }
+            "ref.label" => {
+                out.label_refs.push((
+                    (pack.shape_name)("def.label", &e.text),
+                    cur_scope,
+                    Span { start: e.start, end: e.end },
+                ));
+            }
+            "member.recv" => {
+                member_recv.insert(
+                    e.match_id,
+                    (crate::model::file_analysis::Span { start: e.start, end: e.end }, e.text.clone()),
+                );
+            }
+            "member.op" => {
+                // Map the operator token's KIND (== its text, an anonymous
+                // token) to a MemberOp via the pack's open op_map. Unmapped
+                // (`.*`) → no entry → no op-DX. No source-text re-decision.
+                if let Some((_, op)) = pack.op_map.iter().find(|(k, _)| *k == e.text) {
+                    member_op_raw.insert(
+                        e.match_id,
+                        (*op, crate::model::file_analysis::Span { start: e.start, end: e.end }),
+                    );
+                }
+            }
+            cap if cap.starts_with("ref.") => {
+                // Generic suppression: a "reference" inside a def's own
+                // header is the declaration, not a use. `ref.type` is exempt:
+                // a prototype's RETURN type is the def node's first token
+                // (`Widget make_widget();` starts at `Widget`), which is a
+                // genuine use — its decl-name overlap is suppressed precisely
+                // (exact selection-span match) in `into_file_analysis`.
+                let inside_def = e.cap != "ref.type"
+                    && def_name_spans
+                        .iter()
+                        .any(|&(s, en)| e.start_byte >= s && e.end_byte <= en && {
+                            // only suppress when it IS the def name region
+                            // (cheap heuristic: same start)
+                            s == e.start_byte || en == e.end_byte
+                        });
+                if !inside_def {
+                    let member_op = member_simple
+                        .get(&e.match_id)
+                        .copied()
+                        .unwrap_or(false)
+                        .then(|| member_op_raw.get(&e.match_id).copied())
+                        .flatten();
+                    // Reset-via-method: a rebinding method call on a simple-var
+                    // receiver (`x.clear()`/`.reset()`/`.assign()`) puts a
+                    // moved-from object back into a known state — a rebind. Mint
+                    // a Rebind FlowEdge at the RECEIVER position so the moved-from
+                    // window (and the narrowing cutoff) end there, sparing the
+                    // receiver read itself. The pack owns which method names
+                    // rebind (cpp vocab, like its op_map).
+                    if e.cap == "ref.member"
+                        && (pack.rebind_method)(&e.text)
+                        && member_simple.get(&e.match_id).copied().unwrap_or(false)
+                    {
+                        if let Some((recv_span, recv_text)) = member_recv.get(&e.match_id) {
+                            flow_rebinds.push((
+                                (pack.shape_name)("def.var", recv_text),
+                                cur_scope,
+                                recv_span.start,
+                            ));
+                        }
+                    }
+                    out.refs.push(SkelRef {
+                        kind: e.cap.strip_prefix("ref.").unwrap().to_string(),
+                        name: (pack.shape_name)(&e.cap, &e.text),
+                        start: e.start,
+                        end: e.end,
+                        scope: cur_scope,
+                        invocant: member_recv.get(&e.match_id).cloned(),
+                        member_op,
+                        // A call ref's arg list opens right where its callee /
+                        // method token ends; plain (uncalled) member/type refs
+                        // have no adjacent arg list and stay `None`.
+                        arg_count: matches!(e.cap.as_str(), "ref.call" | "ref.qcall" | "ref.member")
+                            .then(|| arg_counts_by_start.get(&(e.end.row, e.end.column)).copied())
+                            .flatten(),
+                    });
+                }
+            }
+            "import.name" => {
+                out.import_sites
+                    .push((e.text.clone(), Span { start: e.start, end: e.end }));
+                out.imports.push(e.text.clone());
+            }
+            cap if cap.starts_with("expr.lit.") => {
+                let suffix = cap.strip_prefix("expr.lit.").unwrap();
+                if let Some(t) = lit_type(suffix) {
+                    let span = Span { start: e.start, end: e.end };
+                    lit_spans.push((e.start_byte, e.end_byte, span));
+                    out.witnesses.push(crate::model::witnesses::Witness {
+                        attachment: crate::model::witnesses::WitnessAttachment::Expr(span),
+                        source: crate::model::witnesses::WitnessSource::Builder("skeleton".into()),
+                        payload: crate::model::witnesses::WitnessPayload::InferredType(t),
+                        span,
+                    });
+                }
+            }
+            "expr.read.var" => {
+                // a variable READ is an edge: Expr(span) resolves to
+                // whatever the Variable resolves to — same shape the
+                // builder's emit_expr_witness uses.
+                let span = Span { start: e.start, end: e.end };
+                // …and a candidate local-var reference, resolved to its
+                // declaration in into_file_analysis (goto-def + hover).
+                out.var_reads.push((
+                    (pack.shape_name)("ref.var", &e.text),
+                    cur_scope,
+                    span,
+                ));
+                out.witnesses.push(crate::model::witnesses::Witness {
+                    attachment: crate::model::witnesses::WitnessAttachment::Expr(span),
+                    source: crate::model::witnesses::WitnessSource::Builder("skeleton".into()),
+                    payload: crate::model::witnesses::WitnessPayload::Edge(
+                        crate::model::witnesses::WitnessAttachment::Variable {
+                            name: (pack.shape_name)("ref.var", &e.text),
+                            scope: cur_scope,
+                        },
+                    ),
+                    span,
+                });
+            }
+            "expr.return.value" => {
+                // The returned expression's own general-rule witness (literal
+                // / var-read / member / call — whichever matched this same
+                // node) already carries its type; this just records the site
+                // (scope + span) so `emit_return_fuel` (language_driver.rs,
+                // phase 7) can chain the enclosing function's `Symbol` onto it
+                // when undeclared.
+                out.return_sites
+                    .push((cur_scope, Span { start: e.start, end: e.end }));
+            }
+            "flow.target" => {
+                flow_targets.insert(
+                    e.match_id,
+                    ((pack.shape_name)("def.var", &e.text), cur_scope, e.start),
+                );
+                // Record the declared-type text keyed by (var, DECLARING scope)
+                // for the token-less optional-engagement narrowing. cur_scope is
+                // only known here (scopes mint during this walk); the type-annot
+                // half was pre-collected (it precedes the declarator in source).
+                if let Some(annot) = annot_by_match.get(&e.match_id) {
+                    annot_text_by_var.insert(
+                        ((pack.shape_name)("ref.var", &e.text), cur_scope),
+                        annot.clone(),
+                    );
+                }
+            }
+            "flow.rebind" => {
+                flow_rebinds.push(((pack.shape_name)("def.var", &e.text), cur_scope, e.start));
+            }
+            "anonagg.member" => {
+                // A field typed by an anonymous aggregate: its members are
+                // flattened onto the enclosing named container, so the field's
+                // own type IS that container (the anon hop is identity) —
+                // `u->data.ping` types `u->data` as U and finds `ping` there.
+                // TypeName (not ClassName) so a typedef'd container chases.
+                if let Some(owner) = &package {
+                    out.witnesses.push(crate::model::witnesses::Witness {
+                        attachment: crate::model::witnesses::WitnessAttachment::Variable {
+                            name: (pack.shape_name)("def.var", &e.text),
+                            scope: cur_scope,
+                        },
+                        source: crate::model::witnesses::WitnessSource::Builder(
+                            "skeleton-anon-agg".into(),
+                        ),
+                        payload: crate::model::witnesses::WitnessPayload::Edge(
+                            crate::model::witnesses::WitnessAttachment::TypeName(owner.clone()),
+                        ),
+                        span: Span { start: e.start, end: e.start },
+                    });
+                }
+            }
+            "flow.source" => {
+                flow_sources.insert(e.match_id, Span { start: e.start, end: e.end });
+            }
+            "type.annot" => {
+                annots.insert(e.match_id, e.text.clone());
+            }
+            "domain.slot" => {
+                // A field slot used against a typed value — one domain-typing
+                // site. The value is joined by match_id; its enum resolves
+                // cross-file at query time. The span is the SLOT's, so a
+                // find-references on the enum surfaces the field's own uses.
+                if let Some(value) = domain_value_by_match.get(&e.match_id) {
+                    out.domain_sites.push(crate::model::file_analysis::DomainSite {
+                        slot: (pack.shape_name)("ref.member", &e.text),
+                        value: value.clone(),
+                        slot_span: Span { start: e.start, end: e.end },
+                    });
+                }
+            }
+            "expr.shape" => {
+                shape_spans.push((e.start_byte, e.end_byte, Span { start: e.start, end: e.end }));
+            }
+            "shape.ctor" => {
+                // belongs to the smallest enclosing expr.shape; matches
+                // share the call node so byte keys line up
+                shape_ctors
+                    .entry(byte_range_of(&events, e.match_id, "expr.shape").unwrap_or((0, 0)))
+                    .or_insert_with(|| e.text.clone());
+            }
+            "shape.key" => {
+                if let Some(range) = byte_range_of(&events, e.match_id, "expr.shape") {
+                    shape_keys.push((range.0, range.1, e.text.clone()));
+                }
+            }
+            "cmd" => {
+                cmd_names.insert(
+                    e.match_id,
+                    (e.text.clone(), Span { start: e.start, end: e.end }, cur_scope),
+                );
+            }
+            "cmd.arg" => {
+                cmd_args
+                    .entry(e.match_id)
+                    .or_default()
+                    .push((e.text.clone(), Span { start: e.start, end: e.end }));
+            }
+            "import.fn" => {
+                import_fns.insert(e.match_id, e.text.clone());
+            }
+            "import.arg" => {
+                import_args.insert(e.match_id, e.text.clone());
+            }
+            cap if cap.starts_with("obs.") => {
+                // Usage-site evidence: a mono-typed operator observes
+                // its operand. Same Observation payloads the Perl
+                // walker emits; the fold is the production one.
+                let obs = match cap.strip_prefix("obs.").unwrap() {
+                    "numeric" => Some(crate::model::witnesses::TypeObservation::NumericUse),
+                    "string" => Some(crate::model::witnesses::TypeObservation::StringUse),
+                    _ => None,
+                };
+                if let Some(o) = obs {
+                    let span = Span { start: e.start, end: e.end };
+                    out.witnesses.push(crate::model::witnesses::Witness {
+                        attachment: crate::model::witnesses::WitnessAttachment::Variable {
+                            name: (pack.shape_name)("ref.var", &e.text),
+                            scope: cur_scope,
+                        },
+                        source: crate::model::witnesses::WitnessSource::Builder("skeleton-obs".into()),
+                        payload: crate::model::witnesses::WitnessPayload::Observation(o),
+                        span,
+                    });
+                }
+            }
+            "expr.call" => {
+                // A call's VALUE is the callee's own resolution — deferred to
+                // `into_file_analysis`, where the symbol table is known: a
+                // `Class` callee is a functional cast / constructor, a callable
+                // flows its return, an unresolvable name types nothing. Record
+                // (span, callee) and mark the span as a value-producing site so
+                // an enclosing `auto x = f(..)` flow edge targets it; the type
+                // witness is minted later once the callee resolves (no name-case
+                // guess). `docs/adr/macro-handling.md`.
+                let callee = events
+                    .iter()
+                    .find(|x| x.match_id == e.match_id && x.cap == "ref.call")
+                    .map(|x| x.text.clone());
+                if let Some(callee) = callee {
+                    let span = Span { start: e.start, end: e.end };
+                    lit_spans.push((e.start_byte, e.end_byte, span));
+                    out.call_sites.push((span, callee));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- inline namespaces: tag the Package symbol by name span ----
+    if !inline_ns_spans.is_empty() {
+        let same = |a: Point, b: Point| a.row == b.row && a.column == b.column;
+        for s in out.symbols.iter_mut() {
+            if s.kind == "package"
+                && inline_ns_spans
+                    .iter()
+                    .any(|&(st, en)| same(st, s.name_start) && same(en, s.name_end))
+            {
+                s.attributes.push("inline".to_string());
+            }
+        }
+    }
+
+    // ---- keyed shapes → HashWithKeys witnesses ----
+    {
+        let mut seen_spans: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        for &(sb, eb, span) in &shape_spans {
+            if !seen_spans.insert((sb, eb)) {
+                continue;
+            }
+            let Some(ctor) = shape_ctors.get(&(sb, eb)) else { continue };
+            if !(pack.shape_ctor)(ctor) {
+                continue;
+            }
+            let mut keys: Vec<(String, Option<Box<InferredType>>)> = shape_keys
+                .iter()
+                .filter(|&&(s2, e2, _)| s2 == sb && e2 == eb)
+                .map(|(_, _, k)| (k.clone(), None))
+                .collect();
+            keys.dedup_by(|a, b| a.0 == b.0);
+            lit_spans.push((sb, eb, span));
+            out.witnesses.push(crate::model::witnesses::Witness {
+                attachment: crate::model::witnesses::WitnessAttachment::Expr(span),
+                source: crate::model::witnesses::WitnessSource::Builder("skeleton-shape".into()),
+                payload: crate::model::witnesses::WitnessPayload::InferredType(
+                    InferredType::HashWithKeys { keys, open: false },
+                ),
+                span,
+            });
+        }
+    }
+
+    // ---- import CALLS (library/source) → imports ----
+    for (mid, f) in &import_fns {
+        if let Some(arg) = import_args.get(mid) {
+            if let Some(module) = (pack.import_call)(f, arg) {
+                if !out.imports.contains(&module) {
+                    out.imports.push(module);
+                }
+            }
+        }
+    }
+
+    // ---- def dedup: `f <- function` matches both the sub and the
+    // generic var pattern (keep the more specific kind per name site), and
+    // a trailing-return function matches both its leading-`auto` pattern
+    // and the trailing sibling (keep the rettype-bearing copy) ----
+    {
+        let mut best: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut keep = vec![true; out.symbols.len()];
+        for (i, sym) in out.symbols.iter().enumerate() {
+            let key = (sym.name_start.row, sym.name_start.column);
+            match best.get(&key) {
+                None => {
+                    best.insert(key, i);
+                }
+                Some(&j) => {
+                    let (gen_i, gen_j) =
+                        (out.symbols[i].kind == "var", out.symbols[j].kind == "var");
+                    let upgrade_ret = out.symbols[i].kind == out.symbols[j].kind
+                        && out.symbols[i].return_type.is_some()
+                        && out.symbols[j].return_type.is_none();
+                    if (gen_j && !gen_i) || upgrade_ret {
+                        keep[j] = false;
+                        best.insert(key, i);
+                    } else {
+                        keep[i] = false;
+                    }
+                }
+            }
+        }
+        let mut it = keep.iter();
+        out.symbols.retain(|_| *it.next().unwrap());
+    }
+
+    // ---- command dispatch: classify each command's effects ----
+    for (mid, (cmd, cmd_span, scope)) in &cmd_names {
+        let args = cmd_args.get(mid).cloned().unwrap_or_default();
+        // every invocation identifier is a call ref (user functions
+        // rename through it; builtin names match no defs, harmlessly)
+        out.refs.push(SkelRef {
+            kind: "call".into(),
+            name: cmd.clone(),
+            start: cmd_span.start,
+            end: cmd_span.end,
+            scope: *scope,
+            invocant: None,
+            member_op: None,
+            arg_count: Some(args.len()),
+        });
+        for effect in (pack.cmd_effects)(cmd) {
+            match effect {
+                CmdEffect::Def { kind, name_arg } => {
+                    if let Some((name, span)) = args.get(name_arg) {
+                        out.symbols.push(SkelSymbol {
+                            kind: kind.to_string(),
+                            name: name.clone(),
+                            start: cmd_span.start,
+                            end: span.end,
+                            name_start: span.start,
+                            name_end: span.end,
+                            package: None,
+                            scope: *scope,
+                            return_type: None,
+                            deref_stack: Vec::new(),
+                            attributes: Vec::new(),
+                            arity: None,
+                            qualifier_owned: false,
+                        });
+                    }
+                }
+                CmdEffect::RefArgsFrom { from } => {
+                    for (name, span) in args.iter().skip(from) {
+                        let is_keyword =
+                            !name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_');
+                        if !is_keyword && !name.contains("${") {
+                            out.refs.push(SkelRef {
+                                kind: "call".into(),
+                                name: name.clone(),
+                                start: span.start,
+                                end: span.end,
+                                scope: *scope,
+                                invocant: None,
+                                member_op: None,
+                                arg_count: None,
+                            });
+                        }
+                    }
+                }
+                CmdEffect::Import { arg } => {
+                    if let Some((name, _)) = args.get(arg) {
+                        if !out.imports.contains(name) {
+                            out.imports.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- typedef / using aliases → TypeName witnesses (the alias graph) ----
+    // `typedef unsigned short U16` / `using U16 = unsigned short` push
+    // `TypeName("U16") → <underlying>`: a primitive leaf stays an
+    // `InferredType`; a class-shaped underlying edges to `TypeName(that)` so
+    // an alias chain (`typedef V16 W16`) chases; an unrecognized leaf spelling
+    // (`unsigned short` — has a space) is `ClassName(text)` so hover shows the
+    // raw spelling. Struct/union/enum tag typedefs (`typedef struct op OP`)
+    // don't reach here — the skeleton's @parent edge already aliases them.
+    // Emit in match-id (≈ source) order: two `#define`s / typedefs of the
+    // SAME alias name (a config-variant type macro like `PERL_BITFIELD16`,
+    // guarded `#ifdef … #else …`) land competing `TypeName(alias)` witnesses,
+    // and the reducer is latest-wins — a HashMap-iteration emission order
+    // makes the winner flip per process (Rust's randomized hasher). Sorted
+    // emission fixes the winner to the last-defined variant, deterministically.
+    let mut alias_mids: Vec<&usize> = alias_name_by_match.keys().collect();
+    alias_mids.sort_unstable();
+    for mid in alias_mids {
+        let alias = &alias_name_by_match[mid];
+        let Some(underlying) = alias_of_by_match.get(mid) else { continue };
+        out.witnesses.push(crate::model::witnesses::Witness {
+            attachment: crate::model::witnesses::WitnessAttachment::TypeName(alias.clone()),
+            source: crate::model::witnesses::WitnessSource::Builder("skeleton-typedef".into()),
+            payload: type_alias_payload(underlying.trim(), pack.annot_type),
+            span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 0 } },
+        });
+    }
+
+    // ---- object-like `#define X body` type aliases → TypeName witnesses ----
+    // Same alias graph as a typedef, so a field/var typed `PERL_BITFIELD16`
+    // (defined cross-file in another header via a config-guarded `#define`)
+    // chases through to its integer leaf. Gated on a TYPE-shaped body so the
+    // sea of value macros (`#define MAX 100`) mints nothing.
+    // Same deterministic-emission rule as the typedef loop above (the
+    // `PERL_BITFIELD16` config-variant JOIN lives here): sorted by match id so
+    // the latest-wins reducer's winner is order-independent.
+    let mut macro_mids: Vec<&usize> = macro_alias_name_by_match.keys().collect();
+    macro_mids.sort_unstable();
+    for mid in macro_mids {
+        let alias = &macro_alias_name_by_match[mid];
+        let Some(underlying) = macro_alias_of_by_match.get(mid) else { continue };
+        let underlying = underlying.trim();
+        if !looks_like_type_spelling(underlying) {
+            continue;
+        }
+        out.witnesses.push(crate::model::witnesses::Witness {
+            attachment: crate::model::witnesses::WitnessAttachment::TypeName(alias.clone()),
+            source: crate::model::witnesses::WitnessSource::Builder("skeleton-macro-alias".into()),
+            payload: type_alias_payload(underlying, pack.annot_type),
+            span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 0 } },
+        });
+    }
+
+    // ---- join flow captures into Variable witnesses ----
+    // Match-id order (deterministic) — two captures targeting the same
+    // `Variable{name, scope}` slot would otherwise land witnesses in
+    // HashMap-iteration order, flipping the latest-wins winner per process.
+    let mut flow_mids: Vec<&usize> = flow_targets.keys().collect();
+    flow_mids.sort_unstable();
+    // A class/struct DATA MEMBER is visible throughout its class body
+    // regardless of declaration order (C++ member lookup is not sequential:
+    // a method reads a field declared later in a `private:` section below
+    // it). The type-witness temporal filter is position-based — it admits a
+    // witness only at/after its span — so a zero-width witness pinned to the
+    // field's decl point would be REJECTED for every read textually above it.
+    // Give the field's declared-type witness its class-body scope's span so
+    // "this type holds class-wide" is what the filter sees. Locals keep their
+    // decl-point span (flow narrowing is sequential and correct for them).
+    // Scopes are pushed in id order (`id = ScopeId(scopes.len())`), so a
+    // ScopeId indexes its own scope directly.
+    let field_scope_span: std::collections::HashMap<(String, ScopeId), Span> = out
+        .symbols
+        .iter()
+        .filter(|s| s.kind == "field")
+        .filter_map(|s| {
+            out.scopes
+                .get(s.scope.0 as usize)
+                .map(|sc| ((s.name.clone(), s.scope), sc.span))
+        })
+        .collect();
+    for mid in flow_mids {
+        let (name, scope, at) = &flow_targets[mid];
+        let var = crate::model::witnesses::WitnessAttachment::Variable {
+            name: name.clone(),
+            scope: *scope,
+        };
+        // Class-wide extent for a data member; the sequential decl point for a
+        // local (see `field_scope_span`).
+        let annot_span = field_scope_span
+            .get(&(name.clone(), *scope))
+            .copied()
+            .unwrap_or(Span { start: *at, end: *at });
+        if let Some(annot) = annots.get(mid) {
+            // A class-shaped declared type edges into the alias graph (it may
+            // be a typedef — `U16 x;` where `typedef unsigned short U16`);
+            // primitives stay leaves; `None` (auto/void) defers to the flow
+            // edge as before. `TypeName` chases the typedef or falls back to
+            // the same `ClassName`, so a plain struct/class is unchanged.
+            let payload = match (pack.annot_type)(annot) {
+                Some(InferredType::ClassName(cn)) => Some(
+                    crate::model::witnesses::WitnessPayload::Edge(
+                        crate::model::witnesses::WitnessAttachment::TypeName(cn),
+                    ),
+                ),
+                Some(t) => Some(crate::model::witnesses::WitnessPayload::InferredType(t)),
+                None => None,
+            };
+            if let Some(payload) = payload {
+                out.witnesses.push(crate::model::witnesses::Witness {
+                    attachment: var.clone(),
+                    source: crate::model::witnesses::WitnessSource::Builder(crate::model::witnesses::ANNOT_SOURCE.into()),
+                    payload,
+                    span: annot_span,
+                });
+            }
+        }
+        if let Some(src_span) = flow_sources.get(mid) {
+            // Narrow onto the outermost literal the rhs wraps, when the
+            // rhs node itself carries no witness (paren wrappers).
+            let src_bytes = byte_range_of(&events, *mid, "flow.source");
+            let target_span = lit_spans
+                .iter()
+                .filter(|&&(s, en, _)| {
+                    src_bytes.is_some_and(|(ss, se)| s >= ss && en <= se)
+                })
+                .max_by_key(|&&(s, en, _)| en - s)
+                .map(|&(_, _, sp)| sp)
+                .filter(|sp| sp != src_span)
+                .unwrap_or(*src_span);
+            // Mint a value-flow edge (cpp init is `Whole`); the witness is its
+            // lowering, so type inference sees the same `Variable → Edge(Expr)`
+            // it always did — now with the source span kept for provenance.
+            out.flow_edges.push(crate::model::file_analysis::FlowEdge {
+                target_name: name.clone(),
+                target_scope: *scope,
+                target_at: *at,
+                source: target_span,
+                extraction: crate::model::file_analysis::Extraction::Whole,
+            });
+        }
+    }
+    // Bind-shape rebinds (loop vars): no inflowing value, recorded for the
+    // narrowing cutoff (`Rebind` lowers to nothing — provenance only).
+    for (name, scope, at) in flow_rebinds {
+        out.flow_edges.push(crate::model::file_analysis::FlowEdge {
+            target_name: name,
+            target_scope: scope,
+            target_at: at,
+            source: Span { start: at, end: at },
+            extraction: crate::model::file_analysis::Extraction::Rebind,
+        });
+    }
+    // Lower the value-flow edges to type-tier witnesses (the bag is canonical
+    // for types; the edges are the provenance tier above it).
+    for fe in &out.flow_edges {
+        if let Some(w) = fe.lower_to_witness() {
+            out.witnesses.push(w);
+        }
+    }
+    // Narrowing cutoffs (THE cross-language lift): truncate each guarded region
+    // at the first FlowEdge that rebinds the subject — the SAME edge-driven
+    // cutoff the Perl narrowing uses (`earliest_rebind_in`). Deferred to here so
+    // the edges exist. The witness gets a REAL region span [start, cutoff], so
+    // point-containment ends the narrowing at the rebind — the soundness Perl
+    // got from its cutoff, now generic. Every LangPack that narrows (python
+    // isinstance, cpp dynamic_cast + optional engagement) gets it free.
+    for (name, refined, region, scope) in pending_narrow {
+        let end = crate::model::file_analysis::earliest_rebind_in(&out.flow_edges, &name, region)
+            .unwrap_or(region.end);
+        if (region.start.row, region.start.column) >= (end.row, end.column) {
+            continue; // rebound before the region even opens — nothing holds
+        }
+        out.witnesses.push(crate::model::witnesses::Witness {
+            attachment: crate::model::witnesses::WitnessAttachment::Variable { name, scope },
+            source: crate::model::witnesses::WitnessSource::Builder("skeleton-narrow".into()),
+            payload: crate::model::witnesses::WitnessPayload::InferredType(refined),
+            span: Span { start: region.start, end },
+        });
+    }
+    // ---- std::move sites → moved-from facts. The qualifier/name verify the
+    // call IS `std::move` here (no query predicates), so the diagnostic never
+    // sees the call shape — it reads the recorded var + span + scope.
+    for (mid, (span, scope)) in &move_call {
+        if move_scope_txt.get(mid).map(String::as_str) == Some("std")
+            && move_name_txt.get(mid).map(String::as_str) == Some("move")
+        {
+            if let Some(v) = move_var_txt.get(mid) {
+                out.moved_from.push(((pack.shape_name)("ref.var", v), *span, *scope));
+            }
+        }
+    }
+    out.param_sigs = param_sigs;
+    Ok(out)
+}
+
+/// The `TypeName(alias) → …` payload for an underlying type spelling, resolving
+/// it through the pack's `annot_type`: a class-shaped leaf edges into the alias
+/// graph (`Edge(TypeName(cn))`), a primitive is a terminal `InferredType`, an
+/// unrecognized spelling (`unsigned short` — has a space) is `ClassName(text)`
+/// so hover shows it verbatim. Shared by typedef, file-local `#define`, and
+/// gathered-external `#define` alias emission.
+pub(crate) fn type_alias_payload(
+    underlying: &str,
+    annot_type: fn(&str) -> Option<InferredType>,
+) -> crate::model::witnesses::WitnessPayload {
+    use crate::model::witnesses::{WitnessAttachment, WitnessPayload};
+    match annot_type(underlying) {
+        Some(InferredType::ClassName(cn)) => WitnessPayload::Edge(WitnessAttachment::TypeName(cn)),
+        Some(t) => WitnessPayload::InferredType(t),
+        None => WitnessPayload::InferredType(InferredType::ClassName(underlying.to_string())),
+    }
+}
+
+// The canonical template-spelling rule lives in the Model layer
+// (`file_analysis.rs`) so the `ParametricType::Instance` peel shares it;
+// re-exported here because the pack `shape_name`s are its Build-side home.
+pub use crate::model::file_analysis::canonical_template_spelling;
+
+/// Is `body` a bare TYPE spelling (a macro that aliases a type), rather than a
+/// value/expression? Accepts identifier/keyword words possibly `::`-qualified
+/// and space-separated (`U16`, `unsigned short`, `std::string`, `struct op`);
+/// rejects numeric literals (`100`), operators, and punctuation (`1 << 3`,
+/// `(x)`, `&y`). Cheap first-token gate: a type spelling never starts with a
+/// digit or a symbol, and contains only word/`:`/space bytes.
+pub(crate) fn looks_like_type_spelling(body: &str) -> bool {
+    let b = body.trim();
+    if b.is_empty() {
+        return false;
+    }
+    if !b.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        return false;
+    }
+    b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == ' ')
+}
+
+/// A bare identifier lexeme — the only shape that can name an enumerator.
+/// Pure string test (no node-kind probe) so every language's capture text
+/// routes through the same rule.
+fn is_identifier_text(s: &str) -> bool {
+    !s.is_empty()
+        && !s.as_bytes()[0].is_ascii_digit()
+        && s.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric())
+}
+
+fn byte_range_of(events: &[Event], match_id: usize, cap: &str) -> Option<(usize, usize)> {
+    events
+        .iter()
+        .find(|e| e.match_id == match_id && e.cap == cap)
+        .map(|e| (e.start_byte, e.end_byte))
+}
+
+#[cfg(test)]
+#[path = "query_extract_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "cpp_typedef_alias_tests.rs"]
+mod cpp_typedef_alias_tests;

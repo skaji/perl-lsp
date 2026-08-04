@@ -22,9 +22,9 @@
 
 use tree_sitter::Node;
 
-use crate::file_analysis::Span;
+use crate::model::file_analysis::Span;
 
-pub(crate) use crate::conventions::is_conventional_invocant_name;
+pub(crate) use crate::model::conventions::is_conventional_invocant_name;
 
 /// Ergonomic accessors every tree consumer wants; `use crate::cst::NodeExt`
 /// instead of re-spelling `utf8_text(..).ok()` chains.
@@ -735,12 +735,12 @@ pub(crate) fn is_element_access_base(node: Node) -> bool {
 /// comes from inference. The caller resolves `__PACKAGE__` — the enclosing
 /// package is builder state this layer doesn't hold.
 pub(crate) fn constructor_invocant<'a>(node: Node<'a>, src: &'a [u8]) -> Option<&'a str> {
-    use crate::conventions::InvocantText;
+    use crate::model::conventions::InvocantText;
     let call = MethodCall::cast(node)?;
     if !call
         .method()?
         .text(src)
-        .is_some_and(crate::conventions::is_constructor_name)
+        .is_some_and(crate::model::conventions::is_constructor_name)
     {
         return None;
     }
@@ -749,7 +749,7 @@ pub(crate) fn constructor_invocant<'a>(node: Node<'a>, src: &'a [u8]) -> Option<
         InvocantText::CurrentPackage => Some(inv),
         // A computed receiver (`(ref $self)->new`) parses to a leading `(`
         // that classifies as Bareword; only a real package name is a class.
-        InvocantText::Bareword(b) if crate::conventions::is_bareword_class_name(b) => Some(inv),
+        InvocantText::Bareword(b) if crate::model::conventions::is_bareword_class_name(b) => Some(inv),
         InvocantText::Bareword(_)
         | InvocantText::Scalar(_)
         | InvocantText::NonScalar(_)
