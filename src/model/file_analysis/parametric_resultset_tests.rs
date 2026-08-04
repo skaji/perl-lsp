@@ -223,6 +223,57 @@ $schema->resultset('Schema::Result::Users')->find({{ name => 'X' }});
     );
 }
 
+/// A SUPER-qualified search still claims its hash-key args on the
+/// receiver's VALUE: `$rs->SUPER::search({ name => ... })` starts
+/// method lookup at the writing package's parents, but the receiver is
+/// still the resultset — so the `name` key gets the row-class owner
+/// exactly like the bare `->search` spelling. Pins the invocant
+/// ladder's two projections: `method_call_invocant_type` is
+/// token-blind (the Parametric flavor survives a `SUPER::` qualifier,
+/// and `method_arg_owner` is asked with the bare method name), while
+/// the dispatch projection honors the token (no resolvable parent here
+/// → honest None, never the receiver's own class).
+#[test]
+fn super_qualified_search_still_fills_hash_key_owner() {
+    let src = format!(
+        "{}
+package main;
+my $schema;
+my $rs = $schema->resultset('Schema::Result::Users');
+$rs->SUPER::search({{ name => 'X' }});
+",
+        USERS_RESULT,
+    );
+    let (fa, _tree) = parse_with_tree(&src);
+    let key = point_at(&src, "name => 'X'");
+    let r = fa.ref_at(key).expect("name key ref");
+    assert!(
+        matches!(
+            &r.kind,
+            RefKind::HashKeyAccess {
+                owner: Some(crate::model::file_analysis::HashKeyOwner::Bridged { class }),
+                ..
+            } if class == "Schema::Result::Users"
+        ),
+        "SUPER::search's hash-key arg must carry the row-class Bridged owner; got {:?}",
+        r.kind,
+    );
+    let def = fa.find_definition(key, None);
+    assert_eq!(
+        def.map(|s| s.start.row),
+        Some(NAME_COL_DEF_ROW),
+        "`name` in SUPER::search args must land on the column def like the bare spelling",
+    );
+    // Dispatch stays token-aware: `main` has no resolvable parents, so
+    // the SUPER call's dispatch class is an honest miss.
+    let super_ref = fa
+        .refs
+        .iter()
+        .find(|r| r.target_name == "SUPER::search")
+        .expect("SUPER::search MethodCall ref");
+    assert_eq!(fa.method_call_invocant_class(super_ref, None), None);
+}
+
 /// (e) **Receiver dispatch unchanged**. `$rs->all()` and
 /// `$rs->count()` are ResultSet methods; the parametric type must
 /// NOT make them resolve against the row class. We don't define

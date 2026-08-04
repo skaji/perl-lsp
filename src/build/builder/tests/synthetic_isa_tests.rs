@@ -425,9 +425,8 @@ sub action {
         keys.iter().map(|c| c.label.as_str()).collect();
     let _ = key_names; // intentionally not asserted in the spike
 
-    // Hover on `$users[0]->greet` — the tree-aware
-    // `method_call_invocant_class_with_tree` path. The string-side
-    // `method_call_invocant_class` couldn't resolve `$users[0]`
+    // Hover on `$users[0]->greet` — the tree-aware hover path.
+    // The tree-free invocant ladder can't resolve `$users[0]`
     // (it isn't a Variable witness name); the tree-aware variant
     // dispatches through `resolve_expression_type` on the actual
     // CST node, hitting the same array_element_expression arm

@@ -145,30 +145,6 @@ impl FileAnalysis {
         None
     }
 
-    /// Resolve a `MethodCall` ref's invocant class via the witness
-    /// bag — **the** invocant resolver. No tree, no text fallback, no
-    /// per-reader parallel paths: every reader routes through here.
-    ///
-    /// Dispatch by invocant shape:
-    ///   * `$var` / `@var` / `%var` → `inferred_type_via_bag` (so
-    ///     cross-file enrichment's variable types compose automatically).
-    ///   * `$self` (untyped) → enclosing class fallback.
-    ///   * `__PACKAGE__` → enclosing class.
-    ///   * Chain or function-call receiver (invocant_span points at
-    ///     another ref) → that ref's bag answer
-    ///     (`method_call_return_type_via_bag` for MethodCall;
-    ///     `sub_return_type_at_arity` for FunctionCall). Receiver ref
-    ///     found via the `call_ref_by_start` index (O(1)).
-    ///   * Bareword → `Foo` if a zero-arg sub by that name returns
-    ///     ClassName, else the bareword itself.
-    ///
-    /// Query-only: build-time chain typing already landed its product
-    /// in the bag (Variable witnesses, `Expression` edge witnesses on
-    /// chain receivers); this never re-derives.
-    ///
-    /// `module_index` lets chain receivers whose return type lives in
-    /// another package resolve (e.g. `$r->get('/x')->to(...)`). Pass
-    /// `None` only for CLI debug / isolated tests.
     /// The class a value's MEMBER ACCESS dispatches against, index-aware.
     /// `class_name_lenient()` plus one refinement the pure projection
     /// can't make: a template `Instance` whose EXACT canonical spelling
@@ -380,12 +356,57 @@ impl FileAnalysis {
             || module_index.is_some_and(|mi| mi.get_cached(name).is_some())
     }
 
+    /// The class a `MethodCall` ref's method lookup STARTS at — the
+    /// dispatch projection over `method_call_invocant_type` (THE invocant
+    /// ladder). A qualified method token (`Foo::m` / `::m` / `SUPER::m`)
+    /// overrides where lookup starts without changing what the receiver
+    /// IS, so the token arm lives here in the projection, not in the
+    /// value ladder (Parametric arg-claiming on `$rs->SUPER::search`
+    /// still sees the resultset). Every other shape projects the
+    /// ladder's type through `dispatch_class_of` plus the DBIC
+    /// source-moniker resolve.
     pub fn method_call_invocant_class(
         &self,
         r: &Ref,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
-        let cn = self.method_call_invocant_class_raw(r, module_index)?;
+        let RefKind::MethodCall { invocant, .. } = &r.kind else {
+            return None;
+        };
+        let cn = 'cn: {
+            // A qualified method token names its dispatch class explicitly
+            // — Perl ignores the invocant's class for the lookup, so the
+            // token wins ahead of invocant resolution. (A plugin-bridged
+            // token is never method-qualified; the ladder's bridged arm
+            // owns it.)
+            if matches!(invocant, crate::model::conventions::Invocant::Name(_)) {
+                use crate::model::conventions::MethodToken;
+                match MethodToken::parse(&r.target_name) {
+                    MethodToken::Super(name) => {
+                        // SUPER searches the enclosing package's parents'
+                        // MRO; the dispatch class is whichever ancestor
+                        // actually defines it (multi-parent safe). `None`
+                        // when the index isn't available yet (build-time
+                        // stamp of a dependency file, cross-file parent) —
+                        // every query-time consumer re-resolves with the
+                        // index: open docs via the enrichment re-stamp,
+                        // goto-def via the cross-file path,
+                        // references/rename via `refs_to`'s SUPER arm.
+                        let encl = self.enclosing_class_for_scope(r.scope)?;
+                        break 'cn self
+                            .resolve_super_method(&encl, name, module_index)
+                            .map(|res| res.class().to_string())?;
+                    }
+                    token => {
+                        if let Some(pkg) = token.literal_package() {
+                            break 'cn pkg.to_string();
+                        }
+                    }
+                }
+            }
+            self.method_call_invocant_type(r, module_index)
+                .and_then(|t| self.dispatch_class_of(&t, module_index))?
+        };
         // A DBIC resultset row projects to `ClassName(<source moniker>)` —
         // the short registration name (`Artist`), not the FQ result class
         // (`DBICTest::Schema::Artist`) where methods/columns live. Resolve
@@ -394,186 +415,6 @@ impl FileAnalysis {
         // single-segment name that names no real class is a moniker
         // candidate, so ordinary class receivers are untouched.
         Some(self.resolve_dbic_source_moniker(cn, None, module_index))
-    }
-
-    fn method_call_invocant_class_raw(
-        &self,
-        r: &Ref,
-        module_index: Option<&dyn CrossFileLookup>,
-    ) -> Option<String> {
-        let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
-            return None;
-        };
-        // A plugin-bridged token is NOT a Perl receiver — the emitting
-        // plugin already applied its naming convention (e.g. camelized a
-        // Mojo controller key), leaving a plain class key. Resolution is
-        // then GENERIC: match the key to a class (exact, or by `::`-tail
-        // when the plugin dropped the namespace) that owns the action. No
-        // plugin consult, no framework strings. With no index (build-time
-        // stamp, isolated tests) this stays unresolved — which is exactly
-        // why the freeze pass never pins it.
-        let invocant = match invocant {
-            crate::model::conventions::Invocant::Bridged { token, match_mode, .. } => {
-                return self.resolve_bridged_class(
-                    token,
-                    *match_mode,
-                    r.unqualified_target_name(),
-                    module_index,
-                );
-            }
-            crate::model::conventions::Invocant::Name(n) => n,
-        };
-        // A qualified method token names its dispatch class explicitly —
-        // Perl ignores the invocant's class for the lookup, so the token
-        // wins ahead of invocant resolution.
-        use crate::model::conventions::MethodToken;
-        match MethodToken::parse(&r.target_name) {
-            MethodToken::Super(name) => {
-                // SUPER searches the enclosing package's parents' MRO; the
-                // dispatch class is whichever ancestor actually defines it
-                // (multi-parent safe). `None` when the index isn't available
-                // yet (build-time stamp of a dependency file, cross-file
-                // parent) — every query-time consumer re-resolves with the
-                // index: open docs via the enrichment re-stamp, goto-def via
-                // the cross-file path, references/rename via `refs_to`'s
-                // SUPER arm.
-                let encl = self.enclosing_class_for_scope(r.scope)?;
-                return self
-                    .resolve_super_method(&encl, name, module_index)
-                    .map(|res| res.class().to_string());
-            }
-            token => {
-                if let Some(pkg) = token.literal_package() {
-                    return Some(pkg.to_string());
-                }
-            }
-        }
-        if invocant.is_empty() {
-            return None;
-        }
-
-        // Positional receiver spellings and `__PACKAGE__` aren't real
-        // variables (the bag has no witness for them) — both resolve to
-        // enclosing-class identity here.
-        use crate::model::conventions::InvocantText;
-        if matches!(
-            invocant.classify(),
-            InvocantText::PositionalReceiver | InvocantText::CurrentPackage
-        ) {
-            return self.enclosing_class_for_scope(r.scope);
-        }
-
-        // Flow-narrowing: a place invocant — arrow (`$self->{x}`) or direct
-        // (`$h{k}` / `$h[0]`) — refined by a guard resolves at the use-site
-        // point, ahead of the functional deref chase, since narrowing is
-        // strictly more precise where it applies (docs/adr/flow-narrowing.md).
-        // Keyed on the invocant's own spelling, the place narrowing witness
-        // rides the `Variable` query path like any scalar. `is_element_place`
-        // tells a real place from a scalar deref (`${$ref}` is not a hash).
-        if let Some(span) = invocant_span {
-            if InvocantText::parse(invocant).is_element_place() {
-                if let Some(cn) = self
-                    .inferred_type_via_bag_ctx(invocant, span.start, module_index)
-                    .and_then(|t| self.dispatch_class_of(&t, module_index))
-                {
-                    return Some(cn);
-                }
-            }
-        }
-
-        // The invocant's type, resolved tree-free from the bag at its
-        // span. Covers every recorded shape: scalar/array/hash reads,
-        // chain receivers (the `Expression(refidx)` axis), function-call
-        // receivers, baked literals.
-        if let Some(span) = invocant_span {
-            if let Some(cn) = self
-                .expr_type_at_span(*span, module_index)
-                .and_then(|t| self.dispatch_class_of(&t, module_index))
-            {
-                return Some(cn);
-            }
-        }
-
-        // Cross-file chain-receiver fallback. When the inner receiver's
-        // class is only knowable once other modules load (`$c->minion->
-        // enqueue` at enrichment), the build-time `Expr(span)` witness
-        // is absent and `method_call_return_type_via_bag` has no edge to
-        // chase. Re-resolve the receiver's own invocant class fresh with
-        // the index, then chase `MethodOnClass{class, method}` through
-        // `find_method_return_type` (ancestors + cross-file bridges via
-        // the registry). This is the one structure-from-refs step the
-        // bag can't pre-record, so it lives here, not in the builder.
-        if let Some(span) = invocant_span {
-            if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
-                let recv_span = self.refs[recv_idx].span;
-                let contained = recv_span.start == span.start
-                    && (recv_span.end.row, recv_span.end.column)
-                        <= (span.end.row, span.end.column);
-                let is_self = std::ptr::eq(&self.refs[recv_idx], r);
-                if contained && !is_self {
-                    if let RefKind::MethodCall { .. } = &self.refs[recv_idx].kind {
-                        let recv = &self.refs[recv_idx];
-                        if let Some(recv_class) =
-                            self.method_call_invocant_class(recv, module_index)
-                        {
-                            let recv_method = recv.unqualified_target_name();
-                            if crate::model::conventions::is_constructor_name(recv_method) {
-                                return Some(recv_class);
-                            }
-                            if let Some(cn) = self
-                                .find_method_return_type(
-                                    &recv_class,
-                                    recv_method,
-                                    module_index,
-                                    None,
-                                )
-                                .and_then(|t| self.dispatch_class_of(&t, module_index))
-                            {
-                                return Some(cn);
-                            }
-                        }
-                        return None;
-                    }
-                }
-            }
-        }
-
-        // Variable invocant. `expr_type_at_span` above only answers when
-        // the builder pre-recorded an `Expr(span)` — which it can't for a
-        // variable whose type flows from a cross-file source resolved
-        // only at enrichment (`my $x = $c->helper`, `$$x` re-typed once
-        // other modules load). Re-derive from the bag by the variable's
-        // name + position, threading the index so the chase follows the
-        // cross-file Variable edge. Same single bag query everything else
-        // uses; only the var name (which lives on the ref, not the span)
-        // brings us here instead of `expr_type_at_span`.
-        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
-        let first = invocant.as_bytes()[0];
-        if first == b'$' || first == b'@' || first == b'%' {
-            if let Some(cn) = self
-                .inferred_type_via_bag_ctx(invocant, point, module_index)
-                .and_then(|t| self.dispatch_class_of(&t, module_index))
-            {
-                return Some(cn);
-            }
-            // Conventional-invocant enclosing-class fallback for an untyped
-            // variable invocant. Other untyped variable invocants stay None —
-            // better than poisoning them with the surrounding package.
-            if crate::model::conventions::is_conventional_invocant_name(invocant) {
-                return self.enclosing_class_for_scope(r.scope);
-            }
-            return None;
-        }
-
-        // Bareword invocant. Could be a zero-arg sub returning ClassName
-        // (`app->routes` where `app` is plugin-emitted); promote that.
-        // Otherwise the bareword text *is* the class (`Foo->method`).
-        let bare = split_qualified(invocant).1;
-        if let Some(InferredType::ClassName(c)) = self.sub_return_type_at_arity(bare, Some(0)) {
-            return Some(c);
-        }
-
-        Some(invocant.to_string())
     }
 
     /// Resolve a DBIC source moniker (`Artist`) to the FQ result class
@@ -763,12 +604,54 @@ impl FileAnalysis {
             .next()
     }
 
-    /// Full `InferredType` of a `MethodCall` ref's invocant — same
-    /// dispatch shape as `method_call_invocant_class` but returning
-    /// the type, not just the class name. Lets readers that care
-    /// about Parametric narrowing (hash-key lookup for DBIC search-
-    /// family methods, etc.) inspect the `Parametric` flavor (via
-    /// `as_parametric`) without re-resolving the invocant from scratch.
+    /// The `InferredType` of a `MethodCall` ref's invocant — **the**
+    /// invocant ladder, resolved via the witness bag. No tree, no text
+    /// fallback, no per-reader parallel paths: every reader routes
+    /// through here, and `method_call_invocant_class` is its dispatch
+    /// projection. Token-blind by design: a `SUPER::`/`Foo::` method
+    /// qualifier overrides where lookup starts, never what the receiver
+    /// IS, so the token arm lives in the projection while Parametric
+    /// consumers (hash-key arg-claiming on `$rs->SUPER::search`) still
+    /// see the receiver's value here.
+    ///
+    /// A rung answers only when its type carries a dispatch class
+    /// (`dispatch_class_of`); a classless answer (bare `HashRef`, `Str`)
+    /// falls through so a deeper rung — ultimately the cross-file chain
+    /// fallback or the bareword rule — can still resolve. The one
+    /// exception is the variable rung, which returns its bag type
+    /// unprojected (a classless variable receiver has no deeper rung to
+    /// reach, and the flavor is still informative).
+    ///
+    /// Dispatch by invocant shape, in rung order:
+    ///   * plugin-bridged token → generic class-key resolution (the
+    ///     emitting plugin already applied its naming convention; no
+    ///     plugin consult here, and no richer flavor than the class).
+    ///   * positional receiver (`shift`/`$_[0]`) / `__PACKAGE__` →
+    ///     enclosing class (not real variables; the bag has no witness).
+    ///   * element place (`$self->{x}`, `$h{k}`) refined by a guard →
+    ///     the narrowing witness at the use-site point, ahead of the
+    ///     functional chase (docs/adr/flow-narrowing.md); `is_element_
+    ///     place` tells a real place from a scalar deref.
+    ///   * function-call receiver → the zero-arg return of the named sub
+    ///     (its ref spans only the name, invisible to the exact-span read).
+    ///   * any recorded expression → `expr_type_at_span` (scalar/array/
+    ///     hash reads, baked literals, and chain receivers — its
+    ///     exact-span call-ref arm keeps Parametric flavors intact, so
+    ///     DBIC row-class narrowing survives the hop).
+    ///   * cross-file chain receiver → re-resolve the receiver's class
+    ///     fresh with the index and chase `MethodOnClass` through
+    ///     `find_method_return_type` (the one structure-from-refs step
+    ///     the build-time bag can't pre-record).
+    ///   * `$var` / `@var` / `%var` → `inferred_type_via_bag_ctx` (so
+    ///     cross-file enrichment's variable types compose), with the
+    ///     conventional-invocant enclosing-class fallback.
+    ///   * bareword → a zero-arg ClassName-returning sub's class, else
+    ///     the bareword itself.
+    ///
+    /// Query-only: build-time chain typing already landed its product in
+    /// the bag; this never re-derives. `module_index` lets chain
+    /// receivers whose return type lives in another package resolve —
+    /// pass `None` only for CLI debug / isolated tests.
     pub fn method_call_invocant_type(
         &self,
         r: &Ref,
@@ -777,9 +660,6 @@ impl FileAnalysis {
         let RefKind::MethodCall { invocant, invocant_span, .. } = &r.kind else {
             return None;
         };
-        // Plugin-bridged token: generic class-key resolution (same seam as
-        // `method_call_invocant_class`); a route controller key has no
-        // richer flavor than its class identity.
         let invocant = match invocant {
             crate::model::conventions::Invocant::Bridged { token, match_mode, .. } => {
                 return self
@@ -796,26 +676,35 @@ impl FileAnalysis {
         if invocant.is_empty() {
             return None;
         }
-        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
 
-        // Positional receiver spellings and `__PACKAGE__` → enclosing class.
+        use crate::model::conventions::InvocantText;
         if matches!(
             invocant.classify(),
-            crate::model::conventions::InvocantText::PositionalReceiver
-                | crate::model::conventions::InvocantText::CurrentPackage
+            InvocantText::PositionalReceiver | InvocantText::CurrentPackage
         ) {
             return self.enclosing_class_for_scope(r.scope).map(InferredType::ClassName);
         }
 
-        // Chain / function-call receiver. Unlike the class-name path,
-        // this surfaces the full type so `Parametric` narrowing (DBIC
-        // `search`/`find` row-class) survives the hop — and that needs
-        // the *innermost* receiver ref (via `call_ref_by_start`), not an
-        // exact-span match, because the Parametric witness lands on the
-        // receiver-producing call's `Expression(refidx)`. `expr_type_at_
-        // span`'s exact-span chase intentionally collapses that flavor to
-        // a plain class, so the class-name path can route through it but
-        // this one cannot.
+        // Flow-narrowing place invocant.
+        if let Some(span) = invocant_span {
+            if InvocantText::parse(invocant).is_element_place() {
+                if let Some(t) = self.inferred_type_via_bag_ctx(invocant, span.start, module_index)
+                {
+                    if self.dispatch_class_of(&t, module_index).is_some() {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+
+        // Function-call receiver (`create_user(5)->name`): the ref spans
+        // only the function NAME, so the exact-span read below can't see
+        // it — chase it here via `call_ref_by_start` (start-anchored,
+        // contained in the invocant). A method-call receiver is left to
+        // the exact-span read: its ref spans the whole receiver
+        // expression, and the start-anchored index deliberately holds the
+        // INNERMOST call at a point, which for a multi-hop chain is a
+        // strict prefix of the receiver — the wrong hop.
         if let Some(span) = invocant_span {
             if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
                 let recv_span = self.refs[recv_idx].span;
@@ -824,37 +713,115 @@ impl FileAnalysis {
                         <= (span.end.row, span.end.column);
                 let is_self = std::ptr::eq(&self.refs[recv_idx], r);
                 if contained && !is_self {
-                    match &self.refs[recv_idx].kind {
-                        RefKind::MethodCall { .. } => {
-                            return self.method_call_return_type_via_bag(recv_idx, module_index);
+                    if let RefKind::FunctionCall { .. } = &self.refs[recv_idx].kind {
+                        if let Some(t) = self.sub_return_type_at_arity(
+                            &self.refs[recv_idx].target_name,
+                            Some(0),
+                        ) {
+                            if self.dispatch_class_of(&t, module_index).is_some() {
+                                return Some(t);
+                            }
                         }
-                        RefKind::FunctionCall { .. } => {
-                            return self.sub_return_type_at_arity(
-                                &self.refs[recv_idx].target_name,
-                                Some(0),
-                            );
-                        }
-                        _ => {}
                     }
                 }
             }
         }
 
-        // Variable invocant.
+        // The invocant's type, resolved tree-free from the bag at its
+        // exact span. Covers every recorded shape: scalar/array/hash
+        // reads, baked literals, and chain receivers — the exact-span
+        // call-ref arm inside `expr_type_at_span` reads the receiver
+        // call's bag return with Parametric flavors intact, so DBIC
+        // row-class narrowing survives the hop.
+        if let Some(span) = invocant_span {
+            if let Some(t) = self.expr_type_at_span(*span, module_index) {
+                if self.dispatch_class_of(&t, module_index).is_some() {
+                    return Some(t);
+                }
+            }
+        }
+
+        // Cross-file chain-receiver fallback. When the inner receiver's
+        // class is only knowable once other modules load (`$c->minion->
+        // enqueue` at enrichment), the build-time `Expr(span)` witness
+        // is absent and `method_call_return_type_via_bag` has no edge to
+        // chase. Re-resolve the receiver's own invocant class fresh with
+        // the index, then chase `MethodOnClass{class, method}` through
+        // `find_method_return_type` (ancestors + cross-file bridges via
+        // the registry). This is the one structure-from-refs step the
+        // bag can't pre-record, so it lives here, not in the builder.
+        if let Some(span) = invocant_span {
+            if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
+                let recv_span = self.refs[recv_idx].span;
+                let contained = recv_span.start == span.start
+                    && (recv_span.end.row, recv_span.end.column)
+                        <= (span.end.row, span.end.column);
+                let is_self = std::ptr::eq(&self.refs[recv_idx], r);
+                if contained && !is_self {
+                    if let RefKind::MethodCall { .. } = &self.refs[recv_idx].kind {
+                        let recv = &self.refs[recv_idx];
+                        if let Some(recv_class) =
+                            self.method_call_invocant_class(recv, module_index)
+                        {
+                            let recv_method = recv.unqualified_target_name();
+                            if crate::model::conventions::is_constructor_name(recv_method) {
+                                return Some(InferredType::ClassName(recv_class));
+                            }
+                            if let Some(t) = self.find_method_return_type(
+                                &recv_class,
+                                recv_method,
+                                module_index,
+                                None,
+                            ) {
+                                return Some(t);
+                            }
+                        }
+                        // A chain receiver's invocant text is the whole
+                        // receiver expression, never a variable or
+                        // bareword — the trailing rungs cannot answer it.
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // Variable invocant. `expr_type_at_span` above only answers when
+        // the builder pre-recorded an `Expr(span)` — which it can't for a
+        // variable whose type flows from a cross-file source resolved
+        // only at enrichment (`my $x = $c->helper`, `$$x` re-typed once
+        // other modules load). Re-derive from the bag by the variable's
+        // name + position, threading the index so the chase follows the
+        // cross-file Variable edge. Same single bag query everything else
+        // uses; only the var name (which lives on the ref, not the span)
+        // brings us here instead of `expr_type_at_span`.
+        let point = invocant_span.map(|s| s.start).unwrap_or(r.span.start);
         let first = invocant.as_bytes()[0];
         if first == b'$' || first == b'@' || first == b'%' {
             if let Some(t) = self.inferred_type_via_bag_ctx(invocant, point, module_index) {
+                // A conventional invocant (`$self`/`$class`/...) whose bag
+                // type carries no dispatch class still dispatches on the
+                // enclosing class — identity outranks a classless value
+                // type (`$self->{count}++` observations must not demote
+                // `$self` to a plain hashref).
+                if self.dispatch_class_of(&t, module_index).is_none()
+                    && crate::model::conventions::is_conventional_invocant_name(invocant)
+                {
+                    return self.enclosing_class_for_scope(r.scope).map(InferredType::ClassName);
+                }
                 return Some(t);
             }
+            // Enclosing-class fallback for an untyped conventional
+            // invocant. Other untyped variable invocants stay None —
+            // better than poisoning them with the surrounding package.
             if crate::model::conventions::is_conventional_invocant_name(invocant) {
                 return self.enclosing_class_for_scope(r.scope).map(InferredType::ClassName);
             }
             return None;
         }
 
-        // Bareword: the bareword *is* the class (or a zero-arg
-        // ClassName-returning sub — same rule as
-        // `method_call_invocant_class`'s bareword branch).
+        // Bareword invocant. Could be a zero-arg sub returning ClassName
+        // (`app->routes` where `app` is plugin-emitted); promote that.
+        // Otherwise the bareword text *is* the class (`Foo->method`).
         let bare = split_qualified(invocant).1;
         if let Some(InferredType::ClassName(c)) = self.sub_return_type_at_arity(bare, Some(0)) {
             return Some(InferredType::ClassName(c));

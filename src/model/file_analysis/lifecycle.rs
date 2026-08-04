@@ -227,9 +227,8 @@ impl FileAnalysis {
     pub(crate) fn finalize_post_walk(&mut self) {
         self.resolve_method_call_types(None);
         // Fill HashKeyAccess owners that are resolvable in-file
-        // via the chain-recursion dispatcher
-        // (`method_call_invocant_type`'s `call_ref_by_start`
-        // walk). Cross-file gaps stay None until
+        // via the invocant ladder (`method_call_invocant_type`).
+        // Cross-file gaps stay None until
         // `enrich_imported_types_with_keys` re-runs the same
         // routine with `module_index`.
         self.fix_chain_receiver_hash_key_owners(None);
@@ -347,7 +346,10 @@ impl FileAnalysis {
                 continue;
             };
             let Some(p) = ty.as_parametric() else { continue };
-            let Some(o) = p.method_arg_owner(&call.target_name) else { continue };
+            // Bare method name: a qualified spelling (`SUPER::search`,
+            // `Foo::search`) claims args exactly like the bare one — the
+            // flavor's vocabulary is unqualified.
+            let Some(o) = p.method_arg_owner(call.unqualified_target_name()) else { continue };
             owner_fixes.push((i, o));
         }
         for (i, o) in owner_fixes {

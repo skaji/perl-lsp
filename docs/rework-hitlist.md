@@ -17,55 +17,22 @@ XL (an arc).
 The CandidateSet ADR's promise is "identity minted exactly once." Four
 confirmed findings show verbs and tiers that still mint their own.
 
-### A1. `method_call_invocant_class` is documented as a thin projection but is the primary ladder; the typed sibling is a diverging hand-copy — **high leverage / M**
+### A1. LANDED — `method_call_invocant_type` is THE invocant ladder; `method_call_invocant_class` is its dispatch projection
 
-**The wrong embedding.** CLAUDE.md rule 10 says the back-compat wrappers "each
-call the typed sibling and project at the consumer." For invocant resolution
-that is false: `method_call_invocant_class` delegates to
-`method_call_invocant_class_raw` (`src/model/file_analysis/resolution.rs:383-577`),
-a ~190-line string-returning dispatch ladder, while the typed
-`method_call_invocant_type` (`resolution.rs:772-863`) is a separately maintained
-parallel ladder missing three rungs the string ladder has: the
-MethodToken/SUPER qualified-dispatch arm (`resolution.rs:429-450`), the
-flow-narrowing place-invocant arm (`:466-482`), and the cross-file
-chain-receiver fallback (`:497-539`). Caller split: ~15 non-test sites ride the
-string ladder (every nav verb — `index/resolve/collect.rs:1113`,
-`identity.rs:156`, `definitions.rs:319,884`, `lsp/symbols/hover.rs:28`,
-`lifecycle.rs:271`) vs exactly one on the typed ladder (`lifecycle.rs:344`) —
-so the dispatch-target freeze pass and the Parametric hash-key-owner fix
-resolve the *same* MethodCall refs through *different* ladders.
-
-**Why it is wrong at the system level.** This is rule 10's lossy-string bullet
-inverted: the string projection became the contract and the rich type became
-the orphan. Every new invocant shape must be added twice or the forks drift —
-and they already answer differently (`$self->SUPER::search(...)` on a DBIC
-parent resolves through the SUPER arm for goto-def but the typed ladder skips
-the token, so `fix_chain_receiver_hash_key_owners` silently never fills the key
-owner). The doc records a cleanup that did not land.
-
-**Target shape.** `method_call_invocant_type` becomes the ONE ladder: absorb
-the SUPER arm (Super → `resolve_super_method(..).map(ClassName)`), the
-flow-narrowing arm (drop the `dispatch_class_of` projection —
-`inferred_type_via_bag_ctx` is already type-returning), and the cross-file
-chain-receiver fallback (`find_method_return_type` already returns
-`InferredType`). Keep the Parametric-preserving innermost-receiver chase
-(`resolution.rs:819-841`) ordered before the exact-span read; the
-collapse-to-class happens only in the projection. `method_call_invocant_class`
-reduces to `method_call_invocant_type(r, idx).and_then(|t|
-dispatch_class_of(t)).map(resolve_dbic_source_moniker)`; delete
-`method_call_invocant_class_raw`. Fix `lifecycle.rs:348` to pass the
-unqualified target name while there.
-
-**Migration order.** Absorb rungs one at a time into the typed ladder with the
-string ladder still live; flip the wrapper; delete the raw ladder. Land BEFORE
-the parked three-text-resolver collapse (docs/prompt-cst-migration.md item 3),
-which wants this unified ladder as its landing seam.
-
-**Gate.** `chain_tests.rs`, `parametric_resultset_tests.rs`,
-`narrowing_tests.rs`, `file_analysis_tests.rs` all assert through the class
-wrapper — projection-equivalence is directly tested. Gold rows on DBIC/Mojo
-fixtures net the SUPER/chain behavior. Update CLAUDE.md's rule-10 wrapper
-sentence when it lands so the doc stops lying.
+`method_call_invocant_type` (`src/model/file_analysis/resolution.rs`) is the
+one invocant ladder — token-blind receiver-VALUE resolution (bridged /
+positional / flow-narrowed place / function-call receiver / exact-span read
+incl. Parametric-intact chain receivers / cross-file chain fallback / variable
+/ bareword; a rung answers only when its type carries a dispatch class, so
+classless answers fall through). `method_call_invocant_class` is its dispatch
+projection: the SUPER/qualified method-token arm (a token overrides where
+lookup STARTS, never what the receiver IS) + `dispatch_class_of` + the DBIC
+source-moniker resolve. `method_call_invocant_class_raw` is deleted;
+`fix_chain_receiver_hash_key_owners` asks `method_arg_owner` with the
+unqualified method name, so `$rs->SUPER::search({k => 1})` now fills the
+row-class key owner (pinned by
+`super_qualified_search_still_fills_hash_key_owner`). The three-text-resolver
+collapse (docs/prompt-cst-migration.md item 3) lands on this seam.
 
 ### A2. documentHighlight and linkedEditingRange bypass the CandidateSet through a second identity implementation — and the in-file family has already drifted three ways — **high leverage / L**
 
