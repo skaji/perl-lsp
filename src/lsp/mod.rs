@@ -2,6 +2,8 @@
 //! types; no analysis, no tree walks, no Perl semantics decisions.
 
 pub mod backend;
+// the one-shot CLI modes (`perl-lsp --…`) main() dispatches to
+pub mod cli;
 pub mod cursor_context;
 // one Slot vocabulary over cursor_context (Perl) + cursor_sentinel
 // (pack); consumers switch on Slot, never on language
@@ -10,4 +12,6 @@ pub mod cursor_slot;
 // request/notification boundary (no crate:: imports, DAG-neutral)
 pub mod panic_guard;
 pub mod plugin_cli;
+// blocking-thread stdio bridge for the server transport (see its header)
+pub mod stdio_bridge;
 pub mod symbols;
