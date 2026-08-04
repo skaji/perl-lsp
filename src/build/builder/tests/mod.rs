@@ -1,0 +1,33 @@
+use super::*;
+
+fn parse(source: &str) -> Tree {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    parser.parse(source, None).unwrap()
+}
+
+fn build_fa(source: &str) -> FileAnalysis {
+    let tree = parse(source);
+    build(&tree, source.as_bytes())
+}
+
+mod core_tests;
+mod refs_types_tests;
+mod queries_recovery_tests;
+mod inheritance_tests;
+mod frameworks_tests;
+mod plugins_mojo_tests;
+mod plugins_queries_tests;
+mod plugins_more_tests;
+mod synthetic_isa_tests;
+mod exports_runtime_tests;
+mod globs_accessors_tests;
+mod slots_hashkeys_tests;
+
+#[path = "../narrowing_tests.rs"]
+mod narrowing;
+
+#[path = "../pattern_dispatch_tests.rs"]
+mod pattern_dispatch;
