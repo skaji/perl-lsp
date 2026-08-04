@@ -1,0 +1,822 @@
+//! Diagnostics: unresolved names, the narrowing family, `DiagnosticOptions`.
+
+use super::*;
+
+// ---- Diagnostics ----
+
+/// Sorted list of Perl built-in functions. Used to avoid false-positive
+/// "unresolved function" diagnostics. Checked via binary_search.
+pub(super) static PERL_BUILTINS: &[&str] = &[
+    // Core bareword filehandles. Uppercase sorts before the lowercase
+    // builtin names below (ASCII), so the slice stays binary-searchable.
+    // Suppresses `print DATA`, `STDOUT->autoflush`, `-t STDIN` style FPs.
+    "ARGV", "ARGVOUT", "DATA", "STDERR", "STDIN", "STDOUT",
+    "abs", "accept", "alarm", "atan2",
+    "bind", "binmode", "bless",
+    "caller", "chdir", "chmod", "chomp", "chop", "chown", "chr", "chroot", "close",
+    "closedir", "connect", "cos", "crypt",
+    "dbmclose", "dbmopen", "defined", "delete", "die", "do", "dump",
+    "each", "endgrent", "endhostent", "endnetent", "endprotoent", "endpwent",
+    "endservent", "eof", "eval", "exec", "exists", "exit",
+    "fcntl", "fileno", "flock", "fork", "format", "formline",
+    "getc", "getgrent", "getgrgid", "getgrnam", "gethostbyaddr", "gethostbyname",
+    "gethostent", "getlogin", "getnetbyaddr", "getnetbyname", "getnetent",
+    "getpeername", "getpgrp", "getppid", "getpriority", "getprotobyname",
+    "getprotobynumber", "getprotoent", "getpwent", "getpwnam", "getpwuid",
+    "getservbyname", "getservbyport", "getservent", "getsockname", "getsockopt",
+    "glob", "gmtime", "goto", "grep",
+    "hex",
+    "import", "index", "int", "ioctl",
+    "join",
+    "keys", "kill",
+    "last", "lc", "lcfirst", "length", "link", "listen", "local", "localtime", "log",
+    "lstat",
+    "map", "mkdir", "msgctl", "msgget", "msgrcv", "msgsnd",
+    "my",
+    "new", "next", "no", "not",
+    "oct", "open", "opendir", "ord", "our",
+    "pack", "pipe", "pop", "pos", "print", "printf", "prototype", "push",
+    "quotemeta",
+    "rand", "read", "readdir", "readline", "readlink", "readpipe", "recv", "redo",
+    "ref", "rename", "require", "reset", "return", "reverse", "rewinddir", "rindex",
+    "rmdir",
+    "say", "scalar", "seek", "seekdir", "select", "semctl", "semget", "semop", "send",
+    "setgrent", "sethostent", "setnetent", "setpgrp", "setpriority", "setprotoent",
+    "setpwent", "setservent", "setsockopt", "shift", "shmctl", "shmget", "shmread",
+    "shmwrite", "shutdown", "sin", "sleep", "socket", "socketpair", "sort", "splice",
+    "split", "sprintf", "sqrt", "srand", "stat", "state", "study", "sub", "substr",
+    "symlink", "syscall", "sysopen", "sysread", "sysseek", "system", "syswrite",
+    "tell", "telldir", "tie", "tied", "time", "times", "truncate",
+    "uc", "ucfirst", "umask", "undef", "unlink", "unpack", "unshift", "untie", "use",
+    "utime",
+    "values", "vec",
+    "wait", "waitpid", "wantarray", "warn", "write",
+];
+
+pub(super) fn is_perl_builtin(name: &str) -> bool {
+    PERL_BUILTINS.binary_search(&name).is_ok()
+}
+
+
+/// Opt-in diagnostic toggles. Defaults are all-off for the QA/plugin-author
+/// channels (noise for end users); the always-on hints (`unresolved-function`
+/// / `unresolved-method`) ignore this.
+///
+/// **The struct is the schema.** `rename_all = "camelCase"` makes each field
+/// its own LSP key under `initializationOptions.diagnostics`, so `backend.rs`
+/// parses the whole block with one `serde_json::from_value` — no hand-mapped
+/// key strings to drift. `default` fills any absent key with `false`. The CLI
+/// surface (`DiagnosticOptions::from_cli_args`) is the one spelling serde
+/// can't derive; `cli_flags_match_diagnostic_option_fields` guards it against
+/// drift. A `Config` god-struct, a generated editor schema, and richer
+/// per-code config are a design note in `docs/prompt-config-schema.md`. See
+/// `docs/adr/receiver-gated-dispatch.md`, `docs/adr/narrowing-diagnostics.md`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DiagnosticOptions {
+    /// Fire `unresolved-dispatch` when a known dispatch verb's receiver can't
+    /// be typed (`GateResult::ReceiverUntyped`) — never on a settled
+    /// `DoesNotApply`. Off by default.
+    pub unresolved_dispatch: bool,
+    /// Fire `use-after-move` on the decidable subset (straight-line, in-function,
+    /// local-only moved-then-used). Pack-language (C++) channel, off by default —
+    /// it is a heuristic-adjacent lane whose honest subset is narrow. See
+    /// `use_after_move_reads` / `docs/adr/use-after-move.md`.
+    pub use_after_move: bool,
+    /// Extend `unresolved-method` past locally-defined classes to any
+    /// cross-file-resolvable class (D8). The local case is always-on; this
+    /// opt-in lifts the `is_local_class` gate so a narrowed or otherwise
+    /// cross-file-typed receiver (`$x->isa('Some::Dep'); $x->bogus`) is
+    /// checked too, gated by the same complete-ancestry honest-silent valve.
+    /// Off by default: cross-file classes carry more codegen/XS methods the
+    /// static walker can't see (the diag-09/10 Log4perl-accessor class), so
+    /// it earns trust before promotion. See docs/adr/narrowing-diagnostics.md.
+    pub unresolved_method_cross_file: bool,
+    /// Fire `optional-deref` (D2) when a receiver is `Optional<T>` at an
+    /// unguarded use point (a possible undef deref — the strictNullChecks
+    /// analog). Narrowing strips the `Optional` under a dominating
+    /// `defined`/`blessed` guard, so a surviving `Optional` is unguarded by
+    /// construction. "May be undef", not "is" — opt-in, INFORMATION severity,
+    /// with a guard-insertion quick-fix. Off by default.
+    pub optional_deref: bool,
+    /// Fire `redundant-guard` (D3) / `contradictory-guard` (D4): a guard whose
+    /// outcome is constant given the subject's prior type (`if (defined $x)`
+    /// where `$x` is already a confident value; `$x->isa('Foo')` where `$x` is
+    /// already `Foo` or an unrelated class). Off by default — needs confident
+    /// prior types and MRO relatedness, so it earns trust before promotion.
+    pub redundant_guard: bool,
+    /// Fire `deref-shape-mismatch` (D6): a deref whose form demands one
+    /// container rep while a `ref…eq` guard proved another (`$x->{k}` on
+    /// array/code, `$x->[i]` on hash/code, `$x->()` on hash/array) — a
+    /// guaranteed runtime die. Guard-narrowed reps only; objects are never a
+    /// mismatch. Off by default.
+    pub deref_shape: bool,
+}
+
+impl DiagnosticOptions {
+    /// Parse the opt-in flags from CLI args (`--optional-deref`, …). The kebab
+    /// flag for each field mirrors its serde camelCase key; the mapping is
+    /// explicit here (serde doesn't parse argv) and pinned by
+    /// `cli_flags_match_diagnostic_option_fields`.
+    pub fn from_cli_args(args: &[String]) -> Self {
+        let has = |flag: &str| args.iter().any(|a| a == flag);
+        DiagnosticOptions {
+            unresolved_dispatch: has("--unresolved-dispatch"),
+            use_after_move: has("--use-after-move"),
+            unresolved_method_cross_file: has("--unresolved-method-cross-file"),
+            optional_deref: has("--optional-deref"),
+            redundant_guard: has("--redundant-guard"),
+            deref_shape: has("--deref-shape"),
+        }
+    }
+}
+
+pub fn collect_diagnostics(
+    analysis: &FileAnalysis,
+    module_index: &ModuleIndex,
+    options: DiagnosticOptions,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // Plugin-emitted diagnostics (pattern lints) — already decided at
+    // build time; here they only render. Severity vocabulary is the
+    // plugin's; unknown strings degrade to HINT rather than shouting.
+    for pd in &analysis.plugin_diagnostics {
+        diagnostics.push(Diagnostic {
+            range: span_to_range(pd.span),
+            severity: Some(match pd.severity.as_str() {
+                "error" => DiagnosticSeverity::ERROR,
+                "warning" => DiagnosticSeverity::WARNING,
+                "info" => DiagnosticSeverity::INFORMATION,
+                _ => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(pd.code.clone())),
+            source: Some(format!("perl-lsp/{}", pd.plugin_id)),
+            message: pd.message.clone(),
+            ..Default::default()
+        });
+    }
+
+    // Snapshot each `use` once: its bound set (local→remote) and, when the
+    // producer is cached, the names on its (transitive) export surface. The
+    // resolvability verdict for a given call name is then a map lookup against
+    // this snapshot — the same logic as `classify_import`, but the surface walk
+    // and `imported_names` allocation happen once per import instead of once per
+    // (unresolved-ref × import) on every diagnostics publish (every keystroke).
+    // Diagnostics need only the import + verdict, not the producer path or the
+    // remote name `classify_import` also returns — so neither is computed here.
+    struct ImportBinding<'a> {
+        import: &'a crate::model::file_analysis::Import,
+        /// local → remote for everything this `use` brings into scope.
+        bound: HashMap<String, String>,
+        /// Names on the producer's export surface; `None` when not yet cached.
+        exported: Option<std::collections::HashSet<String>>,
+    }
+    let import_bindings: Vec<ImportBinding> = analysis
+        .imports
+        .iter()
+        .map(|import| {
+            let cached = module_index.get_cached(&import.module_name);
+            let (bound, exported) = if let Some(c) = &cached {
+                let surface = c.analysis.export_surface_with_index(module_index);
+                let bound = crate::model::file_analysis::imported_names(import, &surface)
+                    .into_iter()
+                    .collect();
+                (bound, Some(surface.all_names()))
+            } else {
+                // Producer not cached yet: only an explicitly-named import can be
+                // judged `Brought` (tags / bare-use defaults need the surface).
+                let bound = import
+                    .imported_symbols
+                    .iter()
+                    .map(|s| (s.local_name.clone(), s.remote().to_string()))
+                    .collect();
+                (bound, None)
+            };
+            ImportBinding { import, bound, exported }
+        })
+        .collect();
+
+    // Best resolution of a call name across all imports: `Brought` dominates
+    // `ExportedNotBrought`. Mirrors `resolve_imported_function_classified` over
+    // the precomputed snapshot.
+    let resolve_name = |name: &str| -> Option<(&crate::model::file_analysis::Import, ImportResolution)> {
+        let mut best: Option<(&crate::model::file_analysis::Import, ImportResolution)> = None;
+        for b in &import_bindings {
+            let res = if b.bound.contains_key(name) {
+                ImportResolution::Brought
+            } else if b.exported.as_ref().is_some_and(|e| e.contains(name)) {
+                ImportResolution::ExportedNotBrought
+            } else {
+                continue;
+            };
+            if matches!(best, Some((_, ImportResolution::Brought))) {
+                continue;
+            }
+            best = Some((b.import, res));
+        }
+        best
+    };
+
+    for r in &analysis.refs {
+        if !matches!(r.kind, RefKind::FunctionCall { .. }) {
+            continue;
+        }
+        let name = &r.target_name;
+
+        // Skip package-qualified calls like Foo::bar()
+        if crate::model::file_analysis::split_qualified(name).0.is_some() {
+            continue;
+        }
+
+        // Skip code deref calls like &{$var}()
+        if name.starts_with('&') {
+            continue;
+        }
+
+        // Skip Perl builtins
+        if is_perl_builtin(name) {
+            continue;
+        }
+
+        // Skip locally defined subs
+        if !analysis.symbols_named(name).is_empty() {
+            continue;
+        }
+
+        // Skip functions implicitly imported by OOP frameworks (has, extends, etc.)
+        if analysis.framework_imports.contains(name.as_str()) {
+            continue;
+        }
+
+        // Single resolvability verdict — the same query goto-def reads, so a
+        // name goto-def can jump to is never flagged as unresolved here (NAV
+        // § (c)). `Brought` = the name is in scope (named in qw, pulled in by a
+        // `:tag` selector against the producer surface, or auto-imported by a
+        // bare `use`); `ExportedNotBrought` = importable but not yet in the qw
+        // list → actionable hint.
+        //
+        // Bare-use auto-import deliberately treats `export_ok` as brought:
+        // runtime exporters (Moose::Exporter->setup_import_methods etc.) record
+        // their names in `export_ok` because the builder can't tell "runtime
+        // default" from "explicit opt-in" at parse time, so flagging them
+        // produced ~684 FPs (Moose::Util::TypeConstraints &c.). Traditional
+        // opt-in `@EXPORT_OK` on a bare use is suppressed too — accepted.
+        let range = span_to_range(r.span);
+        let resolution = resolve_name(name);
+        match resolution {
+            Some((_, ImportResolution::Brought)) => continue,
+            Some((import, ImportResolution::ExportedNotBrought)) => {
+                diagnostics.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::HINT),
+                    code: Some(NumberOrString::String("unresolved-function".into())),
+                    source: Some("perl-lsp".into()),
+                    message: format!(
+                        "'{}' is exported by {} but not imported",
+                        name, import.module_name,
+                    ),
+                    data: Some(serde_json::json!({
+                        "module": import.module_name,
+                        "function": name,
+                    })),
+                    ..Default::default()
+                });
+            }
+            None => {
+                // Search ALL cached modules for this function.
+                let exporters = module_index.find_exporters(name);
+                if !exporters.is_empty() {
+                    let msg = if exporters.len() == 1 {
+                        format!(
+                            "'{}' is exported by {} (not yet imported)",
+                            name, exporters[0],
+                        )
+                    } else {
+                        format!(
+                            "'{}' is exported by {} and {} other module(s)",
+                            name,
+                            exporters[0],
+                            exporters.len() - 1,
+                        )
+                    };
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::HINT),
+                        code: Some(NumberOrString::String("unresolved-function".into())),
+                        source: Some("perl-lsp".into()),
+                        message: msg,
+                        data: Some(serde_json::json!({
+                            "modules": exporters,
+                            "function": name,
+                        })),
+                        ..Default::default()
+                    });
+                } else {
+                    // HINT (not INFORMATION): an unresolved bareword call is
+                    // often a genuinely-dynamic sub (AUTOLOAD, runtime glob
+                    // install, a not-installed dep) the static walker can't see.
+                    // Keep it the quietest visible severity so a Moose/AUTOLOAD-
+                    // heavy codebase doesn't light up the Problems panel.
+                    diagnostics.push(Diagnostic {
+                        range,
+                        severity: Some(DiagnosticSeverity::HINT),
+                        code: Some(NumberOrString::String("unresolved-function".into())),
+                        source: Some("perl-lsp".into()),
+                        message: format!("'{}' is not defined in this file", name),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
+    // 5e: Unresolved method diagnostics for locally-defined classes.
+    // Rule-#10 debt: the framework entries below (DBIC/Moose) belong to the
+    // frameworks, not core diagnostics — they move out when plugins can
+    // register meta-methods (docs/prompt-dbic-as-plugin.md) or the Openness
+    // rule lands (docs/prompt-graph-walking.md, Openness).
+    let universal_methods = [
+        "new", "AUTOLOAD", "DESTROY", "can", "isa", "DOES",
+        // Moose adds lowercase `does` alongside UNIVERSAL's uppercase DOES.
+        "does",
+        "VERSION",
+        // DBIC meta-methods (inherited from DBIx::Class::Core)
+        "add_columns", "add_column", "set_primary_key", "table", "resultset_class",
+        "has_many", "has_one", "belongs_to", "might_have", "many_to_many",
+        "load_components", "load_own_components",
+        // Moose/Moo meta-methods
+        "meta",
+    ];
+    for r in &analysis.refs {
+        let (invocant, _invocant_span) = match &r.kind {
+            // A plugin-bridged token is plugin-resolved, not a receiver we
+            // can flag as an unresolved method — skip it.
+            RefKind::MethodCall { invocant, invocant_span, .. } => match invocant.as_name() {
+                Some(n) => (n, invocant_span),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let method_name = &r.target_name;
+
+        // Skip universal methods
+        if universal_methods.contains(&method_name.as_str()) {
+            continue;
+        }
+
+        // Skip SUPER::-qualified and other package-qualified method names.
+        // `$self->SUPER::foo()` stores `target_name = "SUPER::foo"`; trying
+        // to find a method literally named "SUPER::foo" in the MRO always
+        // fails. Caller-side package dispatch (`Class::method`) is intentional
+        // and not our job to validate here.
+        use crate::model::conventions::{InvocantText, MethodToken};
+        if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
+            continue;
+        }
+
+        // Resolve invocant to class name. Diagnostics stays bag-only for
+        // scalars — no enclosing-class fallback, which would manufacture
+        // warnings on untyped invocants — and skips everything else.
+        let class_name = match invocant.classify() {
+            InvocantText::Bareword(b) => Some(b.to_string()),
+            InvocantText::Scalar(_) => analysis.inferred_type_via_bag(invocant, r.span.start)
+                .and_then(|ty| ty.class_name().map(|s| s.to_string())),
+            _ => None,
+        };
+        let class_name = match class_name {
+            Some(cn) => cn,
+            None => continue,
+        };
+
+        // Fire for classes we can fully see. Always-on: classes defined in
+        // THIS file (high precision — you wrote it, the walker sees its
+        // methods). Opt-in (D8): also cross-file-resolvable classes, so a
+        // narrowed or cross-file-typed receiver is checked. A class that is
+        // neither local nor cached is external/uninstalled — stay silent, we
+        // can't enumerate its methods. The complete-ancestry valve below is
+        // the shared honest-silent guard for both.
+        let is_local_class = analysis.symbols.iter().any(|s| {
+            matches!(s.kind, FaSymKind::Class | FaSymKind::Package) && s.name == class_name
+        });
+        let is_cached_class =
+            options.unresolved_method_cross_file && module_index.get_cached(&class_name).is_some();
+        if !is_local_class && !is_cached_class {
+            continue;
+        }
+
+        // A local class must define ≥1 method we can see (else it's likely a
+        // forward decl / external alias re-opened here). A cached cross-file
+        // class is already a real module — its methods live in its analysis,
+        // which `resolve_method_in_ancestors` consults below.
+        let has_methods = is_cached_class
+            || analysis.symbols.iter().any(|s| {
+                matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
+                    && analysis.symbol_in_class(s.id, &class_name)
+            });
+        if !has_methods {
+            continue;
+        }
+
+        // Check if the method exists in the class (walks inheritance chain)
+        if analysis.resolve_method_in_ancestors(&class_name, method_name, Some(module_index)).is_some() {
+            continue;
+        }
+
+        // A class with `AUTOLOAD` anywhere in its MRO answers ANY method name at
+        // runtime, so the static `sub` set isn't its real surface — stay silent
+        // (the role-contracts diagnostic uses the same skip, file_analysis.rs).
+        if analysis.resolve_method_in_ancestors(&class_name, "AUTOLOAD", Some(module_index)).is_some() {
+            continue;
+        }
+
+        // Honest-silent on an incomplete ISA chain: if `class_name` (or any
+        // resolvable ancestor) names a parent we can't resolve in the
+        // workspace or @INC, the method might be inherited from there. One
+        // predicate gates EVERY invocant-typing path (`$self`/FirstParam and
+        // direct `Pkg->m` alike), so they can't drift (rule #10).
+        if analysis.class_has_unresolved_ancestor(&class_name, Some(module_index)) {
+            continue;
+        }
+
+        diagnostics.push(Diagnostic {
+            range: span_to_range(r.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unresolved-method".into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "'{}' is not defined in {}",
+                method_name, class_name,
+            ),
+            ..Default::default()
+        });
+    }
+
+    // 5g: undef-deref (D1) — a method call or hash deref on a receiver the
+    // lattice proves is `Undef` at that point (the `else` of `if defined`,
+    // the fall-through after `return if defined`, an `unless defined` body).
+    // Runtime is a hard die. Maximal confidence — the type *is* undef, not
+    // *may be* — so this is always-on `WARNING`, the one narrowing diagnostic
+    // that doesn't wait behind an opt-in flag (rule #10: it reads the type
+    // at the use point, never the syntax). See docs/adr/narrowing-diagnostics.md.
+    // D2 (`optional-deref`) shares this same lattice read: a receiver typed
+    // `Optional<T>` at an UNGUARDED use point — narrowing already strips the
+    // `Optional` wherever a `defined`/`blessed` guard dominates, so a
+    // surviving `Optional` here is unguarded by construction. "May be undef",
+    // not "is" → opt-in, INFORMATION, with a guard-insertion quick-fix.
+    for site in analysis.deref_receiver_sites(Some(module_index)) {
+        match &site.receiver_ty {
+            InferredType::Undef => {
+                diagnostics.push(Diagnostic {
+                    range: span_to_range(site.span),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: Some(NumberOrString::String("undef-deref".into())),
+                    source: Some("perl-lsp".into()),
+                    message: format!(
+                        "'{}' is undef here; {} on it dies at runtime",
+                        site.receiver,
+                        site.form.access_phrase(),
+                    ),
+                    ..Default::default()
+                });
+            }
+            InferredType::Optional(_) if options.optional_deref => {
+                diagnostics.push(Diagnostic {
+                    range: span_to_range(site.span),
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    code: Some(NumberOrString::String("optional-deref".into())),
+                    source: Some("perl-lsp".into()),
+                    // The quick-fix reads the receiver back to synthesize
+                    // `return unless defined $r;`.
+                    data: Some(serde_json::json!({ "receiver": site.receiver })),
+                    message: format!(
+                        "'{}' may be undef here; {} on it could die — guard with `defined`",
+                        site.receiver,
+                        site.form.access_phrase(),
+                    ),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+
+        // D6 — a deref whose form demands one container rep while a `ref…eq`
+        // guard proved the receiver is another (a guaranteed runtime die).
+        // Read the GUARD-narrowed rep specifically: a deref self-infers its
+        // own demanded rep as a zero-extent witness at the use point, masking
+        // any conflict under the merged query, so only a guard surfaces here.
+        // `RepKind::of` answers `None` for objects (overloadable) — never a
+        // mismatch.
+        if options.deref_shape {
+            if let Some(demanded) = site.form.demands_rep() {
+                if let Some(rep) = analysis
+                    .guard_narrowed_rep(&site.receiver, site.span.start)
+                    .and_then(|t| crate::model::file_analysis::RepKind::of(&t))
+                {
+                    if rep != demanded {
+                        diagnostics.push(Diagnostic {
+                            range: span_to_range(site.span),
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            code: Some(NumberOrString::String("deref-shape-mismatch".into())),
+                            source: Some("perl-lsp".into()),
+                            message: format!(
+                                "'{}' is {} here; {} dies at runtime",
+                                site.receiver,
+                                rep.noun(),
+                                site.form.access_phrase(),
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // D3/D4 — a guard whose outcome the lattice already fixes: redundant
+    // (always true → the `else` is dead) or contradictory (always false →
+    // the `then` is dead). Opt-in; gated hard on confident prior types in
+    // `guard_redundancies` (rule #10 — the type answers, never the syntax).
+    if options.redundant_guard {
+        for g in analysis.guard_redundancies(Some(module_index)) {
+            let code = match g.verdict {
+                GuardVerdict::AlwaysTrue => "redundant-guard",
+                GuardVerdict::AlwaysFalse => "contradictory-guard",
+            };
+            let message = render_guard_message(&g);
+            diagnostics.push(Diagnostic {
+                range: span_to_range(g.span),
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                code: Some(NumberOrString::String(code.into())),
+                source: Some("perl-lsp".into()),
+                message,
+                ..Default::default()
+            });
+        }
+    }
+
+    // 5f: role-requires-unfulfilled — the composer-mismatch contract
+    // check (docs/adr/role-contracts.md). WARNING, not HINT: Perl
+    // dies at composition time for this. Anchored to the `with 'Role'`
+    // PackageRef inside the composing package; the package decl is the
+    // fallback (e.g. the parent edge came from a raw `@ISA` push).
+    for u in analysis.unfulfilled_role_requires(Some(module_index)) {
+        let span = analysis
+            .refs
+            .iter()
+            .find(|r| {
+                matches!(r.kind, RefKind::PackageRef)
+                    && r.target_name == u.via_parent
+                    && analysis.package_at(r.span.start) == Some(u.package.as_str())
+            })
+            .map(|r| r.span)
+            .or_else(|| {
+                analysis
+                    .symbols
+                    .iter()
+                    .find(|s| {
+                        matches!(s.kind, FaSymKind::Package | FaSymKind::Class)
+                            && s.name == u.package
+                    })
+                    .map(|s| s.selection_span)
+            });
+        let Some(span) = span else { continue };
+        diagnostics.push(Diagnostic {
+            range: span_to_range(span),
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("role-requires-unfulfilled".into())),
+            source: Some("perl-lsp".into()),
+            message: format!(
+                "role {} requires '{}'; {} does not provide it",
+                u.role, u.name, u.package,
+            ),
+            ..Default::default()
+        });
+    }
+
+    // 5h: helper-not-loaded — the entrypoint-scan lint
+    // (docs/prompt-helper-consumption.md phase 2). A method call whose
+    // ONLY resolution is a plugin bridge from a WORKSPACE module that
+    // no workspace file loads (imports literally or via the SyntheticUse
+    // a `plugin 'X'` line emits). Installed CPAN plugins are exempt —
+    // the "downloaded = intended" policy keeps resolution generous and
+    // makes precision this lint's job. HINT severity.
+    {
+        use crate::model::conventions::{InvocantText, MethodToken};
+        let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+        for r in &analysis.refs {
+            let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
+            // Plugin-bridged tokens are resolved by their owning plugin,
+            // not a missing-plugin hint candidate.
+            let Some(invocant) = invocant.as_name() else { continue };
+            let method_name = &r.target_name;
+            if !matches!(MethodToken::parse(method_name), MethodToken::Bare(_)) {
+                continue;
+            }
+            let class_name = match invocant.classify() {
+                InvocantText::Bareword(b) => Some(b.to_string()),
+                InvocantText::Scalar(_) => analysis
+                    .inferred_type_via_bag(invocant, r.span.start)
+                    .and_then(|ty| ty.class_name().map(|s| s.to_string())),
+                _ => None,
+            };
+            let Some(class_name) = class_name else { continue };
+            if !seen.insert((class_name.clone(), method_name.clone())) {
+                // one hint per (class, helper) per file — the fix is
+                // one `plugin` line, not one per call site
+                continue;
+            }
+            let Some(provider) =
+                analysis.bridged_helper_provider(&class_name, method_name, Some(module_index))
+            else {
+                continue;
+            };
+            if !module_index.is_workspace_module(&provider) {
+                continue;
+            }
+            if analysis.imports.iter().any(|i| i.module_name == provider)
+                || module_index.is_module_loaded(&provider)
+            {
+                continue;
+            }
+            diagnostics.push(Diagnostic {
+                range: span_to_range(r.span),
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("helper-not-loaded".into())),
+                source: Some("perl-lsp".into()),
+                message: format!(
+                    "'{}' is provided by {}, which no workspace entrypoint loads",
+                    method_name, provider,
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Opt-in `unresolved-dispatch`: a known dispatch verb whose receiver
+    // couldn't be typed, so we can't tell if the dispatch applies. Fires ONLY
+    // on `ReceiverUntyped` (a real typing gap), never on `DoesNotApply` — the
+    // 3-way `GateResult` keeps the two apart so the diagnostic can't spew on
+    // every unrelated receiver. QA/plugin-author tool, hence default-off.
+    if options.unresolved_dispatch {
+        for untyped in analysis.untyped_dispatches(Some(module_index)) {
+            diagnostics.push(Diagnostic {
+                range: span_to_range(untyped.call_span),
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                code: Some(NumberOrString::String("unresolved-dispatch".into())),
+                source: Some("perl-lsp".into()),
+                message: format!(
+                    "dispatch verb '{}' fired on an untyped receiver; can't confirm it dispatches into {}",
+                    untyped.dispatcher, untyped.gate,
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Closed-shape hash-key typo: a READ of `$config->{typo}` where
+    // `$config`'s structural literal is CLOSED (no spread, no dynamic
+    // key) and doesn't define the key. Writes are skipped — assigning a
+    // new key extends the shape, it isn't a typo. Open shapes are
+    // skipped — the spread may carry the key. The whole-story gate
+    // skips reassigned/escaped vars (the trust-gate stand-in for the
+    // unmodeled lattice widenings — docs/adr/structural-shapes.md).
+    // HINT severity, per the quiet-by-design diagnostics convention.
+    //
+    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is a DBIC Result
+    // class and `col` is a `Bridged` column — a column isn't a hash slot, so the
+    // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
+    // → class → `field_projections_named` has a bridged column for the key), but
+    // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
+    // which we don't model yet. Spec: docs/adr/narrowing-diagnostics.md (Forward work).
+    use crate::model::file_analysis::InferredType;
+    for r in &analysis.refs {
+        let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
+        // `$config->{k}` (scalar holding a hashref) and `$config{k}`
+        // (literal `%config`, canonical var_text) — same model, both
+        // spellings.
+        if !(var_text.starts_with('$') || var_text.starts_with('%')) {
+            continue;
+        }
+        if matches!(r.access, crate::model::file_analysis::AccessKind::Write) {
+            continue;
+        }
+        let Some(t) =
+            analysis.inferred_type_via_bag_ctx(var_text, r.span.start, Some(module_index))
+        else {
+            continue;
+        };
+        let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+        if keys.iter().any(|(k, _)| k == &r.target_name) {
+            continue;
+        }
+        if !analysis.closed_shape_is_whole_story(var_text) {
+            continue;
+        }
+        let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
+        if keys.len() > 5 {
+            known.push("...");
+        }
+        diagnostics.push(Diagnostic {
+            range: span_to_range(r.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unknown-hash-key".into())),
+            message: format!(
+                "key '{}' is not in {}'s literal shape (keys: {})",
+                r.target_name,
+                var_text,
+                known.join(", "),
+            ),
+            ..Default::default()
+        });
+    }
+
+    // The expression-base spelling of the same typo: `cfg()->{kye}` /
+    // `$obj->get_config->{kye}` — no variable in hand, so the ref loop
+    // above can't see it. The drill's own Projected witness encodes
+    // exactly the (base, key) pair; materialize the base (the registry
+    // chases through call returns, cross-file included) and apply the
+    // same closed-shape check. No whole-story gate: the value is
+    // freshly produced, and the producer's own mutation/escape
+    // widening already rode along on its shape.
+    {
+        use crate::model::witnesses::{ProjectionStep, WitnessAttachment, WitnessPayload};
+        let mut seen: std::collections::HashSet<(Span, &str)> = std::collections::HashSet::new();
+        for w in analysis.witnesses.all() {
+            let WitnessPayload::Projected {
+                base: WitnessAttachment::Expr(base_span),
+                step: ProjectionStep::HashKey(ref key),
+            } = w.payload
+            else {
+                continue;
+            };
+            if !seen.insert((w.span, key.as_str())) {
+                continue;
+            }
+            // A base that is a bare variable read (its Expr attachment
+            // edges to a Variable) is the ref loop's territory — it
+            // carries the whole-story gate this loop deliberately
+            // doesn't. Materializing it here would bypass the gate
+            // (the Compiler.pm conditional-reassignment FP).
+            let base_is_variable = analysis
+                .witnesses
+                .for_attachment(&WitnessAttachment::Expr(base_span))
+                .iter()
+                .any(|bw| {
+                    matches!(
+                        bw.payload,
+                        WitnessPayload::Edge(WitnessAttachment::Variable { .. })
+                    )
+                });
+            if base_is_variable {
+                continue;
+            }
+            let Some(t) = analysis.expr_type_at_span(base_span, Some(module_index)) else {
+                continue;
+            };
+            let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+            if keys.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
+            if keys.len() > 5 {
+                known.push("...");
+            }
+            diagnostics.push(Diagnostic {
+                range: span_to_range(w.span),
+                severity: Some(DiagnosticSeverity::HINT),
+                code: Some(NumberOrString::String("unknown-hash-key".into())),
+                message: format!(
+                    "key '{}' is not in this expression's literal shape (keys: {})",
+                    key,
+                    known.join(", "),
+                ),
+                ..Default::default()
+            });
+        }
+    }
+
+    diagnostics
+}
+
+/// Render a D3/D4 verdict into its user-facing message. The phrasing lives
+/// here in the adapter, not on the neutral `FileAnalysis` IR — a per-language
+/// concern in the multi-language design (`language_driver.rs`).
+fn render_guard_message(g: &crate::model::file_analysis::GuardRedundancy) -> String {
+    use crate::model::file_analysis::GuardPredicate;
+    let subject = &g.subject;
+    match (&g.verdict, &g.predicate) {
+        (GuardVerdict::AlwaysTrue, GuardPredicate::Defined) => {
+            format!("'{subject}' is always defined here; this guard is redundant")
+        }
+        (GuardVerdict::AlwaysFalse, GuardPredicate::Defined) => {
+            format!("'{subject}' is undef here; this guard can never pass")
+        }
+        (GuardVerdict::AlwaysTrue, GuardPredicate::IsType(t)) => {
+            format!("'{subject}' is already {}; this guard is redundant", format_inferred_type(t))
+        }
+        (GuardVerdict::AlwaysFalse, GuardPredicate::IsType(t)) => {
+            format!("'{subject}' is not {} here; this guard can never pass", format_inferred_type(t))
+        }
+    }
+}
