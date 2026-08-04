@@ -1,0 +1,352 @@
+//! Module index: public API for cross-file Perl module intelligence.
+//!
+//! Wraps a concurrent cache (`DashMap`) backed by a background resolver thread.
+//! Async LSP handlers only read from the cache (zero I/O). The resolver thread
+//! handles @INC discovery, in-process parsing, SQLite persistence, and cpanfile
+//! pre-scanning.
+//!
+//! The cache stores the full `FileAnalysis` (not a lossy summary), so
+//! cross-file refs, type constraints, call bindings, and framework context
+//! all survive the module boundary.
+//!
+//! See also:
+//! - `module_resolver.rs` — resolver thread, in-process parsing
+//! - `module_cache.rs` — SQLite persistence (schema v9, bincode+zstd blobs)
+//! - `cpanfile.rs` — cpanfile parsing
+
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+
+use dashmap::DashMap;
+use tower_lsp::Client;
+
+use crate::model::file_analysis::{CrossFileLookup, FileAnalysis, SymKind};
+#[cfg(test)]
+use crate::model::file_analysis::InferredType;
+use crate::index::module_resolver;
+
+// ---- Public types ----
+
+// `CachedModule` / `SubInfo` are pure views over `FileAnalysis` and live
+// there (the index depends on the model, not vice versa); re-exported so
+// index consumers keep one import site.
+pub use crate::model::file_analysis::{CachedModule, SubInfo};
+
+type InferredTypeOwned = crate::model::file_analysis::InferredType;
+
+/// Rehydration misses on evicted copies this process served degraded
+/// (`rehydrate_or_resident`'s invariant-break arm). Process-global: the
+/// residency story spans the hub and every pack sub-index, and the flake
+/// this polices ("inputs vanished" cold runs) is a per-process verdict.
+static REHYDRATION_MISSES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// How many evicted copies failed to rehydrate this process (each was
+/// served as a stripped resident — quietly incomplete answers). Zero in a
+/// healthy session; the strict gate (`PERL_LSP_STRICT_RESIDENCY`) panics
+/// at the first miss instead of counting. Observability hook read by the
+/// residency tests; production reacts via the strict gate, not this reader.
+#[cfg(test)]
+pub fn rehydration_miss_count() -> usize {
+    REHYDRATION_MISSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Mint a fresh monotonic registration generation for `path`. The enrichment
+/// key's ABA-proof identity token: a re-registration (or an @INC re-resolve)
+/// bumps the gen, moving every consumer's key — where a bare Arc pointer
+/// could be freed and its address reused. The resolver THREAD holds the raw
+/// Arcs (not a `&ModuleIndex`), so this is a free fn both the thread and the
+/// `ModuleIndex` methods route through.
+pub(crate) fn mint_registration_gen(
+    registration_gen: &DashMap<std::path::PathBuf, u64>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+    path: &std::path::Path,
+) {
+    let g = gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    registration_gen.insert(path.to_path_buf(), g);
+}
+
+/// Stamp a generation for every name-keyed cache entry that lacks one. The
+/// @INC warm scan (`warm_cache`) writes blobs straight into the cache
+/// without a registration front door, so those providers would otherwise
+/// read gen 0 in `enrichment_key`. `or_insert` so a warm entry racing a
+/// workspace front-door registration keeps the front-door generation.
+pub(crate) fn stamp_missing_import_gens(
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    registration_gen: &DashMap<std::path::PathBuf, u64>,
+    gen_counter: &std::sync::atomic::AtomicU64,
+) {
+    for entry in cache.iter() {
+        if let Some(ref cm) = *entry.value() {
+            registration_gen.entry(cm.path.clone()).or_insert_with(|| {
+                gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            });
+        }
+    }
+}
+
+/// The linkage-visible feed a registration extracts from a WHOLE analysis:
+/// (name, declares-a-Class) per visible symbol. Collected before any strip
+/// so the feeds and tie-breaks never read an emptied `symbols`.
+fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
+    let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut feed: Vec<(String, bool)> = Vec::new();
+    for sym in &analysis.symbols {
+        // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
+        // the same predicate completion gathering uses, so every name
+        // registered here is also offerable and vice versa.
+        if !analysis.is_linkage_visible(sym) {
+            continue;
+        }
+        let is_class = matches!(sym.kind, SymKind::Class);
+        match index.get(sym.name.as_str()) {
+            // A file declaring both a value AND a Class under one name
+            // ranks as a Class.
+            Some(&i) => feed[i].1 |= is_class,
+            None => {
+                index.insert(sym.name.as_str(), feed.len());
+                feed.push((sym.name.clone(), is_class));
+            }
+        }
+    }
+    // Class rank is visibility-INDEPENDENT (the old occupant scan matched
+    // any Class symbol): a non-linkage-visible Class sharing a visible
+    // value's name still ranks the file as declaring that Class.
+    for sym in &analysis.symbols {
+        if matches!(sym.kind, SymKind::Class) {
+            if let Some(&i) = index.get(sym.name.as_str()) {
+                feed[i].1 = true;
+            }
+        }
+    }
+    feed
+}
+
+/// Pick the winner among same-name candidates by the SAME total order
+/// `register_symbols` uses for the global cache slot: a TYPE (Class) beats a
+/// Sub/value, then the smallest canonical path breaks the tie (order-independent
+/// — no reliance on registration order). Factored so the scoped lookup and the
+/// registration winner agree by construction.
+fn best_candidate<'c>(
+    cands: &[&'c Arc<CachedModule>],
+    name: &str,
+    defines_class: &dyn Fn(&CachedModule, &str) -> bool,
+) -> Option<Arc<CachedModule>> {
+    cands
+        .iter()
+        .copied()
+        .max_by(|a, b| {
+            let (ac, bc) = (defines_class(a, name), defines_class(b, name));
+            // Class beats non-class; then SMALLER path wins (reverse for max_by).
+            ac.cmp(&bc).then_with(|| b.path.cmp(&a.path))
+        })
+        .cloned()
+}
+
+// ---- Internal sync primitives (pub(crate) for resolver thread) ----
+
+/// Thread-safe queue: Mutex<Vec> + Condvar.
+pub(crate) struct ResolveQueue {
+    /// High priority: stale modules from open files. Drained first.
+    pub priority: Mutex<Vec<String>>,
+    /// Normal priority: missing modules.
+    pub pending: Mutex<Vec<String>>,
+    pub condvar: Condvar,
+}
+
+/// Signaled after each module is resolved.
+pub(crate) struct ResolveNotify {
+    pub mu: Mutex<()>,
+    pub cv: Condvar,
+}
+
+/// Channel for workspace root from initialize() → resolver thread.
+pub(crate) struct WorkspaceRootChannel {
+    pub root: Mutex<Option<Option<String>>>,
+    pub condvar: Condvar,
+}
+
+mod parts;
+pub use parts::*;
+
+mod lookup;
+mod queries;
+mod registration;
+
+pub struct ModuleIndex {
+    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
+    /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
+    edges: Arc<ModuleEdgeIndexes>,
+    /// Modules imported (literally or via SyntheticUse) by ANY
+    /// workspace file, entrypoint scripts included. Powers the
+    /// entrypoint-scan helper lint's "does anything load M" question.
+    /// Fed by `register_workspace_module` only — the workspace scan
+    /// re-runs every startup, so no warm-rebuild feed is needed.
+    loaded_modules: Arc<DashMap<String, ()>>,
+    /// Primary package names of workspace-registered files. The lint
+    /// fires only for WORKSPACE plugin modules (in-project plugins you
+    /// forgot to load); installed CPAN plugins keep the generous
+    /// "downloaded = intended" resolution.
+    workspace_modules: Arc<DashMap<String, ()>>,
+    /// Loader-config shapes projected at registration: load-name →
+    /// (contributor, shape) pairs from each file's `PluginLoad` facts.
+    /// Projected HERE because lite entrypoints are PACKAGELESS — they
+    /// never enter the cache, so enrichment can't reach their bags;
+    /// the config value is a literal, so its shape is final at the
+    /// contributor's own build. Fed by register_workspace_module
+    /// (before the packageless early-return) AND insert_cache.
+    loader_config_shapes: Arc<DashMap<String, Vec<(String, InferredTypeOwned)>>>,
+    /// Modules loaded from cache with an old extract_version.
+    /// Eligible for priority re-resolution when requested.
+    stale_modules: Arc<DashMap<String, ()>>,
+    /// Perl builtins hover docs, name → rendered markdown. Hydrated
+    /// from SQLite by the resolver thread at startup (parsed from
+    /// `perlfunc.pod` on first cold-cache miss). Empty until the
+    /// resolver has run its warmup path.
+    builtins: Arc<DashMap<String, String>>,
+    /// Known module names from @INC scan. Name → path. No exports until resolved.
+    available_modules: Arc<DashMap<String, std::path::PathBuf>>,
+    queue: Arc<ResolveQueue>,
+    resolved: Arc<ResolveNotify>,
+    workspace_root: Arc<WorkspaceRootChannel>,
+    /// Per-language sub-indexes (`"cpp"`, `"python"`, …) — kept SEPARATE
+    /// (own cache, own `modules-{lang}.db`) so names never comingle across
+    /// languages. The Perl index is the hub; query routing picks the right
+    /// one by the queried file's language. Generic: any pack language.
+    pack_indexes: Arc<DashMap<String, Arc<ModuleIndex>>>,
+    /// Canonical paths of currently-open docs whose surface record the
+    /// open-doc path owns (`SurfaceWrite` — background writes yield).
+    /// Marked by the backend on didOpen, cleared + reconciled on didClose.
+    /// Perl hub only today: pack languages have no open-doc surface
+    /// recorder yet, so guarding their background writes would freeze
+    /// records staleward.
+    open_doc_paths: Arc<DashMap<std::path::PathBuf, ()>>,
+    /// ALL cross-file candidates per name (not just the single winner in
+    /// `cache`) — pack languages only. C linkage is globally flat, so two
+    /// unrelated files can each define `class Box`; `cache` picks one
+    /// deterministic winner, but a query from file F wants the candidate F can
+    /// actually SEE (its `#include` closure). `get_cached_scoped` ranks these by
+    /// reachability. `docs/adr/macro-handling.md`, "the include-closure lie".
+    all_defs: Arc<DashMap<String, Vec<Arc<CachedModule>>>>,
+    /// Every pack file registered, keyed by canonical path — including files
+    /// that declare NOTHING registrable (a header-only `#include` shim). The
+    /// name-keyed views can't reach those, but whole-project sweeps
+    /// (`for_each_cached_file`) must.
+    all_files: Arc<DashMap<std::path::PathBuf, Arc<CachedModule>>>,
+    /// The freshness engine (`docs/adr/storage-engine.md`):
+    /// per-file span-free surface records + the reverse-dependency index.
+    /// Fed at registration (whole copy, pre-strip) and on open-doc
+    /// rebuilds; `dirty_consumers` names who must re-enrich after a
+    /// surface CHANGE, and an Unchanged verdict is the early-cutoff.
+    freshness: Arc<crate::model::surface::FreshnessIndex>,
+    /// The enrichment overlay (R4): derived enriched copies keyed by the
+    /// surface fingerprints of the file + its providers. Bounded FIFO —
+    /// `enriched_order` is the eviction queue.
+    /// `None` payload = a DECLINED build (byte-cap giant / cycle-tainted)
+    /// at this key: repeat queries skip the deep-copy entirely until a
+    /// provider change moves the key.
+    enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
+    /// Monotonic per-path registration generation — the ABA-proof identity
+    /// token `enrichment_key` hashes (an Arc pointer can be freed and its
+    /// address reused; a counter can't run backwards). Bumped by every
+    /// registration front door.
+    registration_gen: Arc<DashMap<std::path::PathBuf, u64>>,
+    gen_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// The witness seams' fallback-on-miss enriched retries only pay off
+    /// when the process lives long enough to amortize the overlay (each
+    /// miss is a whole-analysis deep copy + enrich). Off by default; the
+    /// SERVER enables it at initialize. One-shot CLI query modes leave it
+    /// off — the bisected cost was 2x warm-gold wall for answers no
+    /// one-shot invocation reuses. (`--check`/`--dump-package` consume
+    /// `enriched_snapshot` directly and are unaffected by this gate.)
+    long_lived: Arc<std::sync::atomic::AtomicBool>,
+    enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
+    /// The linkage-visible (name, declares-a-Class) pairs each file
+    /// registered — the exact inverse list `unregister_file` walks AND the
+    /// class-rank source for the cache-slot tie-break. Recorded at
+    /// registration (pre-strip) because the resident copy's `symbols` may be
+    /// evicted, and rehydration after an edit persists would fetch the NEW
+    /// generation's names.
+    registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
+    /// The SOURCE generation (`module_cache::file_mtime_nanos`) the currently
+    /// registered pack analysis for a path was built from — the H9-1
+    /// stale-winner guard. `pack_file_changed`'s swap claims a path at its
+    /// event generation and registers only when the claim succeeds
+    /// (`incoming >= registered`), so a re-analysis that read pre-save bytes
+    /// (a lower generation) can never revert a fresher registration, and a
+    /// deferred-invalidation reconcile (H9-2) safely overrides only paths
+    /// whose registered generation is older than the save it reconciles. Empty
+    /// for a path the swap never touched (bulk/warm register ungated — they
+    /// are the baseline every real edit outranks, and the reconcile's
+    /// unregister+register replaces their entry outright).
+    registered_source_gen: Arc<DashMap<std::path::PathBuf, i64>>,
+    /// Slice-2 rehydration store. Pack sub-indexes get theirs at
+    /// construction (keyed to `modules-{lang}.db`); the Perl hub gets its
+    /// own in `set_workspace_root` (keyed to `modules.db` — workspace
+    /// copies are refs/bag-evicted once persisted). A type query reaching
+    /// into an evicted file rehydrates the exact persisted bag through this
+    /// LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
+    bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::index::pack_bag_cache::PackBagCache>>>>,
+    /// The SIBLING tier's rehydration store, for copies this index does not
+    /// own. Sweeps mint `CachedModule`s from FileStore entries and ask
+    /// whatever index the query routed to — a cpp query's workspace sweep
+    /// hands PERL paths to the cpp sub-index, whose own loader (keyed to
+    /// `modules-{lang}.db`) can never serve them. `attach_pack_index`
+    /// shares the hub's `bag_cache` cell here so a foreign path routes to
+    /// its owner instead of degrading to the stripped resident. The hub's
+    /// converse route (a pack path asked of the hub) walks `pack_indexes`.
+    foreign_bag_cache: std::sync::RwLock<
+        Option<Arc<std::sync::RwLock<Option<Arc<crate::index::pack_bag_cache::PackBagCache>>>>>,
+    >,
+    /// Read-connection opener for the relational ref index
+    /// (`docs/adr/relational-ref-index.md`) — set once per index onto the
+    /// per-language DB (`modules.db` for the Perl hub, `modules-{lang}.db`
+    /// for pack sub-indexes). Opened per retrieval (WAL readers are cheap
+    /// and `rusqlite::Connection` isn't `Sync`); `None` (tests, no cache
+    /// dir) contributes no candidates and the resident sweep still covers.
+    ref_rows_opener:
+        std::sync::RwLock<Option<Arc<dyn Fn() -> Option<rusqlite::Connection> + Send + Sync>>>,
+    /// The retained read connection the opener fills lazily — one per index,
+    /// so the statement cache amortizes across queries (a heatmap projects
+    /// references once per symbol; per-call opens would re-prepare every
+    /// statement). WAL readers see each write txn that committed before
+    /// their own read txn begins, so retaining it never serves stale rows.
+    /// Paired with the DB file's inode at open: `--clear-cache` UNLINKS the
+    /// file, and an fd pinning the dead inode would serve frozen rows
+    /// forever — an inode change (or missing file) drops the conn so the
+    /// next query reopens the recreated DB.
+    ref_rows_conn: std::sync::Mutex<Option<(rusqlite::Connection, u64)>>,
+}
+
+// ---- Module-level helpers ----
+
+/// Return the parents of the primary package of a module, preferring the
+/// package with the same name as `module_name` and falling back to the
+/// single-package case if only one package exists in the file.
+/// First `package X;` declaration in a FileAnalysis. Used to decide
+/// under what name a workspace file should be registered in the
+/// module index so cross-file method resolution (which keys on
+/// package name, e.g. "Users" for `->to('Users#list')`) can find it.
+/// Returns `None` for scripts with no explicit package declaration.
+pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
+    for sym in &analysis.symbols {
+        if matches!(sym.kind, SymKind::Package | SymKind::Class) {
+            return Some(sym.name.clone());
+        }
+    }
+    None
+}
+
+pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {
+    analysis
+        .package_parents
+        .get(module_name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+
+#[cfg(test)]
+#[path = "module_index_tests.rs"]
+mod tests;
