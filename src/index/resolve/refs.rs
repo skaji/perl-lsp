@@ -1,0 +1,894 @@
+//! The reference walks: `refs_to`, `group_refs` + group rename edits,
+//! `implementations_of`, specialization families, and delegation aliases.
+use super::*;
+
+/// Group construction shared by the local arm (cursor in the class
+/// file: spans are origin-local) and the consumer arm (group minted
+/// from the class's cached analysis: spans pin to the class file). The
+/// rename chain on the Method target is computed against the CLASS
+/// analysis — the only one that knows its parents.
+pub(super) fn group_from_projections(
+    p: crate::model::file_analysis::FieldProjections,
+    class_analysis: &FileAnalysis,
+    pinned_path: Option<PathBuf>,
+    module_index: Option<&dyn CrossFileLookup>,
+) -> ResolvedTarget {
+    let mut members = Vec::new();
+    if p.has_reader {
+        // A Corinna `field`'s reader is per-class (private storage), so scope it
+        // precisely (Dispatch) — never fan to an ancestor's same-named reader,
+        // which would rewrite that class's own private field decl and corrupt
+        // it. A `has`/column accessor IS shared down the hierarchy, but its
+        // identity is the OWNING class: `owned_accessor` roots the family at
+        // `p.class` and its descendants, never upward at a framework ancestor
+        // that defines a real same-named `sub` (e.g. an `id` column colliding
+        // with `DBIx::Class::PK::id`).
+        let target = if p.field_backed {
+            TargetRef::method(
+                p.bare.clone(),
+                p.class.clone(),
+                class_analysis,
+                module_index,
+                OverrideScope::Dispatch,
+            )
+        } else {
+            TargetRef::owned_accessor(
+                p.bare.clone(),
+                p.class.clone(),
+                class_analysis,
+                module_index,
+            )
+        };
+        members.push(GroupMember {
+            target,
+            rename: MemberRename::Bare,
+        });
+    }
+    if p.has_param {
+        members.push(GroupMember {
+            target: TargetRef::new(
+                p.bare.clone(),
+                TargetKind::HashKeyOfSub {
+                    package: Some(p.class.clone()),
+                    name: "new".to_string(),
+                },
+            ),
+            rename: MemberRename::Bare,
+        });
+    }
+    if p.has_internal {
+        members.push(GroupMember {
+            target: TargetRef::new(
+                p.bare.clone(),
+                TargetKind::InternalHashKey { class: p.class.clone() },
+            ),
+            rename: MemberRename::Bare,
+        });
+    }
+    if p.has_class_key {
+        // `Bridged`-backed attr (DBIC column): a `HashKeyOfBridged` member catches
+        // the column's condition-arg keys (`search`/`find`/`update`), owned by the
+        // `Bridged` namespace — NOT a `$row->{col}` deref (a column isn't a slot).
+        members.push(GroupMember {
+            target: TargetRef::new(
+                p.bare.clone(),
+                TargetKind::HashKeyOfBridged(p.class.clone()),
+            ),
+            rename: MemberRename::Bare,
+        });
+    }
+    for m in &p.mapped {
+        // Name-mapped accessors (`has_size` for attr `size`) are class-owned
+        // too — same owner-rooted family as the reader (never a framework
+        // ancestor's same-named `sub`).
+        members.push(GroupMember {
+            target: TargetRef::owned_accessor(
+                m.method.clone(),
+                p.class.clone(),
+                class_analysis,
+                module_index,
+            ),
+            rename: match &m.affix {
+                Some((pre, suf)) => MemberRename::Affixed {
+                    prefix: pre.clone(),
+                    suffix: suf.clone(),
+                },
+                None => MemberRename::Skip,
+            },
+        });
+    }
+    match pinned_path {
+        None => ResolvedTarget::Group {
+            local_spans: p.variable_spans,
+            pinned_spans: Vec::new(),
+            members,
+        },
+        Some(path) => ResolvedTarget::Group {
+            local_spans: Vec::new(),
+            pinned_spans: p
+                .variable_spans
+                .into_iter()
+                .map(|s| (path.clone(), s))
+                .collect(),
+            members,
+        },
+    }
+}
+
+/// Union of `refs_to` over a projection group's targets plus the group's
+/// origin-file spans. `mask_override` = `Some(EDITABLE)` for rename;
+/// `None` lets each target pick its references mask. Output is sorted +
+/// deduped like `refs_to`, and every span covers a bare name token, so a
+/// rename caller can write one replacement text at every location.
+pub fn group_refs(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    origin: &FileKey,
+    local_spans: &[Span],
+    pinned_spans: &[(PathBuf, Span)],
+    members: &[GroupMember],
+    mask_override: Option<RoleMask>,
+) -> Vec<RefLocation> {
+    let mut out: Vec<RefLocation> = local_spans
+        .iter()
+        .map(|span| RefLocation {
+            key: origin.clone(),
+            span: *span,
+            access: AccessKind::Read,
+            rewritable: true,
+            label: None
+        })
+        .collect();
+    out.extend(pinned_spans.iter().map(|(path, span)| RefLocation {
+        key: FileKey::Path(path.clone()),
+        span: *span,
+        access: AccessKind::Read,
+        rewritable: true,
+        label: None
+    }));
+    for m in members {
+        let mask = mask_override
+            .unwrap_or_else(|| references_mask_for(files, module_index, &m.target));
+        out.extend(refs_to(files, module_index, &m.target, mask));
+    }
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
+}
+
+/// Reject a `newName` that would corrupt rather than rename: empty,
+/// whitespace, or just sigils (`$`/`@`/`%`). The LSP client normally validates
+/// the new name, but the server must not emit a token-*deleting* edit set when
+/// it doesn't — both rename entry points (LSP handler + CLI) gate on this.
+/// Keyword/identifier-shape validation stays the client's job; this is the
+/// safety floor against silent corruption.
+pub fn is_valid_rename_name(new_name: &str) -> bool {
+    !crate::model::conventions::strip_variable_sigils(new_name.trim()).trim().is_empty()
+}
+
+/// Rename edit set for a projection group: every span paired with ITS
+/// member's replacement text (bare for plain spellings, re-derived for
+/// affixed accessors). Bare-member spans win collisions — a synthesized
+/// accessor's decl token IS the group decl the bare edit covers.
+#[allow(clippy::too_many_arguments)]
+pub fn group_rename_edits(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    origin: &FileKey,
+    local_spans: &[Span],
+    pinned_spans: &[(PathBuf, Span)],
+    members: &[GroupMember],
+    bare_new: &str,
+    mask: RoleMask,
+) -> Vec<(RefLocation, String)> {
+    let mut out: Vec<(RefLocation, String)> = local_spans
+        .iter()
+        .map(|span| {
+            (
+                RefLocation { key: origin.clone(), span: *span, access: AccessKind::Read, rewritable: true, label: None},
+                bare_new.to_string(),
+            )
+        })
+        .collect();
+    out.extend(pinned_spans.iter().map(|(path, span)| {
+        (
+            RefLocation {
+                key: FileKey::Path(path.clone()),
+                span: *span,
+                access: AccessKind::Read,
+                rewritable: true,
+                label: None
+            },
+            bare_new.to_string(),
+        )
+    }));
+    // Bare members before affixed ones, so a same-span collision keeps the
+    // bare edit (dedup below keeps the first).
+    let mut ordered: Vec<&GroupMember> = members
+        .iter()
+        .filter(|m| matches!(m.rename, MemberRename::Bare))
+        .collect();
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| !matches!(m.rename, MemberRename::Bare)),
+    );
+    for m in ordered {
+        let Some(text) = m.rename.text_for(bare_new) else { continue };
+        for loc in refs_to(files, module_index, &m.target, mask) {
+            out.push((loc, text.clone()));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(loc, _)| seen.insert((key_for_sort(&loc.key), loc.span)));
+    out
+}
+
+/// Per-process override for the relational retrieval switch — the parity
+/// harness toggles this between two projections of one set (an env write
+/// there would race other threads reading the env). 0 = defer to the env.
+static REF_ROWS_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_ref_rows_override(on: Option<bool>) {
+    REF_ROWS_OVERRIDE.store(
+        match on {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The relational retrieval switch (`docs/adr/relational-ref-index.md`).
+/// ON by default — resident index copies are refs-evicted after persist, so
+/// the SQL retrieval IS the reference path for them. `PERL_LSP_REF_ROWS=0`
+/// forces the resident-only walk (pair it with PERL_LSP_NO_EVICT=1, or
+/// evicted-file sites vanish — the parity harness runs exactly that pairing).
+fn ref_rows_enabled() -> bool {
+    match REF_ROWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    match std::env::var("PERL_LSP_REF_ROWS") {
+        Ok(v) => v != "0",
+        Err(_) => true,
+    }
+}
+
+/// The name keys the relational retrieval probes for `target`: the target
+/// name's match key plus every delegation alias's — the same
+/// `name_match_key` spelling rows are written under, so retrieval is exactly
+/// as generous as the matcher's name checks.
+pub(super) fn retrieval_keys(target: &TargetRef, aliases: &[DelegationAlias]) -> Vec<String> {
+    let mut keys = vec![crate::model::file_analysis::name_match_key(&target.name)];
+    for a in aliases {
+        let k = crate::model::file_analysis::name_match_key(&a.name);
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// Collect every reference to `target` across the masked file set.
+///
+/// - `files`   — open + workspace store
+/// - `module_index` — dep cache (consulted only if mask includes Dependency)
+pub fn refs_to(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    target: &TargetRef,
+    mask: RoleMask,
+) -> Vec<RefLocation> {
+    let mut out = Vec::new();
+
+    // Names that reach the target through a macro delegation edge — the
+    // BACKWARD half of goto-def's see-through (`#define IncRef(sv)
+    // Perl_Inc(sv)` means every `IncRef(...)` call site is a reference to
+    // `Perl_Inc`). Computed once per query; empty for Perl.
+    let aliases = delegation_aliases(files, module_index, target, mask);
+
+    // Textual-inclusion extension of the closure gate: a file whose own
+    // closure reaches no def path still sees the target when a DIRECT seer
+    // includes it (`ae.c: #include "ae_epoll.c"` — the fragment compiles
+    // inside the includer's TU with the includer's preamble, so its
+    // `zmalloc(...)` calls are real references). One sweep collects the
+    // union of the direct seers' closures; membership is the reverse edge.
+    // Empty def_paths (no gate — every Perl target) skips the sweep.
+    let mut seen_by_inclusion: std::collections::HashSet<String> = Default::default();
+    let target_def_ids = def_path_ids(target);
+    if !target.def_paths.is_empty() {
+        if let Some(idx) = module_index {
+            idx.for_each_cached_file(&mut |cached| {
+                let own = cached.path.to_string_lossy();
+                if file_sees_target_ids(target, &target_def_ids, &cached.analysis, &own) {
+                    seen_by_inclusion.extend(cached.analysis.include_closure.iter_strs().map(|a| a.as_ref().to_owned()));
+                }
+            });
+        }
+    }
+    let gate = |analysis: &FileAnalysis, file_str: &str| {
+        file_sees_target_ids(target, &target_def_ids, analysis, file_str)
+            || seen_by_inclusion.contains(file_str)
+    };
+
+    // Row-narrowing gate: when the relational store is live for a masked
+    // dep/workspace tier, its `files` set is the complete "which files hold
+    // rows" marker. A file WITH rows but ABSENT from the candidate set has
+    // no matching ref/sym row, so — rows over-approximate references — it
+    // provably matches nothing; the resident sweeps below skip rehydrating
+    // it, leaving only rows-ABSENT files (persistence off, mid-index lag) to
+    // the whole-view fallback. Empty set (`PERL_LSP_REF_ROWS=0`, no opener,
+    // degraded) ⇒ every file is swept, exactly as before. This is what makes
+    // the pack references path cost track candidate count, not tree size.
+    // Sweep-narrowing kill-switch (`PERL_LSP_REFS_NARROW=0`), the A/B lever
+    // for the row-narrowed backward walk. Answer-preservation verified:
+    // abseil narrowed vs swept byte-identical; curl identical either way
+    // (its server-warm under-answer PREDATES narrowing — the open-doc
+    // cached-only target-minting divergence, ledgered separately in
+    // docs/open-forks.md "Answer honesty under index/enrichment windows").
+    let narrow_enabled = std::env::var_os("PERL_LSP_REFS_NARROW")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let rows_active =
+        ref_rows_enabled() && mask.intersects(RoleMask::WORKSPACE | RoleMask::DEPENDENCY);
+    // Armed by the relational block below. The sweep-skip is sound ONLY
+    // for files that hold rows AND are NOT candidates (provably matchless).
+    // A CANDIDATE must never be skipped by the sweeps even though it holds
+    // rows: the relational block can fail to RESOLVE it (`cached_by_path`
+    // path-spelling gaps under warm-stub registration — observed on curl:
+    // server-warm references 4 sites vs the sweep's 155) and an unresolved
+    // candidate falls through to the whole-view sweeps for coverage.
+    // Empty candidate retrieval leaves narrowing off entirely.
+    let mut rows_indexed: std::collections::HashSet<PathBuf> = Default::default();
+    let mut candidate_set: std::collections::HashSet<PathBuf> = Default::default();
+
+    // Open files (canonical — workspace entries for open paths are skipped).
+    let mut covered_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    if mask.contains(RoleMask::OPEN) {
+        files.for_each_open(|url, doc| {
+            let url = url.clone();
+            if let Ok(p) = url.to_file_path() {
+                // Claim the canonical spelling too: candidate rows are keyed
+                // canonical, and an open doc reached through a symlinked
+                // root must shadow its own persisted generation.
+                if let Ok(canon) = std::fs::canonicalize(&p) {
+                    covered_paths.insert(canon);
+                }
+                covered_paths.insert(p);
+            }
+            // The walk applies visibility: role mask picked the tier, the
+            // closure gate decides per file (`file_sees_target_ids`); the
+            // matcher below only matches.
+            let key = FileKey::Url(url);
+            let file_str = canonical_file_str(&key);
+            if !gate(&doc.analysis, &file_str) {
+                return;
+            }
+            collect_from_analysis(&key, &doc.analysis, target, &aliases, module_index, &file_str, &mut out);
+        });
+    } else {
+        // Even if open isn't in the mask, track the paths so a WORKSPACE walk
+        // doesn't duplicate them (an open file's pre-close state isn't meaningful).
+        files.for_each_open(|url, _doc| {
+            if let Ok(p) = url.to_file_path() {
+                if let Ok(canon) = std::fs::canonicalize(&p) {
+                    covered_paths.insert(canon);
+                }
+                covered_paths.insert(p);
+            }
+        });
+    }
+
+    // Relational retrieval (`docs/adr/relational-ref-index.md`): the files
+    // holding name-keyed candidate rows, rehydrated (`refs_present`) and run
+    // through the SAME matcher as every resident copy. Runs BEFORE the
+    // resident sweep and claims `covered_paths`, so each file is collected
+    // from its best copy exactly once; the sweep behind it still contributes
+    // declaration-only files and files without rows (degraded, persistence
+    // off, mid-index lag) — composition stays at-least-as-complete whether
+    // or not resident refs were evicted.
+    if rows_active {
+        if let Some(idx) = module_index {
+            let keys = retrieval_keys(target, &aliases);
+            let candidate_paths = idx.ref_candidate_paths(&keys);
+            if std::env::var_os("PERL_LSP_REFS_DEBUG").is_some() {
+                eprintln!(
+                    "[refs-debug] keys={:?} candidates={} narrow={}",
+                    keys,
+                    candidate_paths.len(),
+                    narrow_enabled
+                );
+            }
+            if narrow_enabled && !candidate_paths.is_empty() {
+                rows_indexed = idx.ref_indexed_paths();
+                candidate_set = candidate_paths.iter().cloned().collect();
+            }
+            for path in candidate_paths {
+                if covered_paths.contains(&path) {
+                    continue;
+                }
+                // Tier attribution: a FileStore workspace entry rides the
+                // WORKSPACE role (Perl project files); everything else the
+                // rows name lives in a module-index tier (DEPENDENCY —
+                // @INC and the pack caches). The mask must admit the
+                // candidate's OWN tier, or an EDITABLE rename would walk
+                // read-only deps (and vice versa).
+                let ws_arc = files
+                    .workspace_raw()
+                    .get(&path)
+                    .map(|e| std::sync::Arc::clone(e.value()));
+                let cached = match ws_arc {
+                    Some(arc) => {
+                        if !mask.contains(RoleMask::WORKSPACE) {
+                            continue;
+                        }
+                        std::sync::Arc::new(crate::model::file_analysis::CachedModule::new(
+                            path.clone(),
+                            arc,
+                        ))
+                    }
+                    None => {
+                        if !mask.contains(RoleMask::DEPENDENCY) {
+                            continue;
+                        }
+                        match idx.cached_by_path(&path) {
+                            Some(cm) => cm,
+                            None => continue,
+                        }
+                    }
+                };
+                covered_paths.insert(path);
+                let key = FileKey::Path(cached.path.clone());
+                let file_str = canonical_file_str(&key);
+                if !gate(&cached.analysis, &file_str) {
+                    continue;
+                }
+                // The matcher reads refs (usage sites) AND symbols
+                // (declaration sites) — take the whole view.
+                let full = idx.whole_present(&cached);
+                collect_from_analysis(
+                    &key, &full, target, &aliases, module_index, &file_str, &mut out,
+                );
+            }
+        }
+    }
+
+    // Workspace files.
+    if mask.contains(RoleMask::WORKSPACE) {
+        for entry in files.workspace_raw().iter() {
+            if covered_paths.contains(entry.key()) {
+                continue;
+            }
+            // Shredded AND not a candidate → holds no matching row; skip
+            // the whole-view rehydration. Candidates always fall through
+            // (the relational block may have failed to resolve them).
+            if rows_indexed.contains(entry.key()) && !candidate_set.contains(entry.key()) {
+                continue;
+            }
+            covered_paths.insert(entry.key().clone());
+            let key = FileKey::Path(entry.key().clone());
+            let file_str = canonical_file_str(&key);
+            if !gate(entry.value(), &file_str) {
+                continue;
+            }
+            // Same whole-view routing as the sibling sweeps: a workspace
+            // copy with rows persisted is refs+symbols-STRIPPED, and the
+            // matcher reading it raw silently drops the file's matches.
+            let full = match module_index {
+                Some(idx) => {
+                    let cached = std::sync::Arc::new(
+                        crate::model::file_analysis::CachedModule::new(
+                            entry.key().clone(),
+                            std::sync::Arc::clone(entry.value()),
+                        ),
+                    );
+                    idx.whole_present(&cached)
+                }
+                None => std::sync::Arc::clone(entry.value()),
+            };
+            collect_from_analysis(&key, &full, target, &aliases, module_index, &file_str, &mut out);
+        }
+    }
+
+    // Dependencies (read-only modules from @INC / the pack-language cache).
+    // Per-FILE sweep (`for_each_cached_file`): the name-keyed view both
+    // repeats files and HIDES a file that lost every name tie. Skip paths an
+    // open/workspace copy already covered — those are fresher.
+    if mask.contains(RoleMask::DEPENDENCY) {
+        if let Some(idx) = module_index {
+            idx.for_each_cached_file(&mut |cached| {
+                if !covered_paths.insert(cached.path.clone()) {
+                    return;
+                }
+                // Same row-narrowing skip as the workspace sweep: shredded
+                // but not a candidate ⇒ provably matchless; candidates
+                // always fall through.
+                if rows_indexed.contains(&cached.path) && !candidate_set.contains(&cached.path) {
+                    return;
+                }
+                let key = FileKey::Path(cached.path.clone());
+                let file_str = canonical_file_str(&key);
+                if !gate(&cached.analysis, &file_str) {
+                    return;
+                }
+                // Rows-off fallback sweep: copies here may still be
+                // symbol-evicted (rows exist, retrieval switched off) —
+                // the matcher needs symbols, so take the whole view.
+                let full = idx.whole_present(cached);
+                collect_from_analysis(&key, &full, target, &aliases, module_index, &file_str, &mut out);
+            });
+        }
+    }
+
+    // Sort for stable output, dedupe by (path, span).
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
+}
+
+/// `textDocument/implementation`: defs of `name` on every class that
+/// participates in the target method's dispatch for some concrete
+/// descendant — the transitive descendants of the Method target's class
+/// PLUS their co-ancestors (sibling parents contributed by multi-parent
+/// composition: `load_components`, Moo/Moose `with`, multi-base `use base`).
+/// On a role's `requires` marker that's "every composer's def of the
+/// contract"; on a class method it's "every override that can win dispatch".
+/// Goto-def stays on the contract/def itself; call sites stay on
+/// references — this is the third verb, not a variant of either.
+///
+/// A descendant role's own re-`requires` marker is a contract
+/// re-declaration, not an implementation — `role_requires` is the
+/// recorded fact that identifies (and excludes) it.
+pub fn implementations_of(
+    origin: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+    target: &TargetRef,
+) -> Vec<RefLocation> {
+    // On a class/package name: the specialization FAMILY view — every spec
+    // of the primary template (`formatter` → all `formatter<...>` defs).
+    // gr on the primary stays "uses of the primary"; the family is this
+    // verb's answer (fork 4, docs/adr/cpp-templates.md).
+    if matches!(target.kind, TargetKind::Package) {
+        let mut out = specialization_family(origin, module_index, &target.name);
+        // A plain base class (not a template primary): its "implementations"
+        // are the concrete subclasses — the INHERITS_INV descendants' class
+        // def sites. The edge graph gates this: an unrelated same-named nested
+        // class (SkipList::Iterator) has no INHERITS edge to the target, so it
+        // never appears in the descendant set even though the by-name index
+        // holds a Class of the same spelling.
+        if let Some(idx) = module_index {
+            let probe = crate::model::graph::GraphView::new(origin, Some(idx));
+            let mut descendants: Vec<String> = Vec::new();
+            probe.walk(
+                crate::model::graph::Node::Class(target.name.clone()),
+                crate::model::graph::EdgeKindMask::INHERITS_INV,
+                &mut |n| {
+                    if let crate::model::graph::Node::Class(c) = n {
+                        descendants.push(c.clone());
+                    }
+                    std::ops::ControlFlow::Continue(())
+                },
+            );
+            for pkg in &descendants {
+                for cached in idx.def_candidates(pkg) {
+                    let whole = idx.whole_present(&cached);
+                    for s in &whole.symbols {
+                        if &s.name == pkg && matches!(s.kind, SymKind::Class) {
+                            out.push(RefLocation {
+                                key: FileKey::Path(cached.path.clone()),
+                                span: s.selection_span,
+                                access: AccessKind::Declaration,
+                                rewritable: false,
+                                label: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            key_for_sort(&a.key).cmp(&key_for_sort(&b.key)).then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+        });
+        out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+        return out;
+    }
+    // Both class-bearing target kinds seed the dispatch fan-out: a
+    // `Method{class}` (call-site cursor) and a `Sub{package: Some}` (cursor
+    // ON a `sub NAME` decl inside a package). Perl has no sub/method
+    // distinction — any sub in a package is dispatchable as a method — so the
+    // decl of `sub update` in `DBIx::Class::Row` is as much an implementation
+    // root as an `$obj->update` call whose invocant types to that class.
+    let class = match &target.kind {
+        TargetKind::Method { class } => class,
+        TargetKind::Sub { package: Some(pkg) } => pkg,
+        _ => return Vec::new(),
+    };
+    let Some(idx) = module_index else {
+        return Vec::new();
+    };
+    // The composer fan-out is a graph walk: INHERITS_INV from the
+    // contract's class — the first strangler-fig consumer ported onto
+    // the one walker (docs/prompt-graph-walking.md).
+    let mut descendants: Vec<String> = Vec::new();
+    let probe = crate::model::graph::GraphView::new(origin, Some(idx));
+    probe.walk(
+        crate::model::graph::Node::Class(class.clone()),
+        crate::model::graph::EdgeKindMask::INHERITS_INV,
+        &mut |n| {
+            if let crate::model::graph::Node::Class(c) = n {
+                descendants.push(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+
+    // Mixin/sibling overrides. A concrete class assembles its dispatch table
+    // from MULTIPLE parents (Perl multi-parent composition: `load_components`,
+    // Moo/Moose `with` roles, `use base` with several bases). An override of
+    // the target's method can therefore live on a SIBLING PARENT of a shared
+    // descendant — a class that is an ancestor of some concrete descendant of
+    // the target yet is NOT itself a descendant of the target, so the
+    // INHERITS_INV sweep above never reaches it (DBIC's `Ordered` sits
+    // alongside `Row` in `Track`'s MRO, not beneath it). Surface these by
+    // walking UP each descendant's full MRO and collecting every co-ancestor:
+    // a class that shares a concrete descendant with the target participates
+    // in that descendant's dispatch for the method.
+    let mut implementers: std::collections::BTreeSet<String> =
+        descendants.iter().cloned().collect();
+    for d in &descendants {
+        probe.walk(
+            crate::model::graph::Node::Class(d.clone()),
+            crate::model::graph::EdgeKindMask::INHERITS,
+            &mut |n| {
+                if let crate::model::graph::Node::Class(c) = n {
+                    implementers.insert(c.clone());
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+    }
+    // The target and its own ancestry are the CONTRACT side, not an
+    // implementation: goto-def lands on the target itself, and a superclass
+    // method sits BEHIND the target in every descendant's MRO (shadowed by the
+    // target's own def — it never wins). Exclude both so the verb reports only
+    // the classes that override at or ahead of the contract.
+    let mut contract_line: std::collections::HashSet<String> =
+        std::iter::once(class.clone()).collect();
+    probe.walk(
+        crate::model::graph::Node::Class(class.clone()),
+        crate::model::graph::EdgeKindMask::INHERITS,
+        &mut |n| {
+            if let crate::model::graph::Node::Class(c) = n {
+                contract_line.insert(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    implementers.retain(|p| !contract_line.contains(p));
+
+    let mut out: Vec<RefLocation> = Vec::new();
+    for pkg in &implementers {
+        // class → home module(s): exact cache key for the common
+        // single-package file; the names index covers cross-named and
+        // multi-package homes.
+        let mut homes: Vec<std::sync::Arc<crate::model::file_analysis::CachedModule>> = Vec::new();
+        if let Some(c) = idx.get_cached(pkg) {
+            homes.push(c);
+        } else {
+            for m in idx.modules_with_symbol(pkg) {
+                if let Some(c) = idx.get_cached(&m) {
+                    let declares = idx.whole_present(&c).symbols.iter().any(|s| {
+                        matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
+                    });
+                    if declares {
+                        homes.push(c);
+                    }
+                }
+            }
+        }
+        for cached in homes {
+            let is_marker = cached
+                .analysis
+                .role_requires
+                .get(pkg.as_str())
+                .is_some_and(|reqs| reqs.iter().any(|r| r == &target.name));
+            if is_marker {
+                continue;
+            }
+            let whole = idx.whole_present(&cached);
+            for s in &whole.symbols {
+                if s.name == target.name
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && s.package.as_deref() == Some(pkg.as_str())
+                {
+                    out.push(RefLocation {
+                        key: FileKey::Path(cached.path.clone()),
+                        span: s.selection_span,
+                        access: AccessKind::Declaration,
+                        rewritable: true,
+                        label: None
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
+}
+
+/// The specialization family of primary template `name`: every spec class's
+/// def site, cross-file. Spec NAMES come off the graph's `Specializes` edges
+/// (local `FileAnalysis.specializes` + the index's spec map); def sites
+/// resolve through the by-name index (spec Class symbols are indexed under
+/// their canonical spelling). `rewritable: false` — a spec's selection span
+/// is the whole `X<args>` spelling; renaming the primary rewrites the base
+/// TOKEN inside it via its PackageRef, never this span wholesale.
+pub(super) fn specialization_family(
+    origin: &FileAnalysis,
+    module_index: Option<&dyn CrossFileLookup>,
+    primary: &str,
+) -> Vec<RefLocation> {
+    let mut specs: Vec<String> = Vec::new();
+    let probe = crate::model::graph::GraphView::new(origin, module_index);
+    probe.walk(
+        crate::model::graph::Node::Class(primary.to_string()),
+        crate::model::graph::EdgeKindMask::SPECIALIZES,
+        &mut |n| {
+            if let crate::model::graph::Node::Class(c) = n {
+                specs.push(c.clone());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    let mut out: Vec<RefLocation> = Vec::new();
+    for spec in &specs {
+        // Def sites resolve through the index alone (the origin file is
+        // itself indexed, so its own specs surface with a real path key).
+        // `def_candidates` is the by-name candidate table the pack index
+        // keys everything on — every file defining this spec spelling.
+        let Some(idx) = module_index else { continue };
+        for cached in idx.def_candidates(spec) {
+            let whole = idx.whole_present(&cached);
+            for s in &whole.symbols {
+                if &s.name == spec && matches!(s.kind, SymKind::Class) {
+                    out.push(RefLocation {
+                        key: FileKey::Path(cached.path.clone()),
+                        span: s.selection_span,
+                        access: AccessKind::Declaration,
+                        rewritable: false,
+                        label: None
+                    });
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        key_for_sort(&a.key)
+            .cmp(&key_for_sort(&b.key))
+            .then_with(|| {
+                (a.span.start.row, a.span.start.column)
+                    .cmp(&(b.span.start.row, b.span.start.column))
+            })
+    });
+    out.dedup_by(|a, b| file_key_eq(&a.key, &b.key) && a.span == b.span);
+    out
+}
+
+/// A macro name whose call sites dispatch to the target through a delegation
+/// edge, plus the canonical path of the `#define` that mints the edge. The
+/// path is the alias's VISIBILITY key: an unexpanded `IncRef(x)` in file F
+/// means `Perl_Inc` only when F's preprocessor would expand it — the `#define`
+/// must sit in F's include closure (or F itself). Matching without that gate
+/// let every Perl `croak(...)` in a mixed workspace count as a reference to
+/// perl5's C `Perl_croak_nocontext` via embed.h's alias.
+pub(super) struct DelegationAlias {
+    pub(super) name: String,
+    pub(super) def_path: String,
+}
+
+/// The macro names whose call sites dispatch to `target` through delegation
+/// edges (`MacroDef::delegate`), transitively (`#define A(x) B(x)`,
+/// `#define B(x) F(x)` — both A and B reach F), each carrying its own
+/// `#define`'s file for the per-scanned-file visibility gate. The backward
+/// mirror of the forward see-through offer in `pack_macro_definition`. Only
+/// callable-name-keyed kinds have a delegation surface; the DEPENDENCY sweep
+/// is gated on the mask so a Perl EDITABLE query never touches the dep cache.
+/// Sorted for deterministic output.
+pub(super) fn delegation_aliases(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    target: &TargetRef,
+    mask: RoleMask,
+) -> Vec<DelegationAlias> {
+    if !matches!(
+        target.kind,
+        TargetKind::Sub { .. } | TargetKind::Method { .. } | TargetKind::FileScopeValue
+    ) {
+        return Vec::new();
+    }
+    // (alias name, delegate, canonical path of the #define)
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
+    let mut add = |a: &FileAnalysis, path: &str| {
+        for m in &a.macro_defs {
+            if let Some(d) = &m.delegate {
+                pairs.push((m.name.clone(), d.clone(), path.to_string()));
+            }
+        }
+    };
+    // Read-only walk: handlers hold their open-doc READ guard across
+    // projections (the set's borrow discipline), so a write lock here
+    // deadlocks the moment a diagnostics refresh queues behind it.
+    files.for_each_open(|url, doc| {
+        let path = url
+            .to_file_path()
+            .map(|p| {
+                std::fs::canonicalize(&p)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|_| url.to_string());
+        add(&doc.analysis, &path);
+    });
+    for entry in files.workspace_raw().iter() {
+        add(entry.value(), &entry.key().to_string_lossy());
+    }
+    if mask.contains(RoleMask::DEPENDENCY) {
+        if let Some(idx) = module_index {
+            idx.for_each_cached_file(&mut |cached| {
+                add(&cached.analysis, &cached.path.to_string_lossy());
+            });
+        }
+    }
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    // Reverse-transitive chase: every name whose delegation chain reaches
+    // the target's name. Each alias keeps ALL its def sites (config variants
+    // of the same alias live in different headers).
+    let mut out: Vec<DelegationAlias> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = vec![target.name.clone()];
+    while let Some(cur) = frontier.pop() {
+        for (n, d, p) in &pairs {
+            if *d == cur && *n != target.name {
+                if !out.iter().any(|a| a.name == *n && a.def_path == *p) {
+                    out.push(DelegationAlias { name: n.clone(), def_path: p.clone() });
+                }
+                if seen.insert(n.clone()) {
+                    frontier.push(n.clone());
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.name, &a.def_path).cmp(&(&b.name, &b.def_path)));
+    out
+}
