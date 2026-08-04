@@ -254,37 +254,24 @@ in the old list.
 Both items are confirmed now-sized slices consistent with (and shrinking) the
 parked full unification in docs/prompt-unify-language-paths.md.
 
-### C1. Pack routing is re-derived in every verb handler instead of being a construction fact on the CandidateSet — **high leverage / M**
+### C1. Pack routing is a construction fact on the CandidateSet — **LANDED**
 
-**The wrong embedding.** The ~6-line preamble `let pack = (language !=
-"perl").then(|| module_index.pack_index(language)).flatten(); … if
-pack.is_some() { cs = cs.pack_routed() }` is copied ~13 times: seven server
-handlers (`src/lsp/backend/server.rs:479-485, 573-590, 617-671, 693-722,
-763-792, 821-836`), two in `backend/completion.rs:30-32,173-190`, four CLI
-mirrors (`src/lsp/cli/query.rs:349-385, 413-451, 474-493, 510-529`).
-`pack_routed()` (`src/index/resolve/projections.rs:21-24`) is a caller-set
-bool — an entry-point decorator, the exact shape the ADR's ScopedLookup lesson
-condemns; "which store serves an origin" is a cross-cutting resolution axis
-that the ADR says goes into construction, never a handler.
-docs/prompt-multi-language.md:87-93's prescribed `FileAnalysis.language` stamp
-was never landed (grep confirms no field). A verb that forgets one line
-silently resolves pack files against the Perl hub — cli/query.rs:351-352 even
-carries a comment doing a type system's job ("the CLI mirror MUST route
-here").
-
-**Target shape.** `ModuleIndex::lookup_for(language) -> (&dyn CrossFileLookup,
-bool)` as the one speller of store selection, called INSIDE `resolve()`;
-`resolve()` takes the hub plus the origin language (end-state: the stamped
-`FileAnalysis.language` field, `#[serde(default = "perl")]` + EXTRACT_VERSION
-bump). Set `pack` at construction; delete `pack_routed()` and all handler/CLI
-preambles.
-
-**Migration order.** Seam first (`lookup_for`), thread language into
-`resolve()`, delete preambles verb by verb; stamp the field when convenient.
-
-**Gate.** Layering-test-style tripwire: no call site outside `resolve()` calls
-`module_index.pack_index()` for verb routing. Gold pack rows (cpp corpus)
-cover the CLI surface.
+Pack routing splits into its two real facts, each with one owner. The POLICY
+fact (pack semantics on the set: VISIBLE widening, rename full-or-refuse,
+pack def_paths) is derived inside `resolve()` from the origin's stamped
+`FileAnalysis.language` (`#[serde(default = "perl")]`, stamped by
+`PackDriver::analyze_with_path`, read via
+`LanguageRegistry::is_pack_language`) — `pack_routed()` is deleted, so no
+handler declares or can forget it, and every projection inherits it by
+construction. The STORE fact (hub vs pack sub-index) has one speller,
+`ModuleIndex::lookup_for(language) -> RoutedIndex` (an owning hub-or-pack
+value handlers hold and pass into `resolve()`); the
+`pack_store_selection_stays_in_lookup_for` layering tripwire keeps
+`pack_index()` out of the LSP layer. All ~13 handler/CLI preambles are
+one-line `lookup_for` calls now. `resolve()` cannot take the hub and route
+internally because a pack sub-index is an `Arc` out of the hub's registry —
+the set borrows, so the caller must own the routed store's lifetime; that is
+what `RoutedIndex` is.
 
 ### C2. Driver capabilities answered by language name — with realized CLI/server drift on the include-token gate — **medium leverage / S**
 
@@ -690,8 +677,8 @@ setting `requires_action_attr` and asserting `begin` is NOT exempt.
    refs_present), G2, C2, F3.
 2. **Correctness-bearing seams (M):** E1 (SurfaceFeed + two backfills), A1
    (invocant ladder), B2 (builtins), B1 (diagnostics seams), G1 (Moo gate),
-   C1 (pack routing), D3 (PackInvalidator), F1 (file_analysis recut),
-   E2 phase 1 (PackageFacts).
+   C1 (pack routing — LANDED), D3 (PackInvalidator), F1 (file_analysis
+   recut), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
    (IndexCore), A2 (highlights/linked-editing projections), F2 (monolith
    directories, after D2), A3/A4, D4/D5, E3 (after E2's RefTable).

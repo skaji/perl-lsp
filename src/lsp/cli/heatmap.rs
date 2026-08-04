@@ -25,12 +25,13 @@ fn heatmap_symbol_eligible(sym: &file_analysis::Symbol) -> bool {
 /// One heatmap row for one symbol — the shared body both the Perl and the
 /// pack-language (C/C++/…) gather loops call, so their fan-in counts come
 /// from the SAME `references()` projection by construction (no second ref
-/// walk). `is_pack` routes identity + the backward reference walk through the
-/// caller's per-language sub-index: pack workspace files ride the DEPENDENCY
-/// role (a storage artifact of the per-language cache), so the set widens to
-/// VISIBLE via `pack_routed()` instead of the Perl `mask`, and the pack-only
-/// entry-point guard (C's `main` is reached through the ABI, not a call site)
-/// unlocks. Returns `(row, is_callable, dead, dead_export)`.
+/// walk). `is_pack` names the caller's sweep tier: pack sweeps pass their
+/// per-language sub-index as `routing_idx` and skip the Perl `mask` override
+/// (the set's construction-derived pack routing already widens to VISIBLE —
+/// pack workspace files ride the DEPENDENCY role, a storage artifact of the
+/// per-language cache), and the pack-only entry-point guard (C's `main` is
+/// reached through the ABI, not a call site) unlocks.
+/// Returns `(row, is_callable, dead, dead_export)`.
 ///
 /// `forced_fan_in` is the relational pre-prune verdict: `Some(0)` means the
 /// row store proved this declaration's references projection empty (no ref
@@ -88,9 +89,7 @@ fn heatmap_symbol_row(
                 Some(routing_idx),
                 scope,
             );
-            if is_pack {
-                cs = cs.pack_routed();
-            } else {
+            if !is_pack {
                 cs = cs.with_visibility(mask);
             }
             let locs = cs.references();
@@ -306,9 +305,7 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
                 Some(routing),
                 scope,
             );
-            if is_pack {
-                cs = cs.pack_routed();
-            } else {
+            if !is_pack {
                 cs = cs.with_visibility(resolve::RoleMask::VISIBLE);
             }
             resolve::set_ref_rows_override(Some(false));
@@ -617,8 +614,8 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
     }
 
     // Pack languages route through their own sub-index (VISIBLE-wide — pack
-    // workspace files ride the DEPENDENCY role); `pack_routed()` inside the
-    // helper applies that, so `mask` here is only the Perl knob.
+    // workspace files ride the DEPENDENCY role); the set derives that from
+    // the origin's stamped language, so `mask` here is only the Perl knob.
     for (path, analysis, pack) in &pack_entries {
         let routing: &dyn file_analysis::CrossFileLookup = pack.as_ref();
         gather(

@@ -804,6 +804,21 @@ impl ModuleIndex {
         self.pack_indexes.get(lang).map(|e| e.value().clone())
     }
 
+    /// The ONE speller of verb-routing store selection: which index serves
+    /// cross-file queries for a file of `language` — its pack sub-index when
+    /// attached, else this hub (Perl always; a pack language before its
+    /// index attaches). Handlers and CLI mirrors hold the returned value
+    /// and pass `as_lookup()` into `resolve()`; the pack POLICY is not
+    /// decided here — the CandidateSet derives it from the origin's stamped
+    /// `FileAnalysis.language`. A layering tripwire keeps `pack_index()`
+    /// itself out of the LSP layer so this stays the only spelling.
+    pub fn lookup_for(&self, language: &str) -> RoutedIndex<'_> {
+        match self.pack_index(language) {
+            Some(p) => RoutedIndex::Pack(p),
+            None => RoutedIndex::Hub(self),
+        }
+    }
+
     /// Every attached pack-language sub-index, by language id. The CLI
     /// diagnostics path sweeps these for Mode-B (member-op) diagnostics —
     /// pack files live here, not in the Perl-only `FileStore` the whole-tree

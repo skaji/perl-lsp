@@ -112,8 +112,7 @@ pub(crate) fn cli_hover_single_file(file: &str, line_str: &str, col_str: &str) {
                 None,
                 resolve::OverrideScope::default(),
             )
-            .with_source(&source)
-            .pack_routed();
+            .with_source(&source);
             symbols::pack_hover_markdown(&cs, lang)
         }
         None => analysis.hover_info(point, &source, None),
@@ -346,15 +345,14 @@ fn run_one(
             let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
             let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
                 .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///unknown").unwrap());
-            // Pack languages resolve cross-file through their sub-index (matches
-            // the LSP server); Perl uses the hub. The CLI mirror MUST route here
-            // or cross-file macro/function goto-def silently misses.
+            // Pack languages resolve cross-file through their sub-index
+            // (matches the LSP server); Perl uses the hub. `lookup_for` is
+            // the one speller of that store selection.
             let reg = language_driver::LanguageRegistry::with_enabled();
             let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &source)
                 .map(|d| d.id()).filter(|id| *id != "perl");
-            let pack = lang_id.and_then(|lang| idx.pack_index(lang));
-            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-                pack.as_deref().map_or(idx as &dyn crate::model::file_analysis::CrossFileLookup, |i| i);
+            let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
+            let base_idx = routed.as_lookup();
             // `#include "x.h"` path → the resolved header (`#include` = `use`).
             // A path token, not a name — slot-shaped, stays ahead of the set.
             if lang_id == Some("cpp") {
@@ -375,14 +373,11 @@ fn run_one(
             let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
             let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
                 .expect("origin staged above");
-            let mut cs = resolve::resolve(
+            let cs = resolve::resolve(
                 ws, &origin, file_store::FileKey::Path(abs), point,
                 Some(base_idx), resolve::OverrideScope::default(),
             )
             .with_source(&source);
-            if pack.is_some() {
-                cs = cs.pack_routed();
-            }
             let locs = cs.definitions();
             if !locs.is_empty() {
                 let mut sources = SourceCache::new(fmt);
@@ -417,9 +412,8 @@ fn run_one(
             let reg = language_driver::LanguageRegistry::with_enabled();
             let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
                 .map(|d| d.id()).filter(|id| *id != "perl");
-            let pack = lang_id.and_then(|lang| idx.pack_index(lang));
-            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-                pack.as_deref().map_or(idx as &dyn crate::model::file_analysis::CrossFileLookup, |i| i);
+            let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
+            let base_idx = routed.as_lookup();
             // `#include` reverse — "who includes this header" — owns the path
             // token exclusively (its backward mirror of include goto-def).
             if lang_id == Some("cpp") {
@@ -442,13 +436,10 @@ fn run_one(
             let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
             let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
                 .expect("origin staged above");
-            let mut cs = resolve::resolve(
+            let cs = resolve::resolve(
                 ws, &origin, file_store::FileKey::Path(file_path), point,
                 Some(base_idx), override_scope_from_env(),
             );
-            if pack.is_some() {
-                cs = cs.pack_routed();
-            }
             for loc in cs.references() {
                 let path = match &loc.key {
                     file_store::FileKey::Path(p) => p.display().to_string(),
@@ -468,29 +459,22 @@ fn run_one(
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
             let mut sources = SourceCache::new(fmt);
             let mut results = Vec::new();
-            // Same pack routing as the LSP handler, declared at construction,
-            // so the CLI mirror can't diverge: the domain bridge (enum def →
-            // field-slot sites) and the family/spec walks are one projection.
+            // Same store routing as the LSP handler, so the CLI mirror can't
+            // diverge: the domain bridge (enum def → field-slot sites) and
+            // the family/spec walks are one projection.
             let reg = language_driver::LanguageRegistry::with_enabled();
-            let pack = reg
+            let lang_id = reg
                 .for_path_sniffed(std::path::Path::new(file), &s)
                 .map(|d| d.id())
-                .filter(|id| *id != "perl")
-                .and_then(|lang| idx.pack_index(lang));
-            let base_idx: &dyn file_analysis::CrossFileLookup = match pack.as_deref() {
-                Some(i) => i,
-                None => idx,
-            };
+                .filter(|id| *id != "perl");
+            let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
             let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
             let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
                 .expect("origin staged above");
-            let mut cs = resolve::resolve(
+            let cs = resolve::resolve(
                 ws, &origin, file_store::FileKey::Path(file_path), point,
-                Some(base_idx), resolve::OverrideScope::default(),
+                Some(routed.as_lookup()), resolve::OverrideScope::default(),
             );
-            if pack.is_some() {
-                cs = cs.pack_routed();
-            }
             for loc in cs.implementations() {
                 let path = match &loc.key {
                     file_store::FileKey::Path(p) => p.display().to_string(),
@@ -511,22 +495,17 @@ fn run_one(
             if let Some(lang) = reg.for_path_sniffed(std::path::Path::new(file), &source)
                 .map(|d| d.id()).filter(|id| *id != "perl")
             {
-                let pack = idx.pack_index(lang);
-                let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-                    pack.as_deref().map_or(idx, |i| i);
+                let routed = idx.lookup_for(lang);
                 let abs = std::fs::canonicalize(file)
                     .unwrap_or_else(|_| std::path::PathBuf::from(file));
                 let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
                 let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
                     .expect("origin staged above");
-                let mut cs = resolve::resolve(
+                let cs = resolve::resolve(
                     ws, &origin, file_store::FileKey::Path(abs), point,
-                    Some(base_idx), resolve::OverrideScope::default(),
+                    Some(routed.as_lookup()), resolve::OverrideScope::default(),
                 )
                 .with_source(&source);
-                if pack.is_some() {
-                    cs = cs.pack_routed();
-                }
                 return symbols::pack_hover_markdown(&cs, lang)
                     .ok_or_else(|| format!("No hover info at {}:{}", req.line, req.col));
             }
@@ -855,26 +834,20 @@ fn run_rename(
         .unwrap_or_else(|_| std::path::PathBuf::from(file));
     let (s, _t, mut analysis) = parse_file(file);
     analysis.enrich_imported_types_with_keys(Some(idx));
-    // Same shape as the LSP handler: pack routing declared at construction,
-    // stage the origin, construct the set once, project the rename — the
-    // per-arm policy (cross-file vs group vs single-file, rewritability,
-    // the pack full-or-refuse) lives on the set.
+    // Same shape as the LSP handler: stage the origin, construct the set
+    // once, project the rename — the per-arm policy (cross-file vs group vs
+    // single-file, rewritability, the pack full-or-refuse) lives on the set.
     let reg = language_driver::LanguageRegistry::with_enabled();
     let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
         .map(|d| d.id()).filter(|id| *id != "perl");
-    let pack = lang_id.and_then(|lang| idx.pack_index(lang));
-    let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-        pack.as_deref().map_or(idx as &dyn crate::model::file_analysis::CrossFileLookup, |i| i);
+    let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
     let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
     let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
         .expect("origin staged above");
-    let mut cs = resolve::resolve(
+    let cs = resolve::resolve(
         ws, &origin, file_store::FileKey::Path(file_path), point,
-        Some(base_idx), override_scope_from_env(),
+        Some(routed.as_lookup()), override_scope_from_env(),
     );
-    if pack.is_some() {
-        cs = cs.pack_routed();
-    }
     if cs.resolution().is_none() {
         return Err(format!("Nothing renameable at {}:{}", point.row, point.column));
     }

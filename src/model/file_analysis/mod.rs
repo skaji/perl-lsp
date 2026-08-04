@@ -392,6 +392,15 @@ pub struct FileAnalysis {
     #[serde(skip, default)]
     pub degraded: bool,
 
+    /// The id of the language driver that built this analysis — the origin
+    /// identity `resolve()` derives pack routing from at CandidateSet
+    /// construction (`is_pack_language`), so no verb handler carries the
+    /// routing decision. Stamped by `PackDriver::analyze_with_path`;
+    /// `"perl"` for the native builder and for cache blobs predating the
+    /// field (serde default).
+    #[serde(default = "default_language")]
+    pub language: String,
+
     /// Raw domain-typing sites: each `slot`-field access that interacts
     /// with a `value` token (`slot == V`, `slot = V`) at `slot_span`. The
     /// value's enum is resolved cross-file at query time (an enumerator
@@ -430,6 +439,12 @@ pub struct FileAnalysis {
     /// so it is valid for freshly-built and SQLite-cached modules alike.
     #[serde(skip, default)]
     export_lookup: HashSet<String>,
+}
+
+/// serde default for `FileAnalysis::language` — the native builder's id,
+/// also what pre-field cache blobs deserialize as.
+fn default_language() -> String {
+    "perl".to_string()
 }
 
 /// Everything the builder hands over to construct a `FileAnalysis`.

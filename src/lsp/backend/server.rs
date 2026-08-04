@@ -476,13 +476,8 @@ impl LanguageServer for Backend {
         };
         // cpp/pack functions live in the per-language sub-index; route there
         // so cross-file function goto-def resolves (Perl uses the hub).
-        let pack = (language != "perl")
-            .then(|| self.module_index.pack_index(language))
-            .flatten();
-        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-            Some(i) => i,
-            None => &*self.module_index,
-        };
+        let routed = self.module_index.lookup_for(language);
+        let base_idx = routed.as_lookup();
         // The raw-word lanes below (macro variants, cross-file word fallback)
         // sit outside the CandidateSet and still need this file's closure
         // scope; the set scopes itself at construction.
@@ -505,7 +500,7 @@ impl LanguageServer for Backend {
         // variant lane (ranked, never pruned, see-through delegate) for pack
         // routing; labels ride the candidates and the editor adapter drops
         // them (ordering conveys rank).
-        let mut cs = crate::index::resolve::resolve(
+        let cs = crate::index::resolve::resolve(
             &self.files,
             &analysis,
             FileKey::Url(uri.clone()),
@@ -514,9 +509,6 @@ impl LanguageServer for Backend {
             crate::index::resolve::OverrideScope::default(),
         )
         .with_source(&text);
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
         let locs: Vec<Location> = cs
             .definitions()
             .into_iter()
@@ -568,26 +560,17 @@ impl LanguageServer for Backend {
         };
 
         // The family/descendants/domain projection of the same set references
-        // and rename resolve from — pack routing declared at construction so
+        // and rename resolve from — pack routing is a construction fact, so
         // the resolved target can't diverge across the three verbs.
-        let pack = (language != "perl")
-            .then(|| self.module_index.pack_index(language))
-            .flatten();
-        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-            Some(i) => i,
-            None => &*self.module_index,
-        };
-        let mut cs = crate::index::resolve::resolve(
+        let routed = self.module_index.lookup_for(language);
+        let cs = crate::index::resolve::resolve(
             &self.files,
             &analysis,
             FileKey::Url(uri.clone()),
             symbols::position_to_point(pos),
-            Some(base_idx),
+            Some(routed.as_lookup()),
             crate::index::resolve::OverrideScope::default(),
         );
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
         Ok(refs_to_locations(cs.implementations()).map(GotoDefinitionResponse::Array))
     }
 
@@ -614,13 +597,8 @@ impl LanguageServer for Backend {
         // Pack languages resolve + collect through their sub-index (mirrors
         // goto-def and the CLI) — the hub only knows Perl modules, so a cpp
         // query against it silently misses every cross-file use.
-        let pack = (language != "perl")
-            .then(|| self.module_index.pack_index(language))
-            .flatten();
-        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-            Some(i) => i,
-            None => &*self.module_index,
-        };
+        let routed = self.module_index.lookup_for(language);
+        let base_idx = routed.as_lookup();
         let self_path = uri.to_file_path().ok();
         // `#include` reverse — "who includes this header" — owns the path
         // token exclusively (the backward mirror of include goto-def). The
@@ -654,21 +632,15 @@ impl LanguageServer for Backend {
         let uri = uri.clone();
         let scope = self.override_scope();
         let locs = tokio::task::spawn_blocking(move || {
-            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-                Some(i) => i,
-                None => &*module_index,
-            };
-            let mut cs = crate::index::resolve::resolve(
+            let routed = module_index.lookup_for(language);
+            let cs = crate::index::resolve::resolve(
                 &files,
                 &analysis,
                 FileKey::Url(uri),
                 point,
-                Some(base_idx),
+                Some(routed.as_lookup()),
                 scope,
             );
-            if pack.is_some() {
-                cs = cs.pack_routed();
-            }
             refs_to_locations(cs.references())
         })
         .await
@@ -688,15 +660,9 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let point = symbols::position_to_point(params.position);
-        // Same pack routing as the rename handler, so this gate probes the
+        // Same store routing as the rename handler, so this gate probes the
         // target rename would actually act on.
-        let pack = (language != "perl")
-            .then(|| self.module_index.pack_index(language))
-            .flatten();
-        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-            Some(i) => i,
-            None => &*self.module_index,
-        };
+        let routed = self.module_index.lookup_for(language);
         // The rename box's range + placeholder.
         let box_at = analysis
             .symbol_at(point)
@@ -709,17 +675,14 @@ impl LanguageServer for Backend {
         // `rename_edits`' arms on the same set (incl. the pack probe: a rename
         // the set would refuse or no-op on offers no box), so this gate tracks
         // new renameable kinds automatically, with no change here.
-        let mut cs = crate::index::resolve::resolve(
+        let cs = crate::index::resolve::resolve(
             &self.files,
             &analysis,
             FileKey::Url(params.text_document.uri.clone()),
             point,
-            Some(base_idx),
+            Some(routed.as_lookup()),
             self.override_scope(),
         );
-        if pack.is_some() {
-            cs = cs.pack_routed();
-        }
         let renameable = cs.renameable();
         if !renameable {
             return Ok(None);
@@ -756,17 +719,10 @@ impl LanguageServer for Backend {
         let point = symbols::position_to_point(pos);
         // Rename is the references image + policy, projected from the same
         // set: cross-file walk for workspace-stable targets, per-member texts
-        // for groups, the origin file's rename machinery for lexicals. The
-        // pack routing fact is declared at construction; the set widens the
-        // walk to the per-language cache and REFUSES on alias-spelled sites
-        // instead of emitting a partial edit.
-        let pack = (language != "perl")
-            .then(|| self.module_index.pack_index(language))
-            .flatten();
-        let _base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-            Some(i) => i,
-            None => &*self.module_index,
-        };
+        // for groups, the origin file's rename machinery for lexicals. Pack
+        // routing is a construction fact on the set: it widens the walk to
+        // the per-language cache and REFUSES on alias-spelled sites instead
+        // of emitting a partial edit.
         // Same blocking-pool routing as `references`: rename projects the
         // references image, which now reads SQLite + rehydrates blobs.
         let files = Arc::clone(&self.files);
@@ -775,21 +731,15 @@ impl LanguageServer for Backend {
         let new_name = new_name.clone();
         let scope = self.override_scope();
         tokio::task::spawn_blocking(move || {
-            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
-                Some(i) => i,
-                None => &*module_index,
-            };
-            let mut cs = crate::index::resolve::resolve(
+            let routed = module_index.lookup_for(language);
+            let cs = crate::index::resolve::resolve(
                 &files,
                 &analysis,
                 FileKey::Url(uri),
                 point,
-                Some(base_idx),
+                Some(routed.as_lookup()),
                 scope,
             );
-            if pack.is_some() {
-                cs = cs.pack_routed();
-            }
             cs.rename_edits(&new_name)
                 .map(edit_pairs_to_workspace_edit)
                 .map_err(tower_lsp::jsonrpc::Error::invalid_params)
@@ -819,10 +769,9 @@ impl LanguageServer for Backend {
         // would jump to) — constructed exactly like the goto-def handler's
         // set, so the two verbs can't disagree at a position.
         if language != "perl" {
-            let pack = self.module_index.pack_index(language);
-            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-                pack.as_deref().map_or(&*self.module_index, |i| i);
-            let mut cs = crate::index::resolve::resolve(
+            let routed = self.module_index.lookup_for(language);
+            let base_idx = routed.as_lookup();
+            let cs = crate::index::resolve::resolve(
                 &self.files,
                 &analysis,
                 FileKey::Url(uri.clone()),
@@ -831,9 +780,6 @@ impl LanguageServer for Backend {
                 crate::index::resolve::OverrideScope::default(),
             )
             .with_source(&text);
-            if pack.is_some() {
-                cs = cs.pack_routed();
-            }
             if let Some(h) = symbols::pack_hover(&cs, language) {
                 return Ok(Some(h));
             }

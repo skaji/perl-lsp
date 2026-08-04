@@ -154,11 +154,14 @@ The spike's axes live in CandidateSet construction:
   connectivity gate per scanned file (`file_sees_target`) before the
   matcher runs — no entry point re-applies a decorator, and every
   projection that walks inherits the gate.
-- **pack routing** — `pack_routed()` declares the caller's per-language
-  sub-index routing; the set owns the consequences: visibility widens to
-  VISIBLE (pack workspace files ride the DEPENDENCY role), and
-  `rename_edits` → `Result` REFUSES on alias-spelled sites
-  (full-or-refuse) instead of silently skipping.
+- **pack routing** — a construction fact: `resolve()` derives it from the
+  origin's stamped `FileAnalysis.language` (`is_pack_language`), so no
+  handler declares or can forget it; store selection has its own single
+  speller (`ModuleIndex::lookup_for`, tripwired out of the LSP layer).
+  The set owns the consequences: visibility widens to VISIBLE (pack
+  workspace files ride the DEPENDENCY role), and `rename_edits` →
+  `Result` REFUSES on alias-spelled sites (full-or-refuse) instead of
+  silently skipping.
 - **delegation / `Specializes` / domain edges** — consumers declare
   traversal: references walks delegation aliases (never the domain
   bridge); `implementations()` walks `Specializes` families and the

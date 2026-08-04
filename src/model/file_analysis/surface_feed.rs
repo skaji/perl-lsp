@@ -101,6 +101,7 @@ impl FileAnalysis {
             contract_symbols: _contract_symbols, // SymbolIds (banned from the Surface); the markers they tag project as methods
             column_keyed_verbs: _column_keyed_verbs, // baked from the plugin registry, not this file's source; the plugin fingerprint owns invalidation
             receiver_names: _receiver_names,     // LangPack-wide convention, identical across the pack's files
+            language: _language,                 // the origin's serving-language identity; `resolve()` reads it live per query, never baked into a consumer's cached state
             dynamic_dispatch_sites: _dynamic_dispatch_sites, // heatmap soundness counter, read live
             specializes: _specializes,           // family edges read LIVE from the provider's re-registered analysis (the file re-registers on its own rebuild even when Unchanged)
             template_params: _template_params,   // instantiation substitution reads the provider live at query time

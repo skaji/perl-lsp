@@ -213,6 +213,10 @@ when, why), not the contract.
   ever lands for other reasons.
 - **Discussion needed:** none urgent; fold into B if/when a language tag
   exists.
+- **2026-08-04:** the language tag landed (rework C1): `pack` is derived
+  from `FileAnalysis.language` at set construction and `pack_routed()` is
+  gone; the Sub-lane def_paths mint stays at the set, now gated by the
+  construction-derived fact.
 
 ## `Slot::ModulePath`'s `in_use` field — 2026-07-05 — RATIFIED + GENERALIZED (veesh, 2026-07-05)
 - **Context:** cursor Slot taxonomy (`docs/adr/cursor-slots.md`), migrating

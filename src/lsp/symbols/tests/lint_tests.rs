@@ -218,7 +218,6 @@ mod pack_macro_goto {
             Some(&idx),
             crate::index::resolve::OverrideScope::default(),
         )
-        .pack_routed()
         .with_source(src)
         .definitions()
     }

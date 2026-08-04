@@ -15,14 +15,6 @@ impl<'a> CandidateSet<'a> {
         self
     }
 
-    /// Declare the caller routed this origin through a per-language pack
-    /// sub-index. A routing fact, like which store — the policy consequences
-    /// (VISIBLE-wide walks, rename's full-or-refuse) live on the set.
-    pub fn pack_routed(mut self) -> Self {
-        self.pack = true;
-        self
-    }
-
     /// Supply the origin document's raw text — unlocks the raw-word
     /// candidate lanes (macro variants in `definitions()`).
     pub fn with_source(mut self, source: &'a str) -> Self {
@@ -161,7 +153,7 @@ impl<'a> CandidateSet<'a> {
     /// names for groups). Policy lives on the set/locations, not in handlers:
     /// non-rewritable sites (const-folded names) are references but never
     /// edits, and the walk stops at editable space (for pack routing,
-    /// "editable" includes the per-language cache — see `pack_routed`).
+    /// "editable" includes the per-language cache).
     /// `Ok(empty)` = nothing renameable here; `Err` = a rename that would
     /// SILENTLY BREAK code — a pack set containing an alias-spelled site (a
     /// use through a delegating `#define`, `rewritable: false`) refuses: the

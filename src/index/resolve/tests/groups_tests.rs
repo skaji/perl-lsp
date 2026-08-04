@@ -1657,8 +1657,7 @@ mod pack_symmetry {
             tree_sitter::Point { row: 1, column: 16 }, // on OP_VIS_A
             Some(&idx),
             OverrideScope::default(),
-        )
-        .pack_routed();
+        );
 
         // goto-def: through the closure to the header's enumerator.
         let defs = cs.definitions();
@@ -1708,8 +1707,7 @@ mod pack_symmetry {
             tree_sitter::Point { row: 1, column: 16 },
             Some(&idx),
             OverrideScope::default(),
-        )
-        .pack_routed();
+        );
         assert!(
             cs2.complete("OP_", false).is_empty(),
             "no closure, no completion universe"
@@ -1747,8 +1745,7 @@ mod pack_symmetry {
             None,
             OverrideScope::default(),
         )
-        .with_source(src)
-        .pack_routed();
+        .with_source(src);
         let defs = cs.definitions();
         assert_eq!(defs.len(), 2, "def ranked + decl kept: {defs:?}");
         assert_eq!(defs[0].span.start.row, 2, "the bodied def ranks first: {defs:?}");
@@ -1777,8 +1774,7 @@ mod pack_symmetry {
             Some(&idx),
             OverrideScope::default(),
         )
-        .with_source(header_src)
-        .pack_routed();
+        .with_source(header_src);
         let defs = cs.definitions();
         assert!(
             matches!(&defs[0].key, FileKey::Path(p) if p.ends_with("state.c")),
@@ -1839,8 +1835,7 @@ mod pack_symmetry {
             Some(&idx),
             OverrideScope::default(),
         )
-        .with_source(caller_src)
-        .pack_routed();
+        .with_source(caller_src);
         let defs = cs.definitions();
         assert!(
             defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.cc"))),
@@ -1868,8 +1863,7 @@ mod pack_symmetry {
             Some(&idx),
             OverrideScope::default(),
         )
-        .with_source(header_src)
-        .pack_routed();
+        .with_source(header_src);
         let defs2 = cs2.definitions();
         assert!(
             defs2.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p.ends_with("memtable.cc"))),
@@ -1920,8 +1914,7 @@ mod pack_symmetry {
             Some(&idx),
             OverrideScope::default(),
         )
-        .with_source(def_src)
-        .pack_routed();
+        .with_source(def_src);
         // The Sub target carries closure-keyed def_paths (the D3 gate).
         match cs.resolution() {
             Some(ResolvedTarget::Target(t)) => {
@@ -1974,8 +1967,7 @@ mod pack_symmetry {
             Some(&idx),
             OverrideScope::default(),
         )
-        .with_source(use_src)
-        .pack_routed();
+        .with_source(use_src);
 
         let defs = cs.definitions();
         let hover = crate::lsp::symbols::pack_hover_markdown(&cs, "c");
@@ -1995,8 +1987,7 @@ mod pack_symmetry {
             Some(&idx),
             OverrideScope::default(),
         )
-        .with_source(use_src)
-        .pack_routed();
+        .with_source(use_src);
         assert!(cs_blank.definitions().is_empty(), "gd silent on a token-less position");
         assert!(
             crate::lsp::symbols::pack_hover_markdown(&cs_blank, "c").is_none(),
@@ -2066,8 +2057,7 @@ mod pack_symmetry {
             tree_sitter::Point::new(0, 24),
             None,
             OverrideScope::default(),
-        )
-        .pack_routed();
+        );
         let edits = cs
             .rename_edits("OP_RANGE")
             .expect("plain enum rename must not refuse");

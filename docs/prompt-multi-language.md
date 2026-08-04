@@ -86,11 +86,11 @@ and passes the document's. The SQLite cache gains a `language` column
 
 **2. Cross-language ref pollution: a language tag on FileAnalysis.**
 `refs_to` walks every workspace file; a Python `helper` must not match
-an R `helper`. Add `#[serde(default = "perl")] language: String` to
-FileAnalysis (EXTRACT_VERSION bump), stamp it in `analyze()`, and
-filter in exactly two places: `refs_to`'s store walks and
-`workspace/symbol`. `TargetRef` carries the origin language. This is
-the ONE genuine engine edit in the program — a field and two filters.
+an R `helper`. The field is LANDED: `FileAnalysis.language`
+(`#[serde(default = "perl")]`, stamped by `PackDriver::analyze_with_path`)
+— `resolve()` derives pack routing from it at CandidateSet construction.
+Still to do here: filter in exactly two places — `refs_to`'s store walks
+and `workspace/symbol` — with `TargetRef` carrying the origin language.
 
 ## What pack languages get on day one vs later
 

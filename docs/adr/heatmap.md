@@ -116,8 +116,8 @@ Treat the dead list as a **review queue**, not a delete list.
 Pack-language files light up the heatmap on the same machinery: symbols come
 from the per-language sub-indexes (`ModuleIndex::for_each_pack_index` →
 `for_each_registered_file`), fan-in is the identical `references()` projection
-routed through the pack sub-index (`pack_routed()`, VISIBLE-wide because pack
-workspace files ride the DEPENDENCY role). Free functions group by file (like
+routed through the pack sub-index (construction-derived pack routing,
+VISIBLE-wide because pack workspace files ride the DEPENDENCY role). Free functions group by file (like
 Perl's `main`); class / namespace members group by `sym.package`. No language
 branch.
 

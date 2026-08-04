@@ -115,6 +115,8 @@ impl FileAnalysis {
             include_directives: Vec::new(),
             include_closure: path_intern::ClosureList::default(),
             degraded: false,
+            // Pack drivers re-stamp their id post-construction.
+            language: super::default_language(),
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),

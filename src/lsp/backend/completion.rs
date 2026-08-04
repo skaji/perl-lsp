@@ -27,9 +27,8 @@ pub fn pack_completion(
     // Cross-file resolves against THIS language's sub-index (its own
     // cache — no cross-language overlap), falling back to the hub when
     // none is attached.
-    let pack = module_index.pack_index(language);
-    let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-        pack.as_deref().map_or(module_index, |i| i);
+    let routed = module_index.lookup_for(language);
+    let base_idx = routed.as_lookup();
     // Scope member/type resolution to the file's include closure.
     let scoped = crate::model::file_analysis::ScopedLookup::new(
         base_idx, &analysis.include_closure, path);
@@ -74,8 +73,7 @@ pub fn pack_completion(
             point,
             Some(base_idx),
             crate::index::resolve::OverrideScope::default(),
-        )
-        .pack_routed();
+        );
         let candidates = cs.complete_qualified_path(xidx, prefix);
         if !candidates.is_empty() {
             return (
@@ -170,9 +168,7 @@ fn closure_symbol_completion(
     if prefix.is_empty() {
         return true; // live source, waiting for a prefix
     }
-    let pack = module_index.pack_index(language);
-    let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
-        pack.as_deref().map_or(module_index, |i| i);
+    let routed = module_index.lookup_for(language);
     let seen: std::collections::HashSet<String> =
         items.iter().map(|i| i.label.clone()).collect();
     // The closure-gated identifier universe is the set's completion
@@ -184,10 +180,9 @@ fn closure_symbol_completion(
         analysis,
         crate::index::file_store::FileKey::Path(path.map(|p| p.to_path_buf()).unwrap_or_default()),
         point,
-        Some(base_idx),
+        Some(routed.as_lookup()),
         crate::index::resolve::OverrideScope::default(),
-    )
-    .pack_routed();
+    );
     let candidates =
         crate::model::timings::phase("completion.closure_symbols", || cs.complete(prefix, false));
     for c in candidates {

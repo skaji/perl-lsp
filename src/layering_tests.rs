@@ -353,3 +353,35 @@ fn whole_copy_registration_sites_are_allowlisted() {
     }
     assert!(violations.is_empty(), "whole-copy registration drift:\n{}", violations.join("\n"));
 }
+
+/// Verb-routing store selection has ONE speller: `ModuleIndex::lookup_for`.
+/// An LSP-layer call to `pack_index()` re-derives "which store serves this
+/// origin" per handler — the C1 disease: a verb that picks the store itself
+/// can pick it wrong (or forget), and the CandidateSet's construction-derived
+/// pack policy silently pairs with the wrong store. Whole-sub-index SWEEPS
+/// (`for_each_pack_index`) are a different question and stay allowed.
+#[test]
+fn pack_store_selection_stays_in_lookup_for() {
+    let mut violations = Vec::new();
+    for (path, layer, _stem) in source_files() {
+        if layer != Layer::Lsp {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if t.contains(".pack_index(") {
+                violations.push(format!("{}:{}: {}", path.display(), i + 1, t));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "LSP-layer store selection must route through ModuleIndex::lookup_for \
+         (the one speller), never pick a pack sub-index per handler:\n{}",
+        violations.join("\n")
+    );
+}

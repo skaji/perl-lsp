@@ -219,8 +219,7 @@ fn complete_qualified_path_pack_gathers_owner_members_only() {
         tree_sitter::Point { row: 8, column: 11 },
         None,
         OverrideScope::default(),
-    )
-    .pack_routed();
+    );
 
     let labels: Vec<String> =
         cs.complete_qualified_path(&idx, "fmtx").into_iter().map(|c| c.label).collect();

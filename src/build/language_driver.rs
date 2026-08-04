@@ -241,6 +241,32 @@ impl LanguageDriver for PackDriver {
     /// others below, in order — don't inline new logic into an existing
     /// phase's body.
     fn analyze_with_path(&self, source: &str, path: Option<&Path>) -> FileAnalysis {
+        // Every exit stamps the driver id (degraded stand-ins included — a
+        // failed cpp parse is still a cpp file): `resolve()` derives pack
+        // routing from this origin-identity fact at construction.
+        let mut fa = self.analyze_pipeline(source, path);
+        fa.language = self.id.to_string();
+        fa
+    }
+    fn lang_pack(&self) -> Option<crate::build::query_extract::LangPack> {
+        Some((self.pack)())
+    }
+    fn trigger_chars(&self) -> &[&'static str] {
+        (self.pack)().trigger_chars
+    }
+    fn analysis_input_fingerprint(&self) -> u64 {
+        self.input_fingerprint.map(|f| f()).unwrap_or(0)
+    }
+    fn sniff(&self, prefix: &str) -> bool {
+        self.sniff.is_some_and(|f| f(prefix))
+    }
+}
+
+#[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
+impl PackDriver {
+    /// The phase pipeline `analyze_with_path` documents; the trait method
+    /// wraps it to stamp `FileAnalysis.language` on every exit.
+    fn analyze_pipeline(&self, source: &str, path: Option<&Path>) -> FileAnalysis {
         let mut parser = (self.make_parser)();
         let ctx = self.gather_pack_context(&mut parser, source, path);
         let Some((tree, src, map, recovered)) = self.transform_and_parse(&mut parser, source, &ctx)
@@ -284,18 +310,6 @@ impl LanguageDriver for PackDriver {
                 fa
             }
         }
-    }
-    fn lang_pack(&self) -> Option<crate::build::query_extract::LangPack> {
-        Some((self.pack)())
-    }
-    fn trigger_chars(&self) -> &[&'static str] {
-        (self.pack)().trigger_chars
-    }
-    fn analysis_input_fingerprint(&self) -> u64 {
-        self.input_fingerprint.map(|f| f()).unwrap_or(0)
-    }
-    fn sniff(&self, prefix: &str) -> bool {
-        self.sniff.is_some_and(|f| f(prefix))
     }
 }
 
@@ -1351,6 +1365,26 @@ impl LanguageRegistry {
     /// Configured language ids — what this distribution serves.
     pub fn languages(&self) -> Vec<&'static str> {
         self.drivers.iter().map(|d| d.id()).collect()
+    }
+
+    /// Whether `id` names a pack-served language — its driver carries a
+    /// `LangPack` (Perl's doesn't, so it answers false with no
+    /// language-name branch). THE routing fact `resolve()` reads off an
+    /// origin's stamped `FileAnalysis.language` at CandidateSet
+    /// construction. Memoized: the pack set is fixed at compile time.
+    pub fn is_pack_language(id: &str) -> bool {
+        static PACK_IDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        PACK_IDS
+            .get_or_init(|| {
+                LanguageRegistry::with_enabled()
+                    .drivers
+                    .iter()
+                    .filter(|d| d.lang_pack().is_some())
+                    .map(|d| d.id())
+                    .collect()
+            })
+            .iter()
+            .any(|l| *l == id)
     }
 
     /// Human-facing name for a pack language id, for startup banners and

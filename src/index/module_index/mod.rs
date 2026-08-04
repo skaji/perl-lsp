@@ -319,6 +319,26 @@ pub struct ModuleIndex {
     ref_rows_conn: std::sync::Mutex<Option<(rusqlite::Connection, u64)>>,
 }
 
+/// The store `ModuleIndex::lookup_for` routed a language to. Owning enum:
+/// a pack sub-index is an `Arc` out of the hub's registry and must stay
+/// alive for the query's lifetime (the caller holds this value), while the
+/// hub case stays borrow-only.
+pub enum RoutedIndex<'a> {
+    Hub(&'a ModuleIndex),
+    Pack(Arc<ModuleIndex>),
+}
+
+impl RoutedIndex<'_> {
+    /// The routed store as the lookup trait `resolve()` and the slot-shaped
+    /// pre-set lanes (include tokens, raw-word fallbacks) consume.
+    pub fn as_lookup(&self) -> &dyn crate::model::file_analysis::CrossFileLookup {
+        match self {
+            RoutedIndex::Hub(h) => *h,
+            RoutedIndex::Pack(p) => p.as_ref(),
+        }
+    }
+}
+
 // ---- Module-level helpers ----
 
 /// Return the parents of the primary package of a module, preferring the
