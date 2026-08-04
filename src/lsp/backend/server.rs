@@ -1,0 +1,1423 @@
+//! The `LanguageServer` trait impl — request routing for every LSP verb
+//! (one trait impl, kept whole) — plus its perltidy formatting subprocess.
+
+use super::*;
+
+#[tower_lsp::async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Notify resolver thread of workspace root for per-project cache.
+        let root = params
+            .root_uri
+            .as_ref()
+            .map(|u| u.as_str())
+            .or_else(|| {
+                params
+                    .workspace_folders
+                    .as_ref()
+                    .and_then(|f| f.first())
+                    .map(|f| f.uri.as_str())
+            });
+        // Long-lived process: the overlay + rehydration LRU amortize here
+        // (one-shot CLI modes leave both off — bisected at 2x warm-harness
+        // wall). BEFORE set_workspace_root: the resolver wakes on the root
+        // and reads the flag at warm time.
+        self.module_index.mark_long_lived();
+        self.module_index.set_workspace_root(root);
+        // Same root drives repo-local `.perl-lsp/` plugin discovery, so the
+        // plugin set and the per-project cache key can't disagree.
+        crate::build::plugin::rhai_host::set_workspace_root(root);
+
+        // LSP spec: `initialize` carries the client `processId`; "if the parent
+        // process is not alive then the server should exit." Poll it on an
+        // independent timer — the ROBUST backstop the stdin-EOF path can't be
+        // (that's coupled to the read loop, which isn't running precisely when
+        // the leak happens: a server wedged mid-analysis isn't reading stdin,
+        // and a hard SIGKILL of the editor need not deliver a clean EOF).
+        spawn_parent_liveness_monitor(params.process_id);
+
+        // Server-initiated progress is capability-gated (M7): only send
+        // `window/workDoneProgress/create` to clients that opted in.
+        let wdp = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false);
+        self.work_done_progress
+            .store(wdp, std::sync::atomic::Ordering::Relaxed);
+
+        // Opt-in diagnostics from `initializationOptions.diagnostics`.
+        // The `diagnostics` sub-object deserializes straight into
+        // `DiagnosticOptions` (the struct is the schema — camelCase keys,
+        // absent ones default to false, e.g. `unresolvedDispatch`). A malformed
+        // value leaves the defaults in place rather than failing initialize.
+        if let Some(diag) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("diagnostics"))
+        {
+            if let Ok(parsed) =
+                serde_json::from_value::<symbols::DiagnosticOptions>(diag.clone())
+            {
+                *self.diag_options.lock().unwrap() = parsed;
+            }
+        }
+        // The `rename` sub-object deserializes into `RenameOptions` the same way
+        // (`{ "rename": { "overrideScope": "dispatch" } }`); absent / malformed
+        // leaves the default whole-hierarchy scope.
+        if let Some(rename) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("rename"))
+        {
+            if let Ok(parsed) =
+                serde_json::from_value::<crate::index::resolve::RenameOptions>(rename.clone())
+            {
+                *self.rename_options.lock().unwrap() = parsed;
+            }
+        }
+        // `coldWaitMs` caps the cold-open pull-verb bounded wait; 0 opts out.
+        // Absent / non-integer leaves the default.
+        if let Some(ms) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("coldWaitMs"))
+            .and_then(|v| v.as_u64())
+        {
+            self.cold_wait_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        // `maxCacheMb` sizes the Slice-2 bag-rehydration LRU (0 = rehydrate and
+        // drop). Absent / non-integer leaves the default.
+        if let Some(mb) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|o| o.get("maxCacheMb"))
+            .and_then(|v| v.as_u64())
+        {
+            self.max_cache_mb
+                .store(mb, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Ok(InitializeResult {
+            server_info: Some(ServerInfo {
+                name: "perl-lsp".to_string(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            }),
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(true),
+                        })),
+                        ..Default::default()
+                    },
+                )),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                definition_provider: Some(OneOf::Left(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
+                document_range_formatting_provider: Some(OneOf::Left(true)),
+                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    // Union of every served language's trigger chars — Perl
+                    // sigils/`->`/`{`, plus a pack language's `.`/`::` etc.
+                    // A perl-only build is byte-identical to the old list.
+                    trigger_characters: Some(
+                        crate::build::language_driver::LanguageRegistry::with_enabled().trigger_chars(),
+                    ),
+                    ..Default::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![")".to_string()]),
+                    work_done_progress_options: Default::default(),
+                }),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: SemanticTokensLegend {
+                                token_types: symbols::semantic_token_types(),
+                                token_modifiers: symbols::semantic_token_modifiers(),
+                            },
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: None,
+                            ..Default::default()
+                        },
+                    ),
+                ),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: None,
+                    file_operations: None,
+                }),
+                ..ServerCapabilities::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn initialized(&self, _: InitializedParams) {
+        // Pre-warm each pack language's skeleton-query compilation OFF the
+        // message loop, FIRST — before any `.await` that depends on the client
+        // answering (register_capability), so the warm-up starts even if the
+        // client is slow to respond. `Query::new` is a ~180ms one-time cost
+        // baked into the first pack file build; `did_open` runs that build
+        // synchronously before its own first `.await`, so without this warm-up
+        // it stalls the message loop and the goto-def request queued right
+        // behind the open waits the whole ~180ms (measured: first cpp goto-def
+        // 196ms, second 25ms, third 1ms). A tiny analyze forces the compile
+        // into the driver's `OnceLock`; Perl's query warms on its normal first
+        // build. Correctness-inert: it only populates the cache earlier.
+        tokio::task::spawn_blocking(|| {
+            let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+            for id in reg.languages() {
+                if id == "perl" {
+                    continue;
+                }
+                if let Some(driver) = reg.for_id(id) {
+                    // A non-trivial snippet so `parser.parse` yields a tree and
+                    // the analyze reaches `query_extract::extract` (which is
+                    // where `Query::new` fires); empty source can parse to
+                    // `None` and skip it, leaving the cache cold.
+                    let _ = driver.analyze_with_path("int _perl_lsp_warm;\n", None);
+                }
+            }
+        });
+
+        self.client
+            .log_message(MessageType::INFO, "perl-lsp initialized")
+            .await;
+
+        // Register file watchers for workspace indexing — every served
+        // language's extensions (Perl + pack languages), so out-of-editor
+        // changes to a header/pack file reach the invalidation path too.
+        let watchers: Vec<FileSystemWatcher> = {
+            let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+            reg.languages()
+                .into_iter()
+                .filter_map(|id| reg.for_id(id))
+                .flat_map(|d| d.extensions().iter())
+                .map(|ext| FileSystemWatcher {
+                    glob_pattern: GlobPattern::String(format!("**/*.{ext}")),
+                    kind: None,
+                })
+                .collect()
+        };
+        let registrations = vec![Registration {
+            id: "perl-file-watcher".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: Some(serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers,
+            }).unwrap()),
+        }];
+        let _ = self.client.register_capability(registrations).await;
+
+        // Workspace indexing is LAZY + per-language — the first `did_open` of a
+        // family triggers `ensure_workspace_indexed`, so a C++ session in a
+        // mixed tree never eagerly scans the 4000+ `.pm` files it can't use
+        // (that eager perl scan was the multi-minute first-open stall).
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let text = params.text_document.text;
+        // Build the document OFF the message loop. `FileStore::open` runs the
+        // whole pack pipeline (macro transform + extraction) synchronously — for
+        // a 16k-line macro-heavy C file that is ~1.3 s even cached-only, and
+        // running it here would head-of-line block every request the client
+        // fires on open. cached-only skips the cross-file GATHER (a further
+        // ~1.5 s, warmed later by the single-flight gather heal); the per-file
+        // build is intrinsic and must simply not block the loop.
+        //
+        // A per-URI `Notify` marks the build in flight so read verbs bounded-wait
+        // for it (`await_open_ready`) instead of racing the empty store. The
+        // `set_gather_cached_only` thread-local is set INSIDE the blocking closure
+        // so it applies exactly to this build's thread.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        self.opening.insert(uri.clone(), Arc::clone(&notify));
+        let files = Arc::clone(&self.files);
+        let uri_build = uri.clone();
+        let build_started = std::time::Instant::now();
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::build::cpp_reparse::set_gather_cached_only(true);
+            let opened = files.open(uri_build, text);
+            crate::build::cpp_reparse::set_gather_cached_only(false);
+            opened
+        })
+        .await
+        .unwrap_or(false);
+        // Doc is in the store (or the build failed): drop the in-flight marker
+        // and wake any verb waiting on it.
+        self.opening.remove(&uri);
+        notify.notify_waiters();
+        // If the build outran the bounded wait, the verbs the client fired on
+        // open (semanticTokens, inlayHint) returned degraded. Their content is
+        // now in the store — nudge the client to re-request (LSP server-initiated
+        // refresh) so the visible highlighting/hints heal without a keystroke.
+        // A fast build (< cap) answered those on the first pull; no nudge needed.
+        let cap = self.cold_wait_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if opened && cap > 0 && build_started.elapsed().as_millis() as u64 > cap {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let _ = client.semantic_tokens_refresh().await;
+                let _ = client.inlay_hint_refresh().await;
+            });
+        }
+        let mut needs_gather_refresh = false;
+        if opened {
+            if let Some(doc) = self.files.get_open(&uri) {
+                // Lazily index this file's language family (once) so a C++
+                // open doesn't wait on the perl tree.
+                self.ensure_workspace_indexed(&doc.language);
+                // A pack file's first analyze was cached-only; warm the gather
+                // and re-analyze in the background so full cross-file macros land.
+                needs_gather_refresh = doc.language != "perl";
+                // Enqueue imports for background resolution (non-blocking).
+                for imp in &doc.analysis.imports {
+                    self.module_index.request_resolve(&imp.module_name);
+                }
+                // Enqueue parent classes for resolution (inheritance chain).
+                for parents in doc.analysis.package_parents.values() {
+                    for parent in parents {
+                        self.module_index.request_resolve(parent);
+                    }
+                }
+            }
+        }
+        // The open-doc path now owns this file's surface record (buffer
+        // shadows disk for every cross-file consumer — `SurfaceWrite`).
+        // Recording here also catches an open-after-external-change: the
+        // buffer's surface vs the indexer's record → Changed → refresh.
+        let mut opened_dirty = None;
+        if opened {
+            if let (Ok(path), Some(doc)) = (uri.to_file_path(), self.files.get_open(&uri)) {
+                if doc.language == "perl" {
+                    self.module_index.mark_doc_open(&path);
+                    opened_dirty = self.record_open_doc_surface(&uri);
+                }
+            }
+        }
+        self.publish_diagnostics(&uri).await;
+        if let Some(sd) = opened_dirty {
+            self.republish_open_docs_in(&sd.dirty).await;
+        }
+        if needs_gather_refresh {
+            // The open build was cached-only: mark the degraded window BEFORE
+            // spawning the heal, so a cross-file verb racing this open waits
+            // for the full-gather analysis instead of the partial closure.
+            self.degraded_open
+                .entry(uri.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+            // Announce the degraded window (Part 1) and route the initial
+            // gather through the single-flight registry (Part 2) — so the
+            // first change's heal coalesces into THIS gather instead of
+            // spawning a redundant second one.
+            let heal_ctx = self.pack_heal_ctx();
+            let language = self.files.get_open(&uri).map(|d| d.language);
+            if let Some(language) = language {
+                heal_ctx.begin_progress(&uri, language).await;
+            }
+            heal_ctx.request_gather(uri);
+        }
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let Some(change) = params.content_changes.into_iter().next() else {
+            return;
+        };
+        let language = match self.files.get_open(&uri) {
+            Some(doc) => doc.language,
+            None => return,
+        };
+        // Perl rebuilds synchronously — its build is cheap. Pack languages
+        // (macro-heavy C: ~0.7s/rebuild) update the tree/text immediately so
+        // position features stay live, and DEBOUNCE the analysis so a burst
+        // of keystrokes pays one rebuild after typing settles, not one each.
+        if language == "perl" {
+            if let Some(mut doc) = self.files.get_open_mut(&uri) {
+                doc.update(change.text);
+                for imp in &doc.analysis.imports {
+                    self.module_index.request_resolve(&imp.module_name);
+                }
+                for parents in doc.analysis.package_parents.values() {
+                    for parent in parents {
+                        self.module_index.request_resolve(parent);
+                    }
+                }
+            }
+            // Pre-enrichment record — publish_diagnostics enriches in place.
+            let recorded = self.record_open_doc_surface(&uri);
+            self.publish_diagnostics(&uri).await;
+            // Surface-gated consumer refresh: a body edit stops here
+            // (Unchanged → empty dirty set); a contract change republishes
+            // the open docs that can see it.
+            if let Some(sd) = recorded {
+                self.republish_open_docs_in(&sd.dirty).await;
+            }
+            return;
+        }
+        if let Some(mut doc) = self.files.get_open_mut(&uri) {
+            doc.update_text_only(change.text);
+        }
+        let generation = {
+            let mut e = self.change_gen.entry(uri.clone()).or_insert(0);
+            *e += 1;
+            *e
+        };
+        self.spawn_debounced_rebuild(uri, generation);
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let pack_path = self
+            .files
+            .get_open(&uri)
+            .filter(|doc| doc.language != "perl")
+            .and_then(|_| uri.to_file_path().ok());
+        if let Some(text) = params.text {
+            if let Some(mut doc) = self.files.get_open_mut(&uri) {
+                doc.update(text);
+            }
+            let recorded = self.record_open_doc_surface(&uri);
+            self.publish_diagnostics(&uri).await;
+            if let Some(sd) = recorded {
+                self.republish_open_docs_in(&sd.dirty).await;
+            }
+        }
+        // The saved bytes are on disk: re-register this file's indexed copy,
+        // evict the macro/closure caches it participates in, and refresh its
+        // open consumers (H1 — a saved header must become visible to its
+        // includers without a restart). Runs regardless of includeText.
+        if let Some(path) = pack_path {
+            self.schedule_pack_invalidate(path, false);
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        self.files.close(&uri);
+        // Wake any degraded-window waiter — the doc is gone, there is
+        // nothing to wait for.
+        if let Some((_, n)) = self.degraded_open.remove(&uri) {
+            n.notify_waiters();
+        }
+        // Retire any in-flight gather single-flight entry (no leak on close;
+        // the running loop's next `finish` sees Vacant and stops) and end the
+        // degraded-window progress if one is still live.
+        self.gather_reg.forget(&uri);
+        if let Some((_, token)) = self.degraded_progress.remove(&uri) {
+            progress_end(&self.client, token).await;
+        }
+        // Release the surface record to background writers and reconcile:
+        // consumers flip back to the indexed DISK copy — if the buffer died
+        // with unsaved contract changes, whoever enriched against it is
+        // stale and gets republished here.
+        if let Ok(path) = uri.to_file_path() {
+            if let Some(sd) = self.module_index.mark_doc_closed(&path) {
+                self.republish_open_docs_in(&sd.dirty).await;
+            }
+        }
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = &params.text_document.uri;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let syms = symbols::extract_symbols(&doc.analysis);
+        Ok(Some(DocumentSymbolResponse::Nested(syms)))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        // Cold-open bounded waits: first the file's own initial build (may still
+        // be in flight — `did_open` runs it off the loop), then its family index
+        // — so the query resolves warm instead of returning the one degraded
+        // answer the user never re-triggers. Guards dropped before each await;
+        // analysis snapshotted AFTER so any heal is picked up.
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Interactive).await;
+        }
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, text, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
+            None => return Ok(None),
+        };
+        // cpp/pack functions live in the per-language sub-index; route there
+        // so cross-file function goto-def resolves (Perl uses the hub).
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
+            .flatten();
+        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+            Some(i) => i,
+            None => &*self.module_index,
+        };
+        // The raw-word lanes below (macro variants, cross-file word fallback)
+        // sit outside the CandidateSet and still need this file's closure
+        // scope; the set scopes itself at construction.
+        let self_path = uri.to_file_path().ok();
+        let scoped = crate::model::file_analysis::ScopedLookup::new(
+            base_idx, &analysis.include_closure, self_path.as_deref());
+        let idx: &dyn crate::model::file_analysis::CrossFileLookup = &scoped;
+        // `#include "x.h"` path → the resolved header (`#include` = `use`).
+        // A path token, not a name — slot-shaped, so it stays ahead of the
+        // set (the ADR's honest boundary). The pack declares whether it has
+        // include tokens; asked, never named.
+        if language_has_include_tokens(&language) {
+            if let Some(loc) = symbols::pack_include_definition(
+                &analysis, symbols::position_to_point(pos), self_path.as_deref())
+            {
+                return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+            }
+        }
+        // Forward projection of the set. The source text unlocks the macro
+        // variant lane (ranked, never pruned, see-through delegate) for pack
+        // routing; labels ride the candidates and the editor adapter drops
+        // them (ordering conveys rank).
+        let mut cs = crate::index::resolve::resolve(
+            &self.files,
+            &analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(base_idx),
+            crate::index::resolve::OverrideScope::default(),
+        )
+        .with_source(&text);
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        let locs: Vec<Location> = cs
+            .definitions()
+            .into_iter()
+            .filter_map(|l| {
+                let uri = l.to_url()?;
+                Some(Location { uri, range: symbols::span_to_range(l.span) })
+            })
+            .collect();
+        match locs.len() {
+            0 => {}
+            1 => return Ok(Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap()))),
+            _ => return Ok(Some(GotoDefinitionResponse::Array(locs))),
+        }
+        // Member access (`obj->field`) now flows through `find_definition`
+        // above: cpp mints a `MethodCall` ref core resolves like any other.
+        if language != "perl" {
+            // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`) —
+            // the raw word names a local-or-cross-file symbol.
+            if let Some((target, span, _)) = self.pack_xfile_word_at(&text, &analysis, pos, idx) {
+                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: target.unwrap_or_else(|| uri.clone()),
+                    range: symbols::span_to_range(span),
+                })));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: request::GotoImplementationParams,
+    ) -> Result<Option<request::GotoImplementationResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
+        // the file's own initial build, then an in-flight family index.
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Complete).await;
+        }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
+        // Snapshot the open doc (cheap `Arc` clone) and DROP the store guard
+        // before `resolve()` — it re-locks the open shards via `for_each_open`,
+        // and holding the guard across that reentrant read deadlocks against a
+        // concurrent `for_each_open_mut` writer. See `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+
+        // The family/descendants/domain projection of the same set references
+        // and rename resolve from — pack routing declared at construction so
+        // the resolved target can't diverge across the three verbs.
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
+            .flatten();
+        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+            Some(i) => i,
+            None => &*self.module_index,
+        };
+        let mut cs = crate::index::resolve::resolve(
+            &self.files,
+            &analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(base_idx),
+            crate::index::resolve::OverrideScope::default(),
+        );
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        Ok(refs_to_locations(cs.implementations()).map(GotoDefinitionResponse::Array))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
+        // the file's own initial build, then an in-flight family index so
+        // cross-file references resolve warm (the in-window `op_free` 1 → 118
+        // heal) instead of returning def-only.
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Complete).await;
+        }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+
+        let point = symbols::position_to_point(pos);
+        // Pack languages resolve + collect through their sub-index (mirrors
+        // goto-def and the CLI) — the hub only knows Perl modules, so a cpp
+        // query against it silently misses every cross-file use.
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
+            .flatten();
+        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+            Some(i) => i,
+            None => &*self.module_index,
+        };
+        let self_path = uri.to_file_path().ok();
+        // `#include` reverse — "who includes this header" — owns the path
+        // token exclusively (the backward mirror of include goto-def). The
+        // pack declares whether it has include tokens; asked, never named.
+        if language_has_include_tokens(&language) {
+            if let Some(incs) = symbols::pack_include_references(
+                &analysis, point, self_path.as_deref(), base_idx)
+            {
+                let locs: Vec<Location> = incs
+                    .into_iter()
+                    .filter_map(|(path, span)| {
+                        Some(Location {
+                            uri: Url::from_file_path(&path).ok()?,
+                            range: symbols::span_to_range(span),
+                        })
+                    })
+                    .collect();
+                return Ok((!locs.is_empty()).then_some(locs));
+            }
+        }
+        // (The reverse domain bridge — enum type → field-slot sites — is a
+        // goto-implementation projection, NOT part of plain references.)
+        // One construction, one projection — target/group/lexical branching,
+        // visibility (incl. the origin's include-closure scope and the pack
+        // VISIBLE widening), and the cross-file walk all live inside the set.
+        // The backward walk does real I/O now (relational retrieval +
+        // candidate-blob rehydration) — run construction + projection on the
+        // blocking pool, never the reactor. Everything moved is Arc'd.
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let uri = uri.clone();
+        let scope = self.override_scope();
+        let locs = tokio::task::spawn_blocking(move || {
+            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => &*module_index,
+            };
+            let mut cs = crate::index::resolve::resolve(
+                &files,
+                &analysis,
+                FileKey::Url(uri),
+                point,
+                Some(base_idx),
+                scope,
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            refs_to_locations(cs.references())
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+        Ok(locs)
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        self.await_open_ready(&params.text_document.uri, WaitPolicy::Interactive).await;
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(&params.text_document.uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+        let point = symbols::position_to_point(params.position);
+        // Same pack routing as the rename handler, so this gate probes the
+        // target rename would actually act on.
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
+            .flatten();
+        let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+            Some(i) => i,
+            None => &*self.module_index,
+        };
+        // The rename box's range + placeholder.
+        let box_at = analysis
+            .symbol_at(point)
+            .map(|sym| (sym.selection_span, sym.name.clone()))
+            .or_else(|| analysis.ref_at(point).map(|r| (r.span, r.target_name.clone())));
+        // Only offer a rename box where `rename` would actually produce edits.
+        // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
+        // `@_` or an ownerless constructor key resolve to nothing renameable, so
+        // the user gets a box that silently no-ops. `renameable()` mirrors
+        // `rename_edits`' arms on the same set (incl. the pack probe: a rename
+        // the set would refuse or no-op on offers no box), so this gate tracks
+        // new renameable kinds automatically, with no change here.
+        let mut cs = crate::index::resolve::resolve(
+            &self.files,
+            &analysis,
+            FileKey::Url(params.text_document.uri.clone()),
+            point,
+            Some(base_idx),
+            self.override_scope(),
+        );
+        if pack.is_some() {
+            cs = cs.pack_routed();
+        }
+        let renameable = cs.renameable();
+        if !renameable {
+            return Ok(None);
+        }
+        Ok(box_at.map(|(span, placeholder)| PrepareRenameResponse::RangeWithPlaceholder {
+            range: symbols::span_to_range(span),
+            placeholder,
+        }))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let new_name = &params.new_name;
+        if !crate::index::resolve::is_valid_rename_name(new_name) {
+            return Err(tower_lsp::jsonrpc::Error::invalid_params(
+                "rename: the new name must not be empty or whitespace",
+            ));
+        }
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        // Cross-file rename edits are act-on-able: a cold-index rename that
+        // silently missed files would corrupt the workspace. Wait Complete.
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Complete).await;
+        }
+        self.await_open_full(uri, WaitPolicy::Complete).await;
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+
+        let point = symbols::position_to_point(pos);
+        // Rename is the references image + policy, projected from the same
+        // set: cross-file walk for workspace-stable targets, per-member texts
+        // for groups, the origin file's rename machinery for lexicals. The
+        // pack routing fact is declared at construction; the set widens the
+        // walk to the per-language cache and REFUSES on alias-spelled sites
+        // instead of emitting a partial edit.
+        let pack = (language != "perl")
+            .then(|| self.module_index.pack_index(language))
+            .flatten();
+        let _base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+            Some(i) => i,
+            None => &*self.module_index,
+        };
+        // Same blocking-pool routing as `references`: rename projects the
+        // references image, which now reads SQLite + rehydrates blobs.
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let uri = uri.clone();
+        let new_name = new_name.clone();
+        let scope = self.override_scope();
+        tokio::task::spawn_blocking(move || {
+            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup = match pack.as_deref() {
+                Some(i) => i,
+                None => &*module_index,
+            };
+            let mut cs = crate::index::resolve::resolve(
+                &files,
+                &analysis,
+                FileKey::Url(uri),
+                point,
+                Some(base_idx),
+                scope,
+            );
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            cs.rename_edits(&new_name)
+                .map(edit_pairs_to_workspace_edit)
+                .map_err(tower_lsp::jsonrpc::Error::invalid_params)
+        })
+        .await
+        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        // Cold-open bounded waits (see `await_open_ready` / `await_index_ready`):
+        // the file's own initial build, then an in-flight family index so hover
+        // resolves warm.
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Interactive).await;
+        }
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, text, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
+            None => return Ok(None),
+        };
+        // Perl's hover renderer is Perl-specific; pack languages present the
+        // CandidateSet's hover projection (the top-ranked candidate goto-def
+        // would jump to) — constructed exactly like the goto-def handler's
+        // set, so the two verbs can't disagree at a position.
+        if language != "perl" {
+            let pack = self.module_index.pack_index(language);
+            let base_idx: &dyn crate::model::file_analysis::CrossFileLookup =
+                pack.as_deref().map_or(&*self.module_index, |i| i);
+            let mut cs = crate::index::resolve::resolve(
+                &self.files,
+                &analysis,
+                FileKey::Url(uri.clone()),
+                symbols::position_to_point(pos),
+                Some(base_idx),
+                crate::index::resolve::OverrideScope::default(),
+            )
+            .with_source(&text);
+            if pack.is_some() {
+                cs = cs.pack_routed();
+            }
+            if let Some(h) = symbols::pack_hover(&cs, language) {
+                return Ok(Some(h));
+            }
+            // The raw-word fallback outside the set (mirrors goto-def's): a
+            // macro / enum-constant / global whose token no ref captures —
+            // show its definition line.
+            let self_path = uri.to_file_path().ok();
+            let scoped = crate::model::file_analysis::ScopedLookup::new(
+                base_idx, &analysis.include_closure, self_path.as_deref());
+            let xidx: &dyn crate::model::file_analysis::CrossFileLookup = &scoped;
+            if let Some((_, _, line)) = self.pack_xfile_word_at(&text, &analysis, pos, xidx) {
+                if !line.is_empty() {
+                    return Ok(Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: format!("```{}\n{}\n```", language, line),
+                        }),
+                        range: None,
+                    }));
+                }
+            }
+            return Ok(None);
+        }
+        Ok(symbols::hover_info(
+            &analysis,
+            &text,
+            pos,
+            &self.module_index,
+        ))
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> Result<Option<CompletionResponse>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        // Snapshot + drop the store guard before completion resolves (both the
+        // pack and Perl paths gather cross-file candidates through `resolve()`,
+        // which re-locks the open shards via `for_each_open`); see
+        // `Document::analysis`. `tree` clones O(1) (tree-sitter refcount).
+        let (analysis, text, tree, language, path, package_lines) =
+            match self.files.get_open(uri) {
+                Some(doc) => (
+                    Arc::clone(&doc.analysis),
+                    doc.text.clone(),
+                    doc.tree.clone(),
+                    doc.language,
+                    doc.path.clone(),
+                    doc.stable_outline.package_lines().to_vec(),
+                ),
+                None => return Ok(None),
+            };
+        if language != "perl" {
+            let (items, is_incomplete) = pack_completion(
+                &self.files,
+                &analysis,
+                &text,
+                &tree,
+                symbols::position_to_point(pos),
+                language,
+                path.as_deref(),
+                &self.module_index,
+            );
+            if items.is_empty() && !is_incomplete {
+                return Ok(None);
+            }
+            // Prefix-gated cross-file gathering (macros, include-closure
+            // symbols) filters server-side, so the client must re-request
+            // as the typed prefix changes rather than reuse a cached list.
+            return Ok(Some(if is_incomplete {
+                CompletionResponse::List(CompletionList { is_incomplete: true, items })
+            } else {
+                CompletionResponse::Array(items)
+            }));
+        }
+        let items = symbols::completion_items(
+            &self.files,
+            &FileKey::Url(uri.clone()),
+            &analysis,
+            &tree,
+            &text,
+            pos,
+            &self.module_index,
+            Some(&package_lines),
+        );
+        if items.is_empty() {
+            Ok(None)
+        } else {
+            // If any item is a loading placeholder (empty insert_text), mark as incomplete
+            // so the editor re-requests on next keystroke after the module resolves.
+            let is_incomplete = items.iter().any(|i| i.insert_text.as_deref() == Some(""));
+            if is_incomplete {
+                // Trigger resolution for the module being loaded
+                for i in &items {
+                    if i.insert_text.as_deref() == Some("") {
+                        if let Some(ref label) = Some(&i.label) {
+                            if let Some(name) = label.strip_prefix("loading ").and_then(|s| s.strip_suffix("...")) {
+                                self.module_index.request_resolve(name);
+                            }
+                        }
+                    }
+                }
+                Ok(Some(CompletionResponse::List(CompletionList {
+                    is_incomplete: true,
+                    items,
+                })))
+            } else {
+                Ok(Some(CompletionResponse::Array(items)))
+            }
+        }
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        if doc.language != "perl" {
+            return Ok(None); // Perl cursor-context handler
+        }
+        Ok(symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos, &self.module_index))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let highlights = symbols::document_highlights(&doc.analysis, pos, Some(&*self.module_index));
+        if highlights.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(highlights))
+        }
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = &params.text_document.uri;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        if doc.language != "perl" {
+            return Ok(None); // tree-shape handler, Perl-tuned for v1
+        }
+        let ranges: Vec<SelectionRange> = params
+            .positions
+            .iter()
+            .map(|pos| symbols::selection_ranges(&doc.tree, *pos))
+            .collect();
+        Ok(Some(ranges))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = &params.text_document.uri;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let ranges = symbols::folding_ranges(&doc.analysis);
+        if ranges.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ranges))
+        }
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        // Copy the source out and release the DashMap guard before awaiting
+        // perltidy: holding a shard read lock across the await deadlocks any
+        // concurrent didChange (which needs the write lock) on the same file.
+        let source = match self.files.get_open(uri) {
+            Some(doc) => doc.text.clone(),
+            None => return Ok(None),
+        };
+
+        // Shell out to perltidy
+        let output = match run_perltidy(source.clone()).await {
+            Ok(o) => o,
+            Err(e) => {
+                self.client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed to run perltidy: {}", e),
+                    )
+                    .await;
+                return Ok(None);
+            }
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            self.client
+                .log_message(
+                    MessageType::WARNING,
+                    format!("perltidy exited with error: {}", stderr),
+                )
+                .await;
+            return Ok(None);
+        }
+
+        let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+        if formatted == source {
+            return Ok(None);
+        }
+
+        // Replace entire document
+        let line_count = source.lines().count();
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: line_count as u32,
+                    character: 0,
+                },
+            },
+            new_text: formatted,
+        }]))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let actions = symbols::code_actions(&params.context.diagnostics, &doc.analysis, uri);
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let tokens = symbols::semantic_tokens(&doc.analysis);
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: tokens,
+        })))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+        let hints = symbols::inlay_hints(&doc.analysis, params.range);
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
+        }
+    }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = params.query.to_lowercase();
+        let mut results = Vec::new();
+        // Paths a symbols-present resident copy already answered — the rows
+        // pass skips these (open docs and un-evicted copies are fresher than
+        // their persisted rows; evicted copies are rows-guaranteed).
+        let mut covered: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+
+        self.files.for_each_analysis(|key, analysis| {
+            let uri = match key {
+                FileKey::Url(u) => u,
+                FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
+                    Url::parse(&format!("file://{}", p.display()))
+                        .unwrap()
+                }),
+            };
+            if !analysis.symbols_are_evicted() {
+                if let Ok(p) = uri.to_file_path() {
+                    // Claim the canonical spelling too: rows are keyed
+                    // canonical, and an open doc reached through a symlinked
+                    // root must shadow its own persisted rows.
+                    if let Ok(canon) = std::fs::canonicalize(&p) {
+                        covered.insert(canon);
+                    }
+                    covered.insert(p);
+                }
+            }
+            for sym in &analysis.symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+            // Plugin namespaces — match on both id and kind so users
+            // can find "the minion tasks in this workspace" via either
+            // "minion" or "tasks".
+            for ns in &analysis.plugin_namespaces {
+                let hay = format!("{} {}", ns.id.to_lowercase(), ns.kind.to_lowercase());
+                if hay.contains(&query) {
+                    results.push(symbols::plugin_namespace_to_workspace_info(ns, uri.clone()));
+                }
+            }
+        });
+
+        // Pack-language (C/C++/…) symbols live in per-language sub-indexes, not
+        // the FileStore — sweep them so a C typedef/class/free function shows in
+        // workspace search alongside Perl packages.
+        self.module_index.for_each_pack_registered_file(&mut |path, analysis| {
+            if !analysis.symbols_are_evicted() {
+                covered.insert(path.to_path_buf());
+            }
+            let uri = Url::from_file_path(path).unwrap_or_else(|_| {
+                Url::parse(&format!("file://{}", path.display())).unwrap()
+            });
+            for sym in &analysis.symbols {
+                if sym.name.to_lowercase().contains(&query) {
+                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                        results.push(info);
+                    }
+                }
+            }
+        });
+
+        // Rows pass: symbol-evicted copies (Perl workspace + @INC + every
+        // pack tier) answer from the relational store — the resident sweep
+        // above saw empty vecs for them. Same containment test, same
+        // kind/visibility filters as `symbol_to_workspace_info`.
+        for hit in symbols::sym_row_search(&self.module_index, &query) {
+            let path = std::path::PathBuf::from(&hit.path);
+            if covered.contains(&path) {
+                continue;
+            }
+            if let Some(info) = symbols::sym_row_to_workspace_info(&hit) {
+                results.push(info);
+            }
+        }
+
+        symbols::dedup_workspace_symbols(&mut results);
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        // Route by language: pack files go through the invalidation seam
+        // (re-register + reverse-closure eviction — the old path parsed
+        // them with the Perl parser); Perl keeps the direct re-index.
+        let mut perl_changes: Vec<(PathBuf, FileChangeType)> = Vec::new();
+        {
+            let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+            for change in params.changes {
+                let Ok(path) = change.uri.to_file_path() else { continue };
+                match reg.for_path(&path).map(|d| d.id()) {
+                    Some(id) if id != "perl" => {
+                        self.schedule_pack_invalidate(
+                            path,
+                            change.typ == FileChangeType::DELETED,
+                        );
+                    }
+                    _ => perl_changes.push((path, change.typ)),
+                }
+            }
+        }
+        if perl_changes.is_empty() {
+            return;
+        }
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let dirty = tokio::task::spawn_blocking(move || {
+            // Externally changed deps break their consumers' enrichment too
+            // — collect the dirty closure while the records are in hand and
+            // hand it back for the open-doc republish below.
+            let mut dirty_all: std::collections::HashSet<PathBuf> = Default::default();
+            // The persisted generation (blob + ref rows) is now stale for
+            // these paths; drop it so warm starts re-parse and the
+            // relational retrieval can't serve outdated spans. The fresh
+            // in-RAM copy registered below is FULL (never stripped), so the
+            // resident sweep covers it until the next bulk index persists a
+            // new generation.
+            let ws_key = module_index.workspace_root();
+            let conn = crate::index::module_cache::open_cache_db(ws_key.as_deref(), "perl");
+            for (path, typ) in perl_changes {
+                // A DELETED file can't canonicalize (it's gone) — resolve the
+                // parent instead so the spelling still matches the canonical
+                // keys everything was registered/persisted under.
+                let canon = path.canonicalize().unwrap_or_else(|_| {
+                    match (path.parent(), path.file_name()) {
+                        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                            .map(|d| d.join(name))
+                            .unwrap_or_else(|_| path.clone()),
+                        _ => path.clone(),
+                    }
+                });
+                if let Some(ref conn) = conn {
+                    crate::index::module_cache::invalidate_generation(conn, &canon.to_string_lossy());
+                    if canon != path {
+                        crate::index::module_cache::invalidate_generation(
+                            conn,
+                            &path.to_string_lossy(),
+                        );
+                    }
+                }
+                module_index.invalidate_bag_cache(&canon);
+                match typ {
+                    FileChangeType::DELETED => {
+                        files.remove_workspace(&path);
+                        files.remove_workspace(&canon);
+                        // Consumers of the departed file's packages, BEFORE
+                        // the record (and its provided names) are removed.
+                        dirty_all.extend(module_index.dirty_consumers(&canon));
+                        // The hub's path/name registrations must go too, or
+                        // the dead file stays a retrieval candidate and a
+                        // phantom module in name lookups.
+                        module_index.unregister_workspace_path(&canon);
+                    }
+                    _ => {
+                        // Re-index the file (created or changed). The fresh
+                        // copy registers WHOLE (refs + bag) in both stores:
+                        // its persisted generation was just invalidated, so
+                        // the resident copy is the only source until the
+                        // next bulk index re-persists.
+                        if let Ok(source) = std::fs::read_to_string(&path) {
+                            let mut parser = crate::index::module_resolver::create_parser();
+                            if let Some(tree) = parser.parse(&source, None) {
+                                let analysis = crate::build::builder::build(&tree, source.as_bytes());
+                                let arc = Arc::new(analysis);
+                                files.insert_workspace_arc(canon.clone(), arc.clone());
+                                module_index.record_workspace_projections(&canon, &arc);
+                                // register_workspace_resident routes through
+                                // record_and_dirty: the dirty set is bound to
+                                // the record, so a re-register can't drop it.
+                                let sd = module_index
+                                    .register_workspace_resident(canon.clone(), arc);
+                                dirty_all.extend(sd.dirty);
+                            }
+                        }
+                    }
+                }
+            }
+            dirty_all
+        })
+        .await
+        .unwrap_or_default();
+        self.republish_open_docs_in(&dirty).await;
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        // Copy the source out and release the DashMap guard before awaiting
+        // perltidy — see `formatting` for why holding it across the await
+        // deadlocks concurrent didChange on the same file.
+        let source = match self.files.get_open(uri) {
+            Some(doc) => doc.text.clone(),
+            None => return Ok(None),
+        };
+
+        // Extract lines for the range
+        let start_line = params.range.start.line as usize;
+        let end_line = params.range.end.line as usize;
+        let lines: Vec<&str> = source.lines().collect();
+        let end = end_line.saturating_add(1).min(lines.len());
+        // A malformed or inverted client range (start after end, or start past
+        // EOF) must degrade, not panic on the slice.
+        if start_line >= end {
+            return Ok(None);
+        }
+        let range_text: String = lines[start_line..end].join("\n") + "\n";
+
+        // Shell out to perltidy on the range
+        let output = match run_perltidy(range_text.clone()).await {
+            Ok(o) if o.status.success() => o,
+            _ => return Ok(None),
+        };
+
+        let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+        if formatted == range_text {
+            return Ok(None);
+        }
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position { line: start_line as u32, character: 0 },
+                end: Position { line: end as u32, character: 0 },
+            },
+            new_text: formatted,
+        }]))
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> Result<Option<LinkedEditingRanges>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        let doc = match self.files.get_open(uri) {
+            Some(doc) => doc,
+            None => return Ok(None),
+        };
+
+        match symbols::linked_editing_ranges(&doc.analysis, pos, Some(&*self.module_index)) {
+            Some(ranges) => Ok(Some(LinkedEditingRanges {
+                ranges,
+                word_pattern: None,
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Run perltidy over `input`, returning its captured output.
+///
+/// `kill_on_drop` so a cancelled formatting request (the editor sends
+/// `$/cancelRequest`, tower-lsp aborts the handler future) reaps perltidy
+/// instead of leaving a `<defunct>` zombie (#80). The stdin write runs in its
+/// own task concurrently with `wait_with_output`'s stdout drain so we never
+/// block writing stdin while perltidy is blocked writing stdout.
+async fn run_perltidy(input: String) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = tokio::process::Command::new("perltidy")
+        .arg("--standard-output")
+        .arg("--standard-error-output")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let stdin = child.stdin.take();
+    let writer = tokio::spawn(async move {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(input.as_bytes()).await;
+            // drop closes stdin, signalling EOF to perltidy
+        }
+    });
+
+    let output = child.wait_with_output().await;
+    let _ = writer.await;
+    output
+}

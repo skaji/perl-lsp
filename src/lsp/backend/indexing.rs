@@ -1,0 +1,511 @@
+//! Lazy per-family workspace indexing, the cold-open bounded waits
+//! (`await_*`), and the shared work-done-progress spellings.
+
+use super::*;
+
+impl Backend {
+    pub(super) fn diagnostic_options(&self) -> symbols::DiagnosticOptions {
+        *self.diag_options.lock().unwrap()
+    }
+
+    /// The configured method-override fan-out scope for references + rename.
+    pub(super) fn override_scope(&self) -> crate::index::resolve::OverrideScope {
+        self.rename_options.lock().unwrap().override_scope
+    }
+
+    /// Index the opened file's language FAMILY's workspace, once, in the
+    /// background. `perl` → the `.pm/.pl/.t` scan; any pack language (C++/
+    /// Python/…) → the pack-language scan. Latched per family so a C++-only
+    /// session never touches the perl tree, and vice versa.
+    pub(super) fn ensure_workspace_indexed(&self, language: &str) {
+        use std::sync::atomic::Ordering;
+        let want_perl = language == "perl";
+        let latch = if want_perl { &self.perl_indexed } else { &self.pack_indexed };
+        if latch.swap(true, Ordering::Relaxed) {
+            return; // already indexed (or in flight)
+        }
+        let files = Arc::clone(&self.files);
+        let client = self.client.clone();
+        let module_index = Arc::clone(&self.module_index);
+        let root = self.module_index.workspace_root();
+        // Server-initiated progress requires the client capability; a client
+        // that never advertised it may also never ANSWER the create request —
+        // and indexing must proceed regardless (LSP spec).
+        let progress = self
+            .work_done_progress
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let index_ready = Arc::clone(&self.index_ready);
+        let heal_ctx = self.pack_heal_ctx();
+        let bag_cache_bytes =
+            self.max_cache_mb.load(std::sync::atomic::Ordering::Relaxed) as usize * 1024 * 1024;
+        // H9-2: mark the pack index in flight BEFORE it is scheduled, so a save
+        // racing the scheduling defers into the reconcile set instead of hitting
+        // an unattached (no-op) `pack_file_changed`. Perl uses the direct
+        // re-index path and never touches the coordinator.
+        let pack_coord = (!want_perl).then(|| Arc::clone(&self.pack_coord));
+        if let Some(ref coord) = pack_coord {
+            coord.begin_index();
+        }
+        let pack_change_lock = Arc::clone(&self.pack_change_lock);
+        tokio::task::spawn_blocking(move || {
+            // Announces completion (or the no-root early-out) to bounded waiters
+            // on Drop — every exit path of this closure, panic included.
+            let _done = IndexDoneGuard { ready: index_ready, want_perl };
+            let Some(root_uri) = root else { return };
+            let Some(root_path) = root_uri.strip_prefix("file://") else { return };
+            let root_path = PathBuf::from(root_path);
+            let rt = tokio::runtime::Handle::current();
+            let token = NumberOrString::String(format!(
+                "perl-lsp/workspace-index-{}",
+                if want_perl { "perl" } else { "pack" }
+            ));
+            if progress {
+                // tower-lsp holds the server→client request's oneshot SENDER in
+                // its pending map until the reply lands, and panics ("receiver
+                // already dropped") if that reply arrives after we dropped the
+                // RECEIVER. A bare `timeout(.., send_request)` drops the receiver
+                // on timeout, so a slow client's late `create` reply would take
+                // the whole server down (#36). Spawn the request onto a DETACHED
+                // task instead: dropping its `JoinHandle` on timeout leaves the
+                // task — and its receiver — alive, so a late reply routes to a
+                // live receiver (a harmless `Ok`) rather than panicking. The 2s
+                // cap only bounds how long we wait; indexing must proceed even if
+                // a capable-but-slow client never answers.
+                let create = rt.spawn({
+                    let client = client.clone();
+                    let token = token.clone();
+                    async move {
+                        let _ = client
+                            .send_request::<request::WorkDoneProgressCreate>(
+                                WorkDoneProgressCreateParams { token },
+                            )
+                            .await;
+                    }
+                });
+                let _ = rt.block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    create,
+                ));
+                rt.block_on(client.send_notification::<notification::Progress>(ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                        WorkDoneProgressBegin {
+                            title: "Indexing workspace".into(),
+                            cancellable: Some(false),
+                            message: Some("Scanning files...".into()),
+                            percentage: Some(0),
+                        },
+                    )),
+                }));
+            }
+            // Throttled percentage progress. The Rayon index workers call `cb`
+            // per file (cheap: an atomic `fetch_max` guard); only a ≥2% advance
+            // (or the final tick) crosses the channel, where a tokio task owns
+            // the actual `Report` notification. This keeps `send_notification`
+            // OFF the Rayon worker threads — no `block_on` from the pool — and
+            // bounds emissions to ~50 per index regardless of file count.
+            let emitter = progress.then(|| {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(u32, usize, usize)>();
+                let client_e = client.clone();
+                let token_e = token.clone();
+                let handle = rt.spawn(async move {
+                    while let Some((pct, done, total)) = rx.recv().await {
+                        client_e
+                            .send_notification::<notification::Progress>(ProgressParams {
+                                token: token_e.clone(),
+                                value: ProgressParamsValue::WorkDone(
+                                    WorkDoneProgress::Report(WorkDoneProgressReport {
+                                        cancellable: Some(false),
+                                        message: Some(format!("{done}/{total} files")),
+                                        percentage: Some(pct),
+                                    }),
+                                ),
+                            })
+                            .await;
+                    }
+                });
+                (tx, handle)
+            });
+            let last_pct = std::sync::atomic::AtomicU8::new(0);
+            let cb = emitter.as_ref().map(|(tx, _)| {
+                let tx = tx.clone();
+                move |done: usize, total: usize| {
+                    let pct = if total == 0 {
+                        100u8
+                    } else {
+                        ((done * 100 / total).min(100)) as u8
+                    };
+                    let prev = last_pct.fetch_max(pct, std::sync::atomic::Ordering::Relaxed);
+                    if pct >= prev.saturating_add(2) || done >= total {
+                        let _ = tx.send((pct as u32, done, total));
+                    }
+                }
+            });
+            let cb_ref: Option<&(dyn Fn(usize, usize) + Sync)> =
+                cb.as_ref().map(|c| c as &(dyn Fn(usize, usize) + Sync));
+            let count = if want_perl {
+                crate::index::module_resolver::index_workspace_with_index(
+                    &root_path,
+                    &files,
+                    Some(&module_index),
+                    cb_ref,
+                )
+            } else {
+                crate::index::module_resolver::index_pack_languages(
+                    &root_path,
+                    Some(root_uri.as_str()),
+                    &module_index,
+                    cb_ref,
+                    bag_cache_bytes,
+                )
+            };
+            // Drop the sender(s) so the emitter's channel closes, then drain it
+            // — guarantees the final Report lands before End.
+            drop(cb);
+            if let Some((tx, handle)) = emitter {
+                drop(tx);
+                let _ = rt.block_on(handle);
+            }
+            if progress {
+                rt.block_on(client.send_notification::<notification::Progress>(ProgressParams {
+                    token,
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                        WorkDoneProgressEnd {
+                            message: Some(if want_perl {
+                                format!("Indexed {} Perl files", count)
+                            } else {
+                                let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+                                let langs: Vec<&str> = reg
+                                    .languages()
+                                    .into_iter()
+                                    .filter(|id| *id != "perl")
+                                    .map(crate::build::language_driver::LanguageRegistry::display_name)
+                                    .collect();
+                                format!("Indexed {} {} files", count, langs.join("/"))
+                            }),
+                        },
+                    )),
+                }));
+            }
+            // H9-2: the pack sub-indexes are now attached. Reconcile every save
+            // that arrived DURING the index (deferred to avoid the no-op /
+            // uncoordinated-double-work window) exactly once, off the same
+            // serialization lock steady-state invalidations use. The H9-1
+            // generation guard makes this safe: each reconcile reads current
+            // disk (the freshest generation) and outranks whatever the bulk pass
+            // registered from earlier bytes.
+            if let Some(coord) = pack_coord {
+                let deferred = coord.finish_index();
+                if !deferred.is_empty() {
+                    log::debug!(
+                        "pack index complete: reconciling {} deferred change(s)",
+                        deferred.len()
+                    );
+                    let _g = pack_change_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    for (path, deleted) in deferred {
+                        crate::index::module_resolver::pack_file_changed(
+                            Some(root_uri.as_str()),
+                            &module_index,
+                            &path,
+                            deleted,
+                        );
+                    }
+                }
+            }
+            // Heal the cold-open degraded window: the index this file's family
+            // needs has now ATTACHED (the latch marked KICKOFF; this is the
+            // completion signal). Re-analyze + re-publish every open doc in the
+            // family so pull-verb answers baked in the cached-only open window
+            // (truncated cross-file closure, `None` gd/hover) self-heal without
+            // the user re-triggering.
+            Self::heal_open_docs(&heal_ctx, want_perl);
+        });
+    }
+
+    /// Re-derive + re-publish every OPEN document in a language family after its
+    /// workspace index / macro gather lands — the pull-verb heal for the
+    /// cold-open degraded window. Pack docs get a full OFF-lock re-analysis
+    /// (their `did_open` gather was cached-only + the cross-file index is now
+    /// warm); perl docs get an enrich + diagnostics re-publish.
+    ///
+    /// FileStore guard discipline: pack URIs are collected under a read guard
+    /// that is DROPPED before any re-analysis, and each re-analysis snapshots
+    /// text off the lock (`PackHealCtx::run_gather_once`). The perl branch enriches
+    /// under the write guard but touches only `module_index` (never re-locks the
+    /// store) and publishes after the guard drops — the same shape the resolver
+    /// `on_refresh` callback already uses safely.
+    fn heal_open_docs(ctx: &PackHealCtx, want_perl: bool) {
+        log::debug!(
+            "cold-window heal: index landed for {} family",
+            if want_perl { "perl" } else { "pack" }
+        );
+        if want_perl {
+            let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+            ctx.files.for_each_open_mut(|uri, doc| {
+                if doc.language != "perl" {
+                    return;
+                }
+                std::sync::Arc::make_mut(&mut doc.analysis)
+                    .enrich_imported_types_with_keys(Some(ctx.module_index.as_ref()));
+                let diags =
+                    symbols::collect_diagnostics(&doc.analysis, &ctx.module_index, ctx.options);
+                pending.push((uri.clone(), diags));
+            });
+            if pending.is_empty() {
+                return;
+            }
+            let client = ctx.client.clone();
+            tokio::spawn(async move {
+                for (uri, diags) in pending {
+                    client.publish_diagnostics(uri, diags, None).await;
+                }
+            });
+        } else {
+            let mut uris: Vec<Url> = Vec::new();
+            ctx.files.for_each_open(|uri, doc| {
+                if doc.language != "perl" {
+                    uris.push(uri.clone());
+                }
+            });
+            // Route each through the single-flight registry: a doc already
+            // mid-gather coalesces instead of double-gathering its cone.
+            for uri in uris {
+                ctx.request_gather(uri);
+            }
+        }
+    }
+
+    /// Bounded wait for the opened file's language-family workspace/pack index
+    /// to finish, when — and ONLY when — it is actually in-flight: KICKED OFF
+    /// (`ensure_workspace_indexed` flipped the latch at `did_open`) but not yet
+    /// DONE. This closes the residual cold-open window for PULL verbs
+    /// (goto-def / hover / references): unlike completion (`isIncomplete`) and
+    /// diagnostics (server re-push), a one-shot gd/hover the user fired in the
+    /// window got its degraded answer and is gone. Blocking the handler briefly
+    /// for the imminent index lets it resolve against the warm cross-file index
+    /// instead (e.g. references `op_free` 1 → 118).
+    ///
+    /// Zero added latency in the common cases: the warm session (index already
+    /// `done` → returns before awaiting) and the no-index case (latch never set).
+    /// Bounded by `cold_wait_ms` (0 opts out) so it can never wedge, and on
+    /// timeout the handler resolves degraded exactly as before.
+    ///
+    /// GUARD DISCIPLINE: holds NO FileStore guard across the await — it touches
+    /// only the family's `done` atomic + `Notify`. Callers peek `language` under
+    /// a `get_open` guard that DROPS before this await, and snapshot `analysis`
+    /// fresh AFTER it, picking up any heal (see the hazard note on
+    /// `FileStore::for_each_open`).
+    /// `WaitPolicy` → millisecond cap. `cold_wait_ms == 0` is the global
+    /// "never block" opt-out and wins over any policy.
+    fn wait_cap(&self, policy: WaitPolicy) -> u64 {
+        let interactive = self
+            .cold_wait_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match policy {
+            _ if interactive == 0 => 0,
+            WaitPolicy::Interactive => interactive,
+            // Generous ceiling: bounded (a wedged index can't hang the verb
+            // forever) but far beyond any real build/index time.
+            WaitPolicy::Complete => 120_000,
+        }
+    }
+
+    pub(super) async fn await_index_ready(&self, language: &str, policy: WaitPolicy) {
+        use std::sync::atomic::Ordering;
+        let want_perl = language == "perl";
+        let latch = if want_perl { &self.perl_indexed } else { &self.pack_indexed };
+        let (done, notify) = if want_perl {
+            (&self.index_ready.perl_done, &self.index_ready.perl_notify)
+        } else {
+            (&self.index_ready.pack_done, &self.index_ready.pack_notify)
+        };
+        // Only wait when an index is actually coming: kicked off but not done.
+        if !latch.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
+            return;
+        }
+        let cap = self.wait_cap(policy);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the final `done` re-check to close the
+        // notify lost-wakeup race (a completion between the first check and the
+        // await would otherwise be missed), then wait bounded.
+        let waited = notify.notified();
+        if done.load(Ordering::Relaxed) {
+            return;
+        }
+        self.bounded_wait_with_progress(cap, waited, "Waiting for workspace index")
+            .await;
+    }
+
+    /// Bounded wait for a freshly-opened document's INITIAL build, when it is
+    /// still in flight (`did_open` runs the build off the message loop so the
+    /// loop stays responsive during the ~1.3 s cold build of a big C file). A
+    /// read verb calls this before `get_open`: a small/medium file (build <
+    /// cap) resolves warm on the first pull exactly as before; a pathological
+    /// file degrades after the cap and heals once the build lands + republishes.
+    ///
+    /// GUARD DISCIPLINE: holds NO FileStore / DashMap guard across the await —
+    /// it snapshots the `Notify` Arc out of the `opening` map and drops that
+    /// guard before awaiting. Callers snapshot `analysis` fresh AFTER it.
+    pub(super) async fn await_open_ready(&self, uri: &Url, policy: WaitPolicy) {
+        if self.files.get_open(uri).is_some() {
+            return; // already built
+        }
+        let Some(notify) = self.opening.get(uri).map(|n| Arc::clone(n.value())) else {
+            return; // not an in-flight open (unknown/closed file)
+        };
+        let cap = self.wait_cap(policy);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the final presence re-check to close the
+        // notify lost-wakeup race, then wait bounded.
+        let waited = notify.notified();
+        if self.files.get_open(uri).is_some() {
+            return;
+        }
+        self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
+            .await;
+    }
+
+    /// Bounded wait for the open document's FULL-quality analysis — past the
+    /// degraded cached-only-gather window (`degraded_open`). Only cross-file
+    /// act-on-able verbs (references / rename / implementations) call this,
+    /// AFTER `await_open_ready`: their answers read the cross-file closure,
+    /// and inside the window they return a subset that looks complete (curl:
+    /// 4 reference sites vs 155). Per-file verbs (outline, hover, completion)
+    /// deliberately don't — their answers don't need the gather, and waiting
+    /// would regress open→outline latency for nothing. `Interactive` policy
+    /// returns immediately: fast-best-effort verbs keep today's behavior.
+    pub(super) async fn await_open_full(&self, uri: &Url, policy: WaitPolicy) {
+        if !matches!(policy, WaitPolicy::Complete) {
+            return;
+        }
+        let Some(notify) = self.degraded_open.get(uri).map(|n| Arc::clone(n.value())) else {
+            return; // not degraded (perl doc, heal already landed, or never opened)
+        };
+        let cap = self.wait_cap(policy);
+        if cap == 0 {
+            return; // opt-out
+        }
+        // Register interest BEFORE the re-check (lost-wakeup discipline).
+        let waited = notify.notified();
+        if !self.degraded_open.contains_key(uri) {
+            return;
+        }
+        self.bounded_wait_with_progress(cap, waited, "Waiting for cross-file analysis")
+            .await;
+    }
+
+    /// Bounded wait that surfaces as client progress once it actually
+    /// BLOCKS. Silent for the first 500 ms — warm paths and every
+    /// `Interactive` wait (cap ≤ ~400 ms) resolve inside it, so no UI
+    /// noise; only a `Complete` wait that outlives the quiet window mints
+    /// a work-done token, keeping the honest-answer block visible instead
+    /// of reading as a hung request.
+    async fn bounded_wait_with_progress<F>(&self, cap_ms: u64, wait: F, title: &str)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::time::Duration;
+        const QUIET_MS: u64 = 500;
+        tokio::pin!(wait);
+        let quiet = cap_ms.min(QUIET_MS);
+        if tokio::time::timeout(Duration::from_millis(quiet), &mut wait)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let remaining = cap_ms.saturating_sub(quiet);
+        if remaining == 0 {
+            return;
+        }
+        // Server-initiated progress requires the client capability; a client
+        // that never advertised it may also never answer the create request.
+        if !self
+            .work_done_progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let _ = tokio::time::timeout(Duration::from_millis(remaining), &mut wait).await;
+            return;
+        }
+        static WAIT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let token = NumberOrString::String(format!(
+            "perl-lsp/wait-{}",
+            WAIT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        progress_create_and_begin(&self.client, &token, title).await;
+        let _ = tokio::time::timeout(Duration::from_millis(remaining), &mut wait).await;
+        progress_end(&self.client, token).await;
+    }
+}
+
+/// The one spelling of "create + begin a work-done progress" — reused by the
+/// blocking-wait announcement (`bounded_wait_with_progress`) and the degraded
+/// diagnostics announcement (`PackHealCtx::begin_progress`). The detached
+/// create-request task keeps the oneshot receiver alive past the 2 s timeout,
+/// so a late reply can't panic tower-lsp's pending map (#36). Capability
+/// gating is the caller's responsibility — a token minted here presumes the
+/// client advertised `window/workDoneProgress`.
+pub(super) async fn progress_create_and_begin(client: &Client, token: &NumberOrString, title: &str) {
+    let create = tokio::spawn({
+        let client = client.clone();
+        let token = token.clone();
+        async move {
+            let _ = client
+                .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                    token,
+                })
+                .await;
+        }
+    });
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), create).await;
+    client
+        .send_notification::<notification::Progress>(ProgressParams {
+            token: token.clone(),
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title: title.into(),
+                cancellable: Some(false),
+                message: None,
+                percentage: None,
+            })),
+        })
+        .await;
+}
+
+/// Reserve the per-window progress slot for `uri` atomically. Returns `true`
+/// exactly once per window — the first caller mints the token; every later
+/// caller reuses it (returns `false`), so a keystroke burst inside one degraded
+/// window announces itself with a single Begin, not one per change. Releasing
+/// the slot (`clear_degraded`/close removes the entry) lets the next window
+/// reserve again. The DashMap entry guard is dropped before return — no lock is
+/// held across the caller's subsequent `.await`.
+pub(super) fn reserve_degraded_token(
+    map: &dashmap::DashMap<Url, NumberOrString>,
+    uri: &Url,
+    token: NumberOrString,
+) -> bool {
+    use dashmap::mapref::entry::Entry;
+    match map.entry(uri.clone()) {
+        Entry::Occupied(_) => false,
+        Entry::Vacant(v) => {
+            v.insert(token);
+            true
+        }
+    }
+}
+
+/// The one spelling of "end a work-done progress".
+pub(super) async fn progress_end(client: &Client, token: NumberOrString) {
+    client
+        .send_notification::<notification::Progress>(ProgressParams {
+            token,
+            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                message: None,
+            })),
+        })
+        .await;
+}
