@@ -2,6 +2,7 @@
 //! truth; nothing here imports tree-sitter beyond `Point` or any upper
 //! layer (enforced by `layering_tests`).
 
+pub mod builtins;
 pub mod conventions;
 pub mod file_analysis;
 pub mod graph;

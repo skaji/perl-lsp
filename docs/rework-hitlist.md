@@ -179,40 +179,22 @@ tests to the seam.
 in narrowing-diagnostics.md that unknown-hash-key rides a seam like D1-D6.
 Optional layering-test arm: no `crate::model::witnesses` import in `src/lsp/`.
 
-### B2. The Perl builtin surface is three parallel encodings across three layers — **high leverage / M**
+### B2. The Perl builtin surface is three parallel encodings across three layers — **LANDED**
 
-**The wrong embedding.** "What is a Perl builtin" is answered three ways with
-no tripwire keeping them agreeing: (1) the hand-curated `PERL_BUILTINS` name
-allowlist in the adapter (`src/lsp/symbols/diagnostics.rs:9-58`, consumed at
-`:238` and `hover.rs:304`) — name-level Perl knowledge exactly where doctrine
-says it may not live; (2) typed per-name tables `builtin_return_type` /
-`builtin_first_arg_type` (`src/model/file_analysis/completion.rs:1171,1191`)
-consumed across the builder; (3) the perlfunc-derived doc set
-(`src/index/builtins_pod.rs`, `module_index/queries.rs:84-88`). Meanwhile the
-resolution layer already reserves the honest seam:
-`RoleMask::BUILTIN` (`src/index/resolve/mod.rs:36`), which the ADR admits has
-no name source (docs/adr/resolution-candidate-set.md:119-123 — "when either
-grows a source it plugs into the same mask").
-
-**Why it is wrong at the system level.** Drift yields false unresolved-function
-hints, missing hover docs, or missing types with no tripwire; the BUILTIN tier
-stays sourceless, so builtin hover/completion can never ride the resolution
-spine; every builtin-aware feature must pick one of three encodings or add a
-fourth.
-
-**Target shape.** `model/builtins.rs` under the conventions.rs charter (pure
-`&str`): one table `name → BuiltinKind (Function | BarewordFilehandle |
-Keyword)` plus the optional typed signature slots, absorbing all three
-name lists. Wire Function + BarewordFilehandle membership as the BUILTIN
-RoleMask tier's name source, so diagnostics suppression becomes "resolves in
-the BUILTIN tier" via the set — the exact plug-in point the ADR reserved.
-Delete `PERL_BUILTINS`/`is_perl_builtin` from the adapter; `hover.rs:304`
-routes through the same source. `index/builtins_pod.rs` stays as the
-doc-VALUE store keyed by the same names.
-
-**Gate.** Debug assertion that every perlfunc entry name is known to the model
-table (the anti-drift tripwire). Diagnostics tests for a builtin present only
-in the old list.
+`model/builtins.rs` is THE Perl builtin surface: one sorted table
+`name → (BuiltinKind, return-type, first-arg-type)` sourced from
+perlfunc.pod. The adapter's `PERL_BUILTINS`/`is_perl_builtin` are deleted;
+diagnostics suppression asks `is_builtin` (plus
+`conventions::is_constructor_name` for indirect-object `new`), builtin hover
+gates on the same membership, the builder's typed seeding reads the table's
+type columns, and the BUILTIN RoleMask tier has its name source: `Function`
+rows feed `complete()` as candidates (Perl origins only — the pack arm never
+reaches the table). `index/builtins_pod.rs` stays the doc-VALUE store;
+`builtins_pod_tests.rs` carries the anti-drift tripwire (perlfunc entries ⊆
+table modulo a documented prose-noise set; `Function` rows ⊆ perlfunc). The
+realized drift (`exp`, `fc`, `evalbytes`, `lock` typed/documented but
+flagged unresolved) is pinned by tests in `model/builtins.rs` and
+`diagnostics_tests.rs`.
 
 ---
 

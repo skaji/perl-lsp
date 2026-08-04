@@ -718,7 +718,7 @@ impl<'a> Builder<'a> {
             "postinc_expression" | "preinc_expression" => Some(InferredType::Numeric),
             "func1op_call_expression" | "func0op_call_expression" => {
                 let name = node.child(0)?.utf8_text(self.source).ok()?;
-                builtin_return_type(name)
+                crate::model::builtins::builtin_return_type(name)
             }
             _ => None,
         }

@@ -5,7 +5,7 @@ use super::*;
 /// `not $x` must never produce an unresolved-function diagnostic.
 /// Validated in symbols_tests; here we confirm the builder emits a
 /// FunctionCall ref (so the name is visible for filtering) whose name
-/// is "not" — the is_perl_builtin guard in collect_diagnostics then
+/// is "not" — the builtin-surface guard in collect_diagnostics then
 /// suppresses it.
 #[test]
 fn not_operator_emits_no_function_call_ref() {

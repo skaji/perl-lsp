@@ -22,6 +22,9 @@ pub const PRIORITY_AUTO_ADD_QW: u8 = 18;
 pub const PRIORITY_LESS_RELEVANT: u8 = 20;
 /// Unimported module — inserts full `use` statement.
 pub const PRIORITY_UNIMPORTED: u8 = 25;
+/// Perl builtin functions (the BUILTIN resolution tier's source) — always
+/// valid, but user code outranks the language's own vocabulary.
+pub const PRIORITY_BUILTIN: u8 = 30;
 /// Dynamic hash keys (may not exist).
 pub const PRIORITY_DYNAMIC: u8 = 50;
 /// Pack closure-universe names (headers' file-scope symbols) — sort after
@@ -1165,42 +1168,6 @@ pub(super) fn display_handler_params(params: &[ParamInfo]) -> Vec<String> {
 
 pub(super) fn source_line_at(source: &str, row: usize) -> &str {
     source.lines().nth(row).unwrap_or("")
-}
-
-/// Return the known return type for a Perl builtin function, if any.
-pub(crate) fn builtin_return_type(name: &str) -> Option<InferredType> {
-    match name {
-        // Numeric returns
-        "time" | "length" | "index" | "rindex" | "abs" | "int" | "sqrt"
-        | "hex" | "oct" | "ord" | "rand" | "pos" | "tell"
-        | "fileno" => Some(InferredType::Numeric),
-
-        // String returns
-        "join" | "uc" | "lc" | "ucfirst" | "lcfirst" | "substr" | "sprintf"
-        | "ref" | "chr" | "crypt" | "quotemeta" | "pack" | "readline"
-        | "readlink" => Some(InferredType::String),
-
-        // Truth-test builtins — return a boolean (`1` / `''`).
-        "defined" | "exists" => Some(InferredType::Bool),
-
-        _ => None,
-    }
-}
-
-/// Type constraint to push on the first argument of a Perl builtin.
-pub(crate) fn builtin_first_arg_type(name: &str) -> Option<InferredType> {
-    match name {
-        // Numeric arg builtins
-        "abs" | "int" | "sqrt" | "chr"
-        | "sin" | "cos" | "atan2" | "log" | "exp" => Some(InferredType::Numeric),
-
-        // String arg builtins
-        "uc" | "lc" | "ucfirst" | "lcfirst" | "length" | "chomp" | "chop"
-        | "substr" | "index" | "rindex" | "quotemeta"
-        | "hex" | "oct" | "ord" => Some(InferredType::String),
-
-        _ => None,
-    }
 }
 
 /// Serialize an InferredType to a simple string tag.

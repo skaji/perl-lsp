@@ -311,11 +311,11 @@ module_index: Option<&dyn CrossFileLookup>,
             // right branch when the caller's arg count is known.
             let arg_count = crate::cst::call_args(node).len() as u32;
             analysis.sub_return_type_at_arity(name, Some(arg_count))
-                .or_else(|| crate::model::file_analysis::builtin_return_type(name))
+                .or_else(|| crate::model::builtins::builtin_return_type(name))
         }
         "func1op_call_expression" | "func0op_call_expression" => {
             let name = node.child(0)?.utf8_text(source).ok()?;
-            crate::model::file_analysis::builtin_return_type(name)
+            crate::model::builtins::builtin_return_type(name)
         }
         "hash_element_expression" => {
             // For chaining: resolve the base expression

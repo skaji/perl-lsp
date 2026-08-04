@@ -11,7 +11,7 @@ impl<'a> Builder<'a> {
             .and_then(|c| c.utf8_text(self.source).ok())
             .unwrap_or("");
         // Push type constraint on the argument
-        if let Some(arg_type) = builtin_first_arg_type(name) {
+        if let Some(arg_type) = crate::model::builtins::builtin_first_arg_type(name) {
             if let Some(arg) = node.named_child(0) {
                 self.push_var_type_constraint(arg, node, arg_type);
             }

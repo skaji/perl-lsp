@@ -35,27 +35,6 @@ pub(super) fn fake_cached(
 }
 
 #[test]
-fn test_builtins_sorted() {
-    for window in PERL_BUILTINS.windows(2) {
-        assert!(
-            window[0] < window[1],
-            "PERL_BUILTINS not sorted: '{}' >= '{}'",
-            window[0],
-            window[1],
-        );
-    }
-}
-
-#[test]
-fn test_is_perl_builtin() {
-    assert!(is_perl_builtin("print"));
-    assert!(is_perl_builtin("chomp"));
-    assert!(is_perl_builtin("die"));
-    assert!(!is_perl_builtin("frobnicate"));
-    assert!(!is_perl_builtin("my_custom_sub"));
-}
-
-#[test]
 fn test_diagnostics_skips_builtins() {
     let source = "use Carp qw(croak);\nprint 'hello';\ndie 'oops';\n";
     let analysis = parse_analysis(source);
@@ -65,6 +44,37 @@ fn test_diagnostics_skips_builtins() {
     assert!(
         diags.is_empty(),
         "Expected no diagnostics for builtins/imported, got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+/// The unified surface's drift pin: builtins the retired adapter allowlist
+/// missed (`exp` was even TYPED by the builder's first-arg table while the
+/// allowlist flagged it) must not produce unresolved-function hints.
+#[test]
+fn diagnostics_skip_builtins_the_old_allowlist_missed() {
+    let source = "my $e = exp(1);\nmy $f = fc('A');\nmy $b = evalbytes('1');\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::index::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    assert!(
+        diags.is_empty(),
+        "exp/fc/evalbytes are builtins; got: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+    );
+}
+
+/// `new` rides the constructor CONVENTION (`conventions::is_constructor_name`),
+/// not the builtin table — indirect-object `new Foo(...)` still never flags.
+#[test]
+fn diagnostics_skip_indirect_object_constructor() {
+    let source = "my $obj = new Foo::Bar(1);\n";
+    let analysis = parse_analysis(source);
+    let module_index = crate::index::module_index::ModuleIndex::new_for_test();
+    let diags = collect_diagnostics(&analysis, &module_index, Default::default());
+    assert!(
+        !diags.iter().any(|d| d.message.contains("'new'")),
+        "indirect-object constructor call must not flag `new`: {:?}",
         diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
     );
 }

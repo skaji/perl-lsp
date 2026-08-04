@@ -301,7 +301,7 @@ pub fn hover_info(
     // `perlfunc.pod` only on cold-cache miss).
     if let Some(r) = analysis.ref_at(point) {
         if matches!(r.kind, RefKind::FunctionCall { .. }) {
-            if is_perl_builtin(&r.target_name) {
+            if crate::model::builtins::is_builtin(&r.target_name) {
                 if let Some(markdown) = module_index.builtin_doc(&r.target_name) {
                     return Some(Hover {
                         contents: HoverContents::Markup(MarkupContent {

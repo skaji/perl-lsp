@@ -118,9 +118,12 @@ Deliberately NOT on the set (the seam's edge, kept honest):
 - **Plugin query hooks** — cursor-time, imperative, plugin-owned.
 - **Tiers with no source**: WORKSPACE contributes no completion names
   (true before the seam too — workspace-package names and workspace
-  exporter surfaces were never gathered); BUILTIN has no name source
-  (`PERL_BUILTINS` only suppresses diagnostics). When either grows a
-  source it plugs into the same mask — that's the point of the seam.
+  exporter surfaces were never gathered); when it grows a source it plugs
+  into the same mask — that's the point of the seam. BUILTIN has one: the
+  Perl builtin surface (`model/builtins.rs`, the single table diagnostics
+  suppression and builtin hover also ask) supplies its `Function` rows as
+  completion candidates in `complete()`, Perl origins only (the pack arm
+  never reaches it).
 
 ## Structure
 

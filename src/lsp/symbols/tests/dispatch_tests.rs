@@ -1067,8 +1067,13 @@ sub other {
     };
 
     let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
+    // `connect` may still appear as the socket BUILTIN (the identifier
+    // universe's BUILTIN tier) — what must NOT appear is the registered
+    // handler item for it.
     assert!(
-        !items.iter().any(|i| i.label == "connect"),
+        !items
+            .iter()
+            .any(|i| i.label == "connect" && i.kind == Some(CompletionItemKind::EVENT)),
         "non-dispatcher method must not surface handler completions"
     );
 }

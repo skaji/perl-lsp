@@ -4,60 +4,6 @@ use super::*;
 
 // ---- Diagnostics ----
 
-/// Sorted list of Perl built-in functions. Used to avoid false-positive
-/// "unresolved function" diagnostics. Checked via binary_search.
-pub(super) static PERL_BUILTINS: &[&str] = &[
-    // Core bareword filehandles. Uppercase sorts before the lowercase
-    // builtin names below (ASCII), so the slice stays binary-searchable.
-    // Suppresses `print DATA`, `STDOUT->autoflush`, `-t STDIN` style FPs.
-    "ARGV", "ARGVOUT", "DATA", "STDERR", "STDIN", "STDOUT",
-    "abs", "accept", "alarm", "atan2",
-    "bind", "binmode", "bless",
-    "caller", "chdir", "chmod", "chomp", "chop", "chown", "chr", "chroot", "close",
-    "closedir", "connect", "cos", "crypt",
-    "dbmclose", "dbmopen", "defined", "delete", "die", "do", "dump",
-    "each", "endgrent", "endhostent", "endnetent", "endprotoent", "endpwent",
-    "endservent", "eof", "eval", "exec", "exists", "exit",
-    "fcntl", "fileno", "flock", "fork", "format", "formline",
-    "getc", "getgrent", "getgrgid", "getgrnam", "gethostbyaddr", "gethostbyname",
-    "gethostent", "getlogin", "getnetbyaddr", "getnetbyname", "getnetent",
-    "getpeername", "getpgrp", "getppid", "getpriority", "getprotobyname",
-    "getprotobynumber", "getprotoent", "getpwent", "getpwnam", "getpwuid",
-    "getservbyname", "getservbyport", "getservent", "getsockname", "getsockopt",
-    "glob", "gmtime", "goto", "grep",
-    "hex",
-    "import", "index", "int", "ioctl",
-    "join",
-    "keys", "kill",
-    "last", "lc", "lcfirst", "length", "link", "listen", "local", "localtime", "log",
-    "lstat",
-    "map", "mkdir", "msgctl", "msgget", "msgrcv", "msgsnd",
-    "my",
-    "new", "next", "no", "not",
-    "oct", "open", "opendir", "ord", "our",
-    "pack", "pipe", "pop", "pos", "print", "printf", "prototype", "push",
-    "quotemeta",
-    "rand", "read", "readdir", "readline", "readlink", "readpipe", "recv", "redo",
-    "ref", "rename", "require", "reset", "return", "reverse", "rewinddir", "rindex",
-    "rmdir",
-    "say", "scalar", "seek", "seekdir", "select", "semctl", "semget", "semop", "send",
-    "setgrent", "sethostent", "setnetent", "setpgrp", "setpriority", "setprotoent",
-    "setpwent", "setservent", "setsockopt", "shift", "shmctl", "shmget", "shmread",
-    "shmwrite", "shutdown", "sin", "sleep", "socket", "socketpair", "sort", "splice",
-    "split", "sprintf", "sqrt", "srand", "stat", "state", "study", "sub", "substr",
-    "symlink", "syscall", "sysopen", "sysread", "sysseek", "system", "syswrite",
-    "tell", "telldir", "tie", "tied", "time", "times", "truncate",
-    "uc", "ucfirst", "umask", "undef", "unlink", "unpack", "unshift", "untie", "use",
-    "utime",
-    "values", "vec",
-    "wait", "waitpid", "wantarray", "warn", "write",
-];
-
-pub(super) fn is_perl_builtin(name: &str) -> bool {
-    PERL_BUILTINS.binary_search(&name).is_ok()
-}
-
-
 /// Opt-in diagnostic toggles. Defaults are all-off for the QA/plugin-author
 /// channels (noise for end users); the always-on hints (`unresolved-function`
 /// / `unresolved-method`) ignore this.
@@ -234,8 +180,14 @@ pub fn collect_diagnostics(
             continue;
         }
 
-        // Skip Perl builtins
-        if is_perl_builtin(name) {
+        // Names the Perl language owns never resolve to user code: the
+        // model's builtin surface (the same authority the BUILTIN
+        // resolution tier and builtin hover read) plus the indirect-object
+        // constructor convention (`new Foo(...)` parses as a call named
+        // `new`).
+        if crate::model::builtins::is_builtin(name)
+            || crate::model::conventions::is_constructor_name(name)
+        {
             continue;
         }
 

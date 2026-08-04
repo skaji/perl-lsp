@@ -315,7 +315,7 @@ impl FileAnalysis {
         let mut to_push: Vec<TypeConstraint> = Vec::new();
         for binding in &self.call_bindings {
             if self.sub_return_type_local(&binding.func_name).is_some()
-                || builtin_return_type(&binding.func_name).is_some()
+                || crate::model::builtins::builtin_return_type(&binding.func_name).is_some()
             {
                 continue;
             }

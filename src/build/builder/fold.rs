@@ -1709,7 +1709,7 @@ impl<'a> Builder<'a> {
             let rt = return_types
                 .get(&binding.func_name)
                 .cloned()
-                .or_else(|| builtin_return_type(&binding.func_name));
+                .or_else(|| crate::model::builtins::builtin_return_type(&binding.func_name));
             if let Some(rt) = rt {
                 self.bag.push(Witness {
                     attachment: WitnessAttachment::Variable {

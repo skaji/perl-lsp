@@ -142,6 +142,25 @@ impl<'a> CandidateSet<'a> {
         if mask.contains(RoleMask::OPEN) {
             out.extend(self.origin.complete_general(self.point));
         }
+        // BUILTIN tier: the Perl builtin surface (`model::builtins`) is the
+        // tier's name source — the same authority diagnostics suppression
+        // and builtin hover ask, so a name offered here is never flagged
+        // unresolved. Perl-only by construction (the pack arm returned
+        // above); callable builtins only, keywords stay suppression-side.
+        if mask.contains(RoleMask::BUILTIN) {
+            out.extend(crate::model::builtins::builtin_functions().map(|name| {
+                CompletionCandidate {
+                    label: name.to_string(),
+                    kind: SymKind::Sub,
+                    detail: Some("perl builtin".to_string()),
+                    insert_text: None,
+                    sort_priority: crate::model::file_analysis::PRIORITY_BUILTIN,
+                    additional_edits: vec![],
+                    import_fact: None,
+                    display_override: None,
+                }
+            }));
+        }
         if let (true, Some(idx)) = (import_slot, self.module_index) {
             import_candidates(self.origin, idx, mask, &mut out);
             if mask.contains(RoleMask::DEPENDENCY) {
