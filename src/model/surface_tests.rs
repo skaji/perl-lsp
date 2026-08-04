@@ -67,6 +67,60 @@ fn surface_changing_edits_are_unequal() {
     assert_ne!(s0, surface(&add_import), "import change must change the surface");
 }
 
+/// `%EXPORT_TAGS` grouping is cross-file semantics on its own: moving a
+/// member between tags keeps the flat `exports_ok` set identical while
+/// changing what a consumer's `use Foo qw(:tag)` binds — the verdict must
+/// flip to Changed on a tags-only header edit.
+#[test]
+fn export_tag_regrouping_flips_the_verdict() {
+    use std::path::PathBuf;
+    let base = "package Acme::T;\nour %EXPORT_TAGS = (math => ['area', 'perim'], io => ['slurp']);\nsub area { return 1 }\nsub perim { return 2 }\nsub slurp { return 3 }\n1;\n";
+    // Move `perim` from :math to :io.
+    let moved = "package Acme::T;\nour %EXPORT_TAGS = (math => ['area'], io => ['slurp', 'perim']);\nsub area { return 1 }\nsub perim { return 2 }\nsub slurp { return 3 }\n1;\n";
+    let s0 = surface(base);
+    let s1 = surface(moved);
+    assert!(
+        !s0.export_tags.is_empty(),
+        "tags must project: {:?}",
+        s0.export_tags
+    );
+    assert_eq!(
+        s0.exports_ok, s1.exports_ok,
+        "the flat export set is identical — only the grouping moved"
+    );
+    assert_ne!(s0, s1, "tag regrouping must change the surface");
+
+    let idx = FreshnessIndex::default();
+    let lib = PathBuf::from("/w/Tags.pm");
+    assert_eq!(idx.record(&lib, s0), SurfaceVerdict::FirstSeen);
+    assert_eq!(idx.record(&lib, s1), SurfaceVerdict::Changed);
+
+    // Tag RENAME with unchanged membership flips too — the selector is
+    // what consumers spell.
+    let renamed = base.replace("math =>", "geometry =>");
+    assert_ne!(surface(base), surface(&renamed), "tag rename must change the surface");
+}
+
+/// DBIC `source_name` is cross-file semantics: consumers' `resultset('X')`
+/// resolve through it, and the edit changes no other projected field —
+/// the verdict must flip to Changed on the header-only edit.
+#[test]
+fn dbic_source_name_edit_flips_the_verdict() {
+    use std::path::PathBuf;
+    let base = "package Acme::Schema::Result::Widget;\n__PACKAGE__->source_name('Widget');\nsub table { return 'widgets' }\n1;\n";
+    let edited = base.replace("source_name('Widget')", "source_name('Gadget')");
+    let s0 = surface(base);
+    let s1 = surface(&edited);
+    assert_eq!(s0.dbic_source_name.as_deref(), Some("Widget"));
+    assert_eq!(s1.dbic_source_name.as_deref(), Some("Gadget"));
+    assert_ne!(s0, s1, "source_name edit must change the surface");
+
+    let idx = FreshnessIndex::default();
+    let f = PathBuf::from("/w/Widget.pm");
+    assert_eq!(idx.record(&f, s0), SurfaceVerdict::FirstSeen);
+    assert_eq!(idx.record(&f, s1), SurfaceVerdict::Changed);
+}
+
 /// Surfaces ride bincode (the cache blob) — the projection must round-trip.
 #[test]
 fn surface_serde_roundtrip() {

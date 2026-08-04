@@ -29,7 +29,11 @@ Surface {
                      hash_keys, provenance } ],
     } ],
     imports, exports, reexports,
+    export_tags,             // tag → members: `:tag` grouping is
+                              // cross-file semantics even when the flat
+                              // export set is unchanged
     plugin_bridges, app_surface_consumers,
+    dbic_source_name,        // consumers' resultset('X') resolve through it
     values, free_values,     // linkage-visible non-callables
     macros,                  // name/params/body/guards — the body IS
                               // cross-file semantics under textual inclusion
@@ -38,7 +42,11 @@ Surface {
 ```
 
 Contract (each clause is load-bearing; a Surface field addition without an
-equality-net arm is a review reject):
+equality-net arm is a review reject, and the FileAnalysis→Surface direction
+is compiler-enforced: `FileAnalysis::surface_feed` destructures every field
+with no `..` rest pattern, so a new FileAnalysis field cannot compile until
+its author classifies it — bound into the feed and projected, or discarded
+with a stated not-cross-file-visible reason):
 
 - **No spans, no `Point`s, no byte offsets, no `ScopeId`/`SymbolId`/
   `RefIdx`, anywhere.** Equality of two Surfaces must mean "no

@@ -9,8 +9,12 @@
 //!
 //! - **No spans, no `Point`s, no byte offsets, no `ScopeId`/`SymbolId`/
 //!   `RefIdx`, anywhere.** Every one of those shifts on unrelated edits.
-//!   The equality tests are the regression net; a field addition without an
-//!   equality test is a review reject (`docs/adr/storage-engine.md`).
+//!   The equality tests are the regression net; a Surface field addition
+//!   without an equality test is a review reject (`docs/adr/storage-engine.md`).
+//!   The FileAnalysis→Surface direction is compiler-enforced:
+//!   `FileAnalysis::surface_feed` destructures every field with no `..`,
+//!   so a new field cannot compile until classified as projected or
+//!   reasoned-not-visible.
 //! - **Typed fields, not display strings** — `Option<InferredType>`, never
 //!   `"returns Foo"` (rule #10's lossy-string form). File-internal
 //!   attachment identities inside a type (a `CodeRef` body edge) are
@@ -114,25 +118,40 @@ pub struct Surface {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     pub exports_ok: Vec<String>,
+    /// `%EXPORT_TAGS` membership, tag → sorted members. A member moving
+    /// between tags (or a tag rename) changes what a consumer's
+    /// `use Foo qw(:tag)` binds even when the flat `exports_ok` set is
+    /// unchanged — the grouping itself is cross-file semantics.
+    pub export_tags: Vec<(String, Vec<String>)>,
     pub reexports: Vec<String>,
     /// Classes plugin namespaces in THIS file bridge content onto.
     pub plugin_bridges: Vec<String>,
     /// Manifest-declared app-surface consumer classes.
     pub app_surface_consumers: Vec<String>,
+    /// DBIC `source_name` override — the registered source moniker when it
+    /// differs from the class basename. Consumers' `resultset('X')`
+    /// resolve through it, so an edit is cross-file-visible with no other
+    /// projected change.
+    pub dbic_source_name: Option<String>,
 }
 
 impl Surface {
     /// Project `fa`'s surface. Runs right after `finalize_post_walk()` —
     /// the bag is present (return types resolve) and enrichment has NOT
     /// run (the surface is the file's OWN facts, never its imports').
+    ///
+    /// All field access routes through `surface_feed()` — the exhaustive
+    /// classification gate that makes a new `FileAnalysis` field a compile
+    /// error until its cross-file visibility is decided.
     pub fn project(fa: &FileAnalysis) -> Surface {
+        let feed: crate::model::file_analysis::SurfaceFeed = fa.surface_feed();
         let mut by_pkg: std::collections::BTreeMap<String, PackageSurface> =
             std::collections::BTreeMap::new();
         let mut free_values: Vec<ValueSurface> = Vec::new();
         let mut free_methods: Vec<MethodSurface> = Vec::new();
         // One pass over the (few) HashKeyDef symbols instead of an
         // O(symbols) scan per sub — projection runs per registration.
-        let hash_key_defs: Vec<&crate::model::file_analysis::Symbol> = fa
+        let hash_key_defs: Vec<&crate::model::file_analysis::Symbol> = feed
             .symbols
             .iter()
             .filter(|s| {
@@ -141,7 +160,7 @@ impl Surface {
             .collect();
         // Every package with parents or role-ness exists on the surface
         // even if it declares no callable members.
-        for (pkg, parents) in &fa.package_parents {
+        for (pkg, parents) in feed.package_parents {
             let entry = by_pkg.entry(pkg.clone()).or_insert_with(|| PackageSurface {
                 name: pkg.clone(),
                 ..Default::default()
@@ -151,7 +170,7 @@ impl Surface {
             parents.dedup();
             entry.parents = parents;
         }
-        for sym in &fa.symbols {
+        for sym in feed.symbols {
             match sym.kind {
                 SymKind::Package | SymKind::Class | SymKind::Module => {
                     by_pkg.entry(sym.name.clone()).or_insert_with(|| PackageSurface {
@@ -198,7 +217,8 @@ impl Surface {
                         arity: sym
                             .param_arity()
                             .map(|a| (a.total, a.required, a.variadic)),
-                        ret: fa
+                        ret: feed
+                            .analysis
                             .symbol_return_type_via_bag(sym.id, None)
                             .map(|t| despan(&t)),
                         hash_keys,
@@ -224,7 +244,9 @@ impl Surface {
                     // Cross-file-visible values: the C-linkage file-scope
                     // gate OR class content (fields / named-enum constants
                     // reachable via member access).
-                    if !(fa.is_linkage_visible(sym) || fa.symbol_is_class_content(sym)) {
+                    if !(feed.analysis.is_linkage_visible(sym)
+                        || feed.analysis.symbol_is_class_content(sym))
+                    {
                         continue;
                     }
                     let v = ValueSurface {
@@ -263,17 +285,17 @@ impl Surface {
             ms.dedup();
         };
         for p in &mut packages {
-            p.is_role = fa.is_role_package(&p.name);
+            p.is_role = feed.role_packages.contains(&p.name);
             sort_methods(&mut p.methods);
             sort_values(&mut p.values);
         }
         sort_values(&mut free_values);
         sort_methods(&mut free_methods);
-        let mut imports: Vec<String> = fa
+        let mut imports: Vec<String> = feed
             .imports
             .iter()
             .map(|i| i.module_name.clone())
-            .chain(fa.plugin_loads.iter().map(|f| f.name.clone()))
+            .chain(feed.plugin_loads.iter().map(|f| f.name.clone()))
             .collect();
         imports.sort_unstable();
         imports.dedup();
@@ -283,7 +305,7 @@ impl Surface {
             v.dedup();
             v
         };
-        let mut plugin_bridges: Vec<String> = fa
+        let mut plugin_bridges: Vec<String> = feed
             .plugin_namespaces
             .iter()
             .flat_map(|ns| {
@@ -295,7 +317,7 @@ impl Surface {
             .collect();
         plugin_bridges.sort_unstable();
         plugin_bridges.dedup();
-        let mut macros: Vec<MacroSurface> = fa
+        let mut macros: Vec<MacroSurface> = feed
             .macro_defs
             .iter()
             .map(|m| MacroSurface {
@@ -308,9 +330,15 @@ impl Surface {
         macros.sort_by(|a, b| (&a.name, &a.guards).cmp(&(&b.name, &b.guards)));
         macros.dedup();
         let mut includes: Vec<String> =
-            fa.include_directives.iter().map(|(_, raw)| raw.clone()).collect();
+            feed.include_directives.iter().map(|(_, raw)| raw.clone()).collect();
         includes.sort_unstable();
         includes.dedup();
+        let mut export_tags: Vec<(String, Vec<String>)> = feed
+            .export_tags
+            .iter()
+            .map(|(tag, members)| (tag.clone(), sorted(members)))
+            .collect();
+        export_tags.sort_by(|a, b| a.0.cmp(&b.0));
         Surface {
             packages,
             free_values,
@@ -318,11 +346,13 @@ impl Surface {
             macros,
             includes,
             imports,
-            exports: sorted(&fa.export),
-            exports_ok: sorted(&fa.export_ok),
-            reexports: sorted(&fa.reexport_modules),
+            exports: sorted(feed.export),
+            exports_ok: sorted(feed.export_ok),
+            export_tags,
+            reexports: sorted(feed.reexport_modules),
             plugin_bridges,
-            app_surface_consumers: sorted(&fa.app_surface_consumers),
+            app_surface_consumers: sorted(feed.app_surface_consumers),
+            dbic_source_name: feed.dbic_source_name.clone(),
         }
     }
 }

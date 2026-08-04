@@ -24,6 +24,8 @@ mod outline;
 pub use outline::*;
 mod lifecycle;
 pub use lifecycle::*;
+mod surface_feed;
+pub use surface_feed::*;
 mod queries;
 mod enrichment;
 mod class_queries;

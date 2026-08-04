@@ -447,36 +447,19 @@ existing indexing await tests.
 
 ## Theme E — The data model carves its own joints
 
-### E1. Surface::project's mirror of FileAnalysis is disciplinary where it must be structural — and it has already leaked twice — **high leverage / M**
+### E1. LANDED — Surface::project's mirror of FileAnalysis is now structural
 
-**The wrong embedding.** R1 (docs/adr/storage-engine.md:40-41) polices only
-Surface-side additions; nothing polices the FileAnalysis side.
-`Surface::project` (`src/model/surface.rs:128-327`) reads fields by name, so a
-new cross-file-visible field that never gets projected compiles clean and
-silently under-invalidates. Two live leaks verified: **export_tags** — tag
-members feed `export_ok` (projected), but moving a member between tags or
-renaming a tag keeps the projection identical while changing what a consumer's
-`use Foo qw(:tag)` binds (read cross-file at `resolve/imports.rs:266`,
-`diagnostics.rs:181`, `completion.rs:823`, `cursor_queries.rs:1233`) —
-Unchanged verdict, stale consumer; **dbic_source_name** — read cross-file at
-`resolution.rs:620`, and a `source_name('X')` edit changes no projected field,
-so consumers' `resultset('X')` resolution goes stale. The firewall the ADR
-calls load-bearing is enforced by memory, and memory has failed.
-
-**Target shape.** `FileAnalysis::surface_feed(&self) -> SurfaceFeed` in
-`model/file_analysis/`: an exhaustive destructure — `let Self { scopes,
-symbols, export_tags, dbic_source_name, … }` with NO `..` — binding every
-field into the feed or into an explicit `let _ = field;` arm with a one-line
-not-cross-file-visible justification. `Surface::project` consumes
-`SurfaceFeed`. A new field then fails to compile at exactly one site until
-classified. Backfill export_tags (sorted `Vec<(String, Vec<String>)>`) and
-`dbic_source_name` onto the Surface with R1 equality arms in the same change.
-(role_requires needs no backfill — required names synthesize contract-marker
-Method symbols that already project; say so in its `let _` arm.)
-
-**Gate.** The compile error IS the gate for the FileAnalysis→Surface
-direction; R1's equality-net tests remain the Surface→equality net. Add
-equality-net arms for the two backfilled fields.
+`FileAnalysis::surface_feed(&self) -> SurfaceFeed`
+(`model/file_analysis/surface_feed.rs`) destructures every FileAnalysis field
+with no `..` rest pattern — 14 fields bound into the feed, the rest discarded
+under grouped why-not-visible comments — so a new field is a compile error
+until classified; `Surface::project` reads only through the feed (the
+`analysis` handle carries the three derived queries). The two leaks are
+projected: `export_tags` (sorted tag → members) and `dbic_source_name`, each
+with an equality-net arm in `surface_tests.rs` proving a header-only edit
+flips the verdict to Changed. STUB_VERSION bumped (Surface rides the stubs
+table). R1 is restated as compiler-enforced in CLAUDE.md and
+`docs/adr/storage-engine.md`.
 
 ### E2. FileAnalysis is ~50 flat serialized fields from seven fused models, spelled in quadruplicate — **high leverage / XL**
 
