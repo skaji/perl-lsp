@@ -14,12 +14,12 @@ is whether our engine is the piece TSG was missing.
   the language-neutral contract** (`@def.<kind>` / `@def.<kind>.name`,
   `@scope`, `@context.package`, `@ref.<kind>`, `@import`): the driver
   knows these names, never a node kind.
-- `src/query_extract.rs` — ~200 lines, knows no Perl. Flattens query
+- `src/build/query_extract/` — ~200 lines, knows no Perl. Flattens query
   matches to ordered events; runs a state machine (scope stack from
   `@scope` ranges, sticky namespace from `@context.*`); consults a
   `LangPack` of host predicates (name shaping, default names) — the
   "back and forth". Output: skeleton symbols/refs/imports.
-- `src/query_extract_tests.rs` — differential harness vs the real
+- `src/build/query_extract_tests.rs` — differential harness vs the real
   builder over test_files + a 60-module substrate sample (88 files).
 
 ## Numbers (the deliverable)

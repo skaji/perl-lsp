@@ -157,7 +157,7 @@ payload unreadable without the isa filter (`docs/adr/receiver-gated-dispatch.md`
 
 ## Repros
 
-`src/builder_tests.rs`:
+`src/build/builder/tests/`:
 
 - `param_types_manifest::probe_class_isa_trigger_through_cross_file_parent`
   — PASSES (un-ignored). Cross-file `ClassIsa` trigger, now green via the

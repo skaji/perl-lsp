@@ -325,8 +325,8 @@ allowed for plugins that only need post-walk facts from a use site.
 
 ## 6. Core implementation sketch
 
-New module `src/plugin/patterns.rs` (Build layer in
-`layering_tests.rs`'s `layer_map`; it is a builder plugin in the
+New module `src/build/plugin/patterns.rs` (Build layer by
+directory; it is a builder plugin in the
 sanctioned sense — tree access stays inside `build()`'s call graph):
 
 - **Compile & merge.** At registry construction, per language:

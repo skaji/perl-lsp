@@ -78,9 +78,9 @@ this.
 
 ## Where this lives
 
-- `src/builder.rs` — `recover_structural_from_error`, dispatched on `ERROR`
+- `src/build/builder/` — `recover_structural_from_error`, dispatched on `ERROR`
   node kind in the main visit loop.
-- `src/document.rs` — `StableOutline` struct, update logic in
+- `src/index/document.rs` — `StableOutline` struct, update logic in
   `Document::update`.
 - Source-text validation reads `Document.text` directly; no separate
   invalidation channel needed.

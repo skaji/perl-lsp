@@ -31,7 +31,7 @@ real generator plugin.
 ## Tier 1 — THE KEYSTONE (first slice LANDED)
 
 **`LanguageDriver` foundation** 🚧→✅ first slice on `spike/cpp-support`
-(`src/language_driver.rs`).
+(`src/build/language_driver.rs`).
 
 LANDED (additive, Perl path untouched, default suite 1062/0):
 - `LanguageDriver` trait + `LanguageRegistry`; `PerlDriver` (wraps the

@@ -9,7 +9,7 @@ is the single traversal those collapse into.
 
 ## The shape: a lazy derived view, not a built graph
 
-`src/graph.rs::GraphView` holds two borrows — `&FileAnalysis` and
+`src/model/graph.rs::GraphView` holds two borrows — `&FileAnalysis` and
 `Option<&dyn CrossFileLookup>` — and stores nothing. There is no node
 list, no adjacency map, no build step. `walk(origin, mask, visit)`
 DFS-chases edges on demand: `edges_from` derives a node's neighbours at

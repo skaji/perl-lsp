@@ -121,7 +121,7 @@ Three pieces, phased so no crate is cut before shipping demands it
 (consistent with the rejected workspace split — crates when a second
 consumer exists, tests for layering until then):
 
-**The core crate (`lsp-engine`).** `layering_tests::layer_map()` IS
+**The core crate (`lsp-engine`).** the `src/` layer directories ARE
 the manifest: model (file_analysis, witnesses), the generic driver
 (query_extract + capture vocabulary), cross-file (file_store, resolve,
 module_index, module_cache), the rhai host, and the GENERIC half of

@@ -127,7 +127,7 @@ construct with no static path.
 - +36 crates in the dependency tree.
 
 **Elegance: we already have the more elegant generalization.**
-- `src/graph.rs` is **172 lines total** for the whole derived-edge view:
+- `src/model/graph.rs` is **172 lines total** for the whole derived-edge view:
   `GraphView` holds two borrows and *stores nothing*; edges materialize on
   demand from the stores that already exist; one `walk` (seen-set, depth cap,
   edge-kind mask) backs every reachability query; `EdgeKind` is a closed enum

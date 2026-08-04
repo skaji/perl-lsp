@@ -1,7 +1,7 @@
 # cst/conventions migration backlog
 
 The typed CST layer (`src/cst.rs`) and the name-semantics module
-(`src/conventions.rs`) landed June 2026 with the highest-noise call sites
+(`src/model/conventions.rs`) landed June 2026 with the highest-noise call sites
 migrated. This is the remaining backlog, ranked. The rule going forward is
 in CLAUDE.md rule #1: new visitor code speaks `cst.rs`; a fresh
 `kind() == "..."` probe or `child_by_field_name(..).utf8_text(..)` chain

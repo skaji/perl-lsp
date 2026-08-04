@@ -37,7 +37,7 @@ two features and what keeps the design sound (next section).
 
 ## The obstacle course (the evidence)
 
-`src/cpp_obstacle.rs` isolates one macro idiom per sample; two reports
+`src/build/cpp_obstacle.rs` isolates one macro idiom per sample; two reports
 in `query_extract_tests.rs` measure (a) raw parse damage and (b) actual
 Tier-1 skeleton extraction through the production driver. The losses
 sort into three buckets:
@@ -268,7 +268,7 @@ proved.
 
 ## What landed (spike, measured)
 
-`src/reparse.rs` (Perl) and `src/cpp_reparse.rs` (C++) carry the seam
+`src/build/reparse.rs` (Perl) and `src/build/cpp_reparse/` (C++) carry the seam
 end to end, each measured against its obstacle course, neither wired
 into the build pipeline.
 

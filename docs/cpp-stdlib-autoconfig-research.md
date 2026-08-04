@@ -5,7 +5,7 @@
 > hinges on a correct `compile_commands.json`; without it the stdlib isn't found and the
 > experience "collapses to red squiggles everywhere." If we make a hand-maintained compile DB
 > a *requirement*, we forfeit the whole advantage. The `#include`-closure macro gather in
-> `src/cpp_reparse.rs` already walks quoted includes up ancestor dirs — but it skips `<...>`
+> `src/build/cpp_reparse/` already walks quoted includes up ancestor dirs — but it skips `<...>`
 > system includes because it doesn't know **where the stdlib lives**. This doc is about
 > discovering (a) system/stdlib header roots, (b) the project's own `-I` dirs, and (c) key
 > predefined macros — **without running a build**, cheaply, cached, and degrading gracefully.

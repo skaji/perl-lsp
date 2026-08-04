@@ -17,7 +17,7 @@ brute-forced on every resolver tick.
 
 ## Decision: the Surface — a position-independent per-file projection
 
-`Surface::project(&FileAnalysis)` (`src/surface.rs`) produces a
+`Surface::project(&FileAnalysis)` (`src/model/surface.rs`) produces a
 per-file projection of cross-file-VISIBLE facts:
 
 ```
@@ -85,7 +85,7 @@ spine.
 
 ## Decision: the freshness engine — hand-rolled reverse-dep, not Salsa
 
-`FreshnessIndex` (`src/surface.rs`) is a name-keyed reverse-dependency
+`FreshnessIndex` (`src/model/surface.rs`) is a name-keyed reverse-dependency
 index over Surface records: file A's enrichment depends on `Surface(B)`
 for each B in A's imports ∪ parent chain ∪ bridges. Recording a fresh
 build's Surface against the prior one yields a `SurfaceVerdict`
@@ -118,11 +118,11 @@ the pack tier.
 
 Closed workspace/dependency files answer enriched through
 `ModuleIndex::enriched_snapshot` / `CrossFileLookup::enriched_present`
-(`src/module_index.rs`, `src/file_analysis.rs`): derived,
+(`src/index/module_index/`, `src/model/file_analysis/`): derived,
 fingerprint-and-generation-keyed copies, byte-capped and LRU-bounded,
 cycle-guarded, consulted FALLBACK-ON-MISS after the raw bag answers.
 Consumers: `query_sub_return_type`'s imported recursion and the
-`MethodOnClass` cross-file primary (`src/witnesses.rs`), the diagnostics
+`MethodOnClass` cross-file primary (`src/model/witnesses/`), the diagnostics
 sweep, and `--check`/`--dump-package`. See CLAUDE.md's "Cross-file
 enrichment" section for the full consumer/derivation contract — this ADR
 owns the Surface/freshness design that overlay is keyed on, not its

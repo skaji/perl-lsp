@@ -49,7 +49,7 @@ strings won't.
 
 **The shared engine (do not fork any of this):**
 
-- `src/witnesses.rs` — `WitnessBag`, `WitnessAttachment` (`Symbol`,
+- `src/model/witnesses/` — `WitnessBag`, `WitnessAttachment` (`Symbol`,
   `SymbolReturnArm`, `Expr`, `BranchArm`, `Variable{name,scope}`,
   `Expression(refidx)`, `TypeName`, `MethodOnClass{class,name}`,
   `SlotType{class,key}`), `ReducerRegistry::with_defaults()`, the
@@ -57,7 +57,7 @@ strings won't.
   cross-file fallback hops in `query_rec` (MethodOnClass primary +
   parents + bridged entities; SlotType primary + parents; TypeName
   terminal), `QueryState` pins/memo.
-- `src/file_analysis.rs` — the bag rides `FileAnalysis`
+- `src/model/file_analysis/` — the bag rides `FileAnalysis`
   (`#[serde(default)]`, cached in the blob); `inferred_type_via_bag`,
   `sub_return_type_at_arity`, `expr_type_at_span`,
   `symbol_return_type_via_bag`.
@@ -76,11 +76,11 @@ strings won't.
 
 **Pack emission (the sparse driver):**
 
-- `src/query_extract.rs` (grep `witnesses.push`): typed decls →
+- `src/build/query_extract/` (grep `witnesses.push`): typed decls →
   `Variable{name,scope}` with `Edge(TypeName(class))` payloads; typedef
   chains → `TypeName(alias) → Edge(TypeName(target))`; assorted
   `Expr(span)` witnesses.
-- `src/language_driver.rs::emit_return_fuel`: per return site
+- `src/build/language_driver.rs::emit_return_fuel`: per return site
   `SymbolReturnArm(sid) → Edge(Expr(ret_span))` +
   `Symbol(sid) → Edge(SymbolReturnArm(sid))` — the SAME shape as Perl's
   implicit-return chain, spelled independently (source tags
@@ -130,8 +130,8 @@ FACT ("this language elides the receiver"), never a feature toggle.
 same helpers; a new language driver (or a new fact in an existing one)
 composes helpers instead of hand-rolling `Witness { .. }` literals.
 
-**New module `src/witness_emission.rs`** (assign it to the MODEL layer in
-`layering_tests.rs::layer_map` — it imports `witnesses` + `file_analysis`
+**New module `src/model/witness_emission.rs`** (the MODEL layer by
+directory — it imports `witnesses` + `file_analysis`
 types only; NO tree_sitter imports, NO builder imports; both drivers call
 INTO it). Functions take `&mut WitnessBag` (or the small state they need)
 plus plain data — never a `Node`, never a `Builder`.

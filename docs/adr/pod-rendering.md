@@ -1,6 +1,6 @@
 # ADR: POD rendering goes through a real AST
 
-`src/pod.rs` converts raw POD blobs to GitHub-flavored markdown for hover. It
+`src/build/pod.rs` converts raw POD blobs to GitHub-flavored markdown for hover. It
 does this by **sub-parsing each POD blob with `ts-parser-pod` and walking the
 AST** — not by line/regex matching.
 
@@ -45,7 +45,7 @@ should walk the AST themselves.
 - The interior-sequence rendering table (`C<>` → `` `…` ``, `B<>` → `**…**`,
   etc.) lives in `render_interior_sequence`. Read the code.
 - Edge cases (multi-bracket, ordered list `=item 1.`, head2 vs item priority)
-  are pinned in `src/pod_tests.rs`.
+  are pinned in `src/build/pod_tests.rs`.
 - Phase-3-style POD-based symbol discovery (synthesizing symbols from `=head2
   method_name` for XS / Moose-generated methods) was scoped out — most modules
   have source, the failure mode is a stale hover, not broken navigation.

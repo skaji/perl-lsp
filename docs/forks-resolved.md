@@ -242,7 +242,7 @@ when, why), not the contract.
   promote to option B (split variant) if a future consumer wants to
   match on it structurally instead of a bool.
 - **Discussion needed:** none urgent; the field is documented at its
-  definition (`src/cursor_slot.rs`) and locked by
+  definition (`src/lsp/cursor_slot.rs`) and locked by
   `cursor_slot_tests.rs::detect_slot_perl_use_module_name_is_module_path`.
   (The two renders now live set-side as
   `CandidateSet::complete_module_candidates` / `complete_qualified_path`.)
@@ -319,7 +319,7 @@ when, why), not the contract.
   appears and the two need a shared ordering.
 - **Ratification (veesh):** leave as is — "ArgPosition is a drop of a
   lie, but Slot::Comparison would be sprawl." A friendly comment on the
-  variant acknowledges the stretch (landed in `src/cursor_slot.rs`).
+  variant acknowledges the stretch (landed in `src/lsp/cursor_slot.rs`).
 
 ## Warm stubs — separate table vs. blob column — 2026-07-06 — RATIFIED (veesh, 2026-07-07)
 

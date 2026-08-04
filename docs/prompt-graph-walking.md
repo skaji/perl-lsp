@@ -1,6 +1,6 @@
 # Graph walking — forward work
 
-The walker landed: `src/graph.rs` (`GraphView` + `walk`), the closed
+The walker landed: `src/model/graph.rs` (`GraphView` + `walk`), the closed
 `EdgeKind` enum with exhaustive `edges_from`, and the INHERITS /
 INHERITS_INV / BRIDGES edge kinds. The whole inheritance axis routes
 through it; `children_index`'s descendant fan-out and plugin bridges

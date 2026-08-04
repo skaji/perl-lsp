@@ -51,7 +51,7 @@ macro without probing the whole name set.
 ## The machinery (as it stands)
 
 Macro expansion turns every macro *use* into a **splice** (a byte-range
-replacement). `preprocess_validated_with` (`src/cpp_reparse.rs`) applies
+replacement). `preprocess_validated_with` (`src/build/cpp_reparse/`) applies
 all splices, parses once, and keeps the lot if `parse_damage` did not
 rise over baseline — the cheap path most files take.
 

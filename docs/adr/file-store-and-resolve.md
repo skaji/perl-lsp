@@ -29,7 +29,7 @@ read the field. No "summary type" detour.
 pub enum FileRole { Open, Workspace, Dependency, BuiltIn }
 ```
 
-`src/file_store.rs` holds every parsed file. Open files have `role: Open`,
+`src/index/file_store.rs` holds every parsed file. Open files have `role: Open`,
 indexed by path + url. A workspace file that becomes open flips role; the
 `Arc<FileEntry>` is replaced (cheap; readers hold Arcs and see consistent
 snapshots).
@@ -59,7 +59,7 @@ have to write the mask down.
 
 ### Single `refs_to`, single `resolve_symbol`
 
-`src/resolve.rs` is the only place tier-walking lives. LSP handlers do not
+`src/index/resolve/` is the only place tier-walking lives. LSP handlers do not
 iterate `FileStore` directly. Adding a new cross-file query = picking a
 mask and calling `refs_to`.
 
