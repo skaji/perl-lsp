@@ -208,31 +208,21 @@ impl Backend {
     /// workspace index / macro gather lands — the pull-verb heal for the
     /// cold-open degraded window. Pack docs get a full OFF-lock re-analysis
     /// (their `did_open` gather was cached-only + the cross-file index is now
-    /// warm); perl docs get an enrich + diagnostics re-publish.
-    ///
-    /// FileStore guard discipline: pack URIs are collected under a read guard
-    /// that is DROPPED before any re-analysis, and each re-analysis snapshots
-    /// text off the lock (`PackHealCtx::run_gather_once`). The perl branch enriches
-    /// under the write guard but touches only `module_index` (never re-locks the
-    /// store) and publishes after the guard drops — the same shape the resolver
-    /// `on_refresh` callback already uses safely.
+    /// warm); perl docs re-derive enrichment + diagnostics through
+    /// `refresh_open_diagnostics` (URIs collected under the read iterator,
+    /// each doc derived with no store guard held).
     fn heal_open_docs(ctx: &PackHealCtx, want_perl: bool) {
         log::debug!(
             "cold-window heal: index landed for {} family",
             if want_perl { "perl" } else { "pack" }
         );
         if want_perl {
-            let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
-            ctx.files.for_each_open_mut(|uri, doc| {
-                if doc.language != "perl" {
-                    return;
-                }
-                std::sync::Arc::make_mut(&mut doc.analysis)
-                    .enrich_imported_types_with_keys(Some(ctx.module_index.as_ref()));
-                let diags =
-                    symbols::collect_diagnostics(&doc.analysis, &ctx.module_index, ctx.options);
-                pending.push((uri.clone(), diags));
-            });
+            let pending = refresh_open_diagnostics(
+                &ctx.files,
+                &ctx.module_index,
+                ctx.options,
+                OpenDocScope::PerlFamily,
+            );
             if pending.is_empty() {
                 return;
             }

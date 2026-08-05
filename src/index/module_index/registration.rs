@@ -126,9 +126,20 @@ impl ModuleIndex {
         fa: &FileAnalysis,
         write: SurfaceWrite,
     ) -> SurfaceDirty {
+        self.record_and_dirty_value(path, crate::model::surface::Surface::project(fa), write)
+    }
+
+    /// `record_and_dirty` for an ALREADY-projected surface — the open-doc
+    /// path records `Document::baseline_surface` (projected at build time,
+    /// pre-enrichment) so the record can never fingerprint enriched state.
+    pub fn record_and_dirty_value(
+        &self,
+        path: &std::path::Path,
+        surface: crate::model::surface::Surface,
+        write: SurfaceWrite,
+    ) -> SurfaceDirty {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let verdict =
-            self.record_surface_write(&canon, crate::model::surface::Surface::project(fa), write);
+        let verdict = self.record_surface_write(&canon, surface, write);
         let dirty = match verdict {
             crate::model::surface::SurfaceVerdict::Changed => self.dirty_consumers(&canon),
             _ => Default::default(),

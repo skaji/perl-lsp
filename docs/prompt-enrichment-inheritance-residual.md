@@ -94,16 +94,18 @@ fork ledger.
 synthesis, the cross-file `inheritance_cross` edge projection, and
 `resolve_method_call_types(Some(idx))`) is called ONLY for:
 
-- OPEN documents — `backend.rs:50` (resolver refresh, `for_each_open_mut`)
-  and `backend.rs:72` (`publish_diagnostics`).
-- The CLI focus file — `main.rs:469/513/556/761`.
+- OPEN documents — through `FileStore::enrich_open`, the one open-doc
+  enrichment writer (invoked by `publish_diagnostics`, the resolver refresh,
+  and the cold-open heal).
+- The CLI focus file — `lsp/cli/query.rs` (`cli_open_document` + the
+  cross-file staging helpers).
 
 **Dependency modules** (`module_resolver.rs::resolve_and_parse_inner:552`)
 and **workspace-index files** (`index_workspace_with_index:655`) are built
 via `crate::builder::build(...)` which ends at `finalize_post_walk()` —
 they NEVER get `enrich_imported_types_with_keys`. The resolver refresh
-callback re-enriches only open docs (`for_each_open_mut`,
-`backend.rs:49`).
+callback re-enriches only open docs (`refresh_open_diagnostics` →
+`FileStore::enrich_open`).
 
 What this means per enrichment pass:
 

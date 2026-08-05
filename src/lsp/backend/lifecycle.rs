@@ -169,7 +169,7 @@ impl Backend {
 
         // Coalesce generation for the per-module refresh storm: each resolved
         // module fires `on_refresh` (~33 in ~400ms opening a Perl file with a
-        // dozen `use`s), each otherwise a full `for_each_open_mut` + publish —
+        // dozen `use`s), each otherwise a full all-open re-enrich + publish —
         // CPU + stdout pressure that WIDENS the cold-open degraded window. Every
         // fire bumps this generation and debounces; only the latest surviving
         // fire republishes, so the burst collapses to ~one refresh. Lives only
@@ -201,20 +201,11 @@ impl Backend {
                     None => return,
                 };
                 log::debug!("diag-refresh executing (gen {})", my_gen);
-                // Collect (uri, diagnostics) first without holding the store lock
+                // Derive (uri, diagnostics) first without holding the store lock
                 // across the await — publishing is async and could deadlock.
-                let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
                 let options = *diag_options.lock().unwrap();
-                files.for_each_open_mut(|uri, doc| {
-                    let diagnostics = if doc.language == "perl" {
-                        std::sync::Arc::make_mut(&mut doc.analysis)
-                            .enrich_imported_types_with_keys(Some(module_index.as_ref()));
-                        symbols::collect_diagnostics(&doc.analysis, module_index, options)
-                    } else {
-                        symbols::pack_diagnostics(&doc.analysis, options)
-                    };
-                    pending.push((uri.clone(), diagnostics));
-                });
+                let pending =
+                    refresh_open_diagnostics(&files, module_index, options, OpenDocScope::All);
                 for (uri, diags) in pending {
                     client.publish_diagnostics(uri, diags, None).await;
                 }
@@ -407,25 +398,18 @@ impl Backend {
     /// in the transitive dirty closure (closed workspace consumers stay
     /// correct through the query-time walks; their always-enriched
     /// materialization is the next phase).
-    /// Record the open doc's surface right after a rebuild — BEFORE
-    /// `publish_diagnostics` enriches the analysis in place.
-    /// `Surface::project`'s contract is the file's OWN facts: an enriched
-    /// projection would fingerprint imported types into the record and
-    /// flip-flop verdicts against the workspace indexer's pre-enrichment
-    /// records (spurious Changed storms on body edits).
-    /// Records through `record_and_dirty` — the shared record→verdict→dirty
-    /// seam — so the open-doc editor path can't record a surface without the
-    /// dirty consumer set. The caller acts on the returned set (republish).
+    /// Records `Document::baseline_surface` — the build-time, pre-enrichment
+    /// projection — through `record_and_dirty_value`, the shared
+    /// record→verdict→dirty seam. Enrichment state can't reach the record by
+    /// construction, so this may run before or after any publish. The caller
+    /// acts on the returned set (republish).
     pub(super) fn record_open_doc_surface(&self, uri: &Url) -> Option<crate::index::module_index::SurfaceDirty> {
         let path = uri.to_file_path().ok()?;
         let canon = std::fs::canonicalize(&path).unwrap_or(path);
-        let doc = self.files.get_open(uri)?;
-        if doc.language != "perl" {
-            return None;
-        }
-        Some(self.module_index.record_and_dirty(
+        let surface = self.files.get_open(uri)?.baseline_surface.clone()?;
+        Some(self.module_index.record_and_dirty_value(
             &canon,
-            &doc.analysis,
+            surface,
             crate::index::module_index::SurfaceWrite::OpenDoc,
         ))
     }
@@ -454,34 +438,79 @@ impl Backend {
         }
     }
 
-    fn enrich_analysis(&self, uri: &Url) {
-        if let Some(mut doc) = self.files.get_open_mut(uri) {
-            // enrichment is Perl-flavored (imported-type/hash-key keys);
-            // pack languages skip it.
-            if doc.language == "perl" {
-                std::sync::Arc::make_mut(&mut doc.analysis)
-                    .enrich_imported_types_with_keys(Some(&*self.module_index));
-            }
-        }
-    }
-
+    /// Publish `uri`'s diagnostics — a pure read over the derived enriched
+    /// analysis. The one enrichment writer is `FileStore::enrich_open`
+    /// (clone-and-enrich off the store lock, ptr-guarded swap); this path
+    /// reads the artifact it returns, never mutates a stored analysis.
     pub(super) async fn publish_diagnostics(&self, uri: &Url) {
-        self.enrich_analysis(uri);
         let options = self.diagnostic_options();
-        let diagnostics = match self.files.get_open(uri) {
-            Some(doc) if doc.language == "perl" => {
-                symbols::collect_diagnostics(&doc.analysis, &self.module_index, options)
-            }
+        let language = self.files.get_open(uri).map(|d| d.language);
+        let diagnostics = match language {
+            Some("perl") => match self.files.enrich_open(uri, &*self.module_index) {
+                Some(analysis) => {
+                    symbols::collect_diagnostics(&analysis, &self.module_index, options)
+                }
+                None => vec![],
+            },
             // Pack languages stay honest-silent EXCEPT the always-on
             // member-access operator mismatch and the opt-in use-after-move
             // (gated by `DiagnosticOptions.use_after_move`).
-            Some(doc) => symbols::pack_diagnostics(&doc.analysis, options),
+            Some(_) => self
+                .files
+                .get_open(uri)
+                .map(|doc| symbols::pack_diagnostics(&doc.analysis, options))
+                .unwrap_or_default(),
             None => vec![],
         };
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
     }
+}
+
+/// Which open docs a bulk diagnostics refresh covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OpenDocScope {
+    /// Every open doc (the resolver refresh storm — perl docs re-enrich,
+    /// pack docs re-read).
+    All,
+    /// Perl docs only (the perl-family cold-open heal).
+    PerlFamily,
+}
+
+/// Re-derive diagnostics for open docs: perl docs re-enrich through
+/// `FileStore::enrich_open` (the one enrichment writer) and are read from
+/// the returned artifact; pack docs are read as-is. URIs are collected
+/// under the read iterator first, then each doc is derived with no store
+/// guard held — safe to run from any task, publish after.
+pub(super) fn refresh_open_diagnostics(
+    files: &FileStore,
+    module_index: &ModuleIndex,
+    options: symbols::DiagnosticOptions,
+    scope: OpenDocScope,
+) -> Vec<(Url, Vec<Diagnostic>)> {
+    let mut docs: Vec<(Url, &'static str)> = Vec::new();
+    files.for_each_open(|uri, doc| {
+        if scope == OpenDocScope::All || doc.language == "perl" {
+            docs.push((uri.clone(), doc.language));
+        }
+    });
+    let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
+    for (uri, language) in docs {
+        let diagnostics = if language == "perl" {
+            match files.enrich_open(&uri, module_index) {
+                Some(analysis) => symbols::collect_diagnostics(&analysis, module_index, options),
+                None => continue, // closed mid-iteration
+            }
+        } else {
+            match files.get_open(&uri) {
+                Some(doc) => symbols::pack_diagnostics(&doc.analysis, options),
+                None => continue,
+            }
+        };
+        pending.push((uri, diagnostics));
+    }
+    pending
 }
 
 /// `(RefLocation, text)` pairs → one `WorkspaceEdit` (per-member texts).

@@ -113,8 +113,11 @@ the recording sites, not consumers. This trade-off is ratified in
 Salsa"); revisit if the query graph deepens past what a dirty-set walk
 comfortably serves (e.g. the phase-4 materialized views below).
 
-Consumers: `Backend::refresh_dirty_open_consumers` re-enriches open Perl
-documents on a Changed verdict; `PackInvalidator::file_changed`'s gate
+Consumers: `Backend::republish_open_docs_in` re-enriches open Perl
+documents on a Changed verdict (through `FileStore::enrich_open`, the one
+open-doc enrichment writer; the open doc's own record is its build-time
+`Document::baseline_surface`, so enrichment never reaches a freshness
+record); `PackInvalidator::file_changed`'s gate
 (`src/index/pack_invalidator.rs`) re-analyzes the changed file first and
 records its surface — an Unchanged verdict skips consumer eviction and
 re-analysis entirely, open-document re-gathers included (a deep-header

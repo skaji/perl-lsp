@@ -214,42 +214,20 @@ by the parked unification.
 
 ## Theme D — Serving-path ownership: state mutated by its owner, coordination proven once
 
-### D1. Open-doc enrichment is a model WRITE performed by the diagnostics-publish path, spelled three times — **high leverage / L**
+### D1. LANDED — open-doc enrichment is a derived artifact with one writer
 
-**The wrong embedding.** `Arc::make_mut(..).enrich_imported_types_with_keys`
-executes as a side effect of `publish_diagnostics`
-(`src/lsp/backend/lifecycle.rs:494-501`), the resolver `on_refresh` closure
-(`lifecycle.rs:208-217`), and `heal_open_docs`
-(`src/lsp/backend/indexing.rs:245-254`) — three spellings of one mutation on
-an LSP-notification path. Costs are structural: `for_each_open_mut`'s only two
-callers are these writes, and the entire FileStore snapshot-and-drop deadlock
-discipline (`index/file_store.rs:200-206`, `index/document.rs:21-27`,
-enforced by ~10 repeated comments) exists to protect against them; the
-record-surface-BEFORE-publish ordering contract is re-spelled per call site
-(`lifecycle.rs:442-450`, `server.rs:368-369,401`), and a new publish site
-that forgets it silently poisons freshness records. The R4 overlay
-(`module_index/registration.rs`, `enriched_snapshot`) already solved this for
-closed files with derived copies.
-
-**Why it is wrong at the system level.** A model write owned by a notification
-handler means every future publish/refresh site inherits a mutation-and-
-ordering contract enforceable only by memory, plus a lock discipline every
-handler must re-learn.
-
-**Target shape.** Enrichment becomes a derived artifact produced at one seam:
-either `enrich_for_publish(doc_analysis, &ModuleIndex) -> Arc<FileAnalysis>`
-(clone-and-enrich OFF the store lock, swap in via a short write) or, stronger,
-fold enrichment into `Document::update`/`apply_rebuilt` so the stored analysis
-is always post-enrichment and Surface projection reads the retained
-pre-enrichment build artifact. `publish_diagnostics` becomes a pure read; the
-three spellings, the ordering comments, and `for_each_open_mut` all retire.
-Constraint from the ledger: a per-QUERY enriched-overlay fallback was tried
-and reverted (docs/prompt-enrichment-inheritance-residual.md:79-80) — the
-shape must be rebuild-phase/swap, not query-time.
-
-**Gate.** Enrichment idempotency tests; freshness tests asserting the surface
-projects from the un-enriched artifact by construction; e2e didChange →
-diagnostics unchanged.
+`FileStore::enrich_open(url, idx)` is THE open-doc enrichment writer:
+clone-and-enrich off the store lock, ptr-guarded swap, returns the derived
+`Arc<FileAnalysis>` for the caller to read. `publish_diagnostics` and the
+bulk paths (the resolver `on_refresh` closure and the perl cold-open heal,
+both through `refresh_open_diagnostics`) read the returned artifact — no
+notification handler mutates a stored analysis, and `for_each_open_mut` is
+deleted. The record-surface-BEFORE-publish ordering contract is retired
+structurally: freshness records read `Document::baseline_surface` (projected
+at every build seam from the pristine analysis, recorded via
+`record_and_dirty_value`), so enrichment state cannot reach a surface record
+no matter when either runs. Pinned by
+`enrich_open_swaps_derived_copy_and_keeps_baseline_surface`.
 
 ### D2. The resolver thread holds ModuleIndex's disassembled organs; free-function twins have already drifted — **high leverage / L**
 

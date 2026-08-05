@@ -302,13 +302,13 @@ marked otherwise; the drain re-derived each rationale against current code.
     event, not on a user re-trigger. `spawn_pack_gather_refresh` already heals
     its own doc on gather completion, so BOTH completion signals now fire a
     heal. Guard discipline held: pack URIs are snapshotted under a read guard
-    that drops before any re-analyze; the perl branch enriches under the write
-    guard touching only `module_index` and publishes after the guard drops
-    (same shape as the resolver `on_refresh`). Verified: `heal_open_docs` logs
+    that drops before any re-analyze; the perl branch re-derives enrichment
+    through `FileStore::enrich_open` (clone off the store lock, short swap)
+    and publishes after. Verified: `heal_open_docs` logs
     `cold-window heal: index landed for pack family` on op.c open, refs heal
     1→118 (`e2e/cold-window-heal-repro.sh` phase 1).
   - **Coalesced `on_refresh`.** The callback fired once PER resolved module (33
-    fires opening a Perl file with 14 `use`s), each a full `for_each_open_mut` +
+    fires opening a Perl file with 14 `use`s), each a full all-open re-enrich +
     publish — CPU + stdout pressure that widens the window. It now bumps a
     `refresh_gen` and debounces 120ms; only the latest fire runs, collapsing the
     burst to ONE execution (measured 33→1, `e2e/cold-window-heal-repro.sh` phase
@@ -339,7 +339,7 @@ marked otherwise; the drain re-derived each rationale against current code.
   **The deadlock that used to MASK this window is fixed** (`Document::analysis`
   is now `Arc`; handlers snapshot + drop the `get_open` read guard before
   `resolve()` re-locks the open shards — the reentrant-read-behind-a-queued-
-  `for_each_open_mut`-writer deadlock). Repro lock: `e2e/cold-start-repro.sh`
+  writer deadlock). Repro lock: `e2e/cold-start-repro.sh`
   (pre-fix ~7.5% cold-run failure, post-fix 0). Also: debounce-window staleness
   (mid-typing `doc.analysis` describes prior text). KNOWN-GAPS "LSP session
   determinism".

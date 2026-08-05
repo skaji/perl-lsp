@@ -211,7 +211,7 @@ fn test_demo_file_chain_to_resolves_on_line_71() {
     // Cross-file enrichment — same step the backend runs on open.
     // Resolves MethodCallBindings against the module_index so
     // `my $r = $app->routes;` becomes a TypeConstraint. Without
-    // this, the backend's `enrich_analysis(uri)` hasn't fired
+    // this, `FileStore::enrich_open` hasn't fired
     // yet and the whole chain is un-typed.
     analysis.enrich_imported_types_with_keys(Some(&idx));
 

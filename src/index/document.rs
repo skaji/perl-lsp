@@ -21,9 +21,10 @@ pub struct Document {
     /// `Arc` so a request handler can clone a cheap owned handle and DROP the
     /// `FileStore` read guard before running `resolve()` — which re-locks the
     /// open shards via `for_each_open`. Holding the guard across that reentrant
-    /// read deadlocks against a concurrent `for_each_open_mut` writer (the
-    /// diagnostics-refresh storm): parking_lot's writer-preference blocks the
-    /// second read behind the queued writer, which waits on the first read.
+    /// read deadlocks against a concurrently queued writer (an edit's rebuild
+    /// or `FileStore::enrich_open`'s swap): parking_lot's writer-preference
+    /// blocks the second read behind the queued writer, which waits on the
+    /// first read.
     pub analysis: Arc<FileAnalysis>,
     pub stable_outline: StableOutline,
     /// Driver id: "perl" (the reference path) or a pack language ("cpp").
@@ -31,6 +32,16 @@ pub struct Document {
     /// tree/cursor handlers (completion, signature-help, selection-range)
     /// are Perl cursor-context-specific and skip when this isn't "perl".
     pub language: &'static str,
+    /// The freshness record's source: this doc's Surface, projected at BUILD
+    /// time from the pristine analysis — before `FileStore::enrich_open`
+    /// swaps an enriched copy into `analysis`. `Surface::project`'s contract
+    /// is the file's OWN facts; an enriched projection would fingerprint
+    /// imported types and flip-flop verdicts against the workspace indexer's
+    /// pre-enrichment records (spurious Changed storms on body edits).
+    /// Retained per open doc (bounded by editor tabs) so the record never
+    /// depends on when enrichment ran. Perl-only; pack freshness is the
+    /// invalidator's disk-side gate.
+    pub baseline_surface: Option<crate::model::surface::Surface>,
     /// The file's path, for cross-file analysis (C++ resolves #include'd
     /// macros relative to it). `None` for Perl / unrouted docs.
     pub path: Option<std::path::PathBuf>,
@@ -49,7 +60,15 @@ impl Document {
         let tree = parser.parse(&text, None)?;
         let analysis = driver.analyze_with_path(&text, path.as_deref());
         let stable_outline = StableOutline::from_analysis(&analysis);
-        Some(Document { text, tree, analysis: Arc::new(analysis), stable_outline, language: driver.id(), path })
+        Some(Document {
+            text,
+            tree,
+            analysis: Arc::new(analysis),
+            stable_outline,
+            language: driver.id(),
+            baseline_surface: None,
+            path,
+        })
     }
 
     pub fn new(text: String) -> Option<Self> {
@@ -71,7 +90,16 @@ impl Document {
         let analysis = crate::util::timings::phase("build()", || builder::build(&tree, text.as_bytes()));
         let stable_outline =
             crate::util::timings::phase("stable_outline", || StableOutline::from_analysis(&analysis));
-        Some(Document { text, tree, analysis: Arc::new(analysis), stable_outline, language: "perl", path: None })
+        let baseline_surface = Some(crate::model::surface::Surface::project(&analysis));
+        Some(Document {
+            text,
+            tree,
+            analysis: Arc::new(analysis),
+            stable_outline,
+            language: "perl",
+            baseline_surface,
+            path: None,
+        })
     }
 
     /// Pack-language FAST path for a keystroke: reparse the tree + swap text,
@@ -97,6 +125,9 @@ impl Document {
     /// Write back an analysis built off-lock (from a text snapshot) +
     /// refresh the outline. Pairs with a `spawn_blocking` rebuild.
     pub fn apply_rebuilt(&mut self, analysis: crate::model::file_analysis::FileAnalysis) {
+        if self.language == "perl" {
+            self.baseline_surface = Some(crate::model::surface::Surface::project(&analysis));
+        }
         self.analysis = Arc::new(analysis);
         self.stable_outline.update(&self.analysis, &self.text);
     }
@@ -165,7 +196,9 @@ impl Document {
             log::warn!("Slow parse (update): {:?} for {} bytes", elapsed, new_text.len());
         }
         self.text = new_text;
-        self.analysis = Arc::new(builder::build(&self.tree, self.text.as_bytes()));
+        let analysis = builder::build(&self.tree, self.text.as_bytes());
+        self.baseline_surface = Some(crate::model::surface::Surface::project(&analysis));
+        self.analysis = Arc::new(analysis);
         self.stable_outline.update(&self.analysis, &self.text);
     }
 }

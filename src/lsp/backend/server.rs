@@ -365,7 +365,6 @@ impl LanguageServer for Backend {
                     }
                 }
             }
-            // Pre-enrichment record — publish_diagnostics enriches in place.
             let recorded = self.record_open_doc_surface(&uri);
             self.publish_diagnostics(&uri).await;
             // Surface-gated consumer refresh: a body edit stops here
@@ -553,7 +552,7 @@ impl LanguageServer for Backend {
         // Snapshot the open doc (cheap `Arc` clone) and DROP the store guard
         // before `resolve()` — it re-locks the open shards via `for_each_open`,
         // and holding the guard across that reentrant read deadlocks against a
-        // concurrent `for_each_open_mut` writer. See `Document::analysis`.
+        // concurrently queued writer. See `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),

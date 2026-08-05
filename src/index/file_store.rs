@@ -137,6 +137,39 @@ impl FileStore {
         self.open.get_mut(url)
     }
 
+    /// THE writer of open-doc cross-file enrichment: derives the enriched
+    /// analysis as a clone OFF the store lock, swaps it in via a short
+    /// ptr-guarded write, and returns it for the caller to read (diagnostics)
+    /// without re-locking. Perl-only — pack analyses have no import
+    /// enrichment and are returned untouched. Idempotent through
+    /// `enrich_imported_types_with_keys`'s base_*_count truncation; a
+    /// concurrent rebuild wins the swap (the ptr guard drops this derivation)
+    /// and the next publish re-derives against the newer build. The doc's
+    /// `baseline_surface` is untouched by construction — freshness records
+    /// stay enrichment-invariant no matter when this runs.
+    pub fn enrich_open(
+        &self,
+        url: &Url,
+        idx: &dyn crate::model::file_analysis::CrossFileLookup,
+    ) -> Option<Arc<FileAnalysis>> {
+        let (base, language) = {
+            let doc = self.open.get(url)?;
+            (Arc::clone(&doc.analysis), doc.language)
+        };
+        if language != "perl" {
+            return Some(base);
+        }
+        let mut fa = (*base).clone();
+        fa.enrich_imported_types_with_keys(Some(idx));
+        let enriched = Arc::new(fa);
+        if let Some(mut doc) = self.open.get_mut(url) {
+            if Arc::ptr_eq(&doc.analysis, &base) {
+                doc.analysis = Arc::clone(&enriched);
+            }
+        }
+        Some(enriched)
+    }
+
     // ---- Workspace population ----
 
     /// Insert or replace a workspace entry, unless the same path is currently
@@ -184,26 +217,17 @@ impl FileStore {
 
     // ---- Iteration ----
 
-    /// Call `f` for every open Document with mutable access to the analysis.
-    /// Used by the module-resolver callback to re-enrich open docs. Takes a
-    /// shard write lock per entry — see the deadlock note on `for_each_open`.
-    pub fn for_each_open_mut<F: FnMut(&Url, &mut Document)>(&self, mut f: F) {
-        for mut entry in self.open.iter_mut() {
-            let url = entry.key().clone();
-            f(&url, entry.value_mut());
-        }
-    }
-
     /// Read-only iteration over open Documents. Query paths (`refs_to`,
     /// `references_mask_for`, CandidateSet projections) use this.
     ///
     /// DEADLOCK HAZARD: a caller must NOT hold a `get_open` read guard while
     /// this runs. `iter()` re-locks every shard, so it reentrantly read-locks
-    /// the shard the guard already holds — and if a `for_each_open_mut` writer
-    /// has queued on that shard in between, parking_lot's writer preference
-    /// blocks the reentrant read behind the writer, which waits on the first
-    /// read. Handlers snapshot (`Arc::clone(&doc.analysis)`) and drop the guard
-    /// before calling `resolve()`. See `Document::analysis`.
+    /// the shard the guard already holds — and if a writer (an edit's rebuild
+    /// or `enrich_open`'s swap) has queued on that shard in between,
+    /// parking_lot's writer preference blocks the reentrant read behind the
+    /// writer, which waits on the first read. Handlers snapshot
+    /// (`Arc::clone(&doc.analysis)`) and drop the guard before calling
+    /// `resolve()`. See `Document::analysis`.
     pub fn for_each_open<F: FnMut(&Url, &Document)>(&self, mut f: F) {
         for entry in self.open.iter() {
             f(entry.key(), entry.value());
@@ -250,90 +274,5 @@ impl FileStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(feature = "cpp")]
-    #[test]
-    fn open_routes_cpp_file_to_the_cpp_driver() {
-        // The backend seam: opening a .cpp routes through the C++ driver,
-        // so the document is language-tagged "cpp" and its analysis is the
-        // C++ outline (here, a macro-recovered class). A .pm stays Perl.
-        let store = FileStore::new();
-        let cpp = Url::parse("file:///tmp/route_test.cpp").unwrap();
-        assert!(store.open(
-            cpp.clone(),
-            "#define API __attribute__((visibility(\"default\")))\nclass API Box { public: int width; };\n"
-                .to_string()
-        ));
-        let doc = store.get_open(&cpp).unwrap();
-        assert_eq!(doc.language, "cpp");
-        assert!(doc.analysis.symbols.iter().any(|s| s.name == "Box"), "cpp class via the driver");
-
-        let perl = Url::parse("file:///tmp/route_test.pm").unwrap();
-        assert!(store.open(perl.clone(), "package Foo; sub bar { 1 }\n".to_string()));
-        assert_eq!(store.get_open(&perl).unwrap().language, "perl");
-    }
-
-    #[test]
-    fn test_open_then_close_demotes_to_workspace() {
-        let store = FileStore::new();
-        let url = Url::parse("file:///tmp/demote_test.pm").unwrap();
-
-        assert!(store.open(url.clone(), "package Foo; 1;\n".to_string()));
-        assert_eq!(store.open_count(), 1);
-        assert_eq!(store.workspace_count(), 0);
-
-        store.close(&url);
-        assert_eq!(store.open_count(), 0);
-        assert_eq!(store.workspace_count(), 1);
-    }
-
-    #[test]
-    fn test_open_shadows_workspace_for_same_path() {
-        let store = FileStore::new();
-        let path = PathBuf::from("/tmp/shadow_test.pm");
-        let url = Url::from_file_path(&path).unwrap();
-
-        // Pre-populate as workspace.
-        let analysis = {
-            let src = "package Stale; 1;\n";
-            let mut parser = crate::build::builder::create_parser();
-            let tree = parser.parse(src, None).unwrap();
-            crate::build::builder::build(&tree, src.as_bytes())
-        };
-        store.insert_workspace(path.clone(), analysis);
-        assert_eq!(store.workspace_count(), 1);
-
-        // Opening the same path removes the workspace entry.
-        assert!(store.open(url.clone(), "package Fresh; 1;\n".to_string()));
-        assert_eq!(store.open_count(), 1);
-        assert_eq!(store.workspace_count(), 0);
-
-        // for_each_analysis yields exactly one entry (the open one).
-        let mut count = 0;
-        store.for_each_analysis(|_, _| count += 1);
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_insert_workspace_skipped_when_already_open() {
-        let store = FileStore::new();
-        let path = PathBuf::from("/tmp/skip_test.pm");
-        let url = Url::from_file_path(&path).unwrap();
-
-        store.open(url, "package Open; 1;\n".to_string());
-
-        // Try to insert workspace entry for the same path — should be ignored.
-        let analysis = {
-            let src = "package Workspace; 1;\n";
-            let mut parser = crate::build::builder::create_parser();
-            let tree = parser.parse(src, None).unwrap();
-            crate::build::builder::build(&tree, src.as_bytes())
-        };
-        store.insert_workspace(path, analysis);
-
-        assert_eq!(store.open_count(), 1);
-        assert_eq!(store.workspace_count(), 0, "workspace insert should be skipped");
-    }
-}
+#[path = "file_store_tests.rs"]
+mod tests;
