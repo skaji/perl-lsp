@@ -489,7 +489,7 @@ impl LanguageServer for Backend {
         // A path token, not a name — slot-shaped, so it stays ahead of the
         // set (the ADR's honest boundary). The pack declares whether it has
         // include tokens; asked, never named.
-        if language_has_include_tokens(&language) {
+        if crate::build::language_driver::LanguageRegistry::has_include_tokens(&language) {
             if let Some(loc) = symbols::pack_include_definition(
                 &analysis, symbols::position_to_point(pos), self_path.as_deref())
             {
@@ -603,7 +603,7 @@ impl LanguageServer for Backend {
         // `#include` reverse — "who includes this header" — owns the path
         // token exclusively (the backward mirror of include goto-def). The
         // pack declares whether it has include tokens; asked, never named.
-        if language_has_include_tokens(&language) {
+        if crate::build::language_driver::LanguageRegistry::has_include_tokens(&language) {
             if let Some(incs) = symbols::pack_include_references(
                 &analysis, point, self_path.as_deref(), base_idx)
             {

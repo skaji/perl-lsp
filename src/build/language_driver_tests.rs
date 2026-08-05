@@ -636,6 +636,29 @@ fn implicit_field_read_pass_gated_by_pack_capability() {
         "python: no C preprocessor");
 }
 
+// The by-id capability askers on the registry are THE include-token /
+// preprocessor gates for both serving surfaces (LSP handlers and their
+// CLI/--batch mirrors) — pin their answers so the shared gate can't
+// silently regress to a language-name probe on either side.
+#[cfg(feature = "cpp")]
+#[test]
+fn capability_askers_answer_by_language_id() {
+    use crate::build::language_driver::LanguageRegistry;
+    assert!(LanguageRegistry::has_include_tokens("cpp"),
+        "cpp declares include path tokens — CLI + server both gate on this");
+    assert!(LanguageRegistry::has_preprocessor_macros("cpp"));
+    assert!(!LanguageRegistry::has_include_tokens("perl"),
+        "perl has no LangPack: the asker answers false, no name branch");
+    assert!(!LanguageRegistry::has_preprocessor_macros("perl"));
+    assert!(!LanguageRegistry::has_include_tokens("no-such-language"));
+    #[cfg(feature = "python")]
+    {
+        assert!(!LanguageRegistry::has_include_tokens("python"),
+            "python imports are name-keyed, no path tokens");
+        assert!(!LanguageRegistry::has_preprocessor_macros("python"));
+    }
+}
+
 // Implicit-`this` sibling method CALLs — the call half of the same
 // capability. A bare `foo(...)` inside a method body pins its enclosing
 // class onto the `FunctionCall`'s `resolved_package` (in-class AND

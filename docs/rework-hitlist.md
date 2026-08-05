@@ -197,24 +197,18 @@ internally because a pack sub-index is an `Arc` out of the hub's registry —
 the set borrows, so the caller must own the routed store's lifetime; that is
 what `RoutedIndex` is.
 
-### C2. Driver capabilities answered by language name — with realized CLI/server drift on the include-token gate — **medium leverage / S**
+### C2. LANDED — driver capabilities are asked of the pack from one shared home
 
-**The wrong embedding.** The server asks the pack
-(`language_has_include_tokens`, `src/lsp/backend/completion.rs:214-219`, used
-at `server.rs:497,628` — doc comment cites rule 10), but the CLI mirrors of
-the SAME verbs hard-code `lang_id == Some("cpp")` (`src/lsp/cli/query.rs:360,
-425`). The next include-token language gets include goto-def/references in the
-editor and silently loses them on the gold/CLI surface.
-
-**Target shape.** Move `language_has_include_tokens` to a shared home
-(`build/language_driver.rs` beside the registry); flip the two CLI sites.
-Because that grows the capability-asker family, honor docs/PARKED.md's
-recorded tripwire: at the third boolean asker, collapse to the generic
-`pack_cap(lang, selector)` rather than minting N accessors. Do NOT convert
-the lifecycle `language != "perl"` policy branches — those are owned by the
-parked unification.
-
-**Gate.** A gold cpp include-token gd/references row run through the CLI verb.
+`LanguageRegistry::has_include_tokens` / `has_preprocessor_macros`
+(`build/language_driver.rs`, beside the registry) are THE boolean capability
+askers; the LSP handlers and their CLI/--batch mirrors gate the include-token
+lanes on the same call, so editor and gold answer identically by construction
+(the CLI's `lang_id == Some("cpp")` probes are deleted — the server's
+asked-never-named spelling was the correct side). Two askers is the recorded
+ceiling (docs/PARKED.md): the third collapses to a generic
+`pack_cap(lang, sel)`. `capability_askers_answer_by_language_id` pins the
+by-id answers; the lifecycle `language != "perl"` policy branches stay owned
+by the parked unification.
 
 ---
 

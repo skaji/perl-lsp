@@ -355,7 +355,9 @@ fn run_one(
             let base_idx = routed.as_lookup();
             // `#include "x.h"` path → the resolved header (`#include` = `use`).
             // A path token, not a name — slot-shaped, stays ahead of the set.
-            if lang_id == Some("cpp") {
+            // The pack declares whether it has include tokens; asked, never
+            // named (rule #10) — the same gate the LSP handler asks.
+            if language_driver::LanguageRegistry::has_include_tokens(lang_id.unwrap_or("perl")) {
                 if let Some(loc) = symbols::pack_include_definition(&analysis, point, Some(abs.as_path())) {
                     let path = loc.uri.to_file_path().map(|p| p.display().to_string())
                         .unwrap_or_else(|_| loc.uri.to_string());
@@ -416,7 +418,9 @@ fn run_one(
             let base_idx = routed.as_lookup();
             // `#include` reverse — "who includes this header" — owns the path
             // token exclusively (its backward mirror of include goto-def).
-            if lang_id == Some("cpp") {
+            // The pack declares whether it has include tokens; asked, never
+            // named (rule #10) — the same gate the LSP handler asks.
+            if language_driver::LanguageRegistry::has_include_tokens(lang_id.unwrap_or("perl")) {
                 if let Some(incs) = symbols::pack_include_references(
                     &analysis, point, Some(file_path.as_path()), base_idx)
                 {

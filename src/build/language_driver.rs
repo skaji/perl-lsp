@@ -1387,6 +1387,33 @@ impl LanguageRegistry {
             .any(|l| *l == id)
     }
 
+    /// Does this language's pack declare `#include`-style path tokens (the
+    /// header-is-the-module reference goto-def resolves and references
+    /// reverses)? THE gate for the include-token lanes on BOTH serving
+    /// surfaces — the LSP handlers and their CLI/--batch mirrors — so
+    /// editor and gold cannot answer it differently. Asked of the pack via
+    /// the single `for_id` lookup; Perl's driver has no `LangPack` so it
+    /// answers false without a language-name branch (rule #10).
+    pub fn has_include_tokens(id: &str) -> bool {
+        LanguageRegistry::with_enabled()
+            .for_id(id)
+            .and_then(|d| d.lang_pack())
+            .is_some_and(|p| p.include_path_tokens)
+    }
+
+    /// Does this language's pack declare a C-style preprocessor — `#define`
+    /// macros reachable through `#include`s that identifier-context
+    /// completion offers? Same asked-never-named contract as
+    /// `has_include_tokens`. (Two boolean capability askers is the recorded
+    /// ceiling — a third collapses the family to a generic
+    /// `pack_cap(lang, sel)`, see docs/PARKED.md.)
+    pub fn has_preprocessor_macros(id: &str) -> bool {
+        LanguageRegistry::with_enabled()
+            .for_id(id)
+            .and_then(|d| d.lang_pack())
+            .is_some_and(|p| p.preprocessor_macros)
+    }
+
     /// Human-facing name for a pack language id, for startup banners and
     /// progress messages. Purely cosmetic — `for_id` still speaks the short
     /// id everywhere else. Falls back to the id itself for a language this

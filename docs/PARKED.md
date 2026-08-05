@@ -82,11 +82,12 @@ marked otherwise; the drain re-derived each rationale against current code.
   roots, rejects `::Schema`/`::ResultSet`) that a prefix test cannot; a
   schema class is a DBIx::Class descendant but not a result class.
   [recorded 2026-07-17]
-- **Two boolean pack-capability askers** (`language_has_include_tokens`,
-  `language_has_preprocessor` — backend.rs): identical body shape, fine at
-  two per the rule of three. The THIRD boolean capability asker is the
-  tripwire: collapse to a generic `pack_cap(lang, sel)` then. [recorded
-  2026-07-19, tighten-4 audit]
+- **Two boolean pack-capability askers**
+  (`LanguageRegistry::has_include_tokens` / `has_preprocessor_macros`,
+  build/language_driver.rs — the shared home both serving surfaces ask):
+  identical body shape, fine at two per the rule of three. The THIRD
+  boolean capability asker is the tripwire: collapse to a generic
+  `pack_cap(lang, sel)` then. [recorded 2026-07-19, tighten-4 audit]
 - **Three byte-capped LRU eviction cores** (PackBagCache plain; enrichment
   overlay adds entry-count cap; GatherCache adds single-flight condvar):
   shared discipline (`evict_to_cap`, never-evict-just-inserted), genuinely
