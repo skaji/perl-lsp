@@ -10,7 +10,7 @@
 //! all survive the module boundary.
 //!
 //! See also:
-//! - `module_resolver.rs` — resolver thread, in-process parsing
+//! - `module_resolver/` — resolver thread, in-process parsing
 //! - `module_cache.rs` — SQLite persistence (schema v9, bincode+zstd blobs)
 //! - `cpanfile.rs` — cpanfile parsing
 
