@@ -186,3 +186,89 @@ implementations (Complete policy) until the heal lands — 280 ms warm on
 curl for the byte-identical full answer; cold pays the gather with
 work-done progress visible. Outline/hover/completion stay fast-path
 (no cross-file read). Server and CLI now agree.
+
+## Round 9 — 2026-08-05 — commit 74de442f (post layered-restructure + 24-slice rework) — 4 cores / 15 GB
+
+First round since 2bdf57e; the intervening span (94 commits of spike work +
+the restructure + the rework arc) was unbenched. Scenarios re-anchored to
+fresh upstream HEADs first (d672d525) — abseil/curl/fmt coordinates moved,
+so single-probe deltas against Rounds 5–8 carry that caveat where noted.
+
+### Startup + RSS
+
+| project | cold ready | warm ready | cold peak RSS | warm peak RSS |
+|---|---|---|---|---|
+| bugzilla | 2.5 s | 1.2 s | 253 MB | 161 MB |
+| mojo | 1.5 s | 1.0 s | 125 MB | 86 MB |
+| abseil | 1.2 s¹ | 1.1 s | 214 MB | **101 MB** |
+| fmt | 6.7 s | 0.9 s | 267 MB | 158 MB |
+| curl | 13.8 s | 1.1 s | 305 MB | 162 MB |
+| redis | 12.4 s | 1.0 s | 482 MB | 293 MB |
+
+All within or better than the Rounds 5–8 bands; abseil warm RSS is the
+standout (**274 → 101 MB**, −63% — the residency/eviction discipline of the
+storage arc paying off in steady state; bugzilla warm 188 → 161 MB and fmt
+warm 266 → 158 MB rhyme with it).
+
+### Warm navigation medians
+
+| verb | bugzilla | mojo | abseil | fmt | redis | curl |
+|---|---|---|---|---|---|---|
+| hover | **0.8 ms** (was 333²) | 0.3 ms | 3.4 ms | 3.3 ms | 21 ms | 16 ms |
+| goto-def x-file | 0.7 ms | 0.4 ms | 6.0 ms | 18 ms | 32 ms | 2.7 ms |
+| references | **16 ms** (was 91) | **1.6 ms** (was 19) | **85 ms** (was 1.62 s) | 146 ms | 1.73 s³ | 703 ms⁴ |
+| member completion | 20 ms | 11–17 ms | 2.9 ms | 2.8 ms | 9.9 ms | 4.5 ms |
+| body edit → diags | ~715 ms⁵ | ~70–86 ms | ~195 ms | ~206 ms | ~650 ms³ | ~395 ms |
+| contract/header edit | ~890 ms⁵ | ~83 ms | ~275 ms | ~950 ms⁶ | ~730 ms³ | ~224 ms |
+
+¹ first-file interactivity; bulk index continues (references waits it out:
+  cold refs 25.8 s honest-full vs 85 ms warm).
+² the Bug.pm `Bugzilla->dbh` on-demand-enrichment hover: the open-doc
+  enrichment artifact (D1) killed the 333 ms in-publish enrichment stall.
+³ redis warm-slower-than-cold inversion — see finding below.
+⁴ curl `Curl_conn_meta_get` refs re-anchored (upstream moved the call
+  sites; result 33.6 KB) — not comparable to the old 112 ms row.
+⁵ bugzilla diag latency drifted up from ~530/660 ms — see finding.
+⁶ fmt warm header edit+revert both ~950 ms where cold is 129/652 ms; the
+  old ledger's "~650 ms revert asymmetry" grew a sibling — watch.
+
+### Findings
+
+- **FIXED-BY 74de442f (this round's catch): C++ serving path wedged by the
+  gather single-flight × rayon pool deadlock.** Introduced by H9-3
+  (d0ec2acb, unbenched span): an open-doc gather claims a file's flight and
+  injects level par_iter work into the global rayon pool while a bulk-index
+  pool worker parks on the same flight's condvar — a parked worker buries
+  its stolen continuations, the pool wedges, `index_pack_languages` never
+  returns, the pack ReadyGate never opens. Symptom: fmt never ready,
+  hover/def null at the 400 ms Interactive cap, references null after the
+  full 120 s Complete cap, os.cc diagnostics silent; abseil same disease
+  milder (warm refs 120 s→null, no body diags). Fix: a rayon worker never
+  parks on a foreign flight — it computes a private duplicate and does not
+  publish (claimant owns population). Pinned by
+  `gather_cache_rayon_worker_never_blocks_on_a_foreign_flight` (hangs
+  pre-fix). After: fmt cold ready 6.7 s / refs 71 ms / 1.3 KB; abseil warm
+  refs 85 ms / 12.7 KB — at or above the Rounds 5–8 baselines. Neither
+  cargo test, gold, nor the CLI mirrors can see this failure mode — only
+  server-mode rounds exercise open-doc gather × bulk index concurrency.
+- **NEW: redis warm runs slower than cold on the index-heavy verbs** —
+  refs 383 ms cold → 1.73 s warm, contract diag 72 → 730 ms, body diags
+  137 → ~650 ms. Warm serves from SQLite rows/rehydration where cold has
+  everything resident post-index; the inversion says the warm lane pays
+  rehydration on the hot path for redis-sized files. Candidate for a
+  storage-arc look; not user-catastrophic (still sub-2 s) but the trend is
+  wrong.
+- **NEW: bugzilla edit→diagnostics drifted up** (~530/660 → ~715/890 ms).
+  Enrichment now derives an artifact per publish (D1) where it previously
+  mutated in place; suspect the derive-clone on Bug.pm-sized analyses.
+  Watch; a per-size threshold or reuse would claw it back.
+- **KNOWN (A4 ledger note): CLI hover lane gap** — `Bugzilla->dbh` answers
+  163 B in server mode but empty via `--hover` CLI (CLI renders only the
+  model hover; the set's binding lanes are server-side). Tracked in the
+  rework hitlist's A3/A4 LANDED notes as the renderer-placement residual.
+- **KNOWN (still present): redis warm goto-def def-only wobble** — cold
+  returns def+prototype (440 B), warm def-only (220 B); CLI shows both.
+  Unchanged from the Rounds 5–8 watch-list.
+- dragonbox template knownweak: both probes now answer small non-null
+  payloads (212/133 B) — the lazy template projection edge moved; probes
+  left tagged until asserted meaningful.
