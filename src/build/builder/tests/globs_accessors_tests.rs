@@ -77,12 +77,12 @@ __PACKAGE__->add_columns(qw/id username/);
 ",
     );
     let id: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "id" && s.kind == SymKind::Method)
         .collect();
     let username: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "username" && s.kind == SymKind::Method)
         .collect();
@@ -102,7 +102,7 @@ __PACKAGE__->mk_group_ro_accessors('inflated', 'gamma', 'delta');
     );
     for name in ["alpha", "beta", "gamma", "delta"] {
         let hits: Vec<_> = fa
-            .symbols
+            .symbols()
             .iter()
             .filter(|s| s.name == name && s.kind == SymKind::Method)
             .collect();
@@ -110,7 +110,7 @@ __PACKAGE__->mk_group_ro_accessors('inflated', 'gamma', 'delta');
     }
     // The group name itself is NOT an accessor.
     assert!(
-        !fa.symbols.iter().any(|s| s.name == "simple" && s.kind == SymKind::Method),
+        !fa.symbols().iter().any(|s| s.name == "simple" && s.kind == SymKind::Method),
         "the leading group name must not become an accessor"
     );
 }
@@ -125,7 +125,7 @@ __PACKAGE__->mk_classdata('config');
 ",
     );
     let hits: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "config" && s.kind == SymKind::Method)
         .collect();
@@ -148,7 +148,7 @@ has 'value';
     );
     // ...and Mojo::Base accessor synthesis (getter + setter) applies.
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "value" && s.kind == SymKind::Method)
         .collect();
@@ -182,7 +182,7 @@ has age => (is => 'rw');
 ",
     );
     let name_acc: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -194,14 +194,14 @@ has age => (is => 'rw');
     // The fat-arrow form on the next line still works (no regression).
     // `is => 'rw'` synthesizes a getter + a writer (2 symbols named `age`).
     let age_acc: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "age" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(age_acc.len(), 2, "fat-arrow rw form still synthesizes getter+setter");
     // `is`/`default` must not become phantom accessors.
     assert!(
-        !fa.symbols.iter().any(|s| (s.name == "is" || s.name == "ro") && s.kind == SymKind::Method),
+        !fa.symbols().iter().any(|s| (s.name == "is" || s.name == "ro") && s.kind == SymKind::Method),
         "option keywords/values must not mint phantom methods in comma form"
     );
 }
@@ -209,7 +209,7 @@ has age => (is => 'rw');
 // ---- typeglob sub installation (CG-1) ----
 
 fn has_sub(fa: &FileAnalysis, name: &str) -> bool {
-    fa.symbols
+    fa.symbols()
         .iter()
         .any(|s| s.name == name && s.kind == SymKind::Sub)
 }
@@ -274,7 +274,7 @@ fn glob_dynamic_name_skipped() {
     // The anon `sub {...}` RHS mints an `(anon)` Sub symbol; the glob install
     // itself must add no named Sub.
     assert!(
-        !fa.symbols.iter().any(|s| s.kind == SymKind::Sub && s.name != "(anon)"),
+        !fa.symbols().iter().any(|s| s.kind == SymKind::Sub && s.name != "(anon)"),
         "fully-dynamic glob name must be skipped, not guessed"
     );
 }
@@ -284,7 +284,7 @@ fn glob_unfoldable_concat_skipped() {
     // `'is_' . $type` with an unknown $type is not derivable → skip.
     let fa = build_fa("*{ 'is_' . $type } = sub { 1 };\n");
     assert!(
-        !fa.symbols.iter().any(|s| s.kind == SymKind::Sub && s.name.starts_with("is_")),
+        !fa.symbols().iter().any(|s| s.kind == SymKind::Sub && s.name.starts_with("is_")),
         "unfoldable concat name must be skipped, not guessed with a partial prefix"
     );
 }
@@ -305,11 +305,11 @@ fn normal_assignment_unaffected() {
     // and `my $x = sub {...}` is a lexical coderef, not a glob install.
     let fa = build_fa("my $x = 42;\nmy $cb = sub { 1 };\n");
     assert!(
-        !fa.symbols.iter().any(|s| s.name == "x" && s.kind == SymKind::Sub),
+        !fa.symbols().iter().any(|s| s.name == "x" && s.kind == SymKind::Sub),
         "plain scalar assignment must not mint a Sub symbol"
     );
     assert!(
-        !fa.symbols.iter().any(|s| s.name == "cb" && s.kind == SymKind::Sub),
+        !fa.symbols().iter().any(|s| s.name == "cb" && s.kind == SymKind::Sub),
         "lexical `my $cb = sub {{...}}` must not be treated as a glob install"
     );
 }
@@ -360,7 +360,7 @@ sub _dynamic { return map { lc } @ARGV; }
 ";
     let fa = build_fa(src);
     assert!(
-        !fa.symbols.iter().any(|s| s.kind == SymKind::Sub && s.name != "(anon)" && s.name != "_dynamic"),
+        !fa.symbols().iter().any(|s| s.kind == SymKind::Sub && s.name != "(anon)" && s.name != "_dynamic"),
         "non-literal local sub return must not synthesize glob names"
     );
 }
@@ -375,7 +375,7 @@ for my $m (Some::Other::tags()) {
 ";
     let fa = build_fa(src);
     assert!(
-        !fa.symbols.iter().any(|s| s.kind == SymKind::Sub && s.name != "(anon)"),
+        !fa.symbols().iter().any(|s| s.kind == SymKind::Sub && s.name != "(anon)"),
         "unresolvable loop-source sub must not synthesize glob names"
     );
 }
@@ -416,7 +416,7 @@ fn glob_non_can_method_rhs_skipped() {
 // ---- mk_classdata in a statement-modifier loop ----
 
 fn count_method(fa: &FileAnalysis, name: &str) -> usize {
-    fa.symbols.iter().filter(|s| s.name == name && s.kind == SymKind::Method).count()
+    fa.symbols().iter().filter(|s| s.name == name && s.kind == SymKind::Method).count()
 }
 
 #[test]
@@ -458,7 +458,7 @@ __PACKAGE__->mk_classdata($_) for @dynamic_names;
 ",
     );
     assert!(
-        !fa.symbols.iter().any(|s| s.kind == SymKind::Method),
+        !fa.symbols().iter().any(|s| s.kind == SymKind::Method),
         "non-literal loop list must not synthesize accessors"
     );
 }
@@ -474,7 +474,7 @@ print(\"$_\\n\") for qw/a b c/;
 ",
     );
     assert!(
-        !fa.symbols.iter().any(|s| s.kind == SymKind::Method),
+        !fa.symbols().iter().any(|s| s.kind == SymKind::Method),
         "non-accessor postfix-for loop must not synthesize accessors"
     );
 }
@@ -491,7 +491,7 @@ use Class::Tiny qw( resolvers cache );
     );
     for attr in ["resolvers", "cache"] {
         let acc: Vec<_> = fa
-            .symbols
+            .symbols()
             .iter()
             .filter(|s| s.name == attr && s.kind == SymKind::Method)
             .collect();
@@ -502,7 +502,7 @@ use Class::Tiny qw( resolvers cache );
         );
         // Constructor key so `Foo->new(resolvers => ...)` connects.
         let key_def: Vec<_> = fa
-            .symbols
+            .symbols()
             .iter()
             .filter(|s| s.name == attr && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
             .collect();
@@ -536,7 +536,7 @@ use Class::Tiny {
     // Keys are accessors; default values (string / coderef) are NOT.
     for attr in ["name", "builder"] {
         let acc: Vec<_> = fa
-            .symbols
+            .symbols()
             .iter()
             .filter(|s| s.name == attr && s.kind == SymKind::Method)
             .collect();
@@ -548,7 +548,7 @@ use Class::Tiny {
     }
     // The default value `'default'` must not become an accessor.
     assert!(
-        !fa.symbols
+        !fa.symbols()
             .iter()
             .any(|s| s.name == "default" && s.kind == SymKind::Method),
         "hashref default value must not mint a phantom accessor"
@@ -566,7 +566,7 @@ use Class::Tiny qw( ssn ), { name => undef };
     );
     for attr in ["ssn", "name"] {
         assert!(
-            fa.symbols
+            fa.symbols()
                 .iter()
                 .any(|s| s.name == attr && s.kind == SymKind::Method),
             "combined qw+hashref form should synthesize accessor `{attr}`"
@@ -584,7 +584,7 @@ use List::Util qw( max min );
 ",
     );
     assert!(
-        !fa.symbols
+        !fa.symbols()
             .iter()
             .any(|s| (s.name == "max" || s.name == "min") && s.kind == SymKind::Method),
         "non-Class::Tiny use must not synthesize accessor methods"
@@ -781,7 +781,7 @@ sub opt_b { 'b' }
 
     // ref_at the `opt_a` token in the export list.
     let opt_a_def_span = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "opt_a")
         .map(|s| s.selection_span)
@@ -971,7 +971,7 @@ fn autoloader_data_section_subs_synthesized() {
     let fa = build_fa(src);
 
     let names: std::collections::HashSet<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Sub)
         .map(|s| s.name.as_str())
@@ -982,7 +982,7 @@ fn autoloader_data_section_subs_synthesized() {
 
     // Spans land in the data section (row 5 = first sub after __END__).
     let want_read = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "want_read" && s.kind == SymKind::Sub)
         .expect("want_read symbol");
@@ -1015,13 +1015,13 @@ fn non_autoloader_data_section_synthesizes_nothing() {
                plain documentation text\n";
     let fa = build_fa(src);
     assert!(
-        fa.symbols
+        fa.symbols()
             .iter()
             .all(|s| s.name != "looks_like_a_sub"),
         "data-section subs must NOT be synthesized without AutoLoader/SelfLoader"
     );
     assert!(
-        fa.symbols.iter().any(|s| s.name == "real_sub"),
+        fa.symbols().iter().any(|s| s.name == "real_sub"),
         "the real pre-__END__ sub is still present"
     );
 }
@@ -1037,7 +1037,7 @@ fn autoloader_via_use_base_enables_synthesis() {
                sub inherited_loader_sub { return 1 }\n";
     let fa = build_fa(src);
     assert!(
-        fa.symbols
+        fa.symbols()
             .iter()
             .any(|s| s.name == "inherited_loader_sub" && s.kind == SymKind::Sub),
         "use base 'AutoLoader' must enable data-section synthesis"
@@ -1116,10 +1116,10 @@ $c->{port};
     let expected = HashKeyOwner::Sub { package: Some("Config".to_string()), name: "new".to_string() };
     for key in ["host", "port"] {
         assert!(
-            fa.symbols.iter().any(|s| s.name == key
+            fa.symbols().iter().any(|s| s.name == key
                 && matches!(&s.detail, SymbolDetail::HashKeyDef { owner, .. } if *owner == expected)),
             "plain/fat-comma bless key `{key}` must emit a HashKeyDef owned by Config::new; got: {:?}",
-            fa.symbols.iter()
+            fa.symbols().iter()
                 .filter(|s| matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
                 .map(|s| (s.name.clone(), s.detail.clone())).collect::<Vec<_>>(),
         );
@@ -1167,7 +1167,7 @@ for my $sub (@subs) {
 "#;
     let fa = build_fa(src);
     for tail in ["_ymd2rd", "_rd2ymd"] {
-        let under_datetime = fa.symbols.iter().any(|s| {
+        let under_datetime = fa.symbols().iter().any(|s| {
             s.name == tail
                 && matches!(s.kind, SymKind::Sub)
                 && s.package.as_deref() == Some("DateTime")
@@ -1176,7 +1176,7 @@ for my $sub (@subs) {
             under_datetime,
             "glob-synthesized `{}` should be attributed to DateTime, symbols: {:?}",
             tail,
-            fa.symbols
+            fa.symbols()
                 .iter()
                 .filter(|s| s.name == tail)
                 .map(|s| (&s.name, &s.package))
@@ -1185,7 +1185,7 @@ for my $sub (@subs) {
     }
     // The real definitions (under DateTime::PP) are untouched.
     assert!(
-        fa.symbols.iter().any(|s| s.name == "_ymd2rd"
+        fa.symbols().iter().any(|s| s.name == "_ymd2rd"
             && matches!(s.kind, SymKind::Sub)
             && s.package.as_deref() == Some("DateTime::PP")),
         "the original DateTime::PP::_ymd2rd sub must still exist"
@@ -1280,11 +1280,11 @@ fn same_package_glob_synthesizes_under_current_package() {
 "#;
     let fa = build_fa(src);
     assert!(
-        fa.symbols.iter().any(|s| s.name == "frobnicate"
+        fa.symbols().iter().any(|s| s.name == "frobnicate"
             && matches!(s.kind, SymKind::Sub)
             && s.package.as_deref() == Some("Acme::Widget")),
         "same-package glob must stay under the current package, symbols: {:?}",
-        fa.symbols
+        fa.symbols()
             .iter()
             .filter(|s| s.name == "frobnicate")
             .map(|s| (&s.name, &s.package))

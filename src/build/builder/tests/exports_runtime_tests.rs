@@ -83,7 +83,7 @@ fn refgen_goto_def_lands_on_sub_definition() {
     let src = "sub handler { 1 }\nmy $cb = \\&handler;\n";
     let fa = build_fa(src);
     let sub_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "handler" && matches!(s.kind, SymKind::Sub))
         .expect("handler sub should be defined");
@@ -117,7 +117,7 @@ fn fq_scalar_read_resolves_same_file() {
     let src = "package Pkg;\nour $x = 1;\npackage Main;\nmy $a = $Pkg::x;\n";
     let fa = build_fa(src);
     let decl = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "$x" && s.package.as_deref() == Some("Pkg"))
         .expect("our $x in Pkg should be a symbol");
@@ -141,7 +141,7 @@ fn fq_array_read_resolves_same_file() {
     let src = "package Pkg;\nour @arr = (1, 2);\npackage Main;\nmy @b = @Pkg::arr;\n";
     let fa = build_fa(src);
     let decl = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "@arr" && s.package.as_deref() == Some("Pkg"))
         .expect("our @arr in Pkg should be a symbol");
@@ -409,7 +409,7 @@ fn sub_exporter_member_goto_def_and_references() {
     let fa = build_fa(src);
 
     let foo_def_span = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "foo")
         .map(|s| s.selection_span)
@@ -588,7 +588,7 @@ has 'name' => (is => 'ro', predicate => 'has_name');
 ",
     );
     let pred: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "has_name" && s.kind == SymKind::Method)
         .collect();
@@ -610,7 +610,7 @@ has 'email' => (is => 'ro', predicate => 1);
 ",
     );
     let pred: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "has_email" && s.kind == SymKind::Method)
         .collect();
@@ -628,7 +628,7 @@ has '_token' => (is => 'ro', predicate => 1);
 ",
     );
     let pred: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "_has_token" && s.kind == SymKind::Method)
         .collect();
@@ -645,7 +645,7 @@ has 'cache' => (is => 'rw', clearer => 'clear_cache');
 ",
     );
     let clearer: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "clear_cache" && s.kind == SymKind::Method)
         .collect();
@@ -663,7 +663,7 @@ has 'items' => (is => 'rw', clearer => 1);
 ",
     );
     let clearer: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "clear_items" && s.kind == SymKind::Method)
         .collect();
@@ -680,7 +680,7 @@ has '_session' => (is => 'rw', clearer => 1);
 ",
     );
     let clearer: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "_clear_session" && s.kind == SymKind::Method)
         .collect();
@@ -697,7 +697,7 @@ has 'color' => (is => 'ro', writer => 'set_color');
 ",
     );
     let writer: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "set_color" && s.kind == SymKind::Method)
         .collect();
@@ -717,7 +717,7 @@ has 'size' => (is => 'ro', reader => 'get_size');
 ",
     );
     let reader: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "get_size" && s.kind == SymKind::Method)
         .collect();
@@ -741,7 +741,7 @@ sub _build_items { return [] }
 ",
     );
     let builder_sym: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "_build_items" && s.kind == SymKind::Method)
         .collect();
@@ -763,7 +763,7 @@ has 'cache' => (is => 'lazy', builder => '_make_cache');
 ",
     );
     let builder_sym: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "_make_cache" && s.kind == SymKind::Method)
         .collect();
@@ -781,12 +781,12 @@ has 'flag' => (predicate => 'has_flag', clearer => 'clear_flag');
 ",
     );
     let pred: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "has_flag" && s.kind == SymKind::Method)
         .collect();
     let clearer: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "clear_flag" && s.kind == SymKind::Method)
         .collect();
@@ -806,14 +806,14 @@ has 'secret' => (is => 'bare', predicate => 'has_secret');
     );
     // Default accessor suppressed
     let accessors: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "secret" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(accessors.len(), 0, "bare suppresses default accessor");
     // Predicate still synthesized
     let pred: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "has_secret" && s.kind == SymKind::Method)
         .collect();
@@ -830,12 +830,12 @@ has 'logger' => (is => 'ro', isa => 'Log::Any', handles => { log => 'debug', war
 ",
     );
     let log_sym: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "log" && s.kind == SymKind::Method)
         .collect();
     let warning_sym: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "warning" && s.kind == SymKind::Method)
         .collect();
@@ -853,12 +853,12 @@ has 'db' => (is => 'ro', isa => 'DBI::db', handles => [qw(prepare execute)]);
 ",
     );
     let prepare: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "prepare" && s.kind == SymKind::Method)
         .collect();
     let execute: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "execute" && s.kind == SymKind::Method)
         .collect();
@@ -879,7 +879,7 @@ has 'logger' => (is => 'ro', isa => \"InstanceOf['Log::Any']\", handles => { log
 ",
     );
     let log_sym: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "log" && s.kind == SymKind::Method)
         .collect();
@@ -917,7 +917,7 @@ has 'name' => (is => 'ro', isa => 'Str', default => 'bob', lazy => 1, required =
     );
     for phantom in ["ro", "rw", "lazy", "bare", "Str", "bob", "1"] {
         let hits: Vec<_> = fa
-            .symbols
+            .symbols()
             .iter()
             .filter(|s| s.name == phantom && s.kind == SymKind::Method)
             .collect();
@@ -929,7 +929,7 @@ has 'name' => (is => 'ro', isa => 'Str', default => 'bob', lazy => 1, required =
     }
     // The real accessor still lands.
     let name: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -952,7 +952,7 @@ has 'cache' => (is => 'ro', lazy_build => 1);
         ("has_cache", "predicate"),
     ] {
         let hits: Vec<_> = fa
-            .symbols
+            .symbols()
             .iter()
             .filter(|s| s.name == name && s.kind == SymKind::Method)
             .collect();
@@ -961,7 +961,7 @@ has 'cache' => (is => 'ro', lazy_build => 1);
     // `lazy_build`/`is` themselves are not methods.
     for phantom in ["lazy_build", "ro", "1"] {
         assert!(
-            !fa.symbols.iter().any(|s| s.name == phantom && s.kind == SymKind::Method),
+            !fa.symbols().iter().any(|s| s.name == phantom && s.kind == SymKind::Method),
             "`{phantom}` must not become a method"
         );
     }
@@ -974,7 +974,7 @@ fn test_moo_has_accessor_selection_span_is_attr_name() {
     // `has` on line 3 (0-indexed), attr `name` at col 5; options on line 4.
     let fa = build_fa("package Foo;\nuse Moo;\nhas name => (\n    is => 'ro',\n);\n");
     let name = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "name" && s.kind == SymKind::Method)
         .expect("name accessor");
@@ -996,7 +996,7 @@ has my_setting => (is => 'ro', isa => 'Str');
 ",
     );
     let acc: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "my_setting" && s.kind == SymKind::Method)
         .collect();
@@ -1004,7 +1004,7 @@ has my_setting => (is => 'ro', isa => 'Str');
     // And no phantom from the `is`/`isa` data options.
     for phantom in ["ro", "Str"] {
         assert!(
-            !fa.symbols.iter().any(|s| s.name == phantom && s.kind == SymKind::Method),
+            !fa.symbols().iter().any(|s| s.name == phantom && s.kind == SymKind::Method),
             "`{phantom}` must not become a method under Dancer2::Plugin either"
         );
     }
@@ -1017,9 +1017,9 @@ fn use_constant_scalar_form_registers_sub_symbol() {
     // and gives goto-def.
     let fa = build_fa("use constant DEBUG => 1;\nmy $y = DEBUG && 2;\n");
     assert!(
-        fa.symbols.iter().any(|s| s.name == "DEBUG" && s.kind == SymKind::Sub),
+        fa.symbols().iter().any(|s| s.name == "DEBUG" && s.kind == SymKind::Sub),
         "DEBUG must be registered as a Sub symbol; got: {:?}",
-        fa.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>(),
+        fa.symbols().iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>(),
     );
 }
 
@@ -1028,9 +1028,9 @@ fn use_constant_block_form_registers_each_name() {
     let fa = build_fa("use constant { A => 1, B => 2, C => 3 };\n");
     for n in ["A", "B", "C"] {
         assert!(
-            fa.symbols.iter().any(|s| s.name == n && s.kind == SymKind::Sub),
+            fa.symbols().iter().any(|s| s.name == n && s.kind == SymKind::Sub),
             "block-form constant `{n}` must be a Sub symbol; got: {:?}",
-            fa.symbols.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            fa.symbols().iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
         );
     }
 }
@@ -1043,9 +1043,9 @@ fn use_constant_block_plain_comma_keys_register() {
     let fa = build_fa("use constant { 'GAMMA', 3, 'DELTA', 4, A => 1, B => 2 };\n");
     for n in ["GAMMA", "DELTA", "A", "B"] {
         assert!(
-            fa.symbols.iter().any(|s| s.name == n && s.kind == SymKind::Sub),
+            fa.symbols().iter().any(|s| s.name == n && s.kind == SymKind::Sub),
             "plain-comma block constant `{n}` must be a Sub symbol; got: {:?}",
-            fa.symbols.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            fa.symbols().iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
         );
     }
 }
@@ -1105,7 +1105,7 @@ sub go {
 fn use_constant_block_does_not_mispair_values_as_keys() {
     let fa = build_fa("use constant { A => 1, 'B', 2 };\n");
     let const_subs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Sub)
         .map(|s| s.name.as_str())
@@ -1129,7 +1129,7 @@ fn use_constant_between_subs_at_file_scope() {
     let src = "sub one {}\nuse constant MID => 'x';\nsub two {}\n";
     let fa = build_fa(src);
     assert!(
-        fa.symbols.iter().any(|s| s.name == "MID" && s.kind == SymKind::Sub),
+        fa.symbols().iter().any(|s| s.name == "MID" && s.kind == SymKind::Sub),
         "MID declared between subs must register as a Sub symbol",
     );
 }
@@ -1155,9 +1155,9 @@ sub go {
     let fa = build_fa(src);
     for n in ["ALPHA", "BETA", "GAMMA"] {
         assert!(
-            fa.symbols.iter().any(|s| s.name == n && s.kind == SymKind::Sub),
+            fa.symbols().iter().any(|s| s.name == n && s.kind == SymKind::Sub),
             "every separate NAME-form constant must register a Sub symbol; `{n}` missing. got: {:?}",
-            fa.symbols.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            fa.symbols().iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
         );
         // Usages resolve: each name joins `declared_constants`, so the
         // standalone bareword usage gets a FunctionCall ref to the def.

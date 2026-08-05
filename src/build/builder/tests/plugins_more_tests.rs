@@ -28,7 +28,7 @@ sub _route {
 ";
     let fa = build_fa(src);
     let route_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "_route" && matches!(s.kind, SymKind::Sub | SymKind::Method))
         .expect("_route must be parsed as a sub");
@@ -61,7 +61,7 @@ sub _route { my $self = shift; $self }
 ";
     let fa = build_fa(src);
     let route_id = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "_route")
         .expect("_route present")
@@ -90,7 +90,7 @@ sub _route { my ($x) = @_; { id => $x } }
 ";
     let fa = build_fa(src);
     let id = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "_route")
         .expect("_route present")
@@ -118,7 +118,7 @@ sub other_method { my $self = shift; { ok => 1 } }
 ";
     let fa = build_fa(src);
     let id = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "other_method")
         .expect("other_method present")
@@ -172,7 +172,7 @@ sub _route {
 ";
     let fa = build_fa(src);
     let sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "_route")
         .expect("_route present");
@@ -365,7 +365,7 @@ use Dancer2;
 
     // `request` must resolve to Dancer2::Core::Request.
     let request_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "request" && matches!(s.kind, crate::model::file_analysis::SymKind::Sub));
     assert!(
@@ -480,7 +480,7 @@ use Mojolicious::Lite;
     // We verify via the synthesized Sub symbol: the dancer plugin
     // should not have emitted one.
     let dancer_stubs = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.name == "dancer_app"
@@ -519,7 +519,7 @@ print \"pi is $pi\\n\";
 ";
     let fa = build_fa(src);
     let pi_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "$pi" && s.kind == SymKind::Variable)
         .expect("$pi Variable symbol");
@@ -560,7 +560,7 @@ print \"v=$version\\n\";
 ";
     let fa = build_fa(src);
     let our_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "$version" && s.kind == SymKind::Variable)
         .expect("$version Variable symbol");

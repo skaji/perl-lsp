@@ -422,7 +422,7 @@ impl ProvisionalDispatch {
 /// `enrich_imported_types_with_keys` re-fires it when the package's ancestry
 /// resolves ANY gate prefix CROSS-FILE (`class_isa_prefix`, the same MRO
 /// seam as every other ancestry walk). Idempotent by construction: the
-/// re-fired symbols/refs land ABOVE `base_symbol_count` / `base_ref_count`
+/// re-fired symbols/refs land ABOVE the symbol/ref tables' baselines
 /// and are truncated + re-derived every enrichment cycle, so a file whose
 /// ancestry resolves late converges to the same analysis as one built with
 /// it known — the same discipline as `ReceiverGated` dispatch, but for

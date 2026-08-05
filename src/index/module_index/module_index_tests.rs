@@ -369,7 +369,7 @@ fn get_cached_scoped_prefers_reachable_same_name_class() {
 
     let has = |m: &Option<Arc<CachedModule>>, name: &str| {
         m.as_ref()
-            .is_some_and(|c| c.analysis.symbols.iter().any(|s| s.name == name))
+            .is_some_and(|c| c.analysis.symbols().iter().any(|s| s.name == name))
     };
     let scope = |p: &str| -> HashSet<String> { [p.to_string()].into_iter().collect() };
 
@@ -445,7 +445,7 @@ fn unregister_file_removes_defs_and_repicks_winner() {
 
     let has = |m: &Option<Arc<CachedModule>>, name: &str| {
         m.as_ref()
-            .is_some_and(|c| c.analysis.symbols.iter().any(|s| s.name == name))
+            .is_some_and(|c| c.analysis.symbols().iter().any(|s| s.name == name))
     };
     // a.cpp holds the winner slot (smallest path).
     assert!(has(&idx.get_cached("Box"), "a_only"));
@@ -498,13 +498,13 @@ fn register_symbols_stripping_feeds_before_evict() {
     use crate::index::pack_bag_cache::PackBagCache;
     let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
     let full = parse_source_to_cached(src, "Widget");
-    let full_syms = full.analysis.symbols.len();
+    let full_syms = full.analysis.symbols().len();
     assert!(full_syms > 0);
     let path = full.path.clone();
 
     let idx = ModuleIndex::new_for_cli();
     let arc = idx.register_symbols_stripping((*path).to_path_buf(), (*full.analysis).clone(), true, true);
-    assert!(arc.symbols_are_evicted() && arc.symbols.is_empty(), "stored copy is stripped");
+    assert!(arc.symbols_are_evicted() && arc.symbols().is_empty(), "stored copy is stripped");
     assert!(arc.refs_are_evicted());
 
     // Name lookups still resolve — the feed ran on the whole copy. (`make`
@@ -522,7 +522,7 @@ fn register_symbols_stripping_feeds_before_evict() {
     let idx2 = ModuleIndex::new_for_cli().with_bag_cache(cache);
     let whole = idx2.whole_present(&hit);
     assert!(!whole.symbols_are_evicted());
-    assert_eq!(whole.symbols.len(), full_syms);
+    assert_eq!(whole.symbols().len(), full_syms);
 
     // The unregister inverse walks the recorded names, not the evicted vec.
     idx.unregister_file(&path);
@@ -809,7 +809,7 @@ fn cache_bridged(
     let tree = parser.parse(source, None).unwrap();
     let mut fa = crate::build::builder::build(&tree, source.as_bytes());
     let entity_id = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == entity_sub)
         .map(|s| s.id)
@@ -858,7 +858,7 @@ fn bridged_entity_return_resolves_through_enriched_overlay() {
     let br = idx.get_cached("Br").expect("Br cached");
     let render_id = br
         .analysis
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "render")
         .map(|s| s.id)
@@ -1074,7 +1074,7 @@ fn foreign_path_rehydrates_through_the_owning_sibling() {
     let before = crate::index::module_index::rehydration_miss_count();
     let full = crate::model::file_analysis::CrossFileLookup::whole_present(sub.as_ref(), &cm);
     assert!(
-        full.symbols.iter().any(|s| s.name == "boo"),
+        full.symbols().iter().any(|s| s.name == "boo"),
         "foreign route must serve the owner's WHOLE copy, not the stripped resident"
     );
     assert_eq!(

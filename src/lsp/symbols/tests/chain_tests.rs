@@ -246,7 +246,7 @@ fn test_demo_file_chain_to_resolves_on_line_71() {
         .filter(|b| b.variable == "$r")
         .collect();
     // Is `app` even known as a symbol/import?
-    let app_known = analysis.symbols.iter().any(|s| s.name == "app");
+    let app_known = analysis.symbols().iter().any(|s| s.name == "app");
     // Is Mojolicious in the module index?
     let mojo_cached = idx.get_cached("Mojolicious").is_some();
     let routes_cached = idx.get_cached("Mojolicious::Routes").is_some();
@@ -389,7 +389,7 @@ fn test_route_pm_chain_decomposition() {
     // Probe: find the `_generate_route` sub body and report
     // what we see on each hop.
     let inspect_sym = |name: &str| {
-        for sym in &analysis.symbols {
+        for sym in analysis.symbols() {
             if sym.name != name {
                 continue;
             }
@@ -680,7 +680,7 @@ fn test_demo_chain_empirical_truth_table() {
     // chain's path.
     let route_cached = idx.get_cached("Mojolicious::Routes::Route").unwrap();
     let inspect = |name: &str| -> Option<InferredType> {
-        for sym in &route_cached.analysis.symbols {
+        for sym in route_cached.analysis.symbols() {
             if sym.name != name {
                 continue;
             }
@@ -936,7 +936,7 @@ sub register ($self, $app, $conf) {\n\
     // Sanity: the dynamic loop really minted the concrete `get_order` helper,
     // bridged to the app surface (so the test can't pass vacuously).
     assert!(
-        provider.symbols.iter().any(|s| s.name == "get_order"
+        provider.symbols().iter().any(|s| s.name == "get_order"
             && matches!(&s.namespace, crate::model::file_analysis::Namespace::Framework { id } if id == "mojo-helpers")),
         "provider must mint the dynamic `get_order` helper",
     );
@@ -1001,7 +1001,7 @@ for my $sub (@subs) {\n\
     let provider = parse_analysis(provider_src);
     // Sanity: the glob really attributed `_ymd2rd` to DateTime.
     assert!(
-        provider.symbols.iter().any(|s| s.name == "_ymd2rd"
+        provider.symbols().iter().any(|s| s.name == "_ymd2rd"
             && matches!(s.kind, crate::model::file_analysis::SymKind::Sub)
             && s.package.as_deref() == Some("DateTime")),
         "provider must attribute the glob-installed _ymd2rd to DateTime",

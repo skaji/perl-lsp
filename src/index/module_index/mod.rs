@@ -58,7 +58,7 @@ pub fn rehydration_miss_count() -> usize {
 fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
     let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut feed: Vec<(String, bool)> = Vec::new();
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         // The C-linkage surface (`FileAnalysis::is_linkage_visible`) —
         // the same predicate completion gathering uses, so every name
         // registered here is also offerable and vice versa.
@@ -79,7 +79,7 @@ fn collect_linkage_feed(analysis: &FileAnalysis) -> Vec<(String, bool)> {
     // Class rank is visibility-INDEPENDENT (the old occupant scan matched
     // any Class symbol): a non-linkage-visible Class sharing a visible
     // value's name still ranks the file as declaring that Class.
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         if matches!(sym.kind, SymKind::Class) {
             if let Some(&i) = index.get(sym.name.as_str()) {
                 feed[i].1 = true;
@@ -270,7 +270,7 @@ impl RoutedIndex<'_> {
 /// package name, e.g. "Users" for `->to('Users#list')`) can find it.
 /// Returns `None` for scripts with no explicit package declaration.
 pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         if matches!(sym.kind, SymKind::Package | SymKind::Class) {
             return Some(sym.name.clone());
         }

@@ -55,7 +55,7 @@ impl FileAnalysis {
             specializes: HashMap::new(),
             template_params: HashMap::new(),
             scopes,
-            symbols,
+            symbols: SymbolTable::from_vec(symbols),
             refs: RefTable::from_vec(refs),
             fold_ranges,
             imports,
@@ -74,8 +74,6 @@ impl FileAnalysis {
             type_provenance,
             witnesses,
             bag_evicted: false,
-            symbols_evicted: false,
-            base_symbol_count: 0,
             base_witness_count: 0,
             provisional_dispatches,
             gated_emissions,
@@ -106,8 +104,6 @@ impl FileAnalysis {
             // Pack drivers re-stamp their id post-construction.
             language: super::default_language(),
             scope_starts: Vec::new(),
-            symbols_by_name: HashMap::new(),
-            symbols_by_scope: HashMap::new(),
             export_lookup: HashSet::new(),
         };
         fa.build_indices();
@@ -162,24 +158,23 @@ impl FileAnalysis {
         self.refs.is_evicted()
     }
 
-    /// Strip the resident `symbols` (and the symbol-keyed rebuilt indexes)
-    /// from an index copy whose blob + `syms` rows are persisted — the third
-    /// eviction axis. Lossless: the on-disk analysis keeps the full vec;
-    /// enumeration (workspace/symbol) reads rows, detail reads rehydrate.
-    /// Registration feeds were extracted BEFORE this runs. Touches no other
-    /// pinned field (`export`/`export_ok`/`export_lookup` derive from export
-    /// lists, not symbols, and stay). Idempotent.
+    /// Strip the resident symbols axis from an index copy whose blob +
+    /// `syms` rows are persisted — the symbols twin of `evict_refs`.
+    /// `SymbolTable::evict` drops the vec and every index over it in one
+    /// place, so no index can survive its symbols. Lossless: the on-disk
+    /// analysis keeps the full vec; enumeration (workspace/symbol) reads
+    /// rows, detail reads rehydrate. Registration feeds were extracted
+    /// BEFORE this runs. Touches no other pinned field
+    /// (`export`/`export_ok`/`export_lookup` derive from export lists, not
+    /// symbols, and stay). Idempotent.
     pub fn evict_symbols(&mut self) {
-        self.symbols = Vec::new();
-        self.symbols_by_name = std::collections::HashMap::new();
-        self.symbols_by_scope = std::collections::HashMap::new();
-        self.symbols_evicted = true;
+        self.symbols.evict();
     }
 
     /// True when `evict_symbols` stripped this copy's symbols: empty means
     /// "on disk, not resident", never "no symbols".
     pub fn symbols_are_evicted(&self) -> bool {
-        self.symbols_evicted
+        self.symbols.is_evicted()
     }
 
     /// Whole on EVERY evictable axis — the property `whole_present` gates
@@ -187,7 +182,7 @@ impl FileAnalysis {
     /// setter), so multi-axis consumers stay whole-covered by construction
     /// instead of each spelling its own flag list.
     pub fn is_fully_resident(&self) -> bool {
-        !self.bag_evicted && !self.refs.is_evicted() && !self.symbols_evicted
+        !self.bag_evicted && !self.refs.is_evicted() && !self.symbols.is_evicted()
     }
 
     /// The ONE speller of the registration strip: `strip_bag` drops the
@@ -217,11 +212,11 @@ impl FileAnalysis {
         // Stamp the build-time-resolved dispatch target on MethodCall
         // refs (local-only here; enrichment re-stamps with the index
         // for OPEN docs). Mutates existing refs in place, so it must run
-        // before sealing base_ref_count — the seal counts the refs, the
-        // stamp only sets a field on them.
+        // before the ref table seals its baseline — the seal counts the
+        // refs, the stamp only sets a field on them.
         self.stamp_method_call_targets(None);
-        self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
+        self.symbols.seal_baseline();
         self.refs.seal_baseline();
     }
 
@@ -346,8 +341,6 @@ impl FileAnalysis {
     pub fn after_deserialize(&mut self) {
         // Clear first in case this is called on a populated FileAnalysis.
         self.scope_starts.clear();
-        self.symbols_by_name.clear();
-        self.symbols_by_scope.clear();
         self.export_lookup.clear();
         self.build_indices();
     }
@@ -359,21 +352,7 @@ impl FileAnalysis {
             .collect();
         self.scope_starts.sort_by_key(|(p, _)| (p.row, p.column));
 
-        // Symbols by name
-        for sym in &self.symbols {
-            self.symbols_by_name
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym.id);
-        }
-
-        // Symbols by scope
-        for sym in &self.symbols {
-            self.symbols_by_scope
-                .entry(sym.scope)
-                .or_default()
-                .push(sym.id);
-        }
+        self.symbols.rebuild_indices();
 
         // Link HashKeyAccess refs to their HashKeyDef symbols whenever the
         // owner is already resolved (the builder's pre-pass handled type
@@ -564,8 +543,8 @@ pub struct HeapBreakdown {
     pub include: usize,
     /// `scopes` vec + package names.
     pub scopes: usize,
-    /// The serde-skip reverse indices rebuilt on load
-    /// (`refs_by_name`/`refs_by_target`/`symbols_by_name`/… ).
+    /// The serde-skip reverse indices rebuilt on load (the ref table's
+    /// name/target/call lookups, the symbol table's name/scope lookups, … ).
     pub rebuilt_indices: usize,
     /// `imports` + `call_bindings` + `method_call_bindings` + `fold_ranges`.
     pub bindings: usize,
@@ -656,9 +635,6 @@ impl FileAnalysis {
         fn scap<T>(s: &HashSet<T>) -> usize {
             s.capacity() * (std::mem::size_of::<T>() + 1)
         }
-        fn strcaps<'a>(it: impl Iterator<Item = &'a String>) -> usize {
-            it.map(|s| s.capacity() + std::mem::size_of::<String>()).sum()
-        }
         // HashMap<String, Vec<V>>: flat table + deep key strings + value vecs.
         fn map_str_vec<V>(m: &HashMap<String, Vec<V>>) -> usize {
             let mut b = mcap(m);
@@ -689,19 +665,8 @@ impl FileAnalysis {
         // refs + their indices — the dominant bucket for a big-fan-in TU.
         self.refs.heap_add(&mut h);
 
-        // symbols + their deep strings.
-        h.symbols = vcap(&self.symbols)
-            + self
-                .symbols
-                .iter()
-                .map(|s| {
-                    s.name.capacity()
-                        + s.package.as_ref().map_or(0, |p| p.capacity())
-                        + vcap(&s.attributes)
-                        + strcaps(s.attributes.iter())
-                        + vcap(&s.deref_stack)
-                })
-                .sum::<usize>();
+        // symbols + their deep strings + their name/scope indices.
+        self.symbols.heap_add(&mut h);
 
         // witness bag.
         let (wv, wi) = self.witnesses.heap_bytes_estimate();
@@ -728,27 +693,12 @@ impl FileAnalysis {
                 .sum::<usize>();
 
         // The serde-skip reverse indices (rebuilt on load, resident-only).
-        // The ref-keyed share of this bucket is added by `RefTable::heap_add`.
-        h.rebuilt_indices += {
-            let mut b = self.scope_starts.capacity()
-                * std::mem::size_of::<(Point, ScopeId)>()
-                + self.export_lookup.capacity()
-                    * (std::mem::size_of::<String>() + 1)
-                + self
-                    .export_lookup
-                    .iter()
-                    .map(|s| s.capacity())
-                    .sum::<usize>()
-                + mcap(&self.symbols_by_scope);
-            for (k, v) in &self.symbols_by_name {
-                b += k.capacity() + v.capacity() * std::mem::size_of::<SymbolId>();
-            }
-            b += mcap(&self.symbols_by_name);
-            for v in self.symbols_by_scope.values() {
-                b += v.capacity() * std::mem::size_of::<SymbolId>();
-            }
-            b
-        };
+        // The ref- and symbol-keyed shares of this bucket are added by the
+        // tables' own `heap_add`.
+        h.rebuilt_indices += self.scope_starts.capacity()
+            * std::mem::size_of::<(Point, ScopeId)>()
+            + self.export_lookup.capacity() * (std::mem::size_of::<String>() + 1)
+            + self.export_lookup.iter().map(|s| s.capacity()).sum::<usize>();
 
         // bindings / imports.
         h.bindings = vcap(&self.imports)

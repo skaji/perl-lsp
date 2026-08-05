@@ -1,5 +1,5 @@
-//! Raw symbol/ref index accessors over the rebuilt lookup tables
-//! (`symbols_by_name`, `symbols_by_scope`, `refs_by_name`, and the
+//! Raw symbol/ref index accessors over the tables' rebuilt lookups (the
+//! symbol name/scope indices, the ref name index, and the
 //! linkage-visibility gate they share with cross-file registration).
 
 use super::*;
@@ -7,7 +7,7 @@ use super::*;
 impl FileAnalysis {
     /// Find all symbols with a given name.
     pub fn symbols_named(&self, name: &str) -> &[SymbolId] {
-        self.symbols_by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+        self.symbols.named(name)
     }
 
     /// The local callable a package-scoped `FunctionCall` targets: the
@@ -66,7 +66,7 @@ impl FileAnalysis {
     /// Find all symbols in a given scope.
     #[allow(dead_code)]
     pub fn symbols_in_scope(&self, scope: ScopeId) -> &[SymbolId] {
-        self.symbols_by_scope.get(&scope).map(|v| v.as_slice()).unwrap_or(&[])
+        self.symbols.in_scope(scope)
     }
 
     /// Find all refs with a given target name.

@@ -118,7 +118,7 @@ fn resolve_and_parse_inner(
         }
     }
 
-    let symbols = analysis.symbols.len();
+    let symbols = analysis.symbols().len();
     let result = Arc::new(CachedModule::new(path, Arc::new(analysis)));
     if let Some(start) = bench_start {
         eprintln!("bench\t{}\t{}\t{}\t{}", module_name, start.elapsed().as_micros(), symbols, bytes);

@@ -122,11 +122,11 @@ has 'name' => (is => 'ro');
         // being set at the time `visit_has_call` fires. With SyntheticUse,
         // the kit's `use Co::Base -Class` precedes `has`, so the plugin
         // re-dispatch flips the mode before the has-call is walked.
-        let kit_methods: Vec<&str> = kit.symbols.iter()
+        let kit_methods: Vec<&str> = kit.symbols().iter()
             .filter(|s| s.name == "name" && s.kind == SymKind::Method)
             .map(|s| s.name.as_str())
             .collect();
-        let lit_methods: Vec<&str> = lit.symbols.iter()
+        let lit_methods: Vec<&str> = lit.symbols().iter()
             .filter(|s| s.name == "name" && s.kind == SymKind::Method)
             .map(|s| s.name.as_str())
             .collect();
@@ -143,7 +143,7 @@ has 'name' => (is => 'ro');
         // the one observable axis where the two builds are SUPPOSED
         // to differ — it's what lets `--dump-package` / outline /
         // completion filters surface "this came from co-base-test".
-        let kit_moo = kit.symbols.iter()
+        let kit_moo = kit.symbols().iter()
             .find(|s| s.kind == SymKind::Module && s.name == "Moo")
             .expect("kit build must have a Module symbol for synthesized `use Moo`");
         assert_eq!(
@@ -151,7 +151,7 @@ has 'name' => (is => 'ro');
             Namespace::framework("co-base-test"),
             "synthesized Module must carry the emitting plugin's namespace tag"
         );
-        let lit_moo = lit.symbols.iter()
+        let lit_moo = lit.symbols().iter()
             .find(|s| s.kind == SymKind::Module && s.name == "Moo")
             .expect("literal build must have a Module symbol for `use Moo`");
         assert_eq!(
@@ -199,7 +199,7 @@ has 'name' => (is => 'ro');
             "self-cycle must collapse to one Import entry; use_dedup gate kicked in"
         );
 
-        let module_syms = fa.symbols.iter()
+        let module_syms = fa.symbols().iter()
             .filter(|s| s.kind == SymKind::Module && s.name == "Co::Base")
             .count();
         assert_eq!(module_syms, 1, "self-cycle must emit one Module symbol");
@@ -210,7 +210,7 @@ has 'name' => (is => 'ro');
         // regression where the gate gets moved or `process_use` gets
         // split. If any of these grow without the others, something's
         // half-processing the cycle.
-        let co_base_uses = fa.symbols.iter()
+        let co_base_uses = fa.symbols().iter()
             .filter(|s| s.kind == SymKind::Module && s.name == "Co::Base")
             .count();
         assert_eq!(
@@ -856,7 +856,7 @@ mod param_types_manifest {
         let tree = parser.parse(src, None).unwrap();
         let mut fa = crate::build::builder::build(&tree, src.as_bytes());
         fa.enrich_imported_types_with_keys(Some(&idx));
-        let ready = fa.symbols.iter().filter(|s| {
+        let ready = fa.symbols().iter().filter(|s| {
             s.kind == SymKind::Handler && s.name == "ready"
                 && matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-events")
         }).count();
@@ -903,13 +903,13 @@ mod param_types_manifest {
         let mut fa = crate::build::builder::build(&tree, src.as_bytes());
         // Nothing synthesized yet — the ClassIsa gate saw only local `Mid`.
         assert_eq!(
-            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            fa.symbols().iter().filter(|s| s.name == "comments").count(),
             0,
             "the relationship accessor must NOT synthesize before enrichment \
              (the gate can't see cross-file ancestry at build)",
         );
         fa.enrich_imported_types_with_keys(Some(&idx));
-        let col = fa.symbols.iter().find(|s| {
+        let col = fa.symbols().iter().find(|s| {
             s.name == "name"
                 && s.kind == SymKind::Method
                 && matches!(&s.namespace, Namespace::Framework { id } if id == "dbic")
@@ -919,7 +919,7 @@ mod param_types_manifest {
             "the `name` column accessor should synthesize via 2-hop cross-file \
              DBIx::Class ancestry after enrichment",
         );
-        let rel = fa.symbols.iter().find(|s| {
+        let rel = fa.symbols().iter().find(|s| {
             s.name == "comments"
                 && s.kind == SymKind::Method
                 && matches!(&s.namespace, Namespace::Framework { id } if id == "dbic")
@@ -934,7 +934,7 @@ mod param_types_manifest {
         // Idempotent: a second enrichment must not double the accessors.
         fa.enrich_imported_types_with_keys(Some(&idx));
         assert_eq!(
-            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            fa.symbols().iter().filter(|s| s.name == "comments").count(),
             1,
             "re-enrichment must not stack a second `comments` accessor \
              (truncate-to-baseline idempotency)",
@@ -966,7 +966,7 @@ mod param_types_manifest {
         let mut fa = crate::build::builder::build(&tree, src.as_bytes());
         fa.enrich_imported_types_with_keys(Some(&idx));
         assert_eq!(
-            fa.symbols.iter().filter(|s| s.name == "comments").count(),
+            fa.symbols().iter().filter(|s| s.name == "comments").count(),
             0,
             "no DBIx::Class ancestry ⇒ no synthesis, even with a has_many call",
         );

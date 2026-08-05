@@ -19,7 +19,7 @@ fn open_routes_cpp_file_to_the_cpp_driver() {
         // same shard (seed-dependent, so it hangs one run in ~eight).
         let doc = store.get_open(&cpp).unwrap();
         assert_eq!(doc.language, "cpp");
-        assert!(doc.analysis.symbols.iter().any(|s| s.name == "Box"), "cpp class via the driver");
+        assert!(doc.analysis.symbols().iter().any(|s| s.name == "Box"), "cpp class via the driver");
     }
 
     let perl = Url::parse("file:///tmp/route_test.pm").unwrap();

@@ -15,7 +15,7 @@ pub(super) fn find_use_insertion_position(
     stable_packages: Option<&[(String, usize)]>,
 ) -> Position {
     // Collect package declaration lines from current parse
-    let mut pkg_lines: Vec<usize> = analysis.symbols.iter()
+    let mut pkg_lines: Vec<usize> = analysis.symbols().iter()
         .filter(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class))
         .map(|s| s.selection_span.start.row)
         .collect();
@@ -228,7 +228,7 @@ pub fn code_actions(
                 if let Some(imp) = last_import_above {
                     insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
                 } else {
-                    let last_pkg_above = analysis.symbols.iter().rev()
+                    let last_pkg_above = analysis.symbols().iter().rev()
                         .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < diag_point.row);
                     if let Some(pkg) = last_pkg_above {
                         insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };

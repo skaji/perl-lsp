@@ -26,7 +26,7 @@ sub new {
     let fa = build_fa(src);
 
     let handlers: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Handler
@@ -77,7 +77,7 @@ sub wire {
 "#;
     let fa = build_fa(src);
     let plugin_handlers: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Handler
@@ -113,7 +113,7 @@ sub wire {
     let fa = build_fa(src);
 
     let names: std::collections::HashSet<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Handler
@@ -153,7 +153,7 @@ sub wire {
 "#;
     let fa = build_fa(src);
     let ready: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Handler
@@ -266,7 +266,7 @@ $app->helper(current_user => sub {
     let fa = build_fa(src);
 
     let helpers: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Method
@@ -493,7 +493,7 @@ $app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
     // home; consumer classes reach it via the synthetic-parent edge),
     // despite two dotted helpers sharing that prefix.
     let thing_syms: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.name == "thing"
@@ -518,12 +518,12 @@ $app->helper('thing.there' => sub { my ($c, $arg_b) = @_; });
 
     // Both leaves exist on the shared proxy class, each with its own params.
     let hi = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "hi" && s.kind == SymKind::Method)
         .expect("hi leaf emitted");
     let there = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "there" && s.kind == SymKind::Method)
         .expect("there leaf emitted");
@@ -560,7 +560,7 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
     let fa = build_fa(src);
 
     let admin = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "admin"
@@ -569,7 +569,7 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         })
         .expect("admin on app surface (chain root)");
     let users = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "users"
@@ -578,7 +578,7 @@ $app->helper('admin.users.purge' => sub { my ($c, $force) = @_; });
         })
         .expect("users on admin proxy");
     let purge = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "purge"
@@ -668,7 +668,7 @@ app->start;
     let fa = build_fa(src);
 
     let route_handlers: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Handler
@@ -740,7 +740,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
     assert_eq!(method_refs.len(), 2, "one MethodCallRef per route");
 
     let route_syms: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Handler
@@ -934,13 +934,13 @@ $r->get('/users')->to('Users#list')->name('users_list');
     let fa = build_fa(src);
 
     let route_name_handler = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.kind == SymKind::Handler && s.name == "users_list");
     assert!(
         route_name_handler.is_some(),
         "->name('users_list') must emit a Handler; handlers: {:?}",
-        fa.symbols
+        fa.symbols()
             .iter()
             .filter(|s| s.kind == SymKind::Handler)
             .map(|s| &s.name)
@@ -990,7 +990,7 @@ $r->get('/users')->to('Users#list');
     let fa = build_fa(src);
 
     let route_handler = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.kind == SymKind::Handler && s.name == "Users#list")
         .expect("Users#list Handler");
@@ -1280,7 +1280,7 @@ sub to  { my $self = shift; return $self; }
     // Hop 1: `app` → Mojolicious. The plugin's typed Sub seeds the
     // chain. This is the single sanctioned plugin stub.
     let app_sym = app_fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "app"
@@ -1368,7 +1368,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
 
     // The helper leaf `create` should live on the proxy class.
     let helper_create: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.name == "create"
@@ -1503,7 +1503,7 @@ app->helper(greet => sub {
 "#;
     let fa = build_fa(src);
     let greet = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "greet" && s.kind == SymKind::Method)
         .expect("helper must emit a Method named greet");
@@ -1924,7 +1924,7 @@ sub new {
 "#;
     let fa = build_fa(src);
     let plugin_syms: Vec<&Symbol> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(&s.namespace,
@@ -1956,7 +1956,7 @@ $minion->add_task(send_email => sub {
     let fa = build_fa(src);
 
     let handler = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.kind == SymKind::Handler
@@ -2128,7 +2128,7 @@ $minion->enqueue(send_email => ['alice']);
 "#;
     let fa = build_fa(src);
 
-    let handler = fa.symbols.iter().find(|s| {
+    let handler = fa.symbols().iter().find(|s| {
         s.kind == SymKind::Handler
             && s.name == "send_email"
             && matches!(&s.detail, SymbolDetail::Handler { owner: HandlerOwner::Class(c), .. } if c == "Minion")
@@ -2196,7 +2196,7 @@ $minion->enqueue(task_x => ['arg'] => { priority => 10 });
 
     // Options emitted as HashKeyDef symbols owned by Sub{Minion, enqueue}.
     let option_names: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::HashKeyDef

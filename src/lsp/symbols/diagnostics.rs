@@ -348,7 +348,7 @@ pub fn collect_diagnostics(
         // neither local nor cached is external/uninstalled — stay silent, we
         // can't enumerate its methods. The complete-ancestry valve below is
         // the shared honest-silent guard for both.
-        let is_local_class = analysis.symbols.iter().any(|s| {
+        let is_local_class = analysis.symbols().iter().any(|s| {
             matches!(s.kind, FaSymKind::Class | FaSymKind::Package) && s.name == class_name
         });
         let is_cached_class =
@@ -362,7 +362,7 @@ pub fn collect_diagnostics(
         // class is already a real module — its methods live in its analysis,
         // which `resolve_method_in_ancestors` consults below.
         let has_methods = is_cached_class
-            || analysis.symbols.iter().any(|s| {
+            || analysis.symbols().iter().any(|s| {
                 matches!(s.kind, FaSymKind::Sub | FaSymKind::Method)
                     && analysis.symbol_in_class(s.id, &class_name)
             });
@@ -524,7 +524,7 @@ pub fn collect_diagnostics(
             .map(|r| r.span)
             .or_else(|| {
                 analysis
-                    .symbols
+                    .symbols()
                     .iter()
                     .find(|s| {
                         matches!(s.kind, FaSymKind::Package | FaSymKind::Class)

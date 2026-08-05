@@ -82,8 +82,8 @@ never re-encoded per handler.
 ### Lazy enrichment, idempotent
 
 Workspace files aren't enriched at index time — only on-demand when a query
-needs cross-file types. `base_type_constraint_count` / `base_symbol_count`
-/ `base_witness_count` mark the post-build seal so re-enrichment truncates
+needs cross-file types. The `SymbolTable` / `RefTable` enrichment baselines
+and `base_witness_count` mark the post-build seal so re-enrichment truncates
 back to baseline before re-deriving. The `enriched: bool` flag on
 `FileEntry` short-circuits repeat work.
 

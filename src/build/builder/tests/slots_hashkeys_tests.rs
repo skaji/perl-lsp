@@ -9,7 +9,7 @@ use super::*;
 // docs/parser-shortcomings.md (G1) and docs/adr/error-recovery.md.
 
 fn sub_names(fa: &FileAnalysis) -> Vec<String> {
-    fa.symbols
+    fa.symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
         .map(|s| s.name.clone())
@@ -46,7 +46,7 @@ sub alpha { return 1; }
 "#;
     let fa = build_fa(src);
     let alpha = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "alpha" && matches!(s.kind, SymKind::Sub))
         .expect("alpha recovered");
@@ -69,14 +69,14 @@ sub encode { }
 "#;
     let fa = build_fa(src);
     assert!(
-        fa.symbols
+        fa.symbols()
             .iter()
             .any(|s| s.name == "Net::DNS::RR" && matches!(s.kind, SymKind::Package)),
         "package survives the bleed"
     );
     for want in ["new", "decode", "encode"] {
         assert!(
-            fa.symbols.iter().any(|s| s.name == want
+            fa.symbols().iter().any(|s| s.name == want
                 && matches!(s.kind, SymKind::Sub | SymKind::Method)
                 && s.package.as_deref() == Some("Net::DNS::RR")),
             "sub `{want}` recovered under Net::DNS::RR"
@@ -108,7 +108,7 @@ fn error_text_recovery_does_not_duplicate_a_recovered_sub() {
     let src = "package Foo;\nif (\nsub kept { 1 }\n";
     let fa = build_fa(src);
     let kept: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "kept" && matches!(s.kind, SymKind::Sub | SymKind::Method))
         .collect();
@@ -1040,7 +1040,7 @@ has name => (is => 'ro', isa => 'Str', predicate => 'has_name');
 ";
     let fa = build_fa(src);
     let method = |n: &str| {
-        fa.symbols
+        fa.symbols()
             .iter()
             .any(|s| s.name == n && s.kind == crate::model::file_analysis::SymKind::Method)
     };
@@ -1076,7 +1076,7 @@ fn test_plugin_declared_framework_mode_maker_grants_has_semantics() {
     let tree = parser.parse(source, None).unwrap();
     let fa = build_with_plugins(&tree, source.as_bytes(), std::sync::Arc::new(reg));
     assert!(
-        fa.symbols.iter().any(|s| {
+        fa.symbols().iter().any(|s| {
             s.name == "size" && s.kind == crate::model::file_analysis::SymKind::Method
         }),
         "plugin-declared maker must grant native `has` accessor synthesis",

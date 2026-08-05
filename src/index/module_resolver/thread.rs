@@ -229,7 +229,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
                     // plugin-emitted typed Subs, method return annotations.
                     // These are the chain-invisible-but-reachable classes
                     // the user's chain walks through at query time.
-                    for sym in &m.analysis.symbols {
+                    for sym in m.analysis.symbols() {
                         use crate::model::file_analysis::{InferredType, SymKind, SymbolDetail};
                         if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
                         if !matches!(sym.detail, SymbolDetail::Sub { .. }) { continue; }

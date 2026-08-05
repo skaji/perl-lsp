@@ -113,7 +113,7 @@ fn query_skeleton_differential_report() {
 
         for (bkind, skel_kinds, label) in kind_map {
             let t = tallies.entry(label).or_default();
-            for sym in fa.symbols.iter().filter(|s| s.kind == *bkind) {
+            for sym in fa.symbols().iter().filter(|s| s.kind == *bkind) {
                 t.builder += 1;
                 let pos = (sym.selection_span.start.row, sym.selection_span.start.column);
                 // Exact column: the builder anchors a variable's
@@ -133,7 +133,7 @@ fn query_skeleton_differential_report() {
                     // plugin namespace, requires markers, and the
                     // has-accessor projection families.
                     let sym_id = crate::model::file_analysis::SymbolId(
-                        fa.symbols.iter().position(|s2| std::ptr::eq(s2, sym)).unwrap() as u32,
+                        fa.symbols().iter().position(|s2| std::ptr::eq(s2, sym)).unwrap() as u32,
                     );
                     let plugin_or_marker = !matches!(sym.namespace, crate::model::file_analysis::Namespace::Language)
                         || fa.contract_symbols.contains(&sym_id)
@@ -1235,7 +1235,7 @@ fn cpp_cross_file_enum_variant_goto_def() {
     use crate::model::file_analysis::RefKind;
     let header = "enum opcode {\n    OP_NULL,\n    OP_SCOPE,\n};\n";
     let header_fa = cpp_skel(header).into_file_analysis();
-    let op = header_fa.symbols.iter().find(|s| s.name == "OP_SCOPE").unwrap();
+    let op = header_fa.symbols().iter().find(|s| s.name == "OP_SCOPE").unwrap();
     assert_eq!(op.package.as_deref(), Some("opcode"),
         "enum constant carries its enum as the (type) package");
 
@@ -2142,7 +2142,7 @@ fn class_dedup_keys_on_name_and_span_not_name_alone() {
          class Circle : public Shape { public: int r; };\n",
     );
     let circles: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, crate::model::file_analysis::SymKind::Class) && s.name == "Circle")
         .collect();
@@ -2152,7 +2152,7 @@ fn class_dedup_keys_on_name_and_span_not_name_alone() {
     // both survive (previously the second `Node` vanished).
     let fa2 = cpp_fa("namespace A { struct Node { int a; }; }\nnamespace B { struct Node { int b; }; }\n");
     let nodes: Vec<_> = fa2
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, crate::model::file_analysis::SymKind::Class) && s.name == "Node")
         .collect();
@@ -2257,7 +2257,7 @@ template <typename T> struct formatter<T*, char> { int fmt_partial(); };
 "#,
     );
     let class = |n: &str| {
-        fa.symbols
+        fa.symbols()
             .iter()
             .find(|s| s.name == n && matches!(s.kind, crate::model::file_analysis::SymKind::Class))
     };
@@ -2265,7 +2265,7 @@ template <typename T> struct formatter<T*, char> { int fmt_partial(); };
     assert!(class("formatter<int, char>").is_some(), "full spec is its own Class");
     assert!(class("formatter<T*, char>").is_some(), "partial spec is its own Class");
     // members are OWNED by the spec (package = the canonical spec name)
-    let member = |n: &str| fa.symbols.iter().find(|s| s.name == n).unwrap();
+    let member = |n: &str| fa.symbols().iter().find(|s| s.name == n).unwrap();
     assert_eq!(member("fmt_full").package.as_deref(), Some("formatter<int, char>"));
     assert_eq!(member("fmt_partial").package.as_deref(), Some("formatter<T*, char>"));
     assert_eq!(member("parse").package.as_deref(), Some("formatter"));
@@ -2286,7 +2286,7 @@ template <typename T> struct Buf { void grow(int n); };
 template <typename T> void Buf<T>::grow(int n) { int local_g = n; }
 "#,
     );
-    let grows: Vec<_> = fa.symbols.iter().filter(|s| s.name == "grow").collect();
+    let grows: Vec<_> = fa.symbols().iter().filter(|s| s.name == "grow").collect();
     assert_eq!(grows.len(), 2, "in-class decl + out-of-line def");
     for g in &grows {
         assert_eq!(
@@ -2384,24 +2384,24 @@ template auto thousands_sep_impl(int loc) -> int;
     use crate::model::file_analysis::SymKind;
     // enumerable outline items (fork 2): class + method + function forms
     assert!(fa
-        .symbols
+        .symbols()
         .iter()
         .any(|s| s.name == "Buf<int>" && matches!(s.kind, SymKind::Class)));
     assert!(fa
-        .symbols
+        .symbols()
         .iter()
         .any(|s| s.name == "grow"
             && matches!(s.kind, SymKind::Method)
             && s.package.as_deref() == Some("Buf")));
     assert!(fa
-        .symbols
+        .symbols()
         .iter()
         .any(|s| s.name == "thousands_sep_impl" && matches!(s.kind, SymKind::Sub)));
     // an instantiation is NOT a specialization — no family edge
     assert!(!fa.specializes.contains_key("Buf<int>"));
     // signature params live in a sub-body scope, out of the outline
     for leak in ["n2", "loc"] {
-        let sym = fa.symbols.iter().find(|s| s.name == leak).unwrap();
+        let sym = fa.symbols().iter().find(|s| s.name == leak).unwrap();
         assert!(
             fa.scope_within_sub_body(sym.scope),
             "{leak} must not float to the outline"
@@ -2419,7 +2419,7 @@ struct W { int parse(int ctx); };
 "#,
     );
     for local in ["a", "b", "ctx"] {
-        let sym = fa.symbols.iter().find(|s| s.name == local).unwrap();
+        let sym = fa.symbols().iter().find(|s| s.name == local).unwrap();
         assert!(
             fa.scope_within_sub_body(sym.scope),
             "{local} is sub-body content"
@@ -2427,13 +2427,13 @@ struct W { int parse(int ctx); };
     }
     // fields still surface (class-body scope is NOT a sub body)
     for field in ["x", "y"] {
-        let sym = fa.symbols.iter().find(|s| s.name == field).unwrap();
+        let sym = fa.symbols().iter().find(|s| s.name == field).unwrap();
         assert!(!fa.scope_within_sub_body(sym.scope));
         assert!(fa.symbol_is_class_content(sym), "{field} is class content");
     }
     // a method-body local never reads as class content, and a prototype
     // param (sticky class package) doesn't either
-    let ctx = fa.symbols.iter().find(|s| s.name == "ctx").unwrap();
+    let ctx = fa.symbols().iter().find(|s| s.name == "ctx").unwrap();
     assert!(!fa.symbol_is_class_content(ctx));
 }
 
@@ -2450,14 +2450,14 @@ template <typename T> concept Addable = requires(T a) { a + a; };
     use crate::model::file_analysis::SymKind;
     for name in ["byte_alias", "vec_alias", "Addable"] {
         assert!(
-            fa.symbols
+            fa.symbols()
                 .iter()
                 .any(|s| s.name == name && matches!(s.kind, SymKind::Class)),
             "{name} should be a findable type symbol"
         );
     }
     // requires-expr params stop leaking to top level
-    let a = fa.symbols.iter().find(|s| s.name == "a").unwrap();
+    let a = fa.symbols().iter().find(|s| s.name == "a").unwrap();
     assert!(fa.scope_within_sub_body(a.scope));
 }
 
@@ -2503,7 +2503,7 @@ typedef union {
 "#,
     );
     use crate::model::file_analysis::SymKind;
-    let sym = |n: &str| fa.symbols.iter().find(|s| s.name == n).unwrap();
+    let sym = |n: &str| fa.symbols().iter().find(|s| s.name == n).unwrap();
     // containers carry the union attribute; the anonymous one is synthetic
     let anon = sym("(union)");
     assert!(anon.attributes.iter().any(|a| a == "union"));

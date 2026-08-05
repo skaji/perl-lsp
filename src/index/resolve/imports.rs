@@ -207,7 +207,7 @@ pub(super) fn dispatch_handler_locations(
     for module_name in module_index.modules_with_symbol(name) {
         let Some(cached) = module_index.get_cached(&module_name) else { continue };
         let whole = module_index.whole_present(&cached);
-        for sym in &whole.symbols {
+        for sym in whole.symbols() {
             if sym.name != name {
                 continue;
             }

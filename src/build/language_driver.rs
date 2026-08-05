@@ -607,7 +607,7 @@ fn apply_attribute_macros(fa: &mut FileAnalysis, recovered: &[(String, String)])
     let signals = crate::build::plugin::default_plugin_registry().attribute_macro_signals();
     for (class_name, macro_token) in recovered {
         let Some(signal) = signals.get(macro_token) else { continue };
-        for sym in &mut fa.symbols {
+        for sym in fa.symbols_mut() {
             if matches!(sym.kind, SymKind::Class)
                 && &sym.name == class_name
                 && !sym.attributes.contains(signal)
@@ -763,7 +763,7 @@ fn stamp_access_regions(fa: &mut FileAnalysis, regions: &[crate::build::cpp_repa
         (o.start.row, o.start.column) <= (i.start.row, i.start.column)
             && (i.end.row, i.end.column) <= (o.end.row, o.end.column)
     };
-    for sym in &mut fa.symbols {
+    for sym in fa.symbols_mut() {
         if sym.package.is_none() {
             continue;
         }
@@ -860,7 +860,7 @@ fn emit_return_fuel(
         .iter()
         .filter(|s| matches!(s.kind, ScopeKind::Sub { .. }))
         .filter_map(|s| {
-            fa.symbols
+            fa.symbols()
                 .iter()
                 .find(|sym| matches!(sym.kind, SymKind::Sub | SymKind::Method) && sym.span == s.span)
                 .map(|sym| (s.id, sym.id))
@@ -895,7 +895,7 @@ fn emit_return_fuel(
     let scope_package: HashMap<ScopeId, Option<String>> =
         fa.scopes.iter().map(|s| (s.id, s.package.clone())).collect();
     let field_scope: HashMap<(String, String), ScopeId> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Field))
         .filter_map(|s| s.package.clone().map(|p| ((p, s.name.clone()), s.scope)))
@@ -936,7 +936,7 @@ fn emit_return_fuel(
     // peeled method symbol does (`Buf`). Reading it off the symbol covers
     // in-class AND out-of-line, template or not, with one rule.
     let class_methods: std::collections::HashSet<(String, String)> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Method))
         .filter_map(|s| s.package.clone().map(|p| (p, s.name.clone())))
@@ -947,7 +947,7 @@ fn emit_return_fuel(
     let scope_class: HashMap<ScopeId, String> = scope_to_symbol
         .iter()
         .filter_map(|(&sc, &sid)| {
-            fa.symbols
+            fa.symbols()
                 .iter()
                 .find(|s| s.id == sid)
                 .and_then(|s| s.package.clone())

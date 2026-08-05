@@ -694,7 +694,7 @@ impl ModuleIndex {
             return rec.iter().any(|(n, is_class)| n == name && *is_class);
         }
         m.analysis
-            .symbols
+            .symbols()
             .iter()
             .any(|s| matches!(s.kind, SymKind::Class) && s.name == name)
     }

@@ -88,7 +88,7 @@ pub fn query_sub_return_type(
                 // Outer None = no matching symbol (an enriched retry can't
                 // help — enrichment adds no symbols of these kinds);
                 // Some(None) = symbol present, type unresolved (retryable).
-                let sym = full.symbols.iter().find(|s| {
+                let sym = full.symbols().iter().find(|s| {
                     s.name == sub_name
                         && matches!(
                             s.kind,
@@ -171,7 +171,7 @@ pub fn query_sub_return_type(
                         continue;
                     }
                     let full = idx.bag_present(&cached);
-                    let Some(sym) = full.symbols.iter().find(|s| {
+                    let Some(sym) = full.symbols().iter().find(|s| {
                         s.name == sub_name
                             && matches!(
                                 s.kind,

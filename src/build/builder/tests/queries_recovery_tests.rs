@@ -65,7 +65,7 @@ fn test_hash_key_def_implicit_return_gets_sub_owner() {
     let fa = build(&tree, src.as_bytes());
 
     let host_defs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
         .collect();
@@ -156,7 +156,7 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 
     // Verify hash key defs exist with Sub owner
     let host_defs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
         .collect();
@@ -238,7 +238,7 @@ $calc->get_self->get_config->{host};
 
     // Find the hash key def for "host" in get_config's return
     let host_defs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "host" && matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
         .collect();
@@ -441,7 +441,7 @@ has password => (is => 'rw');
     );
     // Should have HashKeyDef symbols owned by "new" for each has attribute
     let key_defs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.detail, SymbolDetail::HashKeyDef { .. }))
         .collect();
@@ -480,7 +480,7 @@ fn test_error_recovery_sub_outside_error() {
     let source = "package Foo;\nmy $x = [\nuse List::Util qw(max);\nsub process { }\n";
     let fa = build_fa(source);
     let subs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
         .map(|s| s.name.as_str())
@@ -497,7 +497,7 @@ fn test_error_recovery_sub_outside_error_survives() {
     let source = "package Foo;\nmy $x = [\nuse List::Util qw(max);\nsub process { }\n";
     let fa = build_fa(source);
     let subs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
         .map(|s| s.name.as_str())
@@ -514,7 +514,7 @@ fn test_error_node_does_not_panic() {
     let source = "package Foo;\nmy $x = [\nmy $y = [\nsub process { }\n";
     let fa = build_fa(source);
     let pkgs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Package))
         .map(|s| s.name.as_str())
@@ -527,7 +527,7 @@ fn test_error_recovery_sub_inside_error() {
     let source = "package Foo;\nmy $x = [\nmy $y = [\nsub process { }\n";
     let fa = build_fa(source);
     let subs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
         .map(|s| s.name.as_str())
@@ -554,7 +554,7 @@ fn test_error_recovery_package_inside_error() {
     let source = "my $x = [\npackage Bar;\nuse Moose;\nsub bar { }\n";
     let fa = build_fa(source);
     let pkgs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Package))
         .map(|s| s.name.as_str())
@@ -730,7 +730,7 @@ fn test_imports_module_symbol_created() {
 
     // Module symbol should exist
     let module_syms: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Module && s.name == "List::Util")
         .collect();
@@ -875,7 +875,7 @@ fn test_shift_params() {
     assert_eq!(sig.params[1].default, Some("{}".into()));
 
     // Check raw params via symbol detail
-    let sub_sym = fa.symbols.iter().find(|s| s.name == "process").unwrap();
+    let sub_sym = fa.symbols().iter().find(|s| s.name == "process").unwrap();
     if let SymbolDetail::Sub { ref params, .. } = sub_sym.detail {
         assert_eq!(params.len(), 3);
         assert_eq!(params[0].name, "$self");
@@ -911,7 +911,7 @@ fn test_shift_then_list_assign() {
     assert!(sig.params[1].is_slurpy);
 
     // Check raw params
-    let sub_sym = fa.symbols.iter().find(|s| s.name == "process").unwrap();
+    let sub_sym = fa.symbols().iter().find(|s| s.name == "process").unwrap();
     if let SymbolDetail::Sub { ref params, .. } = sub_sym.detail {
         assert_eq!(params.len(), 3);
         assert_eq!(params[0].name, "$self");
@@ -1018,7 +1018,7 @@ Performs a POST request.
         ",
     );
     let get_doc = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "get")
         .and_then(|s| match &s.detail {
@@ -1050,7 +1050,7 @@ sub fetch_data { }
 sub transform { }
 ";
     let fa = build_fa(src);
-    let fd = fa.symbols.iter().find(|s| s.name == "fetch_data").unwrap();
+    let fd = fa.symbols().iter().find(|s| s.name == "fetch_data").unwrap();
     if let SymbolDetail::Sub { ref doc, .. } = fd.detail {
         let d = doc.as_ref().expect("fetch_data should have doc");
         assert!(

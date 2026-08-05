@@ -88,7 +88,7 @@ Held resident for **every** indexed file, exactly as today:
 
 - `refs` + the `refs_by_target` / `refs_by_name` reverse indices — answer
   `references` / `documentHighlight` with exact ranges.
-- `symbols` + `symbols_by_name` — answer `goto-def` (via
+- the `SymbolTable` (symbols + their name/scope indices) — answers `goto-def` (via
   `Ref::binding`'s method target + symbol lookup), `hover` on a definition,
   `rename` targets.
 - The pack `ModuleIndex`'s `all_files` / `all_defs` name→file index — answers

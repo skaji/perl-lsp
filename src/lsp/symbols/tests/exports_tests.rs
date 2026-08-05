@@ -1262,7 +1262,7 @@ sub real_sub { 1 }
     let analysis = parse_analysis(src);
     let uri = tower_lsp::lsp_types::Url::parse("file:///t.pl").unwrap();
     let names: Vec<String> = analysis
-        .symbols
+        .symbols()
         .iter()
         .filter_map(|s| symbol_to_workspace_info(s, uri.clone()))
         .map(|i| i.name)
@@ -1350,7 +1350,7 @@ sub public_fn { helper_fn() }
     let analysis = parse_analysis(src);
     let uri = tower_lsp::lsp_types::Url::parse("file:///t.pl").unwrap();
     let ws: Vec<String> = analysis
-        .symbols
+        .symbols()
         .iter()
         .filter_map(|s| symbol_to_workspace_info(s, uri.clone()))
         .map(|i| i.name)

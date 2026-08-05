@@ -54,7 +54,7 @@ sub list {
     // Sanity — Users.pm's own analysis has `list` but not the
     // helpers (they're declared in the Lite file).
     let users_subs: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Method | SymKind::Sub))
         .map(|s| s.name.as_str())
@@ -1077,7 +1077,7 @@ $minion->add_task(send_email => sub { my ($job, $to) = @_; });
 "#;
     let fa = build_fa(src);
     let h = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.kind == SymKind::Handler && s.name == "send_email")
         .expect("handler exists");

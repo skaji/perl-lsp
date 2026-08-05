@@ -8,7 +8,7 @@ fn test_incremental_preserves_packages() {
     // Count packages in clean parse
     let clean_pkgs: Vec<String> = doc
         .analysis
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(
@@ -34,7 +34,7 @@ fn test_incremental_preserves_packages() {
 
     let dirty_pkgs: Vec<String> = doc
         .analysis
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(
@@ -59,7 +59,7 @@ fn test_incremental_preserves_packages() {
     let fresh = Document::new(dirty_lines.join("\n")).unwrap();
     let fresh_pkgs: Vec<String> = fresh
         .analysis
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(

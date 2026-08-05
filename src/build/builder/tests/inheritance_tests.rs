@@ -191,7 +191,7 @@ fn test_moox_option_synthesizes_accessor_and_ctor_key() {
     );
     // Accessor Method symbols.
     let methods: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == crate::model::file_analysis::SymKind::Method)
         .map(|s| s.name.as_str())
@@ -201,7 +201,7 @@ fn test_moox_option_synthesizes_accessor_and_ctor_key() {
 
     // Constructor HashKeyDefs (`MyApp->new(verbose => ...)`).
     let ctor_keys: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(
@@ -230,7 +230,7 @@ fn test_option_without_moox_is_not_an_accessor() {
         ",
     );
     let methods: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == crate::model::file_analysis::SymKind::Method)
         .map(|s| s.name.as_str())
@@ -251,7 +251,7 @@ fn test_moox_options_plain_has_still_works() {
         ",
     );
     let methods: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == crate::model::file_analysis::SymKind::Method)
         .map(|s| s.name.as_str())

@@ -614,7 +614,7 @@ pub fn implementations_of(
             for pkg in &descendants {
                 for cached in idx.def_candidates(pkg) {
                     let whole = idx.whole_present(&cached);
-                    for s in &whole.symbols {
+                    for s in whole.symbols() {
                         if &s.name == pkg && matches!(s.kind, SymKind::Class) {
                             out.push(RefLocation {
                                 key: FileKey::Path(cached.path.clone()),
@@ -724,7 +724,7 @@ pub fn implementations_of(
         } else {
             for m in idx.modules_with_symbol(pkg) {
                 if let Some(c) = idx.get_cached(&m) {
-                    let declares = idx.whole_present(&c).symbols.iter().any(|s| {
+                    let declares = idx.whole_present(&c).symbols().iter().any(|s| {
                         matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
                     });
                     if declares {
@@ -743,7 +743,7 @@ pub fn implementations_of(
                 continue;
             }
             let whole = idx.whole_present(&cached);
-            for s in &whole.symbols {
+            for s in whole.symbols() {
                 if s.name == target.name
                     && matches!(s.kind, SymKind::Sub | SymKind::Method)
                     && s.package.as_deref() == Some(pkg.as_str())
@@ -804,7 +804,7 @@ pub(super) fn specialization_family(
         let Some(idx) = module_index else { continue };
         for cached in idx.def_candidates(spec) {
             let whole = idx.whole_present(&cached);
-            for s in &whole.symbols {
+            for s in whole.symbols() {
                 if &s.name == spec && matches!(s.kind, SymKind::Class) {
                     out.push(RefLocation {
                         key: FileKey::Path(cached.path.clone()),

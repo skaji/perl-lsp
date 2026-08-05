@@ -120,7 +120,7 @@ pub(super) fn pack_member_of(
             // whether the scope is a struct (`dynamic`) or a namespace
             // (`level`), without depending on how either tags package.
             matches!(s.kind, SymKind::Enumerator)
-                && fa.symbols.iter().any(|c| {
+                && fa.symbols().iter().any(|c| {
                     owners.iter().any(|o| o == &c.name)
                         && c.span != s.span
                         && (c.span.start.row, c.span.start.column)
@@ -143,7 +143,7 @@ pub(super) fn pack_inline_owner_set(fa: &crate::model::file_analysis::FileAnalys
     let mut owners = vec![owner.to_string()];
     loop {
         let mut grew = false;
-        for s in &fa.symbols {
+        for s in fa.symbols() {
             if s.kind == SymKind::Package
                 && s.attributes.iter().any(|a| a == "inline")
                 && s.package.as_deref().is_some_and(|p| owners.iter().any(|o| o == p))
@@ -298,7 +298,7 @@ pub(super) fn pack_symbol_def_location(
     // (bodied, local, path, row, col) — the bodied/local flags are inverted
     // in the sort below so `true` ranks first.
     let mut candidates: Vec<(bool, bool, PathBuf, usize, usize, RefLocation)> = Vec::new();
-    for sym in analysis.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+    for sym in analysis.symbols().iter().filter(|s| s.name == name && wanted(&s.kind)) {
         candidates.push((
             has_body(analysis, sym),
             true,
@@ -324,7 +324,7 @@ pub(super) fn pack_symbol_def_location(
             continue;
         }
         let whole = module_index.whole_present(&cached);
-        for sym in whole.symbols.iter().filter(|s| s.name == name && wanted(&s.kind)) {
+        for sym in whole.symbols().iter().filter(|s| s.name == name && wanted(&s.kind)) {
             candidates.push((
                 has_body(&whole, sym),
                 false,
@@ -482,7 +482,7 @@ pub(super) fn pack_class_def_paths(
     classes.dedup();
     let origin_declares = |c: &str| {
         origin
-            .symbols
+            .symbols()
             .iter()
             .any(|s| matches!(s.kind, SymKind::Class) && s.name == c)
     };
@@ -651,7 +651,7 @@ pub fn references_mask_for(
 ) -> RoleMask {
     let mut found_in_editable = false;
     files.for_each_open(|_url, doc| {
-        if doc.analysis.symbols.iter().any(|s| symbol_defines_target(s, target, &doc.analysis)) {
+        if doc.analysis.symbols().iter().any(|s| symbol_defines_target(s, target, &doc.analysis)) {
             found_in_editable = true;
         }
     });
@@ -664,7 +664,7 @@ pub fn references_mask_for(
             if entry.value().symbols_are_evicted() {
                 continue;
             }
-            if entry.value().symbols.iter().any(|s| symbol_defines_target(s, target, entry.value())) {
+            if entry.value().symbols().iter().any(|s| symbol_defines_target(s, target, entry.value())) {
                 found_in_editable = true;
                 break;
             }
@@ -689,7 +689,7 @@ pub fn references_mask_for(
                     arc,
                 ));
                 let whole = idx.whole_present(&cm);
-                if whole.symbols.iter().any(|s| symbol_defines_target(s, target, &whole)) {
+                if whole.symbols().iter().any(|s| symbol_defines_target(s, target, &whole)) {
                     found_in_editable = true;
                     break;
                 }
@@ -704,7 +704,7 @@ pub fn references_mask_for(
     if !found_in_editable {
         if let (TargetKind::Method { class }, Some(idx)) = (&target.kind, module_index) {
             let declares_class = |fa: &FileAnalysis| {
-                fa.symbols.iter().any(|s| {
+                fa.symbols().iter().any(|s| {
                     matches!(s.kind, SymKind::Package | SymKind::Class) && s.name == *class
                 })
             };
@@ -786,7 +786,7 @@ pub(super) fn collect_package_var(
             && s.package.as_deref() == Some(package)
             && s.name == name
     };
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         if matches!(&sym.detail, SymbolDetail::Variable { decl_kind: DeclKind::Our, .. })
             && sym.package.as_deref() == Some(package)
             && sym.name == name
@@ -963,7 +963,7 @@ pub(super) fn collect_from_analysis(
     };
 
     // Include declaration spans when this file defines the target.
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         if symbol_defines_target(sym, target, analysis) {
             out.push(RefLocation {
                 key: key.clone(),

@@ -709,7 +709,7 @@ fn run_one(
                     }
                     covered.insert(entry.key().clone());
                 }
-                for sym in &entry.value().symbols {
+                for sym in entry.value().symbols() {
                     if sym.hidden_in_outline() {
                         continue;
                     }
@@ -724,7 +724,7 @@ fn run_one(
                 if !analysis.symbols_are_evicted() {
                     covered.insert(path.to_path_buf());
                 }
-                for sym in &analysis.symbols {
+                for sym in analysis.symbols() {
                     if sym.hidden_in_outline() {
                         continue;
                     }
@@ -768,7 +768,7 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
     let mut results = Vec::new();
     let mut seen: std::collections::HashSet<(String, String, usize, usize)> =
         std::collections::HashSet::new();
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         match sym.kind {
             file_analysis::SymKind::Sub | file_analysis::SymKind::Method
             | file_analysis::SymKind::Package | file_analysis::SymKind::Class
@@ -1068,7 +1068,7 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
             std::sync::Arc::clone(entry.value()),
         ));
         let analysis = file_analysis::CrossFileLookup::whole_present(&module_index, &cm);
-        let has_package = analysis.symbols.iter().any(|s| {
+        let has_package = analysis.symbols().iter().any(|s| {
             matches!(s.kind, SymKind::Package | SymKind::Class)
                 && s.name == package_name
         });
@@ -1106,7 +1106,7 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
 
     // Collect subs/methods declared inside this package.
     let mut subs: Vec<&file_analysis::Symbol> = analysis
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(s.kind, SymKind::Sub | SymKind::Method)

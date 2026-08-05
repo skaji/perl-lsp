@@ -64,7 +64,7 @@ impl<'a> CandidateSet<'a> {
                 if self.pack {
                     if let Some(ResolvedTarget::Target(t)) = &mut r {
                         if matches!(t.kind, TargetKind::Sub { .. }) && t.def_paths.is_empty() {
-                            let origin_defines = self.origin.symbols.iter().any(|s| {
+                            let origin_defines = self.origin.symbols().iter().any(|s| {
                                 s.name == t.name
                                     && matches!(s.kind, SymKind::Sub | SymKind::Method)
                             });

@@ -301,15 +301,22 @@ the three indices over it (name, resolved-target, start-anchored call), its
 `ref_row_seeds`, and `evict_refs` / `finalize_post_walk` / enrichment
 delegate, so an index can no longer survive its refs.
 
+**Phase 2b landed** (commit `rework(E2.3): SymbolTable`) — `SymbolTable`
+(`model/file_analysis/symbol_table.rs`) is the symbol axis on RefTable's
+shape: the `Vec<Symbol>`, the name and scope indices over it, its
+`evict()`, its `heap_add()` arm, its enrichment baseline and its
+`row_seeds()` in one owner. `FileAnalysis::symbols` is private; consumers
+read `symbols()` / `symbols_mut()` / `symbols_named` / `symbols_in_scope` /
+`sym_row_seeds`, and `evict_symbols` / `finalize_post_walk` / enrichment
+delegate.
+
 **Target shape.** Cut along the seams the heap probe names, phased
 cheapest-leverage first: (1) `PackageFacts` — LANDED; (2a) `RefTable` —
-LANDED; (2b) `SymbolTable`, owning its indices, its `evict()` (index clears
-by construction), its `heap_estimate()` arm, and its enrichment baseline;
-(3) `PackFacts` and `PluginFacts`.
+LANDED; (2b) `SymbolTable` — LANDED; (3) `PackFacts` and `PluginFacts`.
 `FileAnalysisParts` collapses to moving sub-structs; `new()` shrinks; serde
 field order preserved, one EXTRACT_VERSION bump at the end.
 
-**Migration order.** Phases 2b-3 land best AFTER E1 (surface_feed then
+**Migration order.** Phase 3 lands best AFTER E1 (surface_feed then
 destructures sub-structs). The builder still accumulates its
 walk-time per-package lanes as sibling maps and folds them at
 `PackageFacts::fold`; `LocalParents` / `PackageFrameworks` are the read seams

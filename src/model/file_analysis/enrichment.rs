@@ -211,9 +211,10 @@ impl FileAnalysis {
     /// goto-def / references reader consults — sees a DBIC result class's
     /// synthesized accessors WITHOUT paying the per-query enriched overlay.
     /// Idempotent: `apply_gated_emissions` dedups against existing symbols, so
-    /// a second call is a no-op; the emissions sit above `base_symbol_count`
-    /// and a later full enrichment re-derives them the same way. Rebuilds the
-    /// name/scope indices so `symbols_named` / `sub_info_view` find them.
+    /// a second call is a no-op; the emissions sit above the symbol table's
+    /// enrichment baseline and a later full enrichment re-derives them the
+    /// same way. Rebuilds the name/scope indices so `symbols_named` /
+    /// `sub_info_view` find them.
     pub fn materialize_gated_emissions(&mut self, module_index: &dyn CrossFileLookup) {
         if self.gated_emissions.is_empty() {
             return;
@@ -230,7 +231,7 @@ impl FileAnalysis {
         // accumulate duplicates. Enrichment pushes Variable witnesses
         // via `push_type_constraint` and synthetic symbols + witnesses
         // for imported-hash-key completion.
-        self.symbols.truncate(self.base_symbol_count);
+        self.symbols.truncate_to_baseline();
         self.witnesses.truncate(self.base_witness_count);
         self.refs.truncate_to_baseline();
 
@@ -479,7 +480,7 @@ impl FileAnalysis {
         self.emit_method_call_binding_edges();
         // Re-stamp the MethodCall dispatch-target edges now that the bag
         // carries enriched cross-file invocant types. Enrichment truncated
-        // refs back to base_ref_count, wiping the build-time (local-only)
+        // refs back to their baseline, wiping the build-time (local-only)
         // edge; this re-derives it with the index so cross-file-typed
         // invocants resolve. Single-sourced: refs_to / find_def / hover
         // read this frozen edge, never re-derive at query time.
@@ -904,18 +905,7 @@ impl FileAnalysis {
     /// `build_indices` uses, so the ref→target index stays accurate after a
     /// cross-file hash-key binding resolves.
     fn rebuild_enrichment_indices(&mut self) {
-        self.symbols_by_name.clear();
-        self.symbols_by_scope.clear();
-        for sym in &self.symbols {
-            self.symbols_by_name
-                .entry(sym.name.clone())
-                .or_default()
-                .push(sym.id);
-            self.symbols_by_scope
-                .entry(sym.scope)
-                .or_default()
-                .push(sym.id);
-        }
+        self.symbols.rebuild_indices();
 
         // Re-link HashKeyAccess refs to (possibly newly-injected) HashKeyDef
         // symbols, mirroring build_indices's logic.

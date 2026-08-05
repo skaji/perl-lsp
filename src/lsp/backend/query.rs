@@ -101,7 +101,7 @@ impl QueryCx {
                 lines.get(s.selection_span.start.row).copied()
             };
             let cands: Vec<&crate::model::file_analysis::Symbol> =
-                analysis.symbols.iter().filter(|s| s.name == word).collect();
+                analysis.symbols().iter().filter(|s| s.name == word).collect();
             let sym = cands
                 .iter()
                 .find(|s| line_of(s).is_some_and(|l| l.trim_start().starts_with("#define")))

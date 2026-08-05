@@ -272,8 +272,8 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
     // pre-merge gate: it re-runs the OLD O(symbols × tree) resident walk
     // per symbol, so it is heatmap×2-shaped by construction.
     let mut seen_symbols = 0usize;
-    let total_symbols: usize = entries.iter().map(|(_, a)| a.symbols.len()).sum::<usize>()
-        + pack_entries.iter().map(|(_, a, _)| a.symbols.len()).sum::<usize>();
+    let total_symbols: usize = entries.iter().map(|(_, a)| a.symbols().len()).sum::<usize>()
+        + pack_entries.iter().map(|(_, a, _)| a.symbols().len()).sum::<usize>();
     let stride = sample
         .map(|n| (total_symbols / n.max(1)).max(1))
         .unwrap_or(1);
@@ -286,7 +286,7 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
                      is_pack: bool,
                      checked: &mut usize,
                      mismatched: &mut usize| {
-        for sym in &analysis.symbols {
+        for sym in analysis.symbols() {
             seen_symbols += 1;
             if seen_symbols % stride != 0 {
                 continue;
@@ -532,7 +532,7 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
                   dead_rows: &mut Vec<serde_json::Value>,
                   dead_export_rows: &mut Vec<serde_json::Value>,
                   sources: &mut SourceCache| {
-        for sym in &analysis.symbols {
+        for sym in analysis.symbols() {
             if sym.hidden_in_outline() || !heatmap_symbol_eligible(sym) {
                 continue;
             }

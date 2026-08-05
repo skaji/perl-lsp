@@ -205,7 +205,7 @@ fn run_plugin_on_fixture(plugin: RhaiPlugin, fixture: &Path) -> Value {
 fn diff_emissions(baseline: &FileAnalysis, with_plugin: &FileAnalysis, plugin_id: &str) -> Value {
     // Symbols — namespace-tagged, so filter by id.
     let symbols: Vec<Value> = with_plugin
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == plugin_id))
         .map(symbol_to_snapshot)

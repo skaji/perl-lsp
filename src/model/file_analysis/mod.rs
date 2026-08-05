@@ -16,6 +16,8 @@ mod core_types;
 pub use core_types::*;
 mod ref_table;
 pub use ref_table::*;
+mod symbol_table;
+pub use symbol_table::*;
 mod types;
 pub use types::*;
 mod dispatch;
@@ -49,7 +51,10 @@ pub use completion::*;
 pub struct FileAnalysis {
     // Core tables
     pub scopes: Vec<Scope>,
-    pub symbols: Vec<Symbol>,
+    /// The symbol axis: every declaration, the name/scope indices over
+    /// them, their eviction flag and their enrichment baseline. Read
+    /// through `symbols()` and the delegating query methods.
+    symbols: SymbolTable,
     /// The reference axis: every ref, the indices over them, their
     /// eviction flag and their enrichment baseline. Read through
     /// `refs()` and the delegating query methods.
@@ -180,19 +185,9 @@ pub struct FileAnalysis {
     #[serde(skip, default)]
     bag_evicted: bool,
 
-    /// Symbols twin (`docs/adr/relational-ref-index.md`): `evict_symbols`
-    /// stripped this copy's `symbols` (+ symbol-keyed rebuilt indexes) after
-    /// blob + `syms` rows were persisted. Same lifecycle as the other two
-    /// axes; enumeration answers from rows, detail reads rehydrate through
-    /// `CrossFileLookup::whole_present`.
-    #[serde(skip, default)]
-    symbols_evicted: bool,
-
     /// Witness-bag baseline — `enrich_imported_types_with_keys`
     /// truncates back to this length before re-deriving so repeat
     /// calls stay idempotent.
-    #[serde(default)]
-    base_symbol_count: usize,
     #[serde(default)]
     base_witness_count: usize,
 
@@ -381,10 +376,6 @@ pub struct FileAnalysis {
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]
     scope_starts: Vec<(Point, ScopeId)>, // sorted by start point
-    #[serde(skip, default)]
-    symbols_by_name: HashMap<String, Vec<SymbolId>>,
-    #[serde(skip, default)]
-    symbols_by_scope: HashMap<ScopeId, Vec<SymbolId>>,
     /// Union of `export` + `export_ok` for O(1) membership tests.
     /// Rebuilt by `build_indices` (called from `new` and `after_deserialize`),
     /// so it is valid for freshly-built and SQLite-cached modules alike.

@@ -12,7 +12,7 @@ has 'name' => (is => 'ro');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -38,7 +38,7 @@ has 'name' => (is => 'rw');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -56,7 +56,7 @@ has 'count' => (is => 'ro', isa => 'Int');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "count" && s.kind == SymKind::Method)
         .collect();
@@ -78,12 +78,12 @@ has [qw(foo bar)] => (is => 'ro');
 ",
     );
     let foo: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "foo" && s.kind == SymKind::Method)
         .collect();
     let bar: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "bar" && s.kind == SymKind::Method)
         .collect();
@@ -110,7 +110,7 @@ has @runtime, is => 'ro';
 ",
     );
     let accessor = |name: &str| {
-        fa.symbols
+        fa.symbols()
             .iter()
             .filter(|s| s.name == name && s.kind == SymKind::Method)
             .count()
@@ -132,7 +132,7 @@ has 'internal' => (is => 'bare');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "internal" && s.kind == SymKind::Method)
         .collect();
@@ -149,7 +149,7 @@ has 'internal';
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "internal" && s.kind == SymKind::Method)
         .collect();
@@ -166,7 +166,7 @@ has 'db' => (is => 'ro', isa => 'DBI::db');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "db" && s.kind == SymKind::Method)
         .collect();
@@ -191,7 +191,7 @@ has 'logger' => (is => 'ro', isa => \"InstanceOf['Log::Any']\");
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "logger" && s.kind == SymKind::Method)
         .collect();
@@ -216,12 +216,12 @@ has 'status' => (is => 'rwp');
 ",
     );
     let getter: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "status" && s.kind == SymKind::Method)
         .collect();
     let writer: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "_set_status" && s.kind == SymKind::Method)
         .collect();
@@ -241,14 +241,14 @@ has 'x' => (is => 'rw', accessor => 'get_set_x');
 ",
     );
     let acc: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "get_set_x" && s.kind == SymKind::Method)
         .collect();
     assert_eq!(acc.len(), 1, "accessor keyword should synthesize get_set_x method");
     // The default attr-named accessor ('x') still exists from `is => 'rw'`.
     let default_acc: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "x" && s.kind == SymKind::Method)
         .collect();
@@ -267,7 +267,7 @@ has 'y' => (is => 'ro');
 ",
     );
     let ro_sym: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "ro")
         .collect();
@@ -284,7 +284,7 @@ has 'name';
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -387,12 +387,12 @@ has app;               # no default; getter has no return type
     // Both sister symbols carry per-symbol witnesses now (was 0 across
     // every Mojo::* dump in the QA sweep).
     let getter = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "level" && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.is_empty()))
         .expect("getter symbol");
     let writer = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "level" && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.len() == 1))
         .expect("writer symbol");
@@ -597,7 +597,7 @@ has size => (is => 'rw', isa => 'Int');
     );
 
     let writer = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "size" && matches!(&s.detail, SymbolDetail::Sub { params, .. } if params.len() == 1))
         .expect("writer symbol");
@@ -625,7 +625,7 @@ has 'config';
     );
     // Should synthesize getter + setter accessors
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "config" && s.kind == SymKind::Method)
         .collect();
@@ -643,7 +643,7 @@ has 'name';
     );
     // -strict means no framework mode, has is just a regular function
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -663,7 +663,7 @@ has 'name' => (is => 'ro');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -684,17 +684,17 @@ __PACKAGE__->add_columns(
 ",
     );
     let id: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "id" && s.kind == SymKind::Method)
         .collect();
     let name: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
     let email: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "email" && s.kind == SymKind::Method)
         .collect();
@@ -713,7 +713,7 @@ __PACKAGE__->has_many(comments => 'Schema::Result::Comment', 'post_id');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "comments" && s.kind == SymKind::Method)
         .collect();
@@ -738,7 +738,7 @@ __PACKAGE__->belongs_to(author => 'Schema::Result::User', 'author_id');
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "author" && s.kind == SymKind::Method)
         .collect();
@@ -771,12 +771,12 @@ sub widen {
 ",
     );
     let decl: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "decl_col" && s.kind == SymKind::Method)
         .collect();
     let runtime: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "runtime_col" && s.kind == SymKind::Method)
         .collect();
@@ -809,7 +809,7 @@ sub run {
 
     // Verify the config accessor has the right return type
     let config_methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "config" && s.kind == SymKind::Method)
         .collect();
@@ -871,7 +871,7 @@ has 'name';
 ",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "name" && s.kind == SymKind::Method)
         .collect();
@@ -992,7 +992,7 @@ has flavor => sub { [1, 2, 3] };
 ",
     );
     let sweet_getter_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "flavor"
@@ -1001,7 +1001,7 @@ has flavor => sub { [1, 2, 3] };
         })
         .map(|s| s.id);
     let sour_getter_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "flavor"
@@ -1580,7 +1580,7 @@ fn test_mojo_has_accessor_writer_hidden_from_outline() {
     // carries hide_in_outline so it doesn't duplicate the getter.
     let fa = build_fa("package Msg;\nuse Mojo::Base -base;\nhas 'content';\n");
     let visible: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "content" && s.kind == SymKind::Method)
         .filter(|s| !s.hidden_in_outline())
@@ -1592,7 +1592,7 @@ fn test_mojo_has_accessor_writer_hidden_from_outline() {
         visible.len()
     );
     // Both symbols still exist (writer hidden, not deleted) for arity typing.
-    let total = fa.symbols.iter().filter(|s| s.name == "content" && s.kind == SymKind::Method).count();
+    let total = fa.symbols().iter().filter(|s| s.name == "content" && s.kind == SymKind::Method).count();
     assert_eq!(total, 2, "getter + (hidden) writer both retained");
 }
 
@@ -1635,7 +1635,7 @@ fn test_list_shift_pair_params_extracted() {
     // next @_ element, so the LHS vars are positional params. $self is the
     // invocant; $name is a real param.
     let fa = build_fa("package P;\nsub cookie {\n  my ($self, $name) = (shift, shift);\n}\n");
-    let sub = fa.symbols.iter().find(|s| s.name == "cookie").expect("cookie sym");
+    let sub = fa.symbols().iter().find(|s| s.name == "cookie").expect("cookie sym");
     let params: Vec<&str> = match &sub.detail {
         SymbolDetail::Sub { params, .. } => params.iter().map(|p| p.name.as_str()).collect(),
         _ => panic!("cookie not a Sub"),
@@ -1669,11 +1669,11 @@ sub bar { 1 }
 "#,
     );
     assert!(
-        fa.symbols
+        fa.symbols()
             .iter()
             .any(|s| s.kind == SymKind::Sub && s.name == "_subname"),
         "ternary glob-assign should register `_subname` as a sub: {:?}",
-        fa.symbols.iter().filter(|s| s.kind == SymKind::Sub).map(|s| &s.name).collect::<Vec<_>>()
+        fa.symbols().iter().filter(|s| s.kind == SymKind::Sub).map(|s| &s.name).collect::<Vec<_>>()
     );
 }
 

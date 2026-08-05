@@ -259,7 +259,7 @@ fn optional_receiver_goto_def_resolves() {
     let fa = build_fa(
         "package Foo;\nsub go { my ($self) = @_; }\npackage P;\nsub maybe { return undef unless 1; return Foo->new; }\nsub use_it {\n    my $r = maybe();\n    $r->go;\n}",
     );
-    let foo_go = fa.symbols.iter().find(|s| s.name == "go").unwrap();
+    let foo_go = fa.symbols().iter().find(|s| s.name == "go").unwrap();
     // Cursor on the `go` token of `$r->go`.
     assert_eq!(
         fa.find_definition(Point::new(6, 8), None),
@@ -658,7 +658,7 @@ fn optional_bare_return_then_defined() {
 fn optional_return_provenance() {
     // --dump-package should explain an Optional return via the join.
     let fa = build_fa("package P;\nsub maybe { return undef unless 1; return Foo->new; }\n");
-    let sid = fa.symbols.iter().find(|s| s.name == "maybe").unwrap().id;
+    let sid = fa.symbols().iter().find(|s| s.name == "maybe").unwrap().id;
     match fa.type_provenance.get(&sid) {
         Some(TypeProvenance::ReducerFold { evidence, .. }) => assert!(
             evidence.iter().any(|e| e == "optional_join"),

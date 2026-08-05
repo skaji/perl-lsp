@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn perl_driver_analyzes() {
     let fa = PerlDriver.analyze("package Foo;\nsub bar { 1 }\n");
-    assert!(fa.symbols.iter().any(|s| s.name == "bar"), "perl driver finds the sub");
+    assert!(fa.symbols().iter().any(|s| s.name == "bar"), "perl driver finds the sub");
 }
 
 #[test]
@@ -21,11 +21,11 @@ fn cpp_driver_analyzes_through_reparse() {
     // a declarator-position macro that would otherwise destroy the class
     let src = "#define API __attribute__((visibility(\"default\")))\nclass API Box { public: int width; };\n";
     let fa = cpp_driver().analyze(src);
-    assert!(fa.symbols.iter().any(|s| s.name == "Box"), "macro-recovered class: {:?}", fa.symbols.iter().map(|s| &s.name).collect::<Vec<_>>());
-    assert!(fa.symbols.iter().any(|s| s.name == "width"));
+    assert!(fa.symbols().iter().any(|s| s.name == "Box"), "macro-recovered class: {:?}", fa.symbols().iter().map(|s| &s.name).collect::<Vec<_>>());
+    assert!(fa.symbols().iter().any(|s| s.name == "width"));
     // The unknown-macro safety net: `API` isn't in the attribute-macro
     // vocabulary, so the class is recovered but carries NO signal.
-    let boxsym = fa.symbols.iter().find(|s| s.name == "Box").unwrap();
+    let boxsym = fa.symbols().iter().find(|s| s.name == "Box").unwrap();
     assert!(boxsym.attributes.is_empty(), "unknown macro → no signal: {:?}", boxsym.attributes);
 }
 
@@ -36,8 +36,8 @@ fn cpp_known_attribute_macro_signals_the_recovered_class() {
     // cpp-attributes vocabulary) recovers the class AND stamps its signal.
     let src = "class Q_CORE_EXPORT Widget { public: int x; };\n";
     let fa = cpp_driver().analyze(src);
-    let widget = fa.symbols.iter().find(|s| s.name == "Widget")
-        .unwrap_or_else(|| panic!("Widget recovered: {:?}", fa.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()));
+    let widget = fa.symbols().iter().find(|s| s.name == "Widget")
+        .unwrap_or_else(|| panic!("Widget recovered: {:?}", fa.symbols().iter().map(|s| &s.name).collect::<Vec<_>>()));
     assert!(widget.attributes.contains(&"exported".to_string()),
         "Q_CORE_EXPORT signals exported: {:?}", widget.attributes);
 }
@@ -47,7 +47,7 @@ fn cpp_known_attribute_macro_signals_the_recovered_class() {
 fn cpp_deprecated_attribute_macro_signals_the_recovered_class() {
     let src = "class Q_DEPRECATED OldThing { public: int x; };\n";
     let fa = cpp_driver().analyze(src);
-    let sym = fa.symbols.iter().find(|s| s.name == "OldThing").expect("OldThing recovered");
+    let sym = fa.symbols().iter().find(|s| s.name == "OldThing").expect("OldThing recovered");
     assert!(sym.attributes.contains(&"deprecated".to_string()),
         "Q_DEPRECATED signals deprecated: {:?}", sym.attributes);
 }
@@ -60,7 +60,7 @@ fn cpp_include_guard_define_is_hidden_from_outline_but_resolvable() {
     // goto-def / references still resolve (rule #7).
     let src = "#ifndef FOO_BAR_H_\n#define FOO_BAR_H_\nint real_thing;\n#endif\n";
     let fa = cpp_driver().analyze(src);
-    let guard = fa.symbols.iter().find(|s| s.name == "FOO_BAR_H_")
+    let guard = fa.symbols().iter().find(|s| s.name == "FOO_BAR_H_")
         .expect("guard symbol still exists (resolvable)");
     assert!(guard.hidden_in_outline(), "include guard hidden from listing views");
     assert!(guard.attributes.iter().any(|a| a == "include_guard"),
@@ -68,7 +68,7 @@ fn cpp_include_guard_define_is_hidden_from_outline_but_resolvable() {
     // A non-guard object-like macro stays visible.
     let src2 = "#define MAXLEN 100\nint real_thing;\n";
     let fa2 = cpp_driver().analyze(src2);
-    if let Some(m) = fa2.symbols.iter().find(|s| s.name == "MAXLEN") {
+    if let Some(m) = fa2.symbols().iter().find(|s| s.name == "MAXLEN") {
         assert!(!m.hidden_in_outline(), "a plain object-like macro is NOT hidden");
     }
 }
@@ -89,7 +89,7 @@ fn cpp_macro_recovered_spans_are_in_original_coords() {
     // ORIGINAL `Box`, not the expanded coordinate.
     let src = "#define API __attribute__((visibility(\"default\")))\nclass API Box { public: int width; };\n";
     let fa = cpp_driver().analyze(src);
-    let boxsym = fa.symbols.iter().find(|s| s.name == "Box").expect("Box recovered");
+    let boxsym = fa.symbols().iter().find(|s| s.name == "Box").expect("Box recovered");
     // original: `class API Box {` → Box at row 1, col 10
     let p = boxsym.selection_span.start;
     assert_eq!((p.row, p.column), (1, 10), "Box span in ORIGINAL coords: {:?}", p);
@@ -123,11 +123,11 @@ fn cpp_enumerator_carries_parent_enum_as_container_and_type() {
     // (package) + type (ClassName of the enum).
     let fa = cpp_driver().analyze("enum Color { RED, GREEN };\n");
     let red = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "RED")
         .unwrap_or_else(|| panic!("RED enumerator: {:?}",
-            fa.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()));
+            fa.symbols().iter().map(|s| &s.name).collect::<Vec<_>>()));
     assert_eq!(red.package.as_deref(), Some("Color"),
         "enum member's container is its enum");
     assert_eq!(
@@ -151,7 +151,7 @@ fn function_like_macro_types_from_its_body() {
     use crate::model::file_analysis::InferredType;
     let src = "#define SQ(x) ((x) * (x))\nvoid g(void) { auto b = SQ(3); }\n";
     let fa = cpp_driver().analyze(src);
-    assert!(fa.symbols.iter().any(|s| s.name == "SQ"), "macro is a sub symbol");
+    assert!(fa.symbols().iter().any(|s| s.name == "SQ"), "macro is a sub symbol");
     assert_eq!(
         fa.inferred_type_via_bag("b", tree_sitter::Point { row: 1, column: 20 }),
         Some(InferredType::Numeric),
@@ -174,7 +174,7 @@ fn delegation_macro_types_as_the_wrapped_functions_return() {
         "WRAP delegates to real → real's return type flows through",
     );
     // exactly one `real` sub (the dual @def.sub patterns dedup by span).
-    assert_eq!(fa.symbols.iter().filter(|s| s.name == "real").count(), 1);
+    assert_eq!(fa.symbols().iter().filter(|s| s.name == "real").count(), 1);
 }
 
 /// An annotation-less local initialized from an UNRESOLVABLE uppercase call
@@ -217,7 +217,7 @@ fn class_content_gate_admits_members_not_locals() {
     let fa = cpp_driver().analyze(
         "class Box {\npublic:\n  void grow() { int localx = 1; localx += 2; }\n  int width;\n};\nenum Color { RED, GREEN };\n",
     );
-    let sym = |n: &str| fa.symbols.iter().find(|s| s.name == n).unwrap();
+    let sym = |n: &str| fa.symbols().iter().find(|s| s.name == n).unwrap();
     assert!(fa.symbol_is_class_content(sym("width")), "direct member");
     assert!(fa.symbol_is_class_content(sym("RED")), "enum constant (leaked scope)");
     assert!(
@@ -267,7 +267,7 @@ fn sym_in<'a>(
     fa: &'a crate::model::file_analysis::FileAnalysis,
     n: &str,
 ) -> &'a crate::model::file_analysis::Symbol {
-    fa.symbols.iter().find(|s| s.name == n).unwrap()
+    fa.symbols().iter().find(|s| s.name == n).unwrap()
 }
 
 #[cfg(feature = "cpp")]
@@ -396,9 +396,9 @@ fn cpp_brace_init_declaration_survives_declarator_strip() {
     let fa = cpp_driver().analyze(src);
     // No phantom Class minted from the declared variable.
     assert!(
-        !fa.symbols.iter().any(|s| s.name == "p" && s.kind == SymKind::Class),
+        !fa.symbols().iter().any(|s| s.name == "p" && s.kind == SymKind::Class),
         "brace-init var must not become a Class: {:?}",
-        fa.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
+        fa.symbols().iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
     );
     // The type use on the declaration line keeps its ref.
     assert!(
@@ -426,9 +426,9 @@ fn cpp_empty_brace_init_not_stripped() {
     let src = "void f() {\n  struct sockaddr_in addr {};\n}\n";
     let fa = cpp_driver().analyze(src);
     assert!(
-        !fa.symbols.iter().any(|s| s.name == "addr" && s.kind == SymKind::Class),
+        !fa.symbols().iter().any(|s| s.name == "addr" && s.kind == SymKind::Class),
         "empty brace-init var must not become a Class: {:?}",
-        fa.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
+        fa.symbols().iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
     );
 }
 
@@ -439,9 +439,9 @@ fn cpp_range_for_struct_binding_not_stripped() {
     let src = "struct Point { int x; };\nvoid f(int n) {\n  for (struct Point q : points) { n += q.x; }\n}\n";
     let fa = cpp_driver().analyze(src);
     assert!(
-        !fa.symbols.iter().any(|s| s.name == "q" && s.kind == SymKind::Class),
+        !fa.symbols().iter().any(|s| s.name == "q" && s.kind == SymKind::Class),
         "range-for binding must not become a Class: {:?}",
-        fa.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
+        fa.symbols().iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
     );
     assert!(
         fa.refs().iter().any(|r| r.target_name == "Point" && r.span.start.row == 2),
@@ -710,7 +710,7 @@ struct Gadget { void run() { helper(); } };\n";
             .find(|r| r.target_name == call && matches!(r.kind, RefKind::FunctionCall { .. }))
             .unwrap();
         let decl = fa
-            .symbols
+            .symbols()
             .iter()
             .find(|s| s.name == call && matches!(s.kind, SymKind::Method) && s.package.as_deref() == Some(kind_pkg))
             .unwrap();

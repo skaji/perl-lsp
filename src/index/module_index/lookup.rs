@@ -150,7 +150,7 @@ impl ModuleIndex {
                 // per-bridge Method fan-out is needed.
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
-                    let Some(sym) = whole.symbols.get(idx) else { continue };
+                    let Some(sym) = whole.symbols().get(idx) else { continue };
                     visit(&mod_name, &cached, sym);
                 }
             }

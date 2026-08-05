@@ -169,10 +169,10 @@ fn pattern_dispatch_reaches_fixed_point_over_gating() {
     // Round 2: widget's ClassIsa gate is now true, so its match — same
     // tree, same round-1 query pass — dispatches on re-evaluation.
     assert!(
-        fa.symbols.iter().any(|s| s.name == "made"
+        fa.symbols().iter().any(|s| s.name == "made"
             && matches!(&s.namespace, crate::model::file_analysis::Namespace::Framework { id } if id == "test-widget")),
         "widget plugin gated on the bridged parent must dispatch in a later round; symbols: {:?}",
-        fa.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        fa.symbols().iter().map(|s| &s.name).collect::<Vec<_>>()
     );
 }
 
@@ -191,7 +191,7 @@ fn pattern_dispatch_gates_per_package() {
     let fa = crate::build::builder::build_with_plugins(&tree, source.as_bytes(), Arc::new(reg));
 
     let made: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.name == "made")
         .collect();
@@ -222,7 +222,7 @@ fn resultddl_pattern_synthesizes_accessors_end_to_end() {
          has_many searches => { text => 'SearchTerm.text' };\n",
     );
     let ddl_syms: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             matches!(&s.namespace, crate::model::file_analysis::Namespace::Framework { id } if id == "dbic-resultddl")

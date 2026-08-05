@@ -206,7 +206,7 @@ impl Document {
 impl StableOutline {
     fn from_analysis(analysis: &FileAnalysis) -> Self {
         let mut outline = StableOutline::default();
-        for sym in &analysis.symbols {
+        for sym in analysis.symbols() {
             match sym.kind {
                 SymKind::Package | SymKind::Class => {
                     outline.packages.push((sym.name.clone(), sym.selection_span.start.row));

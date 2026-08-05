@@ -12,7 +12,7 @@ impl<'a> CandidateSet<'a> {
             |k: &SymKind| matches!(k, SymKind::Class | SymKind::Package | SymKind::Module);
         if let Some(sym) = self
             .origin
-            .symbols
+            .symbols()
             .iter()
             .find(|s| s.name == type_name && wanted(&s.kind))
         {
@@ -21,7 +21,7 @@ impl<'a> CandidateSet<'a> {
         let cached = idx.get_cached(type_name)?;
         let whole = idx.whole_present(&cached);
         let sym = whole
-            .symbols
+            .symbols()
             .iter()
             .find(|s| s.name == type_name && wanted(&s.kind))?;
         Some(RefLocation {
@@ -313,7 +313,7 @@ impl<'a> CandidateSet<'a> {
                       seen: &mut std::collections::HashSet<String>,
                       out: &mut Vec<CompletionCandidate>| {
             let owners = pack_inline_owner_set(fa, owner);
-            for s in &fa.symbols {
+            for s in fa.symbols() {
                 let nested_container = matches!(s.kind, SymKind::Package | SymKind::Class)
                     && s.package.as_deref().is_some_and(|p| owners.iter().any(|o| o == p));
                 if !nested_container && !pack_member_of(fa, s, &owners) {

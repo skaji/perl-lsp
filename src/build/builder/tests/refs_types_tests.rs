@@ -369,7 +369,7 @@ fn test_forward_declaration_does_not_duplicate_symbol() {
     // `sub foo { ... }` should produce a symbol (no outline dup / goto-def shadow).
     let fa = build_fa("package P;\nsub foo;\nsub foo { my ($self, $x) = @_; $x }\n");
     let foos: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method) && s.name == "foo")
         .collect();
@@ -1193,10 +1193,10 @@ fn test_block_scoped_package_reverts() {
     let src = "package Outer;\n{\n  package Inner;\n  sub i { }\n}\nsub o { }\n";
     let fa = build_fa(src);
 
-    let o = fa.symbols.iter().find(|s| s.name == "o").expect("sub o");
+    let o = fa.symbols().iter().find(|s| s.name == "o").expect("sub o");
     assert_eq!(o.package.as_deref(), Some("Outer"), "sub o must be in Outer, not Inner");
 
-    let i = fa.symbols.iter().find(|s| s.name == "i").expect("sub i");
+    let i = fa.symbols().iter().find(|s| s.name == "i").expect("sub i");
     assert_eq!(i.package.as_deref(), Some("Inner"), "sub i must be in Inner");
 
     // package_at must also revert: line 5 (`sub o`) is Outer.
@@ -1210,8 +1210,8 @@ fn test_non_block_package_unaffected() {
     // Regression: a normal statement-form `package Bar;` (no block) still
     // flows to end of file.
     let fa = build_fa("package Foo;\nsub a { }\npackage Bar;\nsub b { }\nsub c { }\n");
-    let b = fa.symbols.iter().find(|s| s.name == "b").expect("sub b");
-    let c = fa.symbols.iter().find(|s| s.name == "c").expect("sub c");
+    let b = fa.symbols().iter().find(|s| s.name == "b").expect("sub b");
+    let c = fa.symbols().iter().find(|s| s.name == "c").expect("sub c");
     assert_eq!(b.package.as_deref(), Some("Bar"));
     assert_eq!(c.package.as_deref(), Some("Bar"));
 }

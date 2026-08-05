@@ -12,7 +12,7 @@ fn debug_moo_name_refs() {
             );
         }
     }
-    for s in &fa.symbols {
+    for s in fa.symbols() {
         if s.name == "name"
             || (matches!(s.kind, SymKind::HashKeyDef)
                 && s.span.start.row > 5
@@ -56,7 +56,7 @@ sub register {
 "#;
     let fa = build_fa(src);
     let mut names: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
         .map(|s| s.name.as_str())
@@ -90,7 +90,7 @@ sub register {
     // line), NOT some other loop iteration's line — so goto-def lands on
     // the exact `$app->helper("get_$name" => …)` call.
     let get_order = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| s.name == "get_order")
         .expect("get_order synthesized");
@@ -119,7 +119,7 @@ sub register {
 "#;
     let fa = build_fa(src);
     let mut names: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
         .map(|s| s.name.as_str())
@@ -215,7 +215,7 @@ sub register {
 "#;
     let fa = build_fa(src);
     let names: Vec<&str> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(&s.namespace, Namespace::Framework { id } if id == "mojo-helpers"))
         .map(|s| s.name.as_str())
@@ -253,7 +253,7 @@ $#foo;
 
     // Three distinct declarations.
     let decls: std::collections::HashMap<&str, _> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| {
             s.kind == SymKind::Variable
@@ -318,7 +318,7 @@ fn braced_var_declaration_names_match_bare_form() {
     // the canonical `$foo` name.
     let fa = build_fa("my ${foo} = 1;\n$foo;\n");
     let decls: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Variable && s.name == "$foo")
         .collect();
@@ -326,7 +326,7 @@ fn braced_var_declaration_names_match_bare_form() {
         decls.len(),
         1,
         "expected one $foo symbol, got {:?}",
-        fa.symbols
+        fa.symbols()
             .iter()
             .filter(|s| s.kind == SymKind::Variable)
             .map(|s| &s.name)
@@ -422,7 +422,7 @@ fn test_for_loop_scope() {
 fn test_variable_symbol() {
     let fa = build_fa("my $x = 1;");
     let vars: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Variable && s.name == "$x")
         .collect();
@@ -439,7 +439,7 @@ fn test_variable_symbol() {
 fn test_sub_symbol_with_params() {
     let fa = build_fa("sub connect($self, %opts) { }");
     let subs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Sub && s.name == "connect")
         .collect();
@@ -462,7 +462,7 @@ fn test_sub_symbol_with_params() {
 fn test_legacy_sub_params() {
     let fa = build_fa("sub new {\n    my ($class, %args) = @_;\n}");
     let subs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Sub && s.name == "new")
         .collect();
@@ -481,7 +481,7 @@ fn test_legacy_sub_params() {
 fn test_package_symbol() {
     let fa = build_fa("package Foo;");
     let pkgs: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Package && s.name == "Foo")
         .collect();
@@ -492,7 +492,7 @@ fn test_package_symbol() {
 fn test_class_symbol() {
     let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param;\n    field $y :param;\n    method magnitude() { }\n}");
     let classes: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Class && s.name == "Point")
         .collect();
@@ -512,7 +512,7 @@ fn test_class_symbol() {
 fn test_field_symbol() {
     let fa = build_fa("use v5.38;\nclass Point {\n    field $x :param;\n}");
     let fields: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Field)
         .collect();
@@ -526,7 +526,7 @@ fn test_field_reader_synthesizes_method() {
         "use v5.38;\nclass Point {\n    field $x :param :reader;\n    field $y :param;\n}",
     );
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Method)
         .collect();
@@ -690,7 +690,7 @@ fn test_field_writer_synthesizes_method() {
     let fa =
         build_fa("use v5.38;\nclass Point {\n    field $label :reader :writer = \"point\";\n}");
     let methods: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Method)
         .map(|s| s.name.clone())
@@ -943,7 +943,7 @@ fn slot_type_write_then_extract_resolves_method() {
 fn test_use_symbol() {
     let fa = build_fa("use Foo::Bar;");
     let modules: Vec<_> = fa
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| s.kind == SymKind::Module)
         .collect();

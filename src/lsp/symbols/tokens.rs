@@ -45,7 +45,7 @@ pub fn inlay_hints(analysis: &FileAnalysis, range: Range) -> Vec<InlayHint> {
     let end = position_to_point(range.end);
     let mut hints = Vec::new();
 
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         let decl_point = sym.selection_span.end;
         // Skip symbols outside the requested range
         if decl_point.row < start.row || decl_point.row > end.row {

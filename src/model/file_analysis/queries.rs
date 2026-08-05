@@ -44,13 +44,11 @@ impl FileAnalysis {
         let chain = self.scope_chain(scope);
         let mut result = Vec::new();
         for scope_id in &chain {
-            if let Some(sym_ids) = self.symbols_by_scope.get(scope_id) {
-                for sid in sym_ids {
-                    let sym = &self.symbols[sid.0 as usize];
-                    // Symbol must be declared before the point (or be a sub/package/class)
-                    if sym.span.start <= point || matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class) {
-                        result.push(sym);
-                    }
+            for sid in self.symbols.in_scope(*scope_id) {
+                let sym = &self.symbols[sid.0 as usize];
+                // Symbol must be declared before the point (or be a sub/package/class)
+                if sym.span.start <= point || matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class) {
+                    result.push(sym);
                 }
             }
         }
@@ -63,15 +61,13 @@ impl FileAnalysis {
         let scope = self.scope_at(point)?;
         let chain = self.scope_chain(scope);
         for scope_id in &chain {
-            if let Some(sym_ids) = self.symbols_by_scope.get(scope_id) {
-                for sid in sym_ids {
-                    let sym = &self.symbols[sid.0 as usize];
-                    if sym.name == name
-                        && matches!(sym.kind, SymKind::Variable | SymKind::Field)
-                        && sym.span.start <= point
-                    {
-                        return Some(sym);
-                    }
+            for sid in self.symbols.in_scope(*scope_id) {
+                let sym = &self.symbols[sid.0 as usize];
+                if sym.name == name
+                    && matches!(sym.kind, SymKind::Variable | SymKind::Field)
+                    && sym.span.start <= point
+                {
+                    return Some(sym);
                 }
             }
         }
@@ -722,7 +718,7 @@ impl FileAnalysis {
         let ctx = self.bag_context(module_index);
         crate::model::witnesses::query_sub_return_type(
             &self.witnesses,
-            &self.symbols,
+            self.symbols.as_slice(),
             sub_name,
             arity,
             None,

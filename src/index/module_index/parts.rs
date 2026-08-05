@@ -136,7 +136,7 @@ impl ModuleEdgeIndexes {
     /// across files.
     fn indexable_names(analysis: &FileAnalysis) -> Vec<String> {
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for sym in &analysis.symbols {
+        for sym in analysis.symbols() {
             if matches!(
                 sym.kind,
                 SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class

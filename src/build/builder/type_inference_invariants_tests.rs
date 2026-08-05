@@ -155,7 +155,7 @@ fn plugin_override_survives_all_folds() {
     );
 
     let bar_sym = fa
-        .symbols
+        .symbols()
         .iter()
         .find(|s| {
             s.name == "bar"
@@ -236,7 +236,7 @@ fn post_walk_fold_is_observably_idempotent() {
         // (the walk produces them in the same order), so iterating
         // `symbols` directly gives a deterministic comparison key
         // without needing Ord on InferredType.
-        fa.symbols
+        fa.symbols()
             .iter()
             .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
             .map(|s| {
@@ -265,7 +265,7 @@ fn post_walk_fold_is_observably_idempotent() {
     // --dump-package) hit, so equality here is the user-visible
     // idempotency property.
     for sym in fa_once
-        .symbols
+        .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
     {
@@ -315,7 +315,7 @@ fn provenance_accessor_and_round_trip() {
     let fa = build_with(source, registry_with_bar_override());
 
     let find_sub = |name: &str| -> &crate::model::file_analysis::Symbol {
-        fa.symbols
+        fa.symbols()
             .iter()
             .find(|s| {
                 s.name == name

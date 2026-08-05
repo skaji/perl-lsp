@@ -15,7 +15,7 @@ impl<'a> CandidateSet<'a> {
         // recomputed per file, never shared).
         let member_span_in = |fa: &crate::model::file_analysis::FileAnalysis| -> Option<Span> {
             let owners = pack_inline_owner_set(fa, class);
-            fa.symbols
+            fa.symbols()
                 .iter()
                 .find(|s| s.name == member && pack_member_of(fa, s, &owners))
                 .map(|s| s.selection_span)
@@ -111,7 +111,7 @@ impl<'a> CandidateSet<'a> {
             return vec![decl];
         }
         let Some(sym) = decl_fa
-            .symbols
+            .symbols()
             .iter()
             .find(|s| s.selection_span.start == decl.span.start)
         else {
@@ -176,7 +176,7 @@ impl<'a> CandidateSet<'a> {
             });
         };
         // The decl's own file first (a static's forward decl and body).
-        for s in decl_fa.symbols.iter().filter(|s| cand_is_def(decl_fa, s)) {
+        for s in decl_fa.symbols().iter().filter(|s| cand_is_def(decl_fa, s)) {
             push(&mut defs, &decl.key, s.selection_span);
         }
         // Cross-file: the full def-candidates table, closure-connected to the
@@ -212,7 +212,7 @@ impl<'a> CandidateSet<'a> {
                     }
                     let key = FileKey::Path(cached.path.clone());
                     let whole = idx.whole_present(cached);
-                    for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
+                    for s in whole.symbols().iter().filter(|s| cand_is_def(&whole, s)) {
                         push(&mut defs, &key, s.selection_span);
                     }
                 }
@@ -234,7 +234,7 @@ impl<'a> CandidateSet<'a> {
                         }
                         let key = FileKey::Path(cached.path.clone());
                         let whole = idx.whole_present(cached);
-                        for s in whole.symbols.iter().filter(|s| cand_is_def(&whole, s)) {
+                        for s in whole.symbols().iter().filter(|s| cand_is_def(&whole, s)) {
                             if s.selection_span.start == decl.span.start
                                 && file_key_eq(&key, &decl.key)
                             {
@@ -320,7 +320,7 @@ impl<'a> CandidateSet<'a> {
             RefKind::FunctionCall => r.resolved_package().map(str::to_string).or_else(|| {
                 analysis.find_definition(self.point, Some(idx)).and_then(|sp| {
                     analysis
-                        .symbols
+                        .symbols()
                         .iter()
                         .find(|s| {
                             s.selection_span.start == sp.start
@@ -381,7 +381,7 @@ impl<'a> CandidateSet<'a> {
                 },
             ));
         };
-        for s in analysis.symbols.iter().filter(|s| {
+        for s in analysis.symbols().iter().filter(|s| {
             s.name == name
                 && matches!(s.kind, SymKind::Sub | SymKind::Method)
                 && pkg_ok(s.package.as_deref())
@@ -400,7 +400,7 @@ impl<'a> CandidateSet<'a> {
             if let Some(cached) = idx.get_cached(p) {
                 let key = FileKey::Path(cached.path.clone());
                 let whole = idx.whole_present(&cached);
-                for s in whole.symbols.iter().filter(|s| {
+                for s in whole.symbols().iter().filter(|s| {
                     s.name == name
                         && matches!(s.kind, SymKind::Sub | SymKind::Method)
                         && pkg_ok(s.package.as_deref())
@@ -429,7 +429,7 @@ impl<'a> CandidateSet<'a> {
                 }
                 let key = FileKey::Path(cached.path.clone());
                 let whole = idx.whole_present(&cached);
-                for s in whole.symbols.iter().filter(|s| {
+                for s in whole.symbols().iter().filter(|s| {
                     s.name == name
                         && matches!(s.kind, SymKind::Sub | SymKind::Method)
                         && pkg_ok(s.package.as_deref())
@@ -822,7 +822,7 @@ impl<'a> CandidateSet<'a> {
                     if Url::from_file_path(&cached.path).is_ok() {
                         let whole = idx.whole_present(&cached);
                         let span = whole
-                            .symbols
+                            .symbols()
                             .iter()
                             .find(|s| {
                                 s.name == r.target_name
@@ -838,7 +838,7 @@ impl<'a> CandidateSet<'a> {
                             // file top. Pack-only structural gates; Perl module
                             // lookups keep the file-top fallback.
                             .or_else(|| {
-                                whole.symbols.iter().find(|s| {
+                                whole.symbols().iter().find(|s| {
                                     s.name == r.target_name
                                         && (whole.symbol_is_class_content(s)
                                             || whole.symbol_is_file_scope_value(s))
@@ -892,7 +892,7 @@ impl<'a> CandidateSet<'a> {
                     if let Some(MethodResolution::Local { sym_id, .. }) =
                         analysis.resolve_method_in_ancestors(&cn, method, Some(idx))
                     {
-                        if let Some(sym) = analysis.symbols.iter().find(|s| s.id == sym_id) {
+                        if let Some(sym) = analysis.symbols().iter().find(|s| s.id == sym_id) {
                             return vec![self.origin_decl(sym.selection_span)];
                         }
                     }
@@ -921,7 +921,7 @@ impl<'a> CandidateSet<'a> {
                                     // `def_line` jump (`prefer_member_defs` is a
                                     // no-op off-pack anyway).
                                     if self.pack {
-                                        if let Some(sym) = whole.symbols.iter().find(|s| {
+                                        if let Some(sym) = whole.symbols().iter().find(|s| {
                                             s.name == method
                                                 && matches!(s.kind, SymKind::Sub | SymKind::Method)
                                                 && pkg_agrees(true, s.package.as_deref(), Some(class))
@@ -943,7 +943,7 @@ impl<'a> CandidateSet<'a> {
                             }
                             // cpp data field (or enum constant): a
                             // Variable/Field/Enumerator member, not a sub.
-                            if let Some(sym) = whole.symbols.iter().find(|s| {
+                            if let Some(sym) = whole.symbols().iter().find(|s| {
                                 matches!(
                                     s.kind,
                                     SymKind::Variable | SymKind::Field | SymKind::Enumerator
@@ -985,7 +985,7 @@ impl<'a> CandidateSet<'a> {
                 let name = r.unqualified_target_name();
                 if let Some(cached) = idx.get_cached(name) {
                     let whole = idx.whole_present(&cached);
-                    if let Some(sym) = whole.symbols.iter().find(|s| {
+                    if let Some(sym) = whole.symbols().iter().find(|s| {
                         s.name == name
                             && matches!(s.kind, SymKind::Sub | SymKind::Variable | SymKind::Enumerator)
                     }) {

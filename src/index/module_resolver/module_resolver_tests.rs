@@ -72,7 +72,7 @@ sub new {
     let tree = parser.parse(source, None).unwrap();
     let analysis = std::sync::Arc::new(crate::build::builder::build(&tree, source.as_bytes()));
     assert!(
-        analysis.symbols.iter().any(|s| matches!(s.kind, crate::model::file_analysis::SymKind::Handler)),
+        analysis.symbols().iter().any(|s| matches!(s.kind, crate::model::file_analysis::SymKind::Handler)),
         "fixture should synthesize a Handler symbol via the mojo-events plugin",
     );
 

@@ -132,7 +132,7 @@ pub fn in_scope_completion(analysis: &FileAnalysis, point: Point) -> Vec<Complet
         .unwrap_or_default();
     let mut seen: HashSet<&str> = HashSet::new();
     let mut items = Vec::new();
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         // Top-level defs are addressable anywhere; everything else
         // (params, locals, a class's methods/fields) only where the
         // declaring scope is on the cursor's scope chain.
@@ -656,7 +656,7 @@ fn auto_import_span(
             insert_pos = Position { line: imp.span.end.row as u32 + 1, character: 0 };
         } else {
             // Find the last package statement above the cursor
-            let last_pkg_above = analysis.symbols.iter().rev()
+            let last_pkg_above = analysis.symbols().iter().rev()
                 .find(|s| matches!(s.kind, FaSymKind::Package | FaSymKind::Class) && s.selection_span.start.row < point.row);
             if let Some(pkg) = last_pkg_above {
                 insert_pos = Position { line: pkg.selection_span.start.row as u32 + 1, character: 0 };

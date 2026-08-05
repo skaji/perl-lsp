@@ -502,7 +502,7 @@ fn string_dispatch_signature_for(
         });
     };
 
-    for sym in &analysis.symbols {
+    for sym in analysis.symbols() {
         if sym.name != handler_name { continue; }
         push_sig(&mut signatures, sym, None);
     }
@@ -510,7 +510,7 @@ fn string_dispatch_signature_for(
         for module_name in idx.modules_with_symbol(handler_name) {
             let Some(cached) = idx.get_cached(&module_name) else { continue };
             let whole = idx.whole_present(&cached);
-            for sym in &whole.symbols {
+            for sym in whole.symbols() {
                 if sym.name != handler_name { continue; }
                 push_sig(&mut signatures, sym, Some(module_name.as_str()));
             }

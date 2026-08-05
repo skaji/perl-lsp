@@ -138,11 +138,11 @@ fn render_candidate_hover(
 ) -> Option<String> {
     let module_index = cs.scoped_index();
     let sym_at = |a: &FileAnalysis| -> Option<usize> {
-        a.symbols
+        a.symbols()
             .iter()
             .position(|s| s.selection_span.start == loc.span.start)
             .or_else(|| {
-                a.symbols
+                a.symbols()
                     .iter()
                     .position(|s| s.selection_span.start.row == loc.span.start.row
                         && crate::model::file_analysis::contains_point(&s.selection_span, loc.span.start))
@@ -152,7 +152,7 @@ fn render_candidate_hover(
         let analysis = cs.origin_analysis();
         let source = cs.origin_source()?;
         if let Some(i) = sym_at(analysis) {
-            let sym = &analysis.symbols[i];
+            let sym = &analysis.symbols()[i];
             return Some(render_symbol_hover(
                 sym, source, &sym.span.start, language, analysis, cs.cursor(), module_index,
             ));
@@ -178,7 +178,7 @@ fn render_candidate_hover(
             .map(|midx| midx.whole_present(cached))
             .unwrap_or_else(|| cached.analysis.clone());
         if let Some(i) = sym_at(&whole) {
-            let sym = &whole.symbols[i];
+            let sym = &whole.symbols()[i];
             let mut out = render_symbol_hover(
                 sym, &text, &sym.span.start, language, &whole, sym.span.start,
                 module_index,

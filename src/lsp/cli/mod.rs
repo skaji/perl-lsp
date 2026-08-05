@@ -74,8 +74,8 @@ pub(crate) fn cli_lang_analyze(file: &str) {
     for _ in 1..iters {
         fa = driver.analyze_with_path(&src, Some(std::path::Path::new(path)));
     }
-    println!("# {file} [{}] — {} symbols", driver.id(), fa.symbols.len());
-    for s in &fa.symbols {
+    println!("# {file} [{}] — {} symbols", driver.id(), fa.symbols().len());
+    for s in fa.symbols() {
         let pkg = s.package.as_deref().unwrap_or("");
         let sep = if pkg.is_empty() { "" } else { "::" };
         println!(

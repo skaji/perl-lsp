@@ -318,7 +318,7 @@ pub fn resolve_symbol_scoped(
                     // walk symbols, which the resident copy may have evicted.
                     let whole = idx.whole_present(&cached);
                     whole
-                        .symbols
+                        .symbols()
                         .iter()
                         .filter(|s| s.name == r.target_name)
                         .find_map(|s| class_or_value(&whole, s))
@@ -404,7 +404,7 @@ pub(super) fn pack_member_of_class(
     idx: Option<&dyn CrossFileLookup>,
 ) -> Option<bool> {
     let check = |a: &FileAnalysis| {
-        a.symbols
+        a.symbols()
             .iter()
             .find(|s| {
                 s.name == name
