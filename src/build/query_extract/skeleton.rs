@@ -70,7 +70,7 @@ pub struct SkeletonAnalysis {
     pub imports: Vec<String>,
     /// `#include`/`import` path tokens with spans: (raw path text, path-token
     /// span). Goto-def on the token resolves the header; the span is what the
-    /// bare `imports` list drops. Carried onto `FileAnalysis.include_directives`.
+    /// bare `imports` list drops. Carried onto `FileAnalysis.pack.include_directives`.
     pub import_sites: Vec<(String, crate::model::file_analysis::Span)>,
     pub scope_count: usize,
     pub scopes: Vec<crate::model::file_analysis::Scope>,
@@ -79,12 +79,12 @@ pub struct SkeletonAnalysis {
     pub parents: Vec<(String, String)>,
     /// (specialization, primary) family edges — a `@spec.primary` capture in
     /// a class-def match whose name is a template spelling. Rides onto
-    /// `FileAnalysis.specializes`; the graph's `Specializes` edge derives from
+    /// `FileAnalysis.pack.specializes`; the graph's `Specializes` edge derives from
     /// it (member resolution never traverses it — a spec REPLACES wholesale).
     pub specializations: Vec<(String, String)>,
     /// (owner class, param name, param position) triples from
     /// `@tmpl.owner`/`@tmpl.param` — one per template parameter, joined per
-    /// match. Sorted by position into `FileAnalysis.template_params`
+    /// match. Sorted by position into `FileAnalysis.pack.template_params`
     /// (declaration order is the `ParamOf` index axis).
     pub template_params: Vec<(String, String, usize)>,
     /// Variable reads (`@expr.read.var`): (name, scope, span). Each resolves
@@ -635,7 +635,7 @@ impl SkeletonAnalysis {
         // Per-class template parameter lists (declaration order) — the
         // `ParamOf` index axis. Built here so the writeback below can route
         // param-mentioning member returns through the deferred shape; rides
-        // onto `FileAnalysis.template_params` after construction.
+        // onto `FileAnalysis.pack.template_params` after construction.
         let template_params: std::collections::HashMap<String, Vec<String>> = {
             let mut map: std::collections::HashMap<String, Vec<String>> = Default::default();
             for (owner, param, _) in &self.template_params {
@@ -1112,20 +1112,20 @@ impl SkeletonAnalysis {
         // Pack-declared receiver names ride the FA so core's member /
         // outline filters can exclude them generically (lang semantics in
         // the pack, generic logic in core).
-        fa.receiver_names = std::mem::take(&mut self.receiver_names);
+        fa.pack.receiver_names = std::mem::take(&mut self.receiver_names);
         // Specialization family edges (spec → primary). NOT an inheritance edge:
         // a spec inherits nothing from its primary (it replaces wholesale),
         // so member resolution must never fall through this edge — only the
         // graph's `Specializes` family view reads it.
-        fa.specializes = self.specializations.drain(..).collect();
+        fa.pack.specializes = self.specializations.drain(..).collect();
         // Per-class ordered template params — the substitution axis the
         // dispatch ladder + field substitution read (methods already carry
         // `ParamOf` witnesses from the writeback above).
-        fa.template_params = template_params;
+        fa.pack.template_params = template_params;
         // Include/import path tokens carry a span so goto-def can resolve the
         // header (the bare `imports` list is span-less). Resolution to an
         // absolute path happens where the file path is in hand (the driver).
-        fa.include_directives = self
+        fa.pack.include_directives = self
             .import_sites
             .drain(..)
             .map(|(raw, span)| (span, raw))

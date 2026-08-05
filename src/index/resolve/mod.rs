@@ -131,7 +131,7 @@ pub fn resolve<'a>(
     let scoped = module_index.map(|idx| {
         crate::model::file_analysis::ScopedLookup::new(
             idx,
-            &origin.include_closure,
+            &origin.pack.include_closure,
             self_path.as_deref(),
         )
     });

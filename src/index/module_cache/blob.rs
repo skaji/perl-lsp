@@ -358,7 +358,7 @@ pub fn save_to_db(
                 return false;
             }
             let deps = closure_stamp(
-                &cached.analysis.include_closure,
+                &cached.analysis.pack.include_closure,
                 &mut std::collections::HashMap::new(),
             );
             (cached.path.to_string_lossy().to_string(), mtime, size, blob, deps)

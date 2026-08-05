@@ -247,15 +247,15 @@ impl FileAnalysis {
             }
             cands.push((spec.to_string(), params.clone()));
         };
-        for (spec, primary) in &self.specializes {
+        for (spec, primary) in &self.pack.specializes {
             if primary == base {
-                push_cand(spec, self.template_params.get(spec), &mut cands);
+                push_cand(spec, self.pack.template_params.get(spec), &mut cands);
             }
         }
         if let Some(idx) = module_index {
             for (spec, module) in idx.direct_specializations_of(base) {
                 if let Some(cached) = idx.get_cached(&module) {
-                    push_cand(&spec, cached.analysis.template_params.get(&spec), &mut cands);
+                    push_cand(&spec, cached.analysis.pack.template_params.get(&spec), &mut cands);
                 }
             }
         }
@@ -278,11 +278,11 @@ impl FileAnalysis {
         class: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<String> {
-        if let Some(p) = self.template_params.get(class) {
+        if let Some(p) = self.pack.template_params.get(class) {
             return p.clone();
         }
         if let Some(cached) = module_index.and_then(|idx| idx.get_cached(class)) {
-            if let Some(p) = cached.analysis.template_params.get(class) {
+            if let Some(p) = cached.analysis.pack.template_params.get(class) {
                 return p.clone();
             }
         }
@@ -1001,7 +1001,7 @@ impl FileAnalysis {
         let idx = module_index?;
         let cached = idx.get_cached(&module)?;
         let whole = idx.whole_present(&cached);
-        let is_bridge = whole.plugin_namespaces.iter().any(|ns| {
+        let is_bridge = whole.plugin.namespaces.iter().any(|ns| {
             ns.bridges
                 .iter()
                 .any(|b| matches!(b, Bridge::Class(c) if c == &on_class))
@@ -1192,7 +1192,7 @@ impl FileAnalysis {
                 return true;
             }
         }
-        self.plugin_namespaces.iter().any(|ns| {
+        self.plugin.namespaces.iter().any(|ns| {
             ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls))
                 && ns.entities.iter().any(|sid| {
                     self.symbols.get(sid.0 as usize).is_some_and(|s| {
@@ -1262,7 +1262,7 @@ impl FileAnalysis {
                 }
             }
             // (2) Local plugin-namespace bridge to `cls`.
-            for ns in &self.plugin_namespaces {
+            for ns in &self.plugin.namespaces {
                 if !ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls)) { continue; }
                 for sym_id in &ns.entities {
                     let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
@@ -1472,7 +1472,7 @@ impl FileAnalysis {
     /// Does `name` name a `#define` in this file? (`selection_span` match
     /// optional: `at` narrows to "this exact def site".)
     pub(crate) fn names_macro_def(&self, name: &str, at: Option<Span>) -> bool {
-        self.macro_defs
+        self.pack.macro_defs
             .iter()
             .any(|m| m.name == name && at.is_none_or(|s| m.selection_span == s))
     }

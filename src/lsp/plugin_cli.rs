@@ -247,7 +247,7 @@ fn diff_emissions(baseline: &FileAnalysis, with_plugin: &FileAnalysis, plugin_id
     // plugin_namespaces — owned by plugins, so anything in `with_plugin` is
     // attributable. Filter by plugin_id to be precise.
     let plugin_namespaces: Vec<Value> = with_plugin
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .filter(|n| n.plugin_id == plugin_id)
         .map(|n| json!({

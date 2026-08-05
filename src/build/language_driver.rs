@@ -462,7 +462,7 @@ impl PackDriver {
         recovered: &[(String, String)],
         macro_defs: Vec<crate::model::file_analysis::MacroDef>,
     ) {
-        fa.macro_defs = macro_defs;
+        fa.pack.macro_defs = macro_defs;
         apply_attribute_macros(fa, recovered);
         // Access-specifier regions: a fresh parse of the ORIGINAL source
         // (spans already in original coords, no remap needed) tags each
@@ -479,7 +479,7 @@ impl PackDriver {
         if let (Some(f), Some(p)) = (self.include_closure, path) {
             let (closure, complete) =
                 crate::util::timings::phase("cpp.include_closure", || f(p, source));
-            fa.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+            fa.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
                 closure.iter().map(|s| s.as_str()),
             );
             closure_incomplete = !complete;

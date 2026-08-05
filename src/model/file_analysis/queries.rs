@@ -114,7 +114,7 @@ impl FileAnalysis {
             key(&outer.start) <= key(&inner.start) && key(&inner.end) <= key(&outer.end)
         };
         let mut out = Vec::new();
-        for (name, move_span, move_scope) in &self.moved_from {
+        for (name, move_span, move_scope) in &self.pack.moved_from {
             let scope_span = self.scope(*move_scope).span;
             // GATE B (in-function): only a move that is lexically inside SOME
             // function body is executable straight-line code we can reason
@@ -141,7 +141,7 @@ impl FileAnalysis {
             // the arm and is not `contains`ed by it — those stay flaggable
             // (a same-arm read is a real bug); only the non-scope constructs
             // (braceless arms, loop/switch bodies, ternary, preproc) gate here.
-            let straight_line = !self.control_regions.iter().any(|g| {
+            let straight_line = !self.pack.control_regions.iter().any(|g| {
                 contains(&scope_span, g) && contains(g, move_span)
             });
             if !straight_line {
@@ -159,7 +159,7 @@ impl FileAnalysis {
                 s.name == *name
                     && chain.contains(&s.scope)
                     && self
-                        .param_regions
+                        .pack.param_regions
                         .iter()
                         .any(|pr| contains(pr, &s.selection_span))
             });
@@ -299,7 +299,7 @@ impl FileAnalysis {
             package_framework: &self.packages,
             module_index,
             package_parents: &self.packages,
-            app_surface_consumers: &self.app_surface_consumers,
+            app_surface_consumers: &self.plugin.app_surface_consumers,
         }
     }
 

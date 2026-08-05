@@ -870,7 +870,7 @@ sub register ($self, $app, $conf) {\n\
     // the app surface (otherwise the test would pass vacuously once the bug is
     // "fixed" by an unrelated path).
     assert!(
-        provider.plugin_namespaces.iter().any(|ns| ns
+        provider.plugin.namespaces.iter().any(|ns| ns
             .bridges
             .iter()
             .any(|b| matches!(b, crate::model::file_analysis::Bridge::Class(c) if c == crate::model::file_analysis::APP_SURFACE_CLASS))),

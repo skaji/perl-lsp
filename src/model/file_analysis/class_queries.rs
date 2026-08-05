@@ -309,7 +309,7 @@ impl FileAnalysis {
             if matches!(sym.kind, SymKind::Variable | SymKind::Field)
                 && self.symbol_in_class(sym.id, cls)
                 && !self
-                    .param_regions
+                    .pack.param_regions
                     .iter()
                     .any(|pr| contains(pr, &sym.selection_span))
                 // the class body itself, or a nested container body inside it
@@ -320,7 +320,7 @@ impl FileAnalysis {
                     self.scope_chain(sym.scope).contains(&cb)
                         && !self.scope_within_sub_body(sym.scope)
                 })
-                && !self.receiver_names.contains(&sym.name)
+                && !self.pack.receiver_names.contains(&sym.name)
                 // an anonymous container (`(union)`) is structure, not an
                 // addressable member
                 && !sym.attributes.iter().any(|a| a == "anonymous")
@@ -662,7 +662,7 @@ impl FileAnalysis {
         };
         let att = WitnessAttachment::Field { owner: owner.to_string(), name: field.to_string() };
         let mut bag = WitnessBag::new();
-        for site in &self.domain_sites {
+        for site in &self.pack.domain_sites {
             if site.slot != field {
                 continue;
             }
@@ -735,7 +735,7 @@ impl FileAnalysis {
         enum_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<Span> {
-        self.domain_sites
+        self.pack.domain_sites
             .iter()
             .filter(|s| {
                 self.resolve_enumerator_enum(&s.value, module_index).as_deref() == Some(enum_name)

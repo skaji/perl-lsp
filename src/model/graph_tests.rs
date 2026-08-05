@@ -189,8 +189,8 @@ fn walk_specializes_is_family_view_only() {
     // Local (spec → primary) map drives the edge; member resolution's
     // INHERITS mask never traverses it.
     let mut fa = parse("package Probe;\n1;\n");
-    fa.specializes.insert("formatter<int, char>".into(), "formatter".into());
-    fa.specializes.insert("formatter<T*, char>".into(), "formatter".into());
+    fa.pack.specializes.insert("formatter<int, char>".into(), "formatter".into());
+    fa.pack.specializes.insert("formatter<T*, char>".into(), "formatter".into());
     let g = GraphView::new(&fa, None);
     let mut fam: Vec<String> = Vec::new();
     g.walk(Node::Class("formatter".into()), EdgeKindMask::SPECIALIZES, &mut |n| {

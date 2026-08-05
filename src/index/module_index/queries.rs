@@ -447,7 +447,7 @@ impl ModuleIndex {
         let mut updates: Vec<(String, std::path::PathBuf, Arc<FileAnalysis>)> = Vec::new();
         for entry in self.core.cache.iter() {
             let Some(cached) = entry.value() else { continue };
-            if cached.analysis.gated_emissions.is_empty() {
+            if cached.analysis.plugin.gated_emissions.is_empty() {
                 continue;
             }
             // Rehydrate the whole view (the resident copy may be

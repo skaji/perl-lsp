@@ -46,7 +46,7 @@ impl ModuleIndex {
         for imp in &analysis.imports {
             self.loaded_modules.insert(imp.module_name.clone(), ());
         }
-        for f in &analysis.plugin_loads {
+        for f in &analysis.plugin.loads {
             self.loaded_modules.insert(f.name.clone(), ());
         }
         self.core.record_loader_shapes(&path.display().to_string(), analysis);
@@ -838,7 +838,7 @@ impl ModuleIndex {
     ) -> (Vec<(String, bool)>, Vec<(String, String)>) {
         let feed = collect_linkage_feed(fa);
         let specs: Vec<(String, String)> =
-            fa.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            fa.pack.specializes.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         (feed, specs)
     }
 

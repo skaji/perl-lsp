@@ -51,9 +51,22 @@ impl FileAnalysis {
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
-            receiver_names: Vec::new(),
-            specializes: HashMap::new(),
-            template_params: HashMap::new(),
+            // Pack drivers fill the rest of the lane post-construction
+            // (macros, the include graph, template params).
+            pack: PackFacts {
+                domain_sites,
+                moved_from,
+                control_regions,
+                param_regions,
+                ..Default::default()
+            },
+            plugin: PluginFacts {
+                namespaces: plugin_namespaces,
+                loads: plugin_loads,
+                diagnostics: plugin_diagnostics,
+                gated_emissions,
+                app_surface_consumers,
+            },
             scopes,
             symbols: SymbolTable::from_vec(symbols),
             refs: RefTable::from_vec(refs),
@@ -62,21 +75,17 @@ impl FileAnalysis {
             call_bindings,
             method_call_bindings,
             package_ranges,
-            plugin_diagnostics,
             packages,
-            app_surface_consumers,
             framework_imports,
             export,
             export_ok,
             export_tags,
             reexport_modules,
-            plugin_namespaces,
             type_provenance,
             witnesses,
             bag_evicted: false,
             base_witness_count: 0,
             provisional_dispatches,
-            gated_emissions,
             guard_sites,
             arrow_deref_sites,
             gated_param_types,
@@ -87,19 +96,8 @@ impl FileAnalysis {
             dbic_source_name,
             column_keyed_verbs,
             dynamic_dispatch_sites,
-            plugin_loads,
             loader_config_params,
             flow_edges,
-            moved_from,
-            control_regions,
-            param_regions,
-            domain_sites,
-            // Populated by the pack driver post-construction (macro identity lane).
-            macro_defs: Vec::new(),
-            // Populated post-construction: `include_directives` from the skeleton,
-            // `include_closure` by the driver (it holds the resolving file path).
-            include_directives: Vec::new(),
-            include_closure: path_intern::ClosureList::default(),
             degraded: false,
             // Pack drivers re-stamp their id post-construction.
             language: super::default_language(),
@@ -622,27 +620,34 @@ impl std::fmt::Display for HeapBreakdown {
     }
 }
 
+/// Flat vec footprint: element size times capacity (backing slack counted).
+#[allow(clippy::ptr_arg)]
+pub(super) fn vcap<T>(v: &Vec<T>) -> usize {
+    v.capacity() * std::mem::size_of::<T>()
+}
+
+/// Flat map footprint — hashbrown: ~1 control byte per slot on top of the
+/// (K,V) pair.
+pub(super) fn mcap<K, V>(m: &HashMap<K, V>) -> usize {
+    m.capacity() * (std::mem::size_of::<(K, V)>() + 1)
+}
+
+pub(super) fn scap<T>(s: &HashSet<T>) -> usize {
+    s.capacity() * (std::mem::size_of::<T>() + 1)
+}
+
+/// `HashMap<String, Vec<V>>`: flat table + deep key strings + value vecs.
+pub(super) fn map_str_vec<V>(m: &HashMap<String, Vec<V>>) -> usize {
+    let mut b = mcap(m);
+    for (k, v) in m {
+        b += k.capacity() + v.capacity() * std::mem::size_of::<V>();
+    }
+    b
+}
+
 impl FileAnalysis {
     /// Estimate this analysis's resident heap by bucket. See `HeapBreakdown`.
     pub fn heap_estimate(&self) -> HeapBreakdown {
-        fn vcap<T>(v: &Vec<T>) -> usize {
-            v.capacity() * std::mem::size_of::<T>()
-        }
-        fn mcap<K, V>(m: &HashMap<K, V>) -> usize {
-            // hashbrown: ~1 control byte per slot on top of the (K,V) pair.
-            m.capacity() * (std::mem::size_of::<(K, V)>() + 1)
-        }
-        fn scap<T>(s: &HashSet<T>) -> usize {
-            s.capacity() * (std::mem::size_of::<T>() + 1)
-        }
-        // HashMap<String, Vec<V>>: flat table + deep key strings + value vecs.
-        fn map_str_vec<V>(m: &HashMap<String, Vec<V>>) -> usize {
-            let mut b = mcap(m);
-            for (k, v) in m {
-                b += k.capacity() + v.capacity() * std::mem::size_of::<V>();
-            }
-            b
-        }
         // The per-package table: flat entries + key strings + the name
         // vecs each entry owns. The `bool`/`Option` lanes ride the entry
         // struct, already counted by `mcap`.
@@ -673,16 +678,10 @@ impl FileAnalysis {
         h.witness_vec = wv;
         h.witness_index = wi;
 
-        // include closure — the shared-header-path duplication.
-        // Sorted path-ids over the global table: 4 bytes per entry; the
-        // table's string bytes are process-wide, counted once, not per file.
-        h.include = self.include_closure.heap_bytes()
-            + vcap(&self.include_directives)
-            + self
-                .include_directives
-                .iter()
-                .map(|(_, s)| s.capacity())
-                .sum::<usize>();
+        // the pack lane (include graph, macros, template params, regions)
+        // and the plugin lane (namespaces, loads, emissions).
+        self.pack.heap_add(&mut h);
+        self.plugin.heap_add(&mut h);
 
         // scopes.
         h.scopes = vcap(&self.scopes)
@@ -706,38 +705,27 @@ impl FileAnalysis {
             + vcap(&self.method_call_bindings)
             + vcap(&self.fold_ranges);
 
-        // pack/cpp flat fact vectors.
-        h.cpp_extras = vcap(&self.provisional_dispatches)
+        // flat fact vectors. The pack and plugin lanes add their own.
+        h.cpp_extras += vcap(&self.provisional_dispatches)
             + vcap(&self.guard_sites)
             + vcap(&self.arrow_deref_sites)
             + vcap(&self.gated_param_types)
             + vcap(&self.attr_projections)
             + vcap(&self.key_writes)
             + vcap(&self.flow_edges)
-            + vcap(&self.moved_from)
-            + vcap(&self.control_regions)
-            + vcap(&self.param_regions)
-            + vcap(&self.macro_defs)
-            + vcap(&self.domain_sites)
-            + vcap(&self.plugin_loads)
             + vcap(&self.loader_config_params)
             + vcap(&self.package_ranges);
 
         // per-package small maps/sets + export lists.
-        h.misc = pkg_facts(&self.packages)
-            + map_str_vec(&self.template_params)
+        h.misc += pkg_facts(&self.packages)
             + map_str_vec(&self.export_tags)
-            + mcap(&self.specializes)
             + mcap(&self.type_provenance)
             + scap(&self.framework_imports)
             + scap(&self.reassigned_scalars)
             + scap(&self.column_keyed_verbs)
             + vcap(&self.export)
             + vcap(&self.export_ok)
-            + vcap(&self.reexport_modules)
-            + vcap(&self.receiver_names)
-            + vcap(&self.app_surface_consumers)
-            + vcap(&self.plugin_namespaces);
+            + vcap(&self.reexport_modules);
 
         h
     }

@@ -2022,7 +2022,7 @@ void b(struct op* o) { if (o->op_type == OP_SCOPE) { } }
 ";
     let fa = cpp_skel(src).into_file_analysis();
     // Both comparison sites captured as raw domain evidence.
-    assert_eq!(fa.domain_sites.len(), 2, "sites: {:?}", fa.domain_sites);
+    assert_eq!(fa.pack.domain_sites.len(), 2, "sites: {:?}", fa.pack.domain_sites);
     // The slot's usage-recovered domain is the enum, folded over ≥2 functions,
     // owner resolved to the declaring struct.
     let dom = fa
@@ -2056,7 +2056,7 @@ void c(struct op* o) { if (o->op_type == OP_CONST) { } }
     // ALL three interactions are sites — the `== 0` / `== 1` number-literal
     // operands are counter-evidence (value capture is ungated), so the one
     // enum site is 1/3: below the strict majority over the honest total.
-    assert_eq!(fa.domain_sites.len(), 3, "sites: {:?}", fa.domain_sites);
+    assert_eq!(fa.pack.domain_sites.len(), 3, "sites: {:?}", fa.pack.domain_sites);
     assert_eq!(fa.field_domain_for_owner("op", "op_type", None), None);
 }
 
@@ -2270,8 +2270,8 @@ template <typename T> struct formatter<T*, char> { int fmt_partial(); };
     assert_eq!(member("fmt_partial").package.as_deref(), Some("formatter<T*, char>"));
     assert_eq!(member("parse").package.as_deref(), Some("formatter"));
     // the family edges (spec → primary), NEVER an inheritance edge
-    assert_eq!(fa.specializes.get("formatter<int, char>").map(String::as_str), Some("formatter"));
-    assert_eq!(fa.specializes.get("formatter<T*, char>").map(String::as_str), Some("formatter"));
+    assert_eq!(fa.pack.specializes.get("formatter<int, char>").map(String::as_str), Some("formatter"));
+    assert_eq!(fa.pack.specializes.get("formatter<T*, char>").map(String::as_str), Some("formatter"));
     assert!(
         fa.declared_parents("formatter<int, char>").is_empty(),
         "specialization is not inheritance — member resolution must not fall through"
@@ -2398,7 +2398,7 @@ template auto thousands_sep_impl(int loc) -> int;
         .iter()
         .any(|s| s.name == "thousands_sep_impl" && matches!(s.kind, SymKind::Sub)));
     // an instantiation is NOT a specialization — no family edge
-    assert!(!fa.specializes.contains_key("Buf<int>"));
+    assert!(!fa.pack.specializes.contains_key("Buf<int>"));
     // signature params live in a sub-body scope, out of the outline
     for leak in ["n2", "loc"] {
         let sym = fa.symbols().iter().find(|s| s.name == leak).unwrap();
@@ -2544,12 +2544,12 @@ fn cpp_template_params_extract_in_declaration_order() {
          template <typename T> struct fmtr<vector<T>, char> { T front(); };\n",
     );
     assert_eq!(
-        fa.template_params.get("Box"),
+        fa.pack.template_params.get("Box"),
         Some(&vec!["T".to_string(), "U".to_string()]),
         "primary params, declaration order (defaulted param included)"
     );
     assert_eq!(
-        fa.template_params.get("fmtr<vector<T>, char>"),
+        fa.pack.template_params.get("fmtr<vector<T>, char>"),
         Some(&vec!["T".to_string()]),
         "a partial spec keys its params under the canonical spelling"
     );

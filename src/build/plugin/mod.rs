@@ -449,7 +449,7 @@ pub enum EmitAction {
     },
     /// Emit a diagnostic at a span — the pluggable-lint channel. A
     /// pattern selects the sites, `on_match` decides, and the
-    /// diagnostic rides `FileAnalysis.plugin_diagnostics` into the
+    /// diagnostic rides `FileAnalysis.plugin.diagnostics` into the
     /// same publish path as native diagnostics (cache-durable, so
     /// workspace `--check` sees plugin lints on cached files too).
     /// `severity`: `"error"` / `"warning"` / `"info"`, anything else
@@ -490,7 +490,7 @@ pub enum EmitAction {
     /// Declare a plugin namespace — a scope the plugin owns, with
     /// bridges describing how Perl-space expressions reach it. The
     /// builder collects namespaces declared via this action and
-    /// places them in `FileAnalysis.plugin_namespaces`; lookups
+    /// places them in `FileAnalysis.plugin.namespaces`; lookups
     /// union entities from every namespace whose bridges match the
     /// Perl class at the cursor.
     ///

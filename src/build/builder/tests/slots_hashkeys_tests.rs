@@ -136,7 +136,7 @@ fn slot_type(fa: &FileAnalysis, class: &str, key: &str) -> Option<InferredType> 
         package_framework: &fa.packages,
         module_index: None,
         package_parents: &fa.packages,
-        app_surface_consumers: &fa.app_surface_consumers,
+        app_surface_consumers: &fa.plugin.app_surface_consumers,
     };
     let q = ReducerQuery {
         args: Vec::new(),        attachment: &att,
@@ -1105,13 +1105,13 @@ fn plugin_loads_recorded_trigger_independent_and_multivalue() {
     let mut parser = create_parser();
     let tree = parser.parse(src, None).unwrap();
     let fa = build(&tree, src.as_bytes());
-    let mut loads: Vec<String> = fa.plugin_loads.iter().map(|f| f.name.clone()).collect();
+    let mut loads: Vec<String> = fa.plugin.loads.iter().map(|f| f.name.clone()).collect();
     loads.sort();
     assert_eq!(
         loads,
         vec!["ExportTasks", "FeatureFlags", "Gizmos", "ImportTasks", "SheetReaders"],
         "all three forms (literal, qw-loop, folded constant) recorded; got {:?}",
-        fa.plugin_loads,
+        fa.plugin.loads,
     );
     let _ = SymKind::Sub;
 }

@@ -1337,7 +1337,7 @@ $app->helper('users.create' => sub { my ($c) = @_; });
     // bridging to the app surface", not "a plugin literally called
     // mojo-helpers emits it".
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| {
             n.kind == "app"
@@ -1368,7 +1368,7 @@ $app->helper('users.create' => sub { my ($c) = @_; });
     // for MyApp regardless of how many helpers it registers. Scope
     // the count to this namespace's own (plugin_id, id) pair.
     let count = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
         .count();
@@ -1395,9 +1395,9 @@ get '/home' => sub { my $c = shift; };
     // The namespace data is still there for bridge queries — that's
     // how `$c->current_user` resolves to the helper across files.
     assert!(
-        fa.plugin_namespaces.iter().any(|n| n.kind == "app"),
+        fa.plugin.namespaces.iter().any(|n| n.kind == "app"),
         "app namespace should still exist in FileAnalysis; got: {:?}",
-        fa.plugin_namespaces
+        fa.plugin.namespaces
             .iter()
             .map(|n| &n.id)
             .collect::<Vec<_>>()
@@ -1459,7 +1459,7 @@ sub register {
     let fa = build_fa(src);
 
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| n.kind == "events" && n.bridges.contains(&Bridge::Class("My::Emitter".into())))
         .expect("an `events` namespace must bridge My::Emitter");
@@ -1479,7 +1479,7 @@ sub register {
     }
 
     let count = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
         .count();
@@ -1513,7 +1513,7 @@ sub startup {
     // the Controller#action form, distinguishing from the Lite
     // path-based flavor.
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| {
             n.kind == "routes"
@@ -1544,7 +1544,7 @@ sub startup {
     );
 
     let count = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
         .count();
@@ -1571,7 +1571,7 @@ post '/login' => sub { my $c = shift; };
     let fa = build_fa(src);
 
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| {
             n.kind == "routes"
@@ -1620,7 +1620,7 @@ $minion->add_task(resize_image => sub { my ($job) = @_; });
     let fa = build_fa(src);
 
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| n.kind == "tasks" && n.bridges.contains(&Bridge::Class("Minion".into())))
         .expect("a `tasks` namespace must bridge Minion");
@@ -1642,7 +1642,7 @@ $minion->add_task(resize_image => sub { my ($job) = @_; });
     );
 
     let count = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .filter(|n| n.plugin_id == ns.plugin_id && n.id == ns.id)
         .count();

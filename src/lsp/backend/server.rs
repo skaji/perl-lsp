@@ -521,7 +521,7 @@ impl LanguageServer for Backend {
                 // sits outside the CandidateSet and still needs this file's
                 // closure scope; the set scopes itself at construction.
                 let scoped = crate::model::file_analysis::ScopedLookup::new(
-                    base_idx, &analysis.include_closure, self_path.as_deref());
+                    base_idx, &analysis.pack.include_closure, self_path.as_deref());
                 if let Some((target, span, _)) =
                     cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
                 {
@@ -766,7 +766,7 @@ impl LanguageServer for Backend {
                 // — show its definition line.
                 let self_path = uri.to_file_path().ok();
                 let scoped = crate::model::file_analysis::ScopedLookup::new(
-                    base_idx, &analysis.include_closure, self_path.as_deref());
+                    base_idx, &analysis.pack.include_closure, self_path.as_deref());
                 if let Some((_, _, line)) =
                     cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
                 {
@@ -1110,7 +1110,7 @@ impl LanguageServer for Backend {
                 // Plugin namespaces — match on both id and kind so users
                 // can find "the minion tasks in this workspace" via either
                 // "minion" or "tasks".
-                for ns in &analysis.plugin_namespaces {
+                for ns in &analysis.plugin.namespaces {
                     let hay = format!("{} {}", ns.id.to_lowercase(), ns.kind.to_lowercase());
                     if hay.contains(&query) {
                         results.push(symbols::plugin_namespace_to_workspace_info(ns, uri.clone()));

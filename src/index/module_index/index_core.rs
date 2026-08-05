@@ -167,7 +167,7 @@ impl IndexCore {
             v.retain(|(c, _)| c != contributor);
             !v.is_empty()
         });
-        for f in &analysis.plugin_loads {
+        for f in &analysis.plugin.loads {
             let Some(span) = f.config_span else { continue };
             if let Some(t) = analysis.expr_type_at_span(span, None) {
                 self.loader_config_shapes

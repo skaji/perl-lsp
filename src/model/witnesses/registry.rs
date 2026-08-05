@@ -338,7 +338,7 @@ impl ReducerRegistry {
                                     package_framework: &full.packages,
                                     module_index: Some(idx),
                                     package_parents: &full.packages,
-                                    app_surface_consumers: &full.app_surface_consumers,
+                                    app_surface_consumers: &full.plugin.app_surface_consumers,
                                 };
                                 let sub_q = ReducerQuery {
                                     attachment: q.attachment,
@@ -474,7 +474,7 @@ impl ReducerRegistry {
                                     package_framework: &full.packages,
                                     module_index: Some(idx),
                                     package_parents: &full.packages,
-                                    app_surface_consumers: &full.app_surface_consumers,
+                                    app_surface_consumers: &full.plugin.app_surface_consumers,
                                 };
                                 let sub_q = ReducerQuery {
                                     attachment: q.attachment,
@@ -562,7 +562,7 @@ impl ReducerRegistry {
                                 package_framework: &full.packages,
                                 module_index: Some(idx),
                                 package_parents: &full.packages,
-                                app_surface_consumers: &full.app_surface_consumers,
+                                app_surface_consumers: &full.plugin.app_surface_consumers,
                             };
                             let sub_q = ReducerQuery {
                                 attachment: q.attachment,

@@ -1126,7 +1126,7 @@ impl FileAnalysis {
                     // `fmt::f` mint distinct targets. Perl attribution is
                     // total (closure empty → untouched).
                     package: sym.package.clone().or_else(|| {
-                        (!self.include_closure.is_empty())
+                        (!self.pack.include_closure.is_empty())
                             .then(|| self.enclosing_package_of(&sym.span))
                             .flatten()
                     }),

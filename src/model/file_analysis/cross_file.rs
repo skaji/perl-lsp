@@ -540,7 +540,7 @@ pub trait CrossFileLookup {
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)>;
     /// Template specializations of `primary` as (spec, module) pairs — the
     /// cross-file half of the graph's `Specializes` family edge (the local
-    /// half reads `FileAnalysis.specializes`). Default: none (the Perl hub
+    /// half reads `FileAnalysis.pack.specializes`). Default: none (the Perl hub
     /// and language-less impls have no specialization index).
     fn direct_specializations_of(&self, _primary: &str) -> Vec<(String, String)> {
         Vec::new()

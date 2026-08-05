@@ -321,7 +321,7 @@ pub fn index_pack_languages(
                                 conn,
                                 &path_str,
                                 &e.path,
-                                &e.arc.include_closure,
+                                &e.arc.pack.include_closure,
                                 &e.blob,
                                 "workspace",
                                 e.stamp,

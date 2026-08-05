@@ -310,7 +310,7 @@ $app->helper(current_user => sub {
     // consumer classes reach it via the synthetic-parent edge in core,
     // not via a per-helper bridge list.
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| n.plugin_id == "mojo-helpers" && n.entities.contains(&helper.id))
         .expect("helper belongs to a mojo-helpers namespace");
@@ -965,7 +965,7 @@ $r->get('/users')->to('Users#list')->name('users_list');
     // to the declaring package, so cross-file `url_for('users_list')`
     // from other files in the workspace resolves.
     let ns = fa
-        .plugin_namespaces
+        .plugin.namespaces
         .iter()
         .find(|n| n.plugin_id == "mojo-routes" && n.entities.contains(&sym.id));
     assert!(

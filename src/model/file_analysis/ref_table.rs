@@ -205,9 +205,6 @@ impl RefTable {
     /// deep target-name strings) and the table's share of the rebuilt
     /// indices bucket. See [`HeapBreakdown`].
     pub fn heap_add(&self, h: &mut HeapBreakdown) {
-        fn mcap<K, V>(m: &HashMap<K, V>) -> usize {
-            m.capacity() * (std::mem::size_of::<(K, V)>() + 1)
-        }
         h.refs += self.refs.capacity() * std::mem::size_of::<Ref>()
             + self
                 .refs

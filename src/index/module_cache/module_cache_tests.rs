@@ -96,7 +96,7 @@ fn test_db_plugin_namespaces_roundtrip() {
 
     let source = std::fs::read_to_string(&pm).unwrap();
     let cached = Some(parse_source_to_cached(&source, &pm));
-    let original_ns_count = cached.as_ref().unwrap().analysis.plugin_namespaces.len();
+    let original_ns_count = cached.as_ref().unwrap().analysis.plugin.namespaces.len();
     assert!(
         original_ns_count > 0,
         "sanity: fixture must produce at least one PluginNamespace"
@@ -111,7 +111,7 @@ fn test_db_plugin_namespaces_roundtrip() {
 
     let loaded = cache.get("TestMojoApp").unwrap();
     let loaded = loaded.as_ref().unwrap();
-    let loaded_ns = &loaded.analysis.plugin_namespaces;
+    let loaded_ns = &loaded.analysis.plugin.namespaces;
     assert_eq!(
         loaded_ns.len(),
         original_ns_count,
@@ -378,7 +378,7 @@ fn header_change_invalidates_consumer_row_via_deps_stamp() {
     parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
     let tree = parser.parse(&source, None).unwrap();
     let mut fa = crate::build::builder::build(&tree, source.as_bytes());
-    fa.include_closure =
+    fa.pack.include_closure =
         crate::model::file_analysis::path_intern::ClosureList::from_iter(std::iter::once(hdr_canon.as_str()));
     let cached = Some(Arc::new(CachedModule::new(pm.clone(), Arc::new(fa))));
     // warm_cache serves the 'import' tier ('workspace' rows stream through
@@ -922,13 +922,13 @@ fn refresh_deps_stamp_revalidates_consumer_rows() {
     // A consumer row whose closure contains the header.
     let cached = parse_source_to_cached("1;\n", &consumer);
     let mut fa = (*cached.analysis).clone();
-    fa.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+    fa.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
         [header.to_string_lossy()].iter().map(|s| s.as_ref()),
     );
     let blob = encode_analysis(&fa).unwrap();
     let consumer_str = consumer.to_string_lossy().into_owned();
     let stamp = file_stamp(&consumer).unwrap_or((0, 0));
-    save_blob_to_db_stamped(&conn, &consumer_str, &consumer, &fa.include_closure, &blob, "workspace", stamp);
+    save_blob_to_db_stamped(&conn, &consumer_str, &consumer, &fa.pack.include_closure, &blob, "workspace", stamp);
     let stored: i64 = conn
         .query_row("SELECT deps_stamp FROM modules WHERE path=?1", params![consumer_str], |r| r.get(0))
         .unwrap();
@@ -937,7 +937,7 @@ fn refresh_deps_stamp_revalidates_consumer_rows() {
     std::thread::sleep(std::time::Duration::from_millis(1100));
     std::fs::write(&header, "int helper(void); /* body-ish edit */\n").unwrap();
     let mut memo = std::collections::HashMap::new();
-    refresh_deps_stamp(&conn, &consumer_str, &fa.include_closure, &mut memo);
+    refresh_deps_stamp(&conn, &consumer_str, &fa.pack.include_closure, &mut memo);
     let refreshed: i64 = conn
         .query_row("SELECT deps_stamp FROM modules WHERE path=?1", params![consumer_str], |r| r.get(0))
         .unwrap();
@@ -945,7 +945,7 @@ fn refresh_deps_stamp_revalidates_consumer_rows() {
 
     // And it now matches a fresh recompute (what the next warm scan checks).
     let mut memo2 = std::collections::HashMap::new();
-    let expect = closure_stamp(&fa.include_closure, &mut memo2);
+    let expect = closure_stamp(&fa.pack.include_closure, &mut memo2);
     assert_eq!(refreshed, expect);
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -101,7 +101,7 @@ pub fn query_sub_return_type(
                     package_framework: &full.packages,
                     module_index: Some(idx),
                     package_parents: &full.packages,
-                    app_surface_consumers: &full.app_surface_consumers,
+                    app_surface_consumers: &full.plugin.app_surface_consumers,
                 };
                 let att = WitnessAttachment::Symbol(sym.id);
                 let q = ReducerQuery {
@@ -166,7 +166,7 @@ pub fn query_sub_return_type(
                     // so gate BEFORE rehydrating — an unreachable candidate
                     // never pays a bag decode.
                     let reachable = visible.contains(p.as_ref())
-                        || cached.analysis.include_closure.contains(self_str.as_ref());
+                        || cached.analysis.pack.include_closure.contains(self_str.as_ref());
                     if !reachable {
                         continue;
                     }
@@ -187,7 +187,7 @@ pub fn query_sub_return_type(
                         package_framework: &full.packages,
                         module_index: Some(idx),
                         package_parents: &full.packages,
-                        app_surface_consumers: &full.app_surface_consumers,
+                        app_surface_consumers: &full.plugin.app_surface_consumers,
                     };
                     let att = WitnessAttachment::Symbol(sym.id);
                     let q = ReducerQuery {

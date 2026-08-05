@@ -336,7 +336,7 @@ pub fn refs_to(
             idx.for_each_cached_file(&mut |cached| {
                 let own = cached.path.to_string_lossy();
                 if file_sees_target_ids(target, &target_def_ids, &cached.analysis, &own) {
-                    seen_by_inclusion.extend(cached.analysis.include_closure.iter_strs().map(|a| a.as_ref().to_owned()));
+                    seen_by_inclusion.extend(cached.analysis.pack.include_closure.iter_strs().map(|a| a.as_ref().to_owned()));
                 }
             });
         }
@@ -773,7 +773,7 @@ pub fn implementations_of(
 
 /// The specialization family of primary template `name`: every spec class's
 /// def site, cross-file. Spec NAMES come off the graph's `Specializes` edges
-/// (local `FileAnalysis.specializes` + the index's spec map); def sites
+/// (local `FileAnalysis.pack.specializes` + the index's spec map); def sites
 /// resolve through the by-name index (spec Class symbols are indexed under
 /// their canonical spelling). `rewritable: false` — a spec's selection span
 /// is the whole `X<args>` spelling; renaming the primary rewrites the base
@@ -864,7 +864,7 @@ pub(super) fn delegation_aliases(
     // (alias name, delegate, canonical path of the #define)
     let mut pairs: Vec<(String, String, String)> = Vec::new();
     let mut add = |a: &FileAnalysis, path: &str| {
-        for m in &a.macro_defs {
+        for m in &a.pack.macro_defs {
             if let Some(d) = &m.delegate {
                 pairs.push((m.name.clone(), d.clone(), path.to_string()));
             }

@@ -18,6 +18,10 @@ mod ref_table;
 pub use ref_table::*;
 mod symbol_table;
 pub use symbol_table::*;
+mod pack_facts;
+pub use pack_facts::*;
+mod plugin_facts;
+pub use plugin_facts::*;
 mod types;
 pub use types::*;
 mod dispatch;
@@ -71,39 +75,17 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub package_ranges: Vec<PackageRange>,
 
-    /// Plugin-emitted diagnostics (`EmitAction::Diagnostic` from a
-    /// pattern's `on_match`). `collect_diagnostics` converts them to
-    /// LSP diagnostics alongside the native channels; provenance rides
-    /// on `plugin_id` (surfaced as the diagnostic source).
+    /// Everything a pack driver recorded that Perl has no analog for —
+    /// macros, the include graph, template parameters, move tracking.
+    /// Empty for a Perl analysis.
     #[serde(default)]
-    pub plugin_diagnostics: Vec<PluginDiagnostic>,
+    pub pack: PackFacts,
 
-    /// The language's method-RECEIVER param names (Python `self`/`cls`),
-    /// from the LangPack. A receiver is lexically inside the class so the
-    /// sticky context tags it, but it is NOT a member — member completion
-    /// and the outline exclude these names. Empty for Perl (its receiver
-    /// convention lives in `conventions.rs`).
+    /// Everything the plugin registry contributed — declared namespaces,
+    /// loader facts, emitted diagnostics, deferred emissions, app-surface
+    /// consumers.
     #[serde(default)]
-    pub receiver_names: Vec<String>,
-
-    /// Template-specialization family edges: canonical spec spelling
-    /// (`formatter<int, char>`) → primary base name (`formatter`). NOT an
-    /// inheritance edge — a spec REPLACES the primary wholesale (its member
-    /// table is its own), so member resolution never falls through it; only
-    /// the graph's `Specializes` family view (goto-implementation) traverses.
-    #[serde(default)]
-    pub specializes: HashMap<String, String>,
-
-    /// Per-class template parameter names, in declaration order — primary
-    /// templates keyed by base name (`Box` → `["T"]`), partial specs by
-    /// their canonical spelling (`formatter<vector<T>>` → `["T"]`). The
-    /// substitution axis instantiation-aware typing reads: a member type
-    /// naming a param resolves against the receiver `Instance`'s args at
-    /// the param's index (methods via `ParametricOp::ParamOf`, fields via
-    /// `substitute_type_params`). A full spec (`template<>`) has no
-    /// params, so its members never substitute — correct by construction.
-    #[serde(default)]
-    pub template_params: HashMap<String, Vec<String>>,
+    pub plugin: PluginFacts,
 
     /// Everything this file records about each of its packages, one entry
     /// per package name. Ancestry, the plugin trigger view, the framework
@@ -111,15 +93,6 @@ pub struct FileAnalysis {
     /// join is a single lookup.
     #[serde(default)]
     pub packages: HashMap<String, PackageFacts>,
-
-    /// Manifest-declared app-surface consumer classes
-    /// (`FrameworkPlugin::app_surface_consumers`), baked from the plugin
-    /// registry at build so the query-time ancestor walk can inject the
-    /// synthetic `APP_SURFACE_CLASS` parent (`parents_of`) without
-    /// re-reading the registry. `#[serde(default)]` so older cache blobs
-    /// deserialize as empty.
-    #[serde(default)]
-    pub app_surface_consumers: Vec<String>,
 
     /// Functions implicitly imported by OOP frameworks (e.g. `has`, `extends`, `with`).
     /// Used to suppress "not defined" diagnostics for these known framework keywords.
@@ -146,14 +119,6 @@ pub struct FileAnalysis {
     /// edge-walk). Runtime `import`-delegation is deliberately unmodeled.
     #[serde(default)]
     pub reexport_modules: Vec<String>,
-
-    /// Plugin-declared namespaces. Each is a scope managed by a plugin
-    /// (a Mojolicious app, a Minion instance, an event-emitter subclass,
-    /// …). Declares bridges into Perl-space and owns a set of entities.
-    /// Lookups union these with native Perl resolution — see
-    /// `ModuleIndex::for_each_entity_bridged_to` for the cross-file primitive.
-    #[serde(default)]
-    pub plugin_namespaces: Vec<PluginNamespace>,
 
     /// Per-symbol provenance for return types. Populated for plugin
     /// `overrides()` and for reducer-driven folds over the witness bag.
@@ -200,14 +165,6 @@ pub struct FileAnalysis {
     /// without that check. See `docs/adr/receiver-gated-dispatch.md`.
     #[serde(default)]
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
-
-    /// Plugin pattern emissions deferred because a `ClassIsa` trigger
-    /// couldn't be confirmed against LOCAL-only ancestry at build (rule #1).
-    /// Re-fired by `enrich_imported_types_with_keys` when the package's
-    /// cross-file ancestry resolves a gate prefix — the emission analog of
-    /// `provisional_dispatches`. See `GatedEmission`.
-    #[serde(default)]
-    pub gated_emissions: Vec<GatedEmission>,
 
     /// Guard conditions recognized by the narrowing engine, recorded for the
     /// redundant/contradictory-guard diagnostics (D3/D4). Open-doc only in
@@ -287,11 +244,6 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub dynamic_dispatch_sites: u32,
 
-    /// Caller-side loader facts: this file loads plugin `name` and
-    /// passes the value at `config_span`. Joined at enrichment with
-    /// the loaded module's `loader_config_params` markers.
-    #[serde(default)]
-    pub plugin_loads: Vec<PluginLoadFact>,
     /// Callee-side markers: params whose type arrives from loader
     /// config (the `from_loader_config` ParamType flavor).
     #[serde(default)]
@@ -300,48 +252,6 @@ pub struct FileAnalysis {
     /// extraction. The general provenance tier above the type witness bag.
     #[serde(default)]
     pub flow_edges: Vec<FlowEdge>,
-
-    /// `std::move(x)` sites: (moved var name, move-call span, enclosing scope).
-    /// A read of the var after the call and before its next rebind is a
-    /// use-after-move bug — see `use_after_move_reads`.
-    #[serde(default)]
-    pub moved_from: Vec<(String, Span, ScopeId)>,
-
-    /// Control-flow construct spans (`if`/`while`/`for`/`switch`/ternary/preproc
-    /// conditionals). `use_after_move_reads` reads these for its straight-line
-    /// gate (gate C): a move nested in one of these, relative to its enclosing
-    /// scope, is not straight-line and is not flagged.
-    #[serde(default)]
-    pub control_regions: Vec<Span>,
-
-    /// Parameter-list spans. `use_after_move_reads` gate E: a move of a variable
-    /// declared inside one of these (a parameter) is not flagged — a moved
-    /// parameter is a forwarding / subobject-move idiom this tier can't tell
-    /// from a bug.
-    #[serde(default)]
-    pub param_regions: Vec<Span>,
-
-    /// Every `#define` in this file — the macro identity/navigation lane. One
-    /// entry per `#define` (config variants share a name). Goto-def consults
-    /// this to prefer the `#define` over a use's self-span, rank variants, and
-    /// see through delegation wrappers. Pack-language only; Perl leaves it empty.
-    #[serde(default)]
-    pub macro_defs: Vec<MacroDef>,
-
-    /// `#include "x.h"` / `<x.h>` directives: (path-token span, raw path text).
-    /// Goto-def on the path token resolves the header like `use` resolves a
-    /// module. Pack-language only; Perl leaves it empty.
-    #[serde(default)]
-    pub include_directives: Vec<(Span, String)>,
-
-    /// This file's transitive `#include` closure — canonical header paths it
-    /// reaches. The cross-file VISIBILITY key: a name resolves preferentially to
-    /// a definition in a file this set contains (`ScopedLookup` ranks
-    /// `get_cached` candidates by reachability; `docs/adr/macro-handling.md`,
-    /// "the include-closure lie"). Pack-language only; Perl leaves it empty, so
-    /// the ranking is a no-op there (empty closure → global winner unchanged).
-    #[serde(default)]
-    pub include_closure: path_intern::ClosureList,
 
     /// This analysis was produced from degraded inputs — a parse/extract
     /// failure, or a skipped cross-file macro gather (the on-open
@@ -361,17 +271,6 @@ pub struct FileAnalysis {
     /// field (serde default).
     #[serde(default = "default_language")]
     pub language: String,
-
-    /// Raw domain-typing sites: each `slot`-field access that interacts
-    /// with a `value` token (`slot == V`, `slot = V`) at `slot_span`. The
-    /// value's enum is resolved cross-file at query time (an enumerator
-    /// carries its `enum`), then the sites fold onto the language-generic
-    /// `Field{owner, name}` subject via `DomainCoherenceFold`. Stored raw
-    /// (not pre-resolved) because both the slot owner AND the value's enum
-    /// are cross-file for the perl5 `op_type`/`opcode` case — resolution
-    /// belongs where the module index is in hand. Pack-language only.
-    #[serde(default)]
-    pub domain_sites: Vec<DomainSite>,
 
     // Indices (built in post-pass — skipped by serde; call rebuild_all_indices() after deserialize)
     #[serde(skip, default)]

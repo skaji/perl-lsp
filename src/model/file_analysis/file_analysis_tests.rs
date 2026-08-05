@@ -2170,9 +2170,9 @@ fn loader_config_types_register_conf_cross_file() {
         let tree = parser.parse(app_src, None).unwrap();
         let fa = crate::build::builder::build(&tree, app_src.as_bytes());
         assert!(
-            fa.plugin_loads.iter().any(|f| f.name == "CloveApp" && f.config_span.is_some()),
+            fa.plugin.loads.iter().any(|f| f.name == "CloveApp" && f.config_span.is_some()),
             "the lite plugin arm should record the loader fact: {:?}",
-            fa.plugin_loads,
+            fa.plugin.loads,
         );
         idx.register_workspace_module(
             std::path::PathBuf::from("/fake/conf/app.pl.pm-shim"),

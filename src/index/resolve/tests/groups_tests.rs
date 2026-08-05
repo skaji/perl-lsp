@@ -1635,7 +1635,7 @@ mod pack_symmetry {
 
         let header = cpp(header_src);
         let mut user = cpp(use_src);
-        user.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        user.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             std::iter::once("/fake/vis/def.h"),
         );
         let user_bare = cpp(use_src); // same tokens, no closure
@@ -1756,7 +1756,7 @@ mod pack_symmetry {
         let header_src = "extern struct GS g_state;\n";
         let header = cpp(header_src);
         let mut tu = cpp("struct GS g_state;\n");
-        tu.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        tu.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             std::iter::once("/fake/dd/state.h"),
         );
         let idx = crate::index::module_index::ModuleIndex::new_for_test();
@@ -1805,11 +1805,11 @@ mod pack_symmetry {
 
         let header = cpp(header_src);
         let mut def_tu = cpp(def_src);
-        def_tu.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        def_tu.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             std::iter::once("/fake/mt/memtable.h"),
         );
         let mut caller = cpp(caller_src);
-        caller.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        caller.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             std::iter::once("/fake/mt/memtable.h"),
         );
 
@@ -1880,12 +1880,12 @@ mod pack_symmetry {
         use std::sync::Arc;
         let def_src = "int compute_thing(int n) { return n; }\n";
         let mut def_tu = cpp(def_src);
-        def_tu.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        def_tu.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             std::iter::once("/fake/inc/lib.h"),
         );
         let header = cpp("int compute_thing(int n);\n");
         let mut host = cpp("int a(void) { return compute_thing(1); }\n");
-        host.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        host.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             ["/fake/inc/lib.h", "/fake/inc/frag.c"].into_iter(),
         );
         // The fragment: same call, EMPTY closure (compiled only by textual
@@ -1949,7 +1949,7 @@ mod pack_symmetry {
 
         let header = cpp(header_src);
         let mut user = cpp(use_src);
-        user.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
+        user.pack.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
             std::iter::once(header_path.to_string_lossy().as_ref()),
         );
 

@@ -37,7 +37,7 @@ pub struct ModuleEdgeIndexes {
     pub(super) bridges: DashMap<String, Vec<String>>,
     pub(super) children: DashMap<String, Vec<String>>,
     /// primary template → modules declaring a specialization of it (inverse
-    /// `FileAnalysis.specializes`). The `Specializes` family edge's
+    /// `FileAnalysis.pack.specializes`). The `Specializes` family edge's
     /// cross-file half; member resolution never reads it.
     pub(super) specs: DashMap<String, Vec<String>>,
     /// The indexable-name list each module last fed — the symbols-derived
@@ -153,7 +153,7 @@ impl ModuleEdgeIndexes {
     /// The bridge classes an analysis' plugin namespaces declare, deduped.
     fn bridge_classes(analysis: &FileAnalysis) -> Vec<String> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for ns in &analysis.plugin_namespaces {
+        for ns in &analysis.plugin.namespaces {
             for crate::model::file_analysis::Bridge::Class(c) in &ns.bridges {
                 seen.insert(c.clone());
             }
@@ -165,7 +165,7 @@ impl ModuleEdgeIndexes {
     /// `specializes`, deduped.
     fn spec_primaries(analysis: &FileAnalysis) -> Vec<String> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for primary in analysis.specializes.values() {
+        for primary in analysis.pack.specializes.values() {
             seen.insert(primary.clone());
         }
         seen.into_iter().collect()

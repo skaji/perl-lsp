@@ -51,16 +51,38 @@ impl FileAnalysis {
             // so a new per-package fact is a compile error there.
             packages,
             imports,
-            plugin_loads,
             export,
             export_ok,
             export_tags,
             reexport_modules,
-            plugin_namespaces,
-            app_surface_consumers,
-            macro_defs,
-            include_directives,
             dbic_source_name,
+
+            // The pack and plugin lanes, destructured exhaustively for the
+            // same reason the outer struct is: a new pack/plugin fact is a
+            // compile error here until its Surface fate is decided.
+            pack:
+                PackFacts {
+                    macro_defs,
+                    include_directives,
+                    // File-internal pack lanes: read LIVE from the
+                    // provider's re-registered analysis per query.
+                    receiver_names: _receiver_names, // LangPack-wide convention, identical across the pack's files
+                    specializes: _specializes,       // family edges; the file re-registers on its own rebuild even when Unchanged
+                    template_params: _template_params, // instantiation substitution reads the provider live
+                    include_closure: _include_closure, // this file's OWN visibility ranking key; its freshness lane is the closure dep-stamp (`closure_stamp`)
+                    domain_sites: _domain_sites,     // raw sites; domains resolve live at query time
+                    moved_from: _moved_from,         // own-file use-after-move input
+                    control_regions: _control_regions, // own-file straight-line gate spans
+                    param_regions: _param_regions,   // own-file parameter-region spans
+                },
+            plugin:
+                PluginFacts {
+                    namespaces: plugin_namespaces,
+                    loads: plugin_loads,
+                    app_surface_consumers,
+                    diagnostics: _plugin_diagnostics, // own-file diagnostics presentation
+                    gated_emissions: _gated_emissions, // re-fired by this file's OWN enrichment
+                },
 
             // ---- Projection inputs consumed through the derived-query
             // handle: their cross-file-visible conclusions land in
@@ -84,16 +106,10 @@ impl FileAnalysis {
             key_writes: _key_writes,             // own-file mutation-extension input; resulting shapes surface via `ret`
             reassigned_scalars: _reassigned_scalars, // own-file shape trust gate
             flow_edges: _flow_edges,             // own-file value provenance
-            moved_from: _moved_from,             // own-file use-after-move input
-            control_regions: _control_regions,   // own-file straight-line gate spans
-            param_regions: _param_regions,       // own-file parameter-region spans
-            domain_sites: _domain_sites,         // raw sites; domains resolve live at query time
-            plugin_diagnostics: _plugin_diagnostics, // own-file diagnostics presentation
 
             // ---- Consumer-side / own-file enrichment inputs and local
             // policy state: they shape THIS file's answers, not what
             // another file's cached state observes of this file.
-            gated_emissions: _gated_emissions,   // re-fired by this file's OWN enrichment
             gated_param_types: _gated_param_types, // types this file's own params, query-gated
             provisional_dispatches: _provisional_dispatches, // this file's call-site candidates; foreign readers resolve them live
             loader_config_params: _loader_config_params, // callee markers joined by this file's OWN enrichment
@@ -101,13 +117,9 @@ impl FileAnalysis {
             type_provenance: _type_provenance,   // read-only debugging aid (`--dump-package`)
             contract_symbols: _contract_symbols, // SymbolIds (banned from the Surface); the markers they tag project as methods
             column_keyed_verbs: _column_keyed_verbs, // baked from the plugin registry, not this file's source; the plugin fingerprint owns invalidation
-            receiver_names: _receiver_names,     // LangPack-wide convention, identical across the pack's files
             language: _language,                 // the origin's serving-language identity; `resolve()` reads it live per query, never baked into a consumer's cached state
             dynamic_dispatch_sites: _dynamic_dispatch_sites, // heatmap soundness counter, read live
-            specializes: _specializes,           // family edges read LIVE from the provider's re-registered analysis (the file re-registers on its own rebuild even when Unchanged)
-            template_params: _template_params,   // instantiation substitution reads the provider live at query time
             attr_projections: _attr_projections, // grouping metadata for live rename/reference queries; every member is a synthesized symbol already projected
-            include_closure: _include_closure,   // this file's OWN visibility ranking key; its freshness lane is the closure dep-stamp (`closure_stamp`), not the Surface
 
             // ---- Residency / lifecycle bookkeeping — no semantics.
             bag_evicted: _bag_evicted,

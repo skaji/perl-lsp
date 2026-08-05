@@ -87,7 +87,7 @@ pub fn collect_diagnostics(
     // Plugin-emitted diagnostics (pattern lints) — already decided at
     // build time; here they only render. Severity vocabulary is the
     // plugin's; unknown strings degrade to HINT rather than shouting.
-    for pd in &analysis.plugin_diagnostics {
+    for pd in &analysis.plugin.diagnostics {
         diagnostics.push(Diagnostic {
             range: span_to_range(pd.span),
             severity: Some(match pd.severity.as_str() {

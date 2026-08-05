@@ -192,7 +192,7 @@ impl<'a> GraphView<'a> {
                 EdgeKind::AppSurface => {
                     if let Some(s) = crate::model::file_analysis::app_surface_parent(
                         class,
-                        &self.fa.app_surface_consumers,
+                        &self.fa.plugin.app_surface_consumers,
                     ) {
                         out.push(Node::Class(s));
                     }
@@ -229,7 +229,7 @@ impl<'a> GraphView<'a> {
                     // Deterministic order — HashMap iteration is randomized.
                     let mut local: Vec<&String> = self
                         .fa
-                        .specializes
+                        .pack.specializes
                         .iter()
                         .filter(|(_, primary)| primary.as_str() == class)
                         .map(|(spec, _)| spec)

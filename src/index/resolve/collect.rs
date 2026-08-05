@@ -225,7 +225,7 @@ pub(crate) fn ranked_macro_variants(
             defined.insert(m.name.clone());
         }
     };
-    for m in &analysis.macro_defs {
+    for m in &analysis.pack.macro_defs {
         note(m, &mut defined, &mut universe);
         if m.name == word {
             push(m, origin_key, &mut sites);
@@ -235,7 +235,7 @@ pub(crate) fn ranked_macro_variants(
     // a file that lost every name tie.
     module_index.for_each_cached_file(&mut |cached| {
         let file_key = FileKey::Path(cached.path.clone());
-        for m in &cached.analysis.macro_defs {
+        for m in &cached.analysis.pack.macro_defs {
             note(m, &mut defined, &mut universe);
             if m.name == word {
                 push(m, &file_key, &mut sites);
@@ -454,7 +454,7 @@ pub(super) fn pack_def_paths(
         // targets.
         if c.analysis.names_macro_def(name, None)
             || visible.contains(&p)
-            || c.analysis.include_closure.contains(&self_str)
+            || c.analysis.pack.include_closure.contains(&self_str)
         {
             out.push(p);
         }
@@ -558,7 +558,7 @@ pub(super) fn symbol_defines_target(
             // analyses compare namespace-aware (`pkg_agrees`), recovering an
             // unattributed def's namespace positionally so a `detail::` def
             // still declares its `detail`-scoped target.
-            let relative = !analysis.include_closure.is_empty();
+            let relative = !analysis.pack.include_closure.is_empty();
             let recovered = match (sym.package.as_deref(), relative) {
                 (None, true) => analysis.enclosing_package_of(&sym.span),
                 _ => None,
@@ -633,7 +633,7 @@ pub(super) fn symbol_defines_target(
         TargetKind::FileScopeValue => {
             analysis.names_macro_def(&sym.name, Some(sym.selection_span))
                 || analysis.symbol_is_file_scope_value(sym)
-                || ((!analysis.include_closure.is_empty() || !analysis.macro_defs.is_empty())
+                || ((!analysis.pack.include_closure.is_empty() || !analysis.pack.macro_defs.is_empty())
                     && matches!(sym.kind, SymKind::Sub | SymKind::Method))
         }
     }
@@ -848,7 +848,7 @@ pub(super) fn file_sees_target_ids(
 ) -> bool {
     target.def_paths.is_empty()
         || target.def_paths.iter().zip(ids).any(|(d, id)| {
-            d == file_str || id.is_some_and(|id| analysis.include_closure.contains_id(id))
+            d == file_str || id.is_some_and(|id| analysis.pack.include_closure.contains_id(id))
         })
 }
 
@@ -881,7 +881,7 @@ pub(super) fn collect_from_analysis(
         .iter()
         .filter(|a| {
             a.def_path == file_str
-                || analysis.include_closure.contains(&a.def_path)
+                || analysis.pack.include_closure.contains(&a.def_path)
         })
         .collect();
 
@@ -893,11 +893,11 @@ pub(super) fn collect_from_analysis(
     // (empty closure = the plain index).
     let scoped_storage: Option<crate::model::file_analysis::ScopedLookup>;
     let module_index: Option<&dyn CrossFileLookup> = match module_index {
-        Some(idx) if !analysis.include_closure.is_empty() => {
+        Some(idx) if !analysis.pack.include_closure.is_empty() => {
             let path = key_for_sort(key);
             scoped_storage = Some(crate::model::file_analysis::ScopedLookup::new(
                 idx,
-                &analysis.include_closure,
+                &analysis.pack.include_closure,
                 Some(path.as_path()),
             ));
             // SAFETY: scoped_storage was just set to Some(..) on the line above,
@@ -924,7 +924,7 @@ pub(super) fn collect_from_analysis(
 
     // Pack (closure-carrying) files speak C++'s relative name lookup and may
     // carry only partial namespace attribution — `pkg_agrees` reads this.
-    let relative_ns = !analysis.include_closure.is_empty();
+    let relative_ns = !analysis.pack.include_closure.is_empty();
     // Bare unresolved reads count as uses of a Method target only when the
     // member is an enum-constant shape (its name hoists into the enclosing
     // scope). Receiver-reached members (struct fields, methods) are matched

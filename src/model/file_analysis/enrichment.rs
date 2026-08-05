@@ -117,13 +117,13 @@ impl FileAnalysis {
     /// ancestry known. Rule #10: the "should this synthesis apply?" question
     /// is answered by asking the ancestry graph, never by a shape branch.
     fn apply_gated_emissions(&mut self, module_index: Option<&dyn CrossFileLookup>) {
-        if self.gated_emissions.is_empty() {
+        if self.plugin.gated_emissions.is_empty() {
             return;
         }
         use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
-        // Snapshot: the borrow of `self.gated_emissions` can't overlap the
+        // Snapshot: the borrow of `self.plugin.gated_emissions` can't overlap the
         // `&mut self` symbol/ref/witness pushes below.
-        let emissions = std::mem::take(&mut self.gated_emissions);
+        let emissions = std::mem::take(&mut self.plugin.gated_emissions);
         for em in &emissions {
             let fires = em.gate_prefixes.iter().any(|prefix| {
                 class_isa_prefix(&em.package, prefix, &self.packages, module_index)
@@ -202,7 +202,7 @@ impl FileAnalysis {
                 });
             }
         }
-        self.gated_emissions = emissions;
+        self.plugin.gated_emissions = emissions;
     }
 
     /// Materialize deferred gated emissions into a WORKSPACE-resident cached
@@ -216,7 +216,7 @@ impl FileAnalysis {
     /// same way. Rebuilds the name/scope indices so `symbols_named` /
     /// `sub_info_view` find them.
     pub fn materialize_gated_emissions(&mut self, module_index: &dyn CrossFileLookup) {
-        if self.gated_emissions.is_empty() {
+        if self.plugin.gated_emissions.is_empty() {
             return;
         }
         self.apply_gated_emissions(Some(module_index));
@@ -466,7 +466,7 @@ impl FileAnalysis {
                 package_framework: &self.packages,
                 module_index,
                 package_parents: &self.packages,
-                app_surface_consumers: &self.app_surface_consumers,
+                app_surface_consumers: &self.plugin.app_surface_consumers,
             };
             crate::model::witnesses::emit_mutation_extension_witnesses(
                 &mut self.witnesses,

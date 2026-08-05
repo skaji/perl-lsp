@@ -82,10 +82,10 @@ impl<'a> CandidateSet<'a> {
         // models differ, not the seam.
         if self.pack {
             let mut out = Vec::new();
-            if mask.contains(RoleMask::DEPENDENCY) && !self.origin.include_closure.is_empty() {
+            if mask.contains(RoleMask::DEPENDENCY) && !self.origin.pack.include_closure.is_empty() {
                 if let Some(idx) = self.module_index {
                     let visible: std::collections::HashSet<String> =
-                        self.origin.include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
+                        self.origin.pack.include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
                     // Many candidate names come from the same header —
                     // resolve each FILE's whole view once per request, not
                     // once per name (the LRU absorbs misses, but even hits
@@ -353,7 +353,7 @@ impl<'a> CandidateSet<'a> {
                 module_index.for_each_cached_file(&mut |cached| {
                     let p = cached.path.to_string_lossy();
                     let connected = visible.contains(p.as_ref())
-                        || cached.analysis.include_closure.contains(&self_str);
+                        || cached.analysis.pack.include_closure.contains(&self_str);
                     if !connected {
                         return;
                     }

@@ -429,7 +429,7 @@ impl FileAnalysis {
             }
         }
         // (b) Local plugin-namespace entities bridged to `cls`.
-        for ns in &self.plugin_namespaces {
+        for ns in &self.plugin.namespaces {
             if !ns.bridges.iter().any(|b| matches!(b, Bridge::Class(c) if c == cls)) { continue; }
             for sym_id in &ns.entities {
                 let Some(sym) = self.symbols.get(sym_id.0 as usize) else { continue };
@@ -602,7 +602,7 @@ impl FileAnalysis {
                 cls,
                 &self.packages,
                 module_index,
-                &self.app_surface_consumers,
+                &self.plugin.app_surface_consumers,
             );
             for p in &parents {
                 if !class_is_known(p) {
@@ -673,7 +673,7 @@ impl FileAnalysis {
         // different from `class_name` (e.g. a helper Method whose
         // package is `Mojolicious::Controller` surfacing from a
         // `Mojolicious` query when the namespace bridges both).
-        for ns in &self.plugin_namespaces {
+        for ns in &self.plugin.namespaces {
             let bridges_class = ns.bridges.iter().any(|b|
                 matches!(b, Bridge::Class(c) if c == class_name));
             if !bridges_class { continue; }
@@ -779,7 +779,7 @@ impl FileAnalysis {
             class_name,
             &self.packages,
             module_index,
-            &self.app_surface_consumers,
+            &self.plugin.app_surface_consumers,
         ) {
             self.collect_ancestor_methods(
                 original_class, &parent, module_index, candidates, seen_names, depth + 1,

@@ -88,7 +88,7 @@ pub fn pack_include_definition(
     self_path: Option<&std::path::Path>,
 ) -> Option<Location> {
     let raw = analysis
-        .include_directives
+        .pack.include_directives
         .iter()
         .find(|(span, _)| crate::model::file_analysis::contains_point(span, point))
         .map(|(_, raw)| raw.clone())?;
@@ -129,7 +129,7 @@ pub fn pack_include_references(
     module_index: &dyn CrossFileLookup,
 ) -> Option<Vec<(std::path::PathBuf, crate::model::file_analysis::Span)>> {
     let raw = analysis
-        .include_directives
+        .pack.include_directives
         .iter()
         .find(|(span, _)| crate::model::file_analysis::contains_point(span, point))
         .map(|(_, raw)| raw.clone())?;
@@ -138,7 +138,7 @@ pub fn pack_include_references(
     let header = crate::build::cpp_reparse::resolve_include_path(base, &trim(&raw))?;
     let mut out: Vec<(std::path::PathBuf, crate::model::file_analysis::Span)> = Vec::new();
     let mut collect = |path: &std::path::Path, a: &FileAnalysis| {
-        for (span, r) in &a.include_directives {
+        for (span, r) in &a.pack.include_directives {
             if crate::build::cpp_reparse::resolve_include_path(path, &trim(r)).as_deref()
                 == Some(header.as_path())
             {

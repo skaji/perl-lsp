@@ -1,0 +1,122 @@
+//! The pack lane: the facts only a non-Perl `LangPack` mints.
+//!
+//! Every field here is empty for a Perl analysis — the native builder has
+//! no macros, no include graph, no template parameters, no move tracking.
+//! Grouping them makes that emptiness one fact instead of ten, and gives
+//! the lane one owner for its heap arm and its assembly seam
+//! (`PackDriver::analyze_with_path` fills these post-construction).
+
+use super::*;
+
+/// Everything a pack driver records that Perl has no analog for. Stamped
+/// by the pack driver's extract/skeleton pipeline; `Default` (all empty)
+/// is what a Perl analysis carries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackFacts {
+    /// The language's method-RECEIVER param names (Python `self`/`cls`),
+    /// from the LangPack. A receiver is lexically inside the class so the
+    /// sticky context tags it, but it is NOT a member — member completion
+    /// and the outline exclude these names. Perl's receiver convention
+    /// lives in `conventions.rs`, so this stays empty there.
+    #[serde(default)]
+    pub receiver_names: Vec<String>,
+
+    /// Template-specialization family edges: canonical spec spelling
+    /// (`formatter<int, char>`) → primary base name (`formatter`). NOT an
+    /// inheritance edge — a spec REPLACES the primary wholesale (its member
+    /// table is its own), so member resolution never falls through it; only
+    /// the graph's `Specializes` family view (goto-implementation) traverses.
+    #[serde(default)]
+    pub specializes: HashMap<String, String>,
+
+    /// Per-class template parameter names, in declaration order — primary
+    /// templates keyed by base name (`Box` → `["T"]`), partial specs by
+    /// their canonical spelling (`formatter<vector<T>>` → `["T"]`). The
+    /// substitution axis instantiation-aware typing reads: a member type
+    /// naming a param resolves against the receiver `Instance`'s args at
+    /// the param's index (methods via `ParametricOp::ParamOf`, fields via
+    /// `substitute_type_params`). A full spec (`template<>`) has no
+    /// params, so its members never substitute — correct by construction.
+    #[serde(default)]
+    pub template_params: HashMap<String, Vec<String>>,
+
+    /// Every `#define` in this file — the macro identity/navigation lane. One
+    /// entry per `#define` (config variants share a name). Goto-def consults
+    /// this to prefer the `#define` over a use's self-span, rank variants, and
+    /// see through delegation wrappers.
+    #[serde(default)]
+    pub macro_defs: Vec<MacroDef>,
+
+    /// `#include "x.h"` / `<x.h>` directives: (path-token span, raw path text).
+    /// Goto-def on the path token resolves the header like `use` resolves a
+    /// module.
+    #[serde(default)]
+    pub include_directives: Vec<(Span, String)>,
+
+    /// This file's transitive `#include` closure — canonical header paths it
+    /// reaches. The cross-file VISIBILITY key: a name resolves preferentially to
+    /// a definition in a file this set contains (`ScopedLookup` ranks
+    /// `get_cached` candidates by reachability; `docs/adr/macro-handling.md`,
+    /// "the include-closure lie"). Empty for Perl, so the ranking is a no-op
+    /// there (empty closure → global winner unchanged).
+    #[serde(default)]
+    pub include_closure: path_intern::ClosureList,
+
+    /// Raw domain-typing sites: each `slot`-field access that interacts
+    /// with a `value` token (`slot == V`, `slot = V`) at `slot_span`. The
+    /// value's enum is resolved cross-file at query time (an enumerator
+    /// carries its `enum`), then the sites fold onto the language-generic
+    /// `Field{owner, name}` subject via `DomainCoherenceFold`. Stored raw
+    /// (not pre-resolved) because both the slot owner AND the value's enum
+    /// are cross-file for the perl5 `op_type`/`opcode` case — resolution
+    /// belongs where the module index is in hand.
+    #[serde(default)]
+    pub domain_sites: Vec<DomainSite>,
+
+    /// `std::move(x)` sites: (moved var name, move-call span, enclosing scope).
+    /// A read of the var after the call and before its next rebind is a
+    /// use-after-move bug — see `use_after_move_reads`.
+    #[serde(default)]
+    pub moved_from: Vec<(String, Span, ScopeId)>,
+
+    /// Control-flow construct spans (`if`/`while`/`for`/`switch`/ternary/preproc
+    /// conditionals). `use_after_move_reads` reads these for its straight-line
+    /// gate (gate C): a move nested in one of these, relative to its enclosing
+    /// scope, is not straight-line and is not flagged.
+    #[serde(default)]
+    pub control_regions: Vec<Span>,
+
+    /// Parameter-list spans. `use_after_move_reads` gate E: a move of a variable
+    /// declared inside one of these (a parameter) is not flagged — a moved
+    /// parameter is a forwarding / subobject-move idiom this tier can't tell
+    /// from a bug.
+    #[serde(default)]
+    pub param_regions: Vec<Span>,
+}
+
+impl PackFacts {
+    /// Add this lane's footprint to a heap probe: the include bucket (the
+    /// header-path duplication), the pack fact vectors, and the per-class
+    /// template maps. See [`HeapBreakdown`].
+    pub fn heap_add(&self, h: &mut HeapBreakdown) {
+        // Sorted path-ids over the global table: 4 bytes per entry; the
+        // table's string bytes are process-wide, counted once, not per file.
+        h.include += self.include_closure.heap_bytes()
+            + vcap(&self.include_directives)
+            + self
+                .include_directives
+                .iter()
+                .map(|(_, s)| s.capacity())
+                .sum::<usize>();
+
+        h.cpp_extras += vcap(&self.macro_defs)
+            + vcap(&self.domain_sites)
+            + vcap(&self.moved_from)
+            + vcap(&self.control_regions)
+            + vcap(&self.param_regions);
+
+        h.misc += map_str_vec(&self.template_params)
+            + mcap(&self.specializes)
+            + vcap(&self.receiver_names);
+    }
+}

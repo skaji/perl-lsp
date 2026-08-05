@@ -248,7 +248,7 @@ fn resultddl_pattern_synthesizes_accessors_end_to_end() {
 fn plugin_diagnostic_lint_end_to_end() {
     let fa = build_fa("use DDP;\nmy $x = { a => 1 };\np $x;\nnp($x);\nprint $x;\n");
     let codes: Vec<(&str, &str)> = fa
-        .plugin_diagnostics
+        .plugin.diagnostics
         .iter()
         .map(|d| (d.code.as_str(), d.plugin_id.as_str()))
         .collect();
@@ -259,19 +259,19 @@ fn plugin_diagnostic_lint_end_to_end() {
             ("ddp-debug-left", "data-printer")
         ],
         "one lint per p/np call, none for print; got {:?}",
-        fa.plugin_diagnostics
+        fa.plugin.diagnostics
     );
-    assert_eq!(fa.plugin_diagnostics[0].severity, "info");
-    assert!(fa.plugin_diagnostics[0].message.contains("`p`"));
+    assert_eq!(fa.plugin.diagnostics[0].severity, "info");
+    assert!(fa.plugin.diagnostics[0].message.contains("`p`"));
 
     // The gate: same calls in a file that never imports DDP stay silent
     // (the plugin's trigger is Always for its completion hook, so the
     // import check lives in on_match).
     let fa = build_fa("my $x = 1;\np $x;\n");
     assert!(
-        fa.plugin_diagnostics.is_empty(),
+        fa.plugin.diagnostics.is_empty(),
         "no DDP import, no lint; got {:?}",
-        fa.plugin_diagnostics
+        fa.plugin.diagnostics
     );
 }
 

@@ -50,7 +50,7 @@ use crate::model::file_analysis::FileAnalysis;
 /// so it is also the REVERSE-dependency key. Every consumer set — registered
 /// files and open documents alike — is computed through this one predicate.
 fn is_consumer(analysis: &FileAnalysis, canon_str: &str) -> bool {
-    analysis.include_closure.contains(canon_str)
+    analysis.pack.include_closure.contains(canon_str)
 }
 
 /// What a `file_changed` call decided, for the caller to act on. The
@@ -325,7 +325,7 @@ impl PackInvalidator {
             pack.for_each_registered_file(&mut |cm| {
                 if is_consumer(&cm.analysis, &canon_str) {
                     consumers.push(cm.path.clone());
-                    consumer_closures.push((cm.path.clone(), cm.analysis.include_closure.clone()));
+                    consumer_closures.push((cm.path.clone(), cm.analysis.pack.include_closure.clone()));
                 }
             });
         }

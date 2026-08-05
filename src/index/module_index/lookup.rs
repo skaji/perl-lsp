@@ -138,7 +138,7 @@ impl ModuleIndex {
             // resident copy — resolve them against the whole view (same
             // generation: the LRU is invalidated on every rewrite).
             let whole = self.whole_present(&cached);
-            for ns in &whole.plugin_namespaces {
+            for ns in &whole.plugin.namespaces {
                 let bridges_class = ns.bridges.iter().any(|b|
                     matches!(b, crate::model::file_analysis::Bridge::Class(c) if c == class_name));
                 if !bridges_class { continue; }
@@ -381,7 +381,7 @@ impl CrossFileLookup for ModuleIndex {
             .unwrap_or_default();
         for module in modules {
             let Some(cached) = self.get_cached(&module) else { continue };
-            for (spec, prim) in &cached.analysis.specializes {
+            for (spec, prim) in &cached.analysis.pack.specializes {
                 if prim == primary {
                     out.push((spec.clone(), module.clone()));
                 }

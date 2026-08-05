@@ -401,7 +401,7 @@ pub fn index_workspace_with_index(
                             let seeds: Vec<_> =
                                 analysis.ref_row_seeds();
                             let sym_seeds = analysis.sym_row_seeds();
-                            let closure = analysis.include_closure.clone();
+                            let closure = analysis.pack.include_closure.clone();
                             (blob, seeds, sym_seeds, closure)
                         })
                     } else {

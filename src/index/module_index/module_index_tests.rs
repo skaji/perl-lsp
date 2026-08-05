@@ -814,7 +814,7 @@ fn cache_bridged(
         .find(|s| s.name == entity_sub)
         .map(|s| s.id)
         .expect("entity sub must exist");
-    fa.plugin_namespaces.push(crate::model::file_analysis::PluginNamespace {
+    fa.plugin.namespaces.push(crate::model::file_analysis::PluginNamespace {
         id: format!("test:{module_name}"),
         plugin_id: "test".into(),
         kind: "emitter".into(),

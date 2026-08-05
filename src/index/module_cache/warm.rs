@@ -70,7 +70,7 @@ pub fn warm_cache_streaming(
             log::warn!("Failed to decode cached analysis for '{}', skipping", module_name);
             continue;
         };
-        if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
+        if closure_stamp(&fa.pack.include_closure, &mut stat_memo) != row_deps_stamp {
             continue;
         }
         count += 1;
@@ -202,7 +202,7 @@ pub fn warm_pack_stream_with_stubs(
         if use_stubs && blob_len > 0 {
             let stub_blob = row.get::<_, Option<Vec<u8>>>(6).ok().flatten();
             if let Some(stub) = stub_blob.as_deref().and_then(decode_stub) {
-                if closure_stamp(&stub.skeleton.include_closure, &mut stat_memo)
+                if closure_stamp(&stub.skeleton.pack.include_closure, &mut stat_memo)
                     != row_deps_stamp
                 {
                     continue;
@@ -217,7 +217,7 @@ pub fn warm_pack_stream_with_stubs(
         }
         let module_name = row.get::<_, String>(0).unwrap_or_default();
         let Some(fa) = load_one(conn, &path_str) else { continue };
-        if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
+        if closure_stamp(&fa.pack.include_closure, &mut stat_memo) != row_deps_stamp {
             continue;
         }
         count += 1;
@@ -320,7 +320,7 @@ pub fn warm_cache(
                         // A pack file's analysis bakes its headers (splices,
                         // witnesses, closure): the row is valid only while the
                         // whole closure is unchanged, not just the file itself.
-                        if closure_stamp(&fa.include_closure, &mut stat_memo) != row_deps_stamp {
+                        if closure_stamp(&fa.pack.include_closure, &mut stat_memo) != row_deps_stamp {
                             continue;
                         }
                         // Strip AT INSERT (long-lived processes): the blob

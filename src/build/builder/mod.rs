@@ -355,7 +355,7 @@ struct Builder<'a> {
     reexport_modules: Vec<String>,
     /// Plugin-declared namespaces collected during the walk via
     /// `EmitAction::PluginNamespace`. Flushed into the final
-    /// `FileAnalysis.plugin_namespaces`.
+    /// `FileAnalysis.plugin.namespaces`.
     plugin_namespaces: Vec<crate::model::file_analysis::PluginNamespace>,
     /// Per-symbol provenance for return types. Populated by plugin
     /// `overrides()` (PluginOverride) and by reducer-driven folds
@@ -440,7 +440,7 @@ struct Builder<'a> {
     param_type_manifest: std::collections::HashMap<String, Vec<plugin::ParamType>>,
 
     /// Caller-side loader facts (`plugin 'X', {...}`) — flushed into
-    /// `FileAnalysis.plugin_loads`.
+    /// `FileAnalysis.plugin.loads`.
     plugin_loads: Vec<crate::model::file_analysis::PluginLoadFact>,
     /// Callee-side markers: params whose type arrives from loader
     /// config at enrichment. Flushed into
@@ -558,7 +558,7 @@ struct Builder<'a> {
     /// replay the topic-route base stack in document order.
     topic_group_spans: Vec<crate::model::file_analysis::Span>,
     /// Plugin-emitted diagnostics (`EmitAction::Diagnostic`), flushed
-    /// onto `FileAnalysis.plugin_diagnostics`.
+    /// onto `FileAnalysis.plugin.diagnostics`.
     plugin_diagnostics: Vec<crate::model::file_analysis::PluginDiagnostic>,
 
     /// Topic-route DSL manifests collected from the plugin registry —
