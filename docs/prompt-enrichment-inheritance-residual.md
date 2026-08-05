@@ -92,7 +92,7 @@ fork ledger.
 
 `enrich_imported_types_with_keys` (which runs the imported-hash-key
 synthesis, the cross-file `inheritance_cross` edge projection, and
-`resolve_method_call_types(Some(idx))`) is called ONLY for:
+the MCB→bag bridge `emit_method_call_binding_edges`) is called ONLY for:
 
 - OPEN documents — through `FileStore::enrich_open`, the one open-doc
   enrichment writer (invoked by `publish_diagnostics`, the resolver refresh,
@@ -112,7 +112,7 @@ What this means per enrichment pass:
 | Enrichment pass | Reaches non-open files? | Compensated at query time? |
 |---|---|---|
 | `inheritance_cross` edge projection | No | **Yes** — `query_rec`'s structural `MethodOnClass` fallback (`witnesses.rs:1190`+) walks `parents_of` + recurses into cached bags + `for_each_entity_bridged_to`, with `BagContext.module_index` set. So a dep class inheriting from another dep, or bridging a plugin namespace, still resolves method return types. The build-time edges are an optimization the dep misses, not a correctness floor. |
-| imported hash-key synthesis + `resolve_method_call_types` | No | Partially — cross-file method-return queries route through the same `MethodOnClass` walk; imported-hash-key COMPLETION on a binding inside a non-open dep file would miss the synthetic `HashKeyDef`, but that's a completion-in-a-dependency scenario the LSP doesn't surface (you complete in open files). |
+| imported hash-key synthesis + `emit_method_call_binding_edges` | No | Partially — cross-file method-return queries route through the same `MethodOnClass` walk; imported-hash-key COMPLETION on a binding inside a non-open dep file would miss the synthetic `HashKeyDef`, but that's a completion-in-a-dependency scenario the LSP doesn't surface (you complete in open files). |
 | dispatch resolution | N/A (no enrichment pass) | **Yes — query-time.** Gated candidates ride the cache; `resolve::refs_to` for a Handler calls `applicable_dispatches`, which resolves the receiver isa-check on demand against the module index. A `$minion->enqueue('task')` in a non-open workspace file whose receiver isa-Minion is cross-file (and which doesn't `use Minion`) now surfaces. The `ReceiverGated` seam makes the inner handler payload unreadable without that check (`docs/adr/receiver-gated-dispatch.md`). |
 
 Confirmed by `probe_dispatch_promotion_in_unenriched_workspace_file`

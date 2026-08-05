@@ -209,9 +209,9 @@ fn test_demo_file_chain_to_resolves_on_line_71() {
     let mut analysis = crate::build::builder::build(&tree, demo_source.as_bytes());
 
     // Cross-file enrichment — same step the backend runs on open.
-    // Resolves MethodCallBindings against the module_index so
-    // `my $r = $app->routes;` becomes a TypeConstraint. Without
-    // this, `FileStore::enrich_open` hasn't fired
+    // Re-runs the MCB→bag bridge so `my $r = $app->routes;` carries a
+    // `Variable → Edge(MethodOnClass)` witness the registry chases with
+    // the index. Without this, `FileStore::enrich_open` hasn't fired
     // yet and the whole chain is un-typed.
     analysis.enrich_imported_types_with_keys(Some(&idx));
 

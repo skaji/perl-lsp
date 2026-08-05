@@ -71,35 +71,24 @@ shape (membership from `model::builtins`, doc value from
 assembled in the model vs pack's in the adapter) stays owned by the parked
 multi-language brief.
 
-### A4. The "legacy text-based MCB resolver" is the load-bearing cross-file enrichment typer — **medium leverage / L**
+### A4. LANDED — the MCB pass is the MCB→bag bridge, edges not values
 
-**The wrong embedding.** `pipeline.rs:510-513` labels
-`resolve_method_call_types` "the legacy text-based MCB resolver … a fallback,"
-but cross-file enrichment runs it WITH the index as the primary mechanism for
-imported-method-return propagation (`src/model/file_analysis/enrichment.rs:477`).
-It violates the bag doctrine it postdates: text-keyed `MethodCallBinding` rows
-(`build/builder/visit_use.rs:1388-1395`) are resolved through the string trio
-plus `find_method_return_type`, then MATERIALIZED as `InferredType` TCs
-(`enrichment.rs:499-513`) — values, not edges. It is also the sole production
-keeper of doc-flagged `inferred_type` (`enrichment.rs:494`), and its hash-key
-ownership consumers resolve BY NAME ONLY (`fold.rs:1784-1817`,
-`completion.rs:874-881` via `sub_defining_package(mcb.method_name)`) — the
-resolution class the stamp contract bans ("no name-only fallback,"
-`lifecycle.rs:252-253`). Two stale comments (`queries.rs:285-288`,
-`cursor_context.rs:341-343`) claim a bag→legacy fallback that does not exist.
-
-**Target shape.** Slice A (typing): replace the value push with edge pushes —
-`Variable → Edge(MethodOnClass{class, name})` under a dedicated `mcb` source
-tag, clear-and-emit per run, letting the registry chase lazily with the index
-in hand. `inferred_type` becomes honestly test-only. Slice B (ownership):
-route `fold.rs:1806-1817` and `completion.rs:874-881` through the invocant
-class (post-A1), keying ownership on `{class, method}`. Independent: fix the
-two stale comments and retitle `pipeline.rs:510-513` to what the pass IS (the
-MCB→bag bridge).
-
-**Gate.** Enrichment idempotency tests (truncate-to-baseline still holds);
-gold rows on imported-method variable typing; grep-test that no production
-caller of `inferred_type` remains.
+`emit_method_call_binding_edges` (finalize + the enrichment re-run,
+append-only post-finalize like `emit_mutation_extension_witnesses`)
+publishes each `$var = $invocant->method()` binding as a
+`Variable → Edge(MethodOnClass{class, method})` witness (tag `mcb`); the
+registry chases the return lazily with whatever index the QUERY holds, so
+enrichment materializes no values and no early-out is needed — the fold's
+own precedence arbitrates. `FileAnalysis::inferred_type` is `#[cfg(test)]`
+(raw-seed-state assertions only;
+`layering_tests::inferred_type_has_no_production_caller` pins it). MCB
+hash-key ownership keys on {invocant class, method}: the fold fixup
+resolves the invocant via the bag and uses the class-defining symbol's
+package (name-only fallback only for untyped invocants / non-local
+definers — the fold holds no MRO walker), and the query-time owner path
+(`resolve_hash_key_owner`) walks `resolve_method_in_ancestors` to the
+defining symbol. The two stale bag→legacy-fallback comments are gone;
+`EXTRACT_VERSION` bumped for the bag rule change.
 
 ---
 

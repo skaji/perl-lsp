@@ -228,7 +228,7 @@ impl FileAnalysis {
     }
 
     pub(crate) fn finalize_post_walk(&mut self) {
-        self.resolve_method_call_types(None);
+        self.emit_method_call_binding_edges();
         // Fill HashKeyAccess owners that are resolvable in-file
         // via the invocant ladder (`method_call_invocant_type`).
         // Cross-file gaps stay None until

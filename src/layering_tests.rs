@@ -422,3 +422,32 @@ fn pack_store_selection_stays_in_lookup_for() {
         violations.join("\n")
     );
 }
+
+/// `FileAnalysis::inferred_type` is raw-seed-state introspection for tests
+/// only. Its last production caller (the MCB early-out) is gone — the
+/// MCB→bag bridge publishes `Edge(MethodOnClass)` witnesses and lets the
+/// registry's fold precedence arbitrate, so a new production
+/// `.inferred_type(` call re-opens a parallel type query beside
+/// `inferred_type_via_bag`.
+#[test]
+fn inferred_type_has_no_production_caller() {
+    let mut violations = Vec::new();
+    for (path, _layer, _stem) in source_files() {
+        let text = fs::read_to_string(&path).unwrap();
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if t.contains(".inferred_type(") {
+                violations.push(format!("{}:{}: {}", path.display(), i + 1, t));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "production code must query types via inferred_type_via_bag (the registry), \
+         never the raw seed-state reader:\n{}",
+        violations.join("\n")
+    );
+}

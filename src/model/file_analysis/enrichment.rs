@@ -477,7 +477,7 @@ impl FileAnalysis {
             self.key_writes = key_writes;
         }
 
-        self.resolve_method_call_types(module_index);
+        self.emit_method_call_binding_edges();
         // Re-stamp the MethodCall dispatch-target edges now that the bag
         // carries enriched cross-file invocant types. Enrichment truncated
         // refs back to base_ref_count, wiping the build-time (local-only)
@@ -488,16 +488,21 @@ impl FileAnalysis {
         self.rebuild_enrichment_indices();
     }
 
-    /// Resolve method call bindings to type constraints.
-    /// Called in local post-pass (None) and cross-file enrichment (Some(module_index)).
-    pub(super) fn resolve_method_call_types(&mut self, module_index: Option<&dyn CrossFileLookup>) {
+    /// The MCB→bag bridge: each recorded `$var = $invocant->method()`
+    /// binding becomes a `Variable → Edge(MethodOnClass{class, method})`
+    /// witness (tag `mcb`), so the registry chases the method's return
+    /// lazily — with whatever index the QUERY holds — instead of a value
+    /// materialized here (edges, not values). The invocant class is
+    /// resolved per run: the finalize run sees only walk-seeded types;
+    /// the enrichment re-run resolves invocants that only type once
+    /// imported TCs land. Append-only (post-finalize removal would shift
+    /// the sealed `base_witness_count`, same rule as
+    /// `emit_mutation_extension_witnesses`): duplicates are idempotent
+    /// under the fold and truncated by the next enrichment cycle.
+    pub(super) fn emit_method_call_binding_edges(&mut self) {
+        use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         let bindings = self.method_call_bindings.clone();
         for binding in &bindings {
-            // Skip if this variable already has a type at this point
-            if self.inferred_type(&binding.variable, binding.span.start).is_some() {
-                continue;
-            }
-
             // Resolve invocant to class name
             let class_name = self.resolve_invocant_class(
                 &binding.invocant_var,
@@ -506,14 +511,23 @@ impl FileAnalysis {
             );
 
             if let Some(cn) = class_name {
-                if let Some(rt) = self.find_method_return_type(&cn, &binding.method_name, module_index, None) {
-                    self.push_type_constraint(TypeConstraint {
-                        variable: binding.variable.clone(),
+                self.witnesses.push(Witness {
+                    attachment: WitnessAttachment::Variable {
+                        name: binding.variable.clone(),
                         scope: binding.scope,
-                        constraint_span: binding.span,
-                        inferred_type: rt,
-                    });
-                }
+                    },
+                    source: WitnessSource::Builder("mcb".into()),
+                    payload: WitnessPayload::Edge(WitnessAttachment::MethodOnClass {
+                        class: cn,
+                        name: binding.method_name.clone(),
+                    }),
+                    // Zero-width at the assignment, the TC temporal
+                    // contract: invisible to reads before the binding.
+                    span: Span {
+                        start: binding.span.start,
+                        end: binding.span.start,
+                    },
+                });
             }
         }
     }

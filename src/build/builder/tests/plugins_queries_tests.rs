@@ -521,12 +521,11 @@ sub inline {
 /// `thread 'tokio-rt-worker' panicked at src/file_analysis.rs:1164:44:
 /// index out of bounds: the len is 17 but the index is 17`.
 ///
-/// Root cause: `enrich_imported_types_with_keys` truncates
-/// `type_constraints` back to baseline but leaves stale indices in
-/// `type_constraints_by_var` from the previous enrichment. The next
-/// enrichment's call to `resolve_method_call_types` invokes
-/// `inferred_type`, which indexes into `type_constraints[idx]` —
-/// OOB when idx points past the truncated length.
+/// Root cause: `enrich_imported_types_with_keys` truncated the constraint
+/// store back to baseline but left stale per-var indices behind; the next
+/// enrichment's MCB pass indexed past the truncated length. The MCB pass
+/// is now `emit_method_call_binding_edges` (bag edges, no index maps),
+/// but the double-enrichment repro stays as the idempotency net.
 ///
 /// Repro: enrich the same FileAnalysis twice with a module_index.
 /// The second call must not panic.
@@ -580,8 +579,7 @@ sub to  { my $self = shift; return $self; }
     // resolution. Populates type_constraints + type_constraints_by_var.
     fa.enrich_imported_types_with_keys(Some(&idx));
     // Second enrichment — simulates a subsequent change or refresh.
-    // Before the fix, the stale type_constraints_by_var indices
-    // panicked `inferred_type` during resolve_method_call_types.
+    // Must not panic, and the re-derived state must stay usable.
     fa.enrich_imported_types_with_keys(Some(&idx));
 
     // Sanity: `$r` is still typed after the second run (not just

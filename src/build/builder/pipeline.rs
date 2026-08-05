@@ -523,10 +523,12 @@ pub(super) fn build_with_plugins_inner(
         // domain-typing sites are a pack-language fact; Perl mints none here.
         domain_sites: Vec::new(),
     });
-    // Finalize: run the legacy text-based MCB resolver as a fallback.
-    // For every assignment the unified typer (run before
-    // `resolve_return_types` above) couldn't handle, MCB fills in.
-    // Cross-file enrichment also reuses MCB resolution without a tree.
+    // Finalize: the MCB→bag bridge (`emit_method_call_binding_edges`)
+    // publishes `Variable → Edge(MethodOnClass{...})` for every recorded
+    // `$var = $invocant->method()` binding — the registry chases the
+    // return lazily, cross-file once a query holds the index. Enrichment
+    // re-runs the same bridge without a tree. Then owner fixup, target
+    // stamping, and the base-count seals.
     bphase!("finalize_post_walk", fa.finalize_post_walk());
 
     fa

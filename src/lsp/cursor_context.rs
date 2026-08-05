@@ -338,8 +338,7 @@ fn resolve_text_invocant(text: &str, point: Point, analysis: Option<&FileAnalysi
         InvocantText::Scalar(_) => {
             // Route through the witness-bag path so framework-aware
             // resolution (Mojo `sub name`, blessed-hashref, branch arms,
-            // arity) refines the answer. Falls back to legacy
-            // `inferred_type` when the bag has nothing.
+            // arity) refines the answer.
             analysis.and_then(|a| a.inferred_type_via_bag(text, point))
         }
     }

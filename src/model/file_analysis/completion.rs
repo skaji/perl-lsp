@@ -873,13 +873,28 @@ impl FileAnalysis {
             }
         }
 
-        // Check method call bindings → follow to method's return hash keys
+        // Check method call bindings → follow to method's return hash keys.
+        // Ownership keys on {invocant class, method}: the invocant's class
+        // walks the MRO to the DEFINING symbol, so a same-named method on an
+        // unrelated class can't claim the keys. An invocant that doesn't
+        // type (or a definer outside the local ancestry) keeps the
+        // name-only fallback for recall.
         for mcb in &self.method_call_bindings {
             if mcb.variable == var_text
                 && mcb.span.start <= point
                 && contains_point(&self.scopes[mcb.scope.0 as usize].span, point)
             {
-                let package = self.sub_defining_package(&mcb.method_name);
+                let package = self
+                    .resolve_invocant_class(&mcb.invocant_var, mcb.scope, mcb.span.start)
+                    .and_then(|cn| {
+                        match self.resolve_method_in_ancestors(&cn, &mcb.method_name, None) {
+                            Some(MethodResolution::Local { sym_id, .. }) => {
+                                self.symbol(sym_id).package.clone()
+                            }
+                            _ => None,
+                        }
+                    })
+                    .or_else(|| self.sub_defining_package(&mcb.method_name));
                 return Some(HashKeyOwner::Sub { package, name: mcb.method_name.clone() });
             }
         }

@@ -1778,11 +1778,24 @@ impl<'a> Builder<'a> {
         // dynamic `$obj->$m()` where $m was constant-folded during
         // method_call_binding emission). Same ownership logic as
         // function calls — point $c's hash-key accesses at the
-        // HashKeyDefs inside `method`.
-        let method_binding_map: std::collections::HashMap<&str, String> = self
+        // HashKeyDefs inside `method` — but the package keys on
+        // {invocant class, method}: the invocant's bag-resolved class
+        // (resolved here, outside the `&mut self.refs` loop below) names
+        // the owner when it defines the sub, so a same-named method on
+        // an unrelated package can't claim ownership. The MRO walker is
+        // FileAnalysis machinery; the residuals (inherited definer,
+        // untyped invocant) keep the name-only fallback, and the
+        // query-time owner path (`resolve_hash_key_owner`) applies the
+        // full ladder.
+        let method_binding_map: std::collections::HashMap<&str, (String, Option<String>)> = self
             .method_call_bindings
             .iter()
-            .map(|mcb| (mcb.variable.as_str(), mcb.method_name.clone()))
+            .map(|mcb| {
+                let class = self
+                    .bag_query_variable(&mcb.invocant_var, mcb.scope, mcb.span.start)
+                    .and_then(|t| t.class_name().map(str::to_string));
+                (mcb.variable.as_str(), (mcb.method_name.clone(), class))
+            })
             .collect();
 
         for r in &mut self.refs {
@@ -1797,15 +1810,28 @@ impl<'a> Builder<'a> {
                         package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
                         name: resolved,
                     })
-                } else if let Some(method_name) = method_binding_map.get(var_text.as_str()) {
+                } else if let Some((method_name, invocant_class)) =
+                    method_binding_map.get(var_text.as_str())
+                {
                     let resolved = walk_return_delegation_chain(
                         method_name,
                         &self.sub_return_delegations,
                         &subs_with_own_keys,
                     );
-                    subs_with_own_keys.contains(&resolved).then(|| HashKeyOwner::Sub {
-                        package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
-                        name: resolved,
+                    subs_with_own_keys.contains(&resolved).then(|| {
+                        let class_defines = invocant_class.as_deref().is_some_and(|cn| {
+                            self.symbols.iter().any(|s| {
+                                matches!(s.kind, SymKind::Sub | SymKind::Method)
+                                    && s.name == resolved
+                                    && s.package.as_deref() == Some(cn)
+                            })
+                        });
+                        let package = if class_defines {
+                            invocant_class.clone()
+                        } else {
+                            sub_package.get(resolved.as_str()).cloned().unwrap_or(None)
+                        };
+                        HashKeyOwner::Sub { package, name: resolved }
                     })
                 } else {
                     None

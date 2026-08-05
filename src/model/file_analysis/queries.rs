@@ -252,19 +252,12 @@ impl FileAnalysis {
     /// witness for `var_name` before `point`, with no framework rules,
     /// no branch fold, no narrowing.
     ///
-    /// **NOT the canonical type query.** Use `inferred_type_via_bag`
-    /// for any consumer that wants the answer the rest of the LSP
-    /// uses — this method exists for two narrow purposes:
-    ///
-    /// 1. Internal "did we explicitly assign a type to this variable
-    ///    yet?" checks (e.g. `resolve_method_call_types` early-out)
-    ///    that need the bare seed state, not the bag's reduced answer
-    ///    (which can be non-`None` from rep observations alone).
-    /// 2. Tests that assert on raw seed state.
-    ///
-    /// If you find a third use case, prefer `inferred_type_via_bag`
-    /// and only fall back here if you have a concrete reason that
-    /// would survive a code review.
+    /// **NOT the canonical type query — test-only** (`#[cfg(test)]`
+    /// enforces it; `layering_tests::inferred_type_has_no_production_caller`
+    /// documents it). Use `inferred_type_via_bag` for any consumer that
+    /// wants the answer the rest of the LSP uses; this exists solely for
+    /// tests that assert on raw seed state.
+    #[cfg(test)]
     pub fn inferred_type(&self, var_name: &str, point: Point) -> Option<&InferredType> {
         use crate::model::witnesses::{WitnessAttachment, WitnessPayload};
         let mut best: Option<(&InferredType, Point)> = None;
@@ -283,15 +276,12 @@ impl FileAnalysis {
     }
 
     /// Query the witness bag via the reducer registry for a variable at
-    /// a point, falling back to the legacy `inferred_type()` when the bag
-    /// has nothing. Returns owned `InferredType` because the reducer may
+    /// a point. Returns owned `InferredType` because the reducer may
     /// synthesize a value not stored anywhere.
     ///
     /// The bag is the canonical store: `push_type_constraint` (TC
     /// shape), `call_bindings` propagation, framework accessor
     /// synthesis, and cross-file enrichment all push witnesses here.
-    /// `inferred_type` reads the same Variable+InferredType slice
-    /// without applying reducer rules.
     pub fn inferred_type_via_bag(&self, var_name: &str, point: Point) -> Option<InferredType> {
         self.inferred_type_via_bag_ctx(var_name, point, None)
     }
