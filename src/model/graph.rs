@@ -27,11 +27,20 @@ use crate::model::file_analysis::{CrossFileLookup, FileAnalysis};
 /// source of truth: `EdgeKind::ALL` + `flag()` keep them in lockstep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
-    /// class → parent class/role (`use parent`/`@ISA`/`with`/…, plus
-    /// the synthetic app-surface edge). `parents_of` is the single
-    /// injection site for this edge — the inheritance consumers share
-    /// it, so they can't disagree on the MRO.
+    /// class → parent class/role (`use parent`/`@ISA`/`with`/…).
+    /// `real_parents_of` is the single derivation — the inheritance
+    /// consumers share it, so they can't disagree on the MRO. The
+    /// synthetic app-surface edge is its own kind (`AppSurface`) so
+    /// walks that must not treat a consumer as a descendant of the
+    /// surface (isa gates, trigger views) can mask it off; full-MRO
+    /// walks pass `INHERITS | APP_SURFACE`.
     Inherits,
+    /// class → the synthetic `APP_SURFACE_CLASS` parent for
+    /// manifest-declared app-surface consumers (the Mojo helper/plugin
+    /// "app surface", `docs/adr/plugin-system.md`). Split from
+    /// `Inherits` so it is maskable; `app_surface_parent` is the one
+    /// speller of the edge condition.
+    AppSurface,
     /// parent → direct child/composer (the `children_index` inverse;
     /// `walk` supplies the transitivity).
     InheritsInv,
@@ -50,12 +59,18 @@ impl EdgeKind {
     /// Every variant. New kinds MUST be added here — the `edges_from`
     /// loop iterates it, so a forgotten kind is never traversed (and
     /// its `flag()` arm + match arm are compile errors meanwhile).
-    pub const ALL: [EdgeKind; 4] =
-        [Self::Inherits, Self::InheritsInv, Self::Bridges, Self::Specializes];
+    pub const ALL: [EdgeKind; 5] = [
+        Self::Inherits,
+        Self::AppSurface,
+        Self::InheritsInv,
+        Self::Bridges,
+        Self::Specializes,
+    ];
 
     fn flag(self) -> EdgeKindMask {
         match self {
             EdgeKind::Inherits => EdgeKindMask::INHERITS,
+            EdgeKind::AppSurface => EdgeKindMask::APP_SURFACE,
             EdgeKind::InheritsInv => EdgeKindMask::INHERITS_INV,
             EdgeKind::Bridges => EdgeKindMask::BRIDGES,
             EdgeKind::Specializes => EdgeKindMask::SPECIALIZES,
@@ -73,6 +88,7 @@ bitflags::bitflags! {
         const INHERITS_INV = 1 << 1;
         const BRIDGES      = 1 << 2;
         const SPECIALIZES  = 1 << 3;
+        const APP_SURFACE  = 1 << 4;
     }
 }
 
@@ -82,6 +98,21 @@ bitflags::bitflags! {
 pub enum Node {
     Class(String),
     Module(String),
+}
+
+/// Per-node control verdict a walk visitor returns. `PruneChildren` is
+/// what makes gated gathers (the role-requires walk stops at the first
+/// non-role node) and scoped views expressible as THE walk instead of a
+/// bespoke BFS: it skips expanding the just-visited node's edges while
+/// the rest of the traversal continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkControl {
+    /// Keep walking — expand this node's edges.
+    Continue,
+    /// Don't expand this node's edges; the rest of the walk proceeds.
+    PruneChildren,
+    /// Stop the whole walk.
+    Stop,
 }
 
 /// The derived view: borrows the origin file's analysis (local edges)
@@ -99,14 +130,15 @@ impl<'a> GraphView<'a> {
 
     /// THE walker. DFS from `origin` over edges in `mask`, depth-capped
     /// and cycle-safe; `visit` sees every reached node (origin
-    /// excluded) in traversal order and may stop early. On INHERITS the
-    /// order is Perl's left-to-right DFS MRO, so method resolution sees
-    /// ancestors in the order dispatch demands.
+    /// excluded) in traversal order and answers with a [`WalkControl`]
+    /// verdict — continue, prune the node's own expansion, or stop the
+    /// walk. On INHERITS the order is Perl's left-to-right DFS MRO, so
+    /// method resolution sees ancestors in the order dispatch demands.
     pub fn walk(
         &self,
         origin: Node,
         mask: EdgeKindMask,
-        visit: &mut dyn FnMut(&Node) -> std::ops::ControlFlow<()>,
+        visit: &mut dyn FnMut(&Node) -> WalkControl,
     ) {
         let mut seen: std::collections::HashSet<Node> = std::collections::HashSet::new();
         seen.insert(origin.clone());
@@ -116,8 +148,12 @@ impl<'a> GraphView<'a> {
             // visit at POP — depth-first order, so a left parent's whole
             // ancestry precedes the right parent (the @ISA contract).
             // depth 0 is the origin, which callers already hold.
-            if depth > 0 && visit(&node).is_break() {
-                return;
+            if depth > 0 {
+                match visit(&node) {
+                    WalkControl::Continue => {}
+                    WalkControl::PruneChildren => continue,
+                    WalkControl::Stop => return,
+                }
             }
             if depth >= MAX_DEPTH {
                 continue;
@@ -145,13 +181,20 @@ impl<'a> GraphView<'a> {
             }
             match kind {
                 EdgeKind::Inherits => {
-                    for p in crate::model::file_analysis::parents_of(
+                    for p in crate::model::file_analysis::real_parents_of(
                         class,
                         &self.fa.package_parents,
                         self.idx,
-                        &self.fa.app_surface_consumers,
                     ) {
                         out.push(Node::Class(p));
+                    }
+                }
+                EdgeKind::AppSurface => {
+                    if let Some(s) = crate::model::file_analysis::app_surface_parent(
+                        class,
+                        &self.fa.app_surface_consumers,
+                    ) {
+                        out.push(Node::Class(s));
                     }
                 }
                 EdgeKind::InheritsInv => {

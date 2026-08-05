@@ -390,26 +390,20 @@ symbol-minting / package-range / call-arg infrastructure plus
 (docs/adr/flow-narrowing.md maps to exactly one part) and the plugin
 `ArgInfo` factory in `plugin_emit.rs`.
 
-### F4. Two unledgered bespoke ancestry walkers, blocked on a missing prune verdict in GraphView — **medium leverage / M**
+### F4. LANDED — the walk contract carries a prune verdict; the two bespoke ancestry walkers are GraphView walks
 
-`trigger_view_at` (`class_queries.rs:903`) hand-rolls an UNCAPPED
-transitive-parent BFS (every sibling walk is budgeted/capped);
-`unfulfilled_role_requires` (`invocants.rs:1042`) hand-rolls a
-role-gated BFS with an idiosyncratic visited-size cap. Neither appears in the
-ledger (PARKED.md's four→one entry covers only the three isa DFSes and warns
-"not a fifth bespoke helper" — these are the fifth and sixth). The blocker is
-real: `GraphView::walk`'s visitor returns `ControlFlow<()>`
-(`model/graph.rs:109-121`) — it can stop the whole walk but cannot prune one
-node's expansion, which both the role walk and the parked walk_ancestry
-collapse need. Target: generalize the visitor to
-Continue/PruneChildren/Stop (the WalkVerdict shape `dispatch.rs:200-209`
-already proved); `trigger_view_at` becomes `walk(Class(pkg), INHERITS,
-idx=None)` with the APP_SURFACE edge masked (an EdgeKindMask bit — also what
-the parked collapse waits on); the role gather prunes at non-role nodes,
-preserving docs/adr/role-contracts.md's edge semantics. Both inherit MAX_DEPTH
-for free. Minimum slice if deferred: add both walkers to the PARKED four→one
-entry so the ledger matches the code. Gate: role-contract and trigger-view
-tests; a pathological-parent-graph depth test.
+`GraphView::walk`'s visitor returns `WalkControl`
+(Continue/PruneChildren/Stop, `model/graph.rs`), and the synthetic
+app-surface parent is its own maskable edge kind (`EdgeKind::AppSurface`
+/ `EdgeKindMask::APP_SURFACE`; `real_parents_of` + `app_surface_parent`
+are the two component spellers `parents_of` composes). `trigger_view_at`
+is `walk(Class(pkg), INHERITS, idx=None)` (surface masked, local-only);
+`unfulfilled_role_requires` gathers over the INHERITS walk pruning at
+every non-role node (role-contract edge semantics preserved). Both
+hand-rolled BFSes are deleted and both inherit the walk's MAX_DEPTH;
+full-MRO consumers pass `INHERITS | APP_SURFACE` — which is also the
+mask the parked walk_ancestry→GraphView collapse was waiting on.
+Prune + pathological-depth tests pin the contract in `graph_tests.rs`.
 
 ### F5. LANDED — small truth-telling fixes
 

@@ -906,19 +906,22 @@ impl FileAnalysis {
             None => return (Vec::new(), Vec::new()),
         };
         let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
+        // Local-only transitive parents: no index (emit-time never had
+        // cross-file resolution) and the app-surface edge masked off —
+        // a consumer is not a descendant of the synthetic surface for
+        // trigger gating.
         let mut parents = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut stack = vec![pkg.clone()];
-        while let Some(cur) = stack.pop() {
-            if let Some(ps) = self.package_parents.get(&cur) {
-                for p in ps {
-                    if seen.insert(p.clone()) {
-                        parents.push(p.clone());
-                        stack.push(p.clone());
-                    }
+        let graph = crate::model::graph::GraphView::new(self, None);
+        graph.walk(
+            crate::model::graph::Node::Class(pkg),
+            crate::model::graph::EdgeKindMask::INHERITS,
+            &mut |n| {
+                if let crate::model::graph::Node::Class(c) = n {
+                    parents.push(c.clone());
                 }
-            }
-        }
+                crate::model::graph::WalkControl::Continue
+            },
+        );
         (uses, parents)
     }
 

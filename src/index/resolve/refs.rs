@@ -608,7 +608,7 @@ pub fn implementations_of(
                     if let crate::model::graph::Node::Class(c) = n {
                         descendants.push(c.clone());
                     }
-                    std::ops::ControlFlow::Continue(())
+                    crate::model::graph::WalkControl::Continue
                 },
             );
             for pkg in &descendants {
@@ -663,7 +663,7 @@ pub fn implementations_of(
             if let crate::model::graph::Node::Class(c) = n {
                 descendants.push(c.clone());
             }
-            std::ops::ControlFlow::Continue(())
+            crate::model::graph::WalkControl::Continue
         },
     );
 
@@ -683,12 +683,13 @@ pub fn implementations_of(
     for d in &descendants {
         probe.walk(
             crate::model::graph::Node::Class(d.clone()),
-            crate::model::graph::EdgeKindMask::INHERITS,
+            crate::model::graph::EdgeKindMask::INHERITS
+                | crate::model::graph::EdgeKindMask::APP_SURFACE,
             &mut |n| {
                 if let crate::model::graph::Node::Class(c) = n {
                     implementers.insert(c.clone());
                 }
-                std::ops::ControlFlow::Continue(())
+                crate::model::graph::WalkControl::Continue
             },
         );
     }
@@ -701,12 +702,13 @@ pub fn implementations_of(
         std::iter::once(class.clone()).collect();
     probe.walk(
         crate::model::graph::Node::Class(class.clone()),
-        crate::model::graph::EdgeKindMask::INHERITS,
+        crate::model::graph::EdgeKindMask::INHERITS
+            | crate::model::graph::EdgeKindMask::APP_SURFACE,
         &mut |n| {
             if let crate::model::graph::Node::Class(c) = n {
                 contract_line.insert(c.clone());
             }
-            std::ops::ControlFlow::Continue(())
+            crate::model::graph::WalkControl::Continue
         },
     );
     implementers.retain(|p| !contract_line.contains(p));
@@ -790,7 +792,7 @@ pub(super) fn specialization_family(
             if let crate::model::graph::Node::Class(c) = n {
                 specs.push(c.clone());
             }
-            std::ops::ControlFlow::Continue(())
+            crate::model::graph::WalkControl::Continue
         },
     );
     let mut out: Vec<RefLocation> = Vec::new();

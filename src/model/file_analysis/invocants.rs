@@ -1045,13 +1045,12 @@ impl FileAnalysis {
         &self,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<UnfulfilledRequire> {
-        use std::collections::VecDeque;
-
-        // Role facts for a class that may live in this file or in the
-        // index: (requires list, parents). `None` = not a role — the
-        // requires walk stops there (a base CLASS's composed roles were
-        // checked at its own composition site).
-        let role_facts = |c: &str| -> Option<(Vec<String>, Vec<String>)> {
+        // Requires list for a class that may live in this file or in
+        // the index. `None` = not a role — the requires walk PRUNES
+        // there (a base CLASS's composed roles were checked at its own
+        // composition site), preserving the role-only edge semantics of
+        // docs/adr/role-contracts.md.
+        let role_requires_of = |c: &str| -> Option<Vec<String>> {
             let is_local = self
                 .symbols
                 .iter()
@@ -1060,19 +1059,13 @@ impl FileAnalysis {
                 if !self.is_role_package(c) {
                     return None;
                 }
-                return Some((
-                    self.role_requires.get(c).cloned().unwrap_or_default(),
-                    self.package_parents.get(c).cloned().unwrap_or_default(),
-                ));
+                return Some(self.role_requires.get(c).cloned().unwrap_or_default());
             }
             let cached = module_index?.get_cached(c)?;
             if !cached.analysis.is_role_package(c) {
                 return None;
             }
-            Some((
-                cached.analysis.role_requires.get(c).cloned().unwrap_or_default(),
-                cached.analysis.package_parents.get(c).cloned().unwrap_or_default(),
-            ))
+            Some(cached.analysis.role_requires.get(c).cloned().unwrap_or_default())
         };
 
         let mut out: Vec<UnfulfilledRequire> = Vec::new();
@@ -1093,21 +1086,36 @@ impl FileAnalysis {
             }
 
             // Gather (name, declaring role, direct parent) over the
-            // role-only reachable set from each direct parent.
+            // role-only reachable set from each direct parent: the
+            // INHERITS walk (app-surface edge excluded — the synthetic
+            // parent is never a role), pruned at every non-role node.
+            // `walk` excludes its origin, so the direct parent's own
+            // verdict is taken here.
+            let graph = crate::model::graph::GraphView::new(self, module_index);
             let mut required: Vec<(String, String, String)> = Vec::new();
             for direct in &self.package_parents[pkg] {
-                let mut queue: VecDeque<String> = VecDeque::from([direct.clone()]);
-                let mut seen: HashSet<String> = HashSet::new();
-                while let Some(c) = queue.pop_front() {
-                    if !seen.insert(c.clone()) || seen.len() > 21 {
-                        continue;
-                    }
-                    let Some((requires, parents)) = role_facts(&c) else { continue };
-                    for n in requires {
-                        required.push((n, c.clone(), direct.clone()));
-                    }
-                    queue.extend(parents);
+                let Some(requires) = role_requires_of(direct) else { continue };
+                for n in requires {
+                    required.push((n, direct.clone(), direct.clone()));
                 }
+                graph.walk(
+                    crate::model::graph::Node::Class(direct.clone()),
+                    crate::model::graph::EdgeKindMask::INHERITS,
+                    &mut |n| {
+                        let crate::model::graph::Node::Class(c) = n else {
+                            return crate::model::graph::WalkControl::PruneChildren;
+                        };
+                        match role_requires_of(c) {
+                            Some(requires) => {
+                                for name in requires {
+                                    required.push((name, c.clone(), direct.clone()));
+                                }
+                                crate::model::graph::WalkControl::Continue
+                            }
+                            None => crate::model::graph::WalkControl::PruneChildren,
+                        }
+                    },
+                );
             }
 
             let mut checked: HashSet<String> = HashSet::new();

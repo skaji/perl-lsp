@@ -73,7 +73,10 @@ marked otherwise; the drain re-derived each rationale against current code.
   now share one predicate-parameterized walker (per-call-site budgets 200/
   200/40 and seam scopes preserved). The recorded end state is collapsing
   `walk_ancestry` onto `GraphView`'s lazy walk (docs/adr/graph-walking.md) —
-  do that, not a fifth bespoke helper. The DBIC base-name set
+  do that, not a fifth bespoke helper. The walk contract now carries what
+  the collapse needs: the `WalkControl` prune verdict and the maskable
+  `APP_SURFACE` edge kind (bare `INHERITS` = surface-excluded, the isa
+  gates' seam scope). The DBIC base-name set
   (`class_is_dbic_result`'s Core/Row-vs-Schema/ResultSet polarity) still
   lives in the Model layer; its plugin-manifest move rides the
   `role_makers` precedent (follow-on, est M).

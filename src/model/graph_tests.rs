@@ -32,7 +32,7 @@ fn walk_inherits_preserves_isa_order_and_caps_cycles() {
         if let Node::Class(c) = n {
             order.push(c.clone());
         }
-        std::ops::ControlFlow::Continue(())
+        WalkControl::Continue
     });
     // Perl DFS: A first, A's ancestors (Top, then the cycle back to C is
     // seen-guarded), then B.
@@ -54,7 +54,7 @@ fn walk_descendants_matches_index_fan_out() {
         if let Node::Class(c) = n {
             got.push(c.clone());
         }
-        std::ops::ControlFlow::Continue(())
+        WalkControl::Continue
     });
     got.sort();
 
@@ -88,12 +88,12 @@ fn walk_bridges_reaches_plugin_modules_terminally() {
     let mut mods: Vec<String> = Vec::new();
     g.walk(
         Node::Class("Mojolicious::Controller".into()),
-        EdgeKindMask::BRIDGES | EdgeKindMask::INHERITS,
+        EdgeKindMask::BRIDGES | EdgeKindMask::INHERITS | EdgeKindMask::APP_SURFACE,
         &mut |n| {
             if let Node::Module(m) = n {
                 mods.push(m.clone());
             }
-            std::ops::ControlFlow::Continue(())
+            WalkControl::Continue
         },
     );
     assert_eq!(mods, vec!["My::Plugin::W"]);
@@ -197,7 +197,7 @@ fn walk_specializes_is_family_view_only() {
         if let Node::Class(c) = n {
             fam.push(c.clone());
         }
-        std::ops::ControlFlow::Continue(())
+        WalkControl::Continue
     });
     assert_eq!(fam, vec!["formatter<T*, char>", "formatter<int, char>"], "sorted, deterministic");
     // the inheritance mask sees nothing — a spec REPLACES, never inherits
@@ -206,7 +206,51 @@ fn walk_specializes_is_family_view_only() {
         if let Node::Class(c) = n {
             inh.push(c.clone());
         }
-        std::ops::ControlFlow::Continue(())
+        WalkControl::Continue
     });
     assert!(inh.is_empty(), "member resolution must not fall through Specializes: {inh:?}");
+}
+
+#[test]
+fn walk_prune_children_skips_expansion_but_continues() {
+    // A isa (B, C); B isa D; C isa E. Pruning at B must skip D (B's own
+    // expansion) while the walk still reaches C and E — the verdict the
+    // role-requires gather relies on (prune at non-role nodes).
+    let fa = parse(
+        "package D;\n1;\n\
+         package E;\n1;\n\
+         package B;\nuse parent -norequire, 'D';\n1;\n\
+         package C;\nuse parent -norequire, 'E';\n1;\n\
+         package A;\nuse parent -norequire, 'B', 'C';\n1;\n",
+    );
+    let g = GraphView::new(&fa, None);
+    let mut order: Vec<String> = Vec::new();
+    g.walk(Node::Class("A".into()), EdgeKindMask::INHERITS, &mut |n| {
+        let Node::Class(c) = n else { return WalkControl::Continue };
+        order.push(c.clone());
+        if c == "B" { WalkControl::PruneChildren } else { WalkControl::Continue }
+    });
+    assert_eq!(order, vec!["B", "C", "E"], "D pruned with B; C's line still walked");
+}
+
+#[test]
+fn walk_depth_cap_bounds_pathological_chains() {
+    // A 30-deep linear parent chain: the depth cap (21) bounds the walk
+    // — both re-expressed bespoke walkers (trigger view, role requires)
+    // inherit this backstop instead of hand-rolled caps.
+    let mut src = String::from("package C30;\n1;\n");
+    for i in (0..30).rev() {
+        src.push_str(&format!(
+            "package C{i};\nuse parent -norequire, 'C{}';\n1;\n",
+            i + 1
+        ));
+    }
+    let fa = parse(&src);
+    let g = GraphView::new(&fa, None);
+    let mut visited = 0usize;
+    g.walk(Node::Class("C0".into()), EdgeKindMask::INHERITS, &mut |_| {
+        visited += 1;
+        WalkControl::Continue
+    });
+    assert_eq!(visited, 21, "the MAX_DEPTH backstop bounds a pathological chain");
 }

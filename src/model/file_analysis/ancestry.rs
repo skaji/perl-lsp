@@ -4,20 +4,14 @@
 
 use super::*;
 
-/// Inject the synthetic app-surface ancestor (`APP_SURFACE_CLASS`) when
-/// `class` is one of the declared `consumers`. The ONE place the
-/// synthetic-parent edge is added — every parent-enumeration site
-/// (`for_each_ancestor_class`, `collect_ancestor_methods`, and the
-/// `MethodOnClass` inheritance walk in `witnesses.rs`) routes through
-/// here so they can't drift. Real ancestors come first; the surface is
-/// appended last so same-name overrides on a real parent win. The
-/// surface has no parents of its own, so the walk's seen-set + depth cap
-/// bound it like any edge.
-pub fn parents_of(
+/// The REAL parent edges: local `package_parents` ∪ cross-file
+/// `parents_cached`. One of `parents_of`'s two component spellers — the
+/// graph's `EdgeKind::Inherits` derivation reads this directly so the
+/// app-surface edge stays maskable.
+pub fn real_parents_of(
     class: &str,
     package_parents: &HashMap<String, Vec<String>>,
     module_index: Option<&dyn CrossFileLookup>,
-    consumers: &[String],
 ) -> Vec<String> {
     let mut parents: Vec<String> = package_parents.get(class).cloned().unwrap_or_default();
     if let Some(idx) = module_index {
@@ -27,11 +21,40 @@ pub fn parents_of(
             }
         }
     }
-    if class != APP_SURFACE_CLASS
-        && consumers.iter().any(|c| c == class)
-        && !parents.iter().any(|p| p == APP_SURFACE_CLASS)
-    {
-        parents.push(APP_SURFACE_CLASS.to_string());
+    parents
+}
+
+/// The synthetic app-surface ancestor (`APP_SURFACE_CLASS`) when `class`
+/// is one of the declared `consumers`. The ONE speller of the edge
+/// condition — `parents_of` composes it and the graph's
+/// `EdgeKind::AppSurface` derivation reads it directly.
+pub fn app_surface_parent(class: &str, consumers: &[String]) -> Option<String> {
+    if class != APP_SURFACE_CLASS && consumers.iter().any(|c| c == class) {
+        Some(APP_SURFACE_CLASS.to_string())
+    } else {
+        None
+    }
+}
+
+/// The full parent enumeration: real ancestors ∪ the synthetic
+/// app-surface edge. Every direct parent-enumeration site
+/// (`collect_ancestor_methods`, the `MethodOnClass` inheritance walk in
+/// `witnesses/`) routes through here so they can't drift; graph walks
+/// compose the same two spellers per edge kind. Real ancestors come
+/// first; the surface is appended last so same-name overrides on a real
+/// parent win. The surface has no parents of its own, so the walk's
+/// seen-set + depth cap bound it like any edge.
+pub fn parents_of(
+    class: &str,
+    package_parents: &HashMap<String, Vec<String>>,
+    module_index: Option<&dyn CrossFileLookup>,
+    consumers: &[String],
+) -> Vec<String> {
+    let mut parents = real_parents_of(class, package_parents, module_index);
+    if let Some(s) = app_surface_parent(class, consumers) {
+        if !parents.contains(&s) {
+            parents.push(s);
+        }
     }
     parents
 }
@@ -193,10 +216,16 @@ impl FileAnalysis {
         let graph = crate::model::graph::GraphView::new(self, module_index);
         graph.walk(
             crate::model::graph::Node::Class(class_name.to_string()),
-            crate::model::graph::EdgeKindMask::INHERITS,
+            crate::model::graph::EdgeKindMask::INHERITS
+                | crate::model::graph::EdgeKindMask::APP_SURFACE,
             &mut |n| match n {
-                crate::model::graph::Node::Class(c) => visit(c),
-                _ => std::ops::ControlFlow::Continue(()),
+                crate::model::graph::Node::Class(c) => match visit(c) {
+                    std::ops::ControlFlow::Break(()) => crate::model::graph::WalkControl::Stop,
+                    std::ops::ControlFlow::Continue(()) => {
+                        crate::model::graph::WalkControl::Continue
+                    }
+                },
+                _ => crate::model::graph::WalkControl::Continue,
             },
         );
     }
@@ -229,13 +258,14 @@ impl FileAnalysis {
         let mut found = false;
         graph.walk(
             crate::model::graph::Node::Class(child.to_string()),
-            crate::model::graph::EdgeKindMask::INHERITS,
+            crate::model::graph::EdgeKindMask::INHERITS
+                | crate::model::graph::EdgeKindMask::APP_SURFACE,
             &mut |n| {
                 if matches!(n, crate::model::graph::Node::Class(c) if c == ancestor) {
                     found = true;
-                    std::ops::ControlFlow::Break(())
+                    crate::model::graph::WalkControl::Stop
                 } else {
-                    std::ops::ControlFlow::Continue(())
+                    crate::model::graph::WalkControl::Continue
                 }
             },
         );
@@ -314,7 +344,7 @@ impl FileAnalysis {
                         family.push(c.clone());
                     }
                 }
-                std::ops::ControlFlow::Continue(())
+                crate::model::graph::WalkControl::Continue
             },
         );
         family
@@ -505,14 +535,15 @@ impl FileAnalysis {
         let graph = crate::model::graph::GraphView::new(self, module_index);
         graph.walk(
             crate::model::graph::Node::Class(enclosing.to_string()),
-            crate::model::graph::EdgeKindMask::INHERITS,
+            crate::model::graph::EdgeKindMask::INHERITS
+                | crate::model::graph::EdgeKindMask::APP_SURFACE,
             &mut |n| {
                 let crate::model::graph::Node::Class(cls) = n else {
-                    return std::ops::ControlFlow::Continue(());
+                    return crate::model::graph::WalkControl::Continue;
                 };
                 match self.method_resolution_on_class(cls, method_name, module_index) {
-                    Some(r) => { result = Some(r); std::ops::ControlFlow::Break(()) }
-                    None => std::ops::ControlFlow::Continue(()),
+                    Some(r) => { result = Some(r); crate::model::graph::WalkControl::Stop }
+                    None => crate::model::graph::WalkControl::Continue,
                 }
             },
         );
