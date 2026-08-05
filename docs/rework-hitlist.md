@@ -550,33 +550,20 @@ tests; a pathological-parent-graph depth test.
 
 ## Theme G — Plugin-owned vocabulary, not core allowlists
 
-### G1. "Which modules imply Moo-family `has` semantics" is spelled twice and has already diverged — **high leverage / M**
+### G1. LANDED — Moo-family `has` semantics are one plugin-declared manifest
 
-**The wrong embedding.** Core's `visit_use` match arms populate
-`framework_modes` (`src/build/builder/visit_use.rs:292-327`: Moo, Moo::Role,
-Dancer2::Plugin, Role::Tiny, Role::Tiny::With, MooX::Options, Moose,
-Moose::Role — no Mouse arm), gating NATIVE accessor/constructor-key synthesis
-(`visit_calls.rs:308-313`); `frameworks/moo.rhai:79-93`'s `triggers()` gates
-the PLUGIN's accessor-option vocabulary and lists Mouse, omits Role::Tiny.
-Live drift: `use Mouse; has x => (is=>'ro', predicate=>'has_x')` synthesizes
-the plugin predicate but no base `x` accessor — silent half-support. Every new
-Moo re-exporter needs two synchronized edits in two languages. The sibling
-role verdict four lines up (`visit_use.rs:285-287` reading plugin-fed
-`role_maker_modules`) is the exact pattern already in the codebase.
-
-**Target shape.** Copy the role_makers seam verbatim: a
-`framework_mode_makers() -> [(module, flavor)]` manifest fn declared in
-moo.rhai; the loader bakes `framework_mode_modules: HashMap<String,
-FrameworkMode>`; visit_use replaces the Moo/Moose match arms with a lookup.
-`triggers()` derives from (or is asserted equal to) the same declaration so
-the two gates cannot drift. Mojo::Base stays a core arm (its `-base` parsing
-is structural, not a name list). This deliberately leaves `visit_has_call`
-native — it shrinks, not conflicts with, the parked prompt-plugin-queries.md
-§14 move.
-
-**Gate.** A Mouse `has` fixture asserting both the base accessor AND the
-plugin predicate synthesize; plugin-fingerprint cache invalidation covers the
-.rhai edit.
+`frameworks/moo.rhai`'s `framework_mode_makers()` declares module → flavor
+(`"Moo"`/`"Moose"`) + exported keyword surface, and `triggers()` is derived
+from it, so the plugin's accessor-option gate and core's native-synthesis
+gate share one declaration. The builder bakes `framework_mode_modules:
+HashMap<module, (FrameworkMode, keywords)>` at plugin load; `visit_use`
+looks consumers up (Mojo::Base stays a structural core arm) and the `option`
+keyword is gated per-package via `package_imports_framework_keyword`. Core's
+Moo/Moose match arms and the `package_uses_moox_options` module check are
+deleted. The realized Mouse drift resolved toward full support (Moose
+flavor: native accessor + plugin options), pinned by
+`mouse_has_gets_both_native_accessor_and_plugin_predicate`; the open seam is
+pinned by `test_plugin_declared_framework_mode_maker_grants_has_semantics`.
 
 ### G2. Catalyst private-action name allowlist hardcoded in core's generic param_types dispatcher — **medium leverage / S**
 

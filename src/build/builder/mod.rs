@@ -533,6 +533,15 @@ struct Builder<'a> {
     /// the set is open by construction.
     role_maker_modules: std::collections::HashSet<String>,
 
+    /// Module → (framework mode, exported keyword surface) for modules
+    /// whose `use` grants Moo-family `has` semantics — the union of every
+    /// plugin's `framework_mode_makers()` manifest (the bundled set lives
+    /// in `frameworks/moo.rhai`), flavor-validated at bake. Core holds no
+    /// module list; `visit_use` looks consumers up here. Mojo::Base is
+    /// not in this map — its `-base` gate is structural, not a name match.
+    framework_mode_modules:
+        std::collections::HashMap<String, (FrameworkMode, Vec<String>)>,
+
     /// Per-file verdict: packages that ARE roles. Flushed into
     /// `FileAnalysis.role_packages`; `is_role_package` reads the baked
     /// set, never re-derives from use lists.
@@ -665,6 +674,20 @@ enum FrameworkMode {
     Moo,
     Moose,
     MojoBase,
+}
+
+impl FrameworkMode {
+    /// Parse a manifest flavor string (`FrameworkModeMaker::flavor`).
+    /// The flavor vocabulary is core's — each name selects a core
+    /// synthesis/isa rule set — so `MojoBase` is deliberately absent:
+    /// its gate is structural (`-base`), never a declared module name.
+    fn from_flavor(flavor: &str) -> Option<Self> {
+        match flavor {
+            "Moo" => Some(Self::Moo),
+            "Moose" => Some(Self::Moose),
+            _ => None,
+        }
+    }
 }
 
 // ---- Tests ----

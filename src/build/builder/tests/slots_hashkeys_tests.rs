@@ -1026,6 +1026,68 @@ fn test_bundled_moo_manifest_carries_base_role_engines() {
 }
 
 #[test]
+fn mouse_has_gets_both_native_accessor_and_plugin_predicate() {
+    // Drift pin: the Moo-family module vocabulary is ONE declaration
+    // (moo.rhai's framework_mode_makers(), which also derives triggers()).
+    // The old split — core match arms without Mouse, plugin triggers with
+    // it — gave Mouse `has` the plugin predicate but no base accessor.
+    // Both halves must synthesize from the one manifest.
+    let src = "\
+package Pet;
+use Mouse;
+has name => (is => 'ro', isa => 'Str', predicate => 'has_name');
+1;
+";
+    let fa = build_fa(src);
+    let method = |n: &str| {
+        fa.symbols
+            .iter()
+            .any(|s| s.name == n && s.kind == crate::model::file_analysis::SymKind::Method)
+    };
+    assert!(method("name"), "Mouse `has` synthesizes the native accessor");
+    assert!(method("has_name"), "Mouse `has` synthesizes the plugin predicate");
+    assert_eq!(
+        fa.package_framework.get("Pet"),
+        Some(&crate::model::witnesses::FrameworkFact::Moose),
+        "Mouse packages carry the Moose-flavor framework fact",
+    );
+}
+
+#[test]
+fn test_plugin_declared_framework_mode_maker_grants_has_semantics() {
+    // The framework-mode set is OPEN: core holds no module list, and any
+    // plugin can declare another Moo re-exporter. A registry with ONLY
+    // this plugin proves the manifest alone carries the fact.
+    let plugin_src = r#"
+        fn id() { "house-oo-kit" }
+        fn triggers() { [ #{ UsesModule: "My::OO" } ] }
+        fn framework_mode_makers() {
+            [ #{ "module": "My::OO", flavor: "Moo", imports: ["has", "with", "extends"] } ]
+        }
+    "#;
+    let engine = std::sync::Arc::new(crate::build::plugin::rhai_host::make_engine());
+    let plugin = crate::build::plugin::rhai_host::RhaiPlugin::from_source(plugin_src, engine)
+        .expect("plugin compiles");
+    let mut reg = crate::build::plugin::PluginRegistry::new();
+    reg.register(Box::new(plugin));
+
+    let source = "package House::Thing;\nuse My::OO;\nhas 'size' => (is => 'ro');\n1;\n";
+    let mut parser = create_parser();
+    let tree = parser.parse(source, None).unwrap();
+    let fa = build_with_plugins(&tree, source.as_bytes(), std::sync::Arc::new(reg));
+    assert!(
+        fa.symbols.iter().any(|s| {
+            s.name == "size" && s.kind == crate::model::file_analysis::SymKind::Method
+        }),
+        "plugin-declared maker must grant native `has` accessor synthesis",
+    );
+    assert!(
+        fa.framework_imports.contains("has") && fa.framework_imports.contains("with"),
+        "the maker's declared keyword surface lands in framework_imports",
+    );
+}
+
+#[test]
 fn plugin_loads_recorded_trigger_independent_and_multivalue() {
     use crate::model::file_analysis::SymKind;
     // A Mojolicious::Plugin file (NO Mojo app trigger) loading other

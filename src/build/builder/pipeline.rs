@@ -196,6 +196,7 @@ pub(super) fn build_with_plugins_inner(
         dynamic_parent_packages: std::collections::HashSet::new(),
         dynamic_dispatch_sites: 0,
         role_maker_modules: std::collections::HashSet::new(),
+        framework_mode_modules: std::collections::HashMap::new(),
         role_packages: std::collections::HashSet::new(),
         dbic_source_name: None,
         topic_group_spans: Vec::new(),
@@ -236,6 +237,21 @@ pub(super) fn build_with_plugins_inner(
         .collect();
     b.role_maker_modules
         .extend(b.plugins.role_makers().map(|s| s.to_string()));
+    b.framework_mode_modules = b
+        .plugins
+        .framework_mode_makers()
+        .filter_map(|m| match FrameworkMode::from_flavor(&m.flavor) {
+            Some(mode) => Some((m.module.clone(), (mode, m.imports.clone()))),
+            None => {
+                log::error!(
+                    "framework_mode_makers: unknown flavor `{}` for module `{}` — entry dropped",
+                    m.flavor,
+                    m.module
+                );
+                None
+            }
+        })
+        .collect();
     for pt in b.plugins.param_types() {
         match &pt.method {
             Some(name) => {

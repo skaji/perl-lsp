@@ -21,8 +21,8 @@ use tree_sitter::Point;
 
 use super::{
     AttributeMacro, CompletionQueryContext, ConstraintParam, DispatchVerb, EmitAction,
-    FrameworkPlugin, ParamType, PluginCompletionAnswer, PluginSigHelpAnswer, SigHelpQueryContext,
-    Trigger, TypeOverride, UseContext,
+    FrameworkModeMaker, FrameworkPlugin, ParamType, PluginCompletionAnswer, PluginSigHelpAnswer,
+    SigHelpQueryContext, Trigger, TypeOverride, UseContext,
 };
 
 /// An engine built with our helpers and type registrations. Engines are
@@ -189,6 +189,7 @@ pub struct RhaiPlugin {
     type_constraint_names: Vec<String>,
     app_surface_consumers: Vec<String>,
     role_makers: Vec<String>,
+    framework_mode_makers: Vec<FrameworkModeMaker>,
     column_keyed_verbs: Vec<String>,
     fluent_verbs: Vec<String>,
     topic_route_dsl: Option<crate::build::plugin::TopicRouteDsl>,
@@ -398,6 +399,28 @@ impl RhaiPlugin {
             }
         }
 
+        // `framework_mode_makers()` — modules whose `use` grants Moo-family
+        // `has` semantics; same optional, fail-safe contract.
+        let mut framework_mode_makers: Vec<FrameworkModeMaker> = Vec::new();
+        if signatures.iter().any(|n| n == "framework_mode_makers") {
+            match engine.call_fn::<Array>(&mut rhai::Scope::new(), &ast, "framework_mode_makers", ())
+            {
+                Ok(arr) => {
+                    for d in arr {
+                        match from_dynamic::<FrameworkModeMaker>(&d) {
+                            Ok(m) => framework_mode_makers.push(m),
+                            Err(e) => log::error!(
+                                "plugin `{}` framework_mode_makers() bad entry: {}",
+                                id,
+                                e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => log::error!("plugin `{}` framework_mode_makers() failed: {}", id, e),
+            }
+        }
+
         // `column_keyed_verbs()` — verbs whose first hashref arg is keyed by the
         // receiver class's columns; same optional, fail-safe array-of-strings.
         let mut column_keyed_verbs: Vec<String> = Vec::new();
@@ -491,6 +514,7 @@ impl RhaiPlugin {
             type_constraint_names,
             app_surface_consumers,
             role_makers,
+            framework_mode_makers,
             column_keyed_verbs,
             fluent_verbs,
             topic_route_dsl,
@@ -601,6 +625,10 @@ impl FrameworkPlugin for RhaiPlugin {
 
     fn role_makers(&self) -> &[String] {
         &self.role_makers
+    }
+
+    fn framework_mode_makers(&self) -> &[FrameworkModeMaker] {
+        &self.framework_mode_makers
     }
 
     fn column_keyed_verbs(&self) -> &[String] {
@@ -715,6 +743,22 @@ const BUNDLED: &[(&str, &str)] = &[
     ("catalyst", include_str!("../../../frameworks/catalyst.rhai")),
     ("cpp-attributes", include_str!("../../../frameworks/cpp-attributes.rhai")),
 ];
+
+/// One bundled plugin by id — for registries composed from a custom
+/// plugin PLUS a bundled manifest carrier (e.g. a kit-plugin test that
+/// needs moo.rhai's `framework_mode_makers()` for `use Moo` to grant
+/// framework mode, exactly as the full default registry would).
+#[cfg(test)]
+pub fn load_bundled_plugin(id: &str, engine: Arc<Engine>) -> Option<Box<dyn FrameworkPlugin>> {
+    let (_, src) = BUNDLED.iter().find(|(pid, _)| *pid == id)?;
+    match RhaiPlugin::from_source(src, engine) {
+        Ok(p) => Some(Box::new(p)),
+        Err(e) => {
+            log::warn!("bundled plugin `{}` failed to load: {}", id, e);
+            None
+        }
+    }
+}
 
 pub fn load_bundled(engine: Arc<Engine>) -> Vec<Box<dyn FrameworkPlugin>> {
     let mut out: Vec<Box<dyn FrameworkPlugin>> = Vec::new();

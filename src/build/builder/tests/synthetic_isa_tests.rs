@@ -51,6 +51,14 @@ mod synthetic_use {
 
     fn registry_with_co_base() -> Arc<PluginRegistry> {
         let mut reg = PluginRegistry::new();
+        // "Which modules grant Moo `has` semantics" rides moo.rhai's
+        // framework_mode_makers() manifest — the kit registry needs that
+        // carrier for `use Moo` (literal or synthetic) to set the mode,
+        // same as the default registry.
+        let engine = Arc::new(crate::build::plugin::rhai_host::make_engine());
+        let moo = crate::build::plugin::rhai_host::load_bundled_plugin("moo", engine)
+            .expect("bundled moo plugin loads");
+        reg.register(moo);
         reg.register(Box::new(CoBasePlugin));
         Arc::new(reg)
     }
@@ -763,6 +771,12 @@ mod param_types_manifest {
 
     fn build_with_upgrade(source: &str) -> FileAnalysis {
         let mut reg = PluginRegistry::new();
+        // `use Moo; with 'Role'` needs moo.rhai's framework_mode_makers()
+        // manifest for the mode (and thus `with` handling) to engage.
+        let engine = Arc::new(crate::build::plugin::rhai_host::make_engine());
+        let moo = crate::build::plugin::rhai_host::load_bundled_plugin("moo", engine)
+            .expect("bundled moo plugin loads");
+        reg.register(moo);
         reg.register(Box::new(UpgradeRolePlugin));
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();

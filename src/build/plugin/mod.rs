@@ -817,6 +817,24 @@ pub enum Trigger {
     Always,
 }
 
+/// A plugin-declared "`use MODULE` gives the consuming package
+/// Moo-family `has` semantics" fact: the module name, which flavor's
+/// rules apply (`"Moo"` / `"Moose"` — the flavor vocabulary is core's,
+/// since it names core synthesis behavior; the module→flavor mapping is
+/// the open, plugin-owned part), and the keyword surface the module
+/// exports into the consumer (`has`, `with`, role-only `requires`,
+/// MooX's `option`, …). The builder bakes the union at plugin load and
+/// `visit_use` looks modules up — core holds no module list. Mojo::Base
+/// is deliberately not declarable here: its `-base` gate is structural,
+/// not a name match.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FrameworkModeMaker {
+    pub module: String,
+    pub flavor: String,
+    #[serde(default)]
+    pub imports: Vec<String>,
+}
+
 /// A plugin-asserted return type for a known sub/method. Plugins ship
 /// these as a static manifest (`overrides()` on the trait, `fn
 /// overrides()` at the top of a `.rhai` script) for cases where
@@ -1052,6 +1070,14 @@ pub trait FrameworkPlugin: Send + Sync {
     /// engine module here and consumers are marked roles directly.
     /// Default empty.
     fn role_makers(&self) -> &[String] {
+        &[]
+    }
+
+    /// Modules whose `use` gives the consuming package Moo-family `has`
+    /// semantics — see [`FrameworkModeMaker`]. The bundled set lives in
+    /// `frameworks/moo.rhai`; any plugin can declare another re-exporter.
+    /// Default empty.
+    fn framework_mode_makers(&self) -> &[FrameworkModeMaker] {
         &[]
     }
 
@@ -1423,6 +1449,17 @@ impl PluginRegistry {
         self.plugins
             .iter()
             .flat_map(|p| p.role_makers().iter().map(|s| s.as_str()))
+    }
+
+    /// Union of framework-mode makers across the registry — the open set of
+    /// modules whose `use` grants Moo-family `has` semantics. The builder
+    /// bakes this into its module → (mode, keywords) lookup at start.
+    pub fn framework_mode_makers<'a>(
+        &'a self,
+    ) -> impl Iterator<Item = &'a FrameworkModeMaker> + 'a {
+        self.plugins
+            .iter()
+            .flat_map(|p| p.framework_mode_makers().iter())
     }
 
     /// Union of column-keyed call verbs across the registry — the verbs whose

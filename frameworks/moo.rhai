@@ -76,20 +76,54 @@ fn patterns() {
     ]
 }
 
-fn triggers() {
+// The modules whose `use` grants the consuming package Moo-family `has`
+// semantics: native accessor/constructor-key synthesis, the flavor's isa
+// vocabulary, and the keyword surface each module exports into the
+// consumer. Core holds NO module list — this manifest (plus any
+// third-party plugin's) is the whole set; the builder bakes
+// module → (flavor, keywords) at plugin load. `flavor` selects which of
+// core's rule sets applies ("Moo" / "Moose"); Mojo::Base is absent by
+// design — its `-base` gate is structural, not a name match.
+fn moo_keywords() { ["has", "with", "extends", "around", "before", "after"] }
+fn moose_keywords() {
+    moo_keywords() + ["override", "super", "inner", "augment", "confess", "blessed"]
+}
+
+fn framework_mode_makers() {
     [
-        #{ UsesModule: "Moo" },
-        #{ UsesModule: "Moo::Role" },
-        #{ UsesModule: "Moose" },
-        #{ UsesModule: "Moose::Role" },
-        #{ UsesModule: "Mouse" },
-        // Dancer2::Plugin re-exports Moo's `has` into the consuming plugin, so
-        // `has my_setting => (...)` there wants the same accessor synthesis.
-        #{ UsesModule: "Dancer2::Plugin" },
+        #{ "module": "Moo", flavor: "Moo", imports: moo_keywords() },
+        // `requires` is role-only sugar; a plain class never calls it.
+        #{ "module": "Moo::Role", flavor: "Moo", imports: moo_keywords() + ["requires"] },
+        // Dancer2::Plugin re-exports Moo's `has`/`with`/... into the consuming
+        // plugin package, so `has my_setting => (...)` there wants the same
+        // accessor synthesis.
+        #{ "module": "Dancer2::Plugin", flavor: "Moo", imports: moo_keywords() },
+        // Role::Tiny / Role::Tiny::With behave like Moo::Role for our
+        // purposes: they export `with` (and `requires`, via the role sugar)
+        // into the consuming package.
+        #{ "module": "Role::Tiny", flavor: "Moo", imports: moo_keywords() + ["requires"] },
+        #{ "module": "Role::Tiny::With", flavor: "Moo", imports: moo_keywords() + ["requires"] },
         // MooX::Options' `option` is a `has` with extra option-parsing keys;
-        // its accessor-option vocabulary (predicate/clearer/...) is identical.
-        #{ UsesModule: "MooX::Options" },
+        // it routes through the shared `has` path at the call site, gated on
+        // the `option` keyword being in this import surface.
+        #{ "module": "MooX::Options", flavor: "Moo", imports: moo_keywords() + ["option"] },
+        #{ "module": "Moose", flavor: "Moose", imports: moose_keywords() },
+        #{ "module": "Moose::Role", flavor: "Moose", imports: moose_keywords() + ["requires"] },
+        // Mouse mimics Moose's keyword and `has` surface.
+        #{ "module": "Mouse", flavor: "Moose", imports: moose_keywords() },
+        #{ "module": "Mouse::Role", flavor: "Moose", imports: moose_keywords() + ["requires"] },
     ]
+}
+
+// Derived from the maker manifest, so the plugin's accessor-option
+// vocabulary can never fire for a module core doesn't grant `has`
+// semantics (or vice versa) — one declaration feeds both gates.
+fn triggers() {
+    let out = [];
+    for m in framework_mode_makers() {
+        out.push(#{ UsesModule: m["module"] });
+    }
+    out
 }
 
 // Keywords whose value names a method to synthesize. Any OTHER option keyword

@@ -287,77 +287,48 @@ impl<'a> Builder<'a> {
             }
         }
 
-        // Detect framework mode from use statements
+        // Detect framework mode from use statements. Moo-family `has`
+        // semantics are manifest-declared (`framework_mode_makers()` in
+        // frameworks/moo.rhai — module → flavor + exported keyword surface;
+        // rule #8/#10: the plugin owns the module vocabulary, core holds no
+        // list). Shared with SyntheticUse, so kit chains grant mode through
+        // either hop. Mojo::Base stays a structural arm — its OO-ness is
+        // decided by `-base`/parent args, not a name match.
         if let Some(pkg) = self.current_package.as_ref().cloned() {
-            match module_name.as_str() {
-                // Dancer2::Plugin re-exports Moo's `has`/`with`/etc. into the
-                // consuming plugin package, so it gets Moo-mode accessor synthesis.
-                // Role::Tiny / Role::Tiny::With behave like Moo::Role for our
-                // purposes: they export `with` (and `requires`, via the role
-                // sugar) into the consuming package.
-                // MooX::Options re-exports `option` (a `has` with extra
-                // option-parsing keys) into a Moo class, so it gets Moo-mode
-                // accessor/constructor-key synthesis; the `option` keyword
-                // routes through the shared `has` path at the call site.
-                "Moo" | "Moo::Role" | "Dancer2::Plugin"
-                | "Role::Tiny" | "Role::Tiny::With" | "MooX::Options" => {
-                    self.framework_modes.insert(pkg, FrameworkMode::Moo);
-                    for kw in &["has", "with", "extends", "around", "before", "after"] {
-                        self.framework_imports.insert(kw.to_string());
-                    }
-                    if module_name == "MooX::Options" {
-                        self.framework_imports.insert("option".to_string());
-                    }
-                    // `requires` is role-only sugar; harmless to register for
-                    // plain Moo too (a class never calls it).
-                    if matches!(module_name.as_str(),
-                        "Moo::Role" | "Role::Tiny" | "Role::Tiny::With")
-                    {
-                        self.framework_imports.insert("requires".to_string());
+            if let Some((mode, keywords)) =
+                self.framework_mode_modules.get(&module_name).cloned()
+            {
+                self.framework_modes.insert(pkg, mode);
+                self.framework_imports.extend(keywords);
+            } else if module_name == "Mojo::Base" {
+                // OO-ness is decided by `-base` or a parent-class arg, NOT by
+                // `-strict` — `-base` implies strict, and `use Mojo::Base
+                // -base, -strict` (redundant but legal) is still a class. The
+                // package IS-A its parents (or Mojo::Base for `-base`), so
+                // `tap` / `attr` / `new` resolve through the inheritance walk.
+                let mut parents: Vec<String> = raw_args.iter()
+                    .filter(|s| !s.starts_with('-'))
+                    .cloned()
+                    .collect();
+                let has_base = raw_args.iter().any(|a| a == "-base");
+                if has_base {
+                    parents.push("Mojo::Base".to_string());
+                }
+                if !parents.is_empty() {
+                    self.apply_mojo_base_mode(pkg, parents, node);
+                } else if raw_args.iter().any(|a| a == "-strict") {
+                    // Pure `-strict` (no `-base`, no parent): strict-mode only,
+                    // no class machinery. A bare `shift` here is arg[0], not the
+                    // invocant (see `shift_is_invocant_here`).
+                    if let Some(p) = self.current_package.clone() {
+                        self.non_oo_packages.insert(p);
                     }
                 }
-                "Moose" | "Moose::Role" => {
-                    self.framework_modes.insert(pkg, FrameworkMode::Moose);
-                    for kw in &["has", "with", "extends", "around", "before", "after",
-                                "override", "super", "inner", "augment", "confess", "blessed"] {
-                        self.framework_imports.insert(kw.to_string());
-                    }
-                    if module_name == "Moose::Role" {
-                        self.framework_imports.insert("requires".to_string());
-                    }
-                }
-                "Mojo::Base" => {
-                    // OO-ness is decided by `-base` or a parent-class arg, NOT by
-                    // `-strict` — `-base` implies strict, and `use Mojo::Base
-                    // -base, -strict` (redundant but legal) is still a class. The
-                    // package IS-A its parents (or Mojo::Base for `-base`), so
-                    // `tap` / `attr` / `new` resolve through the inheritance walk.
-                    let mut parents: Vec<String> = raw_args.iter()
-                        .filter(|s| !s.starts_with('-'))
-                        .cloned()
-                        .collect();
-                    let has_base = raw_args.iter().any(|a| a == "-base");
-                    if has_base {
-                        parents.push("Mojo::Base".to_string());
-                    }
-                    if !parents.is_empty() {
-                        self.apply_mojo_base_mode(pkg, parents, node);
-                    } else if raw_args.iter().any(|a| a == "-strict") {
-                        // Pure `-strict` (no `-base`, no parent): strict-mode only,
-                        // no class machinery. A bare `shift` here is arg[0], not the
-                        // invocant (see `shift_is_invocant_here`).
-                        if let Some(p) = self.current_package.clone() {
-                            self.non_oo_packages.insert(p);
-                        }
-                    }
-                }
+            } else if raw_args.iter().any(|a| a == "-base") {
                 // `use Mojo::EventEmitter -base` / any `use X -base`: X becomes a
                 // parent AND the package inherits Mojo::Base's `has`/`attr`/`tap`/
                 // `new` (the `-base` flag is Mojo::Base's "inherit from me" sugar).
-                _ if raw_args.iter().any(|a| a == "-base") => {
-                    self.apply_mojo_base_mode(pkg, vec![module_name.clone()], node);
-                }
-                _ => {}
+                self.apply_mojo_base_mode(pkg, vec![module_name.clone()], node);
             }
         }
 
