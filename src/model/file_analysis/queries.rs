@@ -300,9 +300,9 @@ impl FileAnalysis {
     ) -> crate::model::witnesses::BagContext<'a> {
         crate::model::witnesses::BagContext {
             scopes: &self.scopes,
-            package_framework: &self.package_framework,
+            package_framework: &self.packages,
             module_index,
-            package_parents: &self.package_parents,
+            package_parents: &self.packages,
             app_surface_consumers: &self.app_surface_consumers,
         }
     }
@@ -349,7 +349,7 @@ impl FileAnalysis {
         let pkg = self.package_at(point);
         for gated in &self.gated_param_types {
             if let GateResult::Applies(tc) =
-                gated.resolve_for(pkg, &self.package_parents, module_index)
+                gated.resolve_for(pkg, &self.packages, module_index)
             {
                 if tc.variable == var && chain.contains(&tc.scope) {
                     return Some(tc.inferred_type.clone());

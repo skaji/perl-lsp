@@ -219,7 +219,7 @@ time and replays the record for a stripped copy, so eviction can never
 blank the reverse index (`func → modules`, `find_exporters`).
 
 Pinned resident, per file, across all three axes: `include_closure`,
-`package_parents` / `specializes`, `return_types`, `provisional_dispatches`,
+`packages` / `specializes`, `return_types`, `provisional_dispatches`,
 `export`/`export_ok`, `plugin_namespaces`, `scopes`, the small header maps.
 Open documents keep everything, always.
 

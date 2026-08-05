@@ -133,9 +133,9 @@ fn slot_type(fa: &FileAnalysis, class: &str, key: &str) -> Option<InferredType> 
     };
     let ctx = BagContext {
         scopes: &fa.scopes,
-        package_framework: &fa.package_framework,
+        package_framework: &fa.packages,
         module_index: None,
-        package_parents: &fa.package_parents,
+        package_parents: &fa.packages,
         app_surface_consumers: &fa.app_surface_consumers,
     };
     let q = ReducerQuery {
@@ -795,9 +795,9 @@ use Moo;
 with map \"My::Roles::$_\", qw/Alpha Beta/;
 ";
     let fa = build_fa(src);
-    let parents = fa.package_parents.get("My::Class").expect("parents recorded");
+    let parents = fa.declared_parents("My::Class");
     assert_eq!(
-        parents.as_slice(),
+        parents,
         &["My::Roles::Alpha".to_string(), "My::Roles::Beta".to_string()],
     );
 }
@@ -1047,7 +1047,7 @@ has name => (is => 'ro', isa => 'Str', predicate => 'has_name');
     assert!(method("name"), "Mouse `has` synthesizes the native accessor");
     assert!(method("has_name"), "Mouse `has` synthesizes the plugin predicate");
     assert_eq!(
-        fa.package_framework.get("Pet"),
+        fa.package_framework("Pet").as_ref(),
         Some(&crate::model::witnesses::FrameworkFact::Moose),
         "Mouse packages carry the Moose-flavor framework fact",
     );

@@ -1244,7 +1244,7 @@ sub run {
     assert_eq!(unresolved.len(), 1, "only the typo: {:?}", unresolved);
     assert!(unresolved[0].contains("typo_method"), "{:?}", unresolved);
     assert_eq!(
-        analysis.role_requires.get("My::Role").map(|v| v.len()),
+        Some(analysis.role_requires("My::Role").len()),
         Some(3),
         "the contract record carries all three names",
     );

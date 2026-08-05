@@ -335,9 +335,9 @@ impl ReducerRegistry {
                              state: &mut _| {
                                 let cached_ctx = BagContext {
                                     scopes: &full.scopes,
-                                    package_framework: &full.package_framework,
+                                    package_framework: &full.packages,
                                     module_index: Some(idx),
-                                    package_parents: &full.package_parents,
+                                    package_parents: &full.packages,
                                     app_surface_consumers: &full.app_surface_consumers,
                                 };
                                 let sub_q = ReducerQuery {
@@ -471,9 +471,9 @@ impl ReducerRegistry {
                              state: &mut _| {
                                 let cached_ctx = BagContext {
                                     scopes: &full.scopes,
-                                    package_framework: &full.package_framework,
+                                    package_framework: &full.packages,
                                     module_index: Some(idx),
-                                    package_parents: &full.package_parents,
+                                    package_parents: &full.packages,
                                     app_surface_consumers: &full.app_surface_consumers,
                                 };
                                 let sub_q = ReducerQuery {
@@ -559,9 +559,9 @@ impl ReducerRegistry {
                         if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {
                                 scopes: &full.scopes,
-                                package_framework: &full.package_framework,
+                                package_framework: &full.packages,
                                 module_index: Some(idx),
-                                package_parents: &full.package_parents,
+                                package_parents: &full.packages,
                                 app_surface_consumers: &full.app_surface_consumers,
                             };
                             let sub_q = ReducerQuery {
@@ -842,7 +842,7 @@ impl ReducerRegistry {
         let framework = chain
             .iter()
             .find_map(|sid| ctx.scopes[sid.0 as usize].package.as_ref())
-            .and_then(|pkg| ctx.package_framework.get(pkg).copied())
+            .and_then(|pkg| ctx.package_framework.framework_of(pkg))
             .unwrap_or(FrameworkFact::Plain);
         // A scope that only OBSERVES rep use of the variable (`$self->{k}`
         // inside a nested block → HashRefAccess) yields a bare `HashRef`,

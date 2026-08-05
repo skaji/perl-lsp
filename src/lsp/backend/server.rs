@@ -296,7 +296,7 @@ impl LanguageServer for Backend {
                     self.module_index.request_resolve(&imp.module_name);
                 }
                 // Enqueue parent classes for resolution (inheritance chain).
-                for parents in doc.analysis.package_parents.values() {
+                for (_pkg, parents) in doc.analysis.package_parent_edges() {
                     for parent in parents {
                         self.module_index.request_resolve(parent);
                     }
@@ -359,7 +359,7 @@ impl LanguageServer for Backend {
                 for imp in &doc.analysis.imports {
                     self.module_index.request_resolve(&imp.module_name);
                 }
-                for parents in doc.analysis.package_parents.values() {
+                for (_pkg, parents) in doc.analysis.package_parent_edges() {
                     for parent in parents {
                         self.module_index.request_resolve(parent);
                     }

@@ -16,7 +16,7 @@ impl FileAnalysis {
             fold_ranges,
             imports,
             call_bindings,
-            package_parents,
+            packages,
             method_call_bindings,
             framework_imports,
             export,
@@ -24,13 +24,11 @@ impl FileAnalysis {
             export_tags,
             reexport_modules,
             plugin_namespaces,
-            package_uses,
             type_provenance,
             package_ranges,
             plugin_diagnostics,
             app_surface_consumers,
             mut witnesses,
-            package_framework,
             provisional_dispatches,
             gated_emissions,
             guard_sites,
@@ -39,10 +37,7 @@ impl FileAnalysis {
             attr_projections,
             reassigned_scalars,
             key_writes,
-            role_requires,
             contract_symbols,
-            dynamic_parent_packages,
-            role_packages,
             dbic_source_name,
             column_keyed_verbs,
             dynamic_dispatch_sites,
@@ -68,9 +63,8 @@ impl FileAnalysis {
             method_call_bindings,
             package_ranges,
             plugin_diagnostics,
-            package_parents,
+            packages,
             app_surface_consumers,
-            package_uses,
             framework_imports,
             export,
             export_ok,
@@ -82,7 +76,6 @@ impl FileAnalysis {
             bag_evicted: false,
             refs_evicted: false,
             symbols_evicted: false,
-            package_framework,
             base_symbol_count: 0,
             base_witness_count: 0,
             base_ref_count: 0,
@@ -94,10 +87,7 @@ impl FileAnalysis {
             attr_projections,
             reassigned_scalars,
             key_writes,
-            role_requires,
             contract_symbols,
-            dynamic_parent_packages,
-            role_packages,
             dbic_source_name,
             column_keyed_verbs,
             dynamic_dispatch_sites,
@@ -740,6 +730,18 @@ impl FileAnalysis {
             }
             b
         }
+        // The per-package table: flat entries + key strings + the name
+        // vecs each entry owns. The `bool`/`Option` lanes ride the entry
+        // struct, already counted by `mcap`.
+        fn pkg_facts(m: &HashMap<String, PackageFacts>) -> usize {
+            let mut b = mcap(m);
+            for (k, f) in m {
+                b += k.capacity()
+                    + (f.parents.capacity() + f.uses.capacity() + f.requires.capacity())
+                        * std::mem::size_of::<String>();
+            }
+            b
+        }
 
         let mut h = HeapBreakdown {
             files: 1,
@@ -846,18 +848,13 @@ impl FileAnalysis {
             + vcap(&self.package_ranges);
 
         // per-package small maps/sets + export lists.
-        h.misc = map_str_vec(&self.package_parents)
-            + map_str_vec(&self.package_uses)
-            + map_str_vec(&self.role_requires)
+        h.misc = pkg_facts(&self.packages)
             + map_str_vec(&self.template_params)
             + map_str_vec(&self.export_tags)
             + mcap(&self.specializes)
             + mcap(&self.type_provenance)
-            + mcap(&self.package_framework)
             + scap(&self.framework_imports)
             + scap(&self.reassigned_scalars)
-            + scap(&self.dynamic_parent_packages)
-            + scap(&self.role_packages)
             + scap(&self.column_keyed_verbs)
             + vcap(&self.export)
             + vcap(&self.export_ok)

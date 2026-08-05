@@ -50,9 +50,9 @@ pub struct ReducerQuery<'a> {
 /// `None`/empty for in-file callers.
 pub struct BagContext<'a> {
     pub scopes: &'a [Scope],
-    pub package_framework: &'a HashMap<String, FrameworkFact>,
+    pub package_framework: &'a dyn crate::model::file_analysis::PackageFrameworks,
     pub module_index: Option<&'a dyn crate::model::file_analysis::CrossFileLookup>,
-    pub package_parents: &'a HashMap<String, Vec<String>>,
+    pub package_parents: &'a dyn crate::model::file_analysis::LocalParents,
     /// Manifest-declared app-surface consumer classes — threaded so the
     /// `MethodOnClass` inheritance walk injects the synthetic surface
     /// parent via `parents_of`, matching the FA-side ancestor walks.

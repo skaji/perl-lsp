@@ -220,7 +220,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
                         enqueue(&mut pending, re.clone());
                     }
                     // Parent classes — inheritance chain.
-                    for parents in m.analysis.package_parents.values() {
+                    for (_pkg, parents) in m.analysis.package_parent_edges() {
                         for parent in parents {
                             enqueue(&mut pending, parent.clone());
                         }

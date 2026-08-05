@@ -22,7 +22,7 @@ design holds them together so they can't drift:
 `requires NAMES` synthesizes one Method symbol per name (span = the
 name's atom) so in-role `$self->name` resolves: no unresolved-method
 hint, completion offers it, hover documents it. The names also land in
-`FileAnalysis.role_requires` (per-package lists) and the synthesized
+`PackageFacts::requires` (per-package lists) and the synthesized
 symbols' ids in `FileAnalysis.contract_symbols`.
 
 The id set, not the name list, is what "is this def a marker?" must
@@ -32,7 +32,7 @@ default-implementation pattern (`requires 'fetch'; ... sub fetch {...}`
 checks fail in **both** directions:
 
 - they eat the real def sitting beside the marker ("fetch is in
-  `role_requires`, so every fetch symbol here is a marker" → the
+  `requires`, so every fetch symbol here is a marker" → the
   default impl doesn't count as provision);
 - the names reverse index contains the marker symbol, so a name-keyed
   provision probe (`module_declaring_method_in_package`) finds the
@@ -60,7 +60,7 @@ plugin-bridged entity. Modifiers (`around`/`before`/`after`) never
 synthesize symbols, so they correctly don't provide.
 
 Role-ness itself is `FileAnalysis::is_role_package`, reading the
-baked `role_packages` verdict. One predicate; consumers never
+baked `PackageFacts::is_role` verdict. One predicate; consumers never
 re-derive from use lists. The maker set behind the verdict is OPEN —
 core holds no list at all:
 
@@ -88,7 +88,7 @@ cases:
 - **Incomplete ancestry** — `class_has_unresolved_ancestor`, the
   single source of "is the inheritance chain incomplete" (it already
   gated the unresolved-method hint). This ADR added one input to it:
-  `FileAnalysis.dynamic_parent_packages`, packages with a
+  `PackageFacts::dynamic_parents`, packages with a
   `with`/`extends` argument that didn't fold to a literal name.
   `with ReportProxy(type => ...)` generates a role at runtime; the
   recorded parent list is not the whole ancestry, and pretending
@@ -108,7 +108,7 @@ the two patterns above.
 ## The reverse-edge bundle
 
 `children_index` (parent class/role → modules whose packages
-isa/compose it — inverse `package_parents`) is the fan-out's index,
+isa/compose it — inverse `PackageFacts::parents`) is the fan-out's index,
 walked transitively by `ModuleIndex::for_each_descendant_package`.
 It lives in `ModuleEdgeIndexes` together with the names and bridges
 maps: one struct, one `feed`/`purge`/`clear`, called by every

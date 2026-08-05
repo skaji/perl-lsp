@@ -12,7 +12,7 @@ fn test_use_parent_single() {
         ",
     );
     assert_eq!(
-        fa.package_parents.get("Child").unwrap(),
+        fa.declared_parents("Child"),
         &vec!["Parent".to_string()]
     );
 }
@@ -26,7 +26,7 @@ fn test_use_parent_multiple() {
         ",
     );
     assert_eq!(
-        fa.package_parents.get("Multi").unwrap(),
+        fa.declared_parents("Multi"),
         &vec!["Foo".to_string(), "Bar".to_string()]
     );
 }
@@ -78,7 +78,7 @@ fn test_use_parent_norequire() {
         ",
     );
     assert_eq!(
-        fa.package_parents.get("Local").unwrap(),
+        fa.declared_parents("Local"),
         &vec!["My::Base".to_string()]
     );
 }
@@ -92,7 +92,7 @@ fn test_use_base() {
         ",
     );
     assert_eq!(
-        fa.package_parents.get("Old").unwrap(),
+        fa.declared_parents("Old"),
         &vec!["Legacy::Base".to_string()]
     );
 }
@@ -106,7 +106,7 @@ fn test_isa_assignment() {
         ",
     );
     assert_eq!(
-        fa.package_parents.get("Direct").unwrap(),
+        fa.declared_parents("Direct"),
         &vec!["Alpha".to_string(), "Beta".to_string()]
     );
 }
@@ -119,7 +119,7 @@ fn test_class_isa_populates_package_parents() {
         ",
     );
     assert_eq!(
-        fa.package_parents.get("Child").unwrap(),
+        fa.declared_parents("Child"),
         &vec!["Parent".to_string()]
     );
 }
@@ -131,7 +131,7 @@ fn test_class_does_populates_package_parents() {
             class MyClass :does(Printable) :does(Serializable) { }
         ",
     );
-    let parents = fa.package_parents.get("MyClass").unwrap();
+    let parents = fa.declared_parents("MyClass");
     assert!(parents.contains(&"Printable".to_string()));
     assert!(parents.contains(&"Serializable".to_string()));
 }
@@ -143,7 +143,7 @@ fn test_class_isa_and_does_combined() {
             class Child :isa(Parent) :does(Role) { }
         ",
     );
-    let parents = fa.package_parents.get("Child").unwrap();
+    let parents = fa.declared_parents("Child");
     assert_eq!(parents, &vec!["Parent".to_string(), "Role".to_string()]);
 }
 
@@ -156,7 +156,7 @@ fn test_with_role_populates_package_parents() {
             with 'My::Role::Logging';
         ",
     );
-    let parents = fa.package_parents.get("MyApp").unwrap();
+    let parents = fa.declared_parents("MyApp");
     assert!(parents.contains(&"My::Role::Logging".to_string()));
 }
 
@@ -169,7 +169,7 @@ fn test_with_multiple_roles() {
             with 'Role::A', 'Role::B';
         ",
     );
-    let parents = fa.package_parents.get("MyApp").unwrap();
+    let parents = fa.declared_parents("MyApp");
     assert!(parents.contains(&"Role::A".to_string()));
     assert!(parents.contains(&"Role::B".to_string()));
 }
@@ -314,7 +314,7 @@ fn test_load_components_bare() {
             __PACKAGE__->load_components('InflateColumn::DateTime', 'TimeStamp');
         ",
     );
-    let parents = fa.package_parents.get("MySchema::Result::User").unwrap();
+    let parents = fa.declared_parents("MySchema::Result::User");
     assert!(parents.contains(&"DBIx::Class::Core".to_string()));
     assert!(parents.contains(&"DBIx::Class::InflateColumn::DateTime".to_string()));
     assert!(parents.contains(&"DBIx::Class::TimeStamp".to_string()));
@@ -329,7 +329,7 @@ fn test_load_components_plus_prefix() {
             __PACKAGE__->load_components('+My::Custom::Component');
         ",
     );
-    let parents = fa.package_parents.get("MySchema::Result::User").unwrap();
+    let parents = fa.declared_parents("MySchema::Result::User");
     assert!(parents.contains(&"My::Custom::Component".to_string()));
 }
 
@@ -342,7 +342,7 @@ fn test_load_components_qw() {
             __PACKAGE__->load_components(qw(Helper::ResultSet::Shortcut Helper::ResultSet::Me));
         ",
     );
-    let parents = fa.package_parents.get("MySchema::ResultSet::User").unwrap();
+    let parents = fa.declared_parents("MySchema::ResultSet::User");
     assert!(parents.contains(&"DBIx::Class::Helper::ResultSet::Shortcut".to_string()));
     assert!(parents.contains(&"DBIx::Class::Helper::ResultSet::Me".to_string()));
 }
@@ -361,7 +361,7 @@ fn test_load_own_components_prefixes_current_package() {
             __PACKAGE__->load_own_components(qw(Helpers CascadeActions Base));
         ",
     );
-    let parents = fa.package_parents.get("DBIx::Class::Relationship").unwrap();
+    let parents = fa.declared_parents("DBIx::Class::Relationship");
     assert!(parents.contains(&"DBIx::Class::Relationship::CascadeActions".to_string()));
     assert!(parents.contains(&"DBIx::Class::Relationship::Helpers".to_string()));
     assert!(parents.contains(&"DBIx::Class::Relationship::Base".to_string()));
@@ -375,7 +375,7 @@ fn test_load_own_components_plus_prefix_is_fully_qualified() {
             __PACKAGE__->load_own_components('+Other::Ns::Thing', 'Local');
         ",
     );
-    let parents = fa.package_parents.get("My::Component").unwrap();
+    let parents = fa.declared_parents("My::Component");
     assert!(parents.contains(&"Other::Ns::Thing".to_string()));
     assert!(parents.contains(&"My::Component::Local".to_string()));
 }

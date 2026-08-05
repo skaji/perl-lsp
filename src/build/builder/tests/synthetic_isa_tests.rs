@@ -99,14 +99,14 @@ has 'name' => (is => 'ro');
 
         // Both should record Moo as the active framework for Foo.
         assert_eq!(
-            kit.package_framework.get("Foo"),
-            lit.package_framework.get("Foo"),
+            kit.package_framework("Foo").as_ref(),
+            lit.package_framework("Foo").as_ref(),
             "kit (`use Co::Base -Class`) and literal (`use Moo`) must agree on package_framework"
         );
         assert!(
-            kit.package_framework.contains_key("Foo"),
-            "Foo's framework should be set by SyntheticUse \"Moo\"; package_framework={:?}",
-            kit.package_framework,
+            kit.package_framework("Foo").is_some(),
+            "Foo's framework should be set by SyntheticUse \"Moo\"; packages={:?}",
+            kit.packages,
         );
 
         // Both should have Moo's keyword set in framework_imports.

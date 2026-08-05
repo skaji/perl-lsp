@@ -736,9 +736,9 @@ pub fn implementations_of(
         for cached in homes {
             let is_marker = cached
                 .analysis
-                .role_requires
-                .get(pkg.as_str())
-                .is_some_and(|reqs| reqs.iter().any(|r| r == &target.name));
+                .role_requires(pkg.as_str())
+                .iter()
+                .any(|r| r == &target.name);
             if is_marker {
                 continue;
             }

@@ -94,7 +94,7 @@ fn test_role_requires_dynamic_parent_honest_silence() {
          sub run { my $self = shift; $self->fetch }\n1;\n",
     );
     assert!(
-        analysis.dynamic_parent_packages.contains("My::Dynamic"),
+        analysis.has_dynamic_parents("My::Dynamic"),
         "unfoldable with-arg must mark the package dynamic",
     );
     let module_index = crate::index::module_index::ModuleIndex::new_for_test();

@@ -165,7 +165,7 @@ Format per entry:
   ClassIsa scope.
   (3) **Gated content is invisible to the Surface freshness firewall**
   (surfaced by the round-7 sweep). `Surface::project` reads `fa.symbols` +
-  `fa.package_parents`, never `fa.gated_emissions`, and
+  `fa.packages`, never `fa.gated_emissions`, and
   `materialize_gated_emissions` swaps the cached `Arc` WITHOUT re-recording
   the Surface / `FreshnessIndex`. So a change confined to a result class's
   gated content (its `add_columns`/`has_many` list, whose synthesized

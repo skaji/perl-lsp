@@ -162,11 +162,9 @@ fn pattern_dispatch_reaches_fixed_point_over_gating() {
 
     // Round 1: bridge (Always) fires, minting the parent edge.
     assert!(
-        fa.package_parents
-            .get("P")
-            .is_some_and(|ps| ps.iter().any(|p| p == "Widget::Base")),
+        fa.declared_parents("P").iter().any(|p| p == "Widget::Base"),
         "bridge plugin's PackageParent emission must land; got {:?}",
-        fa.package_parents
+        fa.packages
     );
     // Round 2: widget's ClassIsa gate is now true, so its match — same
     // tree, same round-1 query pass — dispatches on re-evaluation.

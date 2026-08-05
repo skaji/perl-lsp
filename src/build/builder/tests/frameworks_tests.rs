@@ -620,7 +620,7 @@ has 'config';
     );
     // Should register parent
     assert_eq!(
-        fa.package_parents.get("MyApp").map(|v| v.as_slice()),
+        Some(fa.declared_parents("MyApp")),
         Some(["Mojolicious".to_string()].as_slice())
     );
     // Should synthesize getter + setter accessors
@@ -1390,7 +1390,7 @@ use parent NAME;
 ",
     );
     assert_eq!(
-        fa.package_parents.get("Foo").unwrap(),
+        fa.declared_parents("Foo"),
         &vec!["hello".to_string()]
     );
 }

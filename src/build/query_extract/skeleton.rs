@@ -1089,17 +1089,19 @@ impl SkeletonAnalysis {
                 }
             }
         }
-        let mut package_parents: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+        let mut packages: std::collections::HashMap<
+            String,
+            crate::model::file_analysis::PackageFacts,
+        > = std::collections::HashMap::new();
         for (child, parent) in &self.parents {
-            package_parents.entry(child.clone()).or_default().push(parent.clone());
+            packages.entry(child.clone()).or_default().parents.push(parent.clone());
         }
         let mut fa = FileAnalysis::new(FileAnalysisParts {
             scopes: self.scopes,
             symbols,
             refs,
             witnesses: bag,
-            package_parents,
+            packages,
             flow_edges: std::mem::take(&mut self.flow_edges),
             moved_from: std::mem::take(&mut self.moved_from),
             control_regions: std::mem::take(&mut self.control_regions),
@@ -1111,7 +1113,7 @@ impl SkeletonAnalysis {
         // outline filters can exclude them generically (lang semantics in
         // the pack, generic logic in core).
         fa.receiver_names = std::mem::take(&mut self.receiver_names);
-        // Specialization family edges (spec → primary). NOT package_parents:
+        // Specialization family edges (spec → primary). NOT an inheritance edge:
         // a spec inherits nothing from its primary (it replaces wholesale),
         // so member resolution must never fall through this edge — only the
         // graph's `Specializes` family view reads it.

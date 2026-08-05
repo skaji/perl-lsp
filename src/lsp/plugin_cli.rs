@@ -230,10 +230,10 @@ fn diff_emissions(baseline: &FileAnalysis, with_plugin: &FileAnalysis, plugin_id
 
     // package_parents — diff entries.
     let mut package_parents: Vec<Value> = Vec::new();
-    for (pkg, parents) in &with_plugin.package_parents {
-        let baseline_parents = baseline.package_parents.get(pkg);
+    for (pkg, parents) in with_plugin.package_parent_edges() {
+        let baseline_parents = baseline.declared_parents(pkg);
         for p in parents {
-            let already = baseline_parents.map(|v| v.contains(p)).unwrap_or(false);
+            let already = baseline_parents.contains(p);
             if !already {
                 package_parents.push(json!({ "package": pkg, "parent": p }));
             }

@@ -401,7 +401,7 @@ impl ModuleIndex {
                                 // rode the key above — a re-resolve bumps it.
                                 // No deps_of record; its parents ride the
                                 // analysis itself.
-                                for parents in cm.analysis.package_parents.values() {
+                                for (_pkg, parents) in cm.analysis.package_parent_edges() {
                                     next.extend(parents.iter().cloned());
                                 }
                             }
@@ -992,7 +992,7 @@ impl ModuleIndex {
         // self-heals at read. `package_parents` survives every strip
         // (`evict_axes` leaves it) and rides the warm-stub skeleton, so the arc
         // carries it on the fresh, warm, and whole paths alike.
-        for (child, parents) in &analysis.package_parents {
+        for (child, parents) in analysis.package_parent_edges() {
             for parent in parents {
                 let mut v = self.core.edges.children.entry(parent.clone()).or_default();
                 if !v.iter().any(|m| m == child) {

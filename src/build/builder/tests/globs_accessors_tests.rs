@@ -143,10 +143,7 @@ has 'value';
     );
     // The module imported with -base becomes a parent...
     assert!(
-        fa.package_parents
-            .get("My::Emitter")
-            .map(|v| v.iter().any(|p| p == "Mojo::EventEmitter"))
-            .unwrap_or(false),
+        fa.declared_parents("My::Emitter").iter().any(|p| p == "Mojo::EventEmitter"),
         "`use X -base` should register X as a parent"
     );
     // ...and Mojo::Base accessor synthesis (getter + setter) applies.
@@ -168,10 +165,7 @@ has 'x';
 ",
     );
     assert!(
-        fa.package_parents
-            .get("My::Class")
-            .map(|v| v.iter().any(|p| p == "Mojo::Base"))
-            .unwrap_or(false),
+        fa.declared_parents("My::Class").iter().any(|p| p == "Mojo::Base"),
         "`Mojo::Base -base` should carry Mojo::Base itself as a parent so tap/attr/new resolve"
     );
 }

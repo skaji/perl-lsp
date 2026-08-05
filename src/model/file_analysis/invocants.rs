@@ -1020,7 +1020,7 @@ impl FileAnalysis {
     /// engines ∪ plugin `role_makers()` manifests), so house role
     /// engines join via plugin declaration with no core change.
     pub fn is_role_package(&self, pkg: &str) -> bool {
-        self.role_packages.contains(pkg)
+        self.packages.get(pkg).is_some_and(|f| f.is_role)
     }
 
     /// Does `verb` take a column-keyed first hashref arg (DBIC `search`/`create`
@@ -1059,17 +1059,17 @@ impl FileAnalysis {
                 if !self.is_role_package(c) {
                     return None;
                 }
-                return Some(self.role_requires.get(c).cloned().unwrap_or_default());
+                return Some(self.role_requires(c).to_vec());
             }
             let cached = module_index?.get_cached(c)?;
             if !cached.analysis.is_role_package(c) {
                 return None;
             }
-            Some(cached.analysis.role_requires.get(c).cloned().unwrap_or_default())
+            Some(cached.analysis.role_requires(c).to_vec())
         };
 
         let mut out: Vec<UnfulfilledRequire> = Vec::new();
-        let mut composers: Vec<&String> = self.package_parents.keys().collect();
+        let mut composers: Vec<&String> = self.packages.keys().collect();
         composers.sort();
         for pkg in composers {
             if self.is_role_package(pkg) {
@@ -1093,7 +1093,7 @@ impl FileAnalysis {
             // verdict is taken here.
             let graph = crate::model::graph::GraphView::new(self, module_index);
             let mut required: Vec<(String, String, String)> = Vec::new();
-            for direct in &self.package_parents[pkg] {
+            for direct in self.declared_parents(pkg) {
                 let Some(requires) = role_requires_of(direct) else { continue };
                 for n in requires {
                     required.push((n, direct.clone(), direct.clone()));

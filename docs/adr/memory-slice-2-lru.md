@@ -94,7 +94,7 @@ Held resident for **every** indexed file, exactly as today:
 - The pack `ModuleIndex`'s `all_files` / `all_defs` name→file index — answers
   `workspace/symbol` and "which files could reference X" without touching any
   body.
-- `include_closure`, `package_parents`, `specializes`, `return_types`,
+- `include_closure`, `packages`, `specializes`, `return_types`,
   `template_params` — the cross-file visibility / inheritance / baked-return
   metadata the graph walk and MRO need.
 

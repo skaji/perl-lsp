@@ -63,7 +63,7 @@ have to write the mask down.
 iterate `FileStore` directly. Adding a new cross-file query = picking a
 mask and calling `refs_to`.
 
-The walk: start at the `from` namespace, DFS through `package_parents`
+The walk: start at the `from` namespace, DFS through `PackageFacts::parents`
 (soon: `namespace_parents`), filter file entries by mask. `refs_to` reads
 each file's `refs_by_target` for O(1) per-file lookup.
 

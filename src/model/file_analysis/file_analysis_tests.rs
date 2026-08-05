@@ -290,7 +290,7 @@ fn evict_witness_bag_keeps_pinned_drops_bag() {
     let syms_before: Vec<_> = fa.symbols.iter().map(|s| s.name.clone()).collect();
     let targets_before: Vec<_> =
         fa.refs.iter().map(|r| r.method_target().cloned()).collect();
-    let parents_before = fa.package_parents.clone();
+    let parents_before = fa.packages.clone();
     assert!(!refs_before.is_empty() && !syms_before.is_empty());
 
     fa.evict_witness_bag();
@@ -305,7 +305,7 @@ fn evict_witness_bag_keeps_pinned_drops_bag() {
     assert_eq!(refs_before, refs_after);
     assert_eq!(syms_before, syms_after);
     assert_eq!(targets_before, targets_after);
-    assert_eq!(parents_before, fa.package_parents);
+    assert_eq!(parents_before, fa.packages);
     // Idempotent.
     fa.evict_witness_bag();
     assert!(fa.bag_is_evicted());
@@ -1116,7 +1116,7 @@ sub name {
 
     // Framework mode was detected.
     assert_eq!(
-        fa.package_framework.get("Mojolicious::Routes::Route"),
+        fa.package_framework("Mojolicious::Routes::Route").as_ref(),
         Some(&crate::model::witnesses::FrameworkFact::MojoBase),
         "Mojo::Base package should record MojoBase framework"
     );

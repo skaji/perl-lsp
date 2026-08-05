@@ -222,19 +222,19 @@ impl<T> ReceiverGated<T> {
     /// dispatch receiver as the bag resolved it (cross-file aware); `None`
     /// or an unresolved name yields `ReceiverUntyped`. Otherwise the inner
     /// value is handed back iff the receiver `isa` the gate, walking the
-    /// single `class_isa` seam (local `package_parents` ∪ cross-file
+    /// single `class_isa` seam (local `PackageFacts::parents` ∪ cross-file
     /// `parents_cached`).
     pub fn resolve_for(
         &self,
         receiver_class: Option<&str>,
-        package_parents: &HashMap<String, Vec<String>>,
+        local: &dyn LocalParents,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> GateResult<&T> {
         match receiver_class {
             None => GateResult::ReceiverUntyped,
             Some(recv) if recv.is_empty() => GateResult::ReceiverUntyped,
             Some(recv) => {
-                if class_isa(recv, &self.gate, package_parents, module_index) {
+                if class_isa(recv, &self.gate, local, module_index) {
                     GateResult::Applies(&self.inner)
                 } else {
                     GateResult::DoesNotApply

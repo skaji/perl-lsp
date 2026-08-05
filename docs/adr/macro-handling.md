@@ -31,7 +31,7 @@ already valid syntax.
 | object-like, marker | `#define FLAG` | flag symbol — refs/goto, no type |
 | function-like, expression | `#define MAX(a,b) …` | **global sub, implied return typing** |
 | function-like, delegation | `#define F(x) G(x)` | as above + **see-through value-witness** |
-| **member-block** | `#define BASEOP … op_type:9; …` (used in a struct body) | **role: a `package_parents` edge; blank the use** |
+| **member-block** | `#define BASEOP … op_type:9; …` (used in a struct body) | **role: a `PackageFacts::parents` edge; blank the use** |
 | syntactic / statement / `##` | `do {…} while(0)` | **expand** (parse repair only) |
 
 ### The classifier: usage position, not body-parse
@@ -74,7 +74,7 @@ span-remap bugs evaporate structurally. (`alias_only` was the baby step.)
 ### Member-block macros = roles (the copypasta = inheritance)
 
 `#define BASEOP …fields…` pasted into every op struct is a **role** — the shape
-of a Perl `with`, already modeled as a `package_parents` edge. Mint **one**
+of a Perl `with`, already modeled as a `PackageFacts::parents` edge. Mint **one**
 visible synthetic base per macro (a navigable, reusable symbol), members parsed
 from the body under the field-block role, taken from the **config-active
 variant** (reachability reuse). Add a parent edge per pasting struct

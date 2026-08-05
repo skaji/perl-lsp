@@ -23,7 +23,7 @@ role-requires walk prunes at every non-role node) and scoped views
 walk instead of bespoke BFSes. A
 walk materialises only its transient state (seen-set + per-node
 neighbour vec), discarded on return. "Chasing an edge" *is* a map
-lookup against `package_parents` — the same primitive the ported
+lookup against `PackageFacts::parents` — the same primitive the ported
 consumers used, so a port is parity by construction.
 
 `walk` is the caching seam: every consumer goes through it and never
@@ -98,6 +98,6 @@ edge-following traversals, and forcing them in would be contortion:
   start)`, shared by `FileAnalysis::scope_chain` and the witness-bag
   query path (which holds a `&[Scope]` slice, not a `&FileAnalysis`).
 
-The migration ends when `package_parents` and `PluginNamespace.bridges`
+The migration ends when `PackageFacts::parents` and `PluginNamespace.bridges`
 have no direct consumers — every *reachability* question is a `walk`
 with a mask. `RoleMask` is not in that set.

@@ -301,7 +301,7 @@ fn test_full_file_analysis_survives_roundtrip() {
     let source = std::fs::read_to_string(&pm).unwrap();
     let cached = parse_source_to_cached(&source, &pm);
     let original_refs_count = cached.analysis.refs.len();
-    let original_package_parents = cached.analysis.package_parents.clone();
+    let original_packages = cached.analysis.packages.clone();
     save_to_db(&conn, "Fidelity", &Some(Arc::clone(&cached)), "import");
 
     let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
@@ -316,8 +316,8 @@ fn test_full_file_analysis_survives_roundtrip() {
         "refs survive roundtrip"
     );
     assert_eq!(
-        loaded.analysis.package_parents, original_package_parents,
-        "package_parents survive"
+        loaded.analysis.packages, original_packages,
+        "per-package facts survive"
     );
 
     let _ = std::fs::remove_file(&pm);

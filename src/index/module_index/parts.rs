@@ -23,7 +23,7 @@ use super::*;
 ///   index for plugin-synthesized content; queried through
 ///   `for_each_entity_bridged_to`.
 /// - `children`: parent class/role → modules containing a package
-///   that `isa`/composes it (inverse `package_parents`). The
+///   that `isa`/composes it (inverse `PackageFacts::parents`). The
 ///   long-distance primitive: "who composes this role" /
 ///   "who subclasses this class" in O(1).
 ///
@@ -172,12 +172,12 @@ impl ModuleEdgeIndexes {
     }
 
     /// Every parent class/role any package in the analysis records —
-    /// the values of `package_parents`, deduped. `use parent`/`use
+    /// the values of `PackageFacts::parents`, deduped. `use parent`/`use
     /// base`/`@ISA`/`class :isa`/`:does`/`with` all land here, so the
     /// `children` map covers inheritance and role composition alike.
     fn parent_classes(analysis: &FileAnalysis) -> Vec<String> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for parents in analysis.package_parents.values() {
+        for (_pkg, parents) in analysis.package_parent_edges() {
             for p in parents {
                 seen.insert(p.clone());
             }

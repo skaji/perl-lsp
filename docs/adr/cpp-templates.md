@@ -65,7 +65,7 @@ per-spec `Class` symbol plus an `EdgeKind::Specializes` edge to the primary. The
 decisive property is member fallthrough: inheritance augments-and-overrides, but
 specialization **replaces wholesale** — a spec inherits nothing from the primary
 (fmt's primary `formatter` is body-less), so routing specs through
-`package_parents` would corrupt member resolution. Specs share only the name and
+a `PackageFacts::parents` edge would corrupt member resolution. Specs share only the name and
 the parameter contract, which is a selection relationship, not a composition
 one. It is the third instance of the selection seam: `UnionOnArgs` selects by
 arity, `ReceiverGated` by receiver, specialization by type-arg pattern.

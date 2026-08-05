@@ -18,8 +18,7 @@ use super::*;
 /// bypass the classification gate.
 pub struct SurfaceFeed<'a> {
     pub symbols: &'a [Symbol],
-    pub package_parents: &'a HashMap<String, Vec<String>>,
-    pub role_packages: &'a HashSet<String>,
+    pub packages: &'a HashMap<String, PackageFacts>,
     pub imports: &'a [Import],
     pub plugin_loads: &'a [PluginLoadFact],
     pub export: &'a [String],
@@ -43,8 +42,11 @@ impl FileAnalysis {
         let Self {
             // ---- Cross-file-visible: bound into the feed and projected.
             symbols,
-            package_parents,
-            role_packages,
+            // Per-package entry: `parents`/`is_role` project; its
+            // file-internal lanes are classified where it is read —
+            // `Surface::project` destructures `PackageFacts` exhaustively,
+            // so a new per-package fact is a compile error there.
+            packages,
             imports,
             plugin_loads,
             export,
@@ -63,7 +65,6 @@ impl FileAnalysis {
             // can observe changes the projection.
             scopes: _scopes,                     // linkage-visibility gate + the return-type scope walk → `values`/`ret`
             witnesses: _witnesses,               // return-type resolution → `MethodSurface::ret`
-            package_framework: _package_framework, // framework return folds → `ret`; synthesized accessors are already `symbols`
 
             // ---- File-internal use-sites and span tables. Cross-file
             // readers (refs_to, groups, diagnostics scans) reach these
@@ -93,11 +94,8 @@ impl FileAnalysis {
             gated_param_types: _gated_param_types, // types this file's own params, query-gated
             provisional_dispatches: _provisional_dispatches, // this file's call-site candidates; foreign readers resolve them live
             loader_config_params: _loader_config_params, // callee markers joined by this file's OWN enrichment
-            package_uses: _package_uses,         // per-package plugin-trigger view; the `use` edges themselves ride `imports`
             framework_imports: _framework_imports, // local diagnostic suppression set
             type_provenance: _type_provenance,   // read-only debugging aid (`--dump-package`)
-            dynamic_parent_packages: _dynamic_parent_packages, // honest-silence gate for this file's own diagnostics; resolvable edges ride `parents`
-            role_requires: _role_requires,       // required names synthesize contract-marker Method symbols that already project
             contract_symbols: _contract_symbols, // SymbolIds (banned from the Surface); the markers they tag project as methods
             column_keyed_verbs: _column_keyed_verbs, // baked from the plugin registry, not this file's source; the plugin fingerprint owns invalidation
             receiver_names: _receiver_names,     // LangPack-wide convention, identical across the pack's files
@@ -128,8 +126,7 @@ impl FileAnalysis {
         } = self;
         SurfaceFeed {
             symbols,
-            package_parents,
-            role_packages,
+            packages,
             imports,
             plugin_loads,
             export,

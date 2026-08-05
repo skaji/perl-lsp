@@ -279,11 +279,7 @@ pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
 }
 
 pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {
-    analysis
-        .package_parents
-        .get(module_name)
-        .cloned()
-        .unwrap_or_default()
+    analysis.declared_parents(module_name).to_vec()
 }
 
 

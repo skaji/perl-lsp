@@ -2269,11 +2269,11 @@ template <typename T> struct formatter<T*, char> { int fmt_partial(); };
     assert_eq!(member("fmt_full").package.as_deref(), Some("formatter<int, char>"));
     assert_eq!(member("fmt_partial").package.as_deref(), Some("formatter<T*, char>"));
     assert_eq!(member("parse").package.as_deref(), Some("formatter"));
-    // the family edges (spec → primary), NEVER package_parents
+    // the family edges (spec → primary), NEVER an inheritance edge
     assert_eq!(fa.specializes.get("formatter<int, char>").map(String::as_str), Some("formatter"));
     assert_eq!(fa.specializes.get("formatter<T*, char>").map(String::as_str), Some("formatter"));
     assert!(
-        !fa.package_parents.contains_key("formatter<int, char>"),
+        fa.declared_parents("formatter<int, char>").is_empty(),
         "specialization is not inheritance — member resolution must not fall through"
     );
 }
@@ -2469,7 +2469,8 @@ template <typename T> struct base { int common; };
 template <typename T> struct D : base<T> { int own; };
 "#,
     );
-    let parents = fa.package_parents.get("D").expect("D records parents");
+    let parents = fa.declared_parents("D");
+    assert!(!parents.is_empty(), "D records parents");
     assert!(
         parents.iter().any(|p| p == "base"),
         "the bare base name joins the primary; got {parents:?}"

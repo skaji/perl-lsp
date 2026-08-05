@@ -94,7 +94,7 @@ impl ModuleIndex {
                 let Some(cached) = self.get_cached(&module_name) else { continue };
                 // A module can hold several packages; only the ones
                 // actually listing `current` as a parent are children.
-                for (pkg, parents) in &cached.analysis.package_parents {
+                for (pkg, parents) in cached.analysis.package_parent_edges() {
                     if !parents.iter().any(|p| p == &current) {
                         continue;
                     }
@@ -359,7 +359,7 @@ impl CrossFileLookup for ModuleIndex {
         let mut out = Vec::new();
         for module in self.modules_with_parent(class) {
             let Some(cached) = self.get_cached(&module) else { continue };
-            for (pkg, parents) in &cached.analysis.package_parents {
+            for (pkg, parents) in cached.analysis.package_parent_edges() {
                 if parents.iter().any(|p| p == class) {
                     out.push((pkg.clone(), module.clone()));
                 }

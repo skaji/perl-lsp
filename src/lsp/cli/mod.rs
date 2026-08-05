@@ -310,7 +310,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
         for imp in &entry.value().imports {
             needed.insert(imp.module_name.clone());
         }
-        for parents in entry.value().package_parents.values() {
+        for (_pkg, parents) in entry.value().package_parent_edges() {
             for p in parents {
                 needed.insert(p.clone());
             }

@@ -1115,10 +1115,7 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
         .collect();
     subs.sort_by_key(|s| (s.span.start.row, s.span.start.column));
 
-    let framework = analysis
-        .package_framework
-        .get(package_name)
-        .map(|f| format!("{:?}", f));
+    let framework = analysis.package_framework(package_name).map(|f| format!("{:?}", f));
 
     let mut sub_entries = Vec::with_capacity(subs.len());
     for sym in &subs {
@@ -1287,11 +1284,7 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
         sub_entries.push(entry);
     }
 
-    let parents = analysis
-        .package_parents
-        .get(package_name)
-        .cloned()
-        .unwrap_or_default();
+    let parents = analysis.declared_parents(package_name).to_vec();
 
     let out = serde_json::json!({
         "package": package_name,

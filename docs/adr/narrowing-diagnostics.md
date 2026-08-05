@@ -138,7 +138,7 @@ fires on facts it never validated (worse) — so they stay off, not faked.
 narrowing tier, cpp *does* resolve everything D8 needs: a receiver types
 to its class (`Foo f; f.b()` → `expr_type_at_span` = `ClassName("Foo")`,
 verified), classes mint `SymKind::Class` symbols, and inheritance edges
-ride `package_parents`, so `resolve_method_in_ancestors` + the
+ride `PackageFacts::parents`, so `resolve_method_in_ancestors` + the
 `class_has_unresolved_ancestor` honest-silent valve both work — the
 unscanned-base case (`struct D : Ext` with `Ext` in an un-indexed header)
 correctly stays silent. The blocker is **macro member-injection**: a

@@ -95,9 +95,12 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub template_params: HashMap<String, Vec<String>>,
 
-    /// Parent classes for each package in this file.
-    /// Populated by the builder from use parent/base, @ISA, and class :isa.
-    pub package_parents: HashMap<String, Vec<String>>,
+    /// Everything this file records about each of its packages, one entry
+    /// per package name. Ancestry, the plugin trigger view, the framework
+    /// fold and the role lanes all read the same entry, so a per-package
+    /// join is a single lookup.
+    #[serde(default)]
+    pub packages: HashMap<String, PackageFacts>,
 
     /// Manifest-declared app-surface consumer classes
     /// (`FrameworkPlugin::app_surface_consumers`), baked from the plugin
@@ -107,12 +110,6 @@ pub struct FileAnalysis {
     /// deserialize as empty.
     #[serde(default)]
     pub app_surface_consumers: Vec<String>,
-
-    /// Modules `use`-d inside each package in this file. Parallel to
-    /// `package_parents`: keyed by the enclosing package name, values are
-    /// module names. Powers trigger-matching for plugin query hooks
-    /// (emit-path builder state isn't visible at cursor time).
-    pub package_uses: HashMap<String, Vec<String>>,
 
     /// Functions implicitly imported by OOP frameworks (e.g. `has`, `extends`, `with`).
     /// Used to suppress "not defined" diagnostics for these known framework keywords.
@@ -157,12 +154,6 @@ pub struct FileAnalysis {
     /// without re-running the build.
     #[serde(default)]
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
-
-    /// Detected framework mode per package (for the type resolver).
-    /// Populated by the builder when `use Moo` / `use Mojo::Base` /
-    /// `use Moose` etc. is observed.
-    #[serde(default)]
-    pub package_framework: HashMap<String, crate::model::witnesses::FrameworkFact>,
 
     /// The witness bag. Canonical store for type facts:
     /// every Variable type, Symbol/MethodOnClass return type, branch
@@ -275,13 +266,6 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub key_writes: Vec<KeyWrite>,
 
-    /// Per-role `requires` lists: the method contracts a composing
-    /// class must fulfill. The synthesized Method symbols carry the
-    /// in-role resolution; this record feeds the composer-mismatch
-    /// diagnostic (docs/adr/role-contracts.md).
-    #[serde(default)]
-    pub role_requires: HashMap<String, Vec<String>>,
-
     /// SymbolIds of `requires`-synthesized contract markers. A marker
     /// resolves like a Method (in-role `$self->name` dispatch, hover,
     /// goto-def land on the contract) but is NOT a provision — the
@@ -290,19 +274,6 @@ pub struct FileAnalysis {
     /// pattern) still counts the real def.
     #[serde(default)]
     pub contract_symbols: HashSet<SymbolId>,
-
-    /// Packages whose recorded parent list is INCOMPLETE — at least
-    /// one `with`/`extends` argument didn't fold to a literal name
-    /// (runtime-generated roles: `with ReportProxy(type => ...)`).
-    /// `class_has_unresolved_ancestor` treats these as an unresolved
-    /// edge so inheritance-dependent diagnostics stay honest-silent.
-    #[serde(default)]
-    pub dynamic_parent_packages: HashSet<String>,
-
-    /// Packages that ARE roles — the baked verdict behind
-    /// `is_role_package`. Fed by the builder's open role-maker set.
-    #[serde(default)]
-    pub role_packages: HashSet<String>,
 
     /// DBIC `__PACKAGE__->source_name('X')` override for this file's result
     /// class — the registered SOURCE moniker when it differs from the class
@@ -451,6 +422,162 @@ fn default_language() -> String {
     "perl".to_string()
 }
 
+/// What one package in this file declares about itself. Keyed by package
+/// name in `FileAnalysis::packages`, so every per-package consumer
+/// (ancestry, the plugin trigger view, the framework fold, the role
+/// diagnostics, `Surface::project`) resolves its facts in one lookup.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PackageFacts {
+    /// Parent classes, from `use parent`/`use base`, `@ISA`, `class :isa`,
+    /// `with`, and `__PACKAGE__->load_components`.
+    #[serde(default)]
+    pub parents: Vec<String>,
+
+    /// Modules `use`-d inside the package. Powers trigger-matching for
+    /// plugin query hooks (emit-path builder state isn't visible at
+    /// cursor time).
+    #[serde(default)]
+    pub uses: Vec<String>,
+
+    /// Detected framework mode (for the type resolver), set when
+    /// `use Moo` / `use Mojo::Base` / `use Moose` etc. is observed.
+    #[serde(default)]
+    pub framework: Option<crate::model::witnesses::FrameworkFact>,
+
+    /// A role's `requires` list: the method contracts a composing class
+    /// must fulfill. The synthesized Method symbols carry the in-role
+    /// resolution; this record feeds the composer-mismatch diagnostic
+    /// (docs/adr/role-contracts.md).
+    #[serde(default)]
+    pub requires: Vec<String>,
+
+    /// This package IS a role — the baked verdict behind
+    /// `is_role_package`, fed by the builder's open role-maker set.
+    #[serde(default)]
+    pub is_role: bool,
+
+    /// `parents` is INCOMPLETE — at least one `with`/`extends` argument
+    /// didn't fold to a literal name (runtime-generated roles:
+    /// `with ReportProxy(type => ...)`). `class_has_unresolved_ancestor`
+    /// treats this as an unresolved edge so inheritance-dependent
+    /// diagnostics stay honest-silent.
+    #[serde(default)]
+    pub dynamic_parents: bool,
+}
+
+impl PackageFacts {
+    /// Fold a walk-time collector's per-lane maps into the stored table.
+    /// The one seam between accumulating each lane independently (the
+    /// builder, the pack skeleton) and the one-entry-per-package shape
+    /// every consumer reads.
+    pub fn fold(
+        parents: HashMap<String, Vec<String>>,
+        uses: HashMap<String, Vec<String>>,
+        framework: HashMap<String, crate::model::witnesses::FrameworkFact>,
+        requires: HashMap<String, Vec<String>>,
+        roles: HashSet<String>,
+        dynamic_parents: HashSet<String>,
+    ) -> HashMap<String, PackageFacts> {
+        let mut out: HashMap<String, PackageFacts> = HashMap::new();
+        for (pkg, v) in parents {
+            out.entry(pkg).or_default().parents = v;
+        }
+        for (pkg, v) in uses {
+            out.entry(pkg).or_default().uses = v;
+        }
+        for (pkg, v) in framework {
+            out.entry(pkg).or_default().framework = Some(v);
+        }
+        for (pkg, v) in requires {
+            out.entry(pkg).or_default().requires = v;
+        }
+        for pkg in roles {
+            out.entry(pkg).or_default().is_role = true;
+        }
+        for pkg in dynamic_parents {
+            out.entry(pkg).or_default().dynamic_parents = true;
+        }
+        out
+    }
+}
+
+impl FileAnalysis {
+    /// `pkg`'s locally declared parents (empty when it declares none) —
+    /// the LOCAL half of the ancestry seam; `parents_of` adds the
+    /// cross-file and app-surface edges.
+    pub fn declared_parents(&self, pkg: &str) -> &[String] {
+        self.packages.declared_parents(pkg)
+    }
+
+    /// Every package this file records, with its locally declared parents
+    /// — the inheritance-edge enumeration for reverse-index builds and
+    /// dependency sweeps.
+    pub fn package_parent_edges(&self) -> impl Iterator<Item = (&String, &[String])> {
+        self.packages.iter().map(|(pkg, f)| (pkg, f.parents.as_slice()))
+    }
+
+    /// Modules `use`-d inside `pkg`.
+    pub fn package_uses(&self, pkg: &str) -> &[String] {
+        self.packages.get(pkg).map_or(&[], |f| f.uses.as_slice())
+    }
+
+    /// `pkg`'s detected framework mode, if any.
+    pub fn package_framework(&self, pkg: &str) -> Option<crate::model::witnesses::FrameworkFact> {
+        self.packages.get(pkg).and_then(|f| f.framework)
+    }
+
+    /// The method contracts `pkg` requires of its composers (empty unless
+    /// `pkg` is a role that declared `requires`).
+    pub fn role_requires(&self, pkg: &str) -> &[String] {
+        self.packages.get(pkg).map_or(&[], |f| f.requires.as_slice())
+    }
+
+    /// Is `pkg`'s recorded parent list incomplete (a `with`/`extends`
+    /// argument that didn't fold to a literal name)?
+    pub fn has_dynamic_parents(&self, pkg: &str) -> bool {
+        self.packages.get(pkg).is_some_and(|f| f.dynamic_parents)
+    }
+}
+
+/// Read a package's declared parents from any store that keys them by
+/// package name — the builder's walk-time map (facts still accumulating)
+/// or a finished `FileAnalysis`'s table. `parents_of` and the isa walkers
+/// take this so the union/injection policy has one body regardless of
+/// which side holds the facts.
+pub trait LocalParents {
+    fn declared_parents(&self, package: &str) -> &[String];
+}
+
+impl LocalParents for HashMap<String, Vec<String>> {
+    fn declared_parents(&self, package: &str) -> &[String] {
+        self.get(package).map_or(&[], |v| v.as_slice())
+    }
+}
+
+impl LocalParents for HashMap<String, PackageFacts> {
+    fn declared_parents(&self, package: &str) -> &[String] {
+        self.get(package).map_or(&[], |f| f.parents.as_slice())
+    }
+}
+
+/// The framework twin of [`LocalParents`]: read a package's detected
+/// framework from either side's store.
+pub trait PackageFrameworks {
+    fn framework_of(&self, package: &str) -> Option<crate::model::witnesses::FrameworkFact>;
+}
+
+impl PackageFrameworks for HashMap<String, crate::model::witnesses::FrameworkFact> {
+    fn framework_of(&self, package: &str) -> Option<crate::model::witnesses::FrameworkFact> {
+        self.get(package).copied()
+    }
+}
+
+impl PackageFrameworks for HashMap<String, PackageFacts> {
+    fn framework_of(&self, package: &str) -> Option<crate::model::witnesses::FrameworkFact> {
+        self.get(package).and_then(|f| f.framework)
+    }
+}
+
 /// Everything the builder hands over to construct a `FileAnalysis`.
 /// Field-named so a swapped pair of same-typed tables can't compile
 /// silently the way positional args could, and hand-crafted test FAs
@@ -463,7 +590,7 @@ pub struct FileAnalysisParts {
     pub fold_ranges: Vec<FoldRange>,
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
-    pub package_parents: HashMap<String, Vec<String>>,
+    pub packages: HashMap<String, PackageFacts>,
     pub method_call_bindings: Vec<MethodCallBinding>,
     pub framework_imports: HashSet<String>,
     pub export: Vec<String>,
@@ -471,13 +598,11 @@ pub struct FileAnalysisParts {
     pub export_tags: HashMap<String, Vec<String>>,
     pub reexport_modules: Vec<String>,
     pub plugin_namespaces: Vec<PluginNamespace>,
-    pub package_uses: HashMap<String, Vec<String>>,
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
     pub package_ranges: Vec<PackageRange>,
     pub plugin_diagnostics: Vec<PluginDiagnostic>,
     pub app_surface_consumers: Vec<String>,
     pub witnesses: crate::model::witnesses::WitnessBag,
-    pub package_framework: HashMap<String, crate::model::witnesses::FrameworkFact>,
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
     pub gated_emissions: Vec<GatedEmission>,
     pub guard_sites: Vec<GuardSite>,
@@ -486,10 +611,7 @@ pub struct FileAnalysisParts {
     pub attr_projections: Vec<AttrProjection>,
     pub reassigned_scalars: HashSet<String>,
     pub key_writes: Vec<KeyWrite>,
-    pub role_requires: HashMap<String, Vec<String>>,
     pub contract_symbols: HashSet<SymbolId>,
-    pub dynamic_parent_packages: HashSet<String>,
-    pub role_packages: HashSet<String>,
     pub dbic_source_name: Option<String>,
     pub column_keyed_verbs: HashSet<String>,
     pub dynamic_dispatch_sites: u32,

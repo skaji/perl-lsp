@@ -38,7 +38,7 @@ use crate::model::file_analysis::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PackageSurface {
     pub name: String,
-    /// Resolved isa/roles/loaded components, post-fold (`package_parents`).
+    /// Resolved isa/roles/loaded components, post-fold (`PackageFacts::parents`).
     pub parents: Vec<String>,
     /// Is this package a role (plugin-declared role-maker verdict)?
     pub is_role: bool,
@@ -158,9 +158,24 @@ impl Surface {
                 matches!(s.detail, crate::model::file_analysis::SymbolDetail::HashKeyDef { .. })
             })
             .collect();
-        // Every package with parents or role-ness exists on the surface
-        // even if it declares no callable members.
-        for (pkg, parents) in feed.package_parents {
+        // Every package this file records facts about exists on the
+        // surface even if it declares no callable members. One entry read
+        // per package covers both projected lanes; the exhaustive
+        // destructure is the per-package half of R1's classification gate
+        // (`surface_feed.rs`) — a new `PackageFacts` field fails to
+        // compile here until its cross-file visibility is decided.
+        for (pkg, facts) in feed.packages {
+            let crate::model::file_analysis::PackageFacts {
+                // ---- Cross-file-visible: projected below.
+                parents,
+                is_role,
+                // ---- File-internal: shape THIS file's own answers, not
+                // what another file observes of it.
+                uses: _uses, // per-package plugin-trigger view; the `use` edges themselves ride `imports`
+                framework: _framework, // framework return folds → `ret`; synthesized accessors are already `symbols`
+                requires: _requires, // required names synthesize contract-marker Method symbols that already project
+                dynamic_parents: _dynamic_parents, // honest-silence gate for this file's own diagnostics; resolvable edges ride `parents`
+            } = facts;
             let entry = by_pkg.entry(pkg.clone()).or_insert_with(|| PackageSurface {
                 name: pkg.clone(),
                 ..Default::default()
@@ -169,6 +184,7 @@ impl Surface {
             parents.sort_unstable();
             parents.dedup();
             entry.parents = parents;
+            entry.is_role = *is_role;
         }
         for sym in feed.symbols {
             match sym.kind {
@@ -285,7 +301,6 @@ impl Surface {
             ms.dedup();
         };
         for p in &mut packages {
-            p.is_role = feed.role_packages.contains(&p.name);
             sort_methods(&mut p.methods);
             sort_values(&mut p.values);
         }

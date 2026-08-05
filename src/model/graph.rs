@@ -1,7 +1,7 @@
 //! The typed-edge graph — one walker over what is morally one graph.
 //!
 //! A DERIVED view, no stored graph. Edges materialize on demand from
-//! the stores that already exist (`package_parents` ∪ `parents_of`'s
+//! the stores that already exist (`PackageFacts::parents` ∪ `parents_of`'s
 //! synthetic app-surface edge, the `ModuleEdgeIndexes` children map,
 //! plugin-namespace bridges); `walk` is the single traversal — seen-
 //! set, depth cap, edge-kind mask — that the ancestry/bridge/descendant
@@ -183,7 +183,7 @@ impl<'a> GraphView<'a> {
                 EdgeKind::Inherits => {
                     for p in crate::model::file_analysis::real_parents_of(
                         class,
-                        &self.fa.package_parents,
+                        &self.fa.packages,
                         self.idx,
                     ) {
                         out.push(Node::Class(p));
@@ -203,7 +203,7 @@ impl<'a> GraphView<'a> {
                     // member-block role macro, a single-file Perl `@ISA` chain).
                     // Symmetric with `parents_of` (local ∪ cross-file); the walk's
                     // seen-set dedups against the cross-file index below.
-                    for (child, parents) in &self.fa.package_parents {
+                    for (child, parents) in self.fa.package_parent_edges() {
                         if parents.iter().any(|p| p == class) {
                             out.push(Node::Class(child.clone()));
                         }

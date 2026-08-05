@@ -126,7 +126,7 @@ impl FileAnalysis {
         let emissions = std::mem::take(&mut self.gated_emissions);
         for em in &emissions {
             let fires = em.gate_prefixes.iter().any(|prefix| {
-                class_isa_prefix(&em.package, prefix, &self.package_parents, module_index)
+                class_isa_prefix(&em.package, prefix, &self.packages, module_index)
             });
             if !fires {
                 continue;
@@ -410,9 +410,8 @@ impl FileAnalysis {
             };
             // Snapshot to avoid double-mutable-borrow when pushing.
             let parents_snapshot: Vec<(String, Vec<String>)> = self
-                .package_parents
-                .iter()
-                .map(|(c, ps)| (c.clone(), ps.clone()))
+                .package_parent_edges()
+                .map(|(c, ps)| (c.clone(), ps.to_vec()))
                 .collect();
             for (child, parents) in &parents_snapshot {
                 // First-parent-wins per method, mirroring Perl's
@@ -463,9 +462,9 @@ impl FileAnalysis {
             let key_writes = std::mem::take(&mut self.key_writes);
             let ctx = crate::model::witnesses::BagContext {
                 scopes: &self.scopes,
-                package_framework: &self.package_framework,
+                package_framework: &self.packages,
                 module_index,
-                package_parents: &self.package_parents,
+                package_parents: &self.packages,
                 app_surface_consumers: &self.app_surface_consumers,
             };
             crate::model::witnesses::emit_mutation_extension_witnesses(
@@ -588,7 +587,7 @@ impl FileAnalysis {
         module_index: Option<&dyn CrossFileLookup>,
     ) -> GateResult<&'a DispatchCandidate> {
         let recv = self.dispatch_receiver_class(gated, module_index);
-        gated.resolve_for(recv.as_deref(), &self.package_parents, module_index)
+        gated.resolve_for(recv.as_deref(), &self.packages, module_index)
     }
 
     /// Resolve the receiver class for a gated dispatch candidate: the

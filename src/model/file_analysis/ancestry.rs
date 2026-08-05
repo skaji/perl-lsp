@@ -4,16 +4,16 @@
 
 use super::*;
 
-/// The REAL parent edges: local `package_parents` ∪ cross-file
-/// `parents_cached`. One of `parents_of`'s two component spellers — the
-/// graph's `EdgeKind::Inherits` derivation reads this directly so the
-/// app-surface edge stays maskable.
+/// The REAL parent edges: the file's own `PackageFacts::parents` ∪
+/// cross-file `parents_cached`. One of `parents_of`'s two component
+/// spellers — the graph's `EdgeKind::Inherits` derivation reads this
+/// directly so the app-surface edge stays maskable.
 pub fn real_parents_of(
     class: &str,
-    package_parents: &HashMap<String, Vec<String>>,
+    local: &dyn LocalParents,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> Vec<String> {
-    let mut parents: Vec<String> = package_parents.get(class).cloned().unwrap_or_default();
+    let mut parents: Vec<String> = local.declared_parents(class).to_vec();
     if let Some(idx) = module_index {
         for p in idx.parents_cached(class) {
             if !parents.contains(&p) {
@@ -46,11 +46,11 @@ pub fn app_surface_parent(class: &str, consumers: &[String]) -> Option<String> {
 /// seen-set + depth cap bound it like any edge.
 pub fn parents_of(
     class: &str,
-    package_parents: &HashMap<String, Vec<String>>,
+    local: &dyn LocalParents,
     module_index: Option<&dyn CrossFileLookup>,
     consumers: &[String],
 ) -> Vec<String> {
-    let mut parents = real_parents_of(class, package_parents, module_index);
+    let mut parents = real_parents_of(class, local, module_index);
     if let Some(s) = app_surface_parent(class, consumers) {
         if !parents.contains(&s) {
             parents.push(s);
@@ -74,7 +74,7 @@ pub(super) enum WalkVerdict {
 /// The single bounded ancestry DFS — `class_isa`, `class_isa_prefix`, and
 /// `class_is_dbic_result` all route here, so the inheritance graph is
 /// enumerated in exactly one place. `parents_of` supplies the per-node
-/// parent seam (local `package_parents` ∪ cross-file `parents_cached`, or
+/// parent seam (local `PackageFacts::parents` ∪ cross-file `parents_cached`, or
 /// cross-file-only for the DBIC gate); `predicate` classifies each visited
 /// class; `budget` caps TOTAL classes visited (not ancestry depth) — a
 /// per-call-site backstop against a pathological graph, set well above any
@@ -111,16 +111,16 @@ pub(super) fn walk_ancestry(
     false
 }
 
-/// The local+cross-file parent seam for the isa walkers: `package_parents`
-/// first (preserving push order under a budget truncation), then the
-/// cross-file graph via `module_index.parents_cached` (keyed by module
-/// name, which coincides with the class name here).
+/// The local+cross-file parent seam for the isa walkers: the file's own
+/// declared parents first (preserving push order under a budget
+/// truncation), then the cross-file graph via `module_index.parents_cached`
+/// (keyed by module name, which coincides with the class name here).
 fn isa_parents(
     cur: &str,
-    package_parents: &HashMap<String, Vec<String>>,
+    local: &dyn LocalParents,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> Vec<String> {
-    let mut v = package_parents.get(cur).cloned().unwrap_or_default();
+    let mut v = local.declared_parents(cur).to_vec();
     if let Some(idx) = module_index {
         v.extend(idx.parents_cached(cur));
     }
@@ -134,13 +134,13 @@ fn isa_parents(
 pub fn class_isa(
     class: &str,
     target: &str,
-    package_parents: &HashMap<String, Vec<String>>,
+    local: &dyn LocalParents,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> bool {
     walk_ancestry(
         class,
         200,
-        |cur| isa_parents(cur, package_parents, module_index),
+        |cur| isa_parents(cur, local, module_index),
         |c| {
             if c == target {
                 WalkVerdict::Hit
@@ -166,14 +166,14 @@ pub fn class_isa(
 pub fn class_isa_prefix(
     class: &str,
     prefix: &str,
-    package_parents: &HashMap<String, Vec<String>>,
+    local: &dyn LocalParents,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> bool {
     let ns = format!("{prefix}::");
     walk_ancestry(
         class,
         200,
-        |cur| isa_parents(cur, package_parents, module_index),
+        |cur| isa_parents(cur, local, module_index),
         |c| {
             if c == prefix || c.starts_with(&ns) {
                 WalkVerdict::Hit
@@ -187,7 +187,7 @@ pub fn class_isa_prefix(
 impl FileAnalysis {
     /// Single-source-of-truth DFS ancestor walk for every per-class
     /// lookup on this file: walks `class_name` and every ancestor
-    /// (local `package_parents` ∪ cross-file `parents_cached`),
+    /// (local `PackageFacts::parents` ∪ cross-file `parents_cached`),
     /// cycle-safe via a `seen` set, depth-capped at 20 (Perl's default
     /// MRO bound). Visitor decides when to stop via `ControlFlow::Break`.
     ///
@@ -590,17 +590,17 @@ impl FileAnalysis {
             // generated role: `with ReportProxy(type => ...)`) is as
             // unresolved as a named parent we can't find — the
             // recorded list isn't the whole ancestry.
-            let dynamic_here = self.dynamic_parent_packages.contains(cls)
+            let dynamic_here = self.has_dynamic_parents(cls)
                 || module_index
                     .and_then(|idx| idx.get_cached(cls))
-                    .is_some_and(|c| c.analysis.dynamic_parent_packages.contains(cls));
+                    .is_some_and(|c| c.analysis.has_dynamic_parents(cls));
             if dynamic_here {
                 incomplete = true;
                 return std::ops::ControlFlow::Break(());
             }
             let parents = parents_of(
                 cls,
-                &self.package_parents,
+                &self.packages,
                 module_index,
                 &self.app_surface_consumers,
             );
@@ -777,7 +777,7 @@ impl FileAnalysis {
         // site). Name dedup across the recursion is the `seen_names` set.
         for parent in parents_of(
             class_name,
-            &self.package_parents,
+            &self.packages,
             module_index,
             &self.app_surface_consumers,
         ) {

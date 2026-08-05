@@ -279,29 +279,36 @@ table). R1 is restated as compiler-enforced in CLAUDE.md and
 ### E2. FileAnalysis is ~50 flat serialized fields from seven fused models, spelled in quadruplicate — **high leverage / XL**
 
 **The wrong embedding.** The struct (`src/model/file_analysis/mod.rs:41-431`)
-fuses core tables, per-package facts, export surface, plugin lane, narrowing
-lane, pack lane, and eviction bookkeeping as flat siblings; the field list is
-re-spelled in `FileAnalysisParts` (`mod.rs:438-482`), `new()`'s exhaustive
-destructure (`lifecycle.rs:11-128`), and `heap_estimate`'s hand-enumerated
-buckets (`lifecycle.rs:619-866`) — whose bucket names already NAME the natural
-sub-structs. Six per-package sibling maps keyed by the same package name
-(`mod.rs:94,109,159,277,294,299`) force `Surface::project` to re-join per
-package (`surface.rs:144-153`). Each `evict_*` must hand-clear its sibling
-index fields (`lifecycle.rs:164-192`) — a fifth parallel spelling.
+fuses core tables, export surface, plugin lane, narrowing lane, pack lane,
+and eviction bookkeeping as flat siblings; the field list is re-spelled in
+`FileAnalysisParts`, `new()`'s exhaustive destructure (`lifecycle.rs`), and
+`heap_estimate`'s hand-enumerated buckets — whose bucket names already NAME
+the natural sub-structs. Each `evict_*` must hand-clear its sibling index
+fields — a fourth parallel spelling.
+
+**Phase 1 landed** (commit `rework(E2.1): PackageFacts`) — `PackageFacts` (`parents`/`uses`/`framework`/
+`requires`/`is_role`/`dynamic_parents`) replaces the six per-package sibling
+maps; `FileAnalysis::packages` is the one table, `parents_of` and
+`Surface::project` read one entry, and `Surface::project` destructures
+`PackageFacts` exhaustively so E1's classification gate reaches the new
+per-package lane too.
 
 **Target shape.** Cut along the seams the heap probe names, phased
-cheapest-leverage first: (1) `PackageFacts` replacing the six per-package maps
-(`parents/uses/framework/requires/is_role/dynamic_parents` — `parents_of` and
-Surface read one entry); (2) `RefTable` and `SymbolTable`, each owning its
-indices, its `evict()` (index clears by construction), its `heap_estimate()`
-arm, and its enrichment baseline; (3) `PackFacts` and `PluginFacts`.
+cheapest-leverage first: (1) `PackageFacts` — LANDED; (2) `RefTable` and
+`SymbolTable`, each owning its indices, its `evict()` (index clears by
+construction), its `heap_estimate()` arm, and its enrichment baseline;
+(3) `PackFacts` and `PluginFacts`.
 `FileAnalysisParts` collapses to moving sub-structs; `new()` shrinks; serde
 field order preserved, one EXTRACT_VERSION bump at the end.
 
-**Migration order.** Phase 1 (PackageFacts) is an M-sized standalone win; do
-it early. Phases 2-3 land best AFTER E1 (surface_feed then destructures
-sub-structs); E3's `Ref::binding` is already landed and moves into RefTable
-with the rest of the refs.
+**Migration order.** Phases 2-3 land best AFTER E1 (surface_feed then
+destructures sub-structs); E3's `Ref::binding` is already landed and moves
+into RefTable with the rest of the refs. The builder still accumulates its
+walk-time per-package lanes as sibling maps and folds them at
+`PackageFacts::fold`; `LocalParents` / `PackageFrameworks` are the read seams
+that let both sides answer. Collapsing the builder onto the one shape is
+available once the `contains_key`-means-"has parents" sites
+(`visit_decl`, `plugin_emit`) are re-expressed.
 
 **Gate.** The residency tripwire and eviction tests already net phase 2;
 equality-net tests cover PackageFacts' Surface join; heap probe totals

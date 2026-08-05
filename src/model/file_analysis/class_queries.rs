@@ -128,11 +128,7 @@ impl FileAnalysis {
             FrameworkFact, ReducedValue, ReducerQuery, ReducerRegistry,
             WitnessAttachment,
         };
-        let framework = self
-            .package_framework
-            .get(class_name)
-            .copied()
-            .unwrap_or(FrameworkFact::Plain);
+        let framework = self.package_framework(class_name).unwrap_or(FrameworkFact::Plain);
         let att = WitnessAttachment::MethodOnClass {
             class: class_name.to_string(),
             name: method_name.to_string(),
@@ -905,7 +901,7 @@ impl FileAnalysis {
             Some(p) => p.to_string(),
             None => return (Vec::new(), Vec::new()),
         };
-        let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
+        let uses = self.package_uses(&pkg).to_vec();
         // Local-only transitive parents: no index (emit-time never had
         // cross-file resolution) and the app-surface edge masked off —
         // a consumer is not a descendant of the synthetic surface for

@@ -31,7 +31,7 @@ filter is a compile error, not a silent drift. This is rule #10 made
 structural: the type carries the rule, the consumer can't re-decide it.
 
 `resolve_for` walks the single isa seam — the free `class_isa(class,
-target, package_parents, module_index)` over local `package_parents` ∪
+target, local, module_index)` over local `PackageFacts::parents` ∪
 cross-file `parents_cached`, the same nodes `parents_of` enumerates. No
 second ancestry walk exists.
 

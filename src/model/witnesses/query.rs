@@ -98,9 +98,9 @@ pub fn query_sub_return_type(
                 })?;
                 let cached_ctx = BagContext {
                     scopes: &full.scopes,
-                    package_framework: &full.package_framework,
+                    package_framework: &full.packages,
                     module_index: Some(idx),
-                    package_parents: &full.package_parents,
+                    package_parents: &full.packages,
                     app_surface_consumers: &full.app_surface_consumers,
                 };
                 let att = WitnessAttachment::Symbol(sym.id);
@@ -184,9 +184,9 @@ pub fn query_sub_return_type(
                     };
                     let cached_ctx = BagContext {
                         scopes: &full.scopes,
-                        package_framework: &full.package_framework,
+                        package_framework: &full.packages,
                         module_index: Some(idx),
-                        package_parents: &full.package_parents,
+                        package_parents: &full.packages,
                         app_surface_consumers: &full.app_surface_consumers,
                     };
                     let att = WitnessAttachment::Symbol(sym.id);
