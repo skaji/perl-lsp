@@ -1069,6 +1069,58 @@ fn gather_cache_single_flight_computes_once() {
 }
 
 #[test]
+fn gather_cache_rayon_worker_never_blocks_on_a_foreign_flight() {
+    // The fmt cold-start deadlock: the open-doc gather (off-pool) holds a
+    // key's flight while its compute waits on the rayon pool, and a pool
+    // worker resolving the same key parks on the condvar — freezing the
+    // stack-suspended continuations beneath it, so the claimant's injected
+    // work never runs and the whole pool wedges. The rule under pin: a rayon
+    // worker that finds a key in flight computes a private duplicate and
+    // returns; only non-pool waiters coalesce on the condvar.
+    use std::sync::{mpsc, Arc};
+    let cache: Arc<GatherCache<u32, u64, Arc<u64>>> = Arc::new(GatherCache::new(1 << 20));
+
+    // Claim the key from an OFF-pool thread; hold the flight open until told.
+    let (hold_tx, hold_rx) = mpsc::channel::<()>();
+    let (claimed_tx, claimed_rx) = mpsc::channel::<()>();
+    let claimant = {
+        let cache = cache.clone();
+        std::thread::spawn(move || {
+            let v = cache.get_or_fill(9u32, 1u64, || {
+                claimed_tx.send(()).unwrap();
+                hold_rx.recv().unwrap();
+                Fill::Store(Arc::new(1u64), 64)
+            });
+            assert_eq!(*v, 1);
+        })
+    };
+    claimed_rx.recv().unwrap(); // the key is now in flight
+
+    // A rayon worker resolving the held key must answer promptly from its own
+    // compute. Pre-fix it parks on the condvar (which the still-open flight
+    // never signals), and this recv times out.
+    let (done_tx, done_rx) = mpsc::channel::<u64>();
+    {
+        let cache = cache.clone();
+        rayon::spawn(move || {
+            let v = cache.get_or_fill(9u32, 1u64, || Fill::Store(Arc::new(2u64), 64));
+            let _ = done_tx.send(*v);
+        });
+    }
+    let got = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+    hold_tx.send(()).unwrap(); // release the claimant either way — no hang on failure
+    claimant.join().unwrap();
+    let v = got.expect("a rayon worker must not block on another thread's in-flight gather");
+    assert_eq!(v, 2, "the worker answered from its private duplicate compute");
+    // The duplicate did NOT publish: the claimant's copy owns the cache entry.
+    assert_eq!(
+        *cache.get_or_fill(9u32, 1u64, || panic!("claimant's store is cached")),
+        1,
+        "only the claimant's value entered the cache"
+    );
+}
+
+#[test]
 fn gather_cache_cap_evicts_lru_keeps_just_inserted() {
     use std::sync::Arc;
     // Cap = 250 bytes; each entry is 100 bytes → holds 2, the 3rd evicts one.

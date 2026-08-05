@@ -147,7 +147,8 @@ where
         F: FnOnce() -> Option<Fill<V>>,
     {
         // 1. Acquire the key. A stamp-matching entry is a hit; a live in-flight
-        //    compute is waited on (the whole point — no duplicate expansion);
+        //    compute is waited on (the whole point — no duplicate expansion),
+        //    EXCEPT from a rayon worker, which duplicates instead of parking;
         //    otherwise claim the key so siblings coalesce onto our compute.
         {
             let mut st = self.state.lock().expect("gather cache poisoned");
@@ -166,6 +167,33 @@ where
                     return (Some(v), Resolution::Cached);
                 }
                 if st.in_flight.contains(&key) {
+                    // A rayon pool worker must NEVER block on this condvar: the
+                    // claimant may be an off-pool thread whose compute needs
+                    // this very pool (the gather's level `par_iter`), and a
+                    // worker parked here freezes every stack-suspended
+                    // continuation beneath it — rayon's work-stealing runs jobs
+                    // inline during joins, so the claimant's injected pieces
+                    // can be buried under the blocked frame and the pool
+                    // wedges whole (the fmt cold-start deadlock: bulk-index
+                    // worker waits on the open-doc gather's claim, the gather
+                    // waits on the pool). A worker computes a private
+                    // duplicate instead — correct value for this caller, no
+                    // publish (the claimant owns population, and an
+                    // invalidation racing us targets only the claimant's
+                    // in-flight entry, so an unclaimed store could land
+                    // stale). Coalescing is preserved for every non-pool
+                    // waiter, where blocking is safe.
+                    if rayon::current_thread_index().is_some() {
+                        drop(st);
+                        return match compute() {
+                            // Store means the compute succeeded completely —
+                            // the value is authoritative even though only the
+                            // claimant's copy enters the cache.
+                            Some(Fill::Store(v, _)) => (Some(v), Resolution::Cached),
+                            Some(Fill::Transient(v)) => (Some(v), Resolution::Transient),
+                            None => (None, Resolution::Missed),
+                        };
+                    }
                     st = self.ready.wait(st).expect("gather cache poisoned");
                     continue;
                 }
