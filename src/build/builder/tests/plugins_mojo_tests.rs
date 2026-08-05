@@ -730,7 +730,7 @@ $r->post('/users')->to(controller => 'Users', action => 'create');
 
     // Each route: one MethodCallRef + one Handler symbol.
     let method_refs: Vec<&Ref> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             matches!(r.kind, RefKind::MethodCall { .. })
@@ -843,7 +843,7 @@ sub list { my ($c) = @_; }
     // portion of 'Users#list' should be at a span matching the
     // text 'list'.
     let route_ref = app_fa
-        .refs
+        .refs()
         .iter()
         .find(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "list")
         .expect("mojo-routes MethodCallRef for 'list'");
@@ -871,7 +871,7 @@ $r->get('/users')->to('Users#list');
     let fa = build_fa(src);
 
     let route_refs: Vec<&Ref> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "list")
         .collect();
@@ -907,7 +907,7 @@ $r->get('/users')->to(controller => 'Users', action => 'list');
 "#;
     let fa = build_fa(src);
 
-    let has_ref = fa.refs.iter().any(|r| {
+    let has_ref = fa.refs().iter().any(|r| {
         matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
             && r.target_name == "list"
     });
@@ -1385,7 +1385,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
 
     // The route emits a MethodCallRef method_name=create invocant=Users.
     let route_ref = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| {
             matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "Users")
@@ -1574,7 +1574,7 @@ fn plugin_app_surface_minion_enqueue_resolves_when_app_typed() {
          $app->minion->enqueue('send_email' => ['alice']);\n1;\n",
     );
 
-    let mref = fa.refs.iter().find(|r| {
+    let mref = fa.refs().iter().find(|r| {
         matches!(&r.kind, RefKind::MethodCall { .. }) && r.target_name == "minion"
     });
     assert!(mref.is_some(), "an `$app->minion` MethodCall ref must exist");
@@ -1584,7 +1584,7 @@ fn plugin_app_surface_minion_enqueue_resolves_when_app_typed() {
     // `Mojolicious::Lite` is a trigger, so the emit-hook materializes the
     // DispatchCall directly; `applicable_dispatches` de-dups the gated
     // candidate against it. Either path surfaces the handler — exactly once.
-    let has_materialized = fa.refs.iter().any(|r|
+    let has_materialized = fa.refs().iter().any(|r|
         matches!(&r.kind, RefKind::DispatchCall { dispatcher } if dispatcher == "enqueue")
             && matches!(r.handler_owner(), Some(HandlerOwner::Class(c)) if c == "Minion")
             && r.target_name == "send_email");
@@ -1879,7 +1879,7 @@ sub after {
     let fa = build_fa(src);
 
     let dispatch_refs: Vec<&crate::model::file_analysis::Ref> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(&r.kind, RefKind::DispatchCall { .. }))
         .filter(|r| r.target_name == "/hello")
@@ -1988,7 +1988,7 @@ $minion->add_task(send_email => sub {
     );
 
     // DispatchCall on the name (registration itself is a reference).
-    let dc = fa.refs.iter()
+    let dc = fa.refs().iter()
             .find(|r| matches!(&r.kind, RefKind::DispatchCall { dispatcher, .. } if dispatcher == "add_task"))
             .expect("add_task must emit a DispatchCall ref");
     assert_eq!(dc.target_name, "send_email");
@@ -2010,7 +2010,7 @@ $minion->enqueue_p(send_email => ['bob']);
     let fa = build_fa(src);
 
     let dispatchers: Vec<&str> = fa
-        .refs
+        .refs()
         .iter()
         .filter_map(|r| match &r.kind {
             RefKind::DispatchCall { dispatcher, .. } if r.target_name == "send_email" => {
@@ -2056,7 +2056,7 @@ fn gated_dispatch_resolves_on_subclass_receiver_query_time() {
     );
     // The triggers never fired, so nothing was materialized at parse time.
     assert!(
-        !fa.refs.iter().any(|r| matches!(&r.kind, RefKind::DispatchCall { .. })),
+        !fa.refs().iter().any(|r| matches!(&r.kind, RefKind::DispatchCall { .. })),
         "no DispatchCall ref should exist (plugin trigger didn't fire)",
     );
 
@@ -2138,7 +2138,7 @@ $minion->enqueue(send_email => ['alice']);
         "add_task on a Minion subclass receiver must still register a Minion-owned Handler",
     );
 
-    let has_enqueue_dc = fa.refs.iter().any(|r| matches!(
+    let has_enqueue_dc = fa.refs().iter().any(|r| matches!(
         &r.kind, RefKind::DispatchCall { dispatcher, .. }
         if dispatcher == "enqueue" && r.target_name == "send_email"
     ));

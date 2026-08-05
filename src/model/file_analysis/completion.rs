@@ -993,7 +993,7 @@ impl FileAnalysis {
         let mut keys = Vec::new();
         let mut seen = HashSet::new();
 
-        for r in &self.refs {
+        for r in self.refs() {
             if let RefKind::HashKeyAccess { ref var_text, .. } = r.kind {
                 // Check the var_text's bare name matches
                 let ref_bare = if var_text.starts_with('$')

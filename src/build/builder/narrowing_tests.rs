@@ -71,7 +71,7 @@ fn narrow_observed_through_method_dispatch() {
         "package Foo;\nsub paint { my ($self) = @_; }\npackage P;\nsub f {\n    my ($x) = @_;\n    if ($x->isa('Foo')) {\n        $x->paint;\n    }\n}",
     );
     let r = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "paint" && matches!(r.kind, RefKind::MethodCall { .. }))
         .expect("paint method-call ref");
@@ -429,7 +429,7 @@ fn narrow_elsif_else_isa_stays_wide() {
 /// Class an invocant resolves to for the method-call ref named `method`.
 fn invocant_class_of(fa: &FileAnalysis, method: &str) -> Option<String> {
     let r = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == method && matches!(r.kind, RefKind::MethodCall { .. }))
         .unwrap_or_else(|| panic!("no method-call ref for {method}"));

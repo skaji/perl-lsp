@@ -1456,7 +1456,7 @@ sub startup {
     // class — resolution to a class is the plugin's query-time job, which
     // needs a populated index; brand inheritance is what's under test).
     let inherited = |action: &str| -> Option<String> {
-        fa.refs.iter().find_map(|r| {
+        fa.refs().iter().find_map(|r| {
             if let crate::model::file_analysis::RefKind::MethodCall {
                 invocant: crate::model::conventions::Invocant::Bridged { token, .. },
                 ..

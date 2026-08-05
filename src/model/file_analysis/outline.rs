@@ -520,7 +520,7 @@ impl FileAnalysis {
             })
             .collect();
 
-        for r in &self.refs {
+        for r in self.refs() {
             // Skip declaration refs — the symbol loop already emits tokens for declarations
             if matches!(r.access, AccessKind::Declaration) {
                 continue;

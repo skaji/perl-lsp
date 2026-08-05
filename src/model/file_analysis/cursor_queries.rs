@@ -279,7 +279,7 @@ impl FileAnalysis {
         // the route's `Users::create` ref, etc.).
         if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
             let sym_package = sym.package.clone();
-            for r in &self.refs {
+            for r in self.refs() {
                 if r.resolved_symbol().is_some() { continue; }
                 match (&r.kind, &sym.kind) {
                         (RefKind::FunctionCall, SymKind::Sub) => {
@@ -323,7 +323,7 @@ impl FileAnalysis {
         // method or a data field (`Variable`/`Field`). Inheritance-aware for
         // free: every `->op_type` across every struct pasting a role macro
         // froze onto the one `BASEOP::op_type` member, so they splat together.
-        for r in &self.refs {
+        for r in self.refs() {
             if let (
                 RefKind::MethodCall { method_name_span, .. },
                 Some(MethodTarget::Local { sym_id, .. }),
@@ -337,7 +337,7 @@ impl FileAnalysis {
 
         // For hash key definitions, find all accesses with same owner + key name
         if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
-            for r in &self.refs {
+            for r in self.refs() {
                 if matches!(r.kind, RefKind::HashKeyAccess { .. }) {
                     if r.target_name != sym.name {
                         continue;
@@ -690,7 +690,7 @@ impl FileAnalysis {
     /// unlike synthesized members does NOT sit on the group decl token.
     fn mapped_member_spans(&self, g: &FieldGroup, method: &str) -> Vec<Span> {
         let mut spans = Vec::new();
-        for r in &self.refs {
+        for r in self.refs() {
             if let RefKind::MethodCall { method_name_span, .. } = &r.kind {
                 if r.unqualified_target_name() != method {
                     continue;
@@ -760,7 +760,7 @@ impl FileAnalysis {
                 package: Some(g.class.clone()),
                 name: "new".to_string(),
             };
-            for r in &self.refs {
+            for r in self.refs() {
                 if let Some(o) = r.hash_key_owner() {
                     if r.target_name == g.bare && o.found_by(&owner) {
                         spans.push(r.span);
@@ -770,7 +770,7 @@ impl FileAnalysis {
         }
         // Reader calls (`$p->x`) dispatching to this class.
         if g.has_reader {
-            for r in &self.refs {
+            for r in self.refs() {
                 if let RefKind::MethodCall { method_name_span, .. } = &r.kind {
                     if r.unqualified_target_name() != g.bare {
                         continue;
@@ -798,7 +798,7 @@ impl FileAnalysis {
                     && matches!(a.kind, AttrProjectionKind::InternalKey)
             })
         {
-            for r in &self.refs {
+            for r in self.refs() {
                 if let Some(HashKeyOwner::Class(c)) = r.hash_key_owner() {
                     if c == &g.class && r.target_name == g.bare {
                         spans.push(r.span);
@@ -1230,7 +1230,7 @@ impl FileAnalysis {
             if sym.package != *scope { continue; }
             edits.push((sym.selection_span, new_name.to_string()));
         }
-        for r in &self.refs {
+        for r in self.refs() {
             if r.target_name != old_name { continue; }
             match &r.kind {
                 RefKind::FunctionCall => {
@@ -1292,7 +1292,7 @@ impl FileAnalysis {
                 edits.push((sym.selection_span, new_name.to_string()));
             }
         }
-        for r in &self.refs {
+        for r in self.refs() {
             if r.target_name == old_name && matches!(r.kind, RefKind::PackageRef) {
                 edits.push((r.span, new_name.to_string()));
             }

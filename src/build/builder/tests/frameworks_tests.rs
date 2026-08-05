@@ -929,7 +929,7 @@ sub greet {
     // ->age has no args → getter → returns None (unknown)
     // The chain should resolve: name('Bob') returns Foo, ->age is valid on Foo
     let method_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "age" && matches!(r.kind, RefKind::MethodCall { .. }))
         .collect();
@@ -1649,10 +1649,10 @@ fn test_goto_amp_fq_sub_emits_call_ref() {
     // `goto &Foo::bar` — the `&` code-ref sigil is stripped so the FQ call
     // resolves; a FunctionCall ref to Foo::bar is emitted (resolved_package Foo).
     let fa = build_fa("package Child;\nsub import { goto &Parent::Thing::setup; }\n");
-    let r = fa.refs.iter().find(|r|
+    let r = fa.refs().iter().find(|r|
         matches!(r.kind, RefKind::FunctionCall { .. }) && r.target_name == "Parent::Thing::setup");
     assert!(r.is_some(), "expected FunctionCall ref to Parent::Thing::setup (& stripped), got {:?}",
-        fa.refs.iter().filter(|r| matches!(r.kind, RefKind::FunctionCall{..})).map(|r| &r.target_name).collect::<Vec<_>>());
+        fa.refs().iter().filter(|r| matches!(r.kind, RefKind::FunctionCall{..})).map(|r| &r.target_name).collect::<Vec<_>>());
 }
 
 #[test]
@@ -1692,7 +1692,7 @@ sub test {
 ",
     );
     let method_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }))
         .map(|r| r.target_name.as_str())
@@ -1714,7 +1714,7 @@ sub test { my $self = shift; $self->$method() }
 ",
     );
     let method_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "get_name")
         .collect();

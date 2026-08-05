@@ -72,7 +72,7 @@ impl FileAnalysis {
     /// Find all refs with a given target name.
     #[allow(dead_code)]
     pub fn refs_named(&self, name: &str) -> Vec<&Ref> {
-        self.refs_by_name.get(name)
+        self.refs.by_name(name)
             .map(|idxs| idxs.iter().map(|&i| &self.refs[i]).collect())
             .unwrap_or_default()
     }

@@ -177,7 +177,7 @@ fn query_skeleton_differential_report() {
             skel.refs.iter().map(|r| (r.start.row, r.start.column)).collect();
         skel_ref_total += skel.refs.len();
         let mut builder_ref_pos: HashSet<(usize, usize)> = HashSet::new();
-        for r in &fa.refs {
+        for r in fa.refs() {
             if matches!(
                 r.kind,
                 RefKind::FunctionCall { .. } | RefKind::MethodCall { .. } | RefKind::Variable
@@ -1248,7 +1248,7 @@ fn cpp_cross_file_enum_variant_goto_def() {
     let use_src = "int is_scope(int t) {\n    return t == OP_SCOPE;\n}\n";
     let use_fa = cpp_skel(use_src).into_file_analysis();
     assert!(
-        use_fa.refs.iter().any(|r| matches!(r.kind, RefKind::Variable)
+        use_fa.refs().iter().any(|r| matches!(r.kind, RefKind::Variable)
             && r.target_name == "OP_SCOPE"
             && r.resolved_symbol().is_none()),
         "a use with no LOCAL decl still mints an unresolved Variable ref"

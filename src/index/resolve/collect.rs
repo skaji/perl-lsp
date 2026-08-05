@@ -516,7 +516,7 @@ pub(super) fn span_is_folded_name(
     include_calls: bool,
     literal_name: &str,
 ) -> bool {
-    analysis.refs.iter().any(|r| {
+    analysis.refs().iter().any(|r| {
         (matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess)
             || (include_calls && matches!(r.kind, RefKind::FunctionCall { .. })))
             && r.span == span
@@ -800,7 +800,7 @@ pub(super) fn collect_package_var(
             });
         }
     }
-    for r in &analysis.refs {
+    for r in analysis.refs() {
         if !matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) {
             continue;
         }
@@ -981,7 +981,7 @@ pub(super) fn collect_from_analysis(
         TargetKind::Method { class } => Some(Some(class.clone())),
         _ => None,
     };
-    for r in &analysis.refs {
+    for r in analysis.refs() {
         // A qualified call (`Foo::baz()` / `$o->Foo::Bar::baz()`) keeps its
         // whole path in `target_name`; match it on the bare callable tail (the
         // dispatch-class checks in the call arms below still pin the right

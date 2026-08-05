@@ -712,7 +712,7 @@ impl FileAnalysis {
         // INNERMOST call at a point, which for a multi-hop chain is a
         // strict prefix of the receiver — the wrong hop.
         if let Some(span) = invocant_span {
-            if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
+            if let Some(recv_idx) = self.refs.call_at_start(&span.start) {
                 let recv_span = self.refs[recv_idx].span;
                 let contained = recv_span.start == span.start
                     && (recv_span.end.row, recv_span.end.column)
@@ -757,7 +757,7 @@ impl FileAnalysis {
         // the registry). This is the one structure-from-refs step the
         // bag can't pre-record, so it lives here, not in the builder.
         if let Some(span) = invocant_span {
-            if let Some(&recv_idx) = self.call_ref_by_start.get(&span.start) {
+            if let Some(recv_idx) = self.refs.call_at_start(&span.start) {
                 let recv_span = self.refs[recv_idx].span;
                 let contained = recv_span.start == span.start
                     && (recv_span.end.row, recv_span.end.column)

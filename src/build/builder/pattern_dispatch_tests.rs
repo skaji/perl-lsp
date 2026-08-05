@@ -383,7 +383,7 @@ fn receiver_isa_gate_defers_dispatch_to_query_time() {
 
     // The DispatchCall was NOT applied directly — no ref exists yet.
     assert!(
-        !fa.refs.iter().any(|r| matches!(
+        !fa.refs().iter().any(|r| matches!(
             &r.kind,
             crate::model::file_analysis::RefKind::DispatchCall { .. }
         )),

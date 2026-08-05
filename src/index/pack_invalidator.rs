@@ -418,7 +418,7 @@ impl PackInvalidator {
                 let cached = Arc::new(CachedModule::new(p.clone(), arc.clone()));
                 module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace");
                 if !arc.degraded {
-                    let seeds: Vec<_> = arc.refs.iter().map(|r| r.row_seed()).collect();
+                    let seeds: Vec<_> = arc.ref_row_seeds();
                     let sym_seeds = arc.sym_row_seeds();
                     if let Err(e) = module_cache::shred_derived_rows(
                         &conn, &p_str, "workspace", &seeds, &sym_seeds,

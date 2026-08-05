@@ -115,7 +115,7 @@ fn heatmap_symbol_row(
     let is_callable = matches!(sym.kind, SymKind::Sub | SymKind::Method);
     let fan_out: Option<usize> = if is_callable {
         let mut callees: HashSet<&str> = HashSet::new();
-        for r in &analysis.refs {
+        for r in analysis.refs() {
             if matches!(
                 r.kind,
                 RefKind::FunctionCall { .. }

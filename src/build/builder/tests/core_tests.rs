@@ -4,7 +4,7 @@ use super::*;
 fn debug_moo_name_refs() {
     let src = std::fs::read_to_string("test_files/frameworks.pl").unwrap();
     let fa = build_fa(&src);
-    for r in &fa.refs {
+    for r in fa.refs() {
         if r.target_name == "name" || r.target_name == "new" {
             eprintln!(
                 "REF: target={} kind={:?} span={:?} resolves_to={:?}",
@@ -269,7 +269,7 @@ $#foo;
     // Collect every Variable/ContainerAccess ref, keyed by the line
     // it sits on. Line 0 is the declaration — skip it.
     let mut refs_by_line: std::collections::HashMap<usize, Vec<&str>> = Default::default();
-    for r in &fa.refs {
+    for r in fa.refs() {
         if !matches!(r.kind, RefKind::Variable | RefKind::ContainerAccess) {
             continue;
         }

@@ -16,18 +16,18 @@ fn not_operator_emits_no_function_call_ref() {
     // diagnostic for `not`.
     let fa = build_fa("my $x = 1;\nmy $y = not $x;\n");
     let not_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "not" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .collect();
     assert!(
         not_refs.is_empty(),
         "`not` is an operator now; no FunctionCall ref should exist; got refs: {:?}",
-        fa.refs.iter().map(|r| (&r.target_name, &r.kind)).collect::<Vec<_>>(),
+        fa.refs().iter().map(|r| (&r.target_name, &r.kind)).collect::<Vec<_>>(),
     );
     // The $x operand still gets its read ref.
     assert!(
-        fa.refs.iter().any(|r| r.target_name == "$x"),
+        fa.refs().iter().any(|r| r.target_name == "$x"),
         "operand $x should still be referenced",
     );
 }
@@ -40,7 +40,7 @@ fn not_operator_emits_no_function_call_ref() {
 fn refgen_bare_name_emits_function_call_ref() {
     let fa = build_fa("sub handler { 1 }\nmy $cb = \\&handler;\n");
     let refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "handler" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .collect();
@@ -48,7 +48,7 @@ fn refgen_bare_name_emits_function_call_ref() {
         refs.len(),
         1,
         "\\&handler should emit exactly one FunctionCall ref for `handler`; got: {:?}",
-        fa.refs
+        fa.refs()
             .iter()
             .filter(|r| r.target_name == "handler")
             .map(|r| &r.kind)
@@ -61,7 +61,7 @@ fn refgen_bare_name_emits_function_call_ref() {
 fn refgen_qualified_name_emits_function_call_ref() {
     let fa = build_fa("my $cb = \\&Foo::handler;\n");
     let refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "handler" || r.target_name == "Foo::handler"
@@ -70,7 +70,7 @@ fn refgen_qualified_name_emits_function_call_ref() {
     assert!(
         !refs.is_empty(),
         "\\&Foo::handler should emit a FunctionCall ref; got refs: {:?}",
-        fa.refs.iter().map(|r| (&r.target_name, &r.kind)).collect::<Vec<_>>(),
+        fa.refs().iter().map(|r| (&r.target_name, &r.kind)).collect::<Vec<_>>(),
     );
 }
 
@@ -123,7 +123,7 @@ fn fq_scalar_read_resolves_same_file() {
         .expect("our $x in Pkg should be a symbol");
     // Cursor on the `x` tail of `$Pkg::x` (line 3).
     let read = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "$Pkg::x")
         .expect("$Pkg::x should emit a Variable ref");
@@ -146,7 +146,7 @@ fn fq_array_read_resolves_same_file() {
         .find(|s| s.name == "@arr" && s.package.as_deref() == Some("Pkg"))
         .expect("our @arr in Pkg should be a symbol");
     let read = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "@Pkg::arr")
         .expect("@Pkg::arr should emit a Variable ref");
@@ -159,7 +159,7 @@ fn fq_var_ref_span_narrowed_to_tail() {
     let src = "package Pkg;\nour $x = 1;\npackage Main;\nmy $a = $Pkg::x;\n";
     let fa = build_fa(src);
     let read = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "$Pkg::x")
         .expect("$Pkg::x ref");
@@ -173,7 +173,7 @@ fn unqualified_var_still_resolves_lexically() {
     // Regression: the FQ fast-path must not break plain lexical resolution.
     let fa = build_fa("my $x = 1;\nprint $x;\n");
     let read = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "$x" && r.access == AccessKind::Read)
         .expect("plain $x read");
@@ -208,7 +208,7 @@ sub speak_loudly { "WOOF" }
         ty.is_some(),
         "$self inside `around` body should have an inferred type; got None.\
          \nAll TCs: {:?}",
-        fa.refs
+        fa.refs()
             .iter()
             .filter(|r| r.target_name == "$self")
             .collect::<Vec<_>>(),
@@ -379,7 +379,7 @@ fn sub_exporter_member_refs_local_subs() {
          1;\n",
     );
     let count = |name: &str| {
-        fa.refs
+        fa.refs()
             .iter()
             .filter(|r| {
                 r.target_name == name
@@ -390,7 +390,7 @@ fn sub_exporter_member_refs_local_subs() {
     };
     // foo: exports list only = 1. bar: exports + group `extra` = 2.
     // baz: exports + group `extra` = 2.
-    assert_eq!(count("foo"), 1, "foo member ref; got refs {:?}", fa.refs.iter().filter(|r| r.target_name=="foo").collect::<Vec<_>>());
+    assert_eq!(count("foo"), 1, "foo member ref; got refs {:?}", fa.refs().iter().filter(|r| r.target_name=="foo").collect::<Vec<_>>());
     assert_eq!(count("bar"), 2, "bar in exports + group extra");
     assert_eq!(count("baz"), 2, "baz in exports + group extra");
 }
@@ -415,7 +415,7 @@ fn sub_exporter_member_goto_def_and_references() {
         .map(|s| s.selection_span)
         .expect("foo sub symbol");
     let export_ref = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| {
             r.target_name == "foo"
@@ -484,7 +484,7 @@ fn non_sub_exporter_use_unaffected() {
     assert!(!fa.export_ok.contains(&"leak".to_string()),
         "non-Sub::Exporter use must not record exports; got {:?}", fa.export_ok);
     // And no spurious export-member ref on the local sub.
-    let leak_refs = fa.refs.iter().filter(|r| r.target_name == "leak"
+    let leak_refs = fa.refs().iter().filter(|r| r.target_name == "leak"
         && matches!(&r.kind, RefKind::FunctionCall { .. })).count();
     assert_eq!(leak_refs, 0, "no member ref for an unrelated use's pseudo-export");
 }
@@ -1069,13 +1069,13 @@ sub go {
     // Usage refs emitted for both spellings' keys.
     for n in ["GAMMA", "DELTA"] {
         assert!(
-            fa.refs.iter().any(|r| {
+            fa.refs().iter().any(|r| {
                 r.target_name == n
                     && matches!(&r.kind, RefKind::FunctionCall)
                     && r.resolved_package() == Some("Foo")
             }),
             "usage of plain/fat-comma constant `{n}` must get a FunctionCall ref; refs: {:?}",
-            fa.refs.iter().filter(|r| r.target_name == n).collect::<Vec<_>>(),
+            fa.refs().iter().filter(|r| r.target_name == n).collect::<Vec<_>>(),
         );
     }
     let store = FileStore::new();
@@ -1162,13 +1162,13 @@ sub go {
         // Usages resolve: each name joins `declared_constants`, so the
         // standalone bareword usage gets a FunctionCall ref to the def.
         assert!(
-            fa.refs.iter().any(|r| {
+            fa.refs().iter().any(|r| {
                 r.target_name == n
                     && matches!(&r.kind, RefKind::FunctionCall)
                     && r.resolved_package() == Some("Foo")
             }),
             "usage of `{n}` must get a FunctionCall ref to its def; refs for {n}: {:?}",
-            fa.refs.iter().filter(|r| r.target_name == n).collect::<Vec<_>>(),
+            fa.refs().iter().filter(|r| r.target_name == n).collect::<Vec<_>>(),
         );
     }
 }
@@ -1227,11 +1227,11 @@ fn indirect_object_filehandle_not_a_function_ref() {
         let fa = build_fa(src);
         let fh = src.split_whitespace().nth(1).unwrap().trim_matches(|c| c == '"');
         assert!(
-            !fa.refs.iter().any(|r|
+            !fa.refs().iter().any(|r|
                 matches!(r.kind, RefKind::FunctionCall { .. }) && r.target_name == fh),
             "filehandle `{fh}` must not be a FunctionCall ref for `{}`; refs: {:?}",
             src.trim(),
-            fa.refs.iter().filter(|r| matches!(r.kind, RefKind::FunctionCall { .. }))
+            fa.refs().iter().filter(|r| matches!(r.kind, RefKind::FunctionCall { .. }))
                 .map(|r| r.target_name.clone()).collect::<Vec<_>>(),
         );
     }
@@ -1242,7 +1242,7 @@ fn print_with_paren_call_still_emits_function_ref() {
     // `print foo("x")` is a real call — foo must keep its FunctionCall ref.
     let fa = build_fa("print foo(\"x\");\n");
     assert!(
-        fa.refs.iter().any(|r|
+        fa.refs().iter().any(|r|
             matches!(r.kind, RefKind::FunctionCall { .. }) && r.target_name == "foo"),
         "parenthesized call `foo(...)` inside print must keep its FunctionCall ref",
     );

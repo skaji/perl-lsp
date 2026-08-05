@@ -317,7 +317,7 @@ ${$ref}->other;
 ";
     let fa = build_fa(src);
     let thing = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "thing")
         .expect("MethodCall ref for thing");
@@ -332,7 +332,7 @@ ${$ref}->other;
     );
 
     let other = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "other")
         .expect("MethodCall ref for other");
@@ -357,7 +357,7 @@ $c->bump;
 ";
     let fa = build_fa(src);
     let bump = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "bump" && matches!(r.kind, RefKind::MethodCall { .. }))
         .expect("MethodCall ref for bump");
@@ -818,7 +818,7 @@ my $f = UNRESOLVED_BAREWORD_FH;
 ";
     let fa = build_fa(src);
     let call_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "get_config" && matches!(r.kind, RefKind::FunctionCall { .. })
@@ -830,7 +830,7 @@ my $f = UNRESOLVED_BAREWORD_FH;
         "three value-position barewords promote; the decl name does not",
     );
     assert!(
-        !fa.refs.iter().any(|r| r.target_name == "UNRESOLVED_BAREWORD_FH"),
+        !fa.refs().iter().any(|r| r.target_name == "UNRESOLVED_BAREWORD_FH"),
         "unresolvable barewords stay untouched",
     );
 }
@@ -858,7 +858,7 @@ get('/y')->to('#after_group');
         super::build_with_plugins(&tree, src.as_bytes(), super::default_plugin_registry())
     };
     let invocant_of = |action: &str| -> String {
-        fa.refs
+        fa.refs()
             .iter()
             .find_map(|r| {
                 if r.target_name != action {
@@ -897,7 +897,7 @@ plugin 'Foo::BarBaz';
         super::build_with_plugins(&tree, src.as_bytes(), super::default_plugin_registry())
     };
     let invocants: Vec<String> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "register")
         .filter_map(|r| {
@@ -961,7 +961,7 @@ sub run {
 ";
     let fa = build_fa(src);
     let calls = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "filetype" && matches!(r.kind, RefKind::MethodCall { .. })
@@ -969,7 +969,7 @@ sub run {
         .count();
     assert_eq!(calls, 2, "regex-pattern and string interpolations both ref");
     assert!(
-        !fa.refs.iter().any(|r| r.target_name.contains("${")),
+        !fa.refs().iter().any(|r| r.target_name.contains("${")),
         "no junk ref for the outer interpolation scalar",
     );
 }

@@ -2124,7 +2124,7 @@ sub fire {\n  my $self = shift;\n  my $minion = My::Minion->new;\n  $minion->enq
     // Sanity: no DispatchCall ref was materialized at build (query-time path
     // is the only thing that can surface this site).
     assert!(
-        !fa_call.refs.iter().any(|r|
+        !fa_call.refs().iter().any(|r|
             matches!(&r.kind, crate::model::file_analysis::RefKind::DispatchCall { .. })),
         "precondition: the caller must have NO materialized DispatchCall ref",
     );

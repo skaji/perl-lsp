@@ -901,7 +901,7 @@ fn emit_return_fuel(
         .filter_map(|s| s.package.clone().map(|p| ((p, s.name.clone()), s.scope)))
         .collect();
     let implicit_field_edges: Vec<(crate::model::file_analysis::Span, String, ScopeId)> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::Variable) && r.resolved_symbol().is_none())
         .filter_map(|r| {
@@ -943,7 +943,7 @@ fn emit_return_fuel(
         .collect();
     // Each Sub/Method body scope → its owning class (the peeled symbol
     // package). Precomputed so the enclosing-class walk reads no `fa` borrow,
-    // leaving `fa.refs` free to mutate below.
+    // leaving the ref table free to mutate below.
     let scope_class: HashMap<ScopeId, String> = scope_to_symbol
         .iter()
         .filter_map(|(&sc, &sid)| {
@@ -959,7 +959,7 @@ fn emit_return_fuel(
             .find_map(|s| scope_class.get(&s).cloned())
     };
     let sibling_pins: Vec<(usize, String)> = fa
-        .refs
+        .refs()
         .iter()
         .enumerate()
         .filter_map(|(i, r)| {
@@ -973,7 +973,7 @@ fn emit_return_fuel(
         })
         .collect();
     for (i, class) in sibling_pins {
-        fa.refs[i].bind_function_package(class);
+        fa.refs_mut()[i].bind_function_package(class);
     }
 }
 

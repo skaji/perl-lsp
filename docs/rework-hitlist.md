@@ -293,17 +293,24 @@ maps; `FileAnalysis::packages` is the one table, `parents_of` and
 `PackageFacts` exhaustively so E1's classification gate reaches the new
 per-package lane too.
 
+**Phase 2a landed** (commit `rework(E2.2): RefTable`) — `RefTable`
+(`model/file_analysis/ref_table.rs`) is the reference axis: the `Vec<Ref>`,
+the three indices over it (name, resolved-target, start-anchored call), its
+`evict()`, its `heap_add()` arm and its enrichment baseline in one owner.
+`FileAnalysis::refs` is private; consumers read `refs()` / `refs_to_symbol` /
+`ref_row_seeds`, and `evict_refs` / `finalize_post_walk` / enrichment
+delegate, so an index can no longer survive its refs.
+
 **Target shape.** Cut along the seams the heap probe names, phased
-cheapest-leverage first: (1) `PackageFacts` — LANDED; (2) `RefTable` and
-`SymbolTable`, each owning its indices, its `evict()` (index clears by
-construction), its `heap_estimate()` arm, and its enrichment baseline;
+cheapest-leverage first: (1) `PackageFacts` — LANDED; (2a) `RefTable` —
+LANDED; (2b) `SymbolTable`, owning its indices, its `evict()` (index clears
+by construction), its `heap_estimate()` arm, and its enrichment baseline;
 (3) `PackFacts` and `PluginFacts`.
 `FileAnalysisParts` collapses to moving sub-structs; `new()` shrinks; serde
 field order preserved, one EXTRACT_VERSION bump at the end.
 
-**Migration order.** Phases 2-3 land best AFTER E1 (surface_feed then
-destructures sub-structs); E3's `Ref::binding` is already landed and moves
-into RefTable with the rest of the refs. The builder still accumulates its
+**Migration order.** Phases 2b-3 land best AFTER E1 (surface_feed then
+destructures sub-structs). The builder still accumulates its
 walk-time per-package lanes as sibling maps and folds them at
 `PackageFacts::fold`; `LocalParents` / `PackageFrameworks` are the read seams
 that let both sides answer. Collapsing the builder onto the one shape is

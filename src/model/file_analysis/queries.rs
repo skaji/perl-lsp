@@ -173,7 +173,7 @@ impl FileAnalysis {
             let scope_end = scope_span.end;
             let region = Span { start: move_span.end, end: scope_end };
             let cutoff = earliest_rebind_in(&self.flow_edges, name, region).unwrap_or(scope_end);
-            for r in &self.refs {
+            for r in self.refs() {
                 if r.target_name != *name || r.access != AccessKind::Read {
                     continue;
                 }
@@ -230,7 +230,7 @@ impl FileAnalysis {
         &self,
         mut f: impl FnMut(&str, MemberOp, Span, &[DerefStep]),
     ) {
-        for r in &self.refs {
+        for r in self.refs() {
             let RefKind::MethodCall {
                 invocant,
                 invocant_span: Some(span),
@@ -793,7 +793,7 @@ impl FileAnalysis {
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<KeyTypoSite> {
         let mut out = Vec::new();
-        for r in &self.refs {
+        for r in self.refs() {
             let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
             // `$config->{k}` (scalar holding a hashref) and `$config{k}`
             // (literal `%config`, canonical var_text) — same model, both

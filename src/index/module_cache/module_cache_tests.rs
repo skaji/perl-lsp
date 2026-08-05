@@ -300,7 +300,7 @@ fn test_full_file_analysis_survives_roundtrip() {
 
     let source = std::fs::read_to_string(&pm).unwrap();
     let cached = parse_source_to_cached(&source, &pm);
-    let original_refs_count = cached.analysis.refs.len();
+    let original_refs_count = cached.analysis.refs().len();
     let original_packages = cached.analysis.packages.clone();
     save_to_db(&conn, "Fidelity", &Some(Arc::clone(&cached)), "import");
 
@@ -311,7 +311,7 @@ fn test_full_file_analysis_survives_roundtrip() {
     let loaded = cache.get("Fidelity").unwrap();
     let loaded = loaded.as_ref().unwrap();
     assert_eq!(
-        loaded.analysis.refs.len(),
+        loaded.analysis.refs().len(),
         original_refs_count,
         "refs survive roundtrip"
     );
@@ -460,7 +460,7 @@ fn shred_ref_rows_roundtrip() {
     let path_str = pm.to_string_lossy().to_string();
 
     assert!(!has_ref_rows(&conn, &path_str));
-    let seeds: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let seeds: Vec<_> = cached.analysis.ref_row_seeds();
     assert!(!seeds.is_empty(), "call sites must produce row seeds");
     shred_derived_rows(&conn, &path_str, "workspace", &seeds, &[]).unwrap();
     assert!(has_ref_rows(&conn, &path_str));
@@ -500,7 +500,7 @@ fn shred_sym_rows_same_generation() {
     let cached = parse_source_to_cached(source, &pm);
     let path_str = pm.to_string_lossy().to_string();
 
-    let seeds: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let seeds: Vec<_> = cached.analysis.ref_row_seeds();
     let sym_seeds = cached.analysis.sym_row_seeds();
     assert!(
         sym_seeds.iter().any(|s| s.name == "helper"),
@@ -578,7 +578,7 @@ fn unused_exports_view() {
     std::fs::write(&prod, prod_src).unwrap();
     let prod_cached = parse_source_to_cached(prod_src, &prod);
     let prod_path = prod.to_string_lossy().to_string();
-    let prod_refs: Vec<_> = prod_cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let prod_refs: Vec<_> = prod_cached.analysis.ref_row_seeds();
     let prod_syms = prod_cached.analysis.sym_row_seeds();
     shred_derived_rows(&conn, &prod_path, "workspace", &prod_refs, &prod_syms).unwrap();
 
@@ -590,7 +590,7 @@ fn unused_exports_view() {
     std::fs::write(&cons, cons_src).unwrap();
     let cons_cached = parse_source_to_cached(cons_src, &cons);
     let cons_path = cons.to_string_lossy().to_string();
-    let cons_refs: Vec<_> = cons_cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let cons_refs: Vec<_> = cons_cached.analysis.ref_row_seeds();
     let cons_syms = cons_cached.analysis.sym_row_seeds();
     shred_derived_rows(&conn, &cons_path, "workspace", &cons_refs, &cons_syms).unwrap();
 
@@ -645,7 +645,7 @@ fn unused_exports_view_cross_file_candidate_suppresses() {
     std::fs::write(&cons, cons_src).unwrap();
     let cons_cached = parse_source_to_cached(cons_src, &cons);
     let cons_path = cons.to_string_lossy().to_string();
-    let cons_refs: Vec<_> = cons_cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let cons_refs: Vec<_> = cons_cached.analysis.ref_row_seeds();
     assert!(
         cons_refs.iter().any(|s| s.key == "widget"),
         "consumer must produce a `widget` candidate row"
@@ -671,7 +671,7 @@ fn names_with_ref_rows_is_the_distinct_key_set() {
     let src = "package UE::Names;\nsub helper { 1 }\nsub go { helper(); }\n1;\n";
     std::fs::write(&pm, src).unwrap();
     let cached = parse_source_to_cached(src, &pm);
-    let refs: Vec<_> = cached.analysis.refs.iter().map(|r| r.row_seed()).collect();
+    let refs: Vec<_> = cached.analysis.ref_row_seeds();
     shred_derived_rows(&conn, &pm.to_string_lossy(), "workspace", &refs, &[]).unwrap();
 
     let names = names_with_ref_rows(&conn);
@@ -690,7 +690,7 @@ fn ref_row_seed_match_keys() {
     let pm = dir.join("TestModule_keys.pm");
     std::fs::write(&pm, source).unwrap();
     let cached = parse_source_to_cached(source, &pm);
-    let keys: Vec<String> = cached.analysis.refs.iter().map(|r| r.match_key()).collect();
+    let keys: Vec<String> = cached.analysis.refs().iter().map(|r| r.match_key()).collect();
     assert!(
         keys.iter().any(|k| k == "baz"),
         "qualified call keys by bare tail; got {keys:?}"

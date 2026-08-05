@@ -190,7 +190,7 @@ fn ctor_convention_unresolvable_uppercase_call_no_phantom_class() {
     let src = "void g(char *pv) {\n  auto rcpv = RCPVx(pv);\n  rcpv->refcount++;\n}\n";
     let fa = cpp_driver().analyze(src);
     let inv = fa
-        .refs
+        .refs()
         .iter()
         .find_map(|r| match &r.kind {
             RefKind::MethodCall { invocant_span: Some(sp), .. } if r.target_name == "refcount" => {
@@ -346,7 +346,7 @@ fn type_uses_are_package_refs() {
     // while the decl's own name token stays the Symbol's alone.
     let fa = cpp_driver().analyze("struct Widget { int w; };\nWidget make_widget();\nWidget global_w;\n");
     let type_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Widget")
         .collect();
@@ -364,7 +364,7 @@ fn expanded_macro_uses_still_carry_refs() {
     let src = std::fs::read_to_string("gold-corpus/cpp-fixture/macro_refs.h").unwrap();
     let fa = cpp_driver().analyze(&src);
     let uses: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             matches!(r.kind, RefKind::Variable)
@@ -379,7 +379,7 @@ fn expanded_macro_uses_still_carry_refs() {
     let src = std::fs::read_to_string("gold-corpus/cpp-fixture/member_block.cpp").unwrap();
     let fa = cpp_driver().analyze(&src);
     let baseop_uses = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::Variable) && r.target_name == "BASEOP")
         .count();
@@ -402,13 +402,13 @@ fn cpp_brace_init_declaration_survives_declarator_strip() {
     );
     // The type use on the declaration line keeps its ref.
     assert!(
-        fa.refs.iter().any(|r| r.target_name == "Point" && r.span.start.row == 2),
+        fa.refs().iter().any(|r| r.target_name == "Point" && r.span.start.row == 2),
         "Point use on the brace-init line refs: {:?}",
-        fa.refs.iter().map(|r| (&r.target_name, r.span.start)).collect::<Vec<_>>()
+        fa.refs().iter().map(|r| (&r.target_name, r.span.start)).collect::<Vec<_>>()
     );
     // Member resolution through the declared variable still works.
     let inv = fa
-        .refs
+        .refs()
         .iter()
         .find_map(|r| match &r.kind {
             RefKind::MethodCall { invocant_span: Some(sp), .. } if r.target_name == "x" => Some(*sp),
@@ -444,7 +444,7 @@ fn cpp_range_for_struct_binding_not_stripped() {
         fa.symbols.iter().map(|s| (&s.name, s.kind)).collect::<Vec<_>>()
     );
     assert!(
-        fa.refs.iter().any(|r| r.target_name == "Point" && r.span.start.row == 2),
+        fa.refs().iter().any(|r| r.target_name == "Point" && r.span.start.row == 2),
         "Point use inside the for head refs"
     );
 }
@@ -466,7 +466,7 @@ fn h4_member_ref(
     fa: &crate::model::file_analysis::FileAnalysis,
 ) -> (crate::model::file_analysis::Span, Option<(crate::model::file_analysis::MemberOp, crate::model::file_analysis::Span)>) {
     use crate::model::file_analysis::RefKind;
-    fa.refs
+    fa.refs()
         .iter()
         .find_map(|r| match &r.kind {
             RefKind::MethodCall { invocant_span: Some(sp), member_op, .. }
@@ -689,7 +689,7 @@ struct Gadget { void run() { helper(); } };\n";
         (skel.into_file_analysis(), sites)
     };
     let pin_of = |fa: &FileAnalysis, name: &str| -> Option<Option<String>> {
-        fa.refs
+        fa.refs()
             .iter()
             .find(|r| r.target_name == name && matches!(r.kind, RefKind::FunctionCall))
             .map(|r| r.resolved_package().map(str::to_string))
@@ -705,7 +705,7 @@ struct Gadget { void run() { helper(); } };\n";
     // sibling method decl, in-class and out-of-line alike.
     for (call, kind_pkg) in [("paint", "Widget"), ("grow", "Buf")] {
         let cref = fa
-            .refs
+            .refs()
             .iter()
             .find(|r| r.target_name == call && matches!(r.kind, RefKind::FunctionCall { .. }))
             .unwrap();
@@ -749,7 +749,7 @@ class DBIter : public Iterator {\n\
 };\n";
     let fa = cpp_driver().analyze(src);
     let recv_ty = |name: &str, row: usize| -> Option<InferredType> {
-        let r = fa.refs.iter().find(|r| {
+        let r = fa.refs().iter().find(|r| {
             matches!(r.kind, RefKind::Variable) && r.target_name == name && r.span.start.row == row
         })?;
         fa.expr_type_at_span(r.span, None)
@@ -910,7 +910,7 @@ void RE::Init() {\n\
     let fa = cpp_driver().analyze(src);
     // The out-of-line body's enclosing class is read off the peeled method sym.
     let at_prog = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "prog_" && r.span.start.row == 7)
         .map(|r| r.span.start)

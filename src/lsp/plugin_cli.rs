@@ -213,9 +213,9 @@ fn diff_emissions(baseline: &FileAnalysis, with_plugin: &FileAnalysis, plugin_id
 
     // Refs — diff by (kind, span, target_name).
     let baseline_ref_keys: std::collections::HashSet<String> =
-        baseline.refs.iter().map(ref_key).collect();
+        baseline.refs().iter().map(ref_key).collect();
     let refs: Vec<Value> = with_plugin
-        .refs
+        .refs()
         .iter()
         .filter(|r| !baseline_ref_keys.contains(&ref_key(r)))
         .map(ref_to_snapshot)

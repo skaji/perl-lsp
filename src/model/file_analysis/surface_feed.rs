@@ -71,7 +71,7 @@ impl FileAnalysis {
             // LIVE through the current analysis per query; no consumer
             // bakes them into cached enrichment, so freshness needs no
             // Surface edge for them.
-            refs: _refs,
+            refs: _refs,                         // the whole reference axis — use-sites, their indices, their baseline and eviction flag
             fold_ranges: _fold_ranges,
             package_ranges: _package_ranges,
             call_bindings: _call_bindings,       // this file's call sites — the CONSUMER half of the edge; the provider names ride `imports`
@@ -108,20 +108,15 @@ impl FileAnalysis {
 
             // ---- Residency / lifecycle bookkeeping — no semantics.
             bag_evicted: _bag_evicted,
-            refs_evicted: _refs_evicted,
             symbols_evicted: _symbols_evicted,
             degraded: _degraded,
             base_symbol_count: _base_symbol_count,
             base_witness_count: _base_witness_count,
-            base_ref_count: _base_ref_count,
 
             // ---- Derived indices, rebuilt from the tables above.
             scope_starts: _scope_starts,
             symbols_by_name: _symbols_by_name,
             symbols_by_scope: _symbols_by_scope,
-            refs_by_name: _refs_by_name,
-            refs_by_target: _refs_by_target,
-            call_ref_by_start: _call_ref_by_start,
             export_lookup: _export_lookup,
         } = self;
         SurfaceFeed {

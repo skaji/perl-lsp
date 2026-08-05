@@ -232,7 +232,7 @@ impl FileAnalysis {
         // for imported-hash-key completion.
         self.symbols.truncate(self.base_symbol_count);
         self.witnesses.truncate(self.base_witness_count);
-        self.refs.truncate(self.base_ref_count);
+        self.refs.truncate_to_baseline();
 
         // Dispatch promotion is NOT done here: gated candidates resolve at
         // query time (`applicable_dispatches`), so a `$minion->enqueue('T')`
@@ -704,7 +704,7 @@ impl FileAnalysis {
     ) -> Vec<DerefSite> {
         use crate::model::conventions::InvocantText;
         let mut out = Vec::new();
-        for r in &self.refs {
+        for r in self.refs() {
             let (receiver, form) = match &r.kind {
                 RefKind::MethodCall { invocant, .. } => {
                     // Only a scalar invocant can be undef/Optional; a
@@ -895,13 +895,13 @@ impl FileAnalysis {
     }
 
 
-    /// Rebuild indices affected by enrichment (type constraints + symbols +
-    /// refs_by_target + HashKeyAccess linkage).
+    /// Rebuild the indices affected by enrichment (symbols, the ref
+    /// name/target lookups, HashKeyAccess linkage).
     ///
     /// Enrichment injects synthetic HashKeyDef symbols for imported subs and
     /// drops stale HashKeyDef links on re-owned HashKeyAccess refs. This
     /// method re-runs the same `(target_name, owner)` linker that
-    /// `build_indices` uses, so `refs_by_target` stays accurate after a
+    /// `build_indices` uses, so the ref→target index stays accurate after a
     /// cross-file hash-key binding resolves.
     fn rebuild_enrichment_indices(&mut self) {
         self.symbols_by_name.clear();
@@ -943,18 +943,7 @@ impl FileAnalysis {
             self.refs[idx].link_owned_symbol(sid);
         }
 
-        // Refresh refs_by_name + refs_by_target against the current refs.
-        self.refs_by_name.clear();
-        self.refs_by_target.clear();
-        for (i, r) in self.refs.iter().enumerate() {
-            self.refs_by_name
-                .entry(r.target_name.clone())
-                .or_default()
-                .push(i);
-            if let Some(sym_id) = r.resolved_symbol() {
-                self.refs_by_target.entry(sym_id).or_default().push(i);
-            }
-        }
+        self.refs.refresh_name_target_indices();
     }
 
 

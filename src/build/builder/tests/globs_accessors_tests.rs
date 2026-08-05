@@ -608,7 +608,7 @@ sub _attempt { return 1 }
 "#;
     let fa = build_fa(src);
     let usages: Vec<&Ref> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "MAX_RETRIES"
@@ -620,7 +620,7 @@ sub _attempt { return 1 }
         usages.len(),
         2,
         "both MAX_RETRIES usages (plain + call-arg) should ref the const def; got {:?}",
-        fa.refs
+        fa.refs()
             .iter()
             .filter(|r| r.target_name == "MAX_RETRIES")
             .collect::<Vec<_>>()
@@ -645,7 +645,7 @@ sub run {
     let fa = build_fa(src);
     for name in ["TIMEOUT", "BACKOFF"] {
         let n = fa
-            .refs
+            .refs()
             .iter()
             .filter(|r| {
                 r.target_name == name
@@ -720,7 +720,7 @@ sub run {
 "#;
     let fa = build_fa(src);
     assert!(
-        !fa.refs
+        !fa.refs()
             .iter()
             .any(|r| r.target_name == "SOME_OTHER"),
         "a non-constant bareword must not get a constant-usage ref"
@@ -747,7 +747,7 @@ sub opt_c { 'c' }
 "#;
     let fa = build_fa(src);
     let count = |name: &str| {
-        fa.refs
+        fa.refs()
             .iter()
             .filter(|r| {
                 r.target_name == name
@@ -788,7 +788,7 @@ sub opt_b { 'b' }
         .expect("opt_a sub symbol");
     // The export-list member ref must NOT be the def span itself.
     let export_ref = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| {
             r.target_name == "opt_a"
@@ -843,7 +843,7 @@ sub group_one { 'not a tag' }
     // resolve to this sub. The key must still get no ref — only the value-array
     // member `opt_a` does.
     let group_one_refs = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "group_one"
@@ -942,7 +942,7 @@ sub run { return MAX_RETRIES(); }
 "#;
     let fa = build_fa(src);
     let n = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "MAX_RETRIES" && matches!(&r.kind, RefKind::FunctionCall { .. })
@@ -1066,7 +1066,7 @@ $obj->get_config->{host};
     // The `host` token (line 7, after `->{`) gets a HashKeyAccess ref
     // owned by Config — the chain receiver's class.
     let host_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -1139,7 +1139,7 @@ $obj->totally_unknown_method->{host};
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
     let host_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -1211,7 +1211,7 @@ $obj->me->me->get_config->{host};
 ";
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
-    let owners: Vec<_> = fa.refs.iter().filter_map(|r| match r.hash_key_owner() {
+    let owners: Vec<_> = fa.refs().iter().filter_map(|r| match r.hash_key_owner() {
         Some(o) if r.target_name == "host" => Some(o.clone()),
         _ => None,
     }).collect();
@@ -1242,7 +1242,7 @@ $obj->get_config->deep->cfg->{host};
 ";
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
-    let owners: Vec<_> = fa.refs.iter().filter_map(|r| match r.hash_key_owner() {
+    let owners: Vec<_> = fa.refs().iter().filter_map(|r| match r.hash_key_owner() {
         Some(o) if r.target_name == "host" => Some(o.clone()),
         _ => None,
     }).collect();
@@ -1264,7 +1264,7 @@ $obj->mystery->mystery->{host};
 ";
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
-    let owned: Vec<_> = fa.refs.iter().filter(|r| r.hash_key_owner().is_some()
+    let owned: Vec<_> = fa.refs().iter().filter(|r| r.hash_key_owner().is_some()
         && r.target_name == "host").collect();
     assert!(owned.is_empty(), "untyped deep chain must not latch a wrong owner, got {:?}",
         owned.iter().map(|r| &r.kind).collect::<Vec<_>>());

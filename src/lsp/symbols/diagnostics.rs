@@ -164,7 +164,7 @@ pub fn collect_diagnostics(
         best
     };
 
-    for r in &analysis.refs {
+    for r in analysis.refs() {
         if !matches!(r.kind, RefKind::FunctionCall { .. }) {
             continue;
         }
@@ -300,7 +300,7 @@ pub fn collect_diagnostics(
         // Moose/Moo meta-methods
         "meta",
     ];
-    for r in &analysis.refs {
+    for r in analysis.refs() {
         let (invocant, _invocant_span) = match &r.kind {
             // A plugin-bridged token is plugin-resolved, not a receiver we
             // can flag as an unresolved method — skip it.
@@ -514,7 +514,7 @@ pub fn collect_diagnostics(
     // fallback (e.g. the parent edge came from a raw `@ISA` push).
     for u in analysis.unfulfilled_role_requires(Some(module_index)) {
         let span = analysis
-            .refs
+            .refs()
             .iter()
             .find(|r| {
                 matches!(r.kind, RefKind::PackageRef)
@@ -556,7 +556,7 @@ pub fn collect_diagnostics(
     {
         use crate::model::conventions::{InvocantText, MethodToken};
         let mut seen: std::collections::HashSet<(String, String)> = Default::default();
-        for r in &analysis.refs {
+        for r in analysis.refs() {
             let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
             // Plugin-bridged tokens are resolved by their owning plugin,
             // not a missing-plugin hint candidate.

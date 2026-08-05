@@ -191,7 +191,7 @@ pub fn index_pack_languages(
                     if !rows_ok {
                         pending_backfill.push((
                             path.clone(),
-                            fa.refs.iter().map(|r| r.row_seed()).collect(),
+                            fa.ref_row_seeds(),
                             fa.sym_row_seeds(),
                         ));
                     }
@@ -407,7 +407,7 @@ pub fn index_pack_languages(
                     let payload = if persist && !analysis.degraded {
                         module_cache::encode_analysis(&analysis).map(|blob| {
                             let seeds: Vec<_> =
-                                analysis.refs.iter().map(|r| r.row_seed()).collect();
+                                analysis.ref_row_seeds();
                             let sym_seeds = analysis.sym_row_seeds();
                             (blob, seeds, sym_seeds)
                         })

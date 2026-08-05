@@ -523,7 +523,7 @@ print \"pi is $pi\\n\";
         .iter()
         .find(|s| s.name == "$pi" && s.kind == SymKind::Variable)
         .expect("$pi Variable symbol");
-    let pi_refs: Vec<_> = fa.refs.iter().filter(|r| r.target_name == "$pi").collect();
+    let pi_refs: Vec<_> = fa.refs().iter().filter(|r| r.target_name == "$pi").collect();
     assert_eq!(pi_refs.len(), 3, "decl + body use + interpolation = 3 refs");
     for r in &pi_refs {
         assert_eq!(
@@ -567,7 +567,7 @@ print \"v=$version\\n\";
     // Under Calculator the bare $version refs SHOULD resolve to
     // the our-decl: that's the lexical alias half of `our`.
     let bump_use = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "$version" && r.span.start.row == 2)
         .expect("ref inside Calculator's bump");
@@ -579,7 +579,7 @@ print \"v=$version\\n\";
     );
     // Under `package main;` the bare $version must NOT resolve.
     let main_use = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "$version" && r.span.start.row == 5)
         .expect("ref inside package main's print");
@@ -658,7 +658,7 @@ fn quoted_call_arg_key_span_is_content_not_quotes() {
         sub b { my $s = shift; $s->search({ \"name\", 2 }); }\n1;\n";
     let fa = build_fa(src);
     let r = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| {
             r.target_name == "name"
@@ -688,7 +688,7 @@ my $m = MooApp->new(name => 'alice');
 ";
     let fa = build_fa(src);
     let name_access: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "name" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -710,7 +710,7 @@ my $m = MooApp->new(name => 'alice');
 
     // No matching HashKeyDef for `count` → no shadow ref.
     let count_access: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "count" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -723,7 +723,7 @@ my $p = Plain->run(count => 1);
 ";
     let fa2 = build_fa(src_no_def);
     let no_emit: Vec<_> = fa2
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "count" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -774,7 +774,7 @@ my $a = MooApp->new('name', 'alice');
     // synthesizes its own internal-key refs that we're not
     // asserting on here.
     fn name_access_at_call<'a>(fa: &'a FileAnalysis) -> Vec<&'a Ref> {
-        fa.refs
+        fa.refs()
             .iter()
             .filter(|r| {
                 r.target_name == "name"
@@ -814,7 +814,7 @@ my $a = MooApp->new('name', 'alice');
     // to look like a key string. `'alice'` at idx 1 stays a value.
     for fa in [&fa_fat, &fa_bare] {
         let alice_access: Vec<_> = fa
-            .refs
+            .refs()
             .iter()
             .filter(|r| r.target_name == "alice" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
             .collect();
@@ -839,7 +839,7 @@ my $m = MooApp->new('a', 1, 'b', 2);
 ";
     let fa_multi = build_fa(multi_src);
     let call_keys: Vec<&Ref> = fa_multi
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             matches!(r.kind, RefKind::HashKeyAccess { .. })

@@ -14,6 +14,8 @@ mod cross_file;
 pub use cross_file::*;
 mod core_types;
 pub use core_types::*;
+mod ref_table;
+pub use ref_table::*;
 mod types;
 pub use types::*;
 mod dispatch;
@@ -48,7 +50,10 @@ pub struct FileAnalysis {
     // Core tables
     pub scopes: Vec<Scope>,
     pub symbols: Vec<Symbol>,
-    pub refs: Vec<Ref>,
+    /// The reference axis: every ref, the indices over them, their
+    /// eviction flag and their enrichment baseline. Read through
+    /// `refs()` and the delegating query methods.
+    refs: RefTable,
     pub fold_ranges: Vec<FoldRange>,
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
@@ -175,15 +180,6 @@ pub struct FileAnalysis {
     #[serde(skip, default)]
     bag_evicted: bool,
 
-    /// Refs twin of `bag_evicted` (`docs/adr/relational-ref-index.md`):
-    /// `evict_refs` stripped this resident copy's `refs` after the blob +
-    /// relational rows were persisted. `#[serde(skip)]` — a rehydrated
-    /// analysis is refs-present. Consumers that would read a foreign file's
-    /// refs route through `whole_present` (rehydrating on miss); an empty
-    /// `refs` here is "on disk", never "no references".
-    #[serde(skip, default)]
-    refs_evicted: bool,
-
     /// Symbols twin (`docs/adr/relational-ref-index.md`): `evict_symbols`
     /// stripped this copy's `symbols` (+ symbol-keyed rebuilt indexes) after
     /// blob + `syms` rows were persisted. Same lifecycle as the other two
@@ -199,11 +195,6 @@ pub struct FileAnalysis {
     base_symbol_count: usize,
     #[serde(default)]
     base_witness_count: usize,
-    /// Ref baseline — enrichment re-derives synthetic refs (imported hash
-    /// keys), so it truncates `refs` back to this length before re-deriving
-    /// to stay idempotent.
-    #[serde(default)]
-    base_ref_count: usize,
 
     /// Build-time dispatch candidates, each gated on its receiver's class.
     /// The builder records one per call matching a plugin `DispatchVerb`,
@@ -394,21 +385,6 @@ pub struct FileAnalysis {
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
     #[serde(skip, default)]
     symbols_by_scope: HashMap<ScopeId, Vec<SymbolId>>,
-    #[serde(skip, default)]
-    refs_by_name: HashMap<String, Vec<usize>>,
-    /// Refs indexed by the SymbolId they resolve to (phase 5).
-    /// Every query for "refs to symbol X" collapses to an O(1) lookup here.
-    #[serde(skip, default)]
-    refs_by_target: HashMap<SymbolId, Vec<usize>>,
-    /// Start-point → call-shaped ref index. Used by
-    /// `method_call_invocant_class` to chase a chain receiver:
-    /// `Foo->new->m`'s outer `->m` `invocant_span` starts at the
-    /// inner `Foo->new` call's start; `make_b()->touch()`'s outer
-    /// `invocant_span` starts at `make_b`'s start. Only MethodCall
-    /// and FunctionCall refs go in here — the receiver dispatch is
-    /// keyed on those two kinds.
-    #[serde(skip, default)]
-    call_ref_by_start: HashMap<Point, usize>,
     /// Union of `export` + `export_ok` for O(1) membership tests.
     /// Rebuilt by `build_indices` (called from `new` and `after_deserialize`),
     /// so it is valid for freshly-built and SQLite-cached modules alike.

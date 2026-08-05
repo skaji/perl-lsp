@@ -88,7 +88,7 @@ fn test_hash_key_def_implicit_return_gets_sub_owner() {
 
     // Go-to-def from $cfg->{host} should reach the hash key in the implicit return
     let host_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -179,7 +179,7 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
 
     // Verify HashKeyAccess ref for $cfg->{host} has Sub owner
     let host_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "host" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -246,7 +246,7 @@ $calc->get_self->get_config->{host};
 
     // The chained ref now carries its resolved owner at build time.
     let owner = fa
-        .refs
+        .refs()
         .iter()
         .find_map(|r| match r.hash_key_owner() {
             Some(o) if r.target_name == "host" => Some(o.clone()),
@@ -583,7 +583,7 @@ fn test_deref_block_produces_inner_variable_ref() {
     // @{$arr} — the inner $arr should produce a Variable ref
     let fa = build_fa("my @data = (1,2,3);\nmy $arr = \\@data;\npush @{$arr}, 4;");
     let inner_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| {
             r.target_name == "$arr"
@@ -597,7 +597,7 @@ fn test_deref_block_produces_inner_variable_ref() {
     );
     // Should NOT have a bogus ref for the whole @{$arr}
     let bogus: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name.contains("{$arr}"))
         .collect();
@@ -614,7 +614,7 @@ fn test_deref_block_produces_hash_key_ref() {
     // 2. HashKeyAccess ref for "items"
     let fa = build_fa("my %h = (items => []);\n@{$h{items}};");
     let key_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "items" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -629,7 +629,7 @@ fn test_deref_block_resolves_variable() {
     // Variable inside deref block should resolve to its declaration
     let fa = build_fa("my @xs = (1,2);\nmy $ref = \\@xs;\nprint @{$ref};");
     let inner_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "$ref" && r.access == AccessKind::Read)
         .collect();
@@ -836,7 +836,7 @@ fn test_dunder_package_method_invocant() {
         ",
     );
     let method_ref = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| r.target_name == "some_method")
         .unwrap();

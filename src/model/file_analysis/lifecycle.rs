@@ -56,7 +56,7 @@ impl FileAnalysis {
             template_params: HashMap::new(),
             scopes,
             symbols,
-            refs,
+            refs: RefTable::from_vec(refs),
             fold_ranges,
             imports,
             call_bindings,
@@ -74,11 +74,9 @@ impl FileAnalysis {
             type_provenance,
             witnesses,
             bag_evicted: false,
-            refs_evicted: false,
             symbols_evicted: false,
             base_symbol_count: 0,
             base_witness_count: 0,
-            base_ref_count: 0,
             provisional_dispatches,
             gated_emissions,
             guard_sites,
@@ -110,9 +108,6 @@ impl FileAnalysis {
             scope_starts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbols_by_scope: HashMap::new(),
-            refs_by_name: HashMap::new(),
-            refs_by_target: HashMap::new(),
-            call_ref_by_start: HashMap::new(),
             export_lookup: HashSet::new(),
         };
         fa.build_indices();
@@ -147,18 +142,12 @@ impl FileAnalysis {
         self.bag_evicted
     }
 
-    /// Strip the resident `refs` (and the ref-keyed rebuilt indexes) from an
-    /// index copy whose blob + relational rows are persisted — the refs twin
-    /// of `evict_witness_bag`. Lossless: the on-disk analysis keeps the full
-    /// vec; the backward walk retrieves candidates from the relational index
-    /// and rehydrates through `whole_present`. Touches no other pinned field.
+    /// Strip the resident refs axis — the refs twin of `evict_witness_bag`.
+    /// `RefTable::evict` drops the vec and every index over it in one place,
+    /// so no index can survive its refs. Touches no other pinned field.
     /// Idempotent.
     pub fn evict_refs(&mut self) {
-        self.refs = Vec::new();
-        self.refs_by_name = std::collections::HashMap::new();
-        self.refs_by_target = std::collections::HashMap::new();
-        self.call_ref_by_start = std::collections::HashMap::new();
-        self.refs_evicted = true;
+        self.refs.evict();
     }
 
     /// True when `evict_refs` stripped this copy's refs: empty means "on
@@ -170,7 +159,7 @@ impl FileAnalysis {
     // step with `symbols_are_evicted`.
     #[allow(dead_code)]
     pub fn refs_are_evicted(&self) -> bool {
-        self.refs_evicted
+        self.refs.is_evicted()
     }
 
     /// Strip the resident `symbols` (and the symbol-keyed rebuilt indexes)
@@ -198,7 +187,7 @@ impl FileAnalysis {
     /// setter), so multi-axis consumers stay whole-covered by construction
     /// instead of each spelling its own flag list.
     pub fn is_fully_resident(&self) -> bool {
-        !self.bag_evicted && !self.refs_evicted && !self.symbols_evicted
+        !self.bag_evicted && !self.refs.is_evicted() && !self.symbols_evicted
     }
 
     /// The ONE speller of the registration strip: `strip_bag` drops the
@@ -233,7 +222,7 @@ impl FileAnalysis {
         self.stamp_method_call_targets(None);
         self.base_symbol_count = self.symbols.len();
         self.base_witness_count = self.witnesses.len();
-        self.base_ref_count = self.refs.len();
+        self.refs.seal_baseline();
     }
 
     /// Stamp the `Method` binding on every `MethodCall` ref — the NAV
@@ -319,7 +308,7 @@ impl FileAnalysis {
             // wins (innermost call's args).
             let mut enclosing: Option<&Ref> = None;
             let mut enclosing_area: u64 = u64::MAX;
-            for other in &self.refs {
+            for other in self.refs() {
                 if !matches!(other.kind, RefKind::MethodCall { .. }) {
                     continue;
                 }
@@ -359,9 +348,6 @@ impl FileAnalysis {
         self.scope_starts.clear();
         self.symbols_by_name.clear();
         self.symbols_by_scope.clear();
-        self.refs_by_name.clear();
-        self.refs_by_target.clear();
-        self.call_ref_by_start.clear();
         self.export_lookup.clear();
         self.build_indices();
     }
@@ -451,62 +437,13 @@ impl FileAnalysis {
             self.refs[idx].link_owned_symbol(sid);
         }
 
-        // Refs by target name, and refs by resolved target SymbolId.
-        // Same loop populates the start-point → call-ref-idx index
-        // used by `method_call_invocant_class` to chase chain
-        // receivers. Only MethodCall (whose span covers the whole
-        // call expression) and FunctionCall (whose span covers just
-        // the function-name node, but whose start point still
-        // matches the outer call's invocant_span.start) refs go in.
-        for (i, r) in self.refs.iter().enumerate() {
-            self.refs_by_name
-                .entry(r.target_name.clone())
-                .or_default()
-                .push(i);
-            if let Some(sym_id) = r.resolved_symbol() {
-                self.refs_by_target.entry(sym_id).or_default().push(i);
-            }
-            if matches!(r.kind, RefKind::MethodCall { .. } | RefKind::FunctionCall { .. }) {
-                // Smaller span (closer to the actual receiver) wins;
-                // a tie keeps the earlier insertion. Method-call refs
-                // are visited outer-first, so for a chain like
-                // `Foo->new->m` the outer `m` and inner `Foo->new`
-                // share a start point — keeping the smaller-span ref
-                // points the index at the inner receiver. FunctionCall
-                // refs (just the function-name span) are naturally
-                // narrower than the enclosing MethodCall, so they win
-                // the same way.
-                let cur = self.call_ref_by_start.get(&r.span.start).copied();
-                let take = match cur {
-                    None => true,
-                    Some(prev) => {
-                        let prev_span = self.refs[prev].span;
-                        // Smaller span (closer to the receiver) wins.
-                        // Tie-breaker: prefer FunctionCall over MethodCall
-                        // when at the same start, since FunctionCall is
-                        // narrower (just the function-name span).
-                        let new_smaller = (r.span.end.row, r.span.end.column)
-                            < (prev_span.end.row, prev_span.end.column);
-                        new_smaller
-                    }
-                };
-                if take {
-                    self.call_ref_by_start.insert(r.span.start, i);
-                }
-            }
-        }
+        self.refs.rebuild_indices();
 
         // Export membership set — union of export + export_ok for O(1) lookup.
         self.export_lookup = self.export.iter()
             .chain(self.export_ok.iter())
             .cloned()
             .collect();
-    }
-
-    /// All refs that resolve to this symbol — O(1) lookup via the index.
-    /// Callers typically combine this with a kind filter.
-    pub fn refs_to_symbol(&self, sym_id: SymbolId) -> &[usize] {
-        self.refs_by_target.get(&sym_id).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// True if `name` appears in `@EXPORT` or `@EXPORT_OK` for this module.
@@ -749,8 +686,8 @@ impl FileAnalysis {
             ..Default::default()
         };
 
-        // refs — the dominant bucket for a big-fan-in TU.
-        h.refs = vcap(&self.refs) + strcaps(self.refs.iter().map(|r| &r.target_name));
+        // refs + their indices — the dominant bucket for a big-fan-in TU.
+        self.refs.heap_add(&mut h);
 
         // symbols + their deep strings.
         h.symbols = vcap(&self.symbols)
@@ -791,10 +728,8 @@ impl FileAnalysis {
                 .sum::<usize>();
 
         // The serde-skip reverse indices (rebuilt on load, resident-only).
-        h.rebuilt_indices = {
-            fn mcap<K, V>(m: &HashMap<K, V>) -> usize {
-                m.capacity() * (std::mem::size_of::<(K, V)>() + 1)
-            }
+        // The ref-keyed share of this bucket is added by `RefTable::heap_add`.
+        h.rebuilt_indices += {
             let mut b = self.scope_starts.capacity()
                 * std::mem::size_of::<(Point, ScopeId)>()
                 + self.export_lookup.capacity()
@@ -804,22 +739,13 @@ impl FileAnalysis {
                     .iter()
                     .map(|s| s.capacity())
                     .sum::<usize>()
-                + mcap(&self.symbols_by_scope)
-                + mcap(&self.refs_by_target)
-                + mcap(&self.call_ref_by_start);
+                + mcap(&self.symbols_by_scope);
             for (k, v) in &self.symbols_by_name {
                 b += k.capacity() + v.capacity() * std::mem::size_of::<SymbolId>();
             }
             b += mcap(&self.symbols_by_name);
-            for (k, v) in &self.refs_by_name {
-                b += k.capacity() + v.capacity() * std::mem::size_of::<usize>();
-            }
-            b += mcap(&self.refs_by_name);
             for v in self.symbols_by_scope.values() {
                 b += v.capacity() * std::mem::size_of::<SymbolId>();
-            }
-            for v in self.refs_by_target.values() {
-                b += v.capacity() * std::mem::size_of::<usize>();
             }
             b
         };

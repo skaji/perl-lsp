@@ -457,7 +457,7 @@ sub _generate_route {
     // proving the build-time chain resolver treated `shift` as
     // `$self` and looked up the enclosing package.
     let gr_ref = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| {
             matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "_generate_route"
@@ -498,7 +498,7 @@ sub inline {
     let fa = build_fa(src);
 
     let inline_ref = fa
-        .refs
+        .refs()
         .iter()
         .find(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "inline")
         .expect("MethodCall ref for `inline`");

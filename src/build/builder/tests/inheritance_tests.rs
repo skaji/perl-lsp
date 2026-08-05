@@ -40,7 +40,7 @@ fn test_use_parent_emits_package_refs() {
         ",
     );
     let refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Parent")
         .collect();
@@ -56,12 +56,12 @@ fn test_use_parent_qw_emits_package_refs() {
         ",
     );
     let foo_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Foo")
         .collect();
     let bar_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| matches!(r.kind, RefKind::PackageRef) && r.target_name == "Bar")
         .collect();

@@ -228,7 +228,7 @@ pub(super) fn refs_at_point_matching<'a>(
     point: Point,
     pred: impl Fn(&crate::model::file_analysis::Ref) -> bool,
 ) -> Option<Vec<&'a crate::model::file_analysis::Ref>> {
-    let out: Vec<&crate::model::file_analysis::Ref> = analysis.refs.iter()
+    let out: Vec<&crate::model::file_analysis::Ref> = analysis.refs().iter()
         .filter(|r| span_contains_point(&r.span, point) && pred(r))
         .collect();
     if out.is_empty() { None } else { Some(out) }
@@ -423,7 +423,7 @@ fn dispatch_info_for_enclosing_call(
     };
 
     // First DispatchCall ref whose span is contained by this call.
-    for r in &analysis.refs {
+    for r in analysis.refs() {
         let RefKind::DispatchCall { dispatcher } = &r.kind else { continue };
         if !span_contains_span(&call_start, &r.span) { continue; }
         let Some(HandlerOwner::Class(class)) = r.handler_owner() else { continue };

@@ -74,7 +74,7 @@ pub(super) fn save_module_generation(
     }
     if let Some(m) = result {
         if !m.analysis.degraded {
-            let seeds: Vec<_> = m.analysis.refs.iter().map(|r| r.row_seed()).collect();
+            let seeds: Vec<_> = m.analysis.ref_row_seeds();
             let sym_seeds = m.analysis.sym_row_seeds();
             if let Err(e) = module_cache::shred_derived_rows(
                 conn,

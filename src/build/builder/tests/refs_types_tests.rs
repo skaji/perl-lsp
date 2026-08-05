@@ -6,7 +6,7 @@ use super::*;
 fn test_variable_ref() {
     let fa = build_fa("my $x = 1;\nprint $x;");
     let var_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "$x" && matches!(r.kind, RefKind::Variable))
         .collect();
@@ -20,7 +20,7 @@ fn test_variable_ref() {
 fn test_function_call_ref() {
     let fa = build_fa("sub foo { }\nfoo();");
     let call_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .collect();
@@ -39,7 +39,7 @@ fn test_function_call_ref() {
 fn call_ref_in_concatenation_operand() {
     let fa = build_fa("sub Format_Number { }\nprint \"<td>\".Format_Number($x).\"</td>\";\n");
     let call_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "Format_Number" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .collect();
@@ -57,12 +57,12 @@ fn call_ref_in_concatenation_operand() {
 fn call_ref_in_ternary_operands() {
     let fa = build_fa("sub foo { }\nsub bar { }\nmy $y = $cond ? foo() : bar();\n");
     let foo_refs = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .count();
     let bar_refs = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "bar" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .count();
@@ -75,7 +75,7 @@ fn call_ref_in_ternary_operands() {
 fn method_call_ref_in_concatenation_operand() {
     let fa = build_fa("my $s = \"x\" . $obj->fmt($n) . \"y\";\n");
     let m_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "fmt" && matches!(r.kind, RefKind::MethodCall { .. }))
         .collect();
@@ -98,7 +98,7 @@ my %h = (Format_Number => 1);
 ";
     let fa = build_fa(src);
     let call_refs = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "Format_Number" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .count();
@@ -115,7 +115,7 @@ my %h = (Format_Number => 1);
 fn statement_level_call_emits_single_ref() {
     let fa = build_fa("sub debug { }\ndebug(\"hello\");\n");
     let call_refs = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "debug" && matches!(r.kind, RefKind::FunctionCall { .. }))
         .count();
@@ -126,7 +126,7 @@ fn statement_level_call_emits_single_ref() {
 fn test_method_call_ref() {
     let fa = build_fa("$obj->method();");
     let method_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "method" && matches!(r.kind, RefKind::MethodCall { .. }))
         .collect();
@@ -140,7 +140,7 @@ fn test_method_call_ref() {
 fn test_hash_key_ref() {
     let fa = build_fa("my %h;\n$h{foo};");
     let key_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "foo" && matches!(r.kind, RefKind::HashKeyAccess { .. }))
         .collect();
@@ -1065,7 +1065,7 @@ $h{it}->kid();
     // must agree. The invocant-class path takes no tree; the
     // expression-type path is fed the actual invocant CST node.
     let mut checked_shapes = 0;
-    for r in &fa.refs {
+    for r in fa.refs() {
         let RefKind::MethodCall { invocant_span: Some(sp), .. } = &r.kind else {
             continue;
         };
@@ -1105,7 +1105,7 @@ $h{it}->kid();
 
     // Spot-check the concrete answers so a mutual `None` regression
     // can't pass the agreement assert vacuously.
-    let kid_on_scalar = fa.refs.iter().find(|r| {
+    let kid_on_scalar = fa.refs().iter().find(|r| {
         matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text() == "$f")
             && r.target_name == "kid"
     });
@@ -1114,7 +1114,7 @@ $h{it}->kid();
         Some("Foo"),
         "scalar invocant `$f->kid` should type as Foo, tree-free",
     );
-    let kid_on_array = fa.refs.iter().find(|r| {
+    let kid_on_array = fa.refs().iter().find(|r| {
         matches!(&r.kind, RefKind::MethodCall { invocant, .. } if invocant.text().starts_with("$arr"))
             && r.target_name == "kid"
     });
@@ -1136,7 +1136,7 @@ fn test_package_at() {
 fn test_variable_resolves_to() {
     let fa = build_fa("my $x = 1;\nprint $x;");
     let read_refs: Vec<_> = fa
-        .refs
+        .refs()
         .iter()
         .filter(|r| r.target_name == "$x" && r.access == AccessKind::Read)
         .collect();
