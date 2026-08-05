@@ -451,3 +451,39 @@ fn inferred_type_has_no_production_caller() {
         violations.join("\n")
     );
 }
+
+/// D4: the blocking decision rides the query API, not per-handler memory.
+/// Handlers reach set construction, the relational row search, and the
+/// rehydration readers only through `run_query`'s `QueryCx` (minted on the
+/// blocking pool) — the raw spellings appearing in the handler file mean a
+/// verb grew an inline I/O path on the reactor.
+#[test]
+fn query_verbs_route_through_run_query() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/lsp/backend/server.rs");
+    let text = fs::read_to_string(&path).unwrap();
+    let forbidden = [
+        "index::resolve::resolve(", // set construction → QueryCx::set
+        "sym_row_search",           // relational rows → QueryCx::sym_rows
+        ".whole_present(",          // rehydration reader → QueryCx lanes
+        ".lookup_for(",             // routing binds inside the hop → QueryCx::routed
+    ];
+    let mut violations = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("//") {
+            continue;
+        }
+        for f in forbidden {
+            if t.contains(f) {
+                violations.push(format!("{}:{}: {}", path.display(), i + 1, t));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "query verbs reach I/O-capable lookups only through Backend::run_query's \
+         QueryCx (the blocking hop):\n{}",
+        violations.join("\n")
+    );
+}

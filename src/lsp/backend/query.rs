@@ -1,0 +1,123 @@
+//! The single blocking hop for query verbs (`run_query`) and the context
+//! (`QueryCx`) a blocking closure resolves through.
+//!
+//! Set construction/projection, the relational row search, and the
+//! rehydration readers all do real I/O (SQLite + zstd decode on LRU miss,
+//! `fs` reads) — so the blocking decision rides THIS API, not per-handler
+//! memory: a `QueryCx` is minted only inside `run_query`'s
+//! `spawn_blocking`, so holding one proves the code is off the reactor.
+//! `layering_tests::query_verbs_route_through_run_query` pins the raw
+//! spellings out of the handler file.
+
+use super::*;
+
+impl Backend {
+    /// The one blocking hop for query verbs: moves the store + hub handles
+    /// onto the blocking pool and runs `f` there. Handlers snapshot their
+    /// open-doc state (`Arc<FileAnalysis>`, text, language) BEFORE calling —
+    /// the guard discipline on `Document::analysis` is unchanged.
+    pub(super) async fn run_query<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&QueryCx) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let cx = QueryCx {
+            files: Arc::clone(&self.files),
+            module_index: Arc::clone(&self.module_index),
+        };
+        tokio::task::spawn_blocking(move || f(&cx))
+            .await
+            .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())
+    }
+}
+
+/// What a blocking query closure reaches the stores through. Only
+/// `run_query` constructs one.
+pub(super) struct QueryCx {
+    files: Arc<FileStore>,
+    module_index: Arc<ModuleIndex>,
+}
+
+impl QueryCx {
+    pub(super) fn files(&self) -> &FileStore {
+        &self.files
+    }
+
+    pub(super) fn index(&self) -> &ModuleIndex {
+        &self.module_index
+    }
+
+    /// Routed store for the origin's language (pack sub-index or hub).
+    /// Bind it, then construct the set via `set()` — the binding must
+    /// outlive the set, hence the two-step spelling.
+    pub(super) fn routed(&self, language: &str) -> crate::index::module_index::RoutedIndex<'_> {
+        self.module_index.lookup_for(language)
+    }
+
+    /// The one set-construction spelling behind the blocking hop.
+    pub(super) fn set<'a>(
+        &'a self,
+        lookup: &'a dyn crate::model::file_analysis::CrossFileLookup,
+        analysis: &'a crate::model::file_analysis::FileAnalysis,
+        uri: &Url,
+        point: tree_sitter::Point,
+        scope: crate::index::resolve::OverrideScope,
+    ) -> crate::index::resolve::CandidateSet<'a> {
+        crate::index::resolve::resolve(
+            &self.files,
+            analysis,
+            FileKey::Url(uri.clone()),
+            point,
+            Some(lookup),
+            scope,
+        )
+    }
+
+    /// workspace/symbol's relational pass (SQLite over every attached tier).
+    pub(super) fn sym_rows(&self, query: &str) -> Vec<crate::index::module_cache::SymRowHit> {
+        symbols::sym_row_search(&self.module_index, query)
+    }
+
+    /// A bare identifier at the cursor that names a CROSS-FILE top-level
+    /// symbol — a macro (`OP_NULL`, `BASEOP`), enum constant, global, or
+    /// type. Resolves off the RAW word, so it works even when the macro
+    /// expanded AWAY in the analysis (the token isn't a captured ref).
+    /// Reads the target file + rehydrates its whole analysis on demand —
+    /// blocking-pool only, hence a `QueryCx` method.
+    /// Returns (target uri, def span, the def's source line for hover).
+    pub(super) fn pack_xfile_word_at(
+        &self,
+        text: &str,
+        doc_analysis: &crate::model::file_analysis::FileAnalysis,
+        pos: Position,
+        idx: &dyn crate::model::file_analysis::CrossFileLookup,
+    ) -> Option<(Option<Url>, crate::model::file_analysis::Span, String)> {
+        let word = symbols::word_at_point(text, symbols::position_to_point(pos))?;
+        // Pick the best DEFINITION among same-named symbols (a `#define X` plus
+        // its raw usages): prefer the `#define` line, else the earliest.
+        let pick = |analysis: &crate::model::file_analysis::FileAnalysis, src: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            let line_of = |s: &crate::model::file_analysis::Symbol| {
+                lines.get(s.selection_span.start.row).copied()
+            };
+            let cands: Vec<&crate::model::file_analysis::Symbol> =
+                analysis.symbols.iter().filter(|s| s.name == word).collect();
+            let sym = cands
+                .iter()
+                .find(|s| line_of(s).is_some_and(|l| l.trim_start().starts_with("#define")))
+                .or_else(|| cands.iter().min_by_key(|s| s.selection_span.start.row))
+                .copied()?;
+            Some((sym.selection_span, line_of(sym).map(|l| l.trim().to_string()).unwrap_or_default()))
+        };
+        // A macro defined in THIS file (`BASEOP` in op.h) — the usage isn't a
+        // captured ref, so find_definition missed it, but the def symbol is
+        // local. Fall back to the cross-file index for usages from elsewhere.
+        if let Some((span, line)) = pick(doc_analysis, text) {
+            return Some((None, span, line));
+        }
+        let cached = idx.get_cached(word)?;
+        let text = std::fs::read_to_string(&cached.path).ok()?;
+        let (span, line) = pick(&idx.whole_present(&cached), &text)?;
+        Some((Url::from_file_path(&cached.path).ok(), span, line))
+    }
+}

@@ -17,6 +17,7 @@ mod indexing;
 use indexing::*;
 mod lifecycle;
 use lifecycle::*;
+mod query;
 mod server;
 
 /// Default bounded-wait cap for the cold-open pull-verb heal (ms). A gd/hover/

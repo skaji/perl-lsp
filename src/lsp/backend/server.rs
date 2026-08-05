@@ -473,67 +473,72 @@ impl LanguageServer for Backend {
             Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
             None => return Ok(None),
         };
-        // cpp/pack functions live in the per-language sub-index; route there
-        // so cross-file function goto-def resolves (Perl uses the hub).
-        let routed = self.module_index.lookup_for(language);
-        let base_idx = routed.as_lookup();
-        // The raw-word lanes below (macro variants, cross-file word fallback)
-        // sit outside the CandidateSet and still need this file's closure
-        // scope; the set scopes itself at construction.
-        let self_path = uri.to_file_path().ok();
-        let scoped = crate::model::file_analysis::ScopedLookup::new(
-            base_idx, &analysis.include_closure, self_path.as_deref());
-        let idx: &dyn crate::model::file_analysis::CrossFileLookup = &scoped;
-        // `#include "x.h"` path → the resolved header (`#include` = `use`).
-        // A path token, not a name — slot-shaped, so it stays ahead of the
-        // set (the ADR's honest boundary). The pack declares whether it has
-        // include tokens; asked, never named.
-        if crate::build::language_driver::LanguageRegistry::has_include_tokens(&language) {
-            if let Some(loc) = symbols::pack_include_definition(
-                &analysis, symbols::position_to_point(pos), self_path.as_deref())
-            {
-                return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+        let uri = uri.clone();
+        self.run_query(move |cx| {
+            let self_path = uri.to_file_path().ok();
+            // `#include "x.h"` path → the resolved header (`#include` = `use`).
+            // A path token, not a name — slot-shaped, so it stays ahead of the
+            // set (the ADR's honest boundary). The pack declares whether it has
+            // include tokens; asked, never named.
+            if crate::build::language_driver::LanguageRegistry::has_include_tokens(&language) {
+                if let Some(loc) = symbols::pack_include_definition(
+                    &analysis, symbols::position_to_point(pos), self_path.as_deref())
+                {
+                    return Some(GotoDefinitionResponse::Scalar(loc));
+                }
             }
-        }
-        // Forward projection of the set. The source text unlocks the macro
-        // variant lane (ranked, never pruned, see-through delegate) for pack
-        // routing; labels ride the candidates and the editor adapter drops
-        // them (ordering conveys rank).
-        let cs = crate::index::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            symbols::position_to_point(pos),
-            Some(base_idx),
-            crate::index::resolve::OverrideScope::default(),
-        )
-        .with_source(&text);
-        let locs: Vec<Location> = cs
-            .definitions()
-            .into_iter()
-            .filter_map(|l| {
-                let uri = l.to_url()?;
-                Some(Location { uri, range: symbols::span_to_range(l.span) })
-            })
-            .collect();
-        match locs.len() {
-            0 => {}
-            1 => return Ok(Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap()))),
-            _ => return Ok(Some(GotoDefinitionResponse::Array(locs))),
-        }
-        // Member access (`obj->field`) now flows through `find_definition`
-        // above: cpp mints a `MethodCall` ref core resolves like any other.
-        if language != "perl" {
-            // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`) —
-            // the raw word names a local-or-cross-file symbol.
-            if let Some((target, span, _)) = self.pack_xfile_word_at(&text, &analysis, pos, idx) {
-                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: target.unwrap_or_else(|| uri.clone()),
-                    range: symbols::span_to_range(span),
-                })));
+            // cpp/pack functions live in the per-language sub-index; route
+            // there so cross-file function goto-def resolves (Perl uses the
+            // hub).
+            let routed = cx.routed(language);
+            let base_idx = routed.as_lookup();
+            // Forward projection of the set. The source text unlocks the macro
+            // variant lane (ranked, never pruned, see-through delegate) for pack
+            // routing; labels ride the candidates and the editor adapter drops
+            // them (ordering conveys rank).
+            let cs = cx
+                .set(
+                    base_idx,
+                    &analysis,
+                    &uri,
+                    symbols::position_to_point(pos),
+                    crate::index::resolve::OverrideScope::default(),
+                )
+                .with_source(&text);
+            let locs: Vec<Location> = cs
+                .definitions()
+                .into_iter()
+                .filter_map(|l| {
+                    let uri = l.to_url()?;
+                    Some(Location { uri, range: symbols::span_to_range(l.span) })
+                })
+                .collect();
+            match locs.len() {
+                0 => {}
+                1 => return Some(GotoDefinitionResponse::Scalar(locs.into_iter().next().unwrap())),
+                _ => return Some(GotoDefinitionResponse::Array(locs)),
             }
-        }
-        Ok(None)
+            // Member access (`obj->field`) flows through the set above: cpp
+            // mints a `MethodCall` ref core resolves like any other.
+            if language != "perl" {
+                // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`)
+                // — the raw word names a local-or-cross-file symbol. The lane
+                // sits outside the CandidateSet and still needs this file's
+                // closure scope; the set scopes itself at construction.
+                let scoped = crate::model::file_analysis::ScopedLookup::new(
+                    base_idx, &analysis.include_closure, self_path.as_deref());
+                if let Some((target, span, _)) =
+                    cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
+                {
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: target.unwrap_or_else(|| uri.clone()),
+                        range: symbols::span_to_range(span),
+                    }));
+                }
+            }
+            None
+        })
+        .await
     }
 
     async fn goto_implementation(
@@ -561,16 +566,19 @@ impl LanguageServer for Backend {
         // The family/descendants/domain projection of the same set references
         // and rename resolve from — pack routing is a construction fact, so
         // the resolved target can't diverge across the three verbs.
-        let routed = self.module_index.lookup_for(language);
-        let cs = crate::index::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            symbols::position_to_point(pos),
-            Some(routed.as_lookup()),
-            crate::index::resolve::OverrideScope::default(),
-        );
-        Ok(refs_to_locations(cs.implementations()).map(GotoDefinitionResponse::Array))
+        let uri = uri.clone();
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let cs = cx.set(
+                routed.as_lookup(),
+                &analysis,
+                &uri,
+                symbols::position_to_point(pos),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            refs_to_locations(cs.implementations()).map(GotoDefinitionResponse::Array)
+        })
+        .await
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -593,58 +601,45 @@ impl LanguageServer for Backend {
         };
 
         let point = symbols::position_to_point(pos);
-        // Pack languages resolve + collect through their sub-index (mirrors
-        // goto-def and the CLI) — the hub only knows Perl modules, so a cpp
-        // query against it silently misses every cross-file use.
-        let routed = self.module_index.lookup_for(language);
-        let base_idx = routed.as_lookup();
-        let self_path = uri.to_file_path().ok();
-        // `#include` reverse — "who includes this header" — owns the path
-        // token exclusively (the backward mirror of include goto-def). The
-        // pack declares whether it has include tokens; asked, never named.
-        if crate::build::language_driver::LanguageRegistry::has_include_tokens(&language) {
-            if let Some(incs) = symbols::pack_include_references(
-                &analysis, point, self_path.as_deref(), base_idx)
-            {
-                let locs: Vec<Location> = incs
-                    .into_iter()
-                    .filter_map(|(path, span)| {
-                        Some(Location {
-                            uri: Url::from_file_path(&path).ok()?,
-                            range: symbols::span_to_range(span),
-                        })
-                    })
-                    .collect();
-                return Ok((!locs.is_empty()).then_some(locs));
-            }
-        }
-        // (The reverse domain bridge — enum type → field-slot sites — is a
-        // goto-implementation projection, NOT part of plain references.)
-        // One construction, one projection — target/group/lexical branching,
-        // visibility (incl. the origin's include-closure scope and the pack
-        // VISIBLE widening), and the cross-file walk all live inside the set.
-        // The backward walk does real I/O now (relational retrieval +
-        // candidate-blob rehydration) — run construction + projection on the
-        // blocking pool, never the reactor. Everything moved is Arc'd.
-        let files = Arc::clone(&self.files);
-        let module_index = Arc::clone(&self.module_index);
         let uri = uri.clone();
         let scope = self.override_scope();
-        let locs = tokio::task::spawn_blocking(move || {
-            let routed = module_index.lookup_for(language);
-            let cs = crate::index::resolve::resolve(
-                &files,
-                &analysis,
-                FileKey::Url(uri),
-                point,
-                Some(routed.as_lookup()),
-                scope,
-            );
+        self.run_query(move |cx| {
+            // Pack languages resolve + collect through their sub-index
+            // (mirrors goto-def and the CLI) — the hub only knows Perl
+            // modules, so a cpp query against it silently misses every
+            // cross-file use.
+            let routed = cx.routed(language);
+            let base_idx = routed.as_lookup();
+            let self_path = uri.to_file_path().ok();
+            // `#include` reverse — "who includes this header" — owns the path
+            // token exclusively (the backward mirror of include goto-def). The
+            // pack declares whether it has include tokens; asked, never named.
+            if crate::build::language_driver::LanguageRegistry::has_include_tokens(&language) {
+                if let Some(incs) = symbols::pack_include_references(
+                    &analysis, point, self_path.as_deref(), base_idx)
+                {
+                    let locs: Vec<Location> = incs
+                        .into_iter()
+                        .filter_map(|(path, span)| {
+                            Some(Location {
+                                uri: Url::from_file_path(&path).ok()?,
+                                range: symbols::span_to_range(span),
+                            })
+                        })
+                        .collect();
+                    return (!locs.is_empty()).then_some(locs);
+                }
+            }
+            // (The reverse domain bridge — enum type → field-slot sites — is a
+            // goto-implementation projection, NOT part of plain references.)
+            // One construction, one projection — target/group/lexical
+            // branching, visibility (incl. the origin's include-closure scope
+            // and the pack VISIBLE widening), and the cross-file walk all live
+            // inside the set.
+            let cs = cx.set(base_idx, &analysis, &uri, point, scope);
             refs_to_locations(cs.references())
         })
         .await
-        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
-        Ok(locs)
     }
 
     async fn prepare_rename(
@@ -659,37 +654,35 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let point = symbols::position_to_point(params.position);
-        // Same store routing as the rename handler, so this gate probes the
-        // target rename would actually act on.
-        let routed = self.module_index.lookup_for(language);
-        // The rename box's range + placeholder.
-        let box_at = analysis
-            .symbol_at(point)
-            .map(|sym| (sym.selection_span, sym.name.clone()))
-            .or_else(|| analysis.ref_at(point).map(|r| (r.span, r.target_name.clone())));
-        // Only offer a rename box where `rename` would actually produce edits.
-        // Accepting on any `symbol_at`/`ref_at` hit is a UX trap: positions like
-        // `@_` or an ownerless constructor key resolve to nothing renameable, so
-        // the user gets a box that silently no-ops. `renameable()` mirrors
-        // `rename_edits`' arms on the same set (incl. the pack probe: a rename
-        // the set would refuse or no-op on offers no box), so this gate tracks
-        // new renameable kinds automatically, with no change here.
-        let cs = crate::index::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(params.text_document.uri.clone()),
-            point,
-            Some(routed.as_lookup()),
-            self.override_scope(),
-        );
-        let renameable = cs.renameable();
-        if !renameable {
-            return Ok(None);
-        }
-        Ok(box_at.map(|(span, placeholder)| PrepareRenameResponse::RangeWithPlaceholder {
-            range: symbols::span_to_range(span),
-            placeholder,
-        }))
+        let uri = params.text_document.uri.clone();
+        let scope = self.override_scope();
+        self.run_query(move |cx| {
+            // Same store routing as the rename handler, so this gate probes
+            // the target rename would actually act on.
+            let routed = cx.routed(language);
+            // The rename box's range + placeholder.
+            let box_at = analysis
+                .symbol_at(point)
+                .map(|sym| (sym.selection_span, sym.name.clone()))
+                .or_else(|| analysis.ref_at(point).map(|r| (r.span, r.target_name.clone())));
+            // Only offer a rename box where `rename` would actually produce
+            // edits. Accepting on any `symbol_at`/`ref_at` hit is a UX trap:
+            // positions like `@_` or an ownerless constructor key resolve to
+            // nothing renameable, so the user gets a box that silently no-ops.
+            // `renameable()` mirrors `rename_edits`' arms on the same set
+            // (incl. the pack probe: a rename the set would refuse or no-op on
+            // offers no box), so this gate tracks new renameable kinds
+            // automatically, with no change here.
+            let cs = cx.set(routed.as_lookup(), &analysis, &uri, point, scope);
+            if !cs.renameable() {
+                return None;
+            }
+            box_at.map(|(span, placeholder)| PrepareRenameResponse::RangeWithPlaceholder {
+                range: symbols::span_to_range(span),
+                placeholder,
+            })
+        })
+        .await
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
@@ -722,29 +715,17 @@ impl LanguageServer for Backend {
         // routing is a construction fact on the set: it widens the walk to
         // the per-language cache and REFUSES on alias-spelled sites instead
         // of emitting a partial edit.
-        // Same blocking-pool routing as `references`: rename projects the
-        // references image, which now reads SQLite + rehydrates blobs.
-        let files = Arc::clone(&self.files);
-        let module_index = Arc::clone(&self.module_index);
         let uri = uri.clone();
         let new_name = new_name.clone();
         let scope = self.override_scope();
-        tokio::task::spawn_blocking(move || {
-            let routed = module_index.lookup_for(language);
-            let cs = crate::index::resolve::resolve(
-                &files,
-                &analysis,
-                FileKey::Url(uri),
-                point,
-                Some(routed.as_lookup()),
-                scope,
-            );
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let cs = cx.set(routed.as_lookup(), &analysis, &uri, point, scope);
             cs.rename_edits(&new_name)
                 .map(edit_pairs_to_workspace_edit)
                 .map_err(tower_lsp::jsonrpc::Error::invalid_params)
         })
-        .await
-        .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?
+        .await?
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -768,42 +749,47 @@ impl LanguageServer for Backend {
         // at a position. Each keeps its own presenter: pack renders the
         // hover projection (top-ranked candidate), Perl renders through the
         // model primitives + the set's call-binding accessor.
-        let routed = self.module_index.lookup_for(language);
-        let base_idx = routed.as_lookup();
-        let cs = crate::index::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            symbols::position_to_point(pos),
-            Some(base_idx),
-            crate::index::resolve::OverrideScope::default(),
-        )
-        .with_source(&text);
-        if language != "perl" {
-            if let Some(h) = symbols::pack_hover(&cs, language) {
-                return Ok(Some(h));
-            }
-            // The raw-word fallback outside the set (mirrors goto-def's): a
-            // macro / enum-constant / global whose token no ref captures —
-            // show its definition line.
-            let self_path = uri.to_file_path().ok();
-            let scoped = crate::model::file_analysis::ScopedLookup::new(
-                base_idx, &analysis.include_closure, self_path.as_deref());
-            let xidx: &dyn crate::model::file_analysis::CrossFileLookup = &scoped;
-            if let Some((_, _, line)) = self.pack_xfile_word_at(&text, &analysis, pos, xidx) {
-                if !line.is_empty() {
-                    return Ok(Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!("```{}\n{}\n```", language, line),
-                        }),
-                        range: None,
-                    }));
+        let uri = uri.clone();
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let base_idx = routed.as_lookup();
+            let cs = cx
+                .set(
+                    base_idx,
+                    &analysis,
+                    &uri,
+                    symbols::position_to_point(pos),
+                    crate::index::resolve::OverrideScope::default(),
+                )
+                .with_source(&text);
+            if language != "perl" {
+                if let Some(h) = symbols::pack_hover(&cs, language) {
+                    return Some(h);
                 }
+                // The raw-word fallback outside the set (mirrors goto-def's):
+                // a macro / enum-constant / global whose token no ref captures
+                // — show its definition line.
+                let self_path = uri.to_file_path().ok();
+                let scoped = crate::model::file_analysis::ScopedLookup::new(
+                    base_idx, &analysis.include_closure, self_path.as_deref());
+                if let Some((_, _, line)) =
+                    cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
+                {
+                    if !line.is_empty() {
+                        return Some(Hover {
+                            contents: HoverContents::Markup(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: format!("```{}\n{}\n```", language, line),
+                            }),
+                            range: None,
+                        });
+                    }
+                }
+                return None;
             }
-            return Ok(None);
-        }
-        Ok(symbols::perl_hover(&cs, &self.module_index))
+            symbols::perl_hover(&cs, cx.index())
+        })
+        .await
     }
 
     async fn completion(
@@ -921,21 +907,21 @@ impl LanguageServer for Backend {
         };
         // Same construction as references — highlights is its origin-narrowed
         // projection, so the two verbs answer one resolution.
-        let routed = self.module_index.lookup_for(language);
-        let cs = crate::index::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            symbols::position_to_point(pos),
-            Some(routed.as_lookup()),
-            self.override_scope(),
-        );
-        let highlights = symbols::document_highlights(&cs);
-        if highlights.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(highlights))
-        }
+        let uri = uri.clone();
+        let scope = self.override_scope();
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let cs = cx.set(
+                routed.as_lookup(),
+                &analysis,
+                &uri,
+                symbols::position_to_point(pos),
+                scope,
+            );
+            let highlights = symbols::document_highlights(&cs);
+            (!highlights.is_empty()).then_some(highlights)
+        })
+        .await
     }
 
     async fn selection_range(
@@ -1089,89 +1075,92 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = params.query.to_lowercase();
-        let mut results = Vec::new();
-        // Paths a symbols-present resident copy already answered — the rows
-        // pass skips these (open docs and un-evicted copies are fresher than
-        // their persisted rows; evicted copies are rows-guaranteed).
-        let mut covered: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
+        // The resident sweeps read whole stores and the rows pass reads
+        // SQLite — the whole verb runs behind the blocking hop.
+        self.run_query(move |cx| {
+            let mut results = Vec::new();
+            // Paths a symbols-present resident copy already answered — the
+            // rows pass skips these (open docs and un-evicted copies are
+            // fresher than their persisted rows; evicted copies are
+            // rows-guaranteed).
+            let mut covered: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
 
-        self.files.for_each_analysis(|key, analysis| {
-            let uri = match key {
-                FileKey::Url(u) => u,
-                FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
-                    Url::parse(&format!("file://{}", p.display()))
-                        .unwrap()
-                }),
-            };
-            if !analysis.symbols_are_evicted() {
-                if let Ok(p) = uri.to_file_path() {
-                    // Claim the canonical spelling too: rows are keyed
-                    // canonical, and an open doc reached through a symlinked
-                    // root must shadow its own persisted rows.
-                    if let Ok(canon) = std::fs::canonicalize(&p) {
-                        covered.insert(canon);
-                    }
-                    covered.insert(p);
-                }
-            }
-            for sym in &analysis.symbols {
-                if sym.name.to_lowercase().contains(&query) {
-                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
-                        results.push(info);
+            cx.files().for_each_analysis(|key, analysis| {
+                let uri = match key {
+                    FileKey::Url(u) => u,
+                    FileKey::Path(p) => Url::from_file_path(&p).unwrap_or_else(|_| {
+                        Url::parse(&format!("file://{}", p.display()))
+                            .unwrap()
+                    }),
+                };
+                if !analysis.symbols_are_evicted() {
+                    if let Ok(p) = uri.to_file_path() {
+                        // Claim the canonical spelling too: rows are keyed
+                        // canonical, and an open doc reached through a
+                        // symlinked root must shadow its own persisted rows.
+                        if let Ok(canon) = std::fs::canonicalize(&p) {
+                            covered.insert(canon);
+                        }
+                        covered.insert(p);
                     }
                 }
-            }
-            // Plugin namespaces — match on both id and kind so users
-            // can find "the minion tasks in this workspace" via either
-            // "minion" or "tasks".
-            for ns in &analysis.plugin_namespaces {
-                let hay = format!("{} {}", ns.id.to_lowercase(), ns.kind.to_lowercase());
-                if hay.contains(&query) {
-                    results.push(symbols::plugin_namespace_to_workspace_info(ns, uri.clone()));
+                for sym in &analysis.symbols {
+                    if sym.name.to_lowercase().contains(&query) {
+                        if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                            results.push(info);
+                        }
+                    }
                 }
-            }
-        });
-
-        // Pack-language (C/C++/…) symbols live in per-language sub-indexes, not
-        // the FileStore — sweep them so a C typedef/class/free function shows in
-        // workspace search alongside Perl packages.
-        self.module_index.for_each_pack_registered_file(&mut |path, analysis| {
-            if !analysis.symbols_are_evicted() {
-                covered.insert(path.to_path_buf());
-            }
-            let uri = Url::from_file_path(path).unwrap_or_else(|_| {
-                Url::parse(&format!("file://{}", path.display())).unwrap()
+                // Plugin namespaces — match on both id and kind so users
+                // can find "the minion tasks in this workspace" via either
+                // "minion" or "tasks".
+                for ns in &analysis.plugin_namespaces {
+                    let hay = format!("{} {}", ns.id.to_lowercase(), ns.kind.to_lowercase());
+                    if hay.contains(&query) {
+                        results.push(symbols::plugin_namespace_to_workspace_info(ns, uri.clone()));
+                    }
+                }
             });
-            for sym in &analysis.symbols {
-                if sym.name.to_lowercase().contains(&query) {
-                    if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
-                        results.push(info);
+
+            // Pack-language (C/C++/…) symbols live in per-language
+            // sub-indexes, not the FileStore — sweep them so a C typedef/
+            // class/free function shows in workspace search alongside Perl
+            // packages.
+            cx.index().for_each_pack_registered_file(&mut |path, analysis| {
+                if !analysis.symbols_are_evicted() {
+                    covered.insert(path.to_path_buf());
+                }
+                let uri = Url::from_file_path(path).unwrap_or_else(|_| {
+                    Url::parse(&format!("file://{}", path.display())).unwrap()
+                });
+                for sym in &analysis.symbols {
+                    if sym.name.to_lowercase().contains(&query) {
+                        if let Some(info) = symbols::symbol_to_workspace_info(sym, uri.clone()) {
+                            results.push(info);
+                        }
                     }
                 }
-            }
-        });
+            });
 
-        // Rows pass: symbol-evicted copies (Perl workspace + @INC + every
-        // pack tier) answer from the relational store — the resident sweep
-        // above saw empty vecs for them. Same containment test, same
-        // kind/visibility filters as `symbol_to_workspace_info`.
-        for hit in symbols::sym_row_search(&self.module_index, &query) {
-            let path = std::path::PathBuf::from(&hit.path);
-            if covered.contains(&path) {
-                continue;
+            // Rows pass: symbol-evicted copies (Perl workspace + @INC + every
+            // pack tier) answer from the relational store — the resident sweep
+            // above saw empty vecs for them. Same containment test, same
+            // kind/visibility filters as `symbol_to_workspace_info`.
+            for hit in cx.sym_rows(&query) {
+                let path = std::path::PathBuf::from(&hit.path);
+                if covered.contains(&path) {
+                    continue;
+                }
+                if let Some(info) = symbols::sym_row_to_workspace_info(&hit) {
+                    results.push(info);
+                }
             }
-            if let Some(info) = symbols::sym_row_to_workspace_info(&hit) {
-                results.push(info);
-            }
-        }
 
-        symbols::dedup_workspace_symbols(&mut results);
-        if results.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(results))
-        }
+            symbols::dedup_workspace_symbols(&mut results);
+            (!results.is_empty()).then_some(results)
+        })
+        .await
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -1337,22 +1326,23 @@ impl LanguageServer for Backend {
         };
         // The co-edit set is the rename image's origin-file site set,
         // projected from the same construction rename uses.
-        let routed = self.module_index.lookup_for(language);
-        let cs = crate::index::resolve::resolve(
-            &self.files,
-            &analysis,
-            FileKey::Url(uri.clone()),
-            symbols::position_to_point(pos),
-            Some(routed.as_lookup()),
-            self.override_scope(),
-        );
-        match symbols::linked_editing_ranges(&cs) {
-            Some(ranges) => Ok(Some(LinkedEditingRanges {
+        let uri = uri.clone();
+        let scope = self.override_scope();
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let cs = cx.set(
+                routed.as_lookup(),
+                &analysis,
+                &uri,
+                symbols::position_to_point(pos),
+                scope,
+            );
+            symbols::linked_editing_ranges(&cs).map(|ranges| LinkedEditingRanges {
                 ranges,
                 word_pattern: None,
-            })),
-            None => Ok(None),
-        }
+            })
+        })
+        .await
     }
 }
 

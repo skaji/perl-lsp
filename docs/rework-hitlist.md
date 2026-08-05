@@ -227,27 +227,21 @@ forwarding events and publishing `refresh_open` through the gather
 single-flight. The H9 race tests live with the owner
 (`pack_invalidator_tests.rs`).
 
-### D4. Blocking-ness of query paths is decided per-verb in handlers; three verbs still do SQLite/fs I/O on the reactor — **medium leverage / M**
+### D4. LANDED — the blocking decision rides the query API (`Backend::run_query`)
 
-**The evidence.** references and rename carry the "real I/O … never the
-reactor" rationale and spawn_blocking (`server.rs:649-676, 770-798`);
-goto-definition's and hover's raw-word lanes run inline
-(`server.rs:535-544, 840-857`) calling `pack_xfile_word_at`
-(`lifecycle.rs:400-433` — `fs::read_to_string` + `whole_present`, which on LRU
-miss is a SQLite+zstd decode via `registration.rs:641-676`); workspace/symbol
-runs its resident sweep + `sym_row_search` SQLite pass inline
-(`server.rs:1137-1213`).
-
-**Target shape.** One Backend helper (`run_query`, the single spawn_blocking
-hop the references/rename handlers already prototype — factor their duplicated
-pack/base_idx re-binding into it) becomes the only way a handler reaches set
-construction/projection, `sym_row_search`, or any rehydration reader. Move the
-raw-word lanes inside the blocking closure; wrap workspace/symbol. Optional
-enforcement: no direct call to `resolve()`/`sym_row_search`/`whole_present`
-from an async fn in `server.rs` outside `run_query`.
-
-**Gate.** The grep-test above; bench scenarios (edit-bench) confirming no
-latency regression and no reactor stall under cold LRU.
+`lsp/backend/query.rs` owns the single blocking hop: `run_query` mints a
+`QueryCx` (store + hub Arcs) inside `spawn_blocking`, and every resolving
+handler — goto-def, implementations, references, rename, prepareRename,
+hover, documentHighlight, linkedEditingRange, workspace/symbol — reaches
+set construction (`QueryCx::set`), pack routing (`QueryCx::routed`), the
+relational row search (`QueryCx::sym_rows`), and the raw-word rehydration
+lane (`QueryCx::pack_xfile_word_at`, relocated off `Backend`) only through
+that context, off the reactor. The three verbs that did SQLite/fs I/O
+inline (goto-def's and hover's raw-word lanes, workspace/symbol's sweep +
+rows pass) now run behind the hop; references/rename's hand-rolled
+spawn_blocking twins are deleted onto it.
+`layering_tests::query_verbs_route_through_run_query` pins the raw
+spellings out of `server.rs`, so a new verb cannot grow an inline I/O path.
 
 ### D5. The bounded-wait lost-wakeup shape is hand-spelled three times, debounce-by-generation twice — **medium leverage / M**
 
