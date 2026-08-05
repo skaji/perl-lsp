@@ -1023,41 +1023,6 @@ impl ModuleIndex {
         }
     }
 
-    /// Claim `path` at source generation `gen` (H9-1). Succeeds — recording
-    /// `gen` — iff `gen >= the generation already registered` (empty ⇒ the
-    /// baseline `i64::MIN`, so a first claim always wins). A tie succeeds so a
-    /// serialized fresh re-registration (the deferred-invalidation reconcile
-    /// running after the bulk index) still lands; only a STRICTLY older
-    /// generation — a re-analysis that read pre-save bytes — is rejected. The
-    /// check-and-update is atomic under the DashMap entry lock, so two racing
-    /// swaps can't both read-then-clobber. Callers that get `false` must NOT
-    /// register: they would revert a fresher copy.
-    pub(crate) fn claim_source_gen(&self, path: &std::path::Path, gen: i64) -> bool {
-        use dashmap::mapref::entry::Entry;
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        match self.registered_source_gen.entry(canon) {
-            Entry::Occupied(mut e) => {
-                if gen >= *e.get() {
-                    *e.get_mut() = gen;
-                    true
-                } else {
-                    false
-                }
-            }
-            Entry::Vacant(e) => {
-                e.insert(gen);
-                true
-            }
-        }
-    }
-
-    /// Forget `path`'s source generation (H9-1) — a genuine delete, so a later
-    /// recreation claims from the baseline again.
-    pub(crate) fn forget_source_gen(&self, path: &std::path::Path) {
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.registered_source_gen.remove(&canon);
-    }
-
     /// Remove a pack file's registrations: its `all_files` entry, its
     /// candidates in `all_defs`, and any global cache-slot wins — re-picking
     /// the winner among the remaining candidates with the SAME total order

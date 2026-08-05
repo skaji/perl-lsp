@@ -251,8 +251,11 @@ fn whole_copy_registration_sites_are_allowlisted() {
                 // 1 shared writer fallback (commit-fail + panic, via
                 // run_persist_writer — bounded by failure, tripwire-
                 // counted), 1 degraded/unpersisted worker arm (tripwire-
-                // counted), 1 pack_file_changed unpersisted fallback.
-                ("module_resolver", 3, "failure fallbacks + NO_EVICT arm, tripwire-counted"),
+                // counted).
+                ("module_resolver", 2, "failure fallbacks, tripwire-counted"),
+                // The invalidation swap's unpersisted fallback — bounded by
+                // in-session edit volume, whole so the bag stays recoverable.
+                ("pack_invalidator", 1, "unpersisted-edit fallback"),
             ],
         ),
         (

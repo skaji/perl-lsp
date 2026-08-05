@@ -99,15 +99,12 @@ pub struct Backend {
     /// useful — when it did; sending it anyway wedges indexing behind a
     /// request minimal clients never answer.
     work_done_progress: Arc<std::sync::atomic::AtomicBool>,
-    /// Serializes pack-file invalidation runs (did_save + watcher events can
-    /// race on the same header; unregister/register swaps must not interleave).
-    pack_change_lock: Arc<std::sync::Mutex<()>>,
-    /// Defers watcher invalidations that arrive DURING the initial pack bulk
-    /// index and reconciles them once at completion (H9-2). During the index
-    /// the pack sub-indexes aren't attached, so a live `pack_file_changed`
-    /// would drop the save; deferral + the H9-1 generation guard make the
-    /// end-of-index reconcile both complete and safe.
-    pack_coord: Arc<crate::index::module_resolver::PackChangeCoordinator>,
+    /// The pack-file invalidation owner (`index::pack_invalidator`): the
+    /// serialization lock, the H9-2 bulk-index coordinator, and the H9-1
+    /// generation discipline live THERE. Backend only forwards events
+    /// (`file_changed` / the bulk-index begin/finish marks) and publishes
+    /// the returned open-doc refresh set.
+    pack_invalidator: Arc<crate::index::pack_invalidator::PackInvalidator>,
     /// Opt-in diagnostic toggles, set from `initializationOptions.diagnostics`.
     /// Shared with the resolver refresh callback (which also publishes
     /// diagnostics), hence the `Arc<Mutex<_>>`. `DiagnosticOptions` is `Copy`,

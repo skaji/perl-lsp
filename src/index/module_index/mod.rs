@@ -269,18 +269,6 @@ pub struct ModuleIndex {
     /// evicted, and rehydration after an edit persists would fetch the NEW
     /// generation's names.
     registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
-    /// The SOURCE generation (`module_cache::file_mtime_nanos`) the currently
-    /// registered pack analysis for a path was built from — the H9-1
-    /// stale-winner guard. `pack_file_changed`'s swap claims a path at its
-    /// event generation and registers only when the claim succeeds
-    /// (`incoming >= registered`), so a re-analysis that read pre-save bytes
-    /// (a lower generation) can never revert a fresher registration, and a
-    /// deferred-invalidation reconcile (H9-2) safely overrides only paths
-    /// whose registered generation is older than the save it reconciles. Empty
-    /// for a path the swap never touched (bulk/warm register ungated — they
-    /// are the baseline every real edit outranks, and the reconcile's
-    /// unregister+register replaces their entry outright).
-    registered_source_gen: Arc<DashMap<std::path::PathBuf, i64>>,
     /// Slice-2 rehydration store. Pack sub-indexes get theirs at
     /// construction (keyed to `modules-{lang}.db`); the Perl hub gets its
     /// own in `set_workspace_root` (keyed to `modules.db` — workspace

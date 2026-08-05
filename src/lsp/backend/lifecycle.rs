@@ -232,8 +232,7 @@ impl Backend {
             perl_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pack_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_done_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            pack_change_lock: Arc::new(std::sync::Mutex::new(())),
-            pack_coord: Arc::new(crate::index::module_resolver::PackChangeCoordinator::default()),
+            pack_invalidator: Arc::new(crate::index::pack_invalidator::PackInvalidator::default()),
             diag_options,
             rename_options: Arc::new(std::sync::Mutex::new(crate::index::resolve::RenameOptions::default())),
             index_ready: Arc::new(IndexReady::default()),
@@ -331,62 +330,31 @@ impl Backend {
         });
     }
 
-    /// A pack file's bytes changed on disk (save or watcher event) — run the
-    /// invalidation off the message loop: evict its per-file caches +
-    /// every consumer's (reverse-closure), re-register the pack index, then
-    /// refresh every OPEN pack document whose include closure contains the
-    /// changed file (or that IS it), so in-session edits become visible
-    /// without a restart.
+    /// A pack file's bytes changed on disk (save or watcher event) — forward
+    /// the fact to the invalidation owner off the message loop, then publish
+    /// its outcome: every returned open URI re-gathers through the
+    /// single-flight registry (Part 2), so a consumer already mid-gather
+    /// coalesces (re-runs once against the freshly evicted caches) instead
+    /// of double-gathering the same cone. Which analyses are stale, the
+    /// serialization, and the H9 disciplines are all `PackInvalidator`'s.
     pub(super) fn schedule_pack_invalidate(&self, path: PathBuf, deleted: bool) {
         let files = Arc::clone(&self.files);
         let module_index = Arc::clone(&self.module_index);
-        let lock = Arc::clone(&self.pack_change_lock);
+        let invalidator = Arc::clone(&self.pack_invalidator);
         let root = self.module_index.workspace_root();
         let heal_ctx = self.pack_heal_ctx();
-        let pack_coord = Arc::clone(&self.pack_coord);
         tokio::spawn(async move {
-            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-            // H9-2: if the initial pack index is still running, the sub-index
-            // isn't attached — invalidating now would be a no-op that drops the
-            // save. Defer it; the end-of-index reconcile re-runs it against
-            // current disk, and `heal_open_docs` re-publishes the open docs.
-            if pack_coord.note_change(&canon, deleted) {
+            let outcome = tokio::task::spawn_blocking(move || {
+                invalidator.file_changed(root.as_deref(), &module_index, &files, &path, deleted)
+            })
+            .await;
+            let Ok(outcome) = outcome else { return };
+            if outcome.deferred {
+                // Reconciled at end-of-index; `heal_open_docs` re-publishes
+                // the open docs then.
                 return;
             }
-            {
-                let module_index = Arc::clone(&module_index);
-                let canon = canon.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    crate::index::module_resolver::pack_file_changed(
-                        root.as_deref(),
-                        &module_index,
-                        &canon,
-                        deleted,
-                    );
-                })
-                .await;
-            }
-            // Open consumers re-analyze AFTER the eviction so their gather
-            // runs cold against the new header bytes.
-            let canon_str = canon.to_string_lossy().into_owned();
-            let mut to_refresh: Vec<Url> = Vec::new();
-            files.for_each_analysis(|key, analysis| {
-                if let FileKey::Url(u) = key {
-                    let is_self = !deleted
-                        && u.to_file_path()
-                            .ok()
-                            .map(|p| p.canonicalize().unwrap_or(p) == canon)
-                            .unwrap_or(false);
-                    if is_self || analysis.include_closure.contains(&canon_str) {
-                        to_refresh.push(u);
-                    }
-                }
-            });
-            // Route through the single-flight registry (Part 2): a consumer
-            // already mid-gather coalesces (re-runs once against the freshly
-            // evicted caches) instead of double-gathering the same cone.
-            for uri in to_refresh {
+            for uri in outcome.refresh_open {
                 heal_ctx.request_gather(uri);
             }
         });

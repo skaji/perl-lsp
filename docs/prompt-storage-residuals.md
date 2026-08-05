@@ -69,7 +69,7 @@ or by being explicitly declined.
   likely fixes are candidate-row pre-narrowing for pack tiers (the Perl
   rows machinery exists; pack rows are per-language DBs) or memoizing the
   swept whole-views across one query. Measure before building.
-- **Probe serialization in `pack_file_changed`** (Changed case): the
+- **Probe serialization in the `PackInvalidator` swap** (Changed case): the
   changed file's probe runs serially before the parallel consumer fan-out
   (~one header-analysis of added latency per save while actively editing
   a widely-included header whose surface DID change). Speculative

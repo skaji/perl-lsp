@@ -1,0 +1,491 @@
+//! The pack-file invalidation subsystem, in ONE home: file change → which
+//! pack analyses are stale → re-analyze + swap registrations → which OPEN
+//! documents the caller must refresh.
+//!
+//! `PackInvalidator` owns the three coordination facts that keep concurrent
+//! invalidations sound:
+//!
+//! - the **serialization lock** (did_save + watcher events can race on the
+//!   same header; unregister/register swaps must not interleave);
+//! - the **bulk-index coordinator** (H9-2): changes arriving while the
+//!   initial pack index is still attaching are deferred and reconciled once
+//!   at `finish_bulk_index`;
+//! - the **source-generation discipline** (H9-1): every swap claims the
+//!   changed file's mtime generation, so a stale re-analysis (pre-save
+//!   bytes) can never revert a fresher registration.
+//!
+//! The only mutation entry points are `file_changed` and
+//! `finish_bulk_index` (plus the `begin_bulk_index` mark) — the worker that
+//! evicts/re-analyzes/swaps is private, so a new invalidation path cannot
+//! compile around the lock, the coordinator, or the generation guard.
+//!
+//! **The consumer rule is spelled once** (`is_consumer`): a consumer is any
+//! analysis whose include closure contains the changed path. Both the
+//! registered-file re-analysis storm and the open-document refresh set apply
+//! it, and BOTH sit behind the surface gate — an Unchanged verdict (body/
+//! comment edit in a header) re-analyzes the changed file alone and returns
+//! an empty consumer set, open documents included: their analyses are still
+//! semantically valid (macro bodies and include directives are ON the
+//! surface), so re-gathering them would be pure storm.
+//!
+//! Lock order: `change_lock` is the subsystem's OUTERMOST lock — acquired
+//! only from the entry points with no other lock held. Everything the worker
+//! touches (pack index maps, the module-cache connection, the reparse
+//! caches) nests strictly beneath it, and the open-document sweep over
+//! `FileStore` runs AFTER the guard drops, so `change_lock` never meets a
+//! store shard guard.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use tower_lsp::lsp_types::Url;
+
+use crate::index::file_store::{FileKey, FileStore};
+use crate::index::module_cache;
+use crate::index::module_index::{CachedModule, ModuleIndex};
+use crate::model::file_analysis::FileAnalysis;
+
+/// THE consumer rule: the include closure is the cross-file visibility key,
+/// so it is also the REVERSE-dependency key. Every consumer set — registered
+/// files and open documents alike — is computed through this one predicate.
+fn is_consumer(analysis: &FileAnalysis, canon_str: &str) -> bool {
+    analysis.include_closure.contains(canon_str)
+}
+
+/// What a `file_changed` call decided, for the caller to act on. The
+/// invalidator mutates the index side itself; the caller (the LSP backend)
+/// only publishes: it maps `refresh_open` onto its gather/diagnostics
+/// machinery.
+pub struct InvalidationOutcome {
+    /// The change arrived during the initial pack bulk index and was
+    /// deferred (H9-2). Nothing to publish now; `finish_bulk_index`
+    /// reconciles it and the end-of-index open-doc heal covers the refresh.
+    pub deferred: bool,
+    /// OPEN documents to re-gather: the changed file itself (when open and
+    /// not deleted) plus every open consumer — the latter gated by the
+    /// surface verdict exactly like the registered-consumer storm.
+    pub refresh_open: Vec<Url>,
+}
+
+impl InvalidationOutcome {
+    fn deferred() -> Self {
+        InvalidationOutcome { deferred: true, refresh_open: Vec::new() }
+    }
+}
+
+/// Coordinates watcher invalidations against the INITIAL pack bulk index
+/// (`index_pack_languages`) — H9-2. While that index is in flight the pack
+/// sub-indexes aren't attached to the hub yet, so an invalidation would
+/// find no `pack_index` and silently drop the save (and even once attached,
+/// racing the bulk cone re-analyzes it twice, uncoordinated). Instead a save
+/// arriving during the index is DEFERRED into a bounded set (one entry per
+/// distinct path changed during the index) and reconciled ONCE at
+/// completion: `finish_bulk_index` re-runs the worker per deferred path
+/// against current disk, and the H9-1 source-generation guard makes that
+/// safe — the reconcile reads the freshest bytes (highest generation) and
+/// outranks whatever the bulk pass registered.
+#[derive(Default)]
+pub(crate) struct PackChangeCoordinator {
+    in_flight: std::sync::atomic::AtomicBool,
+    // path -> deleted. A HashMap so repeated saves of one path collapse to a
+    // single reconcile (the reconcile reads current disk regardless).
+    deferred: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
+}
+
+impl PackChangeCoordinator {
+    /// Mark the initial pack index in flight. Call synchronously before the
+    /// index is scheduled so a save racing the scheduling is still deferred.
+    pub(crate) fn begin_index(&self) {
+        self.in_flight
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a watched-file change. Returns `true` when the caller should
+    /// DEFER (the index is in flight → the change is queued for reconcile);
+    /// `false` when it should run the invalidation now. The flag check and
+    /// the queue insert are one critical section with `finish_index`'s clear +
+    /// drain, so a save can never be both dropped from the queue AND skipped by
+    /// the normal path.
+    pub(crate) fn note_change(&self, canon: &Path, deleted: bool) -> bool {
+        let mut q = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        if self.in_flight.load(std::sync::atomic::Ordering::Relaxed) {
+            q.insert(canon.to_path_buf(), deleted);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the in-flight flag and drain the deferred set, atomically w.r.t.
+    /// `note_change`. The returned pairs are the paths to reconcile once.
+    pub(crate) fn finish_index(&self) -> Vec<(PathBuf, bool)> {
+        let mut q = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        self.in_flight
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        q.drain().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_in_flight(&self) -> bool {
+        self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The owner. One per server/CLI session, shared by the save/watcher event
+/// forwarders and the bulk-index lifecycle. See the module doc for what it
+/// owns and why.
+#[derive(Default)]
+pub struct PackInvalidator {
+    change_lock: std::sync::Mutex<()>,
+    coord: PackChangeCoordinator,
+    /// The SOURCE generation (`module_cache::file_mtime_nanos`) the currently
+    /// registered pack analysis for a path was built from — the H9-1
+    /// stale-winner guard. The swap claims a path at its event generation and
+    /// registers only when the claim succeeds (`incoming >= registered`), so
+    /// a re-analysis that read pre-save bytes (a lower generation) can never
+    /// revert a fresher registration, and a deferred-invalidation reconcile
+    /// (H9-2) safely overrides only paths whose registered generation is
+    /// older than the save it reconciles. Empty for a path the swap never
+    /// touched (bulk/warm register ungated — they are the baseline every real
+    /// edit outranks, and the reconcile's unregister+register replaces their
+    /// entry outright).
+    registered_source_gen: DashMap<PathBuf, i64>,
+}
+
+impl PackInvalidator {
+    /// Mark the initial pack bulk index in flight (H9-2). Call synchronously
+    /// before the index task is scheduled so a save racing the scheduling
+    /// still defers into the reconcile set.
+    pub fn begin_bulk_index(&self) {
+        self.coord.begin_index();
+    }
+
+    /// A pack file's bytes changed on disk (save or watcher event) — or the
+    /// file was deleted. Runs the whole invalidation (blocking: Rayon inside;
+    /// call off the message loop) and returns the outcome the caller
+    /// publishes. `open_docs` is the caller's open-document view; the
+    /// consumer rule maps it to the URIs whose gather must re-run.
+    pub fn file_changed(
+        &self,
+        root_uri: Option<&str>,
+        hub: &ModuleIndex,
+        open_docs: &FileStore,
+        path: &Path,
+        deleted: bool,
+    ) -> InvalidationOutcome {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if self.coord.note_change(&canon, deleted) {
+            return InvalidationOutcome::deferred();
+        }
+        let skip_consumers = {
+            let _g = self.change_lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.pack_file_changed(root_uri, hub, &canon, deleted)
+        };
+        // Open consumers re-analyze AFTER the eviction so their gather runs
+        // cold against the new bytes. Off the serialization lock — the sweep
+        // only reads closures, and holding `change_lock` across FileStore
+        // shard guards would mint a lock ordering for no protection.
+        let refresh_open = self.open_docs_to_refresh(open_docs, &canon, deleted, skip_consumers);
+        InvalidationOutcome { deferred: false, refresh_open }
+    }
+
+    /// The pack sub-indexes are attached; reconcile every save deferred
+    /// during the bulk index (H9-2) exactly once, off the same serialization
+    /// lock steady-state invalidations use. The H9-1 generation guard makes
+    /// this safe: each reconcile reads current disk (the freshest
+    /// generation) and outranks whatever the bulk pass registered from
+    /// earlier bytes. Open-doc refresh is NOT computed here — the
+    /// end-of-index heal re-publishes every open pack doc anyway.
+    pub fn finish_bulk_index(&self, root_uri: Option<&str>, hub: &ModuleIndex) {
+        let deferred = self.coord.finish_index();
+        if deferred.is_empty() {
+            return;
+        }
+        log::debug!(
+            "pack index complete: reconciling {} deferred change(s)",
+            deferred.len()
+        );
+        let _g = self.change_lock.lock().unwrap_or_else(|e| e.into_inner());
+        for (path, deleted) in deferred {
+            self.pack_file_changed(root_uri, hub, &path, deleted);
+        }
+    }
+
+    /// The open half of the consumer answer: the changed file's own open doc
+    /// (its bytes changed regardless of verdict) plus open consumers by the
+    /// one rule, surface-gated like the registered storm.
+    fn open_docs_to_refresh(
+        &self,
+        open_docs: &FileStore,
+        canon: &Path,
+        deleted: bool,
+        skip_consumers: bool,
+    ) -> Vec<Url> {
+        let canon_str = canon.to_string_lossy().into_owned();
+        let mut out: Vec<Url> = Vec::new();
+        open_docs.for_each_analysis(|key, analysis| {
+            if let FileKey::Url(u) = key {
+                let is_self = !deleted
+                    && u.to_file_path()
+                        .ok()
+                        .map(|p| p.canonicalize().unwrap_or(p) == canon)
+                        .unwrap_or(false);
+                if is_self || (!skip_consumers && is_consumer(analysis, &canon_str)) {
+                    out.push(u);
+                }
+            }
+        });
+        out
+    }
+
+    /// Claim `path` at source generation `gen` (H9-1). Succeeds — recording
+    /// `gen` — iff `gen >= the generation already registered` (empty ⇒ the
+    /// baseline `i64::MIN`, so a first claim always wins). A tie succeeds so a
+    /// serialized fresh re-registration (the deferred-invalidation reconcile
+    /// running after the bulk index) still lands; only a STRICTLY older
+    /// generation — a re-analysis that read pre-save bytes — is rejected. The
+    /// check-and-update is atomic under the DashMap entry lock, so two racing
+    /// swaps can't both read-then-clobber. Callers that get `false` must NOT
+    /// register: they would revert a fresher copy.
+    pub(crate) fn claim_source_gen(&self, path: &Path, gen: i64) -> bool {
+        use dashmap::mapref::entry::Entry;
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match self.registered_source_gen.entry(canon) {
+            Entry::Occupied(mut e) => {
+                if gen >= *e.get() {
+                    *e.get_mut() = gen;
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(gen);
+                true
+            }
+        }
+    }
+
+    /// Forget `path`'s source generation (H9-1) — a genuine delete, so a later
+    /// recreation claims from the baseline again.
+    fn forget_source_gen(&self, path: &Path) {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.registered_source_gen.remove(&canon);
+    }
+
+    /// In-session invalidation worker for a changed (saved/watched) or
+    /// deleted pack file — the H1 seam. Order matters: evict the per-file
+    /// analysis caches FIRST (macro tables, pre-expanded variants, closures)
+    /// so the re-analyses here — and the open documents' background refresh
+    /// after — re-gather instead of serving the frozen tables. Returns
+    /// whether the surface gate skipped the consumer storm. Private: callers
+    /// go through `file_changed` / `finish_bulk_index`, which hold
+    /// `change_lock` and consult the coordinator.
+    fn pack_file_changed(
+        &self,
+        root_uri: Option<&str>,
+        hub: &ModuleIndex,
+        path: &Path,
+        deleted: bool,
+    ) -> bool {
+        use rayon::prelude::*;
+        let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+        let Some(driver) = reg.for_path(path) else { return false };
+        if driver.id() == "perl" {
+            return false;
+        }
+        let lang = driver.id();
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canon_str = canon.to_string_lossy().into_owned();
+        let pack = hub.pack_index(lang);
+
+        // The source generation this invalidation registers under (H9-1): the
+        // changed file's mtime, captured at call time. Every result (the changed
+        // file AND its consumers) is claimed at this generation, so a later save's
+        // invalidation — a strictly greater mtime — outranks it and a straggling
+        // stale re-analysis (a smaller mtime) is rejected at the swap. A delete has
+        // no mtime; use wall-clock now, which is monotone-forward past any prior
+        // save and lets the deletion win.
+        let event_gen = module_cache::file_mtime_nanos(&canon).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(i64::MAX)
+        });
+
+        let mut consumers: Vec<PathBuf> = Vec::new();
+        // Closures ride along for the Unchanged case: the consumers' persisted
+        // deps_stamps must be recomputed (the edited header's mtime moved) or
+        // the next warm scan rejects every consumer row and the cold storm the
+        // gate prevents in-session comes back at restart.
+        let mut consumer_closures: Vec<(PathBuf, crate::model::file_analysis::path_intern::ClosureList)> =
+            Vec::new();
+        if let Some(ref pack) = pack {
+            pack.for_each_registered_file(&mut |cm| {
+                if is_consumer(&cm.analysis, &canon_str) {
+                    consumers.push(cm.path.clone());
+                    consumer_closures.push((cm.path.clone(), cm.analysis.include_closure.clone()));
+                }
+            });
+        }
+
+        if deleted {
+            // The departed file's own header/macro/closure caches go too — a
+            // consumer re-gather resolving the deleted header from its
+            // still-warm entry would make the deletion invisible.
+            crate::build::cpp_reparse::evict_analysis_caches(&std::iter::once(canon.clone()).collect());
+            if let Some(ref pack) = pack {
+                pack.unregister_file(&canon);
+                pack.remove_surface(&canon);
+            }
+            self.forget_source_gen(&canon);
+        }
+
+        // The surface gate (the freshness firewall, pack flavor): re-analyze
+        // the CHANGED file first, alone. If its span-free surface is unchanged
+        // — a body edit, a comment, a reformat in a header — every consumer's
+        // analysis is still semantically valid (macro bodies and include
+        // directives are ON the surface, so textual-inclusion effects are
+        // covered) and the whole consumer re-analysis storm is skipped. A
+        // deep-header comment edit re-parses ONE file, not hundreds of TUs.
+        let mut changed_verdict = crate::model::surface::SurfaceVerdict::Changed;
+        let mut changed_fa: Option<Arc<FileAnalysis>> = None;
+        if !deleted {
+            crate::build::cpp_reparse::evict_analysis_caches(&std::iter::once(canon.clone()).collect());
+            if let (Some(ref pack), Ok(source)) = (&pack, std::fs::read_to_string(&canon)) {
+                let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    driver.analyze_with_path(&source, Some(&canon))
+                }));
+                if let Ok(fa) = probe {
+                    changed_verdict = pack.record_surface(&canon, &fa);
+                    changed_fa = Some(Arc::new(fa));
+                }
+            }
+        }
+        let skip_consumers = matches!(changed_verdict, crate::model::surface::SurfaceVerdict::Unchanged);
+        if !skip_consumers && !consumers.is_empty() {
+            // The changed file's own caches were evicted before the probe and are
+            // fresh — evict only the consumers' so they re-gather.
+            crate::build::cpp_reparse::evict_analysis_caches(&consumers.iter().cloned().collect());
+        }
+
+        // Re-analyze the changed file (unless deleted) + every consumer
+        // (parallel), then swap registrations. Unregister-then-register so names
+        // the new version no longer defines don't linger in `all_defs` / the
+        // cache winner slot. Consumers re-analyze on delete too — their splices
+        // and closures baked the departed header.
+        let mut targets: Vec<PathBuf> = Vec::with_capacity(consumers.len() + 1);
+        if !deleted && changed_fa.is_none() {
+            targets.push(canon.clone());
+        }
+        if !skip_consumers {
+            targets.extend(consumers);
+        }
+        targets.sort();
+        targets.dedup();
+        targets.retain(|p| changed_fa.is_none() || *p != canon);
+        let mut results: Vec<(PathBuf, Arc<FileAnalysis>)> = targets
+            .par_iter()
+            .filter_map(|p| {
+                let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+                let driver = reg.for_path(p).filter(|d| d.id() == lang)?;
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let source = std::fs::read_to_string(p).ok()?;
+                    Some(driver.analyze_with_path(&source, Some(p)))
+                }));
+                match res {
+                    Ok(Some(analysis)) => Some((p.clone(), Arc::new(analysis))),
+                    _ => None,
+                }
+            })
+            .collect();
+        if let Some(fa) = changed_fa {
+            results.push((canon.clone(), fa));
+        }
+        // Persist the FULL analyses (bag present) FIRST so the on-disk blob can
+        // rehydrate, then register bag-STRIPPED resident copies and drop each
+        // file's now-stale entry from the rehydration LRU. `results` holds the
+        // full arcs; `save_to_db` encodes them whole. Strip only when we
+        // actually persisted — else the bag would be unrecoverable, so keep it.
+        let persisted = if let Some(conn) = module_cache::open_cache_db(root_uri, lang) {
+            if deleted {
+                module_cache::delete_ref_rows(&conn, &canon_str);
+            }
+            let tx = conn.unchecked_transaction().ok();
+            for (p, arc) in &results {
+                let p_str = p.to_string_lossy();
+                let cached = Arc::new(CachedModule::new(p.clone(), arc.clone()));
+                module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace");
+                if !arc.degraded {
+                    let seeds: Vec<_> = arc.refs.iter().map(|r| r.row_seed()).collect();
+                    let sym_seeds = arc.sym_row_seeds();
+                    if let Err(e) = module_cache::shred_derived_rows(
+                        &conn, &p_str, "workspace", &seeds, &sym_seeds,
+                    ) {
+                        log::warn!("Failed to shred derived rows for {:?}: {}", p, e);
+                    }
+                }
+            }
+            if skip_consumers {
+                // Unchanged gate: the consumers' rows/blobs/stubs are still
+                // valid, but the edited header's mtime moved every consumer's
+                // closure stamp — refresh them or the next warm rejects every
+                // consumer row (the restart cold storm).
+                let mut memo = std::collections::HashMap::new();
+                for (p, closure) in &consumer_closures {
+                    module_cache::refresh_deps_stamp(
+                        &conn,
+                        &p.to_string_lossy(),
+                        closure,
+                        &mut memo,
+                    );
+                }
+            }
+            if let Some(tx) = tx {
+                let _ = tx.commit();
+            }
+            true
+        } else {
+            false
+        };
+        if let Some(ref pack) = pack {
+            for (p, arc) in &results {
+                // H9-1 generation guard: claim BEFORE unregistering, so a rejected
+                // (strictly-older) result leaves the fresher registration intact
+                // rather than tearing it down. A stale re-analysis that read
+                // pre-save bytes loses to nothing — it simply isn't registered, and
+                // the writer that read post-save bytes (or a later save's event)
+                // wins. This also closes hazard 3: an under-invalidated consumer the
+                // bulk pass registered from pre-save bytes carries a lower generation
+                // than the reconcile that reads current disk, so the reconcile wins
+                // and no pre-save bytes are silently served.
+                if !self.claim_source_gen(p, event_gen) {
+                    log::debug!(
+                        "pack swap: skip stale re-register of {:?} (event gen {} < registered)",
+                        p,
+                        event_gen
+                    );
+                    continue;
+                }
+                pack.unregister_file(p);
+                // Drop the stale LRU pin BEFORE the new stripped copy becomes
+                // reachable — a query racing this re-register must not
+                // rehydrate the pre-edit generation against the new
+                // registration (the blob+rows committed above).
+                pack.invalidate_bag_cache(p);
+                if persisted && !arc.degraded && crate::index::module_resolver::eviction_enabled() {
+                    // Registration-owned strip (feeds read the whole copy).
+                    let _ = pack.register_symbols_stripping((*p).clone(), (**arc).clone(), true, true);
+                } else {
+                    pack.register_symbols(p.clone(), arc.clone());
+                }
+            }
+        }
+        skip_consumers
+    }
+}
+
+#[cfg(test)]
+#[path = "pack_invalidator_tests.rs"]
+mod pack_invalidator_tests;

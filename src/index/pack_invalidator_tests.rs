@@ -1,0 +1,250 @@
+use super::*;
+
+/// H9-2 deferral coordinator: while the initial pack index is in flight,
+/// watched-file changes DEFER into a bounded set (one entry per distinct path)
+/// reconciled exactly once at completion; before/after the index they run
+/// immediately. The flag check and queue insert are atomic with the drain, so a
+/// save is neither dropped from the queue nor skipped by the normal path.
+#[test]
+fn pack_change_coordinator_defers_during_index_and_reconciles_once() {
+    let coord = PackChangeCoordinator::default();
+    let p = |s: &str| PathBuf::from(s);
+
+    // Not in flight → run immediately (no deferral).
+    assert!(!coord.note_change(&p("/w/a.h"), false));
+    assert!(!coord.is_in_flight());
+
+    // In flight → changes defer.
+    coord.begin_index();
+    assert!(coord.is_in_flight());
+    assert!(coord.note_change(&p("/w/a.h"), false));
+    assert!(coord.note_change(&p("/w/b.h"), false));
+    // A repeated save of one path collapses to a single entry; the latest
+    // delete flag wins (the reconcile reads current disk regardless).
+    assert!(coord.note_change(&p("/w/a.h"), true));
+
+    // Completion clears the flag and drains exactly the distinct deferred paths.
+    let mut drained = coord.finish_index();
+    drained.sort();
+    assert!(!coord.is_in_flight());
+    assert_eq!(drained.len(), 2, "distinct paths, deduped");
+    assert_eq!(drained[0], (p("/w/a.h"), true), "last a.h save was a delete");
+    assert_eq!(drained[1], (p("/w/b.h"), false));
+
+    // After completion, changes run immediately again and the set is empty.
+    assert!(!coord.note_change(&p("/w/c.h"), false));
+    assert!(coord.finish_index().is_empty());
+}
+
+/// H9-1 source-generation guard: a claim succeeds iff its generation is ≥ the
+/// one already registered, so a stale re-analysis (built from pre-save bytes →
+/// a lower generation) can never revert a fresher registration, while a
+/// serialized fresh re-registration (an equal-generation reconcile) still lands.
+#[test]
+fn claim_source_gen_orders_by_generation() {
+    let inv = PackInvalidator::default();
+    let p = Path::new("/fake/gen.cpp");
+    // First claim wins from the baseline.
+    assert!(inv.claim_source_gen(p, 5));
+    // Strictly-older is REJECTED (the stale-winner race).
+    assert!(!inv.claim_source_gen(p, 3));
+    // Equal generation ties succeed (the reconcile running after the bulk pass).
+    assert!(inv.claim_source_gen(p, 5));
+    // Newer wins and advances the watermark.
+    assert!(inv.claim_source_gen(p, 9));
+    assert!(!inv.claim_source_gen(p, 8));
+    // A different path is independent.
+    let q = Path::new("/fake/other.cpp");
+    assert!(inv.claim_source_gen(q, 1));
+    assert!(inv.claim_source_gen(p, 10));
+    // Forget resets to the baseline — a recreated file claims cleanly.
+    inv.forget_source_gen(p);
+    assert!(inv.claim_source_gen(p, 1));
+}
+
+#[cfg(feature = "cpp")]
+fn register_pair(
+    driver: &dyn crate::build::language_driver::LanguageDriver,
+    pack: &ModuleIndex,
+    paths: &[&Path],
+) {
+    for p in paths {
+        let src = std::fs::read_to_string(p).unwrap();
+        pack.register_symbols(p.to_path_buf(), Arc::new(driver.analyze_with_path(&src, Some(p))));
+    }
+}
+
+#[cfg(feature = "cpp")]
+fn arc_of(pack: &ModuleIndex, path: &Path) -> usize {
+    let mut found = None;
+    pack.for_each_registered_file(&mut |cm| {
+        if cm.path == path {
+            found = Some(Arc::as_ptr(&cm.analysis) as usize);
+        }
+    });
+    found.expect("registered")
+}
+
+/// The pack-tier surface gate through the ONE entry point: a body/comment-only
+/// edit in a header leaves its span-free surface unchanged, so `file_changed`
+/// re-analyzes the header ALONE — every registered consumer survives untouched
+/// AND the outcome's open-consumer set is empty (the gate covers both halves
+/// of the consumer answer; the changed file's own open doc still refreshes).
+/// A cross-file-visible edit (new method) re-analyzes consumers too and puts
+/// the open consumer in the outcome.
+#[cfg(feature = "cpp")]
+#[test]
+fn surface_gate_covers_registered_and_open_consumers() {
+    let dir = std::env::temp_dir().join(format!("pack-surface-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hdr = dir.join("box.h");
+    let tu = dir.join("use.cpp");
+    std::fs::write(&hdr, "class Box { public: int width() { return 1; } };\n").unwrap();
+    std::fs::write(&tu, "#include \"box.h\"\nint f() { Box b; return b.width(); }\n").unwrap();
+
+    let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+    let driver = reg.for_id("cpp").expect("cpp driver");
+    let hub = ModuleIndex::new_for_test();
+    let pack = Arc::new(ModuleIndex::new_for_test());
+    hub.attach_pack_index("cpp", pack.clone());
+    register_pair(driver, &pack, &[&hdr, &tu]);
+    let canon_tu = std::fs::canonicalize(&tu).unwrap();
+    let canon_hdr = std::fs::canonicalize(&hdr).unwrap();
+
+    // The TU is also OPEN — the outcome must answer the open half too.
+    let files = FileStore::new();
+    let tu_url = Url::from_file_path(&canon_tu).unwrap();
+    let hdr_url = Url::from_file_path(&canon_hdr).unwrap();
+    assert!(files.open(tu_url.clone(), std::fs::read_to_string(&tu).unwrap()));
+
+    // Sanity: the consumer edge exists (use.cpp's closure holds box.h).
+    let tu_before = arc_of(&pack, &canon_tu);
+    let hdr_before = arc_of(&pack, &canon_hdr);
+
+    let inv = PackInvalidator::default();
+
+    // Body-only edit: return value changes, surface identical.
+    std::fs::write(&hdr, "class Box { public: int width() { return 2; } };\n").unwrap();
+    let outcome = inv.file_changed(None, &hub, &files, &hdr, false);
+    assert!(!outcome.deferred);
+    assert_ne!(arc_of(&pack, &canon_hdr), hdr_before, "changed file re-registered");
+    assert_eq!(
+        arc_of(&pack, &canon_tu),
+        tu_before,
+        "surface unchanged: consumer registration must survive untouched"
+    );
+    assert!(
+        outcome.refresh_open.is_empty(),
+        "surface unchanged: open consumers must not re-gather (same gate as the \
+         registered storm); got {:?}",
+        outcome.refresh_open
+    );
+
+    // Cross-file-visible edit: a new method lands on the surface.
+    std::fs::write(
+        &hdr,
+        "class Box { public: int width() { return 2; } int height() { return 3; } };\n",
+    )
+    .unwrap();
+    let outcome = inv.file_changed(None, &hub, &files, &hdr, false);
+    assert_ne!(
+        arc_of(&pack, &canon_tu),
+        tu_before,
+        "surface changed: consumer must re-analyze"
+    );
+    assert_eq!(
+        outcome.refresh_open,
+        vec![tu_url],
+        "surface changed: the open consumer refreshes"
+    );
+
+    // The changed file's OWN open doc refreshes regardless of verdict.
+    assert!(files.open(hdr_url.clone(), std::fs::read_to_string(&hdr).unwrap()));
+    std::fs::write(&hdr, "class Box { public: int width() { return 3; } int height() { return 3; } };\n").unwrap();
+    let outcome = inv.file_changed(None, &hub, &files, &hdr, false);
+    assert!(
+        outcome.refresh_open.contains(&hdr_url),
+        "the edited file's own open doc always refreshes"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The guard applied at the invalidation swap: a re-analysis whose event
+/// generation is OLDER than the one registered leaves the fresher registration
+/// untouched (H9-1). Simulated by pre-claiming the max generation, so the real
+/// (mtime-derived) event generation of the edit loses.
+#[cfg(feature = "cpp")]
+#[test]
+fn pack_swap_skips_stale_generation() {
+    let dir = std::env::temp_dir().join(format!("pack-gen-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hdr = dir.join("box.h");
+    let tu = dir.join("use.cpp");
+    std::fs::write(&hdr, "class Box { public: int width() { return 1; } };\n").unwrap();
+    std::fs::write(&tu, "#include \"box.h\"\nint f() { Box b; return b.width(); }\n").unwrap();
+
+    let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+    let driver = reg.for_id("cpp").expect("cpp driver");
+    let hub = ModuleIndex::new_for_test();
+    let pack = Arc::new(ModuleIndex::new_for_test());
+    hub.attach_pack_index("cpp", pack.clone());
+    register_pair(driver, &pack, &[&hdr, &tu]);
+    let canon_hdr = std::fs::canonicalize(&hdr).unwrap();
+    let canon_tu = std::fs::canonicalize(&tu).unwrap();
+    let hdr_before = arc_of(&pack, &canon_hdr);
+    let tu_before = arc_of(&pack, &canon_tu);
+
+    let inv = PackInvalidator::default();
+    // A fresher writer already claimed the maximum generation for both paths.
+    assert!(inv.claim_source_gen(&canon_hdr, i64::MAX));
+    assert!(inv.claim_source_gen(&canon_tu, i64::MAX));
+
+    // A cross-file-visible edit whose event generation (mtime) is < MAX must be
+    // rejected at the swap — the stale re-analysis loses to nothing.
+    std::fs::write(
+        &hdr,
+        "class Box { public: int width() { return 2; } int height() { return 3; } };\n",
+    )
+    .unwrap();
+    inv.file_changed(None, &hub, &FileStore::new(), &hdr, false);
+    assert_eq!(arc_of(&pack, &canon_hdr), hdr_before, "stale header re-register skipped");
+    assert_eq!(arc_of(&pack, &canon_tu), tu_before, "stale consumer re-register skipped");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A change arriving mid-bulk-index defers (empty outcome) and lands via the
+/// `finish_bulk_index` reconcile — through the invalidator's own entry
+/// points, so the lock + coordinator + generation discipline are exercised
+/// as one subsystem.
+#[cfg(feature = "cpp")]
+#[test]
+fn file_changed_defers_during_bulk_index_and_reconciles() {
+    let dir = std::env::temp_dir().join(format!("pack-defer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hdr = dir.join("box.h");
+    std::fs::write(&hdr, "class Box { public: int width() { return 1; } };\n").unwrap();
+
+    let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+    let driver = reg.for_id("cpp").expect("cpp driver");
+    let hub = ModuleIndex::new_for_test();
+    let pack = Arc::new(ModuleIndex::new_for_test());
+    hub.attach_pack_index("cpp", pack.clone());
+    register_pair(driver, &pack, &[&hdr]);
+    let canon_hdr = std::fs::canonicalize(&hdr).unwrap();
+    let before = arc_of(&pack, &canon_hdr);
+
+    let inv = PackInvalidator::default();
+    inv.begin_bulk_index();
+    std::fs::write(&hdr, "class Box { public: int width() { return 1; } int h(); };\n").unwrap();
+    let outcome = inv.file_changed(None, &hub, &FileStore::new(), &hdr, false);
+    assert!(outcome.deferred, "mid-index change defers");
+    assert!(outcome.refresh_open.is_empty());
+    assert_eq!(arc_of(&pack, &canon_hdr), before, "deferred: no swap yet");
+
+    inv.finish_bulk_index(None, &hub);
+    assert_ne!(arc_of(&pack, &canon_hdr), before, "reconcile lands the deferred change");
+    let _ = std::fs::remove_dir_all(&dir);
+}

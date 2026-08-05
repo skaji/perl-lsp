@@ -39,14 +39,13 @@ impl Backend {
         let bag_cache_bytes =
             self.max_cache_mb.load(std::sync::atomic::Ordering::Relaxed) as usize * 1024 * 1024;
         // H9-2: mark the pack index in flight BEFORE it is scheduled, so a save
-        // racing the scheduling defers into the reconcile set instead of hitting
-        // an unattached (no-op) `pack_file_changed`. Perl uses the direct
-        // re-index path and never touches the coordinator.
-        let pack_coord = (!want_perl).then(|| Arc::clone(&self.pack_coord));
-        if let Some(ref coord) = pack_coord {
-            coord.begin_index();
+        // racing the scheduling defers into the invalidator's reconcile set
+        // instead of hitting an unattached (no-op) invalidation. Perl uses the
+        // direct re-index path and never touches the invalidator.
+        let pack_invalidator = (!want_perl).then(|| Arc::clone(&self.pack_invalidator));
+        if let Some(ref inv) = pack_invalidator {
+            inv.begin_bulk_index();
         }
-        let pack_change_lock = Arc::clone(&self.pack_change_lock);
         tokio::task::spawn_blocking(move || {
             // Announces completion (or the no-root early-out) to bounded waiters
             // on Drop — every exit path of this closure, panic included.
@@ -188,30 +187,12 @@ impl Backend {
                     )),
                 }));
             }
-            // H9-2: the pack sub-indexes are now attached. Reconcile every save
-            // that arrived DURING the index (deferred to avoid the no-op /
-            // uncoordinated-double-work window) exactly once, off the same
-            // serialization lock steady-state invalidations use. The H9-1
-            // generation guard makes this safe: each reconcile reads current
-            // disk (the freshest generation) and outranks whatever the bulk pass
-            // registered from earlier bytes.
-            if let Some(coord) = pack_coord {
-                let deferred = coord.finish_index();
-                if !deferred.is_empty() {
-                    log::debug!(
-                        "pack index complete: reconciling {} deferred change(s)",
-                        deferred.len()
-                    );
-                    let _g = pack_change_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    for (path, deleted) in deferred {
-                        crate::index::module_resolver::pack_file_changed(
-                            Some(root_uri.as_str()),
-                            &module_index,
-                            &path,
-                            deleted,
-                        );
-                    }
-                }
+            // H9-2: the pack sub-indexes are now attached — the invalidator
+            // reconciles every save deferred during the index exactly once
+            // (its own lock + H9-1 generation guard; open docs are covered by
+            // `heal_open_docs` below, so no per-path refresh set is needed).
+            if let Some(inv) = pack_invalidator {
+                inv.finish_bulk_index(Some(root_uri.as_str()), &module_index);
             }
             // Heal the cold-open degraded window: the index this file's family
             // needs has now ATTACHED (the latch marked KICKOFF; this is the

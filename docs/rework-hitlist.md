@@ -286,29 +286,24 @@ parameterized by `Option<ProgressClient>`.
 and asserts `loader_config_shapes` is fed (the current drift as a regression
 test); existing resolver/eviction tests.
 
-### D3. Pack invalidation is one subsystem smeared across Backend and module_resolver, its lock owned by the wrong side — **high leverage / M**
+### D3. LANDED — pack invalidation is one index-side subsystem (`PackInvalidator`)
 
-**The wrong embedding.** `pack_change_lock` and `pack_coord` are Backend
-fields (`src/lsp/backend/mod.rs:104,110`) guarding index-side state;
-`schedule_pack_invalidate` (`lifecycle.rs:340-393`) threads coordinator-check
-→ lock → `pack_file_changed` → its own open-consumer include-closure scan,
-while `pack_file_changed` re-spells the same membership rule over registered
-files (`module_resolver.rs:1989-1996`); the H9-2 reconcile in
-`indexing.rs:46-48,198-215` must independently remember to re-acquire the
-Backend-owned lock; `claim_source_gen` (H9-1) lives in a third home
-(`registration.rs:1020-1037`). A new invalidation entry point compiles while
-bypassing any of the three.
-
-**Target shape.** A `PackInvalidator` owned by the index layer: it owns the
-serialization lock, the coordinator, and the generation discipline, exposing
-`file_changed(path, deleted) -> InvalidationOutcome` and
-`finish_bulk_index()`, where the outcome carries the consumer PATH set (the
-include-closure rule spelled once). Backend shrinks to forwarding events and
-mapping returned paths onto open URIs — the same record→verdict→dirty binding
-`record_and_dirty` established for Perl freshness.
-
-**Gate.** The existing H9 race tests move with the owner; a compile-level
-guarantee that the only mutation entry points are the two methods.
+`src/index/pack_invalidator.rs` owns the serialization lock, the H9-2
+bulk-index coordinator (`PackChangeCoordinator`, relocated), and the H9-1
+source-generation guard (`claim_source_gen` + its map, relocated off
+`ModuleIndex`). Entry points: `file_changed(root, hub, open_docs, path,
+deleted) → InvalidationOutcome { deferred, refresh_open }` and
+`begin_bulk_index`/`finish_bulk_index`; the eviction/re-analysis/swap worker
+is private, so a new invalidation path cannot compile around lock,
+coordinator, or guard. The include-closure consumer rule is ONE predicate
+(`is_consumer`) applied to registered files and open docs alike; the
+realized drift — Backend refreshed open consumers even on an Unchanged
+surface verdict — is unified on the gated spelling (open consumers skip
+too; the changed file's own open doc always refreshes), pinned by
+`surface_gate_covers_registered_and_open_consumers`. Backend shrinks to
+forwarding events and publishing `refresh_open` through the gather
+single-flight. The H9 race tests live with the owner
+(`pack_invalidator_tests.rs`).
 
 ### D4. Blocking-ness of query paths is decided per-verb in handlers; three verbs still do SQLite/fs I/O on the reactor — **medium leverage / M**
 
@@ -348,8 +343,8 @@ when each site proves the invariant independently.
 probe closure) replacing the three await bodies, and `DebouncedLatest`
 (generation-captured settle-window debounce) replacing both spellings — which
 also gets the closure out of `Backend::new`. Leave `GatherRegistry`
-(unit-tested single-flight), `PackChangeCoordinator`, and `claim_source_gen`
-distinct; the latter two relocate under D3's owner.
+(unit-tested single-flight) distinct; `PackChangeCoordinator` and
+`claim_source_gen` now live under D3's `PackInvalidator`.
 
 **Gate.** Unit tests on the two primitives (the wakeup proof written once);
 existing indexing await tests.
@@ -588,7 +583,7 @@ setting `requires_action_attr` and asserting `begin` is NOT exempt.
    refs_present), G2, C2, F3.
 2. **Correctness-bearing seams (M):** E1 (SurfaceFeed + two backfills), A1
    (invocant ladder), B2 (builtins), B1 (diagnostics seams), G1 (Moo gate),
-   C1 (pack routing — LANDED), D3 (PackInvalidator), F1 (file_analysis
+   C1 (pack routing — LANDED), D3 (PackInvalidator — LANDED), F1 (file_analysis
    recut), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
    (IndexCore), A2 (highlights/linked-editing projections), F2 (monolith

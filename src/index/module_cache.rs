@@ -635,7 +635,7 @@ pub fn file_stamp(path: &std::path::Path) -> Option<(i64, i64)> {
 /// currency, unlike `file_stamp`'s hashed-and-sized equality token. A later
 /// save has a strictly greater value (editors write mtime = now, monotone
 /// forward even across git operations), so the registration guard can reject
-/// a re-analysis built from an EARLIER generation: `pack_file_changed`'s swap
+/// a re-analysis built from an EARLIER generation: the `PackInvalidator` swap
 /// registers a result only when its event generation is ≥ the one already
 /// registered for that path (H9-1 stale-winner race). `None` if unstattable.
 pub fn file_mtime_nanos(path: &std::path::Path) -> Option<i64> {
@@ -762,7 +762,7 @@ pub fn save_stub(conn: &Connection, path: &str, blob: &[u8]) {
 }
 
 /// Deferred-backfill guard: insert only while the modules row still carries
-/// `stamp`. A concurrent `pack_file_changed` may rewrite the row (deleting
+/// `stamp`. A concurrent pack invalidation may rewrite the row (deleting
 /// its stub) between the warm scan that encoded this stub and this deferred
 /// write — re-inserting would revive the pre-edit generation under a
 /// fresh-looking row.

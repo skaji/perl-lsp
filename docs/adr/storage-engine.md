@@ -114,13 +114,14 @@ Salsa"); revisit if the query graph deepens past what a dirty-set walk
 comfortably serves (e.g. the phase-4 materialized views below).
 
 Consumers: `Backend::refresh_dirty_open_consumers` re-enriches open Perl
-documents on a Changed verdict; `pack_file_changed`'s gate re-analyzes the
-changed file first and records its surface — an Unchanged verdict skips
-consumer eviction and re-analysis entirely (a deep-header comment edit
-re-parses one file, not every translation unit). Consumer discovery for
-the pack tier stays include-closure-based (the existing scan);
-`FreshnessIndex` needed no closure edge kind, only its equality half gates
-the pack tier.
+documents on a Changed verdict; `PackInvalidator::file_changed`'s gate
+(`src/index/pack_invalidator.rs`) re-analyzes the changed file first and
+records its surface — an Unchanged verdict skips consumer eviction and
+re-analysis entirely, open-document re-gathers included (a deep-header
+comment edit re-parses one file, not every translation unit). Consumer
+discovery for the pack tier stays include-closure-based (the one
+`is_consumer` rule in the invalidator); `FreshnessIndex` needed no closure
+edge kind, only its equality half gates the pack tier.
 
 ## Residency: the R4 enrichment overlay
 
