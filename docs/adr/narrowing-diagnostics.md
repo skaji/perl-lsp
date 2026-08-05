@@ -25,6 +25,12 @@ Every diagnostic routes through one of two `FileAnalysis` reads:
 A diagnostic that needs a new fact extends a seam; it does not grow a
 parallel walk.
 
+The structural-shape lint follows the same law: `unknown-hash-key` reads
+the `closed_shape_key_typos` / `projected_key_typos` seams (variable-base
+and expression-base spellings; `docs/adr/structural-shapes.md` owns the
+shape and trust-gate semantics), and the adapter only renders the
+`KeyTypoSite`s they return.
+
 ## D1 is the only always-on lint; the rest earn trust
 
 `undef-deref` is always-on `WARNING`: the lattice says the receiver *is*
@@ -170,7 +176,8 @@ a pack **capability** (declared like `implicit_this_members`), not a
   a DBIC Result class and `col` is one of its `Bridged` columns — a column
   isn't a hash slot, so the deref is `undef` (the author meant `$row->col`).
   Same thesis (ask the invocant type; the row answers "my columns aren't
-  slots"); the detection seam is TODO-marked in `collect_diagnostics`.
+  slots"); the detection seam is TODO-marked at
+  `FileAnalysis::closed_shape_key_typos`.
   **Blocked on HashRefInflator tracking**: with a `HashRefInflator` result
   class, find/search return plain hashrefs where `$row->{col}` IS valid, and
   we don't model that override yet — so the warning must gate on NOT-HRI first.

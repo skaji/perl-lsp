@@ -814,3 +814,21 @@ pub struct GuardRedundancy {
     pub predicate: GuardPredicate,
 }
 
+/// A read of a hash key that the base's CLOSED structural shape does not
+/// define — the unknown-hash-key finding, in neutral facts for the render
+/// layer. Produced by `FileAnalysis::closed_shape_key_typos` (variable base)
+/// and `projected_key_typos` (expression base).
+#[derive(Debug, Clone)]
+pub struct KeyTypoSite {
+    /// Diagnostic range (the keyed read).
+    pub span: Span,
+    /// The key as spelled at the read site.
+    pub key: String,
+    /// Every key the closed shape defines, untruncated — eliding long lists
+    /// is the renderer's call.
+    pub known_keys: Vec<String>,
+    /// The base's source spelling (`$config`, `%config`) when the base is a
+    /// variable; `None` for the expression-base spelling (`cfg()->{k}`).
+    pub spelling: Option<String>,
+}
+

@@ -139,45 +139,20 @@ caller of `inferred_type` remains.
 
 ## Theme B — Analysis belongs to the model; adapters render
 
-### B1. Diagnostic detection logic is semantic analysis embedded in the LSP adapter — **high leverage / M**
+### B1. Diagnostic detection logic is semantic analysis embedded in the LSP adapter — **LANDED**
 
-**The wrong embedding.** `src/lsp/symbols/diagnostics.rs` is chartered as a
-thin adapter (rule 3), but the closed-shape hash-key-typo pass walks
-`analysis.refs` with sigil gating, runs bag queries, matches `HashWithKeys`,
-and applies the whole-story trust gate inline (`diagnostics.rs:693-732`), and
-its expression-base sibling iterates `analysis.witnesses.all()` matching
-`WitnessPayload::Projected` and probing `Edge(Variable)` attachments
-(`:742-797`) — model-internal vocabulary leaked into the adapter. A repo grep
-shows every other non-test raw-witness iteration lives in
-`model/file_analysis`; these are the outliers. The SAME file demonstrates the
-sanctioned pattern (`deref_receiver_sites`, `guard_redundancies`,
-`untyped_dispatches` verdict seams at `:467/:541/:662`), and
-docs/adr/narrowing-diagnostics.md states the law: "a diagnostic that needs a
-new fact extends a seam; it does not grow a parallel walk." The misplacement
-also forces builder-layer tests to reach UP into
-`crate::lsp::symbols::collect_diagnostics`
-(`build/builder/tests/plugins_queries_tests.rs:190`).
-
-**Why it is wrong at the system level.** As long as the adapter is where
-detection accretes, each new lint grows another parallel walk there, and the
-model's whole-story/witness invariants get re-derived — and drift — outside
-the layer that owns them.
-
-**Target shape.** Two FileAnalysis query seams next to
-`closed_shape_is_whole_story`: `closed_shape_key_typos(&self,
-Option<&dyn CrossFileLookup>) -> Vec<KeyTypoSite>` owning the refs walk +
-gates, and `projected_key_typos(..)` owning the `Projected` enumeration, the
-base-is-variable exclusion, and the `expr_type_at_span` materialization. Both
-return a site struct (span, key, known_keys, spelling). diagnostics.rs shrinks
-to site → Diagnostic formatting; the `crate::model::witnesses` import leaves
-lsp/.
-
-**Migration order.** Standalone; anytime. Move the two loops, flip the builder
-tests to the seam.
-
-**Gate.** Builder tests assert on the seam without routing through lsp/; note
-in narrowing-diagnostics.md that unknown-hash-key rides a seam like D1-D6.
-Optional layering-test arm: no `crate::model::witnesses` import in `src/lsp/`.
+`unknown-hash-key` detection rides two FileAnalysis query seams next to
+`closed_shape_is_whole_story` (`queries.rs`): `closed_shape_key_typos`
+(the HashKeyAccess refs walk, sigil/write gating, bag query, closed-shape
+match, whole-story trust gate) and `projected_key_typos` (the `Projected`
+witness enumeration, the base-is-variable exclusion, the
+`expr_type_at_span` materialization). Both return `KeyTypoSite` (span, key,
+untruncated known_keys, base spelling — `dispatch.rs`, next to the other
+diagnostic site structs). `collect_diagnostics` renders sites into
+`Diagnostic`s (message wording, five-key elision, severity) and holds no
+`crate::model::witnesses` import; the builder-layer helper test asserts on
+`resolve_method_in_ancestors` instead of reaching up into lsp/.
+docs/adr/narrowing-diagnostics.md names the seams alongside D1-D6.
 
 ### B2. The Perl builtin surface is three parallel encodings across three layers — **LANDED**
 

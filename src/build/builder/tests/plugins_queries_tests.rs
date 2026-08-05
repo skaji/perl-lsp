@@ -182,28 +182,15 @@ sub session { my ($self, $key) = @_; }
         );
     }
 
-    // Part 5: no "unresolved-method" diagnostic for helper calls
-    // that now resolve cross-file. The diagnostic builder walks
-    // resolve_method_in_ancestors; our fix extends that to pick
-    // up plugin-emitted methods on parent classes declared
-    // elsewhere in the workspace.
-    let diags = crate::lsp::symbols::collect_diagnostics(&fa, &idx, Default::default());
-    for diag in &diags {
-        let msg = &diag.message;
+    // Part 5: helper calls resolve at the model seam. The ancestor walk
+    // picks up plugin-emitted methods on parent classes declared elsewhere
+    // in the workspace; the unresolved-method diagnostic consults this same
+    // walk, so it stays silent for these by construction.
+    for helper in ["users", "admin", "current_user"] {
         assert!(
-            !msg.contains("'users' is not defined"),
-            "no diagnostic for helper middle hop `users`; got: {}",
-            msg
-        );
-        assert!(
-            !msg.contains("'admin' is not defined"),
-            "no diagnostic for helper middle hop `admin`; got: {}",
-            msg
-        );
-        assert!(
-            !msg.contains("'current_user' is not defined"),
-            "no diagnostic for helper `current_user`; got: {}",
-            msg
+            fa.resolve_method_in_ancestors("Users", helper, Some(&*idx)).is_some(),
+            "helper `{}` must resolve on Users through the app-surface bridge",
+            helper
         );
     }
 }

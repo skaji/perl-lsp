@@ -784,6 +784,119 @@ impl FileAnalysis {
         !self.reassigned_scalars.contains(var_text)
     }
 
+    /// Closed-shape hash-key typo sites: a READ of `$config->{typo}` where
+    /// `$config`'s structural literal is CLOSED (no spread, no dynamic key)
+    /// and doesn't define the key. Writes are skipped — assigning a new key
+    /// extends the shape, it isn't a typo. Open shapes are skipped — the
+    /// spread may carry the key. The whole-story gate skips reassigned/
+    /// escaped vars (the trust-gate stand-in for the unmodeled lattice
+    /// widenings — docs/adr/structural-shapes.md).
+    //
+    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is a DBIC Result
+    // class and `col` is a `Bridged` column — a column isn't a hash slot, so the
+    // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
+    // → class → `field_projections_named` has a bridged column for the key), but
+    // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
+    // which we don't model yet. Spec: docs/adr/narrowing-diagnostics.md (Forward work).
+    pub fn closed_shape_key_typos(
+        &self,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<KeyTypoSite> {
+        let mut out = Vec::new();
+        for r in &self.refs {
+            let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
+            // `$config->{k}` (scalar holding a hashref) and `$config{k}`
+            // (literal `%config`, canonical var_text) — same model, both
+            // spellings.
+            if !(var_text.starts_with('$') || var_text.starts_with('%')) {
+                continue;
+            }
+            if matches!(r.access, AccessKind::Write) {
+                continue;
+            }
+            let Some(t) =
+                self.inferred_type_via_bag_ctx(var_text, r.span.start, module_index)
+            else {
+                continue;
+            };
+            let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+            if keys.iter().any(|(k, _)| k == &r.target_name) {
+                continue;
+            }
+            if !self.closed_shape_is_whole_story(var_text) {
+                continue;
+            }
+            out.push(KeyTypoSite {
+                span: r.span,
+                key: r.target_name.clone(),
+                known_keys: keys.iter().map(|(k, _)| k.clone()).collect(),
+                spelling: Some(var_text.clone()),
+            });
+        }
+        out
+    }
+
+    /// The expression-base spelling of the same typo: `cfg()->{kye}` /
+    /// `$obj->get_config->{kye}` — no variable in hand, so the ref walk in
+    /// `closed_shape_key_typos` can't see it. The drill's own Projected
+    /// witness encodes exactly the (base, key) pair; materialize the base
+    /// (the registry chases through call returns, cross-file included) and
+    /// apply the same closed-shape check. No whole-story gate: the value is
+    /// freshly produced, and the producer's own mutation/escape widening
+    /// already rode along on its shape.
+    pub fn projected_key_typos(
+        &self,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<KeyTypoSite> {
+        use crate::model::witnesses::{ProjectionStep, WitnessAttachment, WitnessPayload};
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<(Span, &str)> = std::collections::HashSet::new();
+        for w in self.witnesses.all() {
+            let WitnessPayload::Projected {
+                base: WitnessAttachment::Expr(base_span),
+                step: ProjectionStep::HashKey(ref key),
+            } = w.payload
+            else {
+                continue;
+            };
+            if !seen.insert((w.span, key.as_str())) {
+                continue;
+            }
+            // A base that is a bare variable read (its Expr attachment
+            // edges to a Variable) is `closed_shape_key_typos`'s territory —
+            // it carries the whole-story gate this walk deliberately
+            // doesn't. Materializing it here would bypass the gate
+            // (the Compiler.pm conditional-reassignment FP).
+            let base_is_variable = self
+                .witnesses
+                .for_attachment(&WitnessAttachment::Expr(base_span))
+                .iter()
+                .any(|bw| {
+                    matches!(
+                        bw.payload,
+                        WitnessPayload::Edge(WitnessAttachment::Variable { .. })
+                    )
+                });
+            if base_is_variable {
+                continue;
+            }
+            let Some(t) = self.expr_type_at_span(base_span, module_index) else {
+                continue;
+            };
+            let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
+            if keys.iter().any(|(k, _)| k == key) {
+                continue;
+            }
+            out.push(KeyTypoSite {
+                span: w.span,
+                key: key.clone(),
+                known_keys: keys.iter().map(|(k, _)| k.clone()).collect(),
+                spelling: None,
+            });
+        }
+        out
+    }
+
     /// Get the return type of a named sub/method (local definitions
     /// only). Routes through the bag — `Symbol(sid)` writeback witness
     /// is the post-field-deletion authority. Returns owned because

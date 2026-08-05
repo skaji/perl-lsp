@@ -626,126 +626,42 @@ pub fn collect_diagnostics(
         }
     }
 
-    // Closed-shape hash-key typo: a READ of `$config->{typo}` where
-    // `$config`'s structural literal is CLOSED (no spread, no dynamic
-    // key) and doesn't define the key. Writes are skipped — assigning a
-    // new key extends the shape, it isn't a typo. Open shapes are
-    // skipped — the spread may carry the key. The whole-story gate
-    // skips reassigned/escaped vars (the trust-gate stand-in for the
-    // unmodeled lattice widenings — docs/adr/structural-shapes.md).
-    // HINT severity, per the quiet-by-design diagnostics convention.
-    //
-    // TODO(dbic-row-deref): warn on `$row->{col}` where `$row` is a DBIC Result
-    // class and `col` is a `Bridged` column — a column isn't a hash slot, so the
-    // deref is `undef` (meant `$row->col`). Detection seam is here (invocant type
-    // → class → `field_projections_named` has a bridged column for the key), but
-    // it must gate on NOT-HashRefInflator first (where `$row->{col}` IS valid),
-    // which we don't model yet. Spec: docs/adr/narrowing-diagnostics.md (Forward work).
-    use crate::model::file_analysis::InferredType;
-    for r in &analysis.refs {
-        let RefKind::HashKeyAccess { ref var_text, .. } = r.kind else { continue };
-        // `$config->{k}` (scalar holding a hashref) and `$config{k}`
-        // (literal `%config`, canonical var_text) — same model, both
-        // spellings.
-        if !(var_text.starts_with('$') || var_text.starts_with('%')) {
-            continue;
-        }
-        if matches!(r.access, crate::model::file_analysis::AccessKind::Write) {
-            continue;
-        }
-        let Some(t) =
-            analysis.inferred_type_via_bag_ctx(var_text, r.span.start, Some(module_index))
-        else {
-            continue;
-        };
-        let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
-        if keys.iter().any(|(k, _)| k == &r.target_name) {
-            continue;
-        }
-        if !analysis.closed_shape_is_whole_story(var_text) {
-            continue;
-        }
-        let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
-        if keys.len() > 5 {
+    // Unknown-hash-key: reads of keys a CLOSED structural shape doesn't
+    // define, in both spellings — variable base (`$config->{typo}`) and
+    // expression base (`cfg()->{typo}`). Detection and the trust gates live
+    // on the seams (`closed_shape_key_typos` / `projected_key_typos`);
+    // here the site renders. HINT severity, per the quiet-by-design
+    // diagnostics convention; long key lists elide past five.
+    for site in analysis
+        .closed_shape_key_typos(Some(module_index))
+        .into_iter()
+        .chain(analysis.projected_key_typos(Some(module_index)))
+    {
+        let mut known: Vec<&str> =
+            site.known_keys.iter().map(String::as_str).take(5).collect();
+        if site.known_keys.len() > 5 {
             known.push("...");
         }
-        diagnostics.push(Diagnostic {
-            range: span_to_range(r.span),
-            severity: Some(DiagnosticSeverity::HINT),
-            code: Some(NumberOrString::String("unknown-hash-key".into())),
-            message: format!(
+        let message = match &site.spelling {
+            Some(base) => format!(
                 "key '{}' is not in {}'s literal shape (keys: {})",
-                r.target_name,
-                var_text,
+                site.key,
+                base,
                 known.join(", "),
             ),
+            None => format!(
+                "key '{}' is not in this expression's literal shape (keys: {})",
+                site.key,
+                known.join(", "),
+            ),
+        };
+        diagnostics.push(Diagnostic {
+            range: span_to_range(site.span),
+            severity: Some(DiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("unknown-hash-key".into())),
+            message,
             ..Default::default()
         });
-    }
-
-    // The expression-base spelling of the same typo: `cfg()->{kye}` /
-    // `$obj->get_config->{kye}` — no variable in hand, so the ref loop
-    // above can't see it. The drill's own Projected witness encodes
-    // exactly the (base, key) pair; materialize the base (the registry
-    // chases through call returns, cross-file included) and apply the
-    // same closed-shape check. No whole-story gate: the value is
-    // freshly produced, and the producer's own mutation/escape
-    // widening already rode along on its shape.
-    {
-        use crate::model::witnesses::{ProjectionStep, WitnessAttachment, WitnessPayload};
-        let mut seen: std::collections::HashSet<(Span, &str)> = std::collections::HashSet::new();
-        for w in analysis.witnesses.all() {
-            let WitnessPayload::Projected {
-                base: WitnessAttachment::Expr(base_span),
-                step: ProjectionStep::HashKey(ref key),
-            } = w.payload
-            else {
-                continue;
-            };
-            if !seen.insert((w.span, key.as_str())) {
-                continue;
-            }
-            // A base that is a bare variable read (its Expr attachment
-            // edges to a Variable) is the ref loop's territory — it
-            // carries the whole-story gate this loop deliberately
-            // doesn't. Materializing it here would bypass the gate
-            // (the Compiler.pm conditional-reassignment FP).
-            let base_is_variable = analysis
-                .witnesses
-                .for_attachment(&WitnessAttachment::Expr(base_span))
-                .iter()
-                .any(|bw| {
-                    matches!(
-                        bw.payload,
-                        WitnessPayload::Edge(WitnessAttachment::Variable { .. })
-                    )
-                });
-            if base_is_variable {
-                continue;
-            }
-            let Some(t) = analysis.expr_type_at_span(base_span, Some(module_index)) else {
-                continue;
-            };
-            let InferredType::HashWithKeys { ref keys, open: false } = t else { continue };
-            if keys.iter().any(|(k, _)| k == key) {
-                continue;
-            }
-            let mut known: Vec<&str> = keys.iter().map(|(k, _)| k.as_str()).take(5).collect();
-            if keys.len() > 5 {
-                known.push("...");
-            }
-            diagnostics.push(Diagnostic {
-                range: span_to_range(w.span),
-                severity: Some(DiagnosticSeverity::HINT),
-                code: Some(NumberOrString::String("unknown-hash-key".into())),
-                message: format!(
-                    "key '{}' is not in this expression's literal shape (keys: {})",
-                    key,
-                    known.join(", "),
-                ),
-                ..Default::default()
-            });
-        }
     }
 
     diagnostics
