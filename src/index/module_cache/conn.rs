@@ -1,0 +1,203 @@
+//! Cache-dir layout and connection opening: the writer open (schema
+//! init, WAL, busy handling) and the resilient read-only / read-write
+//! reader opens that survive the WAL-checkpoint CANTOPEN window.
+
+use super::*;
+
+pub fn cache_base_dir() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("perl-lsp"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return Some(PathBuf::from(home).join(".cache").join("perl-lsp"));
+    }
+    None
+}
+
+pub fn cache_dir_for_workspace(workspace_root: Option<&str>) -> Option<PathBuf> {
+    let base = cache_base_dir()?;
+    match workspace_root {
+        Some(root) => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            root.hash(&mut hasher);
+            Some(base.join(format!("{:016x}", hasher.finish())))
+        }
+        None => Some(base),
+    }
+}
+
+/// Per-language DB filename — Perl keeps `modules.db` (back-compat), every
+/// pack language gets its own `modules-{lang}.db` so names never comingle on
+/// disk (a Perl `Box` and a C++ class `Box` live in different files). The
+/// ONE spelling both openers share.
+// Every consumer is a real-DB opener, itself `#[cfg(not(test))]` (tests
+// stub the opens out) — match their cfg so the test profile stays clean.
+#[cfg(not(test))]
+pub(super) fn db_path_for(dir: &std::path::Path, lang: &str) -> PathBuf {
+    if lang == "perl" {
+        dir.join("modules.db")
+    } else {
+        dir.join(format!("modules-{lang}.db"))
+    }
+}
+
+#[cfg(not(test))]
+pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
+    let dir = cache_dir_for_workspace(workspace_root)?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let db_path = db_path_for(&dir, lang);
+    log::info!("Module cache: {:?}", db_path);
+
+    match Connection::open(&db_path) {
+        Ok(conn) => {
+            let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+            // Two writers share the Perl DB (resolver thread + workspace
+            // indexer); a busy writer must wait, not fail its txn — a failed
+            // commit after resident copies were stripped is unrecoverable
+            // for the session.
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+            match init_schema(&conn) {
+                Ok(()) => Some(conn),
+                Err(e) => {
+                    // BUSY/LOCKED is contention (a sibling writer mid-init,
+                    // e.g. the one-time idx_modules_path build) — deleting
+                    // the live DB under its feet loses every blob the other
+                    // writer stripped against. Only recreate on real
+                    // corruption/shape failures.
+                    if matches!(
+                        e.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy)
+                            | Some(rusqlite::ErrorCode::DatabaseLocked)
+                    ) {
+                        log::warn!("Cache DB busy during init; running without cache: {}", e);
+                        return None;
+                    }
+                    log::warn!("Cache DB schema init failed: {}. Recreating.", e);
+                    drop(conn);
+                    let _ = std::fs::remove_file(&db_path);
+                    let conn = Connection::open(&db_path).ok()?;
+                    let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+                    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+                    init_schema(&conn).ok()?;
+                    Some(conn)
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!("Failed to open cache DB: {}", e);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn open_cache_db(_workspace_root: Option<&str>, _lang: &str) -> Option<Connection> {
+    None
+}
+
+/// Read-only open for query-path consumers (the relational retrieval, bag
+/// rehydration): no schema init, no WAL pragma churn — the writer created
+/// the schema. Returns `None` when the DB file doesn't exist yet (nothing
+/// persisted → no candidates), or in tests.
+#[cfg(not(test))]
+pub fn open_cache_db_readonly(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
+    let dir = cache_dir_for_workspace(workspace_root)?;
+    open_cache_reader_at(&db_path_for(&dir, lang))
+}
+
+/// Resilient query-path reader open (`open_reader_retrying`): retries across
+/// the transient CANTOPEN window a writer's WAL checkpoint opens instead of
+/// returning an empty result.
+/// Routing every reader — bag rehydration, the relational-ref reader, warm
+/// streaming — through here keeps the writer's WAL-checkpoint window from
+/// degrading their results to silent absence. `None` only when the window
+/// never clears (DB absent / truly unreadable).
+// Sole consumer is the real read-only opener above, `#[cfg(not(test))]` —
+// match its cfg.
+#[cfg(not(test))]
+pub fn open_cache_reader_at(db_path: &std::path::Path) -> Option<Connection> {
+    open_reader_retrying(db_path).ok()
+}
+
+/// Open the cache reader across the transient window a writer's WAL
+/// checkpoint/reset opens. During it a fresh open of the WAL-mode DB (SQLite
+/// setting up the `-wal`/`-shm` auxiliaries) returns `SQLITE_CANTOPEN` for
+/// BOTH read-only and read-write modes — and
+/// `busy_timeout` does NOT cover the open itself. Each attempt tries
+/// read-only then read-write (a read-write open additionally recovers a WAL
+/// a read-only open can't map); bounded backoff (~0.26 s total) waits the
+/// window out. `Err` only when the window never clears — a genuinely
+/// unreadable DB, a real invariant break the strict tripwire should catch.
+pub fn open_reader_retrying(db_path: &std::path::Path) -> Result<Connection, String> {
+    let mut delay = std::time::Duration::from_millis(2);
+    let mut last = String::new();
+    for attempt in 0..10 {
+        match open_readonly_at(db_path) {
+            Ok(c) => {
+                if attempt > 0 {
+                    log::warn!(
+                        "cache reader open {db_path:?} recovered read-only after \
+                         {attempt} retr{} (transient WAL-checkpoint CANTOPEN window)",
+                        if attempt == 1 { "y" } else { "ies" }
+                    );
+                }
+                return Ok(c);
+            }
+            Err(e) => last = e,
+        }
+        // Reaching here means the read-only open just failed; a read-write
+        // open that succeeds recovered the transient window. Log even on
+        // attempt 0 so an RW recovery is observable, never silent.
+        if let Some(c) = open_rw_shared_at(db_path) {
+            log::warn!(
+                "cache reader open {db_path:?} recovered read-write on attempt \
+                 {attempt} (read-only hit the transient CANTOPEN window)"
+            );
+            return Ok(c);
+        }
+        if attempt < 9 {
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(std::time::Duration::from_millis(50));
+        }
+    }
+    Err(last)
+}
+
+/// Read-only open of an explicit DB file. Path-taking so the rehydration
+/// logic is unit-testable without the cache-dir plumbing.
+pub fn open_readonly_at(db_path: &std::path::Path) -> Result<Connection, String> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("readonly open {db_path:?}: {e}"))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+    Ok(conn)
+}
+
+/// Read-WRITE open (no CREATE) of an explicit, already-persisted DB file —
+/// the WAL-checkpoint recovery open. A fresh `SQLITE_OPEN_READ_ONLY` open of a
+/// WAL-mode cache DB transiently fails with `SQLITE_CANTOPEN` while a
+/// sibling writer is mid-`wal_checkpoint` (the -wal is being truncated and
+/// the -shm reset; a read-only conn can't rebuild the wal-index in that
+/// window). A read-write open recovers the WAL and, via `busy_timeout`,
+/// waits the writer out — so the blob that is on disk the whole time stays
+/// reachable. The captured cause of the strict-residency crash.
+pub fn open_rw_shared_at(db_path: &std::path::Path) -> Option<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+    Some(conn)
+}
+
+#[cfg(test)]
+pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Option<Connection> {
+    None
+}

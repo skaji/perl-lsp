@@ -11,7 +11,7 @@
 //!
 //! See also:
 //! - `module_resolver/` — resolver thread, in-process parsing
-//! - `module_cache.rs` — SQLite persistence (schema v9, bincode+zstd blobs)
+//! - `module_cache/` — SQLite persistence (schema v9, bincode+zstd blobs)
 //! - `cpanfile.rs` — cpanfile parsing
 
 #[cfg(test)]

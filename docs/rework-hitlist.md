@@ -395,20 +395,21 @@ Surface classification gate in `surface_feed.rs`; the resolution residue is
 `invocants.rs` (target-at-cursor, the invocant/dispatch ladders, role
 contracts, class-content predicates), un-shadowing `index/resolve/`.
 
-### F2. module_resolver.rs and module_cache.rs are the two monoliths the restructure skipped — **high leverage / L**
+### F2. LANDED — module_resolver and module_cache are directories of focused parts
 
-The two largest flat production files (2189 and 1944 lines) against the repo's
-own "oversized modules are directories of focused parts" doctrine, and they
-are where the parked storage residuals and language-path unification must
-land. `index/module_resolver/` → `thread.rs`, `inc.rs`, `index_perl.rs`,
-`index_pack.rs`, `persist.rs`, `watch.rs`; `index/module_cache/` → `conn.rs`,
-`schema.rs`, `blob.rs`, `rows.rs`, `stubs.rs`, `warm.rs`. The
-`index_perl.rs`/`index_pack.rs` sibling cut is the leverage: it turns the
-parked convergence into a confrontable two-file diff instead of archaeology
-inside one 2.2k-line file. Motion must preserve the ordering invariants
-(stub delete inside `save_to_db`; register-after-chunk-commit) — they are
-invariants, not file-local details. Sequence after D2 (IndexCore) or accept
-one rebase. Gate: pure code motion; residency tripwire + eviction tests.
+`index/module_resolver/`: `thread.rs` (the one resolver loop), `inc.rs`
+(@INC discovery + module-file parse with the parent-fallback memo),
+`index_perl.rs` / `index_pack.rs` (the sibling bulk indexers — the
+confrontable two-file diff for the parked language-path convergence),
+`persist.rs` (residency policy + `run_persist_writer` + the stamp-guarded
+analyze protocol); `index/module_cache/`: `conn.rs` (opens), `schema.rs`
+(DDL + generation gates), `blob.rs` (codec + stamps + rehydration),
+`rows.rs` (relational store), `stubs.rs`, `warm.rs` (the three warm
+lanes). mod.rs keeps entry points and glob re-exports, so public paths and
+the whole-copy registration allowlist counts are unchanged; the ordering
+invariants (stub delete inside `save_to_db`; register-after-chunk-commit)
+moved intact inside their functions. (`watch.rs` was already D3's
+`pack_invalidator.rs`.)
 
 ### F3. LANDED — helpers.rs and infra.rs families live with their sibling seams
 
@@ -496,7 +497,7 @@ declares no names exempts nothing, pinned by
    recut — LANDED), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
    (IndexCore — LANDED), A2 (highlights/linked-editing projections — LANDED), F2
-   (monolith directories, after D2), A3/A4, D4/D5, E3 (LANDED).
+   (monolith directories — LANDED), A3/A4, D4/D5, E3 (LANDED).
 4. **The arc:** E2 phases 2-3 (+ E4 alongside).
 
 ---
