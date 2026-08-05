@@ -816,7 +816,7 @@ pub(super) fn collect_package_var(
                     label: None
                 });
             }
-        } else if r.target_name == name && r.resolves_to.is_some_and(is_our_decl) {
+        } else if r.target_name == name && r.resolved_symbol().is_some_and(is_our_decl) {
             // Unqualified — only this package's `our` var (resolved in-file).
             out.push(RefLocation {
                 key: key.clone(),
@@ -1015,7 +1015,7 @@ pub(super) fn collect_from_analysis(
         // invariant. Filter is a single scope comparison.
         let matches_kind = alias_matched || match (&target.kind, &r.kind) {
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
-             RefKind::FunctionCall { resolved_package }) => {
+             RefKind::FunctionCall) => {
                 // callable_scope_for_refs is derived from the same target.kind
                 // match above; a mismatch means malformed input rather than a
                 // real match, so skip this ref instead of asserting the invariant.
@@ -1026,7 +1026,7 @@ pub(super) fn collect_from_analysis(
                 // whole override family); Dispatch keeps the strict single
                 // scope. A bare imported call the single-file walk couldn't pin
                 // (`use Bank;` auto-imports `@EXPORT`, invisible at build) has
-                // `resolved_package: None` — re-derive it here, where the index
+                // no `Function` binding — re-derive it here, where the index
                 // is in hand.
                 // Relative-namespace semantics apply to namespace-scoped Subs
                 // only: a Method target's scope is a CLASS, which an
@@ -1059,8 +1059,8 @@ pub(super) fn collect_from_analysis(
                         || (target.scope == OverrideScope::Hierarchy
                             && target.method_classes.iter().any(|c| Some(c) == pkg.as_ref()))
                 };
-                match resolved_package {
-                    Some(_) => pkg_matches(resolved_package),
+                match r.resolved_package() {
+                    Some(pinned) => pkg_matches(&Some(pinned.to_string())),
                     None => {
                         // Unqualified + unresolved: derive the caller's own
                         // enclosing namespace positionally (pack) — a plain
@@ -1080,8 +1080,8 @@ pub(super) fn collect_from_analysis(
             }
             (TargetKind::Sub { .. } | TargetKind::Method { .. },
              RefKind::MethodCall { .. }) => {
-                // Prefer the build-time-frozen dispatch edge
-                // (`resolved_method_target`) so a call that resolved at build
+                // Prefer the build-time-frozen dispatch edge (the `Method`
+                // binding) so a call that resolved at build
                 // time stays matched regardless of query-time inference. An
                 // absent edge means build-time lacked cross-file info (SUPER
                 // into a cross-file parent; enrichment re-stamps OPEN docs
@@ -1097,7 +1097,7 @@ pub(super) fn collect_from_analysis(
                 };
                 let method = r.unqualified_target_name();
                 {
-                    let resolved_class = match r.resolved_method_target.as_ref() {
+                    let resolved_class = match r.method_target() {
                         // The frozen edge can carry an UNRESOLVED DBIC source
                         // moniker (`Artist`) when it was stamped at build with
                         // no index (a closed call-site file — enrichment
@@ -1166,7 +1166,7 @@ pub(super) fn collect_from_analysis(
             // it binds the target's own class content (a genuinely-local
             // variable — even one carrying the class as sticky package —
             // stays out via the structural gate).
-            (TargetKind::Method { class }, RefKind::Variable) => match r.resolves_to {
+            (TargetKind::Method { class }, RefKind::Variable) => match r.resolved_symbol() {
                 None => target.bare_constant || bare_constant_member,
                 Some(id) => {
                     let s = analysis.symbol(id);
@@ -1192,7 +1192,7 @@ pub(super) fn collect_from_analysis(
             // constant), a type-position token (a type-alias `#define` used as
             // a declared type), or an unresolved call (function-like macro —
             // a package-pinned call belongs to that package's sub, not here).
-            (TargetKind::FileScopeValue, RefKind::Variable) => match r.resolves_to {
+            (TargetKind::FileScopeValue, RefKind::Variable) => match r.resolved_symbol() {
                 None => true,
                 Some(id) => {
                     let s = analysis.symbol(id);
@@ -1202,12 +1202,12 @@ pub(super) fn collect_from_analysis(
                 }
             },
             (TargetKind::FileScopeValue, RefKind::PackageRef) => true,
-            (TargetKind::FileScopeValue, RefKind::FunctionCall { resolved_package }) => {
-                resolved_package.is_none()
+            (TargetKind::FileScopeValue, RefKind::FunctionCall) => {
+                r.resolved_package().is_none()
             }
             (
                 TargetKind::HashKeyOfSub { package, name },
-                RefKind::HashKeyAccess { owner, .. },
+                RefKind::HashKeyAccess { .. },
             ) => {
                 // The owning-sub match, widened across inheritance for
                 // CONSTRUCTOR keys: a base attr's ctor key
@@ -1228,7 +1228,7 @@ pub(super) fn collect_from_analysis(
                                 _ => false,
                             })
                 };
-                match owner {
+                match r.hash_key_owner() {
                     Some(HashKeyOwner::Sub { package: op, name: on }) => sub_matches(op, on),
                     // owner `None` (build gate blind) OR `Variable` (the var is
                     // bound to an imported call enrichment didn't reach in this
@@ -1243,14 +1243,14 @@ pub(super) fn collect_from_analysis(
                         }),
                 }
             },
-            (TargetKind::HashKeyOfBridged(wanted), RefKind::HashKeyAccess { owner, .. }) => {
+            (TargetKind::HashKeyOfBridged(wanted), RefKind::HashKeyAccess { .. }) => {
                 // A DBIC/Class::Accessor column. Its key uses are the
                 // condition args (`$rs->search({ col => … })`), owned by the
                 // `Column` namespace — NOT `$row->{col}` derefs, which carry a
                 // `Class` lookup and so never match here (a column isn't a hash
                 // slot). The owner-`None` case is the cross-file deferred arg key.
                 let target_owner = HashKeyOwner::Bridged { class: wanted.clone() };
-                match owner {
+                match r.hash_key_owner() {
                     Some(o) => o.found_by(&target_owner),
                     None => analysis
                         .deferred_hash_key_owner(r, module_index)
@@ -1258,22 +1258,22 @@ pub(super) fn collect_from_analysis(
                 }
             }
             (TargetKind::InternalHashKey { class },
-             RefKind::HashKeyAccess { owner, .. }) => {
+             RefKind::HashKeyAccess { .. }) => {
                 // STRICT Class-owner shape (see the kind's doc), widened
                 // only by ancestry: a subclass poking `$self->{attr}` owns
                 // the access as ITS class — `Gadget isa Widget` ties it to
                 // Widget's attr. Never `found_by` (Sub-owned arg keys stay
                 // out).
                 matches!(
-                    owner,
+                    r.hash_key_owner(),
                     Some(HashKeyOwner::Class(c))
                         if c == class || analysis.class_isa(c, class, module_index)
                 )
             }
             (TargetKind::Handler { owner, name: hname },
-             RefKind::DispatchCall { owner: ref_owner, .. }) => {
+             RefKind::DispatchCall { .. }) => {
                 r.target_name == *hname
-                    && matches!(ref_owner, Some(o) if o == owner)
+                    && matches!(r.handler_owner(), Some(o) if o == owner)
             }
             _ => false,
         };

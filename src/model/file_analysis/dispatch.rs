@@ -631,14 +631,17 @@ pub struct GatedSymbol {
 }
 
 /// One ref inside a [`GatedEmission`]. Scope is resolved at apply from the
-/// emission's `scope_point`; `resolves_to` is left for the enrichment
-/// re-index to link (HashKeyAccess → HashKeyDef) the same way build does.
+/// emission's `scope_point`; `binding` carries the plugin-declared owner —
+/// its linked symbol is left for the enrichment re-index to fill
+/// (HashKeyAccess → HashKeyDef) the same way build does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatedRef {
     pub kind: RefKind,
     pub span: Span,
     pub target_name: String,
     pub access: AccessKind,
+    #[serde(default)]
+    pub binding: Option<RefBinding>,
 }
 
 /// A confirmed dispatch — a gated candidate whose receiver isa-resolved at

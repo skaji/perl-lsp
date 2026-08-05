@@ -323,7 +323,7 @@ pub(super) fn build_with_plugins_inner(
     // ones.
     b.flush_deferred_named_sub_param_types();
 
-    // Post-pass 1: resolve variable refs -> resolves_to
+    // Post-pass 1: resolve variable refs -> Symbol bindings
     bphase!("resolve_variable_refs", b.resolve_variable_refs());
 
     // Value-flow capture: run the declarative `@flow` query (the assignment
@@ -647,10 +647,10 @@ impl<'a> Builder<'a> {
         let mut mutations: Vec<(HashKeyOwner, String, Span)> = Vec::new();
         let mut slot_writes: Vec<(String, String, Span, Span)> = Vec::new();
         for r in &self.refs {
-            if let (RefKind::HashKeyAccess { owner, var_text }, AccessKind::Write) =
+            if let (RefKind::HashKeyAccess { var_text }, AccessKind::Write) =
                 (&r.kind, r.access)
             {
-                let resolved_owner = match owner {
+                let resolved_owner = match r.hash_key_owner() {
                     Some(o @ (HashKeyOwner::Class(_) | HashKeyOwner::Sub { .. })) => Some(o.clone()),
                     _ => {
                         if var_text == "$self" {
@@ -844,14 +844,14 @@ impl<'a> Builder<'a> {
 
         // Bareword calls to these subs were visited during the walk before the
         // synthesized symbols existed, so `resolve_call_package` left their
-        // `FunctionCall` ref unresolved (`resolved_package: None`). Pin any such
+        // `FunctionCall` ref unpinned (no `Function` binding). Pin any such
         // ref — within the owning package's source region and naming a sub we
         // just synthesized — to `pkg`, so goto-def lands on the data-section
         // definition. Scoped to autoload-backed packages: we only touch refs
         // whose target is one of the freshly minted names.
         for r in self.refs.iter_mut() {
-            if let RefKind::FunctionCall { resolved_package } = &mut r.kind {
-                if resolved_package.is_none() && synth_names.contains(&r.target_name) {
+            if matches!(r.kind, RefKind::FunctionCall) {
+                if r.binding.is_none() && synth_names.contains(&r.target_name) {
                     let in_pkg = self
                         .package_ranges
                         .iter()
@@ -859,7 +859,7 @@ impl<'a> Builder<'a> {
                         .find(|pr| crate::model::file_analysis::contains_point(&pr.span, r.span.start))
                         .is_some_and(|pr| pr.package == pkg);
                     if in_pkg {
-                        *resolved_package = Some(pkg.clone());
+                        r.bind_function_package(pkg.clone());
                     }
                 }
             }

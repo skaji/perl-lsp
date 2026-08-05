@@ -249,14 +249,12 @@ $rs->SUPER::search({{ name => 'X' }});
     let r = fa.ref_at(key).expect("name key ref");
     assert!(
         matches!(
-            &r.kind,
-            RefKind::HashKeyAccess {
-                owner: Some(crate::model::file_analysis::HashKeyOwner::Bridged { class }),
-                ..
-            } if class == "Schema::Result::Users"
+            r.hash_key_owner(),
+            Some(crate::model::file_analysis::HashKeyOwner::Bridged { class })
+                if class == "Schema::Result::Users"
         ),
         "SUPER::search's hash-key arg must carry the row-class Bridged owner; got {:?}",
-        r.kind,
+        r.hash_key_owner(),
     );
     let def = fa.find_definition(key, None);
     assert_eq!(
@@ -469,7 +467,7 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
         .expect("trailing ->name MethodCall ref");
     assert!(
         matches!(
-            &name_ref.resolved_method_target,
+            &name_ref.method_target(),
             Some(crate::model::file_analysis::MethodTarget::Local { invocant_class, .. })
                 if invocant_class == "Schema::Result::Users"
         ),
@@ -477,7 +475,7 @@ my $name = $schema->resultset('Schema::Result::Users')->find(1)->name;
          to the Row accessor (class Schema::Result::Users), proving \
          resolution rides the edge not the deleted same-name fallback. \
          got: {:?}",
-        name_ref.resolved_method_target,
+        name_ref.method_target(),
     );
 
     // References for the Row's `name` method must include the chained
@@ -1247,14 +1245,11 @@ my $y = $plain->{adhoc};
     let r = fa.ref_at(adhoc).expect("adhoc key ref");
     assert!(
         !matches!(
-            r.kind,
-            crate::model::file_analysis::RefKind::HashKeyAccess {
-                owner: Some(crate::model::file_analysis::HashKeyOwner::Class(_)),
-                ..
-            }
+            r.hash_key_owner(),
+            Some(crate::model::file_analysis::HashKeyOwner::Class(_))
         ),
         "untyped hashref deref not promoted to a class owner: {:?}",
-        r.kind,
+        r.hash_key_owner(),
     );
 }
 

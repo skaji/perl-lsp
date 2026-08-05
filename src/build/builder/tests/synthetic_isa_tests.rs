@@ -711,8 +711,8 @@ fn provisional_dispatch_resolves_helper_returned_receiver() {
     // is surfaced either way; `applicable_dispatches` de-dups the gated
     // candidate against the materialized ref so there's no double-count.
     let has_materialized = fa.refs.iter().any(|r|
-        matches!(&r.kind, RefKind::DispatchCall { dispatcher, owner: Some(HandlerOwner::Class(c)) }
-            if dispatcher == "enqueue" && c == "Minion")
+        matches!(&r.kind, RefKind::DispatchCall { dispatcher } if dispatcher == "enqueue")
+            && matches!(r.handler_owner(), Some(HandlerOwner::Class(c)) if c == "Minion")
             && r.target_name == "Task.go");
     let applied = fa.applicable_dispatches(Some(&idx));
     let has_gated = applied.iter().any(|a|

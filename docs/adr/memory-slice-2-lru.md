@@ -60,8 +60,8 @@ The witness bag is a **build-time type-inference scaffold** (see
 point and **bakes its conclusions into ordinary `FileAnalysis` fields**:
 
 - `return_types` (name-keyed map) — `seed_return_types_from_bag`.
-- `Ref::resolved_method_target` — the build-time-resolved dispatch edge.
-- `Ref::invocant_class` — filled PostFold.
+- `Ref::binding` — the build-time resolution outcome (dispatch edge,
+  invocant class, package pin), filled PostFold.
 - `Ref::arg_count`, `Symbol::arity`, `Symbol::deref_stack`, etc.
 
 After the fold, a **non-open** workspace/dependency file's bag is re-read only
@@ -89,7 +89,7 @@ Held resident for **every** indexed file, exactly as today:
 - `refs` + the `refs_by_target` / `refs_by_name` reverse indices — answer
   `references` / `documentHighlight` with exact ranges.
 - `symbols` + `symbols_by_name` — answer `goto-def` (via
-  `Ref::resolved_method_target` + symbol lookup), `hover` on a definition,
+  `Ref::binding`'s method target + symbol lookup), `hover` on a definition,
   `rename` targets.
 - The pack `ModuleIndex`'s `all_files` / `all_defs` name→file index — answers
   `workspace/symbol` and "which files could reference X" without touching any
@@ -186,7 +186,7 @@ kept as an optional **Slice 3** to chase clangd's ~320 MB, not needed to hit
 | Query | Projection reads | Bag? | Evicted-file behavior |
 |---|---|---|---|
 | `references` / `documentHighlight` | `refs`, `refs_by_target` | no | complete, resident |
-| `goto-def` | `Ref::resolved_method_target`, `symbols` | no | complete, resident |
+| `goto-def` | `Ref::binding` (method target), `symbols` | no | complete, resident |
 | `rename` / `prepareRename` | `refs`, `symbols` | no | complete, resident |
 | `workspace/symbol` | `all_defs` (name→file) | no | complete, resident |
 | `hover` on a def / signature | `symbols`, `return_types` | no | complete, resident |

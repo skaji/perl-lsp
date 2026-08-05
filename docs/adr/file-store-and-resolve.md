@@ -93,8 +93,8 @@ Forward residual lives in `prompt-graph-walking.md` (absorbed residuals section)
 
 - Phase 1: `Namespace` enum (deferred — pluggability question gates phases
   6+7).
-- Phase 5: eager `Ref.target: SymbolId` (not `Option`); the field is still
-  `Option<SymbolId>` in `Ref.resolves_to`.
+- Phase 5: eager `Ref.target: SymbolId` (not `Option`); the resolved symbol
+  still rides `Ref.binding` (`RefBinding`, read via `resolved_symbol()`).
 - Phase 6: `Openness` classification + unified diagnostic rule.
 - Phase 7: framework emission rules into framework Namespaces (the Mojo
   intelligence path).

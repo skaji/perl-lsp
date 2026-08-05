@@ -1142,7 +1142,7 @@ fn test_variable_resolves_to() {
         .collect();
     assert!(!read_refs.is_empty());
     assert!(
-        read_refs[0].resolves_to.is_some(),
+        read_refs[0].resolved_symbol().is_some(),
         "read ref should resolve to declaration"
     );
 }

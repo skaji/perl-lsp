@@ -55,7 +55,7 @@ Three sub-decisions, each load-bearing:
 
 2. **Rows carry the post-fold verdicts.** Shredding happens at the same seam
    where the blob is encoded — *after* `fold_to_fixed_point` has baked
-   `resolved_method_target`, `invocant_class`, `resolved_package`, and
+   each ref's `RefBinding` (method target, invocant class, package pin) and
    rewritability into the refs. So the columns are decision-ready facts, not
    raw syntax, and the common matcher arms run on rows alone.
 
@@ -114,8 +114,8 @@ arm keys on — the qualifier that arm compares against the target:
 
 | RefKind | qual_kind | qual_id |
 |---|---|---|
-| `FunctionCall` | `ResolvedPackage` | `resolved_package` |
-| `MethodCall` | `InvocantClass` | `resolved_method_target`'s / PostFold `invocant_class`; NULL = build-unresolved (fallback candidate) |
+| `FunctionCall` | `ResolvedPackage` | the `Function` binding's package |
+| `MethodCall` | `InvocantClass` | the `Method` binding's PostFold `invocant_class`; NULL = build-unresolved (fallback candidate) |
 | `DispatchCall` | `Dispatcher` | `dispatcher` |
 | `HashKeyAccess` | `HashKeyOwnerSub` / `HashKeyOwnerClass` | owner name |
 | `Variable` / `PackageRef` / `ContainerAccess` | `None` | NULL |

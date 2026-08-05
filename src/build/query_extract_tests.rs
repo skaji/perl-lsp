@@ -1250,7 +1250,7 @@ fn cpp_cross_file_enum_variant_goto_def() {
     assert!(
         use_fa.refs.iter().any(|r| matches!(r.kind, RefKind::Variable)
             && r.target_name == "OP_SCOPE"
-            && r.resolves_to.is_none()),
+            && r.resolved_symbol().is_none()),
         "a use with no LOCAL decl still mints an unresolved Variable ref"
     );
 

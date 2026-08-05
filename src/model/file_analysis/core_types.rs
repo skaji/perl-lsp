@@ -762,21 +762,19 @@ pub struct Ref {
     pub scope: ScopeId,
     pub target_name: String,
     pub access: AccessKind,
-    /// For variable refs: which Symbol this resolves to (filled in post-pass).
-    pub resolves_to: Option<SymbolId>,
-    /// For `MethodCall` refs: the build-time-resolved dispatch target.
-    /// Mirrors `resolves_to` for variables (build pipeline phase 6
-    /// `PostFold`): the PostFold invocant-fill already has the invocant
-    /// class in hand, so it resolves the method on that class once and
-    /// stamps the edge here. `refs_to` / `find_definition` / hover all
-    /// read this stored edge instead of re-deriving the invocant class at
-    /// query time, so they can never disagree (the NAV unification — a
-    /// call that resolved at build time stays matched regardless of
-    /// query-time inference flakiness). `None` means the invocant class
-    /// did not infer at build time — the call is honestly unresolved, no
-    /// name-only fallback (that re-introduces the `->new` over-collect).
+    /// Where this ref's resolution landed — the ONE home for every
+    /// resolution outcome, whatever the kind (`RefKind` stays pure
+    /// written shape). `None` means honestly unresolved: no name-only
+    /// fallback (that re-introduces the `->new` over-collect).
+    /// Populated by the post-passes (`resolve_variable_refs`,
+    /// `resolve_hash_key_owners`, the PostFold method stamp,
+    /// `build_indices` sym linking, enrichment re-links) via the
+    /// `bind_*`/`link_*` mutators; read via the projection accessors
+    /// (`resolved_symbol`, `method_target`, `resolved_package`,
+    /// `hash_key_owner`, `handler_owner`) so consumers never match the
+    /// binding shape against the kind themselves.
     #[serde(default)]
-    pub resolved_method_target: Option<MethodTarget>,
+    pub binding: Option<RefBinding>,
     /// Provenance for a call whose name was constant-folded from a variable
     /// (`my $m = 'process'; $self->$m()`): the source string literal's
     /// content span. The call-site token (`$m`) is a non-rewritable variable
@@ -861,7 +859,7 @@ impl Ref {
     /// `%Pkg::h`) return `(package, sigil+basename)` — the package the
     /// global lives in, paired with the sigil-bearing bare name that keys
     /// the declaring symbol (`("Foo::Bar", "$x")`). `None` for unqualified
-    /// reads (those resolve lexically via `resolves_to`). The sigil rides
+    /// reads (those resolve lexically via the `Symbol` binding). The sigil rides
     /// the basename because variable symbols are keyed with their sigil
     /// (`$x`, `@arr`, `%h`); a leading-`::` `main::` spelling yields an
     /// empty-string package, matching how package-globals in `main` key.
@@ -873,6 +871,86 @@ impl Ref {
         }
         let (pkg, base) = split_qualified(chars.as_str());
         pkg.map(|p| (p, format!("{sigil}{base}")))
+    }
+}
+
+/// Projection accessors + binding mutators — the only vocabulary consumers
+/// use to read/write a ref's resolution outcome. Each accessor answers one
+/// question and returns `None` for kinds that don't carry that flavor, so
+/// call sites never match `RefBinding` against `RefKind` themselves.
+impl Ref {
+    /// The declaring symbol this ref resolved to, whatever flavor carried
+    /// it (lexical `Symbol`, a linked `HashKeyDef`, a linked `Handler`).
+    /// Method dispatch is NOT projected here — its symbol rides
+    /// `method_target()` with the frozen invocant class.
+    pub fn resolved_symbol(&self) -> Option<SymbolId> {
+        match self.binding.as_ref()? {
+            RefBinding::Symbol(sym) => Some(*sym),
+            RefBinding::HashKey { sym, .. } | RefBinding::Handler { sym, .. } => *sym,
+            RefBinding::Function { .. } | RefBinding::Method(_) => None,
+        }
+    }
+
+    /// The frozen dispatch target of a `MethodCall` ref.
+    pub fn method_target(&self) -> Option<&MethodTarget> {
+        match self.binding.as_ref()? {
+            RefBinding::Method(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// The package pin of a `FunctionCall` ref.
+    pub fn resolved_package(&self) -> Option<&str> {
+        match self.binding.as_ref()? {
+            RefBinding::Function { package } => Some(package),
+            _ => None,
+        }
+    }
+
+    /// The resolved owner of a `HashKeyAccess` ref.
+    pub fn hash_key_owner(&self) -> Option<&HashKeyOwner> {
+        match self.binding.as_ref()? {
+            RefBinding::HashKey { owner, .. } => Some(owner),
+            _ => None,
+        }
+    }
+
+    /// The resolved owner of a `DispatchCall` ref.
+    pub fn handler_owner(&self) -> Option<&HandlerOwner> {
+        match self.binding.as_ref()? {
+            RefBinding::Handler { owner, .. } => Some(owner),
+            _ => None,
+        }
+    }
+
+    pub fn bind_symbol(&mut self, sym: SymbolId) {
+        self.binding = Some(RefBinding::Symbol(sym));
+    }
+
+    pub fn bind_method(&mut self, target: MethodTarget) {
+        self.binding = Some(RefBinding::Method(target));
+    }
+
+    pub fn bind_function_package(&mut self, package: String) {
+        self.binding = Some(RefBinding::Function { package });
+    }
+
+    /// Stamp (or re-stamp) a `HashKeyAccess` owner. Drops any previously
+    /// linked `HashKeyDef` — a new owner invalidates the old link; the
+    /// linker (`build_indices` / enrichment) re-fills `sym` against it.
+    pub fn bind_hash_key_owner(&mut self, owner: HashKeyOwner) {
+        self.binding = Some(RefBinding::HashKey { owner, sym: None });
+    }
+
+    /// Fill the linked symbol on an owner-resolved `HashKey`/`Handler`
+    /// binding. A no-op without a resolved owner — the linkers only find
+    /// defs through one, so there is nothing to attach it to.
+    pub fn link_owned_symbol(&mut self, sym_id: SymbolId) {
+        if let Some(RefBinding::HashKey { sym, .. } | RefBinding::Handler { sym, .. }) =
+            self.binding.as_mut()
+        {
+            *sym = Some(sym_id);
+        }
     }
 }
 
@@ -898,7 +976,7 @@ impl Ref {
     pub fn row_seed(&self) -> RefRowSeed {
         let kind = match &self.kind {
             RefKind::Variable => 0,
-            RefKind::FunctionCall { .. } => 1,
+            RefKind::FunctionCall => 1,
             RefKind::MethodCall { .. } => 2,
             RefKind::PackageRef => 3,
             RefKind::HashKeyAccess { .. } => 4,
@@ -906,17 +984,15 @@ impl Ref {
             RefKind::DispatchCall { .. } => 6,
         };
         let (qual_kind, qual): (u8, Option<String>) = match &self.kind {
-            RefKind::FunctionCall { resolved_package } => {
-                (1, resolved_package.clone())
+            RefKind::FunctionCall => {
+                (1, self.resolved_package().map(str::to_string))
             }
             RefKind::MethodCall { .. } => (
                 2,
-                self.resolved_method_target
-                    .as_ref()
-                    .map(|t| t.invocant_class().to_string()),
+                self.method_target().map(|t| t.invocant_class().to_string()),
             ),
-            RefKind::DispatchCall { dispatcher, .. } => (3, Some(dispatcher.clone())),
-            RefKind::HashKeyAccess { owner, .. } => match owner {
+            RefKind::DispatchCall { dispatcher } => (3, Some(dispatcher.clone())),
+            RefKind::HashKeyAccess { .. } => match self.hash_key_owner() {
                 Some(HashKeyOwner::Class(c)) => (4, Some(c.clone())),
                 Some(HashKeyOwner::Sub { name, .. }) => (5, Some(name.clone())),
                 _ => (0, None),
@@ -924,7 +1000,7 @@ impl Ref {
             _ => (0, None),
         };
         let flags = u8::from(self.folded_from.is_some())
-            | (u8::from(self.resolves_to.is_some()) << 1);
+            | (u8::from(self.resolved_symbol().is_some()) << 1);
         RefRowSeed {
             key: self.match_key(),
             kind,
@@ -1036,6 +1112,43 @@ impl MethodTarget {
     }
 }
 
+/// A ref's resolution outcome — one variant per resolution flavor, fusing
+/// the components that resolve together (owner + linked symbol) so they can
+/// never drift apart. Which flavor a ref carries follows from its `RefKind`
+/// (a `MethodCall` binds `Method`, a `HashKeyAccess` binds `HashKey`, …);
+/// consumers read through the `Ref` projection accessors rather than
+/// matching this enum against the kind themselves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RefBinding {
+    /// Lexically/package-resolved declaring symbol (variable and label
+    /// reads, `our`-globals, pack local refs).
+    Symbol(SymbolId),
+    /// `FunctionCall` package pin: the package whose `sub` this call
+    /// targets — computed at build time by walking the
+    /// enclosing-package-then-imports graph (`Builder::resolve_call_package`;
+    /// packs pin qualified calls and implicit-`this` sibling calls the same
+    /// way). Unpinned calls carry no binding: class/package-scoped queries
+    /// treat them as no-match rather than cross-linking same-named subs.
+    Function { package: String },
+    /// `MethodCall` dispatch target, stamped by the build pipeline's
+    /// PostFold invocant fill: the fill already has the invocant class in
+    /// hand, so it resolves the method on that class once and freezes the
+    /// edge here. `refs_to` / `find_definition` / hover all read this
+    /// stored edge instead of re-deriving the invocant class at query
+    /// time, so they can never disagree (the NAV unification — a call
+    /// that resolved at build time stays matched regardless of query-time
+    /// inference flakiness).
+    Method(MethodTarget),
+    /// `HashKeyAccess` resolution: which hash this key belongs to, plus
+    /// the linked `HashKeyDef` symbol once `build_indices` / enrichment
+    /// finds one for `(target_name, owner)`.
+    HashKey { owner: HashKeyOwner, sym: Option<SymbolId> },
+    /// `DispatchCall` resolution: the receiver the string-dispatch resolved
+    /// against, plus the linked `Handler` symbol (first stacked def —
+    /// `refs_to_symbol` walks all stacked defs separately).
+    Handler { owner: HandlerOwner, sym: Option<SymbolId> },
+}
+
 /// What kind of entity is being renamed — determines single-file vs cross-file scope.
 #[derive(Debug)]
 pub enum RenameKind {
@@ -1061,17 +1174,9 @@ pub enum RenameKind {
 #[allow(dead_code)]
 pub enum RefKind {
     Variable,
-    /// Bare `foo()` or `Pkg::foo()` call. `resolved_package` is the
-    /// package whose `sub` this call actually targets — computed at
-    /// build time by walking the enclosing-package-then-imports graph
-    /// (see `Builder::resolve_call_package`). `None` means no pin (the
-    /// call site has no package context and no import covers it);
-    /// class/package-scoped queries treat unpinned refs as no-match
-    /// rather than cross-linking same-named subs across packages.
-    FunctionCall {
-        #[serde(default)]
-        resolved_package: Option<String>,
-    },
+    /// Bare `foo()` or `Pkg::foo()` call. The build-time package pin
+    /// lives in `Ref::binding` (`RefBinding::Function`).
+    FunctionCall,
     /// Method call site `$obj->m(...)` / `Class->m(...)` /
     /// `chain()->m(...)`. **Invocant class is NOT cached on the
     /// variant** — it's resolved on demand via
@@ -1102,22 +1207,23 @@ pub enum RefKind {
         member_op: Option<(MemberOp, Span)>,
     },
     PackageRef,
+    /// Key access `$h{k}` / `$obj->{k}`. Which hash owns the key (and the
+    /// linked `HashKeyDef`) lives in `Ref::binding` (`RefBinding::HashKey`).
     HashKeyAccess {
         var_text: String,
-        owner: Option<HashKeyOwner>,
     },
     /// The container variable in `$hash{key}`, `@arr[0]`, etc.
     ContainerAccess,
     /// Call site that dispatches to a `Handler` symbol by string name,
     /// e.g. `$emitter->emit('ready', ...)`. `dispatcher` is the method
-    /// name chosen on the receiver (`"emit"`, `"subscribe"`, etc.).
-    /// `owner` is resolved at build time when the receiver type is
-    /// known; otherwise left `None` and re-linked by enrichment later.
-    /// `target_name` on the enclosing `Ref` is the handler name
-    /// (the string literal first-arg).
+    /// name chosen on the receiver (`"emit"`, `"subscribe"`, etc.);
+    /// `target_name` on the enclosing `Ref` is the handler name (the
+    /// string literal first-arg). The resolved receiver lives in
+    /// `Ref::binding` (`RefBinding::Handler`) — stamped at build time
+    /// when the receiver type is known, otherwise re-linked by
+    /// enrichment later.
     DispatchCall {
         dispatcher: String,
-        owner: Option<HandlerOwner>,
     },
 }
 

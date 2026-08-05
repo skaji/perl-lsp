@@ -637,8 +637,8 @@ impl FileAnalysis {
                 let class = self.method_call_invocant_class(r, module_index)?;
                 (class, r.unqualified_target_name().to_string())
             }
-            RefKind::HashKeyAccess { owner, .. } => {
-                let class = match owner {
+            RefKind::HashKeyAccess { .. } => {
+                let class = match r.hash_key_owner() {
                     Some(HashKeyOwner::Class(c)) | Some(HashKeyOwner::Bridged { class: c }) => {
                         c.clone()
                     }
@@ -657,7 +657,7 @@ impl FileAnalysis {
             RefKind::Variable => {
                 // Corinna `field $x` use: the ref resolves to a Field symbol
                 // whose package IS the declaring class (fields are per-class).
-                let sym = self.symbol(r.resolves_to?);
+                let sym = self.symbol(r.resolved_symbol()?);
                 if !matches!(sym.kind, SymKind::Field) {
                     return None;
                 }
@@ -1197,11 +1197,11 @@ impl FileAnalysis {
     /// over a same-named free function INSIDE the class body (the pin only
     /// happens there), but a name with no member in that package leaves the
     /// `Sub` path untouched, so a free-function-only call still resolves free.
-    pub(super) fn package_scoped_callable(&self, name: &str, resolved_package: &Option<String>) -> Option<SymbolId> {
+    pub(super) fn package_scoped_callable(&self, name: &str, resolved_package: Option<&str>) -> Option<SymbolId> {
         let mut method_fallback = None;
         for &sid in self.symbols_named(name) {
             let sym = self.symbol(sid);
-            if sym.package != *resolved_package {
+            if sym.package.as_deref() != resolved_package {
                 continue;
             }
             match sym.kind {
@@ -1292,7 +1292,7 @@ impl FileAnalysis {
     #[allow(dead_code)]
     pub fn refs_to(&self, target: SymbolId) -> Vec<&Ref> {
         self.refs.iter()
-            .filter(|r| r.resolves_to == Some(target))
+            .filter(|r| r.resolved_symbol() == Some(target))
             .collect()
     }
 
@@ -1300,13 +1300,7 @@ impl FileAnalysis {
     #[allow(dead_code)]
     pub fn hash_keys_for_owner(&self, owner: &HashKeyOwner) -> Vec<&Ref> {
         self.refs.iter()
-            .filter(|r| {
-                if let RefKind::HashKeyAccess { owner: Some(ref o), .. } = r.kind {
-                    o == owner
-                } else {
-                    false
-                }
-            })
+            .filter(|r| r.hash_key_owner() == Some(owner))
             .collect()
     }
 

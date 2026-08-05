@@ -12,7 +12,7 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => {
-                    if let Some(sym_id) = r.resolves_to {
+                    if let Some(sym_id) = r.resolved_symbol() {
                         return Some((sym_id, true));
                     }
                     // Try resolving manually
@@ -20,10 +20,12 @@ impl FileAnalysis {
                         return Some((sym.id, true));
                     }
                 }
-                RefKind::FunctionCall { resolved_package } => {
+                RefKind::FunctionCall => {
                     // Qualified calls carry the full path in `target_name`;
-                    // symbols are keyed by bare name + `resolved_package`.
-                    if let Some(sid) = self.package_scoped_callable(r.unqualified_target_name(), resolved_package) {
+                    // symbols are keyed by bare name + the `Function` binding.
+                    if let Some(sid) = self
+                        .package_scoped_callable(r.unqualified_target_name(), r.resolved_package())
+                    {
                         return Some((sid, true));
                     }
                 }
@@ -91,8 +93,8 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::HashKeyAccess { ref owner, .. } => {
-                    if let Some(ref owner) = owner {
+                RefKind::HashKeyAccess { .. } => {
+                    if let Some(owner) = r.hash_key_owner() {
                         for def in self.hash_key_defs_for_owner(owner) {
                             if def.name == r.target_name {
                                 return Some((def.id, true));
@@ -100,7 +102,8 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::DispatchCall { owner: Some(owner), .. } => {
+                RefKind::DispatchCall { .. } if r.handler_owner().is_some() => {
+                    let owner = r.handler_owner().unwrap();
                     // Folded name (`$obj->on($evt)`): the cursor is on the
                     // variable, so resolve the variable — not the event. Mirrors
                     // the `rename_kind_at` guard so references/highlight/rename
@@ -110,7 +113,7 @@ impl FileAnalysis {
                             && contains_point(&o.span, point)
                     }) {
                         if let Some(sym_id) = var
-                            .resolves_to
+                            .resolved_symbol()
                             .or_else(|| self.resolve_variable(&var.target_name, point).map(|s| s.id))
                         {
                             return Some((sym_id, true));
@@ -125,7 +128,7 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::DispatchCall { owner: None, .. } => {}
+                RefKind::DispatchCall { .. } => {}
             }
         }
 

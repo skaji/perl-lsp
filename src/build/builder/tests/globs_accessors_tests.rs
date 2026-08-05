@@ -618,10 +618,8 @@ sub _attempt { return 1 }
         .iter()
         .filter(|r| {
             r.target_name == "MAX_RETRIES"
-                && matches!(
-                    &r.kind,
-                    RefKind::FunctionCall { resolved_package } if resolved_package.as_deref() == Some("QA::C")
-                )
+                && matches!(&r.kind, RefKind::FunctionCall)
+                    && r.resolved_package() == Some("QA::C")
         })
         .collect();
     assert_eq!(
@@ -759,10 +757,8 @@ sub opt_c { 'c' }
             .iter()
             .filter(|r| {
                 r.target_name == name
-                    && matches!(
-                        &r.kind,
-                        RefKind::FunctionCall { resolved_package } if resolved_package.as_deref() == Some("QA::E")
-                    )
+                    && matches!(&r.kind, RefKind::FunctionCall)
+                    && r.resolved_package() == Some("QA::E")
             })
             .count()
     };
@@ -1086,10 +1082,7 @@ $obj->get_config->{host};
     );
     let owner = host_refs
         .iter()
-        .find_map(|r| match &r.kind {
-            RefKind::HashKeyAccess { owner: Some(o), .. } => Some(o.clone()),
-            _ => None,
-        })
+        .find_map(|r| r.hash_key_owner().cloned())
         .expect("chained hash-key ref should carry a resolved owner");
     assert_eq!(
         owner,
@@ -1224,8 +1217,8 @@ $obj->me->me->get_config->{host};
 ";
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
-    let owners: Vec<_> = fa.refs.iter().filter_map(|r| match &r.kind {
-        RefKind::HashKeyAccess { owner: Some(o), .. } if r.target_name == "host" => Some(o.clone()),
+    let owners: Vec<_> = fa.refs.iter().filter_map(|r| match r.hash_key_owner() {
+        Some(o) if r.target_name == "host" => Some(o.clone()),
         _ => None,
     }).collect();
     assert_eq!(owners.len(), 2, "both 1-hop and 3-hop chained ->{{host}} should emit an owned ref, got {:?}", owners);
@@ -1255,8 +1248,8 @@ $obj->get_config->deep->cfg->{host};
 ";
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
-    let owners: Vec<_> = fa.refs.iter().filter_map(|r| match &r.kind {
-        RefKind::HashKeyAccess { owner: Some(o), .. } if r.target_name == "host" => Some(o.clone()),
+    let owners: Vec<_> = fa.refs.iter().filter_map(|r| match r.hash_key_owner() {
+        Some(o) if r.target_name == "host" => Some(o.clone()),
         _ => None,
     }).collect();
     assert_eq!(owners, vec![HashKeyOwner::Class("Inner".to_string())],
@@ -1277,8 +1270,8 @@ $obj->mystery->mystery->{host};
 ";
     let tree = parse(src);
     let fa = build(&tree, src.as_bytes());
-    let owned: Vec<_> = fa.refs.iter().filter(|r| matches!(&r.kind,
-        RefKind::HashKeyAccess { owner: Some(_), .. }) && r.target_name == "host").collect();
+    let owned: Vec<_> = fa.refs.iter().filter(|r| r.hash_key_owner().is_some()
+        && r.target_name == "host").collect();
     assert!(owned.is_empty(), "untyped deep chain must not latch a wrong owner, got {:?}",
         owned.iter().map(|r| &r.kind).collect::<Vec<_>>());
 }

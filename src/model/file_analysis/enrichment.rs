@@ -196,8 +196,7 @@ impl FileAnalysis {
                     scope,
                     target_name: gr.target_name.clone(),
                     access: gr.access,
-                    resolves_to: None,
-                    resolved_method_target: None,
+                    binding: gr.binding.clone(),
                     folded_from: None,
                     arg_count: None,
                 });
@@ -361,18 +360,22 @@ impl FileAnalysis {
             .collect();
         if !binding_by_var.is_empty() {
             for r in &mut self.refs {
-                if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
-                    if owner.is_some() && !matches!(owner, Some(HashKeyOwner::Variable { .. })) {
+                if let RefKind::HashKeyAccess { ref var_text } = r.kind {
+                    if r.hash_key_owner()
+                        .is_some_and(|o| !matches!(o, HashKeyOwner::Variable { .. }))
+                    {
                         continue;
                     }
                     if let Some(func_name) = binding_by_var.get(var_text.as_str()) {
                         if let Some((pkg, keys)) = imported_hash_keys.get(func_name) {
                             if keys.iter().any(|k| k == &r.target_name) {
-                                *owner = Some(HashKeyOwner::Sub {
+                                // Re-stamping the owner drops the stale
+                                // HashKeyDef link; the enrichment re-index
+                                // re-links against the new owner.
+                                r.bind_hash_key_owner(HashKeyOwner::Sub {
                                     package: pkg.clone(),
                                     name: func_name.clone(),
                                 });
-                                r.resolves_to = None;
                             }
                         }
                     }
@@ -883,8 +886,8 @@ impl FileAnalysis {
     /// refs_by_target + HashKeyAccess linkage).
     ///
     /// Enrichment injects synthetic HashKeyDef symbols for imported subs and
-    /// clears `resolves_to` on HashKeyAccess refs that now have a matching
-    /// owner. This method re-runs the same `(target_name, owner)` linker that
+    /// drops stale HashKeyDef links on re-owned HashKeyAccess refs. This
+    /// method re-runs the same `(target_name, owner)` linker that
     /// `build_indices` uses, so `refs_by_target` stays accurate after a
     /// cross-file hash-key binding resolves.
     fn rebuild_enrichment_indices(&mut self) {
@@ -914,17 +917,17 @@ impl FileAnalysis {
             .collect();
         let mut hashkey_resolutions: Vec<(usize, SymbolId)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            if r.resolves_to.is_some() {
+            if r.resolved_symbol().is_some() {
                 continue;
             }
-            if let RefKind::HashKeyAccess { owner: Some(owner), .. } = &r.kind {
+            if let Some(owner) = r.hash_key_owner() {
                 if let Some(&sid) = hashkey_defs.get(&(r.target_name.clone(), owner.clone())) {
                     hashkey_resolutions.push((i, sid));
                 }
             }
         }
         for (idx, sid) in hashkey_resolutions {
-            self.refs[idx].resolves_to = Some(sid);
+            self.refs[idx].link_owned_symbol(sid);
         }
 
         // Refresh refs_by_name + refs_by_target against the current refs.
@@ -935,7 +938,7 @@ impl FileAnalysis {
                 .entry(r.target_name.clone())
                 .or_default()
                 .push(i);
-            if let Some(sym_id) = r.resolves_to {
+            if let Some(sym_id) = r.resolved_symbol() {
                 self.refs_by_target.entry(sym_id).or_default().push(i);
             }
         }

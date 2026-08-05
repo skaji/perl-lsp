@@ -37,11 +37,12 @@ impl<'a> Builder<'a> {
 
             for name in names {
                 let pkg = self.resolve_call_package(&name);
-                self.add_ref(
-                    RefKind::FunctionCall { resolved_package: pkg },
+                self.add_bound_ref(
+                    RefKind::FunctionCall,
                     name_span,
                     name,
                     AccessKind::Read,
+                    pkg.map(|package| crate::model::file_analysis::RefBinding::Function { package }),
                 );
             }
         }
@@ -286,11 +287,14 @@ impl<'a> Builder<'a> {
                         Some(s.package.clone())
                     });
                     if let Some(pkg) = matched_pkg {
-                        self.add_ref(
-                            RefKind::FunctionCall { resolved_package: pkg },
+                        self.add_bound_ref(
+                            RefKind::FunctionCall,
                             node_to_span(inv_node),
                             bw_text.to_string(),
                             AccessKind::Read,
+                            pkg.map(|package| {
+                                crate::model::file_analysis::RefBinding::Function { package }
+                            }),
                         );
                     } else if !crate::model::conventions::is_current_package_token(bw_text) {
                         // Class-name invocant (`Foo->bar`): the bareword is a
@@ -492,10 +496,10 @@ impl<'a> Builder<'a> {
             if let Some(key_node) = node.child_by_field_name("key") {
                 if let Some((key_text, is_dynamic)) = self.extract_key_text(key_node) {
                     if !is_dynamic {
+                        // Owner resolved in post-pass (`resolve_hash_key_owners`).
                         self.add_ref(
                             RefKind::HashKeyAccess {
                                 var_text: var_text.clone().unwrap_or_default(),
-                                owner: None, // resolved in post-pass
                             },
                             node_to_span(key_node),
                             key_text,

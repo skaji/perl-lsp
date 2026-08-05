@@ -128,7 +128,7 @@ fn fq_scalar_read_resolves_same_file() {
         .find(|r| r.target_name == "$Pkg::x")
         .expect("$Pkg::x should emit a Variable ref");
     assert_eq!(
-        read.resolves_to,
+        read.resolved_symbol(),
         Some(decl.id),
         "FQ scalar read should resolve to the Pkg::x declaration"
     );
@@ -150,7 +150,7 @@ fn fq_array_read_resolves_same_file() {
         .iter()
         .find(|r| r.target_name == "@Pkg::arr")
         .expect("@Pkg::arr should emit a Variable ref");
-    assert_eq!(read.resolves_to, Some(decl.id));
+    assert_eq!(read.resolved_symbol(), Some(decl.id));
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn unqualified_var_still_resolves_lexically() {
         .iter()
         .find(|r| r.target_name == "$x" && r.access == AccessKind::Read)
         .expect("plain $x read");
-    assert!(read.resolves_to.is_some(), "unqualified read still resolves");
+    assert!(read.resolved_symbol().is_some(), "unqualified read still resolves");
 }
 
 // ---- Fix #3: around/before/after modifier bodies ----
@@ -383,11 +383,8 @@ fn sub_exporter_member_refs_local_subs() {
             .iter()
             .filter(|r| {
                 r.target_name == name
-                    && matches!(
-                        &r.kind,
-                        RefKind::FunctionCall { resolved_package }
-                            if resolved_package.as_deref() == Some("My::Exp")
-                    )
+                    && matches!(&r.kind, RefKind::FunctionCall)
+                    && r.resolved_package() == Some("My::Exp")
             })
             .count()
     };
@@ -1074,8 +1071,8 @@ sub go {
         assert!(
             fa.refs.iter().any(|r| {
                 r.target_name == n
-                    && matches!(&r.kind, RefKind::FunctionCall { resolved_package }
-                        if resolved_package.as_deref() == Some("Foo"))
+                    && matches!(&r.kind, RefKind::FunctionCall)
+                    && r.resolved_package() == Some("Foo")
             }),
             "usage of plain/fat-comma constant `{n}` must get a FunctionCall ref; refs: {:?}",
             fa.refs.iter().filter(|r| r.target_name == n).collect::<Vec<_>>(),
@@ -1167,10 +1164,8 @@ sub go {
         assert!(
             fa.refs.iter().any(|r| {
                 r.target_name == n
-                    && matches!(
-                        &r.kind,
-                        RefKind::FunctionCall { resolved_package } if resolved_package.as_deref() == Some("Foo")
-                    )
+                    && matches!(&r.kind, RefKind::FunctionCall)
+                    && r.resolved_package() == Some("Foo")
             }),
             "usage of `{n}` must get a FunctionCall ref to its def; refs for {n}: {:?}",
             fa.refs.iter().filter(|r| r.target_name == n).collect::<Vec<_>>(),

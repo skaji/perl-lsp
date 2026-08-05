@@ -527,7 +527,7 @@ print \"pi is $pi\\n\";
     assert_eq!(pi_refs.len(), 3, "decl + body use + interpolation = 3 refs");
     for r in &pi_refs {
         assert_eq!(
-            r.resolves_to,
+            r.resolved_symbol(),
             Some(pi_sym.id),
             "ref at {:?} (scope {:?}) didn't resolve to the lexical decl — \
                  sibling Package scopes are leaking into variable lookup",
@@ -572,7 +572,7 @@ print \"v=$version\\n\";
         .find(|r| r.target_name == "$version" && r.span.start.row == 2)
         .expect("ref inside Calculator's bump");
     assert_eq!(
-        bump_use.resolves_to,
+        bump_use.resolved_symbol(),
         Some(our_sym.id),
         "bare $version inside the same package as the `our` decl \
              must still resolve to it (lexical alias)"
@@ -584,7 +584,7 @@ print \"v=$version\\n\";
         .find(|r| r.target_name == "$version" && r.span.start.row == 5)
         .expect("ref inside package main's print");
     assert_eq!(
-        main_use.resolves_to, None,
+        main_use.resolved_symbol(), None,
         "bare $version under a sibling `package main;` must not \
              reach Calculator's `our $version` — that's $Calculator::version, \
              a different binding"
@@ -696,10 +696,7 @@ my $m = MooApp->new(name => 'alice');
         !name_access.is_empty(),
         "no HashKeyAccess emitted for `name` in MooApp->new(name => 'alice')",
     );
-    let RefKind::HashKeyAccess {
-        owner: Some(owner), ..
-    } = &name_access[0].kind
-    else {
+    let Some(owner) = name_access[0].hash_key_owner() else {
         panic!("HashKeyAccess emitted with no owner");
     };
     assert_eq!(
@@ -802,8 +799,8 @@ my $a = MooApp->new('name', 'alice');
              `=>` is autoquoting sugar, not a structural marker",
     );
 
-    let owner_of = |r: &Ref| match &r.kind {
-        RefKind::HashKeyAccess { owner: Some(o), .. } => o.clone(),
+    let owner_of = |r: &Ref| match r.hash_key_owner() {
+        Some(o) => o.clone(),
         _ => panic!("expected HashKeyAccess with owner"),
     };
     assert_eq!(

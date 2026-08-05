@@ -121,7 +121,8 @@ pub fn resolve_symbol_scoped(
     if let (Some(idx), Some(r)) = (module_index, analysis.ref_at(point)) {
         use crate::model::file_analysis::HashKeyOwner;
         match &r.kind {
-            RefKind::HashKeyAccess { owner, .. } => {
+            RefKind::HashKeyAccess { .. } => {
+                let owner = r.hash_key_owner();
                 // Reach the owning class's group from a consumer-side cursor. The
                 // `bool` is `require_internal`: a `$obj->{attr}` deref carries a
                 // generic `Class` lookup and is a real reference ONLY to an
@@ -297,7 +298,7 @@ pub fn resolve_symbol_scoped(
                     None
                 }
             };
-            let resolved: Option<Option<(String, bool)>> = match r.resolves_to {
+            let resolved: Option<Option<(String, bool)>> = match r.resolved_symbol() {
                 // A read that resolved to an unexpanded-use artifact (the
                 // phantom Variable a decl-position macro mints) still keys
                 // the macro identity — the class-content/file-scope shapes
@@ -340,7 +341,7 @@ pub fn resolve_symbol_scoped(
                     let mut t =
                         TargetRef::new(r.target_name.clone(), TargetKind::FileScopeValue);
                     let origin_defines = analysis.names_macro_def(&r.target_name, None)
-                        || r.resolves_to.is_some();
+                        || r.resolved_symbol().is_some();
                     t.def_paths =
                         pack_def_paths(&r.target_name, origin_defines, module_index);
                     return Some(ResolvedTarget::Target(t));

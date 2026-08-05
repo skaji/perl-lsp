@@ -18,7 +18,7 @@ use tree_sitter::{
     CaptureQuantifier, Node, Query, QueryCursor, QueryPredicateArg, StreamingIterator,
 };
 
-use crate::model::file_analysis::{DispatchCandidate, HandlerOwner, InferredType, ReceiverGated, Span};
+use crate::model::file_analysis::{DispatchCandidate, HandlerOwner, InferredType, ReceiverGated, RefBinding, Span};
 use crate::build::plugin::{self, CaptureData, CaptureValue, MatchContext, PatternSpec};
 
 use super::{node_to_span, Builder};
@@ -749,18 +749,20 @@ impl<'a> Builder<'a> {
                 }
                 EmitAction::DispatchCall { name, dispatcher, owner, span, .. } => {
                     refs.push(GatedRef {
-                        kind: RefKind::DispatchCall { dispatcher, owner: Some(owner) },
+                        kind: RefKind::DispatchCall { dispatcher },
                         span,
                         target_name: name,
                         access: crate::model::file_analysis::AccessKind::Read,
+                        binding: Some(RefBinding::Handler { owner, sym: None }),
                     });
                 }
                 EmitAction::HashKeyAccess { name, owner, var_text, span, access } => {
                     refs.push(GatedRef {
-                        kind: RefKind::HashKeyAccess { var_text, owner: Some(owner) },
+                        kind: RefKind::HashKeyAccess { var_text },
                         span,
                         target_name: name,
                         access,
+                        binding: Some(RefBinding::HashKey { owner, sym: None }),
                     });
                 }
                 other => {

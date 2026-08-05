@@ -136,7 +136,7 @@ impl std::fmt::Display for InvocantName {
 /// "users" }`). It is deliberately a distinct variant — not a
 /// guessed-by-leading-case string — so:
 ///   * the builder never freezes the raw token as a class
-///     (`resolved_method_target` stays `None` for it), and
+///     (its `Method` binding stays unstamped), and
 ///   * the model asks the *owning plugin* to resolve it instead of
 ///     encoding the plugin's algorithm in core (rule #10 + rule #8).
 ///

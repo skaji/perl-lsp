@@ -8,7 +8,7 @@ fn debug_moo_name_refs() {
         if r.target_name == "name" || r.target_name == "new" {
             eprintln!(
                 "REF: target={} kind={:?} span={:?} resolves_to={:?}",
-                r.target_name, r.kind, r.span, r.resolves_to
+                r.target_name, r.kind, r.span, r.resolved_symbol()
             );
         }
     }

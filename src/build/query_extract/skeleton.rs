@@ -849,8 +849,7 @@ impl SkeletonAnalysis {
                     scope: *read_scope,
                     target_name: name.clone(),
                     access: crate::model::file_analysis::AccessKind::Read,
-                    resolves_to: Some(did),
-                    resolved_method_target: None,
+                    binding: Some(crate::model::file_analysis::RefBinding::Symbol(did)),
                     folded_from: None,
                     arg_count: None,
                 }),
@@ -878,8 +877,7 @@ impl SkeletonAnalysis {
                     scope: *ref_scope,
                     target_name: name.clone(),
                     access: crate::model::file_analysis::AccessKind::Read,
-                    resolves_to: Some(did),
-                    resolved_method_target: None,
+                    binding: Some(crate::model::file_analysis::RefBinding::Symbol(did)),
                     folded_from: None,
                     arg_count: None,
                 });
@@ -904,13 +902,14 @@ impl SkeletonAnalysis {
             .refs
             .iter()
             .filter_map(|r| {
-                use crate::model::file_analysis::RefKind;
+                use crate::model::file_analysis::{RefBinding, RefKind};
                 let mut span = Span { start: r.start, end: r.end };
+                let mut binding = None;
                 let kind = match r.kind.as_str() {
-                    "call" => RefKind::FunctionCall { resolved_package: None },
+                    "call" => RefKind::FunctionCall,
                     // Qualified call (`fmt::format_to(...)`): Perl parity —
-                    // the full path rides `target_name`, the qualifier
-                    // `resolved_package`, and the span narrows to the bare
+                    // the full path rides `target_name`, the qualifier the
+                    // `Function` binding, and the span narrows to the bare
                     // name token (the rename/highlight unit; also what
                     // suppresses the `@expr.read.var` duplicate at the same
                     // start). The tail segment is an identifier, so it never
@@ -922,7 +921,8 @@ impl SkeletonAnalysis {
                             row: r.end.row,
                             column: r.end.column.saturating_sub(bare.len()),
                         };
-                        RefKind::FunctionCall { resolved_package: Some(pkg.to_string()) }
+                        binding = Some(RefBinding::Function { package: pkg.to_string() });
+                        RefKind::FunctionCall
                     }
                     // `recv.field` / `recv->field`: the SAME MethodCall ref
                     // core resolves for Perl `$obj->m`. The invocant types
@@ -959,8 +959,7 @@ impl SkeletonAnalysis {
                     scope: r.scope,
                     target_name: r.name.clone(),
                     access: crate::model::file_analysis::AccessKind::Read,
-                    resolves_to: None,
-                    resolved_method_target: None,
+                    binding,
                     folded_from: None,
                     arg_count: r.arg_count,
                 })
@@ -1005,8 +1004,7 @@ impl SkeletonAnalysis {
                 scope,
                 target_name: name,
                 access: crate::model::file_analysis::AccessKind::Read,
-                resolves_to: None,
-                resolved_method_target: None,
+                binding: None,
                 folded_from: None,
                 arg_count: None,
             });
@@ -1066,15 +1064,16 @@ impl SkeletonAnalysis {
                         scope: crate::model::file_analysis::ScopeId(0),
                         target_name: field.clone(),
                         access: crate::model::file_analysis::AccessKind::Read,
-                        resolves_to: None,
                         // Local edge (the field decl IS in this file): references
                         // matches on `invocant_class`, and goto-def from the
                         // in-body use lands on `sym_id` — no query-time invocant
                         // typing (the receiver is an untypeable macro parameter).
-                        resolved_method_target: Some(crate::model::file_analysis::MethodTarget::Local {
-                            sym_id: *sym_id,
-                            invocant_class: class.to_string(),
-                        }),
+                        binding: Some(crate::model::file_analysis::RefBinding::Method(
+                            crate::model::file_analysis::MethodTarget::Local {
+                                sym_id: *sym_id,
+                                invocant_class: class.to_string(),
+                            },
+                        )),
                         folded_from: None,
                         arg_count: None,
                     });

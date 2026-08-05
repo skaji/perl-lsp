@@ -23,9 +23,7 @@ impl FileAnalysis {
     /// `has`, return-shape keys). `None` = the key is lexical/unowned and
     /// cross-file queries have nothing to pin on.
     pub fn hash_key_owner_at(&self, point: Point) -> Option<HashKeyOwner> {
-        if let Some(RefKind::HashKeyAccess { owner: Some(o), .. }) =
-            self.ref_at(point).map(|r| &r.kind)
-        {
+        if let Some(o) = self.ref_at(point).and_then(|r| r.hash_key_owner()) {
             return Some(o.clone());
         }
         match self.symbol_at(point).map(|s| &s.detail) {
@@ -42,11 +40,11 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable => {
-                    if let Some(sym_id) = r.resolves_to {
+                    if let Some(sym_id) = r.resolved_symbol() {
                         return Some(self.symbol(sym_id).selection_span);
                     }
                 }
-                RefKind::FunctionCall { resolved_package } => {
+                RefKind::FunctionCall => {
                     // Package-scoped: pick the sub whose package
                     // matches the ref's resolved_package. When the
                     // call pinned a specific package (import or
@@ -57,7 +55,9 @@ impl FileAnalysis {
                     // carry the full path in `target_name` but symbols are
                     // keyed by bare name — match on the unqualified tail and
                     // pin via `resolved_package` (the qualifier).
-                    if let Some(sid) = self.package_scoped_callable(r.unqualified_target_name(), resolved_package) {
+                    if let Some(sid) = self
+                        .package_scoped_callable(r.unqualified_target_name(), r.resolved_package())
+                    {
                         return Some(self.symbol(sid).selection_span);
                     }
                     // Nothing local; leave cross-file resolution to
@@ -78,7 +78,7 @@ impl FileAnalysis {
                     // arbitrary same-named sub when the class can't infer is
                     // never right (the `->new` / `'Users#create'` flood, the
                     // libwww untyped-receiver case).
-                    match &r.resolved_method_target {
+                    match r.method_target() {
                         Some(MethodTarget::Local { sym_id, .. }) => {
                             return Some(self.symbol(*sym_id).selection_span);
                         }
@@ -105,9 +105,9 @@ impl FileAnalysis {
                             .map(|s| s.selection_span)
                     });
                 }
-                RefKind::HashKeyAccess { ref owner, .. } => {
+                RefKind::HashKeyAccess { .. } => {
                     // Try the pre-resolved owner first
-                    if let Some(ref owner) = owner {
+                    if let Some(owner) = r.hash_key_owner() {
                         for def in self.hash_key_defs_for_owner(owner) {
                             if def.name == r.target_name {
                                 return Some(def.selection_span);
@@ -119,7 +119,8 @@ impl FileAnalysis {
                     return self.resolve_variable(&r.target_name, point)
                         .map(|sym| sym.selection_span);
                 }
-                RefKind::DispatchCall { owner: Some(owner), .. } => {
+                RefKind::DispatchCall { .. } if r.handler_owner().is_some() => {
+                    let owner = r.handler_owner().unwrap();
                     // Go-to-def on a dispatch call site lands at the
                     // first stacked Handler for this (owner, name).
                     // Features that want all registrations walk
@@ -141,7 +142,7 @@ impl FileAnalysis {
                     // hash-key def at the same span).
                     return None;
                 }
-                RefKind::DispatchCall { owner: None, .. } => {}
+                RefKind::DispatchCall { .. } => {}
             }
         }
 
@@ -207,12 +208,11 @@ impl FileAnalysis {
             .iter()
             .filter(|o| {
                 o.target_name == key
+                    && matches!(o.kind, RefKind::HashKeyAccess { .. })
                     && matches!(
-                        &o.kind,
-                        RefKind::HashKeyAccess {
-                            owner: Some(HashKeyOwner::Variable { name: on, def_scope: ds }),
-                            ..
-                        } if *ds == def_scope && bare(on) == want
+                        o.hash_key_owner(),
+                        Some(HashKeyOwner::Variable { name: on, def_scope: ds })
+                            if *ds == def_scope && bare(on) == want
                     )
             })
             .map(|o| o.span)
@@ -264,16 +264,15 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::FunctionCall { resolved_package: Some(pkg) } => {
-                    let wanted_pkg = pkg.clone();
+                RefKind::FunctionCall if r.resolved_package().is_some() => {
+                    let wanted_pkg = r.resolved_package().unwrap();
                     results.push((r.span, r.access));
                     for other in &self.refs {
                         if std::ptr::eq(other, r) { continue; }
                         if other.target_name != r.target_name { continue; }
-                        if let RefKind::FunctionCall { resolved_package: Some(op) } = &other.kind {
-                            if op == &wanted_pkg {
-                                results.push((other.span, other.access));
-                            }
+                        if !matches!(other.kind, RefKind::FunctionCall) { continue; }
+                        if other.resolved_package() == Some(wanted_pkg) {
+                            results.push((other.span, other.access));
                         }
                     }
                 }
@@ -303,7 +302,7 @@ impl FileAnalysis {
 
         // O(1) lookup for every ref resolved to this symbol.
         // This covers variables, HashKeyAccess refs whose owner was resolved at
-        // build time, and any future kinds that set resolves_to.
+        // build time, and any future kinds that bind a resolved symbol.
         for &idx in self.refs_to_symbol(target_id) {
             let r = &self.refs[idx];
             results.push((r.span, r.access));
@@ -320,16 +319,16 @@ impl FileAnalysis {
         if matches!(sym.kind, SymKind::Sub | SymKind::Method | SymKind::Package | SymKind::Class | SymKind::Module) {
             let sym_package = sym.package.clone();
             for r in &self.refs {
-                if r.resolves_to.is_some() { continue; }
+                if r.resolved_symbol().is_some() { continue; }
                 match (&r.kind, &sym.kind) {
-                        (RefKind::FunctionCall { resolved_package }, SymKind::Sub) => {
+                        (RefKind::FunctionCall, SymKind::Sub) => {
                             // Match the bare callable name so qualified call
                             // sites (`Foo::baz()`, target_name "Foo::baz")
                             // pair with `sub baz`; `resolved_package` (the
                             // qualifier) still isolates same-named subs
                             // across packages.
                             if r.unqualified_target_name() == sym.name
-                                && *resolved_package == sym_package {
+                                && r.resolved_package() == sym_package.as_deref() {
                                 results.push((r.span, r.access));
                             }
                         }
@@ -357,7 +356,7 @@ impl FileAnalysis {
         }
 
         // Member-access refs (cpp `o->field` / `o->method()`) dispatch through
-        // the frozen `resolved_method_target` edge, not `resolves_to`. Any
+        // the frozen `Method` binding, not a resolved-symbol binding. Any
         // MethodCall whose edge landed on this symbol — via the SAME
         // ancestor walk goto-def uses — references it, whether the member is a
         // method or a data field (`Variable`/`Field`). Inheritance-aware for
@@ -367,7 +366,7 @@ impl FileAnalysis {
             if let (
                 RefKind::MethodCall { method_name_span, .. },
                 Some(MethodTarget::Local { sym_id, .. }),
-            ) = (&r.kind, &r.resolved_method_target)
+            ) = (&r.kind, r.method_target())
             {
                 if *sym_id == target_id {
                     results.push((*method_name_span, r.access));
@@ -378,14 +377,13 @@ impl FileAnalysis {
         // For hash key definitions, find all accesses with same owner + key name
         if let SymbolDetail::HashKeyDef { ref owner, .. } = sym.detail {
             for r in &self.refs {
-                if let RefKind::HashKeyAccess { owner: ref ro, .. } = r.kind {
+                if matches!(r.kind, RefKind::HashKeyAccess { .. }) {
                     if r.target_name != sym.name {
                         continue;
                     }
-                    let matches = match ro {
-                        Some(ref ro) => owner.found_by(ro),
+                    let matches = match r.hash_key_owner() {
+                        Some(ro) => owner.found_by(ro),
                         None => false,
-
                     };
                     if matches {
                         results.push((r.span, r.access));
@@ -467,7 +465,7 @@ impl FileAnalysis {
                             }
                         }
                     }
-                    if let Some(sym_id) = r.resolves_to {
+                    if let Some(sym_id) = r.resolved_symbol() {
                         let sym = self.symbol(sym_id);
                         return Some(self.format_symbol_hover_at(sym, source, point, module_index));
                     }
@@ -476,12 +474,14 @@ impl FileAnalysis {
                         return Some(self.format_symbol_hover_at(sym, source, point, module_index));
                     }
                 }
-                RefKind::FunctionCall { resolved_package } => {
+                RefKind::FunctionCall => {
                     // Package-scoped: hover shows the sub whose
                     // package matches what the ref resolved to. Qualified
                     // calls match on the bare tail (symbols are keyed by
-                    // bare name); `resolved_package` pins the package.
-                    if let Some(sid) = self.package_scoped_callable(r.unqualified_target_name(), resolved_package) {
+                    // bare name); the `Function` binding pins the package.
+                    if let Some(sid) = self
+                        .package_scoped_callable(r.unqualified_target_name(), r.resolved_package())
+                    {
                         return Some(self.format_symbol_hover(self.symbol(sid), source, module_index));
                     }
                     // Fall-through: the name might be a function imported
@@ -530,10 +530,7 @@ impl FileAnalysis {
                     // Single-source the invocant class off the frozen
                     // dispatch edge (NAV unification) — same edge find_def /
                     // refs_to read, so hover never diverges.
-                    let class_name = r
-                        .resolved_method_target
-                        .as_ref()
-                        .map(|t| t.invocant_class().to_string());
+                    let class_name = r.method_target().map(|t| t.invocant_class().to_string());
                     // The bare method name (FQ `$o->Foo::Bar::m` resolves `m`).
                     let method = r.unqualified_target_name();
                     if let Some(ref cn) = class_name {
@@ -597,8 +594,8 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::HashKeyAccess { owner, .. } => {
-                    if let Some(ref owner) = owner {
+                RefKind::HashKeyAccess { .. } => {
+                    if let Some(owner) = r.hash_key_owner() {
                         let defs = self.hash_key_defs_for_owner(owner);
                         let matching: Vec<_> = defs.iter()
                             .filter(|d| d.name == r.target_name)
@@ -614,8 +611,8 @@ impl FileAnalysis {
                         }
                     }
                 }
-                RefKind::DispatchCall { dispatcher, owner } => {
-                    if let Some(ref owner) = owner {
+                RefKind::DispatchCall { dispatcher } => {
+                    if let Some(owner) = r.handler_owner() {
                         return Some(self.format_handler_hover(
                             &r.target_name,
                             owner,
@@ -710,7 +707,7 @@ impl FileAnalysis {
                     if !matches!(r.kind, RefKind::Variable) {
                         return None;
                     }
-                    r.resolves_to
+                    r.resolved_symbol()
                         .map(|id| self.symbol(id))
                         .filter(|s| matches!(s.kind, SymKind::Field))
                 })
@@ -724,8 +721,7 @@ impl FileAnalysis {
             if matches!(r.kind, RefKind::MethodCall { .. }) {
                 let bare = r.unqualified_target_name();
                 let cls = r
-                    .resolved_method_target
-                    .as_ref()
+                    .method_target()
                     .map(|t| t.invocant_class().to_string())
                     .or_else(|| self.method_call_invocant_class(r, None));
                 if let Some(class) = cls {
@@ -763,8 +759,11 @@ impl FileAnalysis {
         }
         // Cursor on a constructor key (access at a call site, or the
         // synthesized def) owned by `Sub { class, new }`.
-        let (key, owner) = match self.ref_at(point).map(|r| (r, &r.kind)) {
-            Some((r, RefKind::HashKeyAccess { owner: Some(o), .. })) => {
+        let (key, owner) = match self
+            .ref_at(point)
+            .map(|r| (r, r.hash_key_owner()))
+        {
+            Some((r, Some(o))) if matches!(r.kind, RefKind::HashKeyAccess { .. }) => {
                 (r.target_name.clone(), o.clone())
             }
             _ => match self.symbol_at(point) {
@@ -978,8 +977,7 @@ impl FileAnalysis {
                     continue;
                 }
                 let cls = r
-                    .resolved_method_target
-                    .as_ref()
+                    .method_target()
                     .map(|t| t.invocant_class().to_string())
                     .or_else(|| self.method_call_invocant_class(r, None));
                 if cls.as_deref() == Some(g.class.as_str()) {
@@ -1044,7 +1042,7 @@ impl FileAnalysis {
                 name: "new".to_string(),
             };
             for r in &self.refs {
-                if let RefKind::HashKeyAccess { owner: Some(o), .. } = &r.kind {
+                if let Some(o) = r.hash_key_owner() {
                     if r.target_name == g.bare && o.found_by(&owner) {
                         spans.push(r.span);
                     }
@@ -1059,8 +1057,7 @@ impl FileAnalysis {
                         continue;
                     }
                     let cls = r
-                        .resolved_method_target
-                        .as_ref()
+                        .method_target()
                         .map(|t| t.invocant_class().to_string())
                         .or_else(|| self.method_call_invocant_class(r, None));
                     if cls.as_deref() == Some(g.class.as_str()) {
@@ -1083,9 +1080,7 @@ impl FileAnalysis {
             })
         {
             for r in &self.refs {
-                if let RefKind::HashKeyAccess { owner: Some(HashKeyOwner::Class(c)), .. } =
-                    &r.kind
-                {
+                if let Some(HashKeyOwner::Class(c)) = r.hash_key_owner() {
                     if c == &g.class && r.target_name == g.bare {
                         spans.push(r.span);
                     }
@@ -1130,8 +1125,7 @@ impl FileAnalysis {
             let verb = enclosing.unqualified_target_name();
             if self.is_column_keyed_verb(verb) {
                 if let Some(class) = enclosing
-                    .resolved_method_target
-                    .as_ref()
+                    .method_target()
                     .map(|t| t.invocant_class().to_string())
                     .or_else(|| self.method_call_invocant_class(enclosing, module_index))
                 {
@@ -1166,8 +1160,7 @@ impl FileAnalysis {
         // belongs to `method`'s return value, owned `Sub{invocant_class, method}`.
         if let Some(enclosing) = enclosing_call {
             if let Some(class) = enclosing
-                .resolved_method_target
-                .as_ref()
+                .method_target()
                 .map(|t| t.invocant_class().to_string())
                 .or_else(|| self.method_call_invocant_class(enclosing, module_index))
             {
@@ -1203,11 +1196,11 @@ impl FileAnalysis {
     }
 
     /// Resolve the package a walk-time-unresolved bare call
-    /// (`resolved_package: None`) actually targets, by asking which `use`d
+    /// (no `Function` binding) actually targets, by asking which `use`d
     /// module binds the name. A bare `use Bank;` auto-imports `Bank`'s
     /// `@EXPORT` — a fact only the index knows, so the single-file walk left
     /// the call unpinned. The lazy re-resolution seam method dispatch
-    /// (`resolved_method_target: None`) and deferred hash-key owners already
+    /// (an unstamped `Method` binding) and deferred hash-key owners already
     /// use: where the index is in hand at query time, recover what the
     /// single-file builder couldn't. Returns the module the call resolves to,
     /// or `None` when no imported module binds the name (genuinely local /
@@ -1217,9 +1210,9 @@ impl FileAnalysis {
         call_ref: &Ref,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Option<String> {
-        let RefKind::FunctionCall { resolved_package: None } = &call_ref.kind else {
+        if !matches!(call_ref.kind, RefKind::FunctionCall) || call_ref.binding.is_some() {
             return None;
-        };
+        }
         // Qualified calls (`Foo::bar`) pin at build time; only truly-bare
         // unresolved calls reach the index.
         if split_qualified(&call_ref.target_name).0.is_some() {
@@ -1341,17 +1334,18 @@ impl FileAnalysis {
         if let Some(r) = self.ref_at(point) {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => return Some(RenameKind::Variable),
-                RefKind::FunctionCall { resolved_package } => {
+                RefKind::FunctionCall => {
                     // A qualified call (`Foo::baz()`) carries the whole path
                     // in `target_name`; the renamable identifier is the bare
-                    // tail, scoped by `resolved_package` (the qualifier). When
+                    // tail, scoped by the `Function` binding (the qualifier). When
                     // the walk left the call unresolved (a bare imported call
                     // — `use Bank;` auto-imports `@EXPORT`, invisible single-
                     // file), recover the exporting module via the index so the
                     // target scopes to the source package, not `None`.
-                    let package = resolved_package.clone().or_else(|| {
-                        self.deferred_call_package(r, module_index)
-                    });
+                    let package = r
+                        .resolved_package()
+                        .map(str::to_string)
+                        .or_else(|| self.deferred_call_package(r, module_index));
                     return Some(RenameKind::Function {
                         name: r.unqualified_target_name().to_string(),
                         package,
@@ -1379,7 +1373,8 @@ impl FileAnalysis {
                 }
                 RefKind::PackageRef => return Some(RenameKind::Package(r.target_name.clone())),
                 RefKind::HashKeyAccess { .. } => return Some(RenameKind::HashKey(r.target_name.clone())),
-                RefKind::DispatchCall { owner: Some(owner), .. } => {
+                RefKind::DispatchCall { .. } if r.handler_owner().is_some() => {
+                    let owner = r.handler_owner().unwrap();
                     // A dispatch name spelled via a variable (`my $e = 'x';
                     // $obj->on($e)`) has no literal token to rewrite — the
                     // cursor sits on the variable, so rename the variable, not
@@ -1398,7 +1393,7 @@ impl FileAnalysis {
                 }
                 // Unresolved DispatchCall — owner couldn't be determined
                 // at build time, so rename can't safely scope.
-                RefKind::DispatchCall { owner: None, .. } => return None,
+                RefKind::DispatchCall { .. } => return None,
             }
         }
         if let Some(sym) = self.symbol_at(point) {
@@ -1463,7 +1458,7 @@ impl FileAnalysis {
                 }
                 // Unqualified — a package var only if it resolves to an `our`.
                 let sym = r
-                    .resolves_to
+                    .resolved_symbol()
                     .map(|id| self.symbol(id))
                     .or_else(|| self.resolve_variable(&r.target_name, point));
                 if let Some(s) = sym {
@@ -1519,8 +1514,8 @@ impl FileAnalysis {
         for r in &self.refs {
             if r.target_name != old_name { continue; }
             match &r.kind {
-                RefKind::FunctionCall { resolved_package } => {
-                    if resolved_package == scope {
+                RefKind::FunctionCall => {
+                    if r.resolved_package() == scope.as_deref() {
                         edits.push((r.span, new_name.to_string()));
                     }
                 }

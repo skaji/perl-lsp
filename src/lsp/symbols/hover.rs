@@ -357,8 +357,8 @@ pub fn hover_info(
             }
 
             // Fully-qualified call with no import: resolve the sub in the
-            // package named by the qualifier (`resolved_package`).
-            if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
+            // package named by the qualifier (the `Function` binding).
+            if let (RefKind::FunctionCall, Some(pkg)) = (&r.kind, r.resolved_package()) {
                 let bare = r.unqualified_target_name();
                 if let Some(cached) = module_index.get_cached(pkg) {
                     let whole = module_index.bag_present(&cached);

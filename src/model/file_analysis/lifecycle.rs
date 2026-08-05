@@ -145,7 +145,7 @@ impl FileAnalysis {
     /// type query needing it rehydrates the exact persisted bag on demand
     /// (`docs/adr/memory-slice-2-lru.md`). Clears both the `Vec<Witness>` and
     /// its rebuilt index; touches no pinned field (refs, symbols, return_types,
-    /// resolved_method_target all survive). Idempotent.
+    /// ref bindings all survive). Idempotent.
     pub fn evict_witness_bag(&mut self) {
         self.witnesses = crate::model::witnesses::WitnessBag::default();
         self.bag_evicted = true;
@@ -246,7 +246,7 @@ impl FileAnalysis {
         self.base_ref_count = self.refs.len();
     }
 
-    /// Stamp `resolved_method_target` on every `MethodCall` ref — the NAV
+    /// Stamp the `Method` binding on every `MethodCall` ref — the NAV
     /// unification edge (build pipeline phase 6 `PostFold`, then re-stamped
     /// at enrichment). The invocant class is resolved ONCE here (via the
     /// bag-routed `method_call_invocant_class`) and frozen on the ref;
@@ -300,13 +300,13 @@ impl FileAnalysis {
             // retracts; the only Some→None here is a synthesized member ref
             // whose class was frozen from the field decl (a macro-body
             // `->field` whose receiver is an untypeable macro parameter). Keep it.
-            if target.is_some() {
-                self.refs[i].resolved_method_target = target;
+            if let Some(target) = target {
+                self.refs[i].bind_method(target);
             }
         }
     }
 
-    /// Set the `owner` on `HashKeyAccess { owner: None, .. }` refs
+    /// Set the owner binding on owner-less `HashKeyAccess` refs
     /// whose enclosing `MethodCall`'s receiver types as a
     /// `Parametric` flavor that claims this method's args (DBIC's
     /// `search`/`find`/`update`/...). Build emits these refs
@@ -321,7 +321,7 @@ impl FileAnalysis {
     pub(super) fn fix_chain_receiver_hash_key_owners(&mut self, module_index: Option<&dyn CrossFileLookup>) {
         let mut owner_fixes: Vec<(usize, HashKeyOwner)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            if !matches!(r.kind, RefKind::HashKeyAccess { owner: None, .. }) {
+            if !matches!(r.kind, RefKind::HashKeyAccess { .. }) || r.hash_key_owner().is_some() {
                 continue;
             }
             // Find the enclosing MethodCall ref by span
@@ -356,9 +356,7 @@ impl FileAnalysis {
             owner_fixes.push((i, o));
         }
         for (i, o) in owner_fixes {
-            if let RefKind::HashKeyAccess { ref mut owner, .. } = self.refs[i].kind {
-                *owner = Some(o);
-            }
+            self.refs[i].bind_hash_key_owner(o);
         }
     }
 
@@ -417,17 +415,17 @@ impl FileAnalysis {
             .collect();
         let mut hashkey_resolutions: Vec<(usize, SymbolId)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            if r.resolves_to.is_some() {
+            if r.resolved_symbol().is_some() {
                 continue;
             }
-            if let RefKind::HashKeyAccess { owner: Some(owner), .. } = &r.kind {
+            if let Some(owner) = r.hash_key_owner() {
                 if let Some(&sid) = hashkey_defs.get(&(r.target_name.as_str(), owner)) {
                     hashkey_resolutions.push((i, sid));
                 }
             }
         }
         for (idx, sid) in hashkey_resolutions {
-            self.refs[idx].resolves_to = Some(sid);
+            self.refs[idx].link_owned_symbol(sid);
         }
 
         // Link DispatchCall refs → Handler symbols by (owner, name). A
@@ -438,7 +436,7 @@ impl FileAnalysis {
         //
         // Unlike hash keys, multiple Handlers with the same (owner, name)
         // legitimately coexist (stacked registrations) — we link the ref
-        // to the *first* def found so `resolves_to` has a single target,
+        // to the *first* def found so the linked symbol is a single target,
         // and rely on `refs_to_symbol` walking all stacked defs separately
         // for features like references/rename.
         let handler_defs: HashMap<(&str, &HandlerOwner), SymbolId> = self.symbols.iter()
@@ -452,15 +450,15 @@ impl FileAnalysis {
             .collect();
         let mut handler_resolutions: Vec<(usize, SymbolId)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            if r.resolves_to.is_some() { continue; }
-            if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
+            if r.resolved_symbol().is_some() { continue; }
+            if let Some(owner) = r.handler_owner() {
                 if let Some(&sid) = handler_defs.get(&(r.target_name.as_str(), owner)) {
                     handler_resolutions.push((i, sid));
                 }
             }
         }
         for (idx, sid) in handler_resolutions {
-            self.refs[idx].resolves_to = Some(sid);
+            self.refs[idx].link_owned_symbol(sid);
         }
 
         // Refs by target name, and refs by resolved target SymbolId.
@@ -475,7 +473,7 @@ impl FileAnalysis {
                 .entry(r.target_name.clone())
                 .or_default()
                 .push(i);
-            if let Some(sym_id) = r.resolves_to {
+            if let Some(sym_id) = r.resolved_symbol() {
                 self.refs_by_target.entry(sym_id).or_default().push(i);
             }
             if matches!(r.kind, RefKind::MethodCall { .. } | RefKind::FunctionCall { .. }) {

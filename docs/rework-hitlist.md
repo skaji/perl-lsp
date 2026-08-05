@@ -385,33 +385,30 @@ field order preserved, one EXTRACT_VERSION bump at the end.
 
 **Migration order.** Phase 1 (PackageFacts) is an M-sized standalone win; do
 it early. Phases 2-3 land best AFTER E1 (surface_feed then destructures
-sub-structs) and BEFORE E3 (RefBinding lands into RefTable once).
+sub-structs); E3's `Ref::binding` is already landed and moves into RefTable
+with the rest of the refs.
 
 **Gate.** The residency tripwire and eviction tests already net phase 2;
 equality-net tests cover PackageFacts' Surface join; heap probe totals
 compared before/after.
 
-### E3. Ref's resolution axis is spelled across two homes (flat Optional columns vs variant payloads) — **medium leverage / L**
+### E3. LANDED — Ref's resolution outcome lives in one home: `Ref::binding`
 
-**The evidence.** `resolves_to` is documented "for variable refs"
-(`core_types.rs:765-766`) yet stamped for HashKeyAccess and DispatchCall
-(`lifecycle.rs:412-424, 446-457`); FunctionCall carries its pin INSIDE the
-variant (`resolved_package`, `core_types.rs:1071-1074`) while MethodCall's
-lives OUTSIDE (`resolved_method_target`, `:778-779`); `row_seed`
-(`:897-943`) must re-join both homes per kind. `MethodTarget::Local{sym_id,
-invocant_class}` already IS the fused two-component shape the other kinds
-lack.
-
-**Target shape.** One `binding: Option<RefBinding>` on Ref: `Symbol(SymbolId)`,
-`Function { package, sym }`, `Method(MethodTarget)`, `HashKey { owner, sym }`,
-`Handler { owner, sym }` — populated by the same post-passes that stamp
-today's spellings. RefKind returns to pure written shape. Switchers:
-`row_seed` qual columns (REF_ROWS_VERSION bump), `refs_to` matcher arms,
-`build_indices`, enrichment re-link; EXTRACT_VERSION bump. Land after E2's
-RefTable exists so the new home lands once.
-
-**Gate.** `--refs-parity` A/B run over the gold substrate; refs_to matcher
-tests.
+`Ref::binding: Option<RefBinding>` (`core_types.rs`) is the one home for
+every resolution outcome — `Symbol(SymbolId)`, `Function { package }`,
+`Method(MethodTarget)`, `HashKey { owner, sym }`, `Handler { owner, sym }` —
+replacing the deleted `resolves_to` / `resolved_method_target` flat columns
+and the deleted `FunctionCall.resolved_package` / `HashKeyAccess.owner` /
+`DispatchCall.owner` variant payloads (RefKind is pure written shape again;
+`GatedRef` carries the same binding). Consumers read through the projection
+accessors (`resolved_symbol` / `method_target` / `resolved_package` /
+`hash_key_owner` / `handler_owner`) and post-passes stamp through the
+`bind_*`/`link_owned_symbol` mutators, so no call site matches `RefBinding`
+against `RefKind` itself. `row_seed` derives the same qual columns from the
+binding (row format unchanged — no REF_ROWS_VERSION bump); EXTRACT_VERSION
+bumped (175→176). The `Function { sym }` slot was dropped — no path mints a
+FunctionCall→symbol link today, and a dead field is not a seam. Landed
+before E2's RefTable; when RefTable lands it inherits the field as-is.
 
 ### E4. Symbol presentation policy is encoded three ways — **low leverage / M**
 
@@ -553,7 +550,7 @@ declares no names exempts nothing, pinned by
    recut), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
    (IndexCore), A2 (highlights/linked-editing projections), F2 (monolith
-   directories, after D2), A3/A4, D4/D5, E3 (after E2's RefTable).
+   directories, after D2), A3/A4, D4/D5, E3 (LANDED).
 4. **The arc:** E2 phases 2-3 (+ E4 alongside).
 
 ---

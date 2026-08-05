@@ -317,7 +317,7 @@ impl<'a> CandidateSet<'a> {
         // name lookup here.
         let pkg: Option<String> = match &r.kind {
             RefKind::MethodCall { .. } => Some(analysis.method_call_invocant_class(r, Some(idx))?),
-            RefKind::FunctionCall { resolved_package } => resolved_package.clone().or_else(|| {
+            RefKind::FunctionCall => r.resolved_package().map(str::to_string).or_else(|| {
                 analysis.find_definition(self.point, Some(idx)).and_then(|sp| {
                     analysis
                         .symbols
@@ -685,9 +685,9 @@ impl<'a> CandidateSet<'a> {
         //     `add_columns` / `has` / `:param` HashKeyDef — lives elsewhere.
         // Either way: the class's cached analysis carries the def.
         if let Some(r) = analysis.ref_at(point) {
-            if let RefKind::HashKeyAccess { ref owner, .. } = r.kind {
+            if let RefKind::HashKeyAccess { .. } = r.kind {
                 use crate::model::file_analysis::HashKeyOwner;
-                let owner = match owner {
+                let owner = match r.hash_key_owner() {
                     Some(o) => Some(o.clone()),
                     None => analysis.deferred_hash_key_owner(r, Some(idx)),
                 };
@@ -761,9 +761,9 @@ impl<'a> CandidateSet<'a> {
 
                 // Fully-qualified call (`Foo::Bar::baz()`) with no import: the
                 // qualifier names the package directly; the defining package
-                // lives in another module. Resolve via `resolved_package` (the
-                // qualifier) and the bare sub name.
-                if let RefKind::FunctionCall { resolved_package: Some(pkg) } = &r.kind {
+                // lives in another module. Resolve via the `Function` binding
+                // (the qualifier) and the bare sub name.
+                if let (RefKind::FunctionCall, Some(pkg)) = (&r.kind, r.resolved_package()) {
                     let bare = r.unqualified_target_name();
                     if let Some(cached) = idx.get_cached(pkg) {
                         if Url::from_file_path(&cached.path).is_ok() {
@@ -869,7 +869,7 @@ impl<'a> CandidateSet<'a> {
             // Cross-file DispatchCall goto-def: `$consumer->emit('ready')` in
             // one file jumps to `$producer->on('ready', sub)` in another.
             // Stacked registrations all surface (multi-location picker).
-            if let RefKind::DispatchCall { owner: Some(owner), .. } = &r.kind {
+            if let (RefKind::DispatchCall { .. }, Some(owner)) = (&r.kind, r.handler_owner()) {
                 let locs = dispatch_handler_locations(owner, &r.target_name, idx);
                 if !locs.is_empty() {
                     return locs;

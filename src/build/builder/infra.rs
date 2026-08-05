@@ -235,14 +235,26 @@ impl<'a> Builder<'a> {
     }
 
     pub(super) fn add_ref(&mut self, kind: RefKind, span: Span, target_name: String, access: AccessKind) {
+        self.add_bound_ref(kind, span, target_name, access, None);
+    }
+
+    /// `add_ref` with a walk-time resolution outcome already in hand (a
+    /// `FunctionCall` package pin, a plugin-declared owner).
+    pub(super) fn add_bound_ref(
+        &mut self,
+        kind: RefKind,
+        span: Span,
+        target_name: String,
+        access: AccessKind,
+        binding: Option<crate::model::file_analysis::RefBinding>,
+    ) {
         self.refs.push(Ref {
             kind,
             span,
             scope: self.current_scope(),
             target_name,
             access,
-            resolves_to: None,
-            resolved_method_target: None,
+            binding,
             folded_from: None,
             arg_count: None,
         });

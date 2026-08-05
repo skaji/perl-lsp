@@ -691,11 +691,8 @@ struct Gadget { void run() { helper(); } };\n";
     let pin_of = |fa: &FileAnalysis, name: &str| -> Option<Option<String>> {
         fa.refs
             .iter()
-            .find(|r| r.target_name == name && matches!(r.kind, RefKind::FunctionCall { .. }))
-            .map(|r| match &r.kind {
-                RefKind::FunctionCall { resolved_package } => resolved_package.clone(),
-                _ => None,
-            })
+            .find(|r| r.target_name == name && matches!(r.kind, RefKind::FunctionCall))
+            .map(|r| r.resolved_package().map(str::to_string))
     };
 
     let (mut fa, sites) = build();

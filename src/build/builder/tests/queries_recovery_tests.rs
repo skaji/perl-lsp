@@ -187,15 +187,14 @@ fn test_hash_key_def_in_return_gets_sub_owner() {
         !host_refs.is_empty(),
         "should find HashKeyAccess for 'host'"
     );
-    if let RefKind::HashKeyAccess { ref owner, .. } = host_refs[0].kind {
+    if matches!(host_refs[0].kind, RefKind::HashKeyAccess { .. }) {
         assert_eq!(
-            *owner,
+            host_refs[0].hash_key_owner().cloned(),
             Some(HashKeyOwner::Sub {
                 package: Some("main".to_string()),
                 name: "get_config".to_string()
             }),
-            "host ref should have Sub get_config owner, got {:?}",
-            owner
+            "host ref should have Sub get_config owner",
         );
     }
 
@@ -249,10 +248,8 @@ $calc->get_self->get_config->{host};
     let owner = fa
         .refs
         .iter()
-        .find_map(|r| match &r.kind {
-            RefKind::HashKeyAccess { owner: Some(o), .. } if r.target_name == "host" => {
-                Some(o.clone())
-            }
+        .find_map(|r| match r.hash_key_owner() {
+            Some(o) if r.target_name == "host" => Some(o.clone()),
             _ => None,
         })
         .expect("chained hash access should carry a resolved owner");
@@ -638,7 +635,7 @@ fn test_deref_block_resolves_variable() {
         .collect();
     assert!(!inner_refs.is_empty(), "$ref ref should exist");
     assert!(
-        inner_refs[0].resolves_to.is_some(),
+        inner_refs[0].resolved_symbol().is_some(),
         "$ref inside deref should resolve to declaration"
     );
 }

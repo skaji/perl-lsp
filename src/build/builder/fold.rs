@@ -57,7 +57,7 @@ impl<'a> Builder<'a> {
                         && s.name == name
                         && s.package.as_deref() == Some(pkg.as_str())
                 }) {
-                    self.refs[idx].resolves_to = Some(sym.id);
+                    self.refs[idx].bind_symbol(sym.id);
                 }
                 continue;
             }
@@ -87,7 +87,7 @@ impl<'a> Builder<'a> {
                         })
                         .last()
                     {
-                        self.refs[idx].resolves_to = Some(*sym_id);
+                        self.refs[idx].bind_symbol(*sym_id);
                         break;
                     }
                 }
@@ -692,7 +692,7 @@ impl<'a> Builder<'a> {
     /// method-call result whose return type is known
     /// (`$obj->get_config->{host}`). Mirrors `resolve_hash_owner_from_tree`'s
     /// query-time logic at build time so the stored ref carries a
-    /// resolvable owner (cross-file `refs_to` + the O(1) `resolves_to`
+    /// resolvable owner (cross-file `refs_to` + the O(1) linked-symbol
     /// link both consult the stored owner, not the tree fallback):
     ///   - method returns a Sub-keyed hash (`return { host => … }`) →
     ///     `Sub{package, method}` owner, matching the implicit-return
@@ -713,13 +713,12 @@ impl<'a> Builder<'a> {
     pub(super) fn upgrade_variable_hash_key_owners(&mut self) {
         let mut upgrades: Vec<(usize, HashKeyOwner)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            let RefKind::HashKeyAccess {
-                ref var_text,
-                owner: Some(HashKeyOwner::Variable { .. }),
-            } = r.kind
-            else {
+            let RefKind::HashKeyAccess { ref var_text } = r.kind else {
                 continue;
             };
+            if !matches!(r.hash_key_owner(), Some(HashKeyOwner::Variable { .. })) {
+                continue;
+            }
             if !var_text.starts_with('$') {
                 continue;
             }
@@ -730,9 +729,7 @@ impl<'a> Builder<'a> {
             upgrades.push((i, HashKeyOwner::Class(class.to_string())));
         }
         for (i, o) in upgrades {
-            if let RefKind::HashKeyAccess { ref mut owner, .. } = self.refs[i].kind {
-                *owner = Some(o);
-            }
+            self.refs[i].bind_hash_key_owner(o);
         }
     }
 
@@ -802,14 +799,15 @@ impl<'a> Builder<'a> {
             self.refs.push(Ref {
                 kind: RefKind::HashKeyAccess {
                     var_text: String::new(),
-                    owner: Some(owner),
                 },
                 span,
                 scope: self.scope_at_point(span.start),
                 target_name: key_text,
                 access,
-                resolves_to: None,
-                resolved_method_target: None,
+                binding: Some(crate::model::file_analysis::RefBinding::HashKey {
+                    owner,
+                    sym: None,
+                }),
                 folded_from: None,
                 arg_count: None,
             });
@@ -1788,33 +1786,32 @@ impl<'a> Builder<'a> {
             .collect();
 
         for r in &mut self.refs {
-            if let RefKind::HashKeyAccess {
-                ref var_text,
-                ref mut owner,
-            } = r.kind
-            {
-                if let Some(func_name) = binding_map.get(var_text.as_str()) {
+            if let RefKind::HashKeyAccess { ref var_text } = r.kind {
+                let new_owner = if let Some(func_name) = binding_map.get(var_text.as_str()) {
                     let resolved = walk_return_delegation_chain(
                         func_name,
                         &self.sub_return_delegations,
                         &subs_with_own_keys,
                     );
-                    *owner = Some(HashKeyOwner::Sub {
+                    Some(HashKeyOwner::Sub {
                         package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
                         name: resolved,
-                    });
+                    })
                 } else if let Some(method_name) = method_binding_map.get(var_text.as_str()) {
                     let resolved = walk_return_delegation_chain(
                         method_name,
                         &self.sub_return_delegations,
                         &subs_with_own_keys,
                     );
-                    if subs_with_own_keys.contains(&resolved) {
-                        *owner = Some(HashKeyOwner::Sub {
-                            package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
-                            name: resolved,
-                        });
-                    }
+                    subs_with_own_keys.contains(&resolved).then(|| HashKeyOwner::Sub {
+                        package: sub_package.get(resolved.as_str()).cloned().unwrap_or(None),
+                        name: resolved,
+                    })
+                } else {
+                    None
+                };
+                if let Some(o) = new_owner {
+                    r.bind_hash_key_owner(o);
                 }
             }
         }
@@ -1955,8 +1952,8 @@ impl<'a> Builder<'a> {
         }
 
         for r in &mut self.refs {
-            if let RefKind::HashKeyAccess { ref var_text, ref mut owner } = r.kind {
-                if owner.is_some() { continue; }
+            if let RefKind::HashKeyAccess { ref var_text } = r.kind {
+                if r.hash_key_owner().is_some() { continue; }
 
                 let vt = var_text.clone();
                 // Canonicalize: $hash → %hash for lookup
@@ -1979,14 +1976,14 @@ impl<'a> Builder<'a> {
                                 // For non-Parametric this is the
                                 // dispatch class. CLAUDE.md #10.
                                 if let Some(cn) = tc_type.hash_key_class() {
-                                    *owner = Some(HashKeyOwner::Class(cn.to_string()));
+                                    r.bind_hash_key_owner(HashKeyOwner::Class(cn.to_string()));
                                     break 'outer;
                                 }
                             }
                         }
                         scope = self.scopes[sid.0 as usize].parent;
                     }
-                    if owner.is_some() { continue; }
+                    if r.hash_key_owner().is_some() { continue; }
                 }
 
                 // Fall back to variable identity
@@ -1995,7 +1992,7 @@ impl<'a> Builder<'a> {
                     let mut scope = Some(r.scope);
                     while let Some(sid) = scope {
                         if let Some((def_scope, _sym_id)) = defs.iter().find(|(s, _)| *s == sid) {
-                            *owner = Some(HashKeyOwner::Variable {
+                            r.bind_hash_key_owner(HashKeyOwner::Variable {
                                 name: vt.clone(),
                                 def_scope: *def_scope,
                             });

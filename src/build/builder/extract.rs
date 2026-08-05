@@ -560,13 +560,12 @@ impl<'a> Builder<'a> {
                 node_to_span(key_node)
             };
             self.refs.push(Ref {
-                kind: RefKind::HashKeyAccess { var_text: hash_name.to_string(), owner: None },
+                kind: RefKind::HashKeyAccess { var_text: hash_name.to_string() },
                 span,
                 scope: self.scope_at_point(span.start),
                 target_name: key,
                 access: AccessKind::Write,
-                resolves_to: None,
-                resolved_method_target: None,
+                binding: None,
                 folded_from: None,
                 arg_count: None,
             });
@@ -687,14 +686,13 @@ impl<'a> Builder<'a> {
             self.refs.push(Ref {
                 kind: RefKind::HashKeyAccess {
                     var_text: String::new(),
-                    owner: owner_to_emit,
                 },
                 span,
                 scope: self.scope_at_point(span.start),
                 target_name: key,
                 access,
-                resolves_to: None,
-                resolved_method_target: None,
+                binding: owner_to_emit
+                    .map(|owner| crate::model::file_analysis::RefBinding::HashKey { owner, sym: None }),
                 folded_from: None,
                 arg_count: None,
             });

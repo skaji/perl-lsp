@@ -275,11 +275,14 @@ impl<'a> Builder<'a> {
                 // the full path (the hash-key binding + provenance rely on
                 // it); resolution sites read `unqualified_target_name()`.
                 let ref_span = fq_tail_span(func_node, raw);
-                self.add_ref(
-                    RefKind::FunctionCall { resolved_package: resolved_package.clone() },
+                self.add_bound_ref(
+                    RefKind::FunctionCall,
                     ref_span,
                     name.to_string(),
                     AccessKind::Read,
+                    resolved_package
+                        .clone()
+                        .map(|package| RefBinding::Function { package }),
                 );
                 // Even-position stringy args → HashKeyAccess refs
                 // owned by `Sub{resolved_package, name}`. Same
@@ -883,13 +886,12 @@ impl<'a> Builder<'a> {
             // for an export-list ref anyway (it sits at package top level).
             let scope = self.scopes.first().map(|s| s.id).unwrap_or(ScopeId(0));
             self.refs.push(Ref {
-                kind: RefKind::FunctionCall { resolved_package: pkg },
+                kind: RefKind::FunctionCall,
                 span,
                 scope,
                 target_name: name,
                 access: AccessKind::Read,
-                resolves_to: None,
-                resolved_method_target: None,
+                binding: pkg.map(|package| RefBinding::Function { package }),
                 folded_from: None,
                 arg_count: None,
             });
@@ -921,7 +923,9 @@ impl<'a> Builder<'a> {
         }
         let mut pins: Vec<(usize, String)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
-            let RefKind::FunctionCall { resolved_package: None } = &r.kind else { continue };
+            if !matches!(r.kind, RefKind::FunctionCall) || r.binding.is_some() {
+                continue;
+            }
             if crate::model::file_analysis::split_qualified(&r.target_name).0.is_some() {
                 continue; // qualified calls already pin at walk time (step 1)
             }
@@ -938,9 +942,7 @@ impl<'a> Builder<'a> {
             }
         }
         for (i, pkg) in pins {
-            if let RefKind::FunctionCall { resolved_package } = &mut self.refs[i].kind {
-                *resolved_package = Some(pkg);
-            }
+            self.refs[i].bind_function_package(pkg);
         }
     }
 
@@ -1006,13 +1008,13 @@ impl<'a> Builder<'a> {
                             let name = name.to_string();
                             let resolved_package = self.resolve_call_package(&name);
                             self.refs.push(Ref {
-                                kind: RefKind::FunctionCall { resolved_package },
+                                kind: RefKind::FunctionCall,
                                 span: node_to_span(func),
                                 scope,
                                 target_name: name,
                                 access: AccessKind::Read,
-                                resolves_to: None,
-                                resolved_method_target: None,
+                                binding: resolved_package
+                                    .map(|package| RefBinding::Function { package }),
                                 folded_from: None,
                                 arg_count: None,
                             });
@@ -1049,8 +1051,7 @@ impl<'a> Builder<'a> {
                                     scope,
                                     target_name: name.to_string(),
                                     access: AccessKind::Read,
-                                    resolves_to: None,
-                                    resolved_method_target: None,
+                                    binding: None,
                                     folded_from: None,
                                     arg_count: None,
                                 });
@@ -1068,8 +1069,7 @@ impl<'a> Builder<'a> {
                                 scope,
                                 target_name: t.to_string(),
                                 access: AccessKind::Read,
-                                resolves_to: None,
-                                resolved_method_target: None,
+                                binding: None,
                                 folded_from: None,
                                 arg_count: None,
                             });

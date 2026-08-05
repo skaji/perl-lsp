@@ -342,7 +342,7 @@ impl<'a> Builder<'a> {
                 if !parents.is_empty() {
                     if let Some(node) = node {
                         let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
-                        self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+                        self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef, None);
                     }
                     self.package_parents
                         .entry(pkg)
@@ -386,10 +386,14 @@ impl<'a> Builder<'a> {
                         .filter(|s| !s.starts_with(':') && !s.starts_with('-'))
                         .map(|s| s.as_str())
                         .collect();
-                    let kind = RefKind::FunctionCall {
-                        resolved_package: Some(module_name.clone()),
-                    };
-                    self.emit_refs_for_strings(node, &sym_set, kind);
+                    self.emit_refs_for_strings(
+                        node,
+                        &sym_set,
+                        RefKind::FunctionCall,
+                        Some(crate::model::file_analysis::RefBinding::Function {
+                            package: module_name.clone(),
+                        }),
+                    );
                 }
             }
         }
@@ -417,17 +421,23 @@ impl<'a> Builder<'a> {
                 //     `resolve_call_package` also keys to this package), never
                 //     touching the exporter's symbols.
                 if module_name != "parent" && module_name != "base" {
-                    self.add_ref(
-                        RefKind::FunctionCall { resolved_package: Some(module_name.clone()) },
+                    self.add_bound_ref(
+                        RefKind::FunctionCall,
                         remote_span,
                         remote.clone(),
                         AccessKind::Read,
+                        Some(crate::model::file_analysis::RefBinding::Function {
+                            package: module_name.clone(),
+                        }),
                     );
-                    self.add_ref(
-                        RefKind::FunctionCall { resolved_package: self.current_package.clone() },
+                    self.add_bound_ref(
+                        RefKind::FunctionCall,
                         alias_span,
                         local.clone(),
                         AccessKind::Read,
+                        self.current_package
+                            .clone()
+                            .map(|package| crate::model::file_analysis::RefBinding::Function { package }),
                     );
                 }
                 imported_symbols.push(ImportedSymbol::renamed(local, remote));
@@ -592,7 +602,7 @@ impl<'a> Builder<'a> {
         // A fully-qualified value-position bareword (`URI::HAS_RESERVED_...`)
         // names a constant sub in another package. Mirror the FQ function-call
         // ref shape so it resolves cross-file to that sub: `target_name` keeps
-        // the full path, `resolved_package` = the qualifier, span = bare tail
+        // the full path, the `Function` binding = the qualifier, span = bare tail
         // (narrowest renamable token, rule #7).
         //
         // BUT the method-invocant slot DOES reach this arm — `Foo::Bar->new`
@@ -610,11 +620,14 @@ impl<'a> Builder<'a> {
         }
         if let (Some(qualifier), _) = crate::model::file_analysis::split_qualified(name) {
             let ref_span = fq_tail_span(node, name);
-            self.add_ref(
-                RefKind::FunctionCall { resolved_package: Some(qualifier.to_string()) },
+            self.add_bound_ref(
+                RefKind::FunctionCall,
                 ref_span,
                 name.to_string(),
                 AccessKind::Read,
+                Some(crate::model::file_analysis::RefBinding::Function {
+                    package: qualifier.to_string(),
+                }),
             );
             return;
         }
@@ -627,11 +640,12 @@ impl<'a> Builder<'a> {
             .get(&pkg)
             .is_some_and(|set| set.contains(name));
         if is_declared {
-            self.add_ref(
-                RefKind::FunctionCall { resolved_package: Some(pkg) },
+            self.add_bound_ref(
+                RefKind::FunctionCall,
                 node_to_span(node),
                 name.to_string(),
                 AccessKind::Read,
+                Some(crate::model::file_analysis::RefBinding::Function { package: pkg }),
             );
             return;
         }
@@ -645,11 +659,12 @@ impl<'a> Builder<'a> {
         // ref, so unresolvable barewords (filehandles, prototypes'
         // leftovers) stay untouched.
         if let Some(owner) = self.resolve_call_package(name) {
-            self.add_ref(
-                RefKind::FunctionCall { resolved_package: Some(owner) },
+            self.add_bound_ref(
+                RefKind::FunctionCall,
                 node_to_span(node),
                 name.to_string(),
                 AccessKind::Read,
+                Some(crate::model::file_analysis::RefBinding::Function { package: owner }),
             );
         }
     }
@@ -725,10 +740,11 @@ impl<'a> Builder<'a> {
         node: Node<'a>,
         filter: &std::collections::HashSet<&str>,
         ref_kind: RefKind,
+        binding: Option<crate::model::file_analysis::RefBinding>,
     ) {
         for (text, span) in self.extract_string_list(node) {
             if filter.contains(text.as_str()) {
-                self.add_ref(ref_kind.clone(), span, text, AccessKind::Read);
+                self.add_bound_ref(ref_kind.clone(), span, text, AccessKind::Read, binding.clone());
             }
         }
     }

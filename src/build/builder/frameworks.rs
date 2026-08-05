@@ -64,7 +64,7 @@ impl<'a> Builder<'a> {
         let parents: Vec<String> = named.into_iter().map(|(s, _)| s).collect();
         if !parents.is_empty() {
             let parent_set: std::collections::HashSet<&str> = parents.iter().map(|s| s.as_str()).collect();
-            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef, None);
             self.package_parents
                 .entry(pkg.to_string())
                 .or_default()
@@ -817,7 +817,7 @@ impl<'a> Builder<'a> {
         if let Some(node) = node {
             let parent_set: std::collections::HashSet<&str> =
                 parents.iter().map(|s| s.as_str()).collect();
-            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef);
+            self.emit_refs_for_strings(node, &parent_set, RefKind::PackageRef, None);
         }
         self.package_parents.entry(pkg).or_default().extend(parents);
     }

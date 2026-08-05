@@ -903,7 +903,7 @@ fn emit_return_fuel(
     let implicit_field_edges: Vec<(crate::model::file_analysis::Span, String, ScopeId)> = fa
         .refs
         .iter()
-        .filter(|r| matches!(r.kind, RefKind::Variable) && r.resolves_to.is_none())
+        .filter(|r| matches!(r.kind, RefKind::Variable) && r.resolved_symbol().is_none())
         .filter_map(|r| {
             let class = scope_package.get(&r.scope)?.as_ref()?;
             let fscope = *field_scope.get(&(class.clone(), r.target_name.clone()))?;
@@ -923,7 +923,7 @@ fn emit_return_fuel(
     // fact the field pass covers. A bare `foo(...)` inside a method body is
     // `this->foo(...)` when the enclosing class declares a `foo` method; C++
     // name lookup finds the member before any free function of that name.
-    // Pinning the call's `resolved_package` to the enclosing class routes it
+    // Pinning the call's `Function` binding to the enclosing class routes it
     // through the SAME package-scoped callable resolution a qualified
     // `Class::foo()` uses (`package_scoped_callable`), so goto-def /
     // references / rename all land on the sibling. A name with no matching
@@ -963,7 +963,7 @@ fn emit_return_fuel(
         .iter()
         .enumerate()
         .filter_map(|(i, r)| {
-            if !matches!(r.kind, RefKind::FunctionCall { resolved_package: None }) {
+            if !matches!(r.kind, RefKind::FunctionCall) || r.binding.is_some() {
                 return None;
             }
             let class = class_of(r.scope)?;
@@ -973,9 +973,7 @@ fn emit_return_fuel(
         })
         .collect();
     for (i, class) in sibling_pins {
-        if let RefKind::FunctionCall { resolved_package } = &mut fa.refs[i].kind {
-            *resolved_package = Some(class);
-        }
+        fa.refs[i].bind_function_package(class);
     }
 }
 

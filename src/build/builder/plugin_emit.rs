@@ -306,17 +306,19 @@ impl<'a> Builder<'a> {
                 self.add_symbol_ns(name, SymKind::HashKeyDef, span, selection_span, detail, ns);
             }
             plugin::EmitAction::HashKeyAccess { name, owner, var_text, span, access } => {
-                // `owner: Some(owner)` so the linkage pass (which looks
+                // Owner-carrying binding so the linkage pass (which looks
                 // for HashKeyAccess → HashKeyDef by name+owner) pairs these
                 // refs to both in-file and cross-file defs automatically.
                 self.refs.push(Ref {
-                    kind: RefKind::HashKeyAccess { var_text, owner: Some(owner) },
+                    kind: RefKind::HashKeyAccess { var_text },
                     span,
                     scope: self.current_scope(),
                     target_name: name,
                     access,
-                    resolves_to: None,
-                    resolved_method_target: None,
+                    binding: Some(crate::model::file_analysis::RefBinding::HashKey {
+                        owner,
+                        sym: None,
+                    }),
                     folded_from: None,
                     arg_count: None,
                 });
@@ -406,8 +408,7 @@ impl<'a> Builder<'a> {
                     scope: self.current_scope(),
                     target_name: method_name,
                     access: AccessKind::Read,
-                    resolves_to: None,
-                    resolved_method_target: None,
+                    binding: None,
                     folded_from: None,
                     arg_count: None,
                 });
@@ -429,13 +430,15 @@ impl<'a> Builder<'a> {
                     name.clone(),
                 )) {
                     self.refs.push(Ref {
-                        kind: RefKind::DispatchCall { dispatcher, owner: Some(owner) },
+                        kind: RefKind::DispatchCall { dispatcher },
                         span,
                         scope: self.current_scope(),
                         target_name: name,
                         access: AccessKind::Read,
-                        resolves_to: None,
-                        resolved_method_target: None,
+                        binding: Some(crate::model::file_analysis::RefBinding::Handler {
+                            owner,
+                            sym: None,
+                        }),
                         folded_from: None,
                         arg_count: None,
                     });
@@ -469,11 +472,14 @@ impl<'a> Builder<'a> {
                 // package — the exporting module for a remote name (joins the
                 // source sub's rename), or the consuming package for a local
                 // alias (a self-contained local group).
-                self.add_ref(
-                    RefKind::FunctionCall { resolved_package: package },
+                self.add_bound_ref(
+                    RefKind::FunctionCall,
                     span,
                     name,
                     AccessKind::Read,
+                    package.map(|package| {
+                        crate::model::file_analysis::RefBinding::Function { package }
+                    }),
                 );
             }
             plugin::EmitAction::PackageParent { package, parent } => {

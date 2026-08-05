@@ -1400,7 +1400,7 @@ $app->routes->post('/users')->to(controller => 'Users', action => 'create');
 
     // If resolves_to is Some(sym_id), it MUST NOT point to the
     // helper — the helper lives on a different class.
-    if let Some(target_sid) = route_ref.resolves_to {
+    if let Some(target_sid) = route_ref.resolved_symbol() {
         assert_ne!(
             target_sid, helper_create.id,
             "route MethodCall(create @ Users) must NOT resolve to the \
@@ -1588,8 +1588,8 @@ fn plugin_app_surface_minion_enqueue_resolves_when_app_typed() {
     // DispatchCall directly; `applicable_dispatches` de-dups the gated
     // candidate against it. Either path surfaces the handler — exactly once.
     let has_materialized = fa.refs.iter().any(|r|
-        matches!(&r.kind, RefKind::DispatchCall { dispatcher, owner: Some(HandlerOwner::Class(c)) }
-            if dispatcher == "enqueue" && c == "Minion")
+        matches!(&r.kind, RefKind::DispatchCall { dispatcher } if dispatcher == "enqueue")
+            && matches!(r.handler_owner(), Some(HandlerOwner::Class(c)) if c == "Minion")
             && r.target_name == "send_email");
     let has_gated = fa.applicable_dispatches(Some(&idx)).iter().any(|a|
         a.name == "send_email" && a.owner == HandlerOwner::Class("Minion".into()));

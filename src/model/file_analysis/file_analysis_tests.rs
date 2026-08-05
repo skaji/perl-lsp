@@ -291,7 +291,7 @@ fn evict_witness_bag_keeps_pinned_drops_bag() {
     let refs_before: Vec<_> = fa.refs.iter().map(|r| r.target_name.clone()).collect();
     let syms_before: Vec<_> = fa.symbols.iter().map(|s| s.name.clone()).collect();
     let targets_before: Vec<_> =
-        fa.refs.iter().map(|r| r.resolved_method_target.clone()).collect();
+        fa.refs.iter().map(|r| r.method_target().cloned()).collect();
     let parents_before = fa.package_parents.clone();
     assert!(!refs_before.is_empty() && !syms_before.is_empty());
 
@@ -303,7 +303,7 @@ fn evict_witness_bag_keeps_pinned_drops_bag() {
     let refs_after: Vec<_> = fa.refs.iter().map(|r| r.target_name.clone()).collect();
     let syms_after: Vec<_> = fa.symbols.iter().map(|s| s.name.clone()).collect();
     let targets_after: Vec<_> =
-        fa.refs.iter().map(|r| r.resolved_method_target.clone()).collect();
+        fa.refs.iter().map(|r| r.method_target().cloned()).collect();
     assert_eq!(refs_before, refs_after);
     assert_eq!(syms_before, syms_after);
     assert_eq!(targets_before, targets_after);
@@ -537,7 +537,7 @@ fn test_phase5_consumer_side_cross_file_resolves_via_enrichment() {
         .find(|r| matches!(r.kind, RefKind::HashKeyAccess { .. }) && r.target_name == "host")
         .expect("HashKeyAccess host");
     assert!(
-        hka_before.resolves_to.is_none(),
+        hka_before.resolved_symbol().is_none(),
         "pre-enrichment, access should not be resolved"
     );
 
@@ -576,14 +576,12 @@ sub get_config { return { host => 'h', port => 1, name => 'n' }; }
         .expect("HashKeyAccess host");
     assert!(
         matches!(
-            &hka.kind,
-            RefKind::HashKeyAccess {
-                owner: Some(HashKeyOwner::Sub { package: Some(p), name }),
-                ..
-            } if p == "TestExporter" && name == "get_config"
+            hka.hash_key_owner(),
+            Some(HashKeyOwner::Sub { package: Some(p), name })
+                if p == "TestExporter" && name == "get_config"
         ),
         "access owner must carry the producer package (Sub{{Some(TestExporter), get_config}}), got {:?}",
-        hka.kind,
+        hka.hash_key_owner(),
     );
 }
 
@@ -765,7 +763,7 @@ fn test_phase5_hash_key_owner_flows_through_intermediate_sub() {
 
 /// Previously broken: references on a hash key owned by a sub's return
 /// value didn't flow through refs_by_target because resolves_to was never
-/// set on HashKeyAccess refs. Phase 5 links HashKeyAccess.resolves_to to
+/// set on HashKeyAccess refs. Phase 5 links HashKeyAccess.resolved_symbol() to
 /// the matching HashKeyDef at build time via (target_name, owner) lookup.
 #[test]
 fn test_phase5_hash_key_access_links_to_def_symbol() {
@@ -2404,4 +2402,39 @@ fn test_cross_file_return_type_cycle_terminates() {
         ty.is_none() || ty.as_ref().and_then(|t| t.class_name_lenient()).is_some(),
         "expected None or a class type from the cycle, got {ty:?}",
     );
+}
+
+/// The fused-binding contract: a ref's resolution outcome is ONE value
+/// (`Ref::binding`), so re-stamping an owner structurally drops any stale
+/// linked symbol — the components can never drift apart, and the linker
+/// only attaches a symbol through a resolved owner.
+#[test]
+fn binding_owner_restamp_drops_stale_symbol_link() {
+    let mut r = Ref {
+        kind: RefKind::HashKeyAccess { var_text: "$cfg".to_string() },
+        span: Span { start: Point { row: 0, column: 0 }, end: Point { row: 0, column: 4 } },
+        scope: ScopeId(0),
+        target_name: "host".to_string(),
+        access: AccessKind::Read,
+        binding: None,
+        folded_from: None,
+        arg_count: None,
+    };
+    // Linking without a resolved owner is a no-op — nothing to attach to.
+    r.link_owned_symbol(SymbolId(7));
+    assert_eq!(r.resolved_symbol(), None);
+    assert_eq!(r.hash_key_owner(), None);
+
+    r.bind_hash_key_owner(HashKeyOwner::Class("Config".to_string()));
+    r.link_owned_symbol(SymbolId(7));
+    assert_eq!(r.resolved_symbol(), Some(SymbolId(7)));
+
+    // Re-owning (the enrichment re-stamp) invalidates the old link.
+    r.bind_hash_key_owner(HashKeyOwner::Sub { package: Some("P".into()), name: "get".into() });
+    assert_eq!(r.resolved_symbol(), None, "stale HashKeyDef link must not survive a re-own");
+    assert!(matches!(r.hash_key_owner(), Some(HashKeyOwner::Sub { .. })));
+
+    // Kind-mismatched projections stay honest: no method target, no package pin.
+    assert_eq!(r.method_target(), None);
+    assert_eq!(r.resolved_package(), None);
 }
