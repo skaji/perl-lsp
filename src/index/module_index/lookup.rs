@@ -35,7 +35,7 @@ impl ModuleIndex {
     }
 
     pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
-        match self.edges.bridges.get(class_name) {
+        match self.core.edges.bridges.get(class_name) {
             Some(mods) => {
                 let mut result = mods.clone();
                 result.sort();
@@ -52,7 +52,7 @@ impl ModuleIndex {
     /// through the graph walk (`walk(INHERITS_INV)`) — this is the
     /// depth-1 edge it composes.
     pub fn modules_with_parent(&self, class_name: &str) -> Vec<String> {
-        match self.edges.children.get(class_name) {
+        match self.core.edges.children.get(class_name) {
             Some(mods) => {
                 let mut result = mods.clone();
                 result.sort();
@@ -162,18 +162,18 @@ impl ModuleIndex {
     #[doc(hidden)]
     pub fn wait_resolved(&self, module_name: &str, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
-        let mut guard = self.resolved.mu.lock().unwrap();
+        let mut guard = self.core.resolved.mu.lock().unwrap();
         loop {
-            if self.cache.contains_key(module_name) {
+            if self.core.cache.contains_key(module_name) {
                 return true;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return false;
             }
-            let (g, result) = self.resolved.cv.wait_timeout(guard, remaining).unwrap();
+            let (g, result) = self.core.resolved.cv.wait_timeout(guard, remaining).unwrap();
             guard = g;
-            if result.timed_out() && !self.cache.contains_key(module_name) {
+            if result.timed_out() && !self.core.cache.contains_key(module_name) {
                 return false;
             }
         }
@@ -182,13 +182,13 @@ impl ModuleIndex {
     /// Get cached module synchronously. WARNING: Does blocking I/O. Only for tests.
     #[cfg(test)]
     pub fn get_cached_blocking(&self, module_name: &str) -> Option<Arc<CachedModule>> {
-        if let Some(entry) = self.cache.get(module_name) {
+        if let Some(entry) = self.core.cache.get(module_name) {
             return entry.clone();
         }
         let inc_paths = module_resolver::discover_inc_paths();
         let mut parser = module_resolver::create_parser();
         let result = module_resolver::resolve_and_parse(&inc_paths, module_name, &mut parser);
-        self.cache.insert(module_name.to_string(), result.clone());
+        self.core.cache.insert(module_name.to_string(), result.clone());
         result
     }
 
@@ -256,7 +256,7 @@ impl CrossFileLookup for ModuleIndex {
         if let Some(cm) = self.all_files.get(path) {
             return Some(cm.value().clone());
         }
-        self.cache.iter().find_map(|entry| {
+        self.core.cache.iter().find_map(|entry| {
             entry
                 .value()
                 .as_ref()
@@ -266,7 +266,7 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn enriched_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
-        if !self.long_lived.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.core.long_lived.load(std::sync::atomic::Ordering::Relaxed) {
             return self.bag_present(cached);
         }
         self.enriched_snapshot(cached)
@@ -330,7 +330,7 @@ impl CrossFileLookup for ModuleIndex {
                 f(entry.value());
             }
         }
-        for entry in self.cache.iter() {
+        for entry in self.core.cache.iter() {
             if let Some(ref cached) = *entry.value() {
                 if seen.insert(cached.path.clone()) {
                     f(cached);
@@ -373,6 +373,7 @@ impl CrossFileLookup for ModuleIndex {
     fn direct_specializations_of(&self, primary: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let modules: Vec<String> = self
+            .core
             .edges
             .specs
             .get(primary)
@@ -392,7 +393,7 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn for_each_loader_shape(&self, f: &mut dyn FnMut(&str, &crate::model::file_analysis::InferredType)) {
-        for entry in self.loader_config_shapes.iter() {
+        for entry in self.core.loader_config_shapes.iter() {
             for (_contributor, t) in entry.value() {
                 f(entry.key(), t);
             }

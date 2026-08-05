@@ -52,40 +52,6 @@ pub fn rehydration_miss_count() -> usize {
     REHYDRATION_MISSES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Mint a fresh monotonic registration generation for `path`. The enrichment
-/// key's ABA-proof identity token: a re-registration (or an @INC re-resolve)
-/// bumps the gen, moving every consumer's key — where a bare Arc pointer
-/// could be freed and its address reused. The resolver THREAD holds the raw
-/// Arcs (not a `&ModuleIndex`), so this is a free fn both the thread and the
-/// `ModuleIndex` methods route through.
-pub(crate) fn mint_registration_gen(
-    registration_gen: &DashMap<std::path::PathBuf, u64>,
-    gen_counter: &std::sync::atomic::AtomicU64,
-    path: &std::path::Path,
-) {
-    let g = gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    registration_gen.insert(path.to_path_buf(), g);
-}
-
-/// Stamp a generation for every name-keyed cache entry that lacks one. The
-/// @INC warm scan (`warm_cache`) writes blobs straight into the cache
-/// without a registration front door, so those providers would otherwise
-/// read gen 0 in `enrichment_key`. `or_insert` so a warm entry racing a
-/// workspace front-door registration keeps the front-door generation.
-pub(crate) fn stamp_missing_import_gens(
-    cache: &DashMap<String, Option<Arc<CachedModule>>>,
-    registration_gen: &DashMap<std::path::PathBuf, u64>,
-    gen_counter: &std::sync::atomic::AtomicU64,
-) {
-    for entry in cache.iter() {
-        if let Some(ref cm) = *entry.value() {
-            registration_gen.entry(cm.path.clone()).or_insert_with(|| {
-                gen_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            });
-        }
-    }
-}
-
 /// The linkage-visible feed a registration extracts from a WHOLE analysis:
 /// (name, declares-a-Class) per visible symbol. Collected before any strip
 /// so the feeds and tie-breaks never read an emptied `symbols`.
@@ -170,14 +136,22 @@ pub(crate) struct WorkspaceRootChannel {
 mod parts;
 pub use parts::*;
 
+mod index_core;
+pub(crate) use index_core::IndexCore;
+#[cfg(test)]
+pub(crate) use index_core::strip_import_copy;
+
 mod lookup;
 mod queries;
 mod registration;
 
 pub struct ModuleIndex {
-    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    /// See `ModuleEdgeIndexes` — names + bridges + children reverse maps.
-    edges: Arc<ModuleEdgeIndexes>,
+    /// The shared organs (`IndexCore`): cache, edge indexes, resolve
+    /// queue/notify, generation counters, loader shapes, bag-cache cell.
+    /// The resolver thread holds the SAME `Arc<IndexCore>`, so both sides
+    /// operate through the one method set — an operation's side-effect set
+    /// cannot diverge per entry path.
+    core: Arc<IndexCore>,
     /// Modules imported (literally or via SyntheticUse) by ANY
     /// workspace file, entrypoint scripts included. Powers the
     /// entrypoint-scan helper lint's "does anything load M" question.
@@ -189,27 +163,6 @@ pub struct ModuleIndex {
     /// forgot to load); installed CPAN plugins keep the generous
     /// "downloaded = intended" resolution.
     workspace_modules: Arc<DashMap<String, ()>>,
-    /// Loader-config shapes projected at registration: load-name →
-    /// (contributor, shape) pairs from each file's `PluginLoad` facts.
-    /// Projected HERE because lite entrypoints are PACKAGELESS — they
-    /// never enter the cache, so enrichment can't reach their bags;
-    /// the config value is a literal, so its shape is final at the
-    /// contributor's own build. Fed by register_workspace_module
-    /// (before the packageless early-return) AND insert_cache.
-    loader_config_shapes: Arc<DashMap<String, Vec<(String, InferredTypeOwned)>>>,
-    /// Modules loaded from cache with an old extract_version.
-    /// Eligible for priority re-resolution when requested.
-    stale_modules: Arc<DashMap<String, ()>>,
-    /// Perl builtins hover docs, name → rendered markdown. Hydrated
-    /// from SQLite by the resolver thread at startup (parsed from
-    /// `perlfunc.pod` on first cold-cache miss). Empty until the
-    /// resolver has run its warmup path.
-    builtins: Arc<DashMap<String, String>>,
-    /// Known module names from @INC scan. Name → path. No exports until resolved.
-    available_modules: Arc<DashMap<String, std::path::PathBuf>>,
-    queue: Arc<ResolveQueue>,
-    resolved: Arc<ResolveNotify>,
-    workspace_root: Arc<WorkspaceRootChannel>,
     /// Per-language sub-indexes (`"cpp"`, `"python"`, …) — kept SEPARATE
     /// (own cache, own `modules-{lang}.db`) so names never comingle across
     /// languages. The Perl index is the hub; query routing picks the right
@@ -247,20 +200,6 @@ pub struct ModuleIndex {
     /// at this key: repeat queries skip the deep-copy entirely until a
     /// provider change moves the key.
     enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
-    /// Monotonic per-path registration generation — the ABA-proof identity
-    /// token `enrichment_key` hashes (an Arc pointer can be freed and its
-    /// address reused; a counter can't run backwards). Bumped by every
-    /// registration front door.
-    registration_gen: Arc<DashMap<std::path::PathBuf, u64>>,
-    gen_counter: Arc<std::sync::atomic::AtomicU64>,
-    /// The witness seams' fallback-on-miss enriched retries only pay off
-    /// when the process lives long enough to amortize the overlay (each
-    /// miss is a whole-analysis deep copy + enrich). Off by default; the
-    /// SERVER enables it at initialize. One-shot CLI query modes leave it
-    /// off — the bisected cost was 2x warm-gold wall for answers no
-    /// one-shot invocation reuses. (`--check`/`--dump-package` consume
-    /// `enriched_snapshot` directly and are unaffected by this gate.)
-    long_lived: Arc<std::sync::atomic::AtomicBool>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
@@ -269,13 +208,6 @@ pub struct ModuleIndex {
     /// evicted, and rehydration after an edit persists would fetch the NEW
     /// generation's names.
     registered_names: Arc<DashMap<std::path::PathBuf, Vec<(String, bool)>>>,
-    /// Slice-2 rehydration store. Pack sub-indexes get theirs at
-    /// construction (keyed to `modules-{lang}.db`); the Perl hub gets its
-    /// own in `set_workspace_root` (keyed to `modules.db` — workspace
-    /// copies are refs/bag-evicted once persisted). A type query reaching
-    /// into an evicted file rehydrates the exact persisted bag through this
-    /// LRU (`bag_present`). See `docs/adr/memory-slice-2-lru.md`.
-    bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::index::pack_bag_cache::PackBagCache>>>>,
     /// The SIBLING tier's rehydration store, for copies this index does not
     /// own. Sweeps mint `CachedModule`s from FileStore entries and ask
     /// whatever index the query routed to — a cpp query's workspace sweep

@@ -3,56 +3,11 @@
 use super::*;
 
 impl ModuleIndex {
-    pub fn new(client: Client, on_diagnostics_refresh: impl Fn() + Send + Sync + 'static) -> Self {
-        let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
-        let edges = Arc::new(ModuleEdgeIndexes::new());
-        let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
-        let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
-        let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let queue = Arc::new(ResolveQueue {
-            priority: Mutex::new(Vec::new()),
-            pending: Mutex::new(Vec::new()),
-            condvar: Condvar::new(),
-        });
-        let resolved = Arc::new(ResolveNotify {
-            mu: Mutex::new(()),
-            cv: Condvar::new(),
-        });
-        let workspace_root = Arc::new(WorkspaceRootChannel {
-            root: Mutex::new(None),
-            condvar: Condvar::new(),
-        });
-
-        let refresh_clone = Arc::new(on_diagnostics_refresh);
-        let long_lived = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let bag_cache: Arc<
-            std::sync::RwLock<Option<Arc<crate::index::pack_bag_cache::PackBagCache>>>,
-        > = Arc::new(std::sync::RwLock::new(None));
-        // Hoisted before the spawn so the resolver thread stamps @INC
-        // generations on the SAME maps the enrichment key reads.
-        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
-        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
-
-        module_resolver::spawn_resolver(
-            Arc::clone(&cache),
-            Arc::clone(&edges),
-            Arc::clone(&stale_modules),
-            Arc::clone(&available_modules),
-            Arc::clone(&builtins),
-            Arc::clone(&queue),
-            Arc::clone(&resolved),
-            Arc::clone(&workspace_root),
-            client,
-            Box::new(move || refresh_clone()),
-            Arc::clone(&long_lived),
-            Arc::clone(&bag_cache),
-            Arc::clone(&registration_gen),
-            Arc::clone(&gen_counter),
-        );
-
+    /// Wrap a shared core. Everything OUTSIDE the core is per-`ModuleIndex`
+    /// serving state the resolver thread never touches.
+    fn from_core(core: Arc<IndexCore>) -> Self {
         ModuleIndex {
-            cache,
-            edges,
+            core,
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
             open_doc_paths: Arc::new(DashMap::new()),
@@ -61,40 +16,39 @@ impl ModuleIndex {
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
-            registration_gen,
-            gen_counter,
-            long_lived,
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
-            bag_cache,
             foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
             workspace_modules: Arc::new(DashMap::new()),
-            loader_config_shapes: Arc::new(DashMap::new()),
-            stale_modules,
-            available_modules,
-            builtins,
-            queue,
-            resolved,
-            workspace_root,
         }
+    }
+
+    pub fn new(client: Client, on_diagnostics_refresh: impl Fn() + Send + Sync + 'static) -> Self {
+        let core = Arc::new(IndexCore::new());
+        module_resolver::spawn_resolver(
+            Arc::clone(&core),
+            client,
+            Box::new(on_diagnostics_refresh),
+        );
+        Self::from_core(core)
     }
 
     /// Hover markdown for a Perl builtin (e.g. `push`, `scalar`).
     /// Returns `None` for unknown names or before the resolver has
     /// hydrated the index from SQLite.
     pub fn builtin_doc(&self, name: &str) -> Option<String> {
-        self.builtins.get(name).map(|e| e.clone())
+        self.core.builtins.get(name).map(|e| e.clone())
     }
 
     /// Notify the resolver thread of the workspace root (from LSP initialize).
     pub fn set_workspace_root(&self, root: Option<&str>) {
-        let mut guard = self.workspace_root.root.lock().unwrap();
+        let mut guard = self.core.workspace_root.root.lock().unwrap();
         if root.is_none() {
             log::warn!("No workspace root from client; using global module cache");
         }
         *guard = Some(root.map(String::from));
-        self.workspace_root.condvar.notify_one();
+        self.core.workspace_root.condvar.notify_one();
         drop(guard);
         // The hub's relational-ref-index reader: the SAME cache key the
         // resolver thread writes under (both spell it as this root string),
@@ -135,32 +89,32 @@ impl ModuleIndex {
 
     /// Get the workspace root URI if set.
     pub fn workspace_root(&self) -> Option<String> {
-        self.workspace_root.root.lock().ok()
+        self.core.workspace_root.root.lock().ok()
             .and_then(|guard| guard.as_ref().and_then(|opt| opt.clone()))
     }
 
     /// Request background resolution for a module. Non-blocking.
     /// Stale modules (old extract version) are queued with priority.
     pub fn request_resolve(&self, module_name: &str) {
-        let is_stale = self.stale_modules.contains_key(module_name);
-        if self.cache.contains_key(module_name) && !is_stale {
+        let is_stale = self.core.stale_modules.contains_key(module_name);
+        if self.core.cache.contains_key(module_name) && !is_stale {
             return; // fresh and cached
         }
         if is_stale {
-            let mut priority = self.queue.priority.lock().unwrap();
+            let mut priority = self.core.queue.priority.lock().unwrap();
             if !priority.contains(&module_name.to_string()) {
                 priority.push(module_name.to_string());
             }
         } else {
-            let mut pending = self.queue.pending.lock().unwrap();
+            let mut pending = self.core.queue.pending.lock().unwrap();
             pending.push(module_name.to_string());
         }
-        self.queue.condvar.notify_one();
+        self.core.queue.condvar.notify_one();
     }
 
     /// Return the cached CachedModule for a module name. Never does I/O.
     pub fn get_cached(&self, module_name: &str) -> Option<Arc<CachedModule>> {
-        self.cache.get(module_name).and_then(|entry| entry.clone())
+        self.core.cache.get(module_name).and_then(|entry| entry.clone())
     }
 
     /// Like `get_cached`, but scoped to a querying file's VISIBILITY set
@@ -284,7 +238,7 @@ impl ModuleIndex {
 
     /// Return cached module path only — never does I/O.
     pub fn module_path_cached(&self, module_name: &str) -> Option<std::path::PathBuf> {
-        self.cache
+        self.core.cache
             .get(module_name)
             .and_then(|entry| entry.as_ref().map(|m| m.path.clone()))
     }
@@ -300,7 +254,7 @@ impl ModuleIndex {
 
     /// Iterate all cached modules. Callback receives (module_name, CachedModule).
     pub fn for_each_cached<F: FnMut(&str, &Arc<CachedModule>)>(&self, mut f: F) {
-        for entry in self.cache.iter() {
+        for entry in self.core.cache.iter() {
             if let Some(ref cached) = *entry.value() {
                 f(entry.key(), cached);
             }
@@ -315,7 +269,7 @@ impl ModuleIndex {
         let mut results = Vec::new();
 
         // Tier 1: resolved modules (have full analysis)
-        for entry in self.cache.iter() {
+        for entry in self.core.cache.iter() {
             if entry.value().is_some() {
                 let name = entry.key();
                 if name.to_lowercase().starts_with(&prefix_lower) && seen.insert(name.clone()) {
@@ -325,7 +279,7 @@ impl ModuleIndex {
         }
 
         // Tier 2: @INC scan (name only, no analysis yet)
-        for entry in self.available_modules.iter() {
+        for entry in self.core.available_modules.iter() {
             let name = entry.key();
             if name.to_lowercase().starts_with(&prefix_lower) && seen.insert(name.clone()) {
                 results.push((name.clone(), false));
@@ -339,7 +293,7 @@ impl ModuleIndex {
     #[cfg(test)]
     pub fn get_return_type_cached(&self, func_name: &str) -> Option<InferredType> {
         use crate::model::file_analysis::CrossFileLookup;
-        let modules = self.edges.names.get(func_name)?;
+        let modules = self.core.edges.names.get(func_name)?;
         for module_name in modules.value() {
             if let Some(cached) = self.get_cached(module_name) {
                 // `sub_return_type_local` walks symbols AND resolves through
@@ -378,7 +332,7 @@ impl ModuleIndex {
     /// own kind/detail filter + override/stacking semantics after
     /// picking which specific symbols matter to them.
     pub fn modules_with_symbol(&self, name: &str) -> Vec<String> {
-        match self.edges.names.get(name) {
+        match self.core.edges.names.get(name) {
             Some(modules) => {
                 let mut result = modules.clone();
                 result.sort();
@@ -411,75 +365,16 @@ impl ModuleIndex {
             })
     }
 
-    /// Create a minimal ModuleIndex for CLI mode (no resolver thread, no @INC scan).
+    /// Create a ModuleIndex for CLI mode: a real (headless) resolver
+    /// thread — same @INC scan, SQLite warm/persist, and resolve loop as
+    /// the server's, without the LSP progress/builtins warmup. One-shot
+    /// CLI sessions previously carried NO resolver, so they could never
+    /// resolve a module the editor hadn't already cached. The thread
+    /// blocks until `set_workspace_root` fires in `cli_full_startup`.
     pub fn new_for_cli() -> Self {
-        // A real (headless) resolver thread: one-shot CLI sessions used
-        // to carry NO resolver, so they could never resolve a module the
-        // editor hadn't already cached — framework-implied imports
-        // (DefaultHelpers) stayed invisible to every CLI probe and the
-        // gold harness. The thread blocks until `set_workspace_root`
-        // fires in `cli_full_startup`.
-        let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
-        let edges = Arc::new(ModuleEdgeIndexes::new());
-        let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
-        let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
-        let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let queue = Arc::new(ResolveQueue {
-            priority: Mutex::new(Vec::new()),
-            pending: Mutex::new(Vec::new()),
-            condvar: Condvar::new(),
-        });
-        let resolved = Arc::new(ResolveNotify {
-            mu: Mutex::new(()),
-            cv: Condvar::new(),
-        });
-        let workspace_root = Arc::new(WorkspaceRootChannel {
-            root: Mutex::new(None),
-            condvar: Condvar::new(),
-        });
-
-        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
-        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
-        module_resolver::spawn_test_resolver(
-            Arc::clone(&cache),
-            Arc::clone(&edges),
-            Arc::clone(&stale_modules),
-            Arc::clone(&available_modules),
-            Arc::clone(&queue),
-            Arc::clone(&resolved),
-            Arc::clone(&workspace_root),
-            Arc::clone(&registration_gen),
-            Arc::clone(&gen_counter),
-        );
-
-        ModuleIndex {
-            cache,
-            edges,
-            loaded_modules: Arc::new(DashMap::new()),
-            pack_indexes: Arc::new(DashMap::new()),
-            open_doc_paths: Arc::new(DashMap::new()),
-            all_defs: Arc::new(DashMap::new()),
-            all_files: Arc::new(DashMap::new()),
-            registered_names: Arc::new(DashMap::new()),
-            freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),
-            enriched: Arc::new(DashMap::new()),
-            registration_gen,
-            gen_counter,
-            long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
-            bag_cache: Arc::new(std::sync::RwLock::new(None)),
-            foreign_bag_cache: std::sync::RwLock::new(None),
-            ref_rows_opener: std::sync::RwLock::new(None),
-            ref_rows_conn: std::sync::Mutex::new(None),
-            workspace_modules: Arc::new(DashMap::new()),
-            loader_config_shapes: Arc::new(DashMap::new()),
-            stale_modules,
-            available_modules,
-            builtins,
-            queue,
-            resolved,
-            workspace_root,
-        }
+        let core = Arc::new(IndexCore::new());
+        module_resolver::spawn_test_resolver(Arc::clone(&core));
+        Self::from_core(core)
     }
 
     /// Mark this process LONG-LIVED (the server): the witness seams'
@@ -488,7 +383,7 @@ impl ModuleIndex {
     /// wall), and the resolver strips warm-loaded @INC copies (their
     /// rehydration cost amortizes the same way).
     pub fn mark_long_lived(&self) {
-        self.long_lived
+        self.core.long_lived
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -496,7 +391,7 @@ impl ModuleIndex {
     /// CLI processes — the harness lane that keeps the server-only paths
     /// (enriched retries, warm @INC strip) under a regression net.
     pub fn is_long_lived(&self) -> bool {
-        self.long_lived.load(std::sync::atomic::Ordering::Relaxed)
+        self.core.long_lived.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn mark_long_lived_from_env(&self) {
@@ -509,67 +404,7 @@ impl ModuleIndex {
 
     #[cfg(test)]
     pub fn new_for_test() -> Self {
-        let cache: Arc<DashMap<String, Option<Arc<CachedModule>>>> = Arc::new(DashMap::new());
-        let edges = Arc::new(ModuleEdgeIndexes::new());
-        let stale_modules: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
-        let available_modules: Arc<DashMap<String, std::path::PathBuf>> = Arc::new(DashMap::new());
-        let builtins: Arc<DashMap<String, String>> = Arc::new(DashMap::new());
-        let queue = Arc::new(ResolveQueue {
-            priority: Mutex::new(Vec::new()),
-            pending: Mutex::new(Vec::new()),
-            condvar: Condvar::new(),
-        });
-        let resolved = Arc::new(ResolveNotify {
-            mu: Mutex::new(()),
-            cv: Condvar::new(),
-        });
-        let workspace_root = Arc::new(WorkspaceRootChannel {
-            root: Mutex::new(None),
-            condvar: Condvar::new(),
-        });
-
-        let registration_gen: Arc<DashMap<std::path::PathBuf, u64>> = Arc::new(DashMap::new());
-        let gen_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
-        module_resolver::spawn_test_resolver(
-            Arc::clone(&cache),
-            Arc::clone(&edges),
-            Arc::clone(&stale_modules),
-            Arc::clone(&available_modules),
-            Arc::clone(&queue),
-            Arc::clone(&resolved),
-            Arc::clone(&workspace_root),
-            Arc::clone(&registration_gen),
-            Arc::clone(&gen_counter),
-        );
-
-        let idx = ModuleIndex {
-            cache,
-            edges,
-            loaded_modules: Arc::new(DashMap::new()),
-            pack_indexes: Arc::new(DashMap::new()),
-            open_doc_paths: Arc::new(DashMap::new()),
-            all_defs: Arc::new(DashMap::new()),
-            all_files: Arc::new(DashMap::new()),
-            registered_names: Arc::new(DashMap::new()),
-            freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),
-            enriched: Arc::new(DashMap::new()),
-            registration_gen,
-            gen_counter,
-            long_lived: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
-            bag_cache: Arc::new(std::sync::RwLock::new(None)),
-            foreign_bag_cache: std::sync::RwLock::new(None),
-            ref_rows_opener: std::sync::RwLock::new(None),
-            ref_rows_conn: std::sync::Mutex::new(None),
-            workspace_modules: Arc::new(DashMap::new()),
-            loader_config_shapes: Arc::new(DashMap::new()),
-            stale_modules,
-            available_modules,
-            builtins,
-            queue,
-            resolved,
-            workspace_root,
-        };
+        let idx = Self::new_for_cli();
         // Unit nets exercise the seams' retries; production defaults OFF
         // (the server enables at initialize).
         idx.mark_long_lived();
@@ -581,12 +416,12 @@ impl ModuleIndex {
     /// to spin up the perlfunc.pod parse pipeline.
     #[cfg(test)]
     pub fn seed_builtin_for_test(&self, name: &str, doc: &str) {
-        self.builtins.insert(name.to_string(), doc.to_string());
+        self.core.builtins.insert(name.to_string(), doc.to_string());
     }
 
     /// Direct access to the raw cache DashMap (for CLI warm_cache integration).
     pub fn cache_raw(&self) -> &DashMap<String, Option<Arc<CachedModule>>> {
-        &self.cache
+        &self.core.cache
     }
 
     /// Insert a module directly into the cache (for CLI and testing).
@@ -610,7 +445,7 @@ impl ModuleIndex {
     /// dedups against already-present symbols).
     pub fn materialize_gated_emissions(&self) {
         let mut updates: Vec<(String, std::path::PathBuf, Arc<FileAnalysis>)> = Vec::new();
-        for entry in self.cache.iter() {
+        for entry in self.core.cache.iter() {
             let Some(cached) = entry.value() else { continue };
             if cached.analysis.gated_emissions.is_empty() {
                 continue;

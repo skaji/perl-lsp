@@ -1176,3 +1176,47 @@ fn close_reconciles_the_disk_record() {
         SurfaceVerdict::Unchanged
     );
 }
+
+/// D2 drift pin: a plugin-carrying module resolved VIA THE RESOLVER THREAD
+/// feeds `loader_config_shapes` exactly like a direct `insert_cache` — both
+/// route through `IndexCore::insert_resolved`, whose projections run on the
+/// WHOLE analysis before the registration-owned strip drops the bag. The
+/// prior thread path fed `edges` only, so an @INC-resolved loader's config
+/// shape never reached `for_each_loader_shape` (the enrichment read that
+/// types `$conf` in the plugin's `register`).
+#[test]
+fn thread_path_resolution_feeds_loader_config_shapes() {
+    use crate::model::file_analysis::CrossFileLookup;
+    let dir = std::env::temp_dir().join(format!(
+        "qx-thread-shapes-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("lib/My")).unwrap();
+    std::fs::write(
+        dir.join("lib/My/App.pm"),
+        "package My::App;\nuse Mojolicious::Lite;\nplugin 'CloveApp', { minion => 1, redis => 'r' };\n1;\n",
+    )
+    .unwrap();
+
+    let idx = ModuleIndex::new_for_test();
+    // file:// spelling — the thread's project-lib discovery strips the
+    // scheme to find `lib/`.
+    idx.set_workspace_root(Some(&format!("file://{}", dir.display())));
+    idx.request_resolve("My::App");
+    assert!(
+        idx.wait_resolved("My::App", std::time::Duration::from_secs(30)),
+        "resolver thread should resolve the project-lib module",
+    );
+
+    let mut shapes: Vec<String> = Vec::new();
+    idx.for_each_loader_shape(&mut |name, _t| shapes.push(name.to_string()));
+    assert!(
+        shapes.iter().any(|n| n == "CloveApp"),
+        "thread-path resolution must feed loader_config_shapes; got {shapes:?}",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

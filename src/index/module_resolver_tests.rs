@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::module_index::strip_import_copy;
 
 #[test]
 fn test_resolve_module_list_util() {
@@ -50,7 +51,7 @@ fn test_discover_inc_paths() {
 }
 
 #[test]
-fn insert_into_cache_none_does_not_clobber_indexed_module() {
+fn insert_resolved_none_does_not_clobber_indexed_module() {
     // A workspace-indexed module (built with plugins, carries a Handler
     // symbol) must survive a later on-demand @INC miss for the same name.
     // The miss happens for project modules under a relative `use lib` the
@@ -75,18 +76,17 @@ sub new {
         "fixture should synthesize a Handler symbol via the mojo-events plugin",
     );
 
-    let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
-    let edges = ModuleEdgeIndexes::new();
+    let core = IndexCore::new();
     let cached = Arc::new(CachedModule::new(PathBuf::from("/x/Demo/Has/Event.pm"), analysis));
 
     // Workspace-index style insert: a resolved module.
-    insert_into_cache(&cache, &edges, "Demo::Has::Event", Some(cached));
-    assert!(cache.get("Demo::Has::Event").as_deref().unwrap().is_some());
+    core.insert_resolved("Demo::Has::Event", Some(cached), false, false);
+    assert!(core.cache.get("Demo::Has::Event").as_deref().unwrap().is_some());
 
     // On-demand resolver miss: `None`. Must NOT clobber the indexed copy.
-    insert_into_cache(&cache, &edges, "Demo::Has::Event", None);
+    core.insert_resolved("Demo::Has::Event", None, false, false);
     assert!(
-        cache.get("Demo::Has::Event").as_deref().unwrap().is_some(),
+        core.cache.get("Demo::Has::Event").as_deref().unwrap().is_some(),
         "a None on-demand miss clobbered an already-indexed module",
     );
 
@@ -95,9 +95,9 @@ sub new {
     let tree2 = parser.parse(source, None).unwrap();
     let analysis2 = std::sync::Arc::new(crate::build::builder::build(&tree2, source.as_bytes()));
     let cached2 = Arc::new(CachedModule::new(PathBuf::from("/y/Demo/Has/Event.pm"), analysis2));
-    insert_into_cache(&cache, &edges, "Demo::Has::Event", Some(cached2));
+    core.insert_resolved("Demo::Has::Event", Some(cached2), false, false);
     assert_eq!(
-        cache.get("Demo::Has::Event").as_deref().unwrap().as_ref().unwrap().path,
+        core.cache.get("Demo::Has::Event").as_deref().unwrap().as_ref().unwrap().path,
         PathBuf::from("/y/Demo/Has/Event.pm"),
     );
 }

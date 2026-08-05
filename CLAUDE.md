@@ -137,7 +137,7 @@ When a comment grows past a few lines, that's a smell: either the code wants a c
 
 ## Cross-file resolution
 
-- `ModuleIndex` runs a dedicated `std::thread` for FS I/O (never blocks tokio). `Arc<DashMap>` shared with async handlers.
+- `ModuleIndex` runs a dedicated `std::thread` for FS I/O (never blocks tokio). The shared mutable state (cache, edge indexes, resolve queue, generation counters, loader shapes, bag-cache cell) is ONE struct — `IndexCore` (`index/module_index/index_core.rs`) — held via a single `Arc` by both `ModuleIndex` (async side) and the resolver thread; shared-state operations are `IndexCore` methods so the two sides can't drift.
 - `CachedModule { path, analysis: Arc<FileAnalysis> }` — full FileAnalysis survives module boundary (refs, type_constraints, call_bindings, framework_imports, package_parents). `SubInfo<'_>` view gives ExportedSub-style accessors.
 - Reverse index: `DashMap<func_name, Vec<module_name>>` for O(1) exporter lookup.
 - SQLite cache per project at `~/.cache/perl-lsp/<hash>/modules.db` (honors `$XDG_CACHE_HOME`). `EXTRACT_VERSION` bump triggers priority re-resolution without dropping the table. To nuke it (e.g. before a cold-start repro), use `perl-lsp --clear-cache [<root>]` — not `rm -rf`.

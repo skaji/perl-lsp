@@ -16,321 +16,341 @@ use tree_sitter::Parser;
 
 use crate::build::cpanfile;
 use crate::index::module_cache;
-use crate::index::module_index::{CachedModule, ModuleEdgeIndexes, ResolveNotify, ResolveQueue, WorkspaceRootChannel};
+use crate::index::module_index::{CachedModule, IndexCore, ResolveQueue, WorkspaceRootChannel};
 
 /// Callback invoked after each module is resolved. Used to trigger diagnostic refresh.
 pub type OnResolved = Box<dyn Fn() + Send + Sync>;
 
-/// Spawn the resolver thread. Returns immediately; the thread runs in the background.
+/// The server-session half of the resolver: the LSP client for progress
+/// reporting plus the diagnostics-refresh callback, and the server-only
+/// warmup lanes keyed off its presence (builtins hydration, warm-copy
+/// strip, stale priority re-resolution, cpanfile pre-scan, dependency
+/// descent). `None` ⇒ headless (one-shot CLI, tests): the SAME per-module
+/// resolve protocol, none of the warmup.
+struct ServerSession {
+    handle: tokio::runtime::Handle,
+    client: Client,
+    on_resolved: OnResolved,
+}
+
+/// Spawn the resolver thread for a server session. Returns immediately; the
+/// thread runs in the background holding the same `Arc<IndexCore>` the
+/// `ModuleIndex` wraps, so every shared-state operation goes through the one
+/// `IndexCore` method set.
 ///
 /// The `on_resolved` callback fires after each module is inserted into the cache,
 /// allowing the backend to re-publish diagnostics.
-pub fn spawn_resolver(
-    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    edges: Arc<ModuleEdgeIndexes>,
-    stale_modules: Arc<DashMap<String, ()>>,
-    available_modules: Arc<DashMap<String, PathBuf>>,
-    builtins: Arc<DashMap<String, String>>,
-    queue: Arc<ResolveQueue>,
-    resolved: Arc<ResolveNotify>,
-    workspace_root: Arc<WorkspaceRootChannel>,
-    client: Client,
-    on_resolved: OnResolved,
-    long_lived: Arc<std::sync::atomic::AtomicBool>,
-    bag_cache: Arc<std::sync::RwLock<Option<Arc<crate::index::pack_bag_cache::PackBagCache>>>>,
-    // The enrichment-key generation maps, threaded the same way as
-    // `long_lived`/`bag_cache`: the resolver thread mints a generation for
-    // every @INC provider it warms or (re-)resolves so `enrichment_key` reads
-    // a real, ABA-proof token instead of an Arc pointer.
-    registration_gen: Arc<DashMap<PathBuf, u64>>,
-    gen_counter: Arc<std::sync::atomic::AtomicU64>,
-) {
+pub fn spawn_resolver(core: Arc<IndexCore>, client: Client, on_resolved: OnResolved) {
     let handle = tokio::runtime::Handle::current();
+    spawn_loop("module-resolver", core, Some(ServerSession { handle, client, on_resolved }));
+}
 
+/// Headless resolver — no Client, no LSP progress. Same @INC scan,
+/// project-local lib discovery, SQLite warm/persist, and resolve protocol
+/// as the full resolver (one loop body, not a copy). Serves tests AND
+/// one-shot CLI sessions (`ModuleIndex::new_for_cli`), which previously had
+/// NO resolver at all and could only read what editor sessions had cached.
+#[doc(hidden)]
+pub fn spawn_test_resolver(core: Arc<IndexCore>) {
+    spawn_loop("module-resolver-test", core, None);
+}
+
+fn spawn_loop(name: &str, core: Arc<IndexCore>, server: Option<ServerSession>) {
     std::thread::Builder::new()
-        .name("module-resolver".into())
-        .spawn(move || {
-            let mut inc_paths = discover_inc_paths();
+        .name(name.into())
+        .spawn(move || resolver_loop(core, server))
+        .expect("failed to spawn module-resolver thread");
+}
 
-            // Wait for workspace root from initialize() for per-project cache path.
-            let ws_root = wait_for_workspace_root(&workspace_root);
+/// The ONE resolver loop, server and headless alike. Mode differences are
+/// explicit `server` gates inside this body — the per-module resolve
+/// protocol (memoization, persistence, strip, `insert_resolved`) has a
+/// single spelling and cannot drift between the two spawn fronts.
+fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>) {
+    let mut inc_paths = discover_inc_paths();
 
-            // Auto-discover project-local lib paths (lib/, local/lib/perl5/).
-            if let Some(ref root_uri) = ws_root {
-                if let Some(root_path) = uri_to_path(root_uri) {
-                    add_project_lib_paths(&mut inc_paths, &root_path);
+    // Wait for workspace root from initialize() for per-project cache path.
+    let ws_root = wait_for_workspace_root(&core.workspace_root);
+
+    // Auto-discover project-local lib paths (lib/, local/lib/perl5/).
+    if let Some(root_path) = ws_root.as_ref().and_then(|u| uri_to_path(u)) {
+        add_project_lib_paths(&mut inc_paths, &root_path);
+    }
+
+    // Scan @INC for available module names (fast, no parsing — just readdir)
+    scan_inc_module_names(&inc_paths, &core.available_modules);
+    log::info!("@INC scan: {} modules available", core.available_modules.len());
+
+    // Warm the in-memory cache from SQLite.
+    let db = module_cache::open_cache_db(ws_root.as_deref(), "perl");
+    if let Some(ref conn) = db {
+        let _ = module_cache::validate_inc_paths(conn, &inc_paths);
+        let _ = module_cache::validate_plugin_fingerprint(
+            conn,
+            &crate::build::plugin::rhai_host::plugin_fingerprint(),
+        );
+        if server.is_some() {
+            // Hydrate Perl builtin hover docs (cached in SQLite, re-parsed
+            // from perlfunc.pod only when the perl version tag changes).
+            // Server-only: a one-shot session would pay the cold parse for
+            // hover docs it never serves.
+            match module_cache::hydrate_builtins(conn) {
+                Ok(map) => {
+                    for entry in map.iter() {
+                        core.builtins.insert(entry.key().clone(), entry.value().clone());
+                    }
+                }
+                Err(e) => log::warn!("Builtins hydrate failed: {}", e),
+            }
+        }
+        // Warm-copy strip is a long-lived-server behavior; one-shot CLI
+        // keeps warm copies whole for wall (rehydration never amortizes).
+        let strip_warm = server.is_some()
+            && core.long_lived.load(std::sync::atomic::Ordering::Relaxed)
+            && eviction_enabled();
+        let (n, stale_names) = module_cache::warm_cache(conn, &core.cache, strip_warm);
+        log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
+        // Stamp generations for the warm-loaded @INC providers (they
+        // landed in the cache without a registration front door).
+        core.stamp_missing_import_gens();
+        for name in &stale_names {
+            core.stale_modules.insert(name.clone(), ());
+        }
+        // Server sessions re-resolve stale modules eagerly; headless ones
+        // re-resolve on demand (`request_resolve` queues stale names with
+        // priority).
+        if server.is_some() && !stale_names.is_empty() {
+            let mut pq = core.queue.priority.lock().unwrap();
+            pq.extend(stale_names);
+            core.queue.condvar.notify_one();
+        }
+        // Build reverse index from warmed cache.
+        core.rebuild_reverse_index();
+    }
+
+    // Track which extract version each module was resolved at.
+    let mut seen: HashMap<String, i64> = HashMap::new();
+
+    // One parser + one parent-fallback memo for the whole sweep.
+    // Without the memo, every child whose own exports are empty re-parses
+    // its parent (e.g. ~50× Exporter, ~30× URI on a cold cpanfile run).
+    let mut parser = create_parser();
+    let mut parse_memo: ParseMemo = HashMap::new();
+
+    // Queue cpanfile dependencies (non-blocking — lets priority items go first).
+    // Track total for progress reporting in the main loop. Server-only: a
+    // one-shot session must not burn its wall resolving the dep tree in the
+    // background.
+    let mut cpanfile_total = 0usize;
+    let mut cpanfile_done = 0usize;
+    if let Some(srv) = &server {
+        if let Some(root_path) = ws_root.as_ref().and_then(|u| uri_to_path(u)) {
+            let cpanfile_modules = cpanfile::parse_cpanfile(&root_path);
+            let to_resolve: Vec<String> = cpanfile_modules
+                .into_iter()
+                .filter(|m| !core.cache.contains_key(m.as_str()))
+                .collect();
+
+            if !to_resolve.is_empty() {
+                cpanfile_total = to_resolve.len();
+                log::info!("cpanfile: {} modules queued for indexing", cpanfile_total);
+
+                // Start progress bar.
+                let token = NumberOrString::String("perl-lsp/indexing".to_string());
+                let _ = srv.handle.block_on(srv.client.send_request::<request::WorkDoneProgressCreate>(
+                    WorkDoneProgressCreateParams { token: token.clone() },
+                ));
+                srv.handle.block_on(srv.client.send_notification::<notification::Progress>(
+                    ProgressParams {
+                        token,
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                            WorkDoneProgressBegin {
+                                title: "Indexing Perl modules".into(),
+                                cancellable: Some(false),
+                                message: None,
+                                percentage: Some(0),
+                            },
+                        )),
+                    },
+                ));
+
+                let mut pending = core.queue.pending.lock().unwrap();
+                pending.extend(to_resolve);
+                core.queue.condvar.notify_one();
+            }
+        }
+    }
+
+    // Main resolve loop — drain priority first, then pending.
+    loop {
+        let batch = drain_next_batch(&core.queue);
+
+        for module_name in batch {
+            // Allow re-resolution when extract version is outdated.
+            if let Some(&ver) = seen.get(&module_name) {
+                if ver >= module_cache::EXTRACT_VERSION {
+                    continue;
+                }
+            }
+            seen.insert(module_name.clone(), module_cache::EXTRACT_VERSION);
+
+            let is_re_resolve = core.stale_modules.contains_key(&module_name);
+            if is_re_resolve {
+                log::info!("Re-resolving stale module '{}'", module_name);
+                // Stale entry must not be served from the run-local memo.
+                parse_memo.remove(&module_name);
+            } else {
+                log::info!("Resolving module '{}'", module_name);
+            }
+
+            let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
+            match &result {
+                Some(m) => log::info!(
+                    "Resolved '{}': {} export, {} export_ok",
+                    module_name,
+                    m.analysis.export.len(),
+                    m.analysis.export_ok.len()
+                ),
+                None => log::info!("No exports found for '{}'", module_name),
+            }
+            let persisted = db
+                .as_ref()
+                .map(|conn| save_module_generation(conn, &module_name, &result))
+                .unwrap_or(false);
+            // The one spelling of "a resolution landed": stale-pin clear +
+            // generation mint + whole-analysis projections + registration-
+            // owned strip + the None-never-clobbers guard, all inside
+            // `insert_resolved`.
+            let stored = core.insert_resolved(
+                &module_name,
+                result.clone(),
+                persisted,
+                eviction_enabled(),
+            );
+            // The memo would otherwise pin the WHOLE closure for the
+            // thread's lifetime — a second copy of the tier. Failed
+            // resolves are NOT memoized (pre-existing semantics: the
+            // parent-fallback re-probes, catching mid-session
+            // installs).
+            match &stored {
+                Some(_) => {
+                    parse_memo.insert(module_name.clone(), stored.clone());
+                }
+                None => {
+                    parse_memo.remove(&module_name);
                 }
             }
 
-            // Scan @INC for available module names (fast, no parsing — just readdir)
-            scan_inc_module_names(&inc_paths, &available_modules);
-            log::info!("@INC scan: {} modules available", available_modules.len());
-
-            // Warm the in-memory cache from SQLite.
-            let db = module_cache::open_cache_db(ws_root.as_deref(), "perl");
-            if let Some(ref conn) = db {
-                let _ = module_cache::validate_inc_paths(conn, &inc_paths);
-                let _ = module_cache::validate_plugin_fingerprint(
-                    conn,
-                    &crate::build::plugin::rhai_host::plugin_fingerprint(),
-                );
-                // Hydrate Perl builtin hover docs (cached in SQLite,
-                // re-parsed from perlfunc.pod only when the perl
-                // version tag changes).
-                match module_cache::hydrate_builtins(conn) {
-                    Ok(map) => {
-                        for entry in map.iter() {
-                            builtins.insert(entry.key().clone(), entry.value().clone());
+            // Descend into the module's own dependencies so the
+            // chain keeps resolving beyond the open doc's direct
+            // imports. Without this the cache stops at depth 1 —
+            // e.g. opening a Mojolicious::Lite script resolves
+            // Mojolicious.pm, but Mojolicious.pm's
+            // `has routes => sub { Mojolicious::Routes->new }`
+            // never triggers a resolve on Mojolicious::Routes,
+            // and `$r->get` on line 71 of the demo chain-dies
+            // because the intermediate class is a cache miss.
+            //
+            // The `seen` guard above makes this cycle-safe: a
+            // transitively-enqueued name that was already
+            // resolved at the current EXTRACT_VERSION gets
+            // skipped on its next turn. Server-only: a one-shot
+            // session resolves exactly what its query asks for.
+            if server.is_some() {
+                if let Some(ref m) = result {
+                    let mut pending = core.queue.pending.lock().unwrap();
+                    let enqueue = |pending: &mut Vec<String>, name: String| {
+                        if name.is_empty() { return; }
+                        if core.cache.contains_key(&name) { return; }
+                        if seen.contains_key(&name) { return; }
+                        if !pending.iter().any(|p| p == &name) {
+                            pending.push(name);
+                        }
+                    };
+                    // Explicit imports — the module's own `use` statements.
+                    for imp in &m.analysis.imports {
+                        enqueue(&mut pending, imp.module_name.clone());
+                    }
+                    // Re-export edges — a re-exporting module (Test::Most →
+                    // Test::More) pulls its producers' surfaces transitively,
+                    // so those producers must be resolved even when no file
+                    // `use`s them directly.
+                    for re in &m.analysis.reexport_modules {
+                        enqueue(&mut pending, re.clone());
+                    }
+                    // Parent classes — inheritance chain.
+                    for parents in m.analysis.package_parents.values() {
+                        for parent in parents {
+                            enqueue(&mut pending, parent.clone());
                         }
                     }
-                    Err(e) => log::warn!("Builtins hydrate failed: {}", e),
+                    // ClassName return types — `has foo => sub { Bar->new }`,
+                    // plugin-emitted typed Subs, method return annotations.
+                    // These are the chain-invisible-but-reachable classes
+                    // the user's chain walks through at query time.
+                    for sym in &m.analysis.symbols {
+                        use crate::model::file_analysis::{InferredType, SymKind, SymbolDetail};
+                        if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
+                        if !matches!(sym.detail, SymbolDetail::Sub { .. }) { continue; }
+                        if let Some(InferredType::ClassName(c)) =
+                            m.analysis.symbol_return_type_via_bag(sym.id, None)
+                        {
+                            enqueue(&mut pending, c);
+                        }
+                    }
+                    if !pending.is_empty() {
+                        core.queue.condvar.notify_one();
+                    }
                 }
-                let strip_warm = long_lived.load(std::sync::atomic::Ordering::Relaxed)
-                    && eviction_enabled();
-                let (n, stale_names) = module_cache::warm_cache(conn, &cache, strip_warm);
-                log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
-                // Stamp generations for the warm-loaded @INC providers (they
-                // landed in the cache without a registration front door).
-                crate::index::module_index::stamp_missing_import_gens(
-                    &cache, &registration_gen, &gen_counter,
-                );
-                // Queue stale modules for priority re-resolution.
-                for name in &stale_names {
-                    stale_modules.insert(name.clone(), ());
-                }
-                if !stale_names.is_empty() {
-                    let mut pq = queue.priority.lock().unwrap();
-                    pq.extend(stale_names);
-                    queue.condvar.notify_one();
-                }
-                // Build reverse index from warmed cache.
-                rebuild_reverse_index(&cache, &edges);
             }
 
-            // Track which extract version each module was resolved at.
-            let mut seen: HashMap<String, i64> = HashMap::new();
+            // Remove from stale set after re-resolution (no-op otherwise).
+            core.stale_modules.remove(&module_name);
 
-            // One parser + one parent-fallback memo for the whole sweep.
-            // Without the memo, every child whose own exports are empty re-parses
-            // its parent (e.g. ~50× Exporter, ~30× URI on a cold cpanfile run).
-            let mut parser = create_parser();
-            let mut parse_memo: ParseMemo = HashMap::new();
-
-            // Queue cpanfile dependencies (non-blocking — lets priority items go first).
-            // Track total for progress reporting in the main loop.
-            let mut cpanfile_total = 0usize;
-            let mut cpanfile_done = 0usize;
-            if let Some(ref root_uri) = ws_root {
-                if let Some(root_path) = uri_to_path(root_uri) {
-                    let cpanfile_modules = cpanfile::parse_cpanfile(&root_path);
-                    let to_resolve: Vec<String> = cpanfile_modules
-                        .into_iter()
-                        .filter(|m| !cache.contains_key(m.as_str()))
-                        .collect();
-
-                    if !to_resolve.is_empty() {
-                        cpanfile_total = to_resolve.len();
-                        log::info!("cpanfile: {} modules queued for indexing", cpanfile_total);
-
-                        // Start progress bar.
-                        let token = NumberOrString::String("perl-lsp/indexing".to_string());
-                        let _ = handle.block_on(client.send_request::<request::WorkDoneProgressCreate>(
-                            WorkDoneProgressCreateParams { token: token.clone() },
-                        ));
-                        handle.block_on(client.send_notification::<notification::Progress>(
+            // Report cpanfile progress.
+            if let Some(srv) = &server {
+                if cpanfile_total > 0 && cpanfile_done < cpanfile_total {
+                    cpanfile_done += 1;
+                    let pct = (cpanfile_done * 100 / cpanfile_total) as u32;
+                    let token = NumberOrString::String("perl-lsp/indexing".to_string());
+                    if cpanfile_done < cpanfile_total {
+                        srv.handle.block_on(srv.client.send_notification::<notification::Progress>(
                             ProgressParams {
                                 token,
-                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                                    WorkDoneProgressBegin {
-                                        title: "Indexing Perl modules".into(),
+                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                                    WorkDoneProgressReport {
                                         cancellable: Some(false),
-                                        message: None,
-                                        percentage: Some(0),
+                                        message: Some(format!("{} ({}/{})", module_name, cpanfile_done, cpanfile_total)),
+                                        percentage: Some(pct),
                                     },
                                 )),
                             },
                         ));
-
-                        let mut pending = queue.pending.lock().unwrap();
-                        pending.extend(to_resolve);
-                        queue.condvar.notify_one();
-                    }
-                }
-            }
-
-            // Main resolve loop — drain priority first, then pending.
-            loop {
-                let batch = drain_next_batch(&queue);
-
-                for module_name in batch {
-                    // Allow re-resolution when extract version is outdated.
-                    if let Some(&ver) = seen.get(&module_name) {
-                        if ver >= module_cache::EXTRACT_VERSION {
-                            continue;
-                        }
-                    }
-                    seen.insert(module_name.clone(), module_cache::EXTRACT_VERSION);
-
-                    let is_re_resolve = stale_modules.contains_key(&module_name);
-                    if is_re_resolve {
-                        log::info!("Re-resolving stale module '{}'", module_name);
-                        // Stale entry must not be served from the run-local memo.
-                        parse_memo.remove(&module_name);
                     } else {
-                        log::info!("Resolving module '{}'", module_name);
+                        srv.handle.block_on(srv.client.send_notification::<notification::Progress>(
+                            ProgressParams {
+                                token,
+                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                    WorkDoneProgressEnd {
+                                        message: Some(format!("Indexed {} modules", cpanfile_total)),
+                                    },
+                                )),
+                            },
+                        ));
                     }
-
-                    let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
-                    match &result {
-                        Some(m) => log::info!(
-                            "Resolved '{}': {} export, {} export_ok",
-                            module_name,
-                            m.analysis.export.len(),
-                            m.analysis.export_ok.len()
-                        ),
-                        None => log::info!("No exports found for '{}'", module_name),
-                    }
-                    let persisted = db
-                        .as_ref()
-                        .map(|conn| save_module_generation(conn, &module_name, &result))
-                        .unwrap_or(false);
-                    let stored =
-                        strip_import_copy(&result, persisted, eviction_enabled());
-                    // The memo would otherwise pin the WHOLE closure for the
-                    // thread's lifetime — a second copy of the tier. Failed
-                    // resolves are NOT memoized (pre-existing semantics: the
-                    // parent-fallback re-probes, catching mid-session
-                    // installs).
-                    match &stored {
-                        Some(_) => {
-                            parse_memo.insert(module_name.clone(), stored.clone());
-                        }
-                        None => {
-                            parse_memo.remove(&module_name);
-                        }
-                    }
-                    // Stale-pin clear BEFORE the new copy is reachable — a
-                    // re-resolve replaced the blob; a query racing this
-                    // insert must not rehydrate the prior generation.
-                    if let Some(ref m) = stored {
-                        if let Some(bc) = bag_cache.read().ok().and_then(|g| g.clone()) {
-                            bc.invalidate(&m.path);
-                        }
-                        // Mint a fresh generation: a re-resolve (content
-                        // changed) moves every consumer's enrichment key.
-                        crate::index::module_index::mint_registration_gen(
-                            &registration_gen, &gen_counter, &m.path,
-                        );
-                    }
-                    insert_into_cache(&cache, &edges, &module_name, stored);
-
-                    // Descend into the module's own dependencies so the
-                    // chain keeps resolving beyond the open doc's direct
-                    // imports. Without this the cache stops at depth 1 —
-                    // e.g. opening a Mojolicious::Lite script resolves
-                    // Mojolicious.pm, but Mojolicious.pm's
-                    // `has routes => sub { Mojolicious::Routes->new }`
-                    // never triggers a resolve on Mojolicious::Routes,
-                    // and `$r->get` on line 71 of the demo chain-dies
-                    // because the intermediate class is a cache miss.
-                    //
-                    // The `seen` guard above makes this cycle-safe: a
-                    // transitively-enqueued name that was already
-                    // resolved at the current EXTRACT_VERSION gets
-                    // skipped on its next turn.
-                    if let Some(ref m) = result {
-                        let mut pending = queue.pending.lock().unwrap();
-                        let enqueue = |pending: &mut Vec<String>, name: String| {
-                            if name.is_empty() { return; }
-                            if cache.contains_key(&name) { return; }
-                            if seen.contains_key(&name) { return; }
-                            if !pending.iter().any(|p| p == &name) {
-                                pending.push(name);
-                            }
-                        };
-                        // Explicit imports — the module's own `use` statements.
-                        for imp in &m.analysis.imports {
-                            enqueue(&mut pending, imp.module_name.clone());
-                        }
-                        // Re-export edges — a re-exporting module (Test::Most →
-                        // Test::More) pulls its producers' surfaces transitively,
-                        // so those producers must be resolved even when no file
-                        // `use`s them directly.
-                        for re in &m.analysis.reexport_modules {
-                            enqueue(&mut pending, re.clone());
-                        }
-                        // Parent classes — inheritance chain.
-                        for parents in m.analysis.package_parents.values() {
-                            for parent in parents {
-                                enqueue(&mut pending, parent.clone());
-                            }
-                        }
-                        // ClassName return types — `has foo => sub { Bar->new }`,
-                        // plugin-emitted typed Subs, method return annotations.
-                        // These are the chain-invisible-but-reachable classes
-                        // the user's chain walks through at query time.
-                        for sym in &m.analysis.symbols {
-                            use crate::model::file_analysis::{InferredType, SymKind, SymbolDetail};
-                            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
-                            if !matches!(sym.detail, SymbolDetail::Sub { .. }) { continue; }
-                            if let Some(InferredType::ClassName(c)) =
-                                m.analysis.symbol_return_type_via_bag(sym.id, None)
-                            {
-                                enqueue(&mut pending, c);
-                            }
-                        }
-                        if !pending.is_empty() {
-                            queue.condvar.notify_one();
-                        }
-                    }
-
-                    // Remove from stale set after successful re-resolution.
-                    if is_re_resolve {
-                        stale_modules.remove(&module_name);
-                    }
-
-                    // Report cpanfile progress.
-                    if cpanfile_total > 0 && cpanfile_done < cpanfile_total {
-                        cpanfile_done += 1;
-                        let pct = (cpanfile_done * 100 / cpanfile_total) as u32;
-                        let token = NumberOrString::String("perl-lsp/indexing".to_string());
-                        if cpanfile_done < cpanfile_total {
-                            handle.block_on(client.send_notification::<notification::Progress>(
-                                ProgressParams {
-                                    token,
-                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
-                                        WorkDoneProgressReport {
-                                            cancellable: Some(false),
-                                            message: Some(format!("{} ({}/{})", module_name, cpanfile_done, cpanfile_total)),
-                                            percentage: Some(pct),
-                                        },
-                                    )),
-                                },
-                            ));
-                        } else {
-                            handle.block_on(client.send_notification::<notification::Progress>(
-                                ProgressParams {
-                                    token,
-                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
-                                        WorkDoneProgressEnd {
-                                            message: Some(format!("Indexed {} modules", cpanfile_total)),
-                                        },
-                                    )),
-                                },
-                            ));
-                        }
-                    }
-
-                    // Signal waiters and trigger diagnostic refresh.
-                    {
-                        let _g = resolved.mu.lock().unwrap();
-                        resolved.cv.notify_all();
-                    }
-                    on_resolved();
                 }
             }
-        })
-        .expect("failed to spawn module-resolver thread");
+
+            // Signal waiters and trigger diagnostic refresh.
+            {
+                let _g = core.resolved.mu.lock().unwrap();
+                core.resolved.cv.notify_all();
+            }
+            if let Some(srv) = &server {
+                (srv.on_resolved)();
+            }
+        }
+    }
 }
 
 /// Drain the next batch from the queue, checking priority first.
@@ -357,93 +377,6 @@ fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
     }
 }
 
-/// Headless resolver — no Client, no LSP progress. Same @INC scan,
-/// project-local lib discovery, SQLite warm/persist, and index feeds
-/// as the full resolver. Serves tests AND one-shot CLI sessions
-/// (`ModuleIndex::new_for_cli`), which previously had NO resolver at
-/// all and could only read what editor sessions had cached.
-#[doc(hidden)]
-pub fn spawn_test_resolver(
-    cache: Arc<DashMap<String, Option<Arc<CachedModule>>>>,
-    edges: Arc<ModuleEdgeIndexes>,
-    stale_modules: Arc<DashMap<String, ()>>,
-    available_modules: Arc<DashMap<String, PathBuf>>,
-    queue: Arc<ResolveQueue>,
-    resolved: Arc<ResolveNotify>,
-    workspace_root: Arc<WorkspaceRootChannel>,
-    registration_gen: Arc<DashMap<PathBuf, u64>>,
-    gen_counter: Arc<std::sync::atomic::AtomicU64>,
-) {
-    std::thread::Builder::new()
-        .name("module-resolver-test".into())
-        .spawn(move || {
-            let mut inc_paths = discover_inc_paths();
-            let ws_root = wait_for_workspace_root(&workspace_root);
-
-            if let Some(ref root_uri) = ws_root {
-                if let Some(root_path) = uri_to_path(root_uri) {
-                    add_project_lib_paths(&mut inc_paths, &root_path);
-                }
-            }
-
-            scan_inc_module_names(&inc_paths, &available_modules);
-
-            let db = module_cache::open_cache_db(ws_root.as_deref(), "perl");
-            if let Some(ref conn) = db {
-                let _ = module_cache::validate_inc_paths(conn, &inc_paths);
-                let _ = module_cache::validate_plugin_fingerprint(
-                    conn,
-                    &crate::build::plugin::rhai_host::plugin_fingerprint(),
-                );
-                let (_, stale_names) = module_cache::warm_cache(conn, &cache, false);
-                crate::index::module_index::stamp_missing_import_gens(
-                    &cache, &registration_gen, &gen_counter,
-                );
-                for name in stale_names {
-                    stale_modules.insert(name, ());
-                }
-                rebuild_reverse_index(&cache, &edges);
-            }
-
-            let mut seen: HashMap<String, i64> = HashMap::new();
-            let mut parser = create_parser();
-            let mut parse_memo: ParseMemo = HashMap::new();
-            loop {
-                let batch = drain_next_batch(&queue);
-                for module_name in batch {
-                    if let Some(&ver) = seen.get(&module_name) {
-                        if ver >= module_cache::EXTRACT_VERSION {
-                            continue;
-                        }
-                    }
-                    seen.insert(module_name.clone(), module_cache::EXTRACT_VERSION);
-                    if stale_modules.contains_key(&module_name) {
-                        parse_memo.remove(&module_name);
-                    }
-
-                    let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
-                    let persisted = db
-                        .as_ref()
-                        .map(|conn| save_module_generation(conn, &module_name, &result))
-                        .unwrap_or(false);
-                    let stored =
-                        strip_import_copy(&result, persisted, eviction_enabled());
-                    parse_memo.insert(module_name.clone(), stored.clone());
-                    if let Some(ref m) = stored {
-                        crate::index::module_index::mint_registration_gen(
-                            &registration_gen, &gen_counter, &m.path,
-                        );
-                    }
-                    insert_into_cache(&cache, &edges, &module_name, stored);
-                    stale_modules.remove(&module_name);
-                    let _g = resolved.mu.lock().unwrap();
-                    resolved.cv.notify_all();
-                }
-            }
-        })
-        .expect("failed to spawn test module-resolver thread");
-}
-
 // ---- Internal helpers ----
 
 fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<String> {
@@ -462,65 +395,6 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
         guard = g;
     }
     guard.clone().flatten()
-}
-
-/// Insert a resolved module into the cache and update the edge indexes.
-/// The @INC tier's registration-owned strip: once the blob is persisted,
-/// the resident copy drops its witness bag (the dominant share of a CPAN
-/// module's payload; `bag_present` rehydrates through the hub's LRU).
-/// Symbols and refs stay resident this slice — their reader routing for
-/// the import tier is the follow-up in
-/// `docs/prompt-storage-residuals.md`. Degraded
-/// analyses keep the bag (their rows never persist).
-fn strip_import_copy(
-    result: &Option<Arc<CachedModule>>,
-    persisted: bool,
-    strip: bool,
-) -> Option<Arc<CachedModule>> {
-    match result {
-        Some(m) if persisted && strip && !m.analysis.degraded => {
-            let mut fa = (*m.analysis).clone();
-            fa.evict_axes(true, false);
-            Some(Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa))))
-        }
-        _ => result.clone(),
-    }
-}
-
-fn insert_into_cache(
-    cache: &DashMap<String, Option<Arc<CachedModule>>>,
-    edges: &ModuleEdgeIndexes,
-    module_name: &str,
-    result: Option<Arc<CachedModule>>,
-) {
-    if let Some(ref cached) = result {
-        edges.feed(module_name, &cached.analysis);
-    } else if matches!(cache.get(module_name).as_deref(), Some(Some(_))) {
-        // On-demand @INC resolution missed this module (`None`), but the
-        // workspace indexer already built it (e.g. a project module under a
-        // relative `use lib` the resolver's @INC doesn't cover). Don't let
-        // the miss clobber the indexed copy — and don't leave the reverse
-        // index pointing at a module the cache no longer holds (the orphan
-        // that broke cross-file Handler / dispatch lookup). Keep the Some.
-        return;
-    }
-    cache.insert(module_name.to_string(), result);
-}
-
-/// Rebuild edge indexes from existing cache (e.g. after warming from
-/// SQLite). The warm path writes blobs straight into the cache without
-/// touching the indexes, so skipping this leaves every reverse lookup
-/// blind on warm starts (cold/warm attribution, the B6 class).
-fn rebuild_reverse_index(
-    cache: &DashMap<String, Option<Arc<CachedModule>>>,
-    edges: &ModuleEdgeIndexes,
-) {
-    edges.clear();
-    for entry in cache.iter() {
-        if let Some(ref cached) = *entry.value() {
-            edges.feed(entry.key(), &cached.analysis);
-        }
-    }
 }
 
 // ---- Module parsing ----

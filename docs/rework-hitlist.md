@@ -229,34 +229,29 @@ at every build seam from the pristine analysis, recorded via
 no matter when either runs. Pinned by
 `enrich_open_swaps_derived_copy_and_keeps_baseline_surface`.
 
-### D2. The resolver thread holds ModuleIndex's disassembled organs; free-function twins have already drifted — **high leverage / L**
+### D2. LANDED — the resolver thread and ModuleIndex share one owned core (`IndexCore`)
 
-**The wrong embedding.** `spawn_resolver` receives 13 loose Arcs
-(`src/index/module_resolver.rs:28-47`); `module_index/mod.rs:56-61` admits
-"the resolver THREAD holds the raw Arcs (not a `&ModuleIndex`)." Module-level
-free functions re-implement owner methods on the raw parts and have drifted:
-`insert_into_cache` (`module_resolver.rs:490-508`) does `edges.feed` only,
-while `ModuleIndex::insert_cache` (`module_index/registration.rs:30-39`) also
-records loader-config shapes and mints import generations — so an
-@INC-resolved plugin-carrying module never feeds `loader_config_shapes` on the
-thread path, contradicting the field's own doc (`mod.rs:193-199`).
-`rebuild_reverse_index` (`:514-524`) is byte-identical to
-`rebuild_reverse_index_from_cache` (`registration.rs:1147-1154`).
-`spawn_test_resolver` (`:366-445`) duplicates the loop with further
-divergences (no bag-cache stale-pin clear; memoizes None where the main loop
-removes it).
-
-**Target shape.** Extract `IndexCore` in `index/module_index/` owning exactly
-the shared mutable state (cache, edges, stale/available sets, generation
-counters, queue, resolved, workspace root, bag-cache cell). `ModuleIndex`
-wraps `Arc<IndexCore>`; the thread receives the same Arc and calls the one
-method set — the twins and the 13-Arc plumbing disappear, and side-effect sets
-cannot diverge per entry path. Collapse the two spawn loops into one
-parameterized by `Option<ProgressClient>`.
-
-**Gate.** A test that resolves a plugin-carrying module via the thread path
-and asserts `loader_config_shapes` is fed (the current drift as a regression
-test); existing resolver/eviction tests.
+`index/module_index/index_core.rs` owns the shared mutable state — cache,
+edge indexes, loader-config shapes, stale/available sets, builtins, resolve
+queue/notify, workspace-root channel, generation map + counter, long-lived
+flag, bag-cache cell — as ONE struct held via a single `Arc` by `ModuleIndex`
+(async side) and the resolver thread (blocking side); the 13-Arc plumbing and
+the free-fn twins (`insert_into_cache`, `rebuild_reverse_index`,
+`mint_registration_gen`, `stamp_missing_import_gens`) are deleted.
+`IndexCore::insert_resolved` is the one spelling of "a resolution landed":
+stale-pin clear → generation mint → whole-analysis projections (edge feed +
+loader shapes) → registration-owned strip (`strip_import_copy`, core-owned) →
+store, with the None-never-clobbers guard; `ModuleIndex::insert_cache` and
+the thread both route through it. This fixes the realized drift (an
+@INC-resolved plugin-carrying module never fed `loader_config_shapes` on the
+thread path — the projection also had to move PRE-strip, since it reads the
+witness bag the strip drops). `resolver_loop` is the single loop body,
+parameterized by `Option<ServerSession>` (builtins hydrate, warm strip, stale
+priority, cpanfile scan, dependency descent, progress are explicit server
+gates); the test-loop divergences (no bag-cache stale-pin clear; memoized
+None) are unified on the main spelling. Pinned by
+`thread_path_resolution_feeds_loader_config_shapes` and
+`insert_resolved_none_does_not_clobber_indexed_module`.
 
 ### D3. LANDED — pack invalidation is one index-side subsystem (`PackInvalidator`)
 
@@ -522,8 +517,8 @@ declares no names exempts nothing, pinned by
    C1 (pack routing — LANDED), D3 (PackInvalidator — LANDED), F1 (file_analysis
    recut — LANDED), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
-   (IndexCore), A2 (highlights/linked-editing projections), F2 (monolith
-   directories, after D2), A3/A4, D4/D5, E3 (LANDED).
+   (IndexCore — LANDED), A2 (highlights/linked-editing projections), F2
+   (monolith directories, after D2), A3/A4, D4/D5, E3 (LANDED).
 4. **The arc:** E2 phases 2-3 (+ E4 alongside).
 
 ---

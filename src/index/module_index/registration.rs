@@ -27,38 +27,12 @@ impl ModuleIndex {
         self.insert_cache(&name, Some(cm));
     }
 
+    /// Insert a resolved module into the name-keyed cache slot — a thin
+    /// front over `IndexCore::insert_resolved`, the one spelling shared
+    /// with the resolver thread. CLI/test copies stay whole (`persisted:
+    /// false` — nothing was written here, so the strip has no license).
     pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
-        if let Some(ref m) = cached {
-            self.edges.feed(module_name, &m.analysis);
-            self.record_loader_shapes(module_name, &m.analysis);
-            // A CLI-resolved @INC provider: mint its generation so the
-            // enrichment key reads a real token, and a re-resolve moves it.
-            self.mint_import_gen(&m.path);
-        }
-        self.cache.insert(module_name.to_string(), cached);
-    }
-
-    /// Project each `PluginLoad` fact's config value into a stored
-    /// shape under its load-name. The value is a literal in the
-    /// contributor's file, so `expr_type_at_span` with no index is
-    /// already final — this is a registration-time projection of
-    /// local facts (the same tier as export names), not a cached
-    /// cross-file resolution.
-    fn record_loader_shapes(&self, contributor: &str, analysis: &FileAnalysis) {
-        // re-registration: drop this contributor's old entries
-        self.loader_config_shapes.retain(|_n, v| {
-            v.retain(|(c, _)| c != contributor);
-            !v.is_empty()
-        });
-        for f in &analysis.plugin_loads {
-            let Some(span) = f.config_span else { continue };
-            if let Some(t) = analysis.expr_type_at_span(span, None) {
-                self.loader_config_shapes
-                    .entry(f.name.clone())
-                    .or_default()
-                    .push((contributor.to_string(), t));
-            }
-        }
+        self.core.insert_resolved(module_name, cached, false, false);
     }
 
     /// The workspace-registration reads that need the FULL analysis:
@@ -75,7 +49,7 @@ impl ModuleIndex {
         for f in &analysis.plugin_loads {
             self.loaded_modules.insert(f.name.clone(), ());
         }
-        self.record_loader_shapes(&path.display().to_string(), analysis);
+        self.core.record_loader_shapes(&path.display().to_string(), analysis);
     }
 
     /// The residency half of workspace registration: the path-keyed
@@ -105,9 +79,9 @@ impl ModuleIndex {
             return sd;
         };
         self.workspace_modules.insert(module_name.clone(), ());
-        self.edges.purge_module(&module_name);
-        self.edges.feed(&module_name, &analysis);
-        self.cache.insert(module_name, Some(cached));
+        self.core.edges.purge_module(&module_name);
+        self.core.edges.feed(&module_name, &analysis);
+        self.core.cache.insert(module_name, Some(cached));
         sd
     }
 
@@ -220,25 +194,18 @@ impl ModuleIndex {
     /// surface-covered (a body edit re-registers with a new generation,
     /// where a surface fingerprint deliberately stands still).
     pub(crate) fn bump_registration_gen(&self, path: &std::path::Path) {
-        mint_registration_gen(&self.registration_gen, &self.gen_counter, path);
-    }
-
-    /// Mint a generation for an @INC provider the CLI resolved directly
-    /// (main.rs's `insert_cache`) — the resolver THREAD mints through the
-    /// free `mint_registration_gen` on its own Arcs.
-    pub(crate) fn mint_import_gen(&self, path: &std::path::Path) {
-        mint_registration_gen(&self.registration_gen, &self.gen_counter, path);
+        self.core.mint_registration_gen(path);
     }
 
     /// Stamp a generation for every name-keyed cache entry that lacks one —
     /// the warm scan loads @INC blobs straight into the cache without a
-    /// registration front door. See `stamp_missing_import_gens`.
+    /// registration front door. See `IndexCore::stamp_missing_import_gens`.
     pub(crate) fn stamp_import_generations(&self) {
-        stamp_missing_import_gens(&self.cache, &self.registration_gen, &self.gen_counter);
+        self.core.stamp_missing_import_gens();
     }
 
     fn registration_gen_of(&self, path: &std::path::Path) -> u64 {
-        self.registration_gen.get(path).map(|g| *g).unwrap_or(0)
+        self.core.registration_gen.get(path).map(|g| *g).unwrap_or(0)
     }
 
     /// Drop `path`'s recorded surface and its dep edges (file deleted).
@@ -447,6 +414,7 @@ impl ModuleIndex {
             frontier = next;
         }
         let mut shapes: Vec<(String, Vec<u8>)> = self
+            .core
             .loader_config_shapes
             .iter()
             .map(|e| {
@@ -483,8 +451,8 @@ impl ModuleIndex {
         let module_name = first_package_name(fa);
         if let Some(ref name) = module_name {
             self.workspace_modules.insert(name.clone(), ());
-            self.edges.purge_module(name);
-            self.edges.feed(name, fa);
+            self.core.edges.purge_module(name);
+            self.core.edges.feed(name, fa);
         }
         module_name
     }
@@ -508,7 +476,7 @@ impl ModuleIndex {
         let cached = Arc::new(CachedModule::new(path, arc));
         self.all_files.insert(cached.path.clone(), cached.clone());
         if let Some(name) = module_name {
-            self.cache.insert(name, Some(cached));
+            self.core.cache.insert(name, Some(cached));
         }
     }
 
@@ -539,7 +507,7 @@ impl ModuleIndex {
     pub fn unregister_workspace_path(&self, path: &std::path::Path) {
         self.remove_surface(path);
         self.all_files.remove(path);
-        let name = self.cache.iter().find_map(|entry| {
+        let name = self.core.cache.iter().find_map(|entry| {
             entry
                 .value()
                 .as_ref()
@@ -547,8 +515,8 @@ impl ModuleIndex {
                 .map(|_| entry.key().clone())
         });
         if let Some(name) = name {
-            self.edges.purge_module(&name);
-            self.cache.remove(&name);
+            self.core.edges.purge_module(&name);
+            self.core.cache.remove(&name);
             self.workspace_modules.remove(&name);
         }
     }
@@ -578,7 +546,7 @@ impl ModuleIndex {
         // cell, so a later `set_workspace_root` install stays visible): the
         // sub-index can then serve a hub-owned path a sweep misroutes to it.
         if let Ok(mut g) = idx.foreign_bag_cache.write() {
-            *g = Some(Arc::clone(&self.bag_cache));
+            *g = Some(Arc::clone(&self.core.bag_cache));
         }
         self.pack_indexes.insert(lang.to_string(), idx);
     }
@@ -598,13 +566,13 @@ impl ModuleIndex {
     /// LAST root wins — a re-rooted session must not keep rehydrating from
     /// the first root's DB while the writers moved to the new one.
     pub fn set_bag_cache(&self, cache: Arc<crate::index::pack_bag_cache::PackBagCache>) {
-        if let Ok(mut g) = self.bag_cache.write() {
+        if let Ok(mut g) = self.core.bag_cache.write() {
             *g = Some(cache);
         }
     }
 
     fn bag_cache_ref(&self) -> Option<Arc<crate::index::pack_bag_cache::PackBagCache>> {
-        self.bag_cache.read().ok().and_then(|g| g.clone())
+        self.core.bag_cache.read().ok().and_then(|g| g.clone())
     }
 
     /// Install the relational ref index's read-connection opener (once).
@@ -977,7 +945,7 @@ impl ModuleIndex {
             // order). Break the tie by the smallest canonical path — a
             // stable, order-independent choice.
             use dashmap::mapref::entry::Entry;
-            match self.cache.entry(sym_name.clone()) {
+            match self.core.cache.entry(sym_name.clone()) {
                 Entry::Vacant(v) => {
                     v.insert(Some(cached.clone()));
                 }
@@ -1008,7 +976,7 @@ impl ModuleIndex {
         // self-heals at read: `direct_specializations_of` re-checks the pair
         // against the CURRENT analysis.
         for (spec, primary) in specializes {
-            let mut v = self.edges.specs.entry(primary.clone()).or_default();
+            let mut v = self.core.edges.specs.entry(primary.clone()).or_default();
             if !v.iter().any(|m| m == spec) {
                 v.push(spec.clone());
             }
@@ -1026,7 +994,7 @@ impl ModuleIndex {
         // carries it on the fresh, warm, and whole paths alike.
         for (child, parents) in &analysis.package_parents {
             for parent in parents {
-                let mut v = self.edges.children.entry(parent.clone()).or_default();
+                let mut v = self.core.edges.children.entry(parent.clone()).or_default();
                 if !v.iter().any(|m| m == child) {
                     v.push(child.clone());
                 }
@@ -1068,6 +1036,7 @@ impl ModuleIndex {
                 }));
             // Only touch the cache slot if the departing file held it.
             let held = self
+                .core
                 .cache
                 .get(name)
                 .map(|e| matches!(e.value(), Some(c) if c.path == canon))
@@ -1075,10 +1044,10 @@ impl ModuleIndex {
             if held {
                 match survivor {
                     Some(cand) => {
-                        self.cache.insert(name.clone(), Some(cand));
+                        self.core.cache.insert(name.clone(), Some(cand));
                     }
                     None => {
-                        self.cache.remove(name);
+                        self.core.cache.remove(name);
                     }
                 }
             }
@@ -1136,11 +1105,6 @@ impl ModuleIndex {
     /// (the B6 cold/warm attribution regression). The resolver thread already
     /// calls the equivalent rebuild after its own warm.
     pub fn rebuild_reverse_index_from_cache(&self) {
-        self.edges.clear();
-        for entry in self.cache.iter() {
-            if let Some(ref cached) = *entry.value() {
-                self.edges.feed(entry.key(), &cached.analysis);
-            }
-        }
+        self.core.rebuild_reverse_index();
     }
 }
