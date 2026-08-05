@@ -3,6 +3,7 @@ mod cst;
 mod index;
 mod lsp;
 mod model;
+mod util;
 
 #[cfg(test)]
 #[path = "layering_tests.rs"]

@@ -60,7 +60,7 @@ impl<'a> Builder<'a> {
         if self.pod_texts.is_empty() {
             return;
         }
-        if crate::model::timings::phases_enabled() {
+        if crate::util::timings::phases_enabled() {
             let nsubs = self.symbols.iter().filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method)).count();
             let podbytes: usize = self.pod_texts.iter().map(|p| p.len()).sum();
             eprintln!(

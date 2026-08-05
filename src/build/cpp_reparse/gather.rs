@@ -60,7 +60,7 @@ impl PreExpandedExternal {
         // hoists out of every analyze — paid ONCE per include-set here, then
         // reused warm. Labelled so `PERL_LSP_PHASE_TIMING` shows the per-analyze
         // cost it eliminates.
-        let (full, alias) = crate::model::timings::phase("cpp.external_preexpand", || {
+        let (full, alias) = crate::util::timings::phase("cpp.external_preexpand", || {
             let full = ExpandedVariant::of(&raw);
             let mut alias_src = (*raw).clone();
             alias_src.retain(|_, m| is_identifier_alias(m));

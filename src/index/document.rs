@@ -60,7 +60,7 @@ impl Document {
         if elapsed.as_millis() > 100 {
             log::warn!("Slow parse (new): {:?} for {} bytes", elapsed, text.len());
         }
-        if crate::model::timings::phases_enabled() {
+        if crate::util::timings::phases_enabled() {
             eprintln!(
                 "[PHASE] {:<32} {:>8.2} ms ({} bytes)",
                 "parse",
@@ -68,9 +68,9 @@ impl Document {
                 text.len()
             );
         }
-        let analysis = crate::model::timings::phase("build()", || builder::build(&tree, text.as_bytes()));
+        let analysis = crate::util::timings::phase("build()", || builder::build(&tree, text.as_bytes()));
         let stable_outline =
-            crate::model::timings::phase("stable_outline", || StableOutline::from_analysis(&analysis));
+            crate::util::timings::phase("stable_outline", || StableOutline::from_analysis(&analysis));
         Some(Document { text, tree, analysis: Arc::new(analysis), stable_outline, language: "perl", path: None })
     }
 

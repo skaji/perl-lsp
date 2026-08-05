@@ -202,11 +202,12 @@ already-decoded analysis — no separate migration pass, no re-parse.
 (`evict_symbols`) — each the same shape: clear the field(s) (and their
 rebuilt indexes), set a `#[serde(skip)]` `*_evicted` flag, called at the
 register seams always AFTER the blob and rows are persisted. The disk
-blob keeps everything, so rehydration is lossless. Single-axis consumers
-route through the axis's accessor (`bag_present`, `refs_present` —
-resident-if-not-evicted, else rehydrate through the shared blob LRU);
-readers needing more than one axis on the same copy take `whole_present`,
-gated by `is_fully_resident()`.
+blob keeps everything, so rehydration is lossless. The one single-axis
+accessor is `bag_present` (resident-if-not-evicted, else rehydrate through
+the shared blob LRU); the refs axis has no single-axis reader — the
+backward walk reaches refs through `whole_present` — and readers needing
+more than one axis on the same copy take `whole_present`, gated by
+`is_fully_resident()`.
 
 Registration is REGISTRATION-OWNED: every feed that needs symbol/edge data
 (`ModuleEdgeIndexes::feed`, the class-rank tie-break, the unregister

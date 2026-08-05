@@ -37,7 +37,7 @@ two features and what keeps the design sound (next section).
 
 ## The obstacle course (the evidence)
 
-`src/build/cpp_obstacle.rs` isolates one macro idiom per sample; two reports
+`src/build/cpp_obstacle_test_corpus.rs` isolates one macro idiom per sample; two reports
 in `query_extract_tests.rs` measure (a) raw parse damage and (b) actual
 Tier-1 skeleton extraction through the production driver. The losses
 sort into three buckets:

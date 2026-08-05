@@ -5,7 +5,7 @@
 use super::*;
 use crate::build::query_extract::{cpp_pack, extract};
 
-#[path = "cpp_obstacle.rs"]
+#[path = "cpp_obstacle_test_corpus.rs"]
 mod cpp_obstacle;
 
 fn cpp_parser() -> tree_sitter::Parser {

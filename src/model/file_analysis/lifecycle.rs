@@ -173,8 +173,11 @@ impl FileAnalysis {
 
     /// True when `evict_refs` stripped this copy's refs: empty means "on
     /// disk, not resident", never "no references".
-    // Asserted by the eviction tests and read by the (currently unwired)
-    // `refs_present` seam; keep in step with `symbols_are_evicted`.
+    // Eviction-test support: the residency assertions need to distinguish
+    // "stripped" from "genuinely empty". No production reader — the backward
+    // walk reaches refs through `whole_present`, so a refs-only view would
+    // reintroduce the degraded-copy bug `whole_present` prevents. Keep in
+    // step with `symbols_are_evicted`.
     #[allow(dead_code)]
     pub fn refs_are_evicted(&self) -> bool {
         self.refs_evicted

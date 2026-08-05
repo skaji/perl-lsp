@@ -184,7 +184,7 @@ fn closure_symbol_completion(
         crate::index::resolve::OverrideScope::default(),
     );
     let candidates =
-        crate::model::timings::phase("completion.closure_symbols", || cs.complete(prefix, false));
+        crate::util::timings::phase("completion.closure_symbols", || cs.complete(prefix, false));
     for c in candidates {
         if seen.contains(&c.label) {
             continue;

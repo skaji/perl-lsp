@@ -324,7 +324,7 @@ impl PackDriver {
         // Cross-file macros from #included headers (C++), so a macro
         // #defined elsewhere (SPDLOG_NAMESPACE_BEGIN) expands here.
         let external = match (self.gather_macros, path) {
-            (Some(g), Some(p)) => crate::model::timings::phase("cpp.gather", || g(p, source, parser)),
+            (Some(g), Some(p)) => crate::util::timings::phase("cpp.gather", || g(p, source, parser)),
             _ => std::sync::Arc::new(crate::build::cpp_reparse::PreExpandedExternal::empty()),
         };
         // Member-block macros as roles: BLANK the standalone-in-struct-body uses
@@ -333,7 +333,7 @@ impl PackDriver {
         // blank is length-preserving, so the transform + remap stay in original
         // coordinates; the ORIGINAL source keeps the token (goto-def-on-`BASEOP`
         // untouched). `docs/adr/macro-handling.md`.
-        let plan = self.member_blocks.map(|f| crate::model::timings::phase("cpp.member_blocks", || f(parser, source)));
+        let plan = self.member_blocks.map(|f| crate::util::timings::phase("cpp.member_blocks", || f(parser, source)));
         PackContext { external, plan }
     }
 
@@ -349,7 +349,7 @@ impl PackDriver {
     ) -> Option<(tree_sitter::Tree, String, crate::build::cpp_reparse::SpliceMap, Vec<(String, String)>)> {
         let parse_input: &str = ctx.plan.as_ref().map(|p| p.blanked_source.as_str()).unwrap_or(source);
         let (src, map, recovered) = match self.transform {
-            Some(t) => crate::model::timings::phase("cpp.transform", || t(parser, parse_input, &ctx.external)),
+            Some(t) => crate::util::timings::phase("cpp.transform", || t(parser, parse_input, &ctx.external)),
             None => (parse_input.to_string(), crate::build::cpp_reparse::SpliceMap::default(), Vec::new()),
         };
         let tree = parser.parse(&src, None)?;
@@ -469,7 +469,7 @@ impl PackDriver {
         // member symbol non-public when its declaration falls under
         // `private:`/`protected:`.
         if let Some(f) = self.access_regions {
-            let regions = crate::model::timings::phase("cpp.access_regions", || f(parser, source));
+            let regions = crate::util::timings::phase("cpp.access_regions", || f(parser, source));
             stamp_access_regions(fa, &regions);
         }
         // The file's include closure is the cross-file visibility key
@@ -478,7 +478,7 @@ impl PackDriver {
         let mut closure_incomplete = false;
         if let (Some(f), Some(p)) = (self.include_closure, path) {
             let (closure, complete) =
-                crate::model::timings::phase("cpp.include_closure", || f(p, source));
+                crate::util::timings::phase("cpp.include_closure", || f(p, source));
             fa.include_closure = crate::model::file_analysis::path_intern::ClosureList::from_iter(
                 closure.iter().map(|s| s.as_str()),
             );

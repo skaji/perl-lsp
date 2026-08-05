@@ -5,8 +5,8 @@
 //! skeleton: the unexpanded preprocessor means declaration-generating
 //! macros produce symbols with zero claimable syntax (the spike's
 //! ring-3), and macros in declarator position corrupt the parse into
-//! ERROR nodes (ring-2, but worse — silent). The harness in
-//! `cpp_obstacle_tests.rs` parses each, counts ERROR/MISSING nodes, and
+//! ERROR nodes (ring-2, but worse — silent). The harnesses in
+//! `query_extract_tests.rs` / `cpp_reparse_tests.rs` parse each, counts ERROR/MISSING nodes, and
 //! reports how many expected symbols survive vs. how many the macro
 //! ate. This file holds no logic — only the corpus.
 

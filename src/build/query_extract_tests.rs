@@ -766,7 +766,7 @@ fn cmake_outline_targets_vars_and_interpolated_refs() {
 
 // ---- C++ obstacle course: measure macro-induced parse damage ----
 
-#[path = "cpp_obstacle.rs"]
+#[path = "cpp_obstacle_test_corpus.rs"]
 mod cpp_obstacle;
 
 fn cpp_parser() -> tree_sitter::Parser {

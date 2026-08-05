@@ -285,7 +285,7 @@ impl<'a> Builder<'a> {
                     // zero-match runs record too so a never-matching
                     // pattern shows up at 0 in the stats report.
                     if round == 0 {
-                        crate::model::timings::record_pattern_matches(
+                        crate::util::timings::record_pattern_matches(
                             p.id(),
                             &spec.name,
                             collected.len(),
@@ -322,7 +322,7 @@ impl<'a> Builder<'a> {
                         }
                         dispatched.insert(key);
                         progressed = true;
-                        crate::model::timings::record_pattern_dispatch(p.id(), &spec.name);
+                        crate::util::timings::record_pattern_dispatch(p.id(), &spec.name);
                         // Projections that consult package-relative walk
                         // state (constant folds via the current package,
                         // `__PACKAGE__` receivers) see the match site's
@@ -499,7 +499,7 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
-                crate::model::timings::record_pattern_matches(p.id(), &spec.name, count);
+                crate::util::timings::record_pattern_matches(p.id(), &spec.name, count);
             }
         }
         collected.sort_by_key(|(_, _, _, _, _, s)| (s.start.row, s.start.column));
@@ -557,7 +557,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             dispatched.insert(key);
-            crate::model::timings::record_pattern_dispatch(p.id(), &spec.name);
+            crate::util::timings::record_pattern_dispatch(p.id(), &spec.name);
 
             let pkg_for_gate = pkg.clone();
             let saved = std::mem::replace(&mut self.current_package, Some(pkg.clone()));

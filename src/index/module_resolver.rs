@@ -610,7 +610,7 @@ fn resolve_and_parse_inner(
     let bytes = metadata.len();
     let source = std::fs::read_to_string(&path).ok()?;
 
-    let timing = crate::model::timings::is_enabled();
+    let timing = crate::util::timings::is_enabled();
     let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
     let tree = parser.parse(&source, None)?;
     let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
@@ -618,7 +618,7 @@ fn resolve_and_parse_inner(
     let t_build = if timing { Some(std::time::Instant::now()) } else { None };
     let mut analysis = crate::build::builder::build(&tree, source.as_bytes());
     let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
-    crate::model::timings::record_built(module_name, parse_dur, build_dur);
+    crate::util::timings::record_built(module_name, parse_dur, build_dur);
 
     // If this module has no exports but inherits via @ISA (e.g. DDP → Data::Printer),
     // fall back to the first parent's exports. This only patches `export`/`export_ok`;
@@ -935,7 +935,7 @@ pub fn index_workspace_with_index(
         stamp: (i64, i64),
     }
     let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
-    let timing = crate::model::timings::is_enabled();
+    let timing = crate::util::timings::is_enabled();
 
     // Deliberate whole-copy accounting for the workspace-tier residency
     // tripwire — the Perl twin of the pack indexer's counter.
@@ -1052,7 +1052,7 @@ pub fn index_workspace_with_index(
                     let analysis = crate::build::builder::build(&tree, source.as_bytes());
                     let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
                     if timing {
-                        crate::model::timings::record_built(
+                        crate::util::timings::record_built(
                             path.strip_prefix(root).unwrap_or(path).display().to_string(),
                             parse_dur,
                             build_dur,

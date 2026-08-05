@@ -264,7 +264,7 @@ fn compute_splices_inner(
     force_slow: bool,
     expand_region_bodies: bool,
 ) -> Vec<Splice> {
-    let eff = crate::model::timings::phase("cpp.macro_expand", || {
+    let eff = crate::util::timings::phase("cpp.macro_expand", || {
         build_effective_macros(tree, src, external, alias_only, force_slow)
     });
     if eff.is_empty() {

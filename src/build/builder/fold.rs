@@ -244,7 +244,7 @@ impl<'a> Builder<'a> {
             prev = cur;
         }
         self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
-        if crate::model::timings::phases_enabled() {
+        if crate::util::timings::phases_enabled() {
             eprintln!(
                 "[PHASE] {:<32} {} iters, bag.len={}",
                 "build::fold_iterations",

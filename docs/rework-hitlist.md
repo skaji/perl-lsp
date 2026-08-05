@@ -501,32 +501,15 @@ for free. Minimum slice if deferred: add both walkers to the PARKED four→one
 entry so the ledger matches the code. Gate: role-contract and trigger-view
 tests; a pathological-parent-graph depth test.
 
-### F5. Small truth-telling fixes — **S each**
+### F5. LANDED — small truth-telling fixes
 
-- **`src/util/` neutral tier for timings.rs** (medium leverage). `model/mod.rs:9-11`
-  confesses the placement is an importability dodge; `timings.rs` is std-only
-  process instrumentation with zero model content, yet "placing a file places
-  it in the architecture." Add `util` to `layering_tests::layer_of_segment`
-  with an enforced std-only rule (a util file referencing `crate::` fails the
-  walk) so it cannot become a laundering hole; move timings.rs; delete the
-  apology comment; update the CLAUDE.md file map.
-- **cpp_obstacle.rs is a test corpus audited as production Build source** (low
-  leverage). Data-only, absent from `build/mod.rs`, consumed only via
-  `#[path]` from two `_tests` files, yet walked as production by
-  `layering_tests` (`:76-78`). Fix: teach `is_test_file` a checked fixture
-  predicate (e.g. `_test_corpus` stems) and rename, or move under a dir the
-  walker never visits; update the two `#[path]` includes and
-  docs/prompt-cpp-reparse.md:40.
-- **refs_present ghost seam** (low leverage). CLAUDE.md's module_cache entry
-  cites a "deliberately retained dead" `refs_present` seam that does not exist
-  anywhere in src/ (the trait has `bag_present`/`enriched_present`/
-  `whole_present` only); `refs.rs:392-393` credits it for rehydration the code
-  does via `whole_present` (`:458`); `refs_are_evicted`
-  (`lifecycle.rs:174-179`) justifies its dead-code allowance by the ghost.
-  Purely subtractive: fix the two comments, re-justify `refs_are_evicted` as
-  eviction-test support, delete the CLAUDE.md sentence. Do NOT mint the trait
-  method — a single-axis refs view would reintroduce the degradation bug
-  `whole_present` prevents.
+`src/util/` is the neutral leaf tier (std-only, no crate paths — enforced
+by `layering_tests::util_tier_is_std_only`) and holds `timings.rs`;
+`cpp_obstacle_test_corpus.rs` is recognized as test fixture data by the
+layering walk's `_test_corpus` stem predicate; the `refs_present` ghost is
+scrubbed — comments, CLAUDE.md, and docs/adr/relational-ref-index.md all
+state the real shape (no refs-axis reader; the backward walk goes through
+`whole_present`, and a single-axis refs view must not be minted).
 
 ---
 

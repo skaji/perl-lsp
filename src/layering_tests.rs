@@ -17,19 +17,23 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Layer order — an import may only point at the same layer or lower.
+/// `Util` sits below everything: std-only instrumentation with no crate
+/// imports at all (`util_tier_is_std_only` enforces the stronger rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Layer {
-    Model = 0,
-    Cst = 1,
-    Build = 2,
-    Index = 3,
-    Lsp = 4,
+    Util = 0,
+    Model = 1,
+    Cst = 2,
+    Build = 3,
+    Index = 4,
+    Lsp = 5,
 }
 
 /// Top-level path segment → layer. `crate::build::builder::…` resolves
 /// through its first segment, so the directory name is the whole story.
 fn layer_of_segment(seg: &str) -> Option<Layer> {
     Some(match seg {
+        "util" => Layer::Util,
         "model" => Layer::Model,
         "cst" => Layer::Cst,
         "build" => Layer::Build,
@@ -65,7 +69,7 @@ fn source_files() -> Vec<(PathBuf, Layer, String)> {
             "cst" => Layer::Cst,
             _ => panic!(
                 "unassigned module src/{stem}.rs — place it in a layer directory \
-                 (model/ cst build/ index/ lsp/)"
+                 (util/ model/ cst build/ index/ lsp/)"
             ),
         };
         out.push((path, layer, stem));
@@ -74,7 +78,12 @@ fn source_files() -> Vec<(PathBuf, Layer, String)> {
 }
 
 fn is_test_file(stem: &str) -> bool {
-    stem.ends_with("_tests") || stem.ends_with("_test") || stem == "layering_tests"
+    // `_test_corpus`: data-only fixture files consumed via `#[path]` from
+    // test suites — never compiled into the production binary.
+    stem.ends_with("_tests")
+        || stem.ends_with("_test")
+        || stem.ends_with("_test_corpus")
+        || stem == "layering_tests"
 }
 
 fn collect_rs(
@@ -125,6 +134,31 @@ fn crate_refs(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The util tier's charter is stricter than down-only: std-only, no
+/// `crate::` references at all. Without this, util would be a laundering
+/// hole — a file could dodge the DAG by moving there while still
+/// importing model/build internals.
+#[test]
+fn util_tier_is_std_only() {
+    let mut violations = Vec::new();
+    for (f, layer, _module) in source_files() {
+        if layer != Layer::Util {
+            continue;
+        }
+        let text = fs::read_to_string(&f).expect("read source");
+        for (ln, line) in text.lines().enumerate() {
+            if line.contains("crate::") {
+                violations.push(format!(
+                    "{}:{}: util is std-only — no crate:: references",
+                    f.display(),
+                    ln + 1,
+                ));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "util-tier violations:\n{}", violations.join("\n"));
 }
 
 /// Rule: every `crate::X` reference points at the same layer or lower.

@@ -4,13 +4,14 @@
 use crate::build::{builder, language_driver, plugin};
 use crate::index::{document, file_store, module_cache, module_index, module_resolver, resolve};
 use crate::lsp::{backend, symbols};
-use crate::model::{conventions, file_analysis, timings, witnesses};
+use crate::model::{conventions, file_analysis, witnesses};
+use crate::util::timings;
 
 /// Time one CLI query step — `tphase!("completion_items", expr)` prints a
 /// `[PHASE]` line when `PERL_LSP_PHASE_TIMING` is set. Sugar over `timings::phase`.
 macro_rules! tphase {
     ($label:literal, $body:expr) => {
-        $crate::model::timings::phase($label, || $body)
+        $crate::util::timings::phase($label, || $body)
     };
 }
 

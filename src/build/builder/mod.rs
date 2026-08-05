@@ -42,7 +42,7 @@ pub(crate) mod pattern_dispatch;
 /// when `PERL_LSP_PHASE_TIMING` is set. Call-site sugar over `timings::phase`.
 macro_rules! bphase {
     ($label:literal, $body:expr) => {
-        $crate::model::timings::phase(concat!("build::", $label), || $body)
+        $crate::util::timings::phase(concat!("build::", $label), || $body)
     };
 }
 

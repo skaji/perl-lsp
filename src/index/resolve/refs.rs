@@ -390,7 +390,7 @@ pub fn refs_to(
     }
 
     // Relational retrieval (`docs/adr/relational-ref-index.md`): the files
-    // holding name-keyed candidate rows, rehydrated (`refs_present`) and run
+    // holding name-keyed candidate rows, rehydrated (`whole_present`) and run
     // through the SAME matcher as every resident copy. Runs BEFORE the
     // resident sweep and claims `covered_paths`, so each file is collected
     // from its best copy exactly once; the sweep behind it still contributes
