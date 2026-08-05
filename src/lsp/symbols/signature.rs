@@ -313,12 +313,13 @@ pub(super) fn dispatch_target_items_for(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<CompletionItem> = Vec::new();
     let mut emit = |sym: &crate::model::file_analysis::Symbol| {
-        let SymbolDetail::Handler { display, .. } = &sym.detail else { return };
+        let SymbolDetail::Handler { .. } = &sym.detail else { return };
         if !seen.insert(sym.name.clone()) { return; }
+        let display = sym.presentation.display.unwrap_or_default();
         let detail = display.outline_word().map(|s| s.to_string());
         out.push(CompletionItem {
             label: sym.name.clone(),
-            kind: Some(handler_display_to_completion_kind(display)),
+            kind: Some(handler_display_to_completion_kind(&display)),
             detail,
             filter_text: Some(sym.name.clone()),
             sort_text: Some(format!(" 000{}", sym.name)),

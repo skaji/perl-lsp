@@ -464,6 +464,10 @@ pub struct GatedSymbol {
     pub span: Span,
     pub selection_span: Span,
     pub detail: SymbolDetail,
+    /// Presentation policy carried from the emitting action, stamped
+    /// onto the minted `Symbol` at apply time.
+    #[serde(default)]
+    pub presentation: Presentation,
     /// Explicit owning class (`EmitAction::Method.on_class`); when `None` the
     /// symbol is keyed under the emission's match-site package.
     pub on_class: Option<String>,

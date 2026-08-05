@@ -1081,11 +1081,7 @@ $minion->add_task(send_email => sub { my ($job, $to) = @_; });
         .iter()
         .find(|s| s.kind == SymKind::Handler && s.name == "send_email")
         .expect("handler exists");
-    let SymbolDetail::Handler {
-        dispatchers,
-        display,
-        ..
-    } = &h.detail
+    let SymbolDetail::Handler { dispatchers, .. } = &h.detail
     else {
         panic!("detail shape");
     };
@@ -1095,9 +1091,9 @@ $minion->add_task(send_email => sub { my ($job, $to) = @_; });
         dispatchers
     );
     assert!(
-        matches!(display, HandlerDisplay::Task),
+        matches!(h.presentation.display, Some(HandlerDisplay::Task)),
         "task handlers display as Task; got: {:?}",
-        display
+        h.presentation.display
     );
 }
 

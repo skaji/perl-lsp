@@ -195,6 +195,40 @@ impl Namespace {
 
 // ---- Symbol ----
 
+/// How a symbol presents to humans — the ONE policy home for listing
+/// views (document outline, workspace-symbol, heatmap, completion
+/// icons). Minted at symbol synthesis by whoever creates the symbol
+/// (builder, plugin emit, pack skeleton conversion); every view reads
+/// it and never re-derives presentation from the detail. Kind-semantic
+/// facts (`is_constant`, `opaque_return`, `lexical`) stay on
+/// `SymbolDetail` — they change behavior, not rendering.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Presentation {
+    /// Suppress this symbol in listing views. Set for presentation
+    /// duplicates (the arity-variant accessor twin sharing its getter's
+    /// name/span), plugin-synthesized DSL infrastructure
+    /// (Mojolicious::Lite's `get`/`post`/`app`/…), anonymous subs, and
+    /// include-guard `#define`s — hover/gd/completion still resolve the
+    /// name (rule #7); the outline stays focused on user-visible
+    /// structure.
+    #[serde(default)]
+    pub hide_in_outline: bool,
+    /// Plugin's final word on the LSP kind this symbol renders as
+    /// (helper/route/task/event/…). Framework-synthesized entities
+    /// resolve/complete/goto-def like regular symbols; `None` leaves
+    /// the default `SymKind` → LSP mapping.
+    #[serde(default)]
+    pub display: Option<HandlerDisplay>,
+    /// Outline-only display-name override. When set, the outline uses
+    /// this verbatim instead of `name` (and drops any kind prefix).
+    /// A chained Mojo helper leaf has `name: "create"` (so method
+    /// resolution works on `$c->users->create`) but labels itself
+    /// `"users.create"`; a mojo-lite route prepends the HTTP verb.
+    /// Doesn't affect resolution, rename, or workspace-symbol.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Symbol {
     pub id: SymbolId,
@@ -212,17 +246,9 @@ pub struct Symbol {
     /// framework plugins stamp their plugin id.
     #[serde(default)]
     pub namespace: Namespace,
-    /// Optional outline-only display name override. When set, the document
-    /// outline uses this verbatim instead of `name` (and drops any
-    /// kind-specific prefix like "helper"/"method"). Plugin-controlled:
-    /// a chained Mojo helper leaf has `name: "create"` (so method
-    /// resolution works on `$c->users->create`) but needs
-    /// `outline_label: "users.create"` so the outline reflects the
-    /// declared helper path. A mojo-lite route uses it to prepend the
-    /// HTTP verb to the path. Doesn't affect resolution, rename, or
-    /// workspace-symbol.
+    /// How this symbol presents in listing views — see [`Presentation`].
     #[serde(default)]
-    pub outline_label: Option<String>,
+    pub presentation: Presentation,
     /// Free-string annotations the language pack attaches to this symbol —
     /// today, the signal a recovered C++ class's declarator-position
     /// attribute macro carried (`exported`, `deprecated`), looked up in the
@@ -577,22 +603,13 @@ impl Symbol {
     }
 
     /// True when this symbol is a presentation duplicate that symbol-listing
-    /// views should fold away — set by plugins on DSL-import infrastructure
-    /// and by accessor synthesis on the arity-variant twin (e.g. the fluent
-    /// `rw` writer that shares its getter's name/span). The getter/primary
-    /// carries the listing; the hidden twin exists only so arity-discriminated
-    /// type inference can answer both `$o->attr` and `$o->attr($v)`. Every
-    /// view that enumerates symbols for humans (outline, workspace-symbol,
-    /// usage heatmap) asks the symbol this rather than re-matching the detail.
+    /// views should fold away — the getter/primary carries the listing; the
+    /// hidden twin exists only so arity-discriminated type inference can
+    /// answer both `$o->attr` and `$o->attr($v)`. Every view that enumerates
+    /// symbols for humans (outline, workspace-symbol, usage heatmap) asks
+    /// this; the verdict is stamped on `presentation` at synthesis.
     pub fn hidden_in_outline(&self) -> bool {
-        // An include-guard `#define` is compilation plumbing, not a program
-        // entity — folded from listing views but still resolvable (rule #7).
-        self.attributes.iter().any(|a| a == "include_guard")
-            || matches!(
-                &self.detail,
-                SymbolDetail::Sub { hide_in_outline: true, .. }
-                    | SymbolDetail::Handler { hide_in_outline: true, .. }
-            )
+        self.presentation.hide_in_outline
     }
 }
 
@@ -638,21 +655,6 @@ pub enum SymbolDetail {
         is_method: bool,
         /// Pre-rendered markdown from POD or comments preceding this sub.
         doc: Option<String>,
-        /// Optional plugin-provided display override. Framework-synthesized
-        /// methods (Mojo helpers, Dancer routes, DBIC relationships, etc.)
-        /// resolve/complete/goto-def the same as a regular Method, but the
-        /// plugin gets the final word on which LSP kind they render as.
-        /// `None` leaves the default (Method → METHOD, Sub → FUNCTION).
-        #[serde(default)]
-        display: Option<HandlerDisplay>,
-        /// Suppress this symbol in the document outline / workspace
-        /// symbol list. Plugins synthesizing DSL imports (Mojolicious::Lite's
-        /// `get`/`post`/`app`/...) set it so hover/gd/completion still work
-        /// on the name, but the outline stays focused on user-visible
-        /// structure. Whoever constructs the detail decides — the core
-        /// never infers.
-        #[serde(default)]
-        hide_in_outline: bool,
         /// The return type is plugin-internal plumbing — use it for
         /// chain resolution but don't render it in completion details,
         /// hover return-type lines, or inlay hints. Lets framework
@@ -696,25 +698,14 @@ pub enum SymbolDetail {
     /// handler's sub signature, consumed by signature help at call
     /// sites and by hover to describe the handler shape.
     ///
-    /// `display` is the plugin's choice of LSP kind for outline,
-    /// completion icon, and workspace-symbol presentation. Handlers
-    /// share internal machinery (refs_by_target, stacking semantics,
-    /// cross-file resolution) but aren't all "events" — Mojo events
-    /// are, but routes are methods, config keys are fields, etc.
-    /// The plugin says what the user sees; the abstraction stays one
-    /// thing internally.
+    /// The plugin's choice of LSP kind rides `Symbol.presentation` —
+    /// handlers share internal machinery (refs_by_target, stacking
+    /// semantics, cross-file resolution) but aren't all "events": Mojo
+    /// events are, but routes are methods, config keys are fields, etc.
     Handler {
         owner: HandlerOwner,
         dispatchers: Vec<String>,
         params: Vec<ParamInfo>,
-        #[serde(default)]
-        display: HandlerDisplay,
-        /// Suppress this handler in the document outline. Plugins set
-        /// it for framework-synthesized entries that shouldn't clutter
-        /// the user's navigation view — hover/gd/completion still find
-        /// them via the symbol table.
-        #[serde(default)]
-        hide_in_outline: bool,
     },
     /// Package, Module, or other kinds needing no extra data.
     None,

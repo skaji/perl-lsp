@@ -428,8 +428,6 @@ impl<'a> Builder<'a> {
                     params: Vec::new(),
                     is_method,
                     doc: None,
-                    display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
@@ -735,7 +733,7 @@ impl<'a> Builder<'a> {
             if is_method { SymKind::Method } else { SymKind::Sub },
             node_to_span(node),
             node_to_span(name_node),
-            SymbolDetail::Sub { params: params.clone(), is_method, doc, display: None, hide_in_outline: false, opaque_return: false, is_constant: false, lexical },
+            SymbolDetail::Sub { params: params.clone(), is_method, doc, opaque_return: false, is_constant: false, lexical },
         );
 
         // Exporter::Extensible method-attribute export form: `sub foo :Export`.
@@ -874,13 +872,13 @@ impl<'a> Builder<'a> {
                 params: params.to_vec(),
                 is_method: false,
                 doc: None,
-                display: None,
-                hide_in_outline: true,
                 opaque_return: false,
                 is_constant: false,
                 lexical: false,
             },
         );
+        // Not a nameable entity — resolvable, never listed.
+        self.presentation_mut(sym_id).hide_in_outline = true;
         self.anon_sub_symbol_by_span.insert(span, sym_id);
         sym_id
     }
@@ -1408,7 +1406,7 @@ impl<'a> Builder<'a> {
                         SymKind::Method,
                         node_to_span(node),
                         bare_span,
-                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, display: None, hide_in_outline: false, opaque_return: false, is_constant: false, lexical: false },
+                        SymbolDetail::Sub { params: vec![], is_method: true, doc: None, opaque_return: false, is_constant: false, lexical: false },
                     );
                 }
                 if has_writer {
@@ -1427,8 +1425,6 @@ impl<'a> Builder<'a> {
                             }],
                             is_method: true,
                             doc: None,
-                            display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,

@@ -152,7 +152,7 @@ impl<'a> Builder<'a> {
             package,
             detail,
             namespace,
-            outline_label: None,
+            presentation: Default::default(),
             attributes: Vec::new(),
             deref_stack: Vec::new(),
             // Perl carries params in `SymbolDetail::Sub`; `param_arity()`
@@ -160,6 +160,16 @@ impl<'a> Builder<'a> {
             arity: None,
         });
         id
+    }
+
+    /// The just-minted symbol's presentation, for the synthesis sites
+    /// that stamp policy (hidden twins, plugin display/label). SymbolId
+    /// is the positional index, so this is O(1).
+    pub(super) fn presentation_mut(
+        &mut self,
+        id: SymbolId,
+    ) -> &mut crate::model::file_analysis::Presentation {
+        &mut self.symbols[id.0 as usize].presentation
     }
 
     // ---- Package-range tracking ----

@@ -509,7 +509,16 @@ impl SkeletonAnalysis {
                 package: s.package.clone(),
                 detail: SymbolDetail::None,
                 namespace: crate::model::file_analysis::Namespace::Language,
-                outline_label: None,
+                presentation: crate::model::file_analysis::Presentation {
+                    // An include-guard `#define` is compilation plumbing,
+                    // not a program entity — folded from listing views but
+                    // still resolvable (rule #7). The attribute stays on
+                    // the symbol for hover; the listing verdict is stamped
+                    // here so warm stub rebuilds mint it identically.
+                    hide_in_outline: s.attributes.iter().any(|a| a == "include_guard"),
+                    display: None,
+                    label: None,
+                },
                 attributes: {
                     let mut a = s.attributes.clone();
                     // union containers carry the marker the hover-overlay /

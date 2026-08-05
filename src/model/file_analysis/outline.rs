@@ -12,10 +12,9 @@ pub struct OutlineSymbol {
     pub span: Span,
     pub selection_span: Span,
     pub children: Vec<OutlineSymbol>,
-    /// For `Handler` symbols, the plugin-chosen LSP display kind.
-    /// Carried here so the outline→DocumentSymbol conversion doesn't
-    /// need to re-resolve the SymbolDetail. `None` for non-Handler
-    /// kinds (they use the fixed SymKind → LSP mapping).
+    /// The plugin-chosen LSP display kind (`Symbol.presentation.display`),
+    /// carried so the outline→DocumentSymbol conversion doesn't re-consult
+    /// the symbol. `None` = the fixed SymKind → LSP mapping.
     pub handler_display: Option<HandlerDisplay>,
 }
 
@@ -49,17 +48,6 @@ pub struct PerlSemanticToken {
     pub span: Span,
     pub token_type: u32,
     pub modifiers: u32,
-}
-
-/// Plugin-chosen LSP display for a Sub-detail symbol, if any. Null for
-/// everything else — lets completion/outline carry plugin intent
-/// without each site re-matching on detail shape.
-pub(super) fn sub_display_override(detail: &SymbolDetail) -> Option<HandlerDisplay> {
-    if let SymbolDetail::Sub { display, .. } = detail {
-        *display
-    } else {
-        None
-    }
 }
 
 fn sigil_modifier(sigil: char) -> u32 {
@@ -274,9 +262,9 @@ impl FileAnalysis {
                     // Helper/Action/Route → FUNCTION. Native subs and
                     // methods get the spec-compliant bare name and
                     // route their kind word through `detail`.
-                    let disp = sub_display_override(&sym.detail);
+                    let disp = sym.presentation.display;
                     let default_word = if matches!(sym.kind, SymKind::Method) { "method" } else { "sub" };
-                    let identifier = sym.outline_label.clone().unwrap_or_else(|| sym.name.clone());
+                    let identifier = sym.presentation.label.clone().unwrap_or_else(|| sym.name.clone());
                     let params_suffix = match &sym.detail {
                         SymbolDetail::Sub { params, .. } => {
                             let visible: Vec<&str> = params.iter()
@@ -367,25 +355,28 @@ impl FileAnalysis {
                     // gives stacked registrations (two handlers on
                     // the same name with different sigs, GET + POST
                     // on the same path) visually distinct entries.
-                    // `outline_label` lets the plugin inject a
+                    // `presentation.label` lets the plugin inject a
                     // disambiguator (e.g. HTTP verb) into the
                     // identifier slot without affecting dispatch
                     // lookups, which still key on `sym.name`.
-                    let (word, params_suffix) = match &sym.detail {
-                        SymbolDetail::Handler { params, display, .. } => {
-                            let word = display.outline_word().unwrap_or("handler");
+                    let word = sym
+                        .presentation
+                        .display
+                        .and_then(|d| d.outline_word())
+                        .unwrap_or("handler");
+                    let params_suffix = match &sym.detail {
+                        SymbolDetail::Handler { params, .. } => {
                             let visible: Vec<&str> = params
                                 .iter()
                                 .filter(|p| !p.is_invocant)
                                 .map(|p| p.name.as_str())
                                 .collect();
-                            let suf = if visible.is_empty() { String::new() }
-                                else { format!(" ({})", visible.join(", ")) };
-                            (word, suf)
+                            if visible.is_empty() { String::new() }
+                            else { format!(" ({})", visible.join(", ")) }
                         }
-                        _ => ("handler", String::new()),
+                        _ => String::new(),
                     };
-                    let identifier = sym.outline_label.clone().unwrap_or_else(|| sym.name.clone());
+                    let identifier = sym.presentation.label.clone().unwrap_or_else(|| sym.name.clone());
                     let label = format!("<{}> {}{}", word, identifier, params_suffix);
                     (label, Some(word.to_string()), Vec::new())
                 }
@@ -397,11 +388,7 @@ impl FileAnalysis {
                 }
             };
 
-            let handler_display = match &sym.detail {
-                SymbolDetail::Handler { display, .. } => Some(*display),
-                SymbolDetail::Sub { display: Some(d), .. } => Some(*d),
-                _ => None,
-            };
+            let handler_display = sym.presentation.display;
             result.push(OutlineSymbol {
                 name,
                 detail,

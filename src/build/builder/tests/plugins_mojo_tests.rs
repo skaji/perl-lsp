@@ -287,26 +287,23 @@ $app->helper(current_user => sub {
         "canonical home is the fictional app surface"
     );
 
-    if let SymbolDetail::Sub {
-        params, display, ..
-    } = &helper.detail
-    {
+    if let SymbolDetail::Sub { params, .. } = &helper.detail {
         let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["$c", "$extra"],
             "helper's sub params flow through to the Method signature"
         );
-        assert_eq!(
-            *display,
-            Some(crate::model::file_analysis::HandlerDisplay::Helper),
-            "helpers render as HandlerDisplay::Helper — the LSP kind is \
-                 FUNCTION (the enum doesn't have Helper), the outline word \
-                 is 'helper'. See HandlerDisplay::outline_word.",
-        );
     } else {
         panic!("helper detail should be Sub");
     }
+    assert_eq!(
+        helper.presentation.display,
+        Some(crate::model::file_analysis::HandlerDisplay::Helper),
+        "helpers render as HandlerDisplay::Helper — the LSP kind is \
+             FUNCTION (the enum doesn't have Helper), the outline word \
+             is 'helper'. See HandlerDisplay::outline_word.",
+    );
 
     // The PluginNamespace owns the bridge visibility: a SINGLE bridge
     // to the fictional app surface (docs/adr/plugin-system.md). The
@@ -1972,8 +1969,6 @@ $minion->add_task(send_email => sub {
         ref owner,
         ref dispatchers,
         ref params,
-        ref display,
-        ..
     } = handler.detail
     else {
         panic!("handler detail should be Handler")
@@ -1981,7 +1976,7 @@ $minion->add_task(send_email => sub {
     assert!(matches!(owner, HandlerOwner::Class(c) if c == "Minion"));
     assert!(dispatchers.iter().any(|d| d == "enqueue"));
     assert!(
-        matches!(display, HandlerDisplay::Task),
+        matches!(handler.presentation.display, Some(HandlerDisplay::Task)),
         "minion tasks render as HandlerDisplay::Task (LSP kind FUNCTION, outline word 'task')"
     );
     // Callback params: $job flagged as invocant, then the rest.

@@ -1423,8 +1423,6 @@ impl<'a> Builder<'a> {
                     params: vec![],
                     is_method: false,
                     doc: None,
-                    display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,

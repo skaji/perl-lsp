@@ -157,7 +157,7 @@ impl FileAnalysis {
                     package: pkg.clone(),
                     detail: gs.detail.clone(),
                     namespace: ns.clone(),
-                    outline_label: None,
+                    presentation: gs.presentation.clone(),
                     attributes: Vec::new(),
                     deref_stack: Vec::new(),
                     arity: None,

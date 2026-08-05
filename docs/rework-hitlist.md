@@ -325,18 +325,20 @@ bumped (175→176). The `Function { sym }` slot was dropped — no path mints a
 FunctionCall→symbol link today, and a dead field is not a seam. Landed
 before E2's RefTable; when RefTable lands it inherits the field as-is.
 
-### E4. Symbol presentation policy is encoded three ways — **low leverage / M**
+### E4. LANDED — symbol presentation policy is one home: `Symbol.presentation`
 
-`hidden_in_outline()` unions an `'include_guard'` attribute probe with a
-two-variant detail match (`core_types.rs:587-596`); `Sub` and `Handler` each
-re-declare `display`/`hide_in_outline` (`:646-676, :710-717`); `outline_label`
-is a third channel (`:215-232`); `SymRowSeed` re-bakes the scattered verdicts
-(`:959-974`). Any other kind wanting hiding is silently un-hideable until
-someone grows the match. Target: one `presentation: Presentation
-{ hide_in_outline, display, label }` (`#[serde(default)]`) minted at symbol
-synthesis; genuinely kind-semantic flags (`is_constant`, `opaque_return`,
-`lexical`) stay in the detail. EXTRACT_VERSION bump; row flags unchanged.
-Gate: outline/workspace-symbol tests; do alongside E2's SymbolTable phase.
+`Presentation { hide_in_outline, display, label }` (`core_types.rs`,
+`#[serde(default)]`) is minted at symbol synthesis — builder sites via
+`presentation_mut`, plugin emit / gated emissions from the action-level
+fields (`EmitAction::Symbol` grew `display`/`hide_in_outline` alongside
+`Method`/`Handler`'s), the pack skeleton conversion stamps the
+include-guard verdict. `SymbolDetail::Sub`/`Handler` no longer carry
+`display`/`hide_in_outline`, `Symbol.outline_label` is
+`presentation.label`, and every view (outline, workspace-symbol rows,
+heatmap, completion icons, CLI dumps) reads the one home —
+`hidden_in_outline()` is a plain read, `sub_display_override` is deleted.
+Kind-semantic flags (`is_constant`, `opaque_return`, `lexical`) stay in
+the detail. Row flags unchanged; EXTRACT_VERSION bumped.
 
 ---
 

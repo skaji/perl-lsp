@@ -113,10 +113,10 @@ fn on_use(ctx) {
                     params: [],
                     is_method: false,
                     doc: "The Mojolicious application instance.",
-                    display: "Function",
-                    hide_in_outline: true,
                 }
             },
+            display: "Function",
+            hide_in_outline: true,
             return_type: #{ ClassName: "Mojolicious" },
         }
     };
@@ -134,10 +134,10 @@ fn on_use(ctx) {
                     params: [],
                     is_method: false,
                     doc: "Group routes so common prefixes/middlewares apply to all of them.",
-                    display: "Function",
-                    hide_in_outline: true,
                 }
             },
+            display: "Function",
+            hide_in_outline: true,
         }
     };
 

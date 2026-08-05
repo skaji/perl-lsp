@@ -619,7 +619,7 @@ impl FileAnalysis {
                 {
                     seen_names.insert(sym.name.clone());
                     let defining = if class_name != original_class { Some(class_name) } else { None };
-                    let display_override = sub_display_override(&sym.detail);
+                    let display_override = sym.presentation.display;
                     candidates.push(CompletionCandidate {
                         label: sym.name.clone(),
                         kind: sym.kind,
@@ -653,7 +653,7 @@ impl FileAnalysis {
                 if !visible(sym) { continue; }
                 seen_names.insert(sym.name.clone());
                 let defining = if class_name != original_class { Some(class_name) } else { None };
-                let display_override = sub_display_override(&sym.detail);
+                let display_override = sym.presentation.display;
                 candidates.push(CompletionCandidate {
                     label: sym.name.clone(),
                     kind: sym.kind,
@@ -681,7 +681,7 @@ impl FileAnalysis {
             //       class itself).
             // Collect into a temporary list to avoid borrow-checker
             // issues with the closure capturing &mut seen_names/candidates.
-            let mut bridged: Vec<(String, SymKind, Option<SymbolDetail>, Option<InferredType>)> = Vec::new();
+            let mut bridged: Vec<(String, SymKind, Option<SymbolDetail>, Option<HandlerDisplay>)> = Vec::new();
             idx.for_each_entity_bridged_to(class_name, &mut |_mod, _cached, sym| {
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
                 if !visible(sym) { return; }
@@ -689,10 +689,10 @@ impl FileAnalysis {
                     sym.name.clone(),
                     sym.kind,
                     Some(sym.detail.clone()),
-                    None,
+                    sym.presentation.display,
                 ));
             });
-            for (name, kind, detail, _rt) in bridged {
+            for (name, kind, detail, display_override) in bridged {
                 if seen_names.contains(&name) { continue; }
                 seen_names.insert(name.clone());
                 let is_method = kind == SymKind::Method
@@ -700,9 +700,6 @@ impl FileAnalysis {
                 let kind = if is_method { SymKind::Method } else { SymKind::Sub };
                 let defining = if class_name != original_class { Some(class_name) } else { None };
                 let method_detail_str = self.method_detail(original_class, &name, defining, module_index);
-                let display_override = detail.as_ref()
-                    .map(|d| sub_display_override(d))
-                    .unwrap_or(None);
                 candidates.push(CompletionCandidate {
                     label: name,
                     kind,
@@ -728,7 +725,7 @@ impl FileAnalysis {
                     let kind = if is_method { SymKind::Method } else { SymKind::Sub };
                     let defining = if class_name != original_class { Some(class_name) } else { None };
                     let detail = self.method_detail(original_class, &sym.name, defining, module_index);
-                    let display_override = sub_display_override(&sym.detail);
+                    let display_override = sym.presentation.display;
                     candidates.push(CompletionCandidate {
                         label: sym.name.clone(),
                         kind,

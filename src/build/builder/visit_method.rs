@@ -439,8 +439,6 @@ impl<'a> Builder<'a> {
                     }],
                     is_method: true,
                     doc: None,
-                    display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,

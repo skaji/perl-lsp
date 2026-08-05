@@ -210,8 +210,6 @@ impl<'a> Builder<'a> {
                     params: params.into_iter().map(Into::into).collect(),
                     is_method,
                     doc,
-                    display,
-                    hide_in_outline,
                     opaque_return,
                     is_constant: false,
                     lexical: false,
@@ -248,15 +246,14 @@ impl<'a> Builder<'a> {
                 } else {
                     self.add_symbol_ns(name, SymKind::Method, span, selection_span, detail, ns)
                 };
-                if outline_label.is_some() {
-                    // Apply to the symbol just pushed. Kept out of
-                    // `add_symbol_ns` since outline_label is only
-                    // meaningful on plugin-emitted callables; the core
-                    // constructor stays narrow.
-                    if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
-                        s.outline_label = outline_label;
-                    }
-                }
+                // Stamped post-mint; kept out of `add_symbol_ns` so the
+                // core constructor stays narrow (defaults for the
+                // builder-native paths, plugin policy only here).
+                *self.presentation_mut(sid) = crate::model::file_analysis::Presentation {
+                    hide_in_outline,
+                    display,
+                    label: outline_label,
+                };
                 // Mirror the return type into the bag so walk-time and
                 // post-walk consumers see the plugin-synthesized sub
                 // through the same bag-query path locals + imports
@@ -343,15 +340,13 @@ impl<'a> Builder<'a> {
                     owner,
                     dispatchers,
                     params: params.into_iter().map(Into::into).collect(),
-                    display,
-                    hide_in_outline,
                 };
                 let sid = self.add_symbol_ns(name, SymKind::Handler, span, selection_span, detail, ns);
-                if outline_label.is_some() {
-                    if let Some(s) = self.symbols.iter_mut().find(|s| s.id == sid) {
-                        s.outline_label = outline_label;
-                    }
-                }
+                *self.presentation_mut(sid) = crate::model::file_analysis::Presentation {
+                    hide_in_outline,
+                    display: Some(display),
+                    label: outline_label,
+                };
             }
             plugin::EmitAction::PluginLoad { name, config_span } => {
                 self.plugin_loads.push(crate::model::file_analysis::PluginLoadFact {
@@ -444,7 +439,10 @@ impl<'a> Builder<'a> {
                     });
                 }
             }
-            plugin::EmitAction::Symbol { name, kind, span, selection_span, detail, return_type } => {
+            plugin::EmitAction::Symbol {
+                name, kind, span, selection_span, detail, return_type,
+                display, hide_in_outline,
+            } => {
                 // The per-symbol return type rides at the action
                 // level, not on `SymbolDetail`. The Symbol(sid) push
                 // is the canonical record — chain typing's bag-routed
@@ -453,6 +451,11 @@ impl<'a> Builder<'a> {
                 // and pushes `MethodOnClass{class, name} → Edge(Symbol(sid))`
                 // for the primary slot when the sym carries a class.
                 let sid = self.add_symbol_ns(name, kind, span, selection_span, detail, ns);
+                *self.presentation_mut(sid) = crate::model::file_analysis::Presentation {
+                    hide_in_outline,
+                    display,
+                    label: None,
+                };
                 if let Some(rt) = return_type {
                     use crate::model::witnesses::{
                         Witness, WitnessAttachment, WitnessPayload, WitnessSource,

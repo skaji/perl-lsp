@@ -270,7 +270,7 @@ impl FileAnalysis {
                 sort_priority: PRIORITY_FILE_WIDE,
                 additional_edits: vec![],
                 import_fact: None,
-                display_override: sub_display_override(&s.detail),
+                display_override: s.presentation.display,
             })
             .collect()
     }

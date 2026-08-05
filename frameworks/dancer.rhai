@@ -206,10 +206,10 @@ fn on_use(ctx) {
                         params: [],
                         is_method: false,
                         doc: doc_str,
-                        display: "Function",
-                        hide_in_outline: true,
                     }
                 },
+                display: "Function",
+                hide_in_outline: true,
                 return_type: rtype,
             }
         };

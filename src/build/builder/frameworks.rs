@@ -28,8 +28,6 @@ impl<'a> Builder<'a> {
                     doc: Some(format!(
                         "**Required** by role `{pkg}` — the composing class must provide it.",
                     )),
-                    display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
@@ -366,8 +364,6 @@ impl<'a> Builder<'a> {
                             params: vec![],
                             is_method: true,
                             doc: None,
-                            display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
@@ -408,15 +404,15 @@ impl<'a> Builder<'a> {
                                 }],
                                 is_method: true,
                                 doc: None,
-                                display: None,
-                    // Same name+span as the getter — hide so the outline shows
-                    // one entry per `has` attribute, not a reader+writer pair.
-                    hide_in_outline: true,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
                             },
                         );
+                        // Same name+span as the getter — hide so the outline
+                        // shows one entry per `has` attribute, not a
+                        // reader+writer pair.
+                        self.presentation_mut(writer_id).hide_in_outline = true;
                         let writer_arm = return_type.clone().map(|t| {
                             (
                                 crate::model::witnesses::ArgGuard::AtLeast(1),
@@ -449,8 +445,6 @@ impl<'a> Builder<'a> {
                                 }],
                                 is_method: true,
                                 doc: None,
-                                display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
@@ -524,8 +518,6 @@ impl<'a> Builder<'a> {
                             params: vec![],
                             is_method: true,
                             doc: None,
-                            display: None,
-                    hide_in_outline: false,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
@@ -559,15 +551,15 @@ impl<'a> Builder<'a> {
                             }],
                             is_method: true,
                             doc: None,
-                            display: None,
-                    // Same name+span as the getter — hide so the outline shows
-                    // one entry per `has` attribute, not a reader+writer pair.
-                    hide_in_outline: true,
                     opaque_return: false,
                     is_constant: false,
                     lexical: false,
                         },
                     );
+                    // Same name+span as the getter — hide so the outline
+                    // shows one entry per `has` attribute, not a
+                    // reader+writer pair.
+                    self.presentation_mut(writer_id).hide_in_outline = true;
                     // Mojo writer: arity ≥ 1 → fluent return
                     // (the invocant). Encode as `Receiver` so the
                     // value-side substitution evaluates to the

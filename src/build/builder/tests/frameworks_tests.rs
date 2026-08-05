@@ -1583,7 +1583,7 @@ fn test_mojo_has_accessor_writer_hidden_from_outline() {
         .symbols
         .iter()
         .filter(|s| s.name == "content" && s.kind == SymKind::Method)
-        .filter(|s| !matches!(&s.detail, SymbolDetail::Sub { hide_in_outline: true, .. }))
+        .filter(|s| !s.hidden_in_outline())
         .collect();
     assert_eq!(
         visible.len(),

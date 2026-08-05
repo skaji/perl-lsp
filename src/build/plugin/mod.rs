@@ -479,6 +479,13 @@ pub enum EmitAction {
         detail: SymbolDetail,
         #[serde(default)]
         return_type: Option<InferredType>,
+        /// Presentation policy — same vocabulary as `Method`/`Handler`
+        /// (rides `Symbol.presentation`, never the detail).
+        #[serde(default)]
+        display: Option<HandlerDisplay>,
+        /// Hide from listing views (see Method variant).
+        #[serde(default)]
+        hide_in_outline: bool,
     },
     /// Declare a plugin namespace — a scope the plugin owns, with
     /// bridges describing how Perl-space expressions reach it. The

@@ -327,12 +327,12 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
         "span": span_to_json(&s.span),
         "selection": span_to_json(&s.selection_span),
     });
-    if let Some(label) = &s.outline_label {
+    if let Some(label) = &s.presentation.label {
         entry["outline_label"] = json!(label);
     }
     use crate::model::file_analysis::SymbolDetail;
     match &s.detail {
-        SymbolDetail::Sub { params, is_method, display, hide_in_outline, opaque_return, .. } => {
+        SymbolDetail::Sub { params, is_method, opaque_return, .. } => {
             // `return_type` was a `SymbolDetail` field; D1 of the
             // bag-residual refactor moved it to the bag. The snapshot
             // omits it from the symbol-shape dump — callers that
@@ -346,12 +346,12 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
                     "default": p.default,
                 })).collect::<Vec<_>>(),
                 "is_method": is_method,
-                "display": display.as_ref().map(|d| format!("{:?}", d)),
-                "hide_in_outline": hide_in_outline,
+                "display": s.presentation.display.as_ref().map(|d| format!("{:?}", d)),
+                "hide_in_outline": s.presentation.hide_in_outline,
                 "opaque_return": opaque_return,
             });
         }
-        SymbolDetail::Handler { owner, dispatchers, params, display, hide_in_outline } => {
+        SymbolDetail::Handler { owner, dispatchers, params } => {
             entry["detail"] = json!({
                 "kind": "Handler",
                 "owner": format!("{:?}", owner),
@@ -361,8 +361,8 @@ fn symbol_to_snapshot(s: &Symbol) -> Value {
                     "is_invocant": p.is_invocant,
                     "is_slurpy": p.is_slurpy,
                 })).collect::<Vec<_>>(),
-                "display": format!("{:?}", display),
-                "hide_in_outline": hide_in_outline,
+                "display": format!("{:?}", s.presentation.display.unwrap_or_default()),
+                "hide_in_outline": s.presentation.hide_in_outline,
             });
         }
         SymbolDetail::HashKeyDef { owner, is_dynamic } => {

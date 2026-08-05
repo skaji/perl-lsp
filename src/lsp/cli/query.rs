@@ -800,7 +800,7 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
         if let Some(container) = analysis.union_container_of(sym) {
             entry["container"] = serde_json::json!(container.name);
         }
-        if let file_analysis::SymbolDetail::Sub { ref params, is_method, ref display, .. } = sym.detail {
+        if let file_analysis::SymbolDetail::Sub { ref params, is_method, .. } = sym.detail {
             if params.iter().any(|p| !p.is_invocant) {
                 let param_names: Vec<&str> = params.iter()
                     .filter(|p| !p.is_invocant)
@@ -814,18 +814,18 @@ fn outline_json(analysis: &file_analysis::FileAnalysis) -> String {
             if is_method {
                 entry["is_method"] = serde_json::json!(true);
             }
-            if let Some(d) = display {
+            if let Some(d) = sym.presentation.display {
                 entry["display"] = serde_json::json!(format!("{:?}", d));
             }
         }
-        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, ref display, .. } = sym.detail {
+        if let file_analysis::SymbolDetail::Handler { ref params, ref dispatchers, .. } = sym.detail {
             let param_names: Vec<&str> = params.iter()
                 .filter(|p| !p.is_invocant)
                 .map(|p| p.name.as_str())
                 .collect();
             entry["params"] = serde_json::json!(param_names);
             entry["dispatchers"] = serde_json::json!(dispatchers);
-            entry["display"] = serde_json::json!(format!("{:?}", display));
+            entry["display"] = serde_json::json!(format!("{:?}", sym.presentation.display.unwrap_or_default()));
         }
         use file_analysis::Namespace;
         let is_framework = matches!(sym.namespace, Namespace::Framework { .. });
@@ -1125,8 +1125,6 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
         let SymbolDetail::Sub {
             ref params,
             is_method,
-            ref display,
-            hide_in_outline,
             opaque_return,
             ref doc,
             ..
@@ -1268,16 +1266,16 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
         if let Some(prov) = provenance {
             entry["return_type_provenance"] = prov;
         }
-        if let Some(d) = display {
+        if let Some(d) = sym.presentation.display {
             entry["display"] = serde_json::json!(format!("{:?}", d));
         }
-        if hide_in_outline {
+        if sym.presentation.hide_in_outline {
             entry["hide_in_outline"] = serde_json::json!(true);
         }
         if opaque_return {
             entry["opaque_return"] = serde_json::json!(true);
         }
-        if let Some(ref outline) = sym.outline_label {
+        if let Some(ref outline) = sym.presentation.label {
             entry["outline_label"] = serde_json::json!(outline);
         }
         if let Some(d) = doc.as_ref() {

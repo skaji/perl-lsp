@@ -684,7 +684,7 @@ impl<'a> Builder<'a> {
             match a {
                 EmitAction::Method {
                     name, span, selection_span, params, is_method, return_type, doc,
-                    on_class, display, hide_in_outline, opaque_return, ..
+                    on_class, display, hide_in_outline, opaque_return, outline_label, ..
                 } => {
                     symbols.push(GatedSymbol {
                         name,
@@ -695,11 +695,14 @@ impl<'a> Builder<'a> {
                             params: params.into_iter().map(Into::into).collect(),
                             is_method,
                             doc,
-                            display,
-                            hide_in_outline,
                             opaque_return,
                             is_constant: false,
                             lexical: false,
+                        },
+                        presentation: crate::model::file_analysis::Presentation {
+                            hide_in_outline,
+                            display,
+                            label: outline_label,
                         },
                         on_class,
                         return_type,
@@ -712,13 +715,14 @@ impl<'a> Builder<'a> {
                         span,
                         selection_span,
                         detail: SymbolDetail::HashKeyDef { owner, is_dynamic: false },
+                        presentation: Default::default(),
                         on_class: None,
                         return_type: None,
                     });
                 }
                 EmitAction::Handler {
                     name, owner, dispatchers, params, span, selection_span,
-                    display, hide_in_outline, ..
+                    display, hide_in_outline, outline_label,
                 } => {
                     symbols.push(GatedSymbol {
                         name,
@@ -729,20 +733,31 @@ impl<'a> Builder<'a> {
                             owner,
                             dispatchers,
                             params: params.into_iter().map(Into::into).collect(),
-                            display,
+                        },
+                        presentation: crate::model::file_analysis::Presentation {
                             hide_in_outline,
+                            display: Some(display),
+                            label: outline_label,
                         },
                         on_class: None,
                         return_type: None,
                     });
                 }
-                EmitAction::Symbol { name, kind, span, selection_span, detail, return_type } => {
+                EmitAction::Symbol {
+                    name, kind, span, selection_span, detail, return_type,
+                    display, hide_in_outline,
+                } => {
                     symbols.push(GatedSymbol {
                         name,
                         kind,
                         span,
                         selection_span,
                         detail,
+                        presentation: crate::model::file_analysis::Presentation {
+                            hide_in_outline,
+                            display,
+                            label: None,
+                        },
                         on_class: None,
                         return_type,
                     });
