@@ -128,6 +128,11 @@ impl FileStore {
     }
 
     /// Immutable access to an open Document.
+    ///
+    /// The returned `Ref` pins its DashMap shard: holding it across ANY
+    /// store mutation (`open`/`close`/`insert_workspace`) deadlocks when
+    /// the other key lands on the same shard — a seed-dependent hang, not
+    /// a deterministic failure. Snapshot what you need and drop the guard.
     pub fn get_open(&self, url: &Url) -> Option<dashmap::mapref::one::Ref<'_, Url, Document>> {
         self.open.get(url)
     }

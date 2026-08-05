@@ -13,9 +13,14 @@ fn open_routes_cpp_file_to_the_cpp_driver() {
         "#define API __attribute__((visibility(\"default\")))\nclass API Box { public: int width; };\n"
             .to_string()
     ));
-    let doc = store.get_open(&cpp).unwrap();
-    assert_eq!(doc.language, "cpp");
-    assert!(doc.analysis.symbols.iter().any(|s| s.name == "Box"), "cpp class via the driver");
+    {
+        // Scoped: `get_open` hands back a DashMap shard guard — holding it
+        // across the next `open()` deadlocks whenever both URLs hash to the
+        // same shard (seed-dependent, so it hangs one run in ~eight).
+        let doc = store.get_open(&cpp).unwrap();
+        assert_eq!(doc.language, "cpp");
+        assert!(doc.analysis.symbols.iter().any(|s| s.name == "Box"), "cpp class via the driver");
+    }
 
     let perl = Url::parse("file:///tmp/route_test.pm").unwrap();
     assert!(store.open(perl.clone(), "package Foo; sub bar { 1 }\n".to_string()));
