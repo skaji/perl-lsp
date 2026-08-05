@@ -263,7 +263,7 @@ impl Backend {
     /// timeout the handler resolves degraded exactly as before.
     ///
     /// GUARD DISCIPLINE: holds NO FileStore guard across the await — it touches
-    /// only the family's `done` atomic + `Notify`. Callers peek `language` under
+    /// only the family's `ReadyGate`. Callers peek `language` under
     /// a `get_open` guard that DROPS before this await, and snapshot `analysis`
     /// fresh AFTER it, picking up any heal (see the hazard note on
     /// `FileStore::for_each_open`).
@@ -286,28 +286,19 @@ impl Backend {
         use std::sync::atomic::Ordering;
         let want_perl = language == "perl";
         let latch = if want_perl { &self.perl_indexed } else { &self.pack_indexed };
-        let (done, notify) = if want_perl {
-            (&self.index_ready.perl_done, &self.index_ready.perl_notify)
-        } else {
-            (&self.index_ready.pack_done, &self.index_ready.pack_notify)
-        };
+        let gate = if want_perl { &self.index_ready.perl } else { &self.index_ready.pack };
         // Only wait when an index is actually coming: kicked off but not done.
-        if !latch.load(Ordering::Relaxed) || done.load(Ordering::Relaxed) {
+        if !latch.load(Ordering::Relaxed) || gate.is_open() {
             return;
         }
         let cap = self.wait_cap(policy);
         if cap == 0 {
             return; // opt-out
         }
-        // Register interest BEFORE the final `done` re-check to close the
-        // notify lost-wakeup race (a completion between the first check and the
-        // await would otherwise be missed), then wait bounded.
-        let waited = notify.notified();
-        if done.load(Ordering::Relaxed) {
-            return;
+        if let Some(waited) = gate.armed_wait(|| false) {
+            self.bounded_wait_with_progress(cap, waited, "Waiting for workspace index")
+                .await;
         }
-        self.bounded_wait_with_progress(cap, waited, "Waiting for workspace index")
-            .await;
     }
 
     /// Bounded wait for a freshly-opened document's INITIAL build, when it is
@@ -318,27 +309,24 @@ impl Backend {
     /// file degrades after the cap and heals once the build lands + republishes.
     ///
     /// GUARD DISCIPLINE: holds NO FileStore / DashMap guard across the await —
-    /// it snapshots the `Notify` Arc out of the `opening` map and drops that
+    /// it snapshots the `ReadyGate` Arc out of the `opening` map and drops that
     /// guard before awaiting. Callers snapshot `analysis` fresh AFTER it.
     pub(super) async fn await_open_ready(&self, uri: &Url, policy: WaitPolicy) {
         if self.files.get_open(uri).is_some() {
             return; // already built
         }
-        let Some(notify) = self.opening.get(uri).map(|n| Arc::clone(n.value())) else {
+        let Some(gate) = self.opening.get(uri).map(|n| Arc::clone(n.value())) else {
             return; // not an in-flight open (unknown/closed file)
         };
         let cap = self.wait_cap(policy);
         if cap == 0 {
             return; // opt-out
         }
-        // Register interest BEFORE the final presence re-check to close the
-        // notify lost-wakeup race, then wait bounded.
-        let waited = notify.notified();
-        if self.files.get_open(uri).is_some() {
-            return;
+        let waited = gate.armed_wait(|| self.files.get_open(uri).is_some());
+        if let Some(waited) = waited {
+            self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
+                .await;
         }
-        self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
-            .await;
     }
 
     /// Bounded wait for the open document's FULL-quality analysis — past the
@@ -354,20 +342,18 @@ impl Backend {
         if !matches!(policy, WaitPolicy::Complete) {
             return;
         }
-        let Some(notify) = self.degraded_open.get(uri).map(|n| Arc::clone(n.value())) else {
+        let Some(gate) = self.degraded_open.get(uri).map(|n| Arc::clone(n.value())) else {
             return; // not degraded (perl doc, heal already landed, or never opened)
         };
         let cap = self.wait_cap(policy);
         if cap == 0 {
             return; // opt-out
         }
-        // Register interest BEFORE the re-check (lost-wakeup discipline).
-        let waited = notify.notified();
-        if !self.degraded_open.contains_key(uri) {
-            return;
+        let waited = gate.armed_wait(|| !self.degraded_open.contains_key(uri));
+        if let Some(waited) = waited {
+            self.bounded_wait_with_progress(cap, waited, "Waiting for cross-file analysis")
+                .await;
         }
-        self.bounded_wait_with_progress(cap, waited, "Waiting for cross-file analysis")
-            .await;
     }
 
     /// Bounded wait that surfaces as client progress once it actually

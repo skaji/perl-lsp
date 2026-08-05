@@ -13,6 +13,8 @@ use crate::lsp::symbols;
 
 mod completion;
 pub use completion::*;
+mod gates;
+use gates::*;
 mod indexing;
 use indexing::*;
 mod lifecycle;
@@ -44,17 +46,15 @@ pub fn max_cache_mb_default() -> u64 {
 
 /// Per-language-family completion signal for the cold-open bounded wait. The
 /// KICKOFF latch (`perl_indexed`/`pack_indexed`) flips synchronously on the
-/// first `did_open`; these fire on COMPLETION — the workspace/pack index has
-/// attached and `heal_open_docs` ran. A pull verb arriving in the in-flight
-/// window (latch set, `done` clear) registers on the matching `Notify` and
-/// waits bounded. Touched only via atomics + `Notify::notify_waiters` — never
+/// first `did_open`; these gates open on COMPLETION — the workspace/pack index
+/// has attached and `heal_open_docs` ran. A pull verb arriving in the
+/// in-flight window (latch set, gate closed) arms the family's `ReadyGate`
+/// and waits bounded. Touched only via the gate's atomics + `Notify` — never
 /// behind a FileStore guard — so the wait is deadlock-safe by construction.
 #[derive(Default)]
 struct IndexReady {
-    perl_done: std::sync::atomic::AtomicBool,
-    pack_done: std::sync::atomic::AtomicBool,
-    perl_notify: tokio::sync::Notify,
-    pack_notify: tokio::sync::Notify,
+    perl: ReadyGate,
+    pack: ReadyGate,
 }
 
 /// Fires the family's completion signal on EVERY exit path of the indexing
@@ -67,13 +67,10 @@ struct IndexDoneGuard {
 
 impl Drop for IndexDoneGuard {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
         if self.want_perl {
-            self.ready.perl_done.store(true, Ordering::Relaxed);
-            self.ready.perl_notify.notify_waiters();
+            self.ready.perl.open();
         } else {
-            self.ready.pack_done.store(true, Ordering::Relaxed);
-            self.ready.pack_notify.notify_waiters();
+            self.ready.pack.open();
         }
     }
 }
@@ -82,12 +79,12 @@ pub struct Backend {
     client: Client,
     files: Arc<FileStore>,
     module_index: Arc<ModuleIndex>,
-    /// Per-document edit generation. Each `did_change` bumps it; a debounced
-    /// rebuild task only proceeds if its captured generation is still the
-    /// latest — so a burst of keystrokes triggers ONE analysis (~0.7s on a
-    /// big macro-heavy C file) after typing settles, not one per keystroke.
+    /// Per-document rebuild debounce (`DebouncedLatest`): each `did_change`
+    /// fires it, and only the fire that survives the settle window rebuilds —
+    /// so a burst of keystrokes triggers ONE analysis (~0.7s on a big
+    /// macro-heavy C file) after typing settles, not one per keystroke.
     /// Pack languages only; Perl rebuilds synchronously (cheap).
-    change_gen: Arc<dashmap::DashMap<Url, u64>>,
+    change_debounce: Arc<dashmap::DashMap<Url, Arc<DebouncedLatest>>>,
     /// Workspace indexing is LAZY + per-language: a family's index runs on the
     /// first `did_open` of a file in it, not eagerly at `initialized`. So a C++
     /// session in a mixed tree (e.g. perl5) never pays to index the 4000+ `.pm`
@@ -126,20 +123,20 @@ pub struct Backend {
     max_cache_mb: Arc<std::sync::atomic::AtomicU64>,
     /// URIs whose initial `did_open` build is in flight (running off the message
     /// loop). A read verb that finds the doc still absent bounded-waits on the
-    /// per-URI `Notify` instead of racing an empty store — the same heal shape
-    /// as `await_index_ready`, but for the file's own first build (a big
+    /// per-URI `ReadyGate` instead of racing an empty store — the same heal
+    /// shape as `await_index_ready`, but for the file's own first build (a big
     /// macro-heavy C file is ~1.3 s and must not run synchronously on `did_open`).
-    opening: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    opening: Arc<dashmap::DashMap<Url, Arc<ReadyGate>>>,
     /// URIs whose OPEN analysis is DEGRADED — built with the cached-only
     /// cross-file gather (a fresh server's gather cache is empty even when
     /// modules.db is warm), pending the background full-gather heal
     /// (`PackHealCtx::run_gather_once`). Cross-file act-on-able verbs
     /// (references/rename/implementations) bounded-wait on the entry's
-    /// `Notify` (`await_open_full`) instead of answering from the partial
+    /// `ReadyGate` (`await_open_full`) instead of answering from the partial
     /// closure — the answer LOOKS complete and isn't (curl: 4 sites vs 155
     /// inside the window). Per-file verbs (outline, hover) don't wait: their
     /// answers don't read the cross-file closure.
-    degraded_open: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    degraded_open: Arc<dashmap::DashMap<Url, Arc<ReadyGate>>>,
     /// Live work-done progress token per degraded URI — the LSP-visible
     /// announcement that the cross-file gather is still warming and the
     /// published diagnostics are provisional. Reserved once per degraded
@@ -236,7 +233,7 @@ struct PackHealCtx {
     module_index: Arc<ModuleIndex>,
     client: Client,
     options: symbols::DiagnosticOptions,
-    degraded_open: Arc<dashmap::DashMap<Url, Arc<tokio::sync::Notify>>>,
+    degraded_open: Arc<dashmap::DashMap<Url, Arc<ReadyGate>>>,
     degraded_progress: Arc<dashmap::DashMap<Url, NumberOrString>>,
     gather_reg: Arc<GatherRegistry>,
     work_done: Arc<std::sync::atomic::AtomicBool>,

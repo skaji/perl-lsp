@@ -67,8 +67,8 @@ impl PackHealCtx {
     /// Clear the degraded-open mark, wake `await_open_full` waiters, and end
     /// the provisional-diagnostics progress. The window is over.
     async fn clear_degraded(&self, uri: &Url) {
-        if let Some((_, n)) = self.degraded_open.remove(uri) {
-            n.notify_waiters();
+        if let Some((_, g)) = self.degraded_open.remove(uri) {
+            g.open();
         }
         self.end_progress(uri).await;
     }
@@ -159,58 +159,15 @@ impl Backend {
         // a later-set Arc<ModuleIndex>, then wire up the Arc.
         let diag_options = Arc::new(std::sync::Mutex::new(symbols::DiagnosticOptions::default()));
 
-        let refresh_client = client.clone();
-        let refresh_files = Arc::clone(&files);
-        let refresh_diag_options = Arc::clone(&diag_options);
-
         let module_index_holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>> =
             Arc::new(std::sync::OnceLock::new());
-        let holder_clone = Arc::clone(&module_index_holder);
 
-        // Coalesce generation for the per-module refresh storm: each resolved
-        // module fires `on_refresh` (~33 in ~400ms opening a Perl file with a
-        // dozen `use`s), each otherwise a full all-open re-enrich + publish —
-        // CPU + stdout pressure that WIDENS the cold-open degraded window. Every
-        // fire bumps this generation and debounces; only the latest surviving
-        // fire republishes, so the burst collapses to ~one refresh. Lives only
-        // in the closure — nothing outside bumps it.
-        let refresh_gen_cb = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Capture the tokio handle so the callback can spawn async work
-        // from the resolver thread (which has no tokio context).
-        let tokio_handle = tokio::runtime::Handle::current();
-        let on_refresh = move || {
-            use std::sync::atomic::Ordering;
-            let client = refresh_client.clone();
-            let files = Arc::clone(&refresh_files);
-            let holder = Arc::clone(&holder_clone);
-            let diag_options = Arc::clone(&refresh_diag_options);
-            let refresh_gen = Arc::clone(&refresh_gen_cb);
-            // Debounce: bump the generation, then only the LATEST fire that
-            // survives the settle window does the work. A tight resolver burst
-            // (~45 modules in ~400ms) thus republishes once, not 45×.
-            let my_gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
-            log::debug!("diag-refresh fired (gen {})", my_gen);
-            tokio_handle.spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                if refresh_gen.load(Ordering::Relaxed) != my_gen {
-                    return; // a newer fire superseded this one
-                }
-                let module_index = match holder.get() {
-                    Some(idx) => idx,
-                    None => return,
-                };
-                log::debug!("diag-refresh executing (gen {})", my_gen);
-                // Derive (uri, diagnostics) first without holding the store lock
-                // across the await — publishing is async and could deadlock.
-                let options = *diag_options.lock().unwrap();
-                let pending =
-                    refresh_open_diagnostics(&files, module_index, options, OpenDocScope::All);
-                for (uri, diags) in pending {
-                    client.publish_diagnostics(uri, diags, None).await;
-                }
-            });
-        };
+        let on_refresh = make_on_refresh(
+            client.clone(),
+            Arc::clone(&files),
+            Arc::clone(&module_index_holder),
+            Arc::clone(&diag_options),
+        );
 
         let module_index = Arc::new(ModuleIndex::new(client.clone(), on_refresh));
         let _ = module_index_holder.set(Arc::clone(&module_index));
@@ -219,7 +176,7 @@ impl Backend {
             module_index,
             client,
             files,
-            change_gen: Arc::new(dashmap::DashMap::new()),
+            change_debounce: Arc::new(dashmap::DashMap::new()),
             perl_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pack_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_done_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -236,24 +193,25 @@ impl Backend {
         }
     }
 
-    /// After a debounce, rebuild the pack analysis for `uri` OFF the document
-    /// lock (snapshot text → `spawn_blocking` build → write back) + publish
-    /// diagnostics — but only while `generation` is still the latest edit, so
-    /// a burst of keystrokes collapses to ONE rebuild after typing settles.
-    pub(super) fn spawn_debounced_rebuild(&self, uri: Url, generation: u64) {
+    /// Debounced pack rebuild for `uri`: OFF the document lock (snapshot text
+    /// → `spawn_blocking` build → write back) + publish diagnostics — only
+    /// the edit that survives the settle window rebuilds, so a burst of
+    /// keystrokes collapses to ONE analysis after typing settles.
+    pub(super) fn spawn_debounced_rebuild(&self, uri: Url) {
+        let debounce = Arc::clone(
+            self.change_debounce
+                .entry(uri.clone())
+                .or_default()
+                .value(),
+        );
         let files = Arc::clone(&self.files);
         let module_index = Arc::clone(&self.module_index);
         let client = self.client.clone();
-        let change_gen = Arc::clone(&self.change_gen);
         let options = self.diagnostic_options();
         let degraded_open = Arc::clone(&self.degraded_open);
         let heal_ctx = self.pack_heal_ctx();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let is_latest = || change_gen.get(&uri).map(|v| *v) == Some(generation);
-            if !is_latest() {
-                return;
-            }
+        let handle = tokio::runtime::Handle::current();
+        debounce.fire(&handle, std::time::Duration::from_millis(150), move |latest| async move {
             // Snapshot the latest text off the lock; build on a blocking
             // thread so the ~0.7s analysis never stalls completion/hover.
             let Some((text, path, language)) = files
@@ -283,7 +241,7 @@ impl Backend {
             let Some(analysis) = analysis else {
                 return;
             };
-            if !is_latest() {
+            if !latest.still() {
                 return; // a newer keystroke superseded this build
             }
             for imp in &analysis.imports {
@@ -314,7 +272,7 @@ impl Backend {
             if language != "perl" {
                 degraded_open
                     .entry(uri.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+                    .or_insert_with(|| Arc::new(ReadyGate::default()));
                 heal_ctx.begin_progress(&uri, language).await;
                 heal_ctx.request_gather(uri);
             }
@@ -425,6 +383,45 @@ impl Backend {
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
+    }
+}
+
+/// The resolver thread's diagnostics-refresh callback. Each resolved module
+/// fires it (~33 in ~400ms opening a Perl file with a dozen `use`s), each
+/// otherwise a full all-open re-enrich + publish — CPU + stdout pressure
+/// that WIDENS the cold-open degraded window. `DebouncedLatest` collapses
+/// the burst: only the latest fire surviving the settle window republishes.
+/// The tokio handle is captured at construction because the callback runs on
+/// the resolver thread, which has no tokio context.
+fn make_on_refresh(
+    client: Client,
+    files: Arc<FileStore>,
+    holder: Arc<std::sync::OnceLock<Arc<ModuleIndex>>>,
+    diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
+) -> impl Fn() + Send + Sync + 'static {
+    let debounce = Arc::new(DebouncedLatest::default());
+    let handle = tokio::runtime::Handle::current();
+    move || {
+        let client = client.clone();
+        let files = Arc::clone(&files);
+        let holder = Arc::clone(&holder);
+        let diag_options = Arc::clone(&diag_options);
+        log::debug!("diag-refresh fired");
+        debounce.fire(&handle, std::time::Duration::from_millis(120), move |_latest| async move {
+            let module_index = match holder.get() {
+                Some(idx) => idx,
+                None => return,
+            };
+            log::debug!("diag-refresh executing");
+            // Derive (uri, diagnostics) first without holding the store lock
+            // across the await — publishing is async and could deadlock.
+            let options = *diag_options.lock().unwrap();
+            let pending =
+                refresh_open_diagnostics(&files, module_index, options, OpenDocScope::All);
+            for (uri, diags) in pending {
+                client.publish_diagnostics(uri, diags, None).await;
+            }
+        });
     }
 }
 

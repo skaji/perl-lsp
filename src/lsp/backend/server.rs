@@ -248,12 +248,12 @@ impl LanguageServer for Backend {
         // ~1.5 s, warmed later by the single-flight gather heal); the per-file
         // build is intrinsic and must simply not block the loop.
         //
-        // A per-URI `Notify` marks the build in flight so read verbs bounded-wait
-        // for it (`await_open_ready`) instead of racing the empty store. The
-        // `set_gather_cached_only` thread-local is set INSIDE the blocking closure
-        // so it applies exactly to this build's thread.
-        let notify = Arc::new(tokio::sync::Notify::new());
-        self.opening.insert(uri.clone(), Arc::clone(&notify));
+        // A per-URI `ReadyGate` marks the build in flight so read verbs
+        // bounded-wait for it (`await_open_ready`) instead of racing the empty
+        // store. The `set_gather_cached_only` thread-local is set INSIDE the
+        // blocking closure so it applies exactly to this build's thread.
+        let gate = Arc::new(ReadyGate::default());
+        self.opening.insert(uri.clone(), Arc::clone(&gate));
         let files = Arc::clone(&self.files);
         let uri_build = uri.clone();
         let build_started = std::time::Instant::now();
@@ -268,7 +268,7 @@ impl LanguageServer for Backend {
         // Doc is in the store (or the build failed): drop the in-flight marker
         // and wake any verb waiting on it.
         self.opening.remove(&uri);
-        notify.notify_waiters();
+        gate.open();
         // If the build outran the bounded wait, the verbs the client fired on
         // open (semanticTokens, inlayHint) returned degraded. Their content is
         // now in the store — nudge the client to re-request (LSP server-initiated
@@ -326,7 +326,7 @@ impl LanguageServer for Backend {
             // for the full-gather analysis instead of the partial closure.
             self.degraded_open
                 .entry(uri.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()));
+                .or_insert_with(|| Arc::new(ReadyGate::default()));
             // Announce the degraded window (Part 1) and route the initial
             // gather through the single-flight registry (Part 2) — so the
             // first change's heal coalesces into THIS gather instead of
@@ -378,12 +378,7 @@ impl LanguageServer for Backend {
         if let Some(mut doc) = self.files.get_open_mut(&uri) {
             doc.update_text_only(change.text);
         }
-        let generation = {
-            let mut e = self.change_gen.entry(uri.clone()).or_insert(0);
-            *e += 1;
-            *e
-        };
-        self.spawn_debounced_rebuild(uri, generation);
+        self.spawn_debounced_rebuild(uri);
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -417,8 +412,8 @@ impl LanguageServer for Backend {
         self.files.close(&uri);
         // Wake any degraded-window waiter — the doc is gone, there is
         // nothing to wait for.
-        if let Some((_, n)) = self.degraded_open.remove(&uri) {
-            n.notify_waiters();
+        if let Some((_, g)) = self.degraded_open.remove(&uri) {
+            g.open();
         }
         // Retire any in-flight gather single-flight entry (no leak on close;
         // the running loop's next `finish` sees Vacant and stops) and end the

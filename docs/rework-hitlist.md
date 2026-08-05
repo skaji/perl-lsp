@@ -243,27 +243,20 @@ spawn_blocking twins are deleted onto it.
 `layering_tests::query_verbs_route_through_run_query` pins the raw
 spellings out of `server.rs`, so a new verb cannot grow an inline I/O path.
 
-### D5. The bounded-wait lost-wakeup shape is hand-spelled three times, debounce-by-generation twice — **medium leverage / M**
+### D5. LANDED — one spelling each for the bounded wait and the settle-window debounce (`lsp/backend/gates.rs`)
 
-**The evidence.** The "register interest BEFORE the final re-check" discipline
-is comment-spelled at three await sites (`indexing.rs:331-334, 363-365, 393`);
-the generation-captured debounce exists twice (`spawn_debounced_rebuild`,
-`lifecycle.rs:253-297`; the `refresh_gen` dance inline in `Backend::new`'s
-on_refresh closure, `lifecycle.rs:170-221`). The repo's own precedent — four
-bare gather caches drifting into check-release-compute races before
-unification (docs/prompt-storage-residuals.md:44-58) — shows the class rots
-when each site proves the invariant independently.
-
-**Target shape.** Two small types in a backend submodule: `ReadyGate`
-(latch + Notify + register-before-recheck bounded wait; each caller keeps its
-probe closure) replacing the three await bodies, and `DebouncedLatest`
-(generation-captured settle-window debounce) replacing both spellings — which
-also gets the closure out of `Backend::new`. Leave `GatherRegistry`
-(unit-tested single-flight) distinct; `PackChangeCoordinator` and
-`claim_source_gen` now live under D3's `PackInvalidator`.
-
-**Gate.** Unit tests on the two primitives (the wakeup proof written once);
-existing indexing await tests.
+`ReadyGate` (one-way latch + Notify; `armed_wait` registers interest BEFORE
+the final re-check — the lost-wakeup proof lives on the type, unit-tested
+once) backs all three bounded-wait sites: the per-family `IndexReady` gates,
+the per-URI `opening` map, and the per-URI `degraded_open` map — callers keep
+their probe closures. `DebouncedLatest` (generation-captured settle-window
+debounce; `fire` runs only the latest surviving fire, `Latest::still`
+re-probes mid-job) backs both debounce sites: `spawn_debounced_rebuild`
+(replacing the `change_gen` map of raw counters) and the resolver's
+diagnostics-refresh callback, whose body moved out of `Backend::new` into
+`make_on_refresh`. `GatherRegistry` stays distinct (single-flight, not a
+debounce); `PackChangeCoordinator` and `claim_source_gen` were already eaten
+by D3's `PackInvalidator`.
 
 ---
 
