@@ -467,25 +467,18 @@ inside one 2.2k-line file. Motion must preserve the ordering invariants
 invariants, not file-local details. Sequence after D2 (IndexCore) or accept
 one rebase. Gate: pure code motion; residency tripwire + eviction tests.
 
-### F3. helpers.rs and infra.rs carry families that belong to sibling seams — **medium leverage / S each**
+### F3. LANDED — helpers.rs and infra.rs families live with their sibling seams
 
-- `build/builder/helpers.rs` (1384 lines, header self-describes six concerns):
-  the bless family (`:720-902`, four sibling-part consumers) becomes
-  `visit_bless.rs`; POD capture (`:1255, :1305`) pairs into a `docs.rs` part;
-  AUTOLOAD/__DATA__ synthesis (`:1124`) moves beside the pipeline synthesis
-  passes; the DBIC resultset-parametric family (`:330-455`) moves into
-  `visit_method.rs` (its caller) so the parked DBIC phase-3 lift has one
-  source file; `add_fold_range` (`:9`) into visit_decl.rs. The residue renames
-  to `extract.rs` with a tight charter so the drawer stops inviting orphans.
-- `build/builder/infra.rs`: flow-edge minting
-  (`mint_flow_edges_via_query`/`push_flow_edge`/`bare_bind_names`,
-  `:107/:248/:230`) moves into narrowing.rs so docs/adr/flow-narrowing.md maps
-  to exactly one part; the plugin decision-ready-context factory
-  (`arg_info_for`/`extract_anonymous_sub_params`, `:462/:654`) moves into
-  plugin_emit.rs. `coderef_return_edge_for` (`:624`) stays — it is witness
-  emission (consumer: `emit.rs:198`), not plugin context.
-
-Gate: pure code motion, `cargo test`.
+`build/builder/` has no grab-drawer: the bless family is `visit_bless.rs`,
+POD doc capture is `docs.rs`, AUTOLOAD/__DATA__ synthesis sits beside the
+pipeline synthesis passes in `pipeline.rs`, the DBIC resultset-parametric
+family lives in `visit_method.rs` (one source file for the parked DBIC
+phase-3 lift), and `add_fold_range` is in `visit_decl.rs`; the residue is
+`extract.rs` under a tight tree-reading charter. `infra.rs` keeps scope /
+symbol-minting / package-range / call-arg infrastructure plus
+`coderef_return_edge_for`; flow-edge minting lives in `narrowing.rs`
+(docs/adr/flow-narrowing.md maps to exactly one part) and the plugin
+`ArgInfo` factory in `plugin_emit.rs`.
 
 ### F4. Two unledgered bespoke ancestry walkers, blocked on a missing prune verdict in GraphView — **medium leverage / M**
 

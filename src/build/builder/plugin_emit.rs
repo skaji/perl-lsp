@@ -605,4 +605,135 @@ impl<'a> Builder<'a> {
             }
         }
     }
+
+    /// Build an `ArgInfo` for a plugin. Constant-folds literals, barewords,
+    /// and `$var` references that accumulate in `constant_strings`. When the
+    /// arg is an anonymous sub, also extracts its param list so plugins
+    /// registering handlers (`->on('ready', sub ($s, $m) {})`) can preserve
+    /// the handler signature for later sig-help lookup.
+    ///
+    /// `&mut self` because the inferred-type derivation emits the arg's
+    /// `Expr(span)` witness onto the bag before querying it — the order
+    /// matters: emit first, then query. Reversing yields `None` from the
+    /// query (no witness on the attachment yet) and the caller would
+    /// silently skip the `callable_return_edge` projection.
+    pub(super) fn arg_info_for(&mut self, arg: Node<'a>) -> plugin::ArgInfo {
+        let text = arg.utf8_text(self.source).unwrap_or("").to_string();
+        let mut content_span: Option<Span> = None;
+        let string_value = match arg.kind() {
+            "string_literal" | "interpolated_string_literal" => {
+                // Read the string_content child — quote-flavor-agnostic
+                // (handles q{}, qq!!, heredocs, etc.). An empty literal
+                // has no content child, so default to "".
+                // Also capture the content span so plugins can address
+                // positions inside the string without hardcoding
+                // quote-length offsets into the outer node's span.
+                for i in 0..arg.named_child_count() {
+                    if let Some(c) = arg.named_child(i) {
+                        if c.kind() == "string_content" {
+                            content_span = Some(node_to_span(c));
+                            break;
+                        }
+                    }
+                }
+                Some(self.extract_string_content(arg).unwrap_or_default())
+            }
+            // `autoquoted_bareword` is a fat-comma key (`key => value`)
+            // — its text IS the value, never const-folded (a key that
+            // happens to match a constant name is still that key).
+            "autoquoted_bareword" => Some(text.clone()),
+            // A positional `bareword` arg may be a constant — fold it
+            // through the constant table (`$app->plugin(EXTRA)` where
+            // `use constant EXTRA => 'Gizmos'`). Falls back to the raw
+            // token when it names no constant.
+            "bareword" => self
+                .resolve_constant_strings(&text, 0)
+                .and_then(|f| f.into_iter().next())
+                .or_else(|| Some(text.clone())),
+            "scalar" | "array" | "hash" => {
+                self.resolve_constant_strings(&text, 0).and_then(|f| f.into_iter().next())
+            }
+            _ => None,
+        };
+        // `string_values` is the multi-value channel: a loop registration
+        // (`$app->helper("get_$name" => …) for my $name (qw(a b))`) folds to
+        // every candidate. The general enumeration owns literal / interpolated
+        // / constant-ref / concat folding; an undecidable arg yields empty and
+        // falls back to the single `string_value` (a fat-comma bareword key,
+        // an unfolded interpolation the plugin then skips).
+        let mut string_values = self.enumerate_string_values(arg);
+        if string_values.is_empty() {
+            string_values.extend(string_value.clone());
+        }
+        self.emit_expr_witness(arg);
+        let inferred_type = self.bag_query_expr_span(node_to_span(arg));
+        let sub_params = if arg.kind() == "anonymous_subroutine_expression" {
+            self.extract_anonymous_sub_params(arg)
+        } else {
+            Vec::new()
+        };
+        // `callable_return_edge` flows from whichever
+        // `InferredType::CodeRef { return_edge }` is reachable for
+        // this arg. Three reachability paths covered uniformly:
+        //
+        //   helper(name => sub { … })             (anon literal)
+        //   my $sub = sub { … }; helper(_, $sub)   (rebound anon)
+        //   helper(name => \&Foo::bar)             (named ref)
+        //
+        // The literal paths (anon-sub + refgen) flow through
+        // `emit_expr_witness`'s closed-syntax arms in `expr_payload`;
+        // the rebind path goes through `invocant_type_at_node`'s
+        // `scalar` arm, which `bag_query_variable`-resolves the
+        // variable's TC. Either yields the right `CodeRef` shape;
+        // the projection extracts the attachment whatever its target
+        // shape (`Expr(span)` for anon, `MethodOnClass{...}` for refgen).
+        let callable_return_edge = inferred_type
+            .as_ref()
+            .and_then(InferredType::callable_return_edge)
+            .cloned()
+            .or_else(|| {
+                self.invocant_type_at_node(arg)
+                    .as_ref()
+                    .and_then(InferredType::callable_return_edge)
+                    .cloned()
+            });
+        // `\&name` refgen — the named sub a registration plugin may want to
+        // type the first param of. Same name extraction the return-edge path
+        // uses; bare names stay bare so the deferred resolver scopes them to
+        // the current package.
+        let ref_sub_name = if arg.kind() == "refgen_expression" {
+            self.extract_names_from_refgen(arg).into_iter().next()
+        } else {
+            None
+        };
+        let value_shape = self.classify_value_shape(arg);
+        plugin::ArgInfo {
+            text,
+            string_value,
+            string_values,
+            span: node_to_span(arg),
+            content_span,
+            inferred_type,
+            value_shape,
+            sub_params,
+            callable_return_edge,
+            ref_sub_name,
+        }
+    }
+
+    /// Extract params from an anonymous sub. Delegates to the builder's
+    /// shared named-sub extractor (signature syntax + `my (...) = @_` +
+    /// `shift`/`$_[N]` unpacks, all via tree walking) so the two codepaths
+    /// can't diverge.
+    pub(super) fn extract_anonymous_sub_params(&self, sub_node: Node<'a>) -> Vec<plugin::EmittedParam> {
+        self.extract_params(sub_node)
+            .into_iter()
+            .map(|p| plugin::EmittedParam {
+                name: p.name,
+                default: p.default,
+                is_slurpy: p.is_slurpy,
+                is_invocant: false,
+            })
+            .collect()
+    }
 }

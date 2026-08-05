@@ -60,8 +60,10 @@ mod emit;
 mod visit_calls;
 mod frameworks;
 mod visit_method;
-mod helpers;
+mod visit_bless;
+mod extract;
 mod fold;
+mod docs;
 
 /// Single CST walk that powers the post-walk `ChainTypingReducer`.
 /// Indexes the node sets the reducer needs:

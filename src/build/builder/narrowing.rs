@@ -1,4 +1,6 @@
-//! Flow-sensitive narrowing — guard recognition + span-scoped emission.
+//! Flow-sensitive narrowing — guard recognition, span-scoped emission, and
+//! the declarative `@flow` value-flow pass (FlowEdge minting + lowering), so
+//! `docs/adr/flow-narrowing.md` maps to exactly this part.
 //!
 //! A child module of `builder` (so it keeps direct access to `Builder`'s
 //! private fields) rather than a sibling: narrowing is still part of the
@@ -8,7 +10,7 @@
 //! Decisions (engine-is-emission, truncation soundness, polarity +
 //! the `Undef` negative lattice): `docs/adr/flow-narrowing.md`.
 
-use tree_sitter::{Node, Point};
+use tree_sitter::{Node, Point, Tree};
 
 use crate::cst::node_to_span;
 use crate::model::file_analysis::{InferredType, ScopeId, Span};
@@ -716,5 +718,176 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+    }
+
+    /// Run the declarative `@flow` query (`queries/perl/flow.scm`) and mint a
+    /// FlowEdge per `(target, source)` with the builder's OWN scope. The
+    /// assignment shapes are captured in the `.scm`; the minting + scope live
+    /// here — the same FlowEdge concept the cpp pack produces. The forcing-
+    /// function start of Perl-on-the-query-engine. Provenance-only for now
+    /// (no lowering): the shapes' types still come from the walk.
+    pub(super) fn mint_flow_edges_via_query(&mut self, tree: &'a Tree) {
+        use tree_sitter::{QueryCursor, StreamingIterator};
+        let query = match super::flow_query() {
+            Some(q) => q,
+            None => return,
+        };
+        let cap_names: Vec<String> = query.capture_names().iter().map(|s| s.to_string()).collect();
+        // Collect captures per match FIRST — the cursor borrows `self.source`,
+        // so we can't mutate until it drops. `source` is optional: bind shapes
+        // (`@flow.bare`) carry no inflowing value.
+        struct FlowCaps<'t> {
+            lhs: Option<Node<'t>>,
+            target: Option<Node<'t>>,
+            bare: Option<Node<'t>>,
+            loopvar: Option<Node<'t>>,
+            source: Option<Node<'t>>,
+        }
+        let mut pending: Vec<FlowCaps> = Vec::new();
+        {
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(query, tree.root_node(), self.source);
+            while let Some(m) = matches.next() {
+                let mut caps = FlowCaps {
+                    lhs: None,
+                    target: None,
+                    bare: None,
+                    loopvar: None,
+                    source: None,
+                };
+                for c in m.captures {
+                    match cap_names[c.index as usize].as_str() {
+                        "flow.lhs" => caps.lhs = Some(c.node),
+                        "flow.target" => caps.target = Some(c.node),
+                        "flow.bare" => caps.bare = Some(c.node),
+                        "flow.loopvar" => caps.loopvar = Some(c.node),
+                        "flow.source" => caps.source = Some(c.node),
+                        _ => {}
+                    }
+                }
+                if caps.lhs.or(caps.target).or(caps.bare).or(caps.loopvar).is_some() {
+                    pending.push(caps);
+                }
+            }
+        }
+        for caps in pending {
+            // Bind shapes: no inflowing value. A bare `my`/`local` CLEARS to
+            // undef (`Cleared`); a `foreach` var rebinds per element (`Rebind`,
+            // type TBD). Both record the rebind for the narrowing cutoff.
+            if let Some(bare) = caps.bare {
+                let at = bare.start_position();
+                for name in self.bare_bind_names(bare) {
+                    // Record the rebind (for the narrowing cutoff). A scalar
+                    // clears to undef — but that `Undef` is a REGION assertion
+                    // truncated at the next rebind (`my $x; $x->[0]` autoviv
+                    // ends it), so it lands with the narrowing tier (where
+                    // region+cutoff compose), not as a plain bag witness here.
+                    self.push_flow_edge(
+                        name,
+                        at,
+                        node_to_span(bare),
+                        crate::model::file_analysis::Extraction::Rebind,
+                    );
+                }
+                continue;
+            }
+            if let Some(loopvar) = caps.loopvar {
+                if let (Ok(name), Some(src)) = (loopvar.utf8_text(self.source), caps.source) {
+                    self.push_flow_edge(
+                        name.to_string(),
+                        loopvar.start_position(),
+                        node_to_span(src),
+                        crate::model::file_analysis::Extraction::Rebind,
+                    );
+                }
+                continue;
+            }
+            let Some(src) = caps.source else { continue };
+            let source_span = node_to_span(src);
+            if let Some(lhs_node) = caps.lhs {
+                if let Some(targets) = self.lhs_list_targets(lhs_node) {
+                    // List/destructuring: each slot edges to its literal element
+                    // (Whole) or a Positional projection — the logic that used
+                    // to live in `visit_assignment`'s paren arm, now driven by
+                    // the declarative capture.
+                    let elem_nodes = self.list_element_nodes(src);
+                    let at = lhs_node.start_position();
+                    for (vt, extraction) in targets {
+                        let (source, extraction) = match (&elem_nodes, &extraction) {
+                            (Some(nodes), crate::model::file_analysis::Extraction::Positional(n))
+                                if *n < nodes.len() =>
+                            {
+                                self.emit_expr_witness(nodes[*n]);
+                                (node_to_span(nodes[*n]), crate::model::file_analysis::Extraction::Whole)
+                            }
+                            _ => (source_span, extraction),
+                        };
+                        self.push_flow_edge(vt, at, source, extraction);
+                    }
+                } else if let Some(vt) = self.get_var_text_from_lhs(lhs_node) {
+                    self.push_flow_edge(
+                        vt,
+                        lhs_node.start_position(),
+                        source_span,
+                        crate::model::file_analysis::Extraction::Whole,
+                    );
+                }
+            } else if let Some(tnode) = caps.target {
+                if let Ok(vt) = tnode.utf8_text(self.source) {
+                    let vt = vt.to_string();
+                    self.push_flow_edge(
+                        vt,
+                        tnode.start_position(),
+                        source_span,
+                        crate::model::file_analysis::Extraction::Whole,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The variable name(s) a bare bind (`@flow.bare`) targets — a
+    /// `variable_declaration` (single or paren list) or a `localization`
+    /// scalar.
+    pub(super) fn bare_bind_names(&self, bare: Node<'a>) -> Vec<String> {
+        if bare.kind() == "variable_declaration" {
+            if let Some(targets) = self.lhs_list_targets(bare) {
+                return targets.into_iter().map(|(n, _)| n).collect();
+            }
+            return self.get_var_text_from_lhs(bare).into_iter().collect();
+        }
+        bare.utf8_text(self.source)
+            .ok()
+            .map(|s| s.to_string())
+            .into_iter()
+            .collect()
+    }
+
+    /// Mint a FlowEdge + lower it as a FALLBACK: a refined eager TC (a direct
+    /// InferredType witness, resolvable pre-fold) wins; the query Edge fills in
+    /// only when the walk left the variable untyped. The single mint+lower for
+    /// the query pass.
+    pub(super) fn push_flow_edge(
+        &mut self,
+        name: String,
+        at: Point,
+        source: Span,
+        extraction: crate::model::file_analysis::Extraction,
+    ) {
+        let scope = self.scope_at_point(at);
+        let already_typed = self.bag_query_variable(&name, scope, at).is_some();
+        let fe = crate::model::file_analysis::FlowEdge {
+            target_name: name,
+            target_scope: scope,
+            target_at: at,
+            source,
+            extraction,
+        };
+        if !already_typed {
+            if let Some(w) = fe.lower_to_witness() {
+                self.bag.push(w);
+            }
+        }
+        self.flow_edges.push(fe);
     }
 }

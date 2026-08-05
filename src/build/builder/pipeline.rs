@@ -745,4 +745,138 @@ impl<'a> Builder<'a> {
         }
     }
 
+
+    /// Synthesize `Sub` symbols for AutoLoader / SelfLoader packages whose
+    /// real sub definitions live in the file's `data_section` (the text after
+    /// `__END__` / `__DATA__`). Those subs are loaded on demand at runtime by
+    /// `AUTOLOAD`, so they are live code — but tree-sitter parks the whole
+    /// region in one opaque `data_section` node, leaving them un-navigable.
+    ///
+    /// Gate: only packages that actually use AutoLoader/SelfLoader (via `use`
+    /// or `@ISA`/`use base`/`use parent`) get this treatment, so genuine
+    /// `__DATA__` payloads and trailing POD on ordinary modules synthesize
+    /// nothing. This is a framework semantic (like Moo/Mojo detection), not a
+    /// shape-branch: the property "package is autoload-backed" rides on the
+    /// package's recorded uses/parents, and the data section is only mined when
+    /// the owning package answers yes.
+    ///
+    /// Re-parsing the data-section text as Perl is the single-build-entry way
+    /// to recover the sub shapes (rule #1: all CST traversal stays in build()).
+    /// Spans are offset back to real file coordinates so goto-def lands.
+    pub(super) fn synthesize_autoloader_data_subs(&mut self, tree: &Tree) {
+        let Some(data) = find_data_section(tree.root_node()) else { return };
+
+        // Which package is in effect at the data section? `__END__`/`__DATA__`
+        // terminates compilation, so the owning package is whichever range
+        // brackets the marker — for the typical single-package AutoLoader
+        // module that's the only package in the file.
+        let data_start = data.start_position();
+        let owner_pkg = self
+            .package_ranges
+            .iter()
+            .rev()
+            .find(|r| crate::model::file_analysis::contains_point(&r.span, data_start))
+            .map(|r| r.package.clone())
+            .or_else(|| self.current_package.clone());
+
+        let Some(pkg) = owner_pkg else { return };
+        if !self.is_autoload_backed(&pkg) {
+            return;
+        }
+
+        let section_text = match data.utf8_text(self.source) {
+            Ok(s) => s.to_string(),
+            Err(_) => return,
+        };
+
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&ts_parser_perl::LANGUAGE.into()).is_err() {
+            return;
+        }
+        let Some(sub_tree) = parser.parse(&section_text, None) else { return };
+        let sub_src = section_text.as_bytes();
+
+        // tree-sitter reports re-parse positions relative to the section text;
+        // map them back to file coordinates. Row N of the section is file row
+        // (data_start.row + N); the section's first row continues the
+        // `__END__` line, so its column carries the marker offset.
+        let offset = |p: Point| -> Point {
+            if p.row == 0 {
+                Point { row: data_start.row, column: data_start.column + p.column }
+            } else {
+                Point { row: data_start.row + p.row, column: p.column }
+            }
+        };
+        let offset_span = |s: Span| -> Span {
+            Span { start: offset(s.start), end: offset(s.end) }
+        };
+
+        let prev_pkg = self.current_package.take();
+        self.current_package = Some(pkg.clone());
+
+        let mut found: Vec<Node> = Vec::new();
+        collect_data_section_subs(sub_tree.root_node(), &mut found);
+        let mut synth_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sub_node in found {
+            let Some(name_node) = sub_node.child_by_field_name("name") else { continue };
+            let Ok(name) = name_node.utf8_text(sub_src) else { continue };
+            let params = extract_data_section_params(sub_node, sub_src);
+            self.add_symbol(
+                name.to_string(),
+                SymKind::Sub,
+                offset_span(node_to_span(sub_node)),
+                offset_span(node_to_span(name_node)),
+                SymbolDetail::Sub {
+                    params,
+                    is_method: false,
+                    doc: None,
+                    display: None,
+                    hide_in_outline: false,
+                    opaque_return: false,
+                    is_constant: false,
+                    lexical: false,
+                },
+            );
+            synth_names.insert(name.to_string());
+        }
+
+        self.current_package = prev_pkg;
+
+        // Bareword calls to these subs were visited during the walk before the
+        // synthesized symbols existed, so `resolve_call_package` left their
+        // `FunctionCall` ref unresolved (`resolved_package: None`). Pin any such
+        // ref — within the owning package's source region and naming a sub we
+        // just synthesized — to `pkg`, so goto-def lands on the data-section
+        // definition. Scoped to autoload-backed packages: we only touch refs
+        // whose target is one of the freshly minted names.
+        for r in self.refs.iter_mut() {
+            if let RefKind::FunctionCall { resolved_package } = &mut r.kind {
+                if resolved_package.is_none() && synth_names.contains(&r.target_name) {
+                    let in_pkg = self
+                        .package_ranges
+                        .iter()
+                        .rev()
+                        .find(|pr| crate::model::file_analysis::contains_point(&pr.span, r.span.start))
+                        .is_some_and(|pr| pr.package == pkg);
+                    if in_pkg {
+                        *resolved_package = Some(pkg.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// True when `pkg` pulls in AutoLoader or SelfLoader — either via a `use`
+    /// line or by inheriting from it (`@ISA`/`use base`/`use parent`). Both
+    /// reach `package_parents`; `use` lines reach `package_uses`.
+    pub(super) fn is_autoload_backed(&self, pkg: &str) -> bool {
+        let is_loader = |m: &str| m == "AutoLoader" || m == "SelfLoader";
+        self.package_uses
+            .get(pkg)
+            .map_or(false, |us| us.iter().any(|m| is_loader(m)))
+            || self
+                .package_parents
+                .get(pkg)
+                .map_or(false, |ps| ps.iter().any(|p| is_loader(p)))
+    }
 }

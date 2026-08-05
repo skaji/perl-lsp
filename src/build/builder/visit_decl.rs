@@ -1617,4 +1617,16 @@ impl<'a> Builder<'a> {
         // `visit_group_accessors` directly, or not a per-element install.
         matches!(args.map(|a| a.kind()), Some("scalar"))
     }
+
+    pub(super) fn add_fold_range(&mut self, node: Node<'a>) {
+        let start = node.start_position().row;
+        let end = node.end_position().row;
+        if end > start {
+            self.fold_ranges.push(FoldRange {
+                start_line: start,
+                end_line: end,
+                kind: FoldKind::Region,
+            });
+        }
+    }
 }

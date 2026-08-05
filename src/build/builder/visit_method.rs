@@ -555,4 +555,189 @@ impl<'a> Builder<'a> {
         }
         false
     }
+
+    /// `recv->resultset('Foo')` → `Parametric(ResultSet { base,
+    /// row })`. `base` is discovered via the
+    /// `<NS>::Result::<X>` ↔ `<NS>::ResultSet::<X>` convention if
+    /// that class exists in this file; otherwise falls back to
+    /// `DBIx::Class::ResultSet` (the universal DBIC default that
+    /// runtime DBIC creates dynamically when no custom resultset
+    /// class is defined). The fallback hardcode is core-resident
+    /// for now — the DBIC plugin (queued, see
+    /// `docs/prompt-dbic-as-plugin.md`) will own it once the port
+    /// lands.
+    ///
+    /// First arg must be a string literal — a non-literal
+    /// (variable, computed) means the row class is dynamic and
+    /// we don't claim.
+    pub(super) fn extract_resultset_parametric(&self, node: Node<'a>) -> Option<InferredType> {
+        use crate::model::file_analysis::ParametricType;
+        if node.kind() != "method_call_expression" {
+            return None;
+        }
+        let method = node.child_by_field_name("method")?;
+        let mtext = method.utf8_text(self.source).ok()?;
+        // `recv->resultset('Foo')` — row class from the string arg.
+        if mtext == "resultset" {
+            let args = node.child_by_field_name("arguments")?;
+            let row_class = self.first_string_or_constfold_arg(args)?;
+            let base = self
+                .discover_resultset_class(&row_class)
+                .unwrap_or_else(|| "DBIx::Class::ResultSet".to_string());
+            return Some(InferredType::Parametric(ParametricType::ResultSet { base, row: row_class }));
+        }
+        None
+    }
+
+    /// Is this call a plugin-declared FLUENT verb (`$rs->search`)? A fluent verb
+    /// returns its invocant's type UNCHANGED — whatever it is — so the call site
+    /// edges the call's type to the invocant's rather than minting one (DBIC's
+    /// `search`/`search_rs` keep a resultset a resultset; this stays generic).
+    /// The verb list is the plugin's (#10/#8).
+    pub(super) fn is_fluent_verb_call(&self, node: Node<'a>) -> bool {
+        node.kind() == "method_call_expression"
+            && node
+                .child_by_field_name("method")
+                .and_then(|m| m.utf8_text(self.source).ok())
+                .is_some_and(|m| self.plugins.fluent_verbs().any(|v| v == m))
+    }
+
+    /// Push `ReturnExpr` declarations on `MethodOnClass{base, m}`
+    /// for every projection method the flavor declares. Called
+    /// after each `extract_resultset_parametric` hit so the chain
+    /// typer's coderef-edge / dynamic-method / inheritance routes
+    /// all see the same answer through the bag's standard
+    /// `MethodOnClass` chase. Latest-wins among duplicates: same
+    /// `(base, method)` pair seen twice (two `resultset(...)` calls
+    /// in one file) re-publishes the same ReturnExpr — the
+    /// reducer's content equality on Operator(RowOf(Receiver))
+    /// makes that a no-op.
+    ///
+    /// Idempotent across re-runs: `EXTRACT_VERSION` bumps when
+    /// `WitnessPayload::ReturnExpr` lands, so cached blobs from
+    /// before this phase don't carry stale declarations. Within
+    /// one build, the worklist driver doesn't call this — emission
+    /// happens once during the live walk.
+    pub(super) fn emit_parametric_return_expr_decls(&mut self, ty: &InferredType) {
+        let Some(p) = ty.as_parametric() else { return };
+        // The flavor's own dispatch class pins the slot — no per-variant
+        // match, so a flavor with no declarations (empty vec) is a no-op.
+        let Some(base_class) = p.class_name().map(|s| s.to_string()) else { return };
+        let zero = Span {
+            start: Point { row: 0, column: 0 },
+            end: Point { row: 0, column: 0 },
+        };
+        for (method_name, return_expr) in p.return_method_declarations() {
+            self.bag.push(crate::model::witnesses::Witness {
+                attachment: crate::model::witnesses::WitnessAttachment::MethodOnClass {
+                    class: base_class.clone(),
+                    name: method_name.to_string(),
+                },
+                source: crate::model::witnesses::WitnessSource::Builder(
+                    "parametric_return_expr".into(),
+                ),
+                payload: crate::model::witnesses::WitnessPayload::ReturnExpr(return_expr),
+                span: zero,
+            });
+        }
+    }
+
+    /// Like `first_string_literal_arg` but additionally const-folds
+    /// a scalar arg (`$sner` where `my $sner = 'Foo'` exists in
+    /// scope). Used by `extract_resultset_parametric` so
+    /// `$schema->resultset($sner)` types the same as
+    /// `$schema->resultset('Foo')` when `$sner` is a known
+    /// compile-time constant. Multi-value const-folding (a scalar
+    /// that resolves to multiple strings) bails — Parametric's
+    /// `row` is a single class, not a sum type yet.
+    pub(super) fn first_string_or_constfold_arg(&self, args: Node<'a>) -> Option<String> {
+        if let Some(s) = self.first_string_literal_arg(args) {
+            return Some(s);
+        }
+        // Try the first arg as a `scalar` node with const-foldable
+        // value. Same one-level unwrap rule as the literal helper.
+        let arg_node = match args.kind() {
+            "scalar" => Some(args),
+            "parenthesized_expression" | "list_expression" => {
+                let mut found: Option<Node<'a>> = None;
+                for i in 0..args.named_child_count() {
+                    if let Some(c) = args.named_child(i) {
+                        found = Some(c);
+                        break;
+                    }
+                }
+                found
+            }
+            _ => None,
+        }?;
+        if arg_node.kind() != "scalar" {
+            return None;
+        }
+        let var_text = arg_node.utf8_text(self.source).ok()?;
+        let folded = self.resolve_constant_strings(var_text, 0)?;
+        // Single-value fold only — multi-value (loop variable that
+        // takes several strings) doesn't have a single row class to
+        // emit. Future sum-types work could lift this.
+        if folded.len() == 1 {
+            folded.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// Discover the resultset class for a given row class via the
+    /// `<NS>::Result::<X>` ↔ `<NS>::ResultSet::<X>` convention.
+    /// Returns `Some(class)` only when the discovered class is
+    /// declared in the file's symbols (`SymKind::Package` or
+    /// `SymKind::Class`). Cross-file discovery (looking up
+    /// `<NS>::ResultSet::<X>` in `module_index`) is queued with
+    /// the DBIC plugin port — most projects keep the row class
+    /// and resultset class in sibling files of the same dist,
+    /// so this in-file discovery covers the common case until
+    /// the plugin lands.
+    pub(super) fn discover_resultset_class(&self, row_class: &str) -> Option<String> {
+        if !row_class.contains("::Result::") {
+            return None;
+        }
+        let candidate = row_class.replacen("::Result::", "::ResultSet::", 1);
+        let exists = self.symbols.iter().any(|s| {
+            s.name == candidate
+                && matches!(s.kind, SymKind::Package | SymKind::Class)
+        });
+        if exists { Some(candidate) } else { None }
+    }
+
+    /// First named child of a call-arg node that's a string literal,
+    /// returning its content. Returns None for non-literal first
+    /// args (variables, computed expressions). Shared between the
+    /// resultset emission and any future parametric-by-literal
+    /// emission rule.
+    pub(super) fn first_string_literal_arg(&self, args: Node<'a>) -> Option<String> {
+        // Single-arg method calls land here with `args` itself a
+        // `string_literal` node (no surrounding paren / list
+        // expression). Multi-arg calls wrap in
+        // `list_expression`/`parenthesized_expression`. Handle the
+        // bare-string case first, then recurse into wrappers.
+        match args.kind() {
+            "string_literal" | "interpolated_string_literal" => {
+                return self.extract_string_content(args);
+            }
+            "parenthesized_expression" | "list_expression" => {
+                for i in 0..args.named_child_count() {
+                    let child = args.named_child(i)?;
+                    return match child.kind() {
+                        "string_literal" | "interpolated_string_literal" => {
+                            self.extract_string_content(child)
+                        }
+                        "parenthesized_expression" | "list_expression" => {
+                            self.first_string_literal_arg(child)
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            _ => {}
+        }
+        None
+    }
 }
