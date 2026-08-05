@@ -154,41 +154,65 @@ impl FileAnalysis {
         None
     }
 
-    /// Find all references to the symbol at cursor.
+    /// Find all references to the symbol at cursor (span projection of
+    /// `find_occurrences`).
     pub fn find_references(
         &self,
         point: Point,
         module_index: Option<&dyn CrossFileLookup>,
     ) -> Vec<Span> {
+        self.find_occurrences(point, module_index)
+            .into_iter()
+            .map(|(span, _)| span)
+            .collect()
+    }
+
+    /// THE in-file occurrence union: every same-identity site in this file,
+    /// with its access classification. The single spelling behind the whole
+    /// in-file family — `find_references` projects the spans, `rename_at`
+    /// turns them into edits, and the CandidateSet's `references()`/
+    /// `highlights()` Local arm reads it directly, so the verbs cannot
+    /// drift on what "the occurrences of this cursor" means.
+    pub fn find_occurrences(
+        &self,
+        point: Point,
+        module_index: Option<&dyn CrossFileLookup>,
+    ) -> Vec<(Span, AccessKind)> {
         // A field group's spellings reference each other — from any of
         // them, surface all of them (the same union rename rewrites).
+        // Group spans are bare-name tokens with no recorded access shape.
         if let Some(g) = self.field_group_at(point) {
-            return self.field_group_spans(&g);
+            return self
+                .field_group_spans(&g)
+                .into_iter()
+                .map(|s| (s, AccessKind::Read))
+                .collect();
         }
         // A lexical hash key (`my %opts = (k => …); $opts{k}`): every same-key
         // access on the same `my %h` — keyed by the variable's `def_scope`, so a
         // shadowing `%h` in an inner block stays its own set — is one renameable
         // unit, single-file (no owner reaches another file).
-        if let Some(spans) = self.lexical_hash_key_refs(point) {
-            return spans;
+        if let Some(pairs) = self.lexical_hash_key_refs(point) {
+            return pairs;
         }
         if let Some((target_id, include_decl)) = self.resolve_target_at(point, module_index) {
             let mut results = self.collect_refs_for_target(target_id, include_decl, module_index);
             results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
             results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
-            results.into_iter().map(|(span, _)| span).collect()
+            results
         } else {
             Vec::new()
         }
     }
 
-    /// Spans of a lexical hash key under the cursor — every `$h{key}` access
-    /// (read or write) on the same `my %h`, plus the literal key in the
-    /// declaration. `None` when the cursor isn't on a `Variable`-owned hash key.
+    /// Occurrences of a lexical hash key under the cursor — every `$h{key}`
+    /// access (with its read/write access) on the same `my %h`, plus the
+    /// literal key in the declaration.
+    /// `None` when the cursor isn't on a `Variable`-owned hash key.
     /// Matched on the owner's `def_scope` (the `%h` declaration) so an unrelated
     /// or shadowing same-named hash never bleeds in. Single-file by nature — a
     /// `my` lexical is unreachable from another file.
-    fn lexical_hash_key_refs(&self, point: Point) -> Option<Vec<Span>> {
+    fn lexical_hash_key_refs(&self, point: Point) -> Option<Vec<(Span, AccessKind)>> {
         let r = self.ref_at(point)?;
         if !matches!(r.kind, RefKind::HashKeyAccess { .. }) {
             return None;
@@ -203,7 +227,7 @@ impl FileAnalysis {
         let bare = |n: &str| n.trim_start_matches(['$', '@', '%']).to_string();
         let want = bare(&var);
         let key = r.target_name.as_str();
-        let mut spans: Vec<Span> = self
+        let mut pairs: Vec<(Span, AccessKind)> = self
             .refs
             .iter()
             .filter(|o| {
@@ -215,77 +239,14 @@ impl FileAnalysis {
                             if *ds == def_scope && bare(on) == want
                     )
             })
-            .map(|o| o.span)
+            .map(|o| (o.span, o.access))
             .collect();
-        spans.sort_by_key(|s| (s.start.row, s.start.column));
-        spans.dedup();
-        Some(spans)
+        pairs.sort_by_key(|(s, _)| (s.start.row, s.start.column));
+        pairs.dedup_by(|a, b| a.0 == b.0);
+        Some(pairs)
     }
 
-    /// Document highlights: like references but with read/write annotation.
-    pub fn find_highlights(
-        &self,
-        point: Point,
-        module_index: Option<&dyn CrossFileLookup>,
-    ) -> Vec<(Span, AccessKind)> {
-        if let Some((target_id, _)) = self.resolve_target_at(point, module_index) {
-            let mut results = self.collect_refs_for_target(target_id, true, module_index);
-            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
-            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
-            return results;
-        }
-        // Fallback — cursor is on a ref whose target isn't defined in
-        // this file (cross-file method call, unresolved import). Match
-        // other refs in the same file that share (target_name, scope).
-        // Without this, documentHighlight on a cross-file method call
-        // returns empty even when other call sites for the same class+method
-        // exist in the file.
-        if let Some(r) = self.ref_at(point) {
-            let mut results: Vec<(Span, AccessKind)> = Vec::new();
-            match &r.kind {
-                RefKind::MethodCall { method_name_span, .. } => {
-                    // Single bag-routed invocant resolver — same call
-                    // for the cursor's ref and every candidate.
-                    let Some(wanted_class) = self.method_call_invocant_class(r, module_index) else {
-                        return Vec::new();
-                    };
-                    results.push((*method_name_span, r.access));
-                    for other in &self.refs {
-                        if std::ptr::eq(other, r) { continue; }
-                        // Match on the bare method tail so a plain `$x->m()` and
-                        // a fully-qualified `$y->Foo::Bar::m()` group together
-                        // (the class check below still pins same-class dispatch).
-                        if other.unqualified_target_name() != r.unqualified_target_name() { continue; }
-                        if !matches!(other.kind, RefKind::MethodCall { .. }) { continue; }
-                        let Some(ocn) = self.method_call_invocant_class(other, module_index) else { continue };
-                        if ocn != wanted_class { continue; }
-                        if let RefKind::MethodCall { method_name_span: ms, .. } = &other.kind {
-                            results.push((*ms, other.access));
-                        }
-                    }
-                }
-                RefKind::FunctionCall if r.resolved_package().is_some() => {
-                    let wanted_pkg = r.resolved_package().unwrap();
-                    results.push((r.span, r.access));
-                    for other in &self.refs {
-                        if std::ptr::eq(other, r) { continue; }
-                        if other.target_name != r.target_name { continue; }
-                        if !matches!(other.kind, RefKind::FunctionCall) { continue; }
-                        if other.resolved_package() == Some(wanted_pkg) {
-                            results.push((other.span, other.access));
-                        }
-                    }
-                }
-                _ => {}
-            }
-            results.sort_by_key(|(s, _)| (s.start.row, s.start.column));
-            results.dedup_by(|a, b| a.0.start == b.0.start && a.0.end == b.0.end);
-            return results;
-        }
-        Vec::new()
-    }
-
-    /// Shared implementation for find_references and find_highlights.
+    /// Shared implementation behind `find_occurrences`.
     fn collect_refs_for_target(
         &self,
         target_id: SymbolId,

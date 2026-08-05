@@ -176,13 +176,18 @@ pub fn pack_include_references(
 /// (`resolve::word_at_point`); hover and the sig-help slot share it.
 pub use crate::index::resolve::word_at_point;
 
-pub fn document_highlights(analysis: &FileAnalysis, pos: Position, module_index: Option<&dyn CrossFileLookup>) -> Vec<DocumentHighlight> {
+/// documentHighlight: the set's origin-narrowed references projection
+/// (`highlights()`), adapted to LSP types — access classification becomes
+/// the highlight kind. Shared by the LSP handler and the
+/// `--document-highlight` CLI; both construct the set with their own
+/// routing facts and hand it here.
+pub fn document_highlights(cs: &crate::index::resolve::CandidateSet<'_>) -> Vec<DocumentHighlight> {
     use crate::model::file_analysis::AccessKind;
-    analysis.find_highlights(position_to_point(pos), module_index)
+    cs.highlights()
         .into_iter()
-        .map(|(span, access)| DocumentHighlight {
-            range: span_to_range(span),
-            kind: Some(match access {
+        .map(|l| DocumentHighlight {
+            range: span_to_range(l.span),
+            kind: Some(match l.access {
                 AccessKind::Write => DocumentHighlightKind::WRITE,
                 _ => DocumentHighlightKind::READ,
             }),
@@ -190,19 +195,15 @@ pub fn document_highlights(analysis: &FileAnalysis, pos: Position, module_index:
         .collect()
 }
 
-/// Linked-editing ranges = the in-file occurrence set of the symbol at `pos`.
-/// Shared by the LSP `linked_editing_range` handler and the `--linked-editing`
-/// CLI so neither re-derives it — it's just `find_references` (the same path
-/// document-highlight/references use), surfaced as ranges. None when there's
-/// nothing to co-edit (fewer than two occurrences).
-pub fn linked_editing_ranges(
-    analysis: &FileAnalysis,
-    pos: Position,
-    module_index: Option<&dyn CrossFileLookup>,
-) -> Option<Vec<Range>> {
-    let refs = analysis.find_references(position_to_point(pos), module_index);
-    if refs.len() < 2 {
+/// Linked-editing ranges = the set's co-edit projection
+/// (`linked_editing_spans()` — the origin-file sites rename would rewrite
+/// with the typed text verbatim), surfaced as ranges. Shared by the LSP
+/// `linked_editing_range` handler and the `--linked-editing` CLI. None when
+/// there's nothing to co-edit (fewer than two occurrences).
+pub fn linked_editing_ranges(cs: &crate::index::resolve::CandidateSet<'_>) -> Option<Vec<Range>> {
+    let spans = cs.linked_editing_spans();
+    if spans.len() < 2 {
         return None;
     }
-    Some(refs.into_iter().map(span_to_range).collect())
+    Some(spans.into_iter().map(span_to_range).collect())
 }

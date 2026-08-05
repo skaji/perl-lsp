@@ -223,7 +223,7 @@ sub run {
     let col = src.lines().nth(row).unwrap().find("do_thing").unwrap();
     let point = tree_sitter::Point::new(row, col + 1);
 
-    let hits = fa.find_highlights(point, None);
+    let hits = fa.find_occurrences(point, None);
     assert!(!hits.is_empty(), "should highlight at least one occurrence");
 
     for (span, _access) in &hits {

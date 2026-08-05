@@ -7,7 +7,12 @@ use super::*;
 impl FileAnalysis {
     // ---- Internal resolution helpers ----
 
-    /// Find the target symbol for the thing at cursor. Returns (SymbolId, include_decl_in_refs).
+    /// The LOCAL-arm target resolver behind `find_occurrences`: cursor →
+    /// this file's own symbol, for cursors the CandidateSet answered
+    /// `Local`/`None` (lexicals, and targets only this file can anchor).
+    /// Cross-file identity is `index::resolve::resolve_symbol_scoped` —
+    /// never widen this to a second cross-file minting.
+    /// Returns (SymbolId, include_decl_in_refs).
     pub(super) fn resolve_target_at(&self, point: Point, module_index: Option<&dyn CrossFileLookup>) -> Option<(SymbolId, bool)> {
         // Check refs first
         if let Some(r) = self.ref_at(point) {
@@ -133,17 +138,14 @@ impl FileAnalysis {
             }
         }
 
-        // Check if cursor is directly on a symbol declaration
+        // Check if cursor is directly on a symbol declaration. The decl is
+        // part of the occurrence union — the same convention the
+        // CandidateSet's cross-file matcher applies (every Target walk mints
+        // a Declaration row), so def-side and access-side cursors answer the
+        // same set and highlights/rename never drop the token under the
+        // cursor itself.
         if let Some(sym) = self.symbol_at(point) {
-            // A hash-key def has no ref at its own token (unlike a variable
-            // decl, which carries a `Variable` ref and so resolves with
-            // `include_decl = true` via the ref arm above). The generic decl
-            // case excludes the declaration (references' includeDeclaration=
-            // false convention), which would drop the key from its own
-            // rename/reference set — asymmetric with the access-side path,
-            // which returns def + every access. Include it for hash-key defs.
-            let include_decl = matches!(sym.kind, SymKind::HashKeyDef);
-            return Some((sym.id, include_decl));
+            return Some((sym.id, true));
         }
 
         None

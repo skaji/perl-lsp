@@ -113,14 +113,158 @@ impl<'a> CandidateSet<'a> {
             ),
             Some(ResolvedTarget::Local) | None => self
                 .origin
-                .find_references(self.point, self.idx())
+                .find_occurrences(self.point, self.idx())
                 .into_iter()
-                .map(|span| RefLocation {
+                .map(|(span, access)| RefLocation {
                     key: self.origin_key.clone(),
                     span,
-                    access: AccessKind::Read,
+                    access,
                     rewritable: true,
                     label: None
+                })
+                .collect(),
+        }
+    }
+
+    /// documentHighlight: the origin-file-narrowed image of `references()`,
+    /// carrying each site's access classification (`RefLocation.access`) for
+    /// highlight kinds. Same identity, same visibility, same matcher — the
+    /// walk just never leaves the cursor's document, so the projection stays
+    /// cursor-move cheap.
+    pub fn highlights(&self) -> Vec<RefLocation> {
+        self.origin_occurrences()
+            .into_iter()
+            .map(|(loc, _)| loc)
+            .collect()
+    }
+
+    /// linkedEditingRange: the co-edit set — the origin-file sites a rename
+    /// would rewrite with the typed text VERBATIM, so the co-edit set equals
+    /// the rename image's site set by construction. Two exclusions, both
+    /// rename policy: non-`rewritable` sites (const-folded names — rename
+    /// skips them too) and group members whose replacement is re-derived
+    /// rather than bare (`has_size` for attr `size` — co-editing one text
+    /// across them would corrupt the affix).
+    pub fn linked_editing_spans(&self) -> Vec<Span> {
+        self.origin_occurrences()
+            .into_iter()
+            .filter(|(loc, bare)| *bare && loc.rewritable)
+            .map(|(loc, _)| loc.span)
+            .collect()
+    }
+
+    /// The tier the ORIGIN document rides in the reference walk — the same
+    /// attribution `refs_to`'s sweeps apply, so the origin-narrowed image
+    /// admits the origin's own sites exactly when the full walk would.
+    fn origin_role(&self) -> RoleMask {
+        match &self.origin_key {
+            FileKey::Url(_) => RoleMask::OPEN,
+            FileKey::Path(p) => {
+                if self.files.workspace_raw().contains_key(p) {
+                    RoleMask::WORKSPACE
+                } else {
+                    RoleMask::DEPENDENCY
+                }
+            }
+        }
+    }
+
+    /// The origin-file slice of the references image, each site tagged with
+    /// whether a rename writes the BARE typed text there (true everywhere
+    /// except affixed/skip group members). Both in-file verbs project this.
+    fn origin_occurrences(&self) -> Vec<(RefLocation, bool)> {
+        match self.resolution() {
+            Some(ResolvedTarget::Target(t)) => {
+                let mask = self.target_visibility(t);
+                // The visibility axis flows here like every projection: a
+                // mask that excludes the origin's own tier excludes its
+                // sites, exactly as `references()` would.
+                if !mask.intersects(self.origin_role()) {
+                    return Vec::new();
+                }
+                refs_to_in_file(
+                    self.files,
+                    self.module_index,
+                    t,
+                    &self.origin_key,
+                    self.origin,
+                    mask,
+                )
+                .into_iter()
+                .map(|loc| (loc, true))
+                .collect()
+            }
+            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
+                let origin_path = key_for_sort(&self.origin_key);
+                let mut out: Vec<(RefLocation, bool)> = local_spans
+                    .iter()
+                    // Pinned spans live in the class file — they join only
+                    // when that IS the origin (group minted locally they're
+                    // in `local_spans` instead, so this is the remote-mint,
+                    // cursor-in-class-file edge).
+                    .chain(pinned_spans.iter().filter_map(|(p, s)| {
+                        (*p == origin_path).then_some(s)
+                    }))
+                    .map(|span| {
+                        (
+                            RefLocation {
+                                key: self.origin_key.clone(),
+                                span: *span,
+                                access: AccessKind::Read,
+                                rewritable: true,
+                                label: None,
+                            },
+                            true,
+                        )
+                    })
+                    .collect();
+                // Bare members first, so a same-span collision keeps the
+                // co-editable entry (mirrors `group_rename_edits`).
+                let ordered = members
+                    .iter()
+                    .filter(|m| matches!(m.rename, MemberRename::Bare))
+                    .chain(members.iter().filter(|m| !matches!(m.rename, MemberRename::Bare)));
+                for m in ordered {
+                    // Per-member masks, exactly as `group_refs` picks them;
+                    // a mask excluding the origin's tier excludes the member.
+                    let mask = self.visibility_override.unwrap_or_else(|| {
+                        references_mask_for(self.files, self.module_index, &m.target)
+                    });
+                    if !mask.intersects(self.origin_role()) {
+                        continue;
+                    }
+                    let bare = matches!(m.rename, MemberRename::Bare);
+                    for loc in refs_to_in_file(
+                        self.files,
+                        self.module_index,
+                        &m.target,
+                        &self.origin_key,
+                        self.origin,
+                        mask,
+                    ) {
+                        out.push((loc, bare));
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                out.retain(|(loc, _)| seen.insert(loc.span));
+                out.sort_by_key(|(loc, _)| (loc.span.start.row, loc.span.start.column));
+                out
+            }
+            Some(ResolvedTarget::Local) | None => self
+                .origin
+                .find_occurrences(self.point, self.idx())
+                .into_iter()
+                .map(|(span, access)| {
+                    (
+                        RefLocation {
+                            key: self.origin_key.clone(),
+                            span,
+                            access,
+                            rewritable: true,
+                            label: None,
+                        },
+                        true,
+                    )
                 })
                 .collect(),
         }

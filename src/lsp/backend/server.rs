@@ -917,11 +917,24 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),
         };
-        let highlights = symbols::document_highlights(&doc.analysis, pos, Some(&*self.module_index));
+        // Same construction as references — highlights is its origin-narrowed
+        // projection, so the two verbs answer one resolution.
+        let routed = self.module_index.lookup_for(language);
+        let cs = crate::index::resolve::resolve(
+            &self.files,
+            &analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(routed.as_lookup()),
+            self.override_scope(),
+        );
+        let highlights = symbols::document_highlights(&cs);
         if highlights.is_empty() {
             Ok(None)
         } else {
@@ -1320,12 +1333,24 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
-        let doc = match self.files.get_open(uri) {
-            Some(doc) => doc,
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
             None => return Ok(None),
         };
-
-        match symbols::linked_editing_ranges(&doc.analysis, pos, Some(&*self.module_index)) {
+        // The co-edit set is the rename image's origin-file site set,
+        // projected from the same construction rename uses.
+        let routed = self.module_index.lookup_for(language);
+        let cs = crate::index::resolve::resolve(
+            &self.files,
+            &analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(routed.as_lookup()),
+            self.override_scope(),
+        );
+        match symbols::linked_editing_ranges(&cs) {
             Some(ranges) => Ok(Some(LinkedEditingRanges {
                 ranges,
                 word_pattern: None,

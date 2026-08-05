@@ -277,7 +277,7 @@ $calc->get_self->get_config->{host};
 fn test_highlights_read_write() {
     let src = "my $x = 1;\nprint $x;\n$x = 2;";
     let fa = build_fa(src);
-    let highlights = fa.find_highlights(Point::new(0, 4), None);
+    let highlights = fa.find_occurrences(Point::new(0, 4), None);
     assert!(!highlights.is_empty(), "should have highlights");
     // Check that we have both read and write accesses
     let has_write = highlights

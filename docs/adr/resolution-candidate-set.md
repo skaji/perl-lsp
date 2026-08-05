@@ -74,12 +74,14 @@ Every feature is a **projection** of the same CandidateSet:
 | goto-def | `definitions()` — forward-best projection |
 | completion gathering | `complete(prefix, import_slot)` — prefix-enumeration of the visible identifier universe (Perl: in-scope + explicit imports on OPEN, export surfaces + auto-import firehose on DEPENDENCY; pack: the origin's include-closure universe); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `import_slot` is the slot's import affordance: `false` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code); candidates carry `ImportFact`, the adapter composes the edit |
 | hover | `hover_candidate()` — the top-ranked `definitions()` candidate, presented (pack languages; the adapter renders, the set resolves — hover and goto-def cannot disagree at a position). Perl keeps its language-specific renderer over the same origin |
+| documentHighlight | `highlights()` — the origin-file-narrowed image of `references()` (same identity, same matcher via `refs_to_in_file`, walk never leaves the cursor's document), carrying `RefLocation.access` for highlight kinds |
+| linkedEditingRange | `linked_editing_spans()` — the co-edit set: `highlights()` restricted to sites a rename writes the typed text at VERBATIM (`rewritable`, bare-text group members only — affix-derived accessors join references but can't co-edit one text), so it equals the rename image's site set by construction |
 
 Symmetry becomes **by construction**: an axis added to CandidateSet
 construction is inherited by every projection — the test
 `candidate_set_visibility_axis_flows_to_every_projection` demonstrates the
-one-knob property, asserting references, rename, AND completion gathering
-narrow together. C1 ("gd gated, gr not") and C2 ("rename edits a subset
+one-knob property, asserting references, rename, highlights, linked
+editing, AND completion gathering narrow together. C1 ("gd gated, gr not") and C2 ("rename edits a subset
 of refs") become unrepresentable states, and disease #2's class
 ("resolution cross-file, completion gathering same-file") is closed: the
 identifier candidates come from the same masked universe the navigation

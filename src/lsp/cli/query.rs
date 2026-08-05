@@ -279,6 +279,16 @@ impl<'a> ScopedWorkspaceEntry<'a> {
         ws.insert_workspace(path.clone(), analysis);
         Self { ws, path, prior }
     }
+
+    fn insert_arc(
+        ws: &'a file_store::FileStore,
+        path: std::path::PathBuf,
+        analysis: std::sync::Arc<file_analysis::FileAnalysis>,
+    ) -> Self {
+        let prior = ws.workspace_raw().get(&path).map(|r| r.value().clone());
+        ws.insert_workspace_arc(path.clone(), analysis);
+        Self { ws, path, prior }
+    }
 }
 
 impl Drop for ScopedWorkspaceEntry<'_> {
@@ -588,7 +598,20 @@ fn run_one(
         }
         "document-highlight" => {
             let doc = cli_open_document(file, idx);
-            let highlights = symbols::document_highlights(&doc.analysis, pos, Some(idx));
+            // Same construction as the LSP handler (routed index, origin
+            // key): highlights is the set's origin-narrowed projection.
+            // Staging classifies the origin as workspace tier, matching how
+            // the references verb attributes the queried file.
+            let abs = std::fs::canonicalize(file)
+                .unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let routed = idx.lookup_for(doc.language);
+            let _staged = ScopedWorkspaceEntry::insert_arc(
+                ws, abs.clone(), std::sync::Arc::clone(&doc.analysis));
+            let cs = resolve::resolve(
+                ws, &doc.analysis, file_store::FileKey::Path(abs), point,
+                Some(routed.as_lookup()), override_scope_from_env(),
+            );
+            let highlights = symbols::document_highlights(&cs);
             let mut sources = SourceCache::new(fmt);
             let path = std::fs::canonicalize(file).map(|p| p.display().to_string())
                 .unwrap_or_else(|_| file.to_string());
@@ -607,7 +630,16 @@ fn run_one(
             let doc = cli_open_document(file, idx);
             let path = std::fs::canonicalize(file).map(|p| p.display().to_string())
                 .unwrap_or_else(|_| file.to_string());
-            match symbols::linked_editing_ranges(&doc.analysis, pos, Some(idx)) {
+            let abs = std::fs::canonicalize(file)
+                .unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let routed = idx.lookup_for(doc.language);
+            let _staged = ScopedWorkspaceEntry::insert_arc(
+                ws, abs.clone(), std::sync::Arc::clone(&doc.analysis));
+            let cs = resolve::resolve(
+                ws, &doc.analysis, file_store::FileKey::Path(abs), point,
+                Some(routed.as_lookup()), override_scope_from_env(),
+            );
+            match symbols::linked_editing_ranges(&cs) {
                 Some(ranges) => {
                     let mut sources = SourceCache::new(fmt);
                     let mut out = String::new();

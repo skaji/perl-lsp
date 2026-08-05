@@ -51,15 +51,25 @@
       "col": 5,
       "expect": {
         "all": [
-          "URI.pm:24:5",
-          "URI.pm:66:21",
+          "URI.pm:24:6",
+          "URI.pm:66:22",
+          "URI.pm:73:36",
+          "URI.pm:101:45",
           "URI.pm:126:29",
-          "URI.pm:153:35",
-          "URI.pm:273:18"
+          "URI.pm:153:36",
+          "URI.pm:225:36",
+          "URI.pm:232:53",
+          "URI.pm:233:30",
+          "URI.pm:240:34",
+          "URI.pm:242:27",
+          "URI.pm:245:34",
+          "URI.pm:269:18",
+          "URI.pm:273:19"
         ],
         "none": []
       },
-      "status": "gold"
+      "status": "gold",
+      "note": "our-var linked editing rides the PackageVar target (the references image): every resolved read incl. regex-interpolated and FQ $URI::scheme_re spellings, spans tail-narrowed to the name token (sigil survives a co-edit)."
     },
     {
       "id": "le-uri-implementor-sub-def",
@@ -159,18 +169,27 @@
       "col": 4,
       "expect": {
         "all": [
-          "Moo.pm:35:5",
-          "Moo.pm:57:16",
-          "Moo.pm:83:10",
-          "Moo.pm:83:29",
-          "Moo.pm:268:16"
+          "Moo.pm:35:6",
+          "Moo.pm:57:17",
+          "Moo.pm:83:11",
+          "Moo.pm:83:30",
+          "Moo.pm:154:30",
+          "Moo.pm:177:18",
+          "Moo.pm:178:4",
+          "Moo.pm:185:12",
+          "Moo.pm:185:36",
+          "Moo.pm:203:18",
+          "Moo.pm:204:4",
+          "Moo.pm:235:28",
+          "Moo.pm:268:17"
         ],
         "none": [
           "Moo.pm:211",
           "Moo.pm:212"
         ]
       },
-      "status": "gold"
+      "status": "gold",
+      "note": "our-var linked editing rides the PackageVar target (the references image): element accesses AND FQ $Moo::MAKERS spellings co-edit; generated-code strings (211-212) stay out. Name-token spans, sigil survives."
     },
     {
       "id": "le-dt-p-hash-slices",

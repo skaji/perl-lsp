@@ -1087,9 +1087,21 @@ sub create { }
     let tree = parser.parse(src, None).unwrap();
     let fa = crate::build::builder::build(&tree, src.as_bytes());
     // The route controller `'Users'` is a plugin-bridged token resolved at
-    // query time; an (empty) index hands `find_highlights` the plugin
+    // query time; an (empty) index hands the highlights projection the plugin
     // resolver, which finds the local `package Users` owning `create`.
     let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let store = FileStore::new();
+    let highlights_at = |pt: tree_sitter::Point| {
+        resolve(
+            &store,
+            &fa,
+            FileKey::Path(PathBuf::from("/tmp/dh_scope_test.pl")),
+            pt,
+            Some(&idx),
+            OverrideScope::default(),
+        )
+        .highlights()
+    };
 
     // Lines (0-indexed; file starts with a blank row 0):
     //   row 6 — `$app->helper('users.create' => sub ...);`
@@ -1112,8 +1124,8 @@ sub create { }
         row: line_helper,
         column: helper_col + 2,
     };
-    let helper_highlights = fa.find_highlights(helper_pt, Some(&idx));
-    let helper_rows: Vec<usize> = helper_highlights.iter().map(|(s, _)| s.start.row).collect();
+    let helper_highlights = highlights_at(helper_pt);
+    let helper_rows: Vec<usize> = helper_highlights.iter().map(|l| l.span.start.row).collect();
     assert!(
         helper_rows.contains(&line_helper),
         "helper highlight missed its own site: {:?}",
@@ -1132,8 +1144,8 @@ sub create { }
         row: line_route,
         column: route_col + 2,
     };
-    let route_highlights = fa.find_highlights(route_pt, Some(&idx));
-    let route_rows: Vec<usize> = route_highlights.iter().map(|(s, _)| s.start.row).collect();
+    let route_highlights = highlights_at(route_pt);
+    let route_rows: Vec<usize> = route_highlights.iter().map(|l| l.span.start.row).collect();
     assert!(
         route_rows.contains(&line_route),
         "route highlight missed its own site: {:?}",
@@ -1639,7 +1651,7 @@ $b->touch();
     );
 }
 
-/// Companion: `find_highlights`'s cross-file fallback path
+/// Companion: the highlights projection (origin-narrowed references)
 /// must match both `$b->touch()` sites once enrichment has typed
 /// `$b: B`. Cursor on the first call; the second has the same None
 /// build-time-resolved invocant_class — both should highlight.
@@ -1675,14 +1687,21 @@ $b->touch();
     consumer_fa.enrich_imported_types_with_keys(Some(&idx));
 
     // Cursor on the first $b->touch() — column 4 lands on `t` of touch.
-    let highlights = consumer_fa.find_highlights(
+    let store = FileStore::new();
+    let highlights = resolve(
+        &store,
+        &consumer_fa,
+        FileKey::Path(PathBuf::from("/tmp/highlights_xfile_consumer.pl")),
         tree_sitter::Point { row: 3, column: 4 },
-        Some(&idx));
+        Some(&idx),
+        OverrideScope::default(),
+    )
+    .highlights();
 
     assert_eq!(
         highlights.len(),
         2,
-        "find_highlights should match both $$b->touch() sites once \
+        "highlights should match both $$b->touch() sites once \
          enrichment has typed $$b: B. got {:?}",
         highlights,
     );
@@ -1944,13 +1963,11 @@ $x->makeFoo()->ping();
     );
 }
 
-/// `find_highlights` chain-hop case: receiver class only known
-/// via cross-file `MethodOnClass` resolution (`$x->makeFoo()->ping()`
-/// — `makeFoo` returns a cross-file class). Was a red-pin until
-/// the polish commit threaded `module_index` through
-/// `find_highlights` / `collect_refs_for_target` /
-/// `find_references` / `rename_kind_at` / `rename_callable_in_scope`,
-/// matching `crate::index::resolve::refs_to`'s already-threaded shape.
+/// Highlights chain-hop case: receiver class only known via cross-file
+/// `MethodOnClass` resolution (`$x->makeFoo()->ping()` — `makeFoo`
+/// returns a cross-file class). The set's origin-narrowed projection
+/// threads the index through the same invocant ladder references uses,
+/// so both call sites group.
 #[test]
 fn find_highlights_cross_file_chain_hop_post_enrichment() {
     use crate::index::module_index::ModuleIndex;
@@ -1983,9 +2000,16 @@ $x->makeFoo()->ping();
     consumer_fa.enrich_imported_types_with_keys(Some(&idx));
 
     // Cursor on the first `->ping()` — column 18 lands on `p` of ping.
-    let highlights = consumer_fa.find_highlights(
+    let store = FileStore::new();
+    let highlights = resolve(
+        &store,
+        &consumer_fa,
+        FileKey::Path(PathBuf::from("/tmp/highlights_chain_consumer.pl")),
         tree_sitter::Point { row: 3, column: 18 },
-        Some(&idx));
+        Some(&idx),
+        OverrideScope::default(),
+    )
+    .highlights();
 
     // Both call sites of `->ping()` share the same chain receiver
     // shape; they must highlight together once chain typing
@@ -1993,7 +2017,7 @@ $x->makeFoo()->ping();
     assert_eq!(
         highlights.len(),
         2,
-        "find_highlights should match both $$x->makeFoo()->ping() sites \
+        "highlights should match both $$x->makeFoo()->ping() sites \
          once chain typing through cross-file enrichment is threaded \
          via module_index. got {:?}",
         highlights,
@@ -2432,3 +2456,4 @@ fn references_mask_scopes_to_editable_for_project_symbols() {
         "symbol with no editable decl should widen to VISIBLE",
     );
 }
+

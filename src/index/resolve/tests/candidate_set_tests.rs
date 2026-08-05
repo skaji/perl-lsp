@@ -124,12 +124,22 @@ fn candidate_set_visibility_axis_flows_to_every_projection() {
         "module-name universe gathered",
     );
 
+    assert!(
+        !wide.highlights().is_empty(),
+        "highlights (origin-narrowed references) answer under the default mask",
+    );
+
     // One knob turned at construction: only the OPEN tier stays visible.
     let narrow = resolve(&store, &fa_a, FileKey::Path(path_a), point, Some(&idx), OverrideScope::default())
         .with_visibility(RoleMask::OPEN);
     assert!(
         narrow.references().is_empty(),
         "references projection inherits the narrowed visibility",
+    );
+    assert!(
+        narrow.highlights().is_empty() && narrow.linked_editing_spans().is_empty(),
+        "highlights + linked-editing inherit the SAME narrowed visibility — \
+         the origin's workspace tier is outside the OPEN mask",
     );
     assert!(
         narrow.rename_edits("food").expect("perl rename never refuses").is_empty(),
@@ -169,6 +179,74 @@ fn candidate_set_local_projections() {
     let edits = cs.rename_edits("$total").expect("perl rename never refuses");
     assert_eq!(edits.len(), 3, "rename covers the same in-file set: {edits:?}");
     assert!(cs.implementations().is_empty());
+}
+
+/// Highlights and linked editing at a FIELD-GROUP cursor: both are
+/// projections of the same Group resolution references/rename read, so a
+/// Moo attr's whole spelling family lights up together (the drift the A2
+/// rework closed — the old in-file highlight path lacked the group claim).
+/// Linked editing additionally excludes the affix-derived accessor
+/// (`has_size` for attr `size`): co-editing one text across it would
+/// corrupt the affix, exactly as rename re-derives rather than bare-writes.
+#[test]
+fn candidate_set_highlights_and_linked_editing_at_field_group_cursor() {
+    let store = FileStore::new();
+    let src = "\
+package Widget;
+use Moo;
+has 'size' => (is => 'rw', predicate => 'has_size');
+sub check {
+    my ($self) = @_;
+    return $self->size + ($self->has_size ? 1 : 0);
+}
+package main;
+my $w = Widget->new(size => 3);
+print $w->size;
+";
+    let fa = parse(src);
+    let key = FileKey::Path(PathBuf::from("/tmp/cs_group_hl.pl"));
+    // Cursor on the `size` token of the `has` declaration (row 2).
+    let decl_col = src.lines().nth(2).unwrap().find("size").unwrap();
+    let cs = resolve(
+        &store,
+        &fa,
+        key,
+        tree_sitter::Point { row: 2, column: decl_col },
+        None,
+        OverrideScope::default(),
+    );
+    assert!(
+        matches!(cs.resolution(), Some(ResolvedTarget::Group { .. })),
+        "a has-attr cursor resolves to the projection group",
+    );
+
+    let line5 = src.lines().nth(5).unwrap();
+    let size_call = (5usize, line5.find("size").unwrap());
+    let has_size_call = (5usize, line5.find("has_size").unwrap());
+    let ctor_key = (8usize, src.lines().nth(8).unwrap().find("size").unwrap());
+    let reader_call = (9usize, src.lines().nth(9).unwrap().find("size").unwrap());
+
+    let hl: Vec<(usize, usize)> = cs
+        .highlights()
+        .iter()
+        .map(|l| (l.span.start.row, l.span.start.column))
+        .collect();
+    for want in [size_call, has_size_call, ctor_key, reader_call] {
+        assert!(hl.contains(&want), "highlights missing {want:?}: {hl:?}");
+    }
+
+    let le: Vec<(usize, usize)> = cs
+        .linked_editing_spans()
+        .iter()
+        .map(|s| (s.start.row, s.start.column))
+        .collect();
+    for want in [size_call, ctor_key, reader_call] {
+        assert!(le.contains(&want), "linked editing missing {want:?}: {le:?}");
+    }
+    assert!(
+        !le.contains(&has_size_call),
+        "the affix-derived accessor must not co-edit the bare text: {le:?}",
+    );
 }
 
 /// Goto-def is the forward projection of the same set: cursor on a call,

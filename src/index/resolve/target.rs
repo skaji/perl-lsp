@@ -336,9 +336,9 @@ pub enum TargetKind {
 pub struct RefLocation {
     pub key: FileKey,
     pub span: Span,
-    /// Read/Write/Declaration — used by document_highlight callers that will
-    /// migrate to `refs_to` in a follow-up.
-    #[allow(dead_code)]
+    /// Read/Write/Declaration — the access classification the matcher minted
+    /// at the site. `highlights()` renders it as the LSP highlight kind;
+    /// other projections carry it for symmetry (a reference IS its access).
     pub access: AccessKind,
     /// Whether rename may rewrite this span. `false` for a site whose name has
     /// no literal token to replace — a const-folded event name

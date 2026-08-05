@@ -34,48 +34,26 @@ row-class key owner (pinned by
 `super_qualified_search_still_fills_hash_key_owner`). The three-text-resolver
 collapse (docs/prompt-cst-migration.md item 3) lands on this seam.
 
-### A2. documentHighlight and linkedEditingRange bypass the CandidateSet through a second identity implementation — and the in-file family has already drifted three ways — **high leverage / L**
+### A2. LANDED — documentHighlight and linkedEditingRange are CandidateSet projections; the in-file family is one occurrence union
 
-**The wrong embedding.** Both verbs route `symbols::document_highlights` /
-`linked_editing_ranges` (`src/lsp/symbols/navigate.rs:179-208`) into
-`FileAnalysis::find_highlights` / `find_references`, which sit on
-`resolve_target_at` (`src/model/file_analysis/resolution.rs:10-76`) — a full
-second identity minting (variable resolution, package-scoped callables,
-MethodCall invocant typing + ancestor dispatch) parallel to
-`resolve_symbol_scoped`. gd/references/rename construct the set
-(`src/lsp/backend/server.rs:508/661/782`); these two never do
-(`server.rs:968-985, 1371-1390`; CLI mirror `src/lsp/cli/query.rs:608`).
-Lockstep is comment-enforced (`index/resolve/identity.rs:99-101`) and has
-failed: `find_references` pre-claims field groups and lexical hash keys
-(`cursor_queries.rs:164-173`) which `find_highlights` lacks (`:231`), while
-`find_highlights` carries a cross-file same-class grouping fallback
-(`:243-285`) neither sibling shares — three sibling verbs, three occurrence
-sets at the same cursor. `index/resolve/target.rs:339-342` even carries the
-smoking gun: `RefLocation.access` is `#[allow(dead_code)]` with a comment
-saying documentHighlight "will migrate to refs_to in a follow-up" — the
-follow-up that never happened.
-
-**Why it is wrong at the system level.** Every future CandidateSet axis
-(visibility, delegation aliases, ranking) silently skips these two verbs —
-the exact C1/C2 disease class the ADR was written to end. The drift is
-user-visible today on Moo attribute groups and lexical hash keys.
-
-**Target shape.** Two projections on the set: `highlights()` = the
-origin-file-narrowed image of `references()` carrying the already-minted
-`RefLocation.access` (drop its dead-code allowance); `linked_editing_ranges()`
-= the origin-file rewritable spans of `rename_edits()`, so the co-edit set
-equals the rename image by construction. `find_highlights`' cross-file
-grouping fallback moves into set construction as an origin-narrowed lane;
-`resolve_target_at` shrinks to the Local-arm helper the set calls; the
-lockstep comment dies because the discipline becomes structural.
-
-**Migration order.** After A1 (the set's Local arm then rides the unified
-ladder). Add the projections, flip navigate.rs and the CLI mirror, collapse
-the in-file family.
-
-**Gate.** Extend `candidate_set_visibility_axis_flows_to_every_projection` to
-assert highlights narrows with the others; update the ADR projection table
-with both verbs. E2e highlight/linked-editing cases at a field-group cursor.
+`CandidateSet::highlights()` is the origin-file-narrowed image of
+`references()` (same identity, same matcher — `refs_to_in_file` runs
+`collect_from_analysis` + delegation aliases against the origin only),
+carrying the now-live `RefLocation.access` for highlight kinds;
+`linked_editing_spans()` is its co-edit subset (rewritable, bare-text
+members only — affix-derived accessors join highlights but never co-edit),
+equal to the rename image's site set by construction. Both LSP handlers and
+CLI mirrors construct the set; `find_highlights` (and its bespoke
+cross-file grouping fallback) is deleted. The in-file family collapsed to
+`FileAnalysis::find_occurrences` — the one access-classified occurrence
+union (`find_references` is its span projection, `rename_at` its edit
+projection, the set's Local arm reads it directly), with declarations
+always included (the set's Declaration-row convention) and `resolve_target_at`
+reduced to its Local-arm resolver. Unifying on the references spelling
+changed the drifted our-var linked-editing rows (PackageVar walk: FQ +
+interpolated reads join, name-token spans) — re-pinned gold.
+`candidate_set_visibility_axis_flows_to_every_projection` asserts both
+verbs narrow with the others.
 
 ### A3. Perl hover is a parallel resolution stack inside the thin adapter — **medium leverage / L**
 
@@ -517,7 +495,7 @@ declares no names exempts nothing, pinned by
    C1 (pack routing — LANDED), D3 (PackInvalidator — LANDED), F1 (file_analysis
    recut — LANDED), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
-   (IndexCore — LANDED), A2 (highlights/linked-editing projections), F2
+   (IndexCore — LANDED), A2 (highlights/linked-editing projections — LANDED), F2
    (monolith directories, after D2), A3/A4, D4/D5, E3 (LANDED).
 4. **The arc:** E2 phases 2-3 (+ E4 alongside).
 

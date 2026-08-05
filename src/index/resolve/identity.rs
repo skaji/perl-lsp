@@ -97,8 +97,8 @@ pub fn resolve_symbol_scoped(
 ) -> Option<ResolvedTarget> {
     use crate::model::file_analysis::{HashKeyOwner, RenameKind};
     // Field projections claim first: from any spelling of a field group,
-    // the answer is the whole group (rename and references stay in
-    // lockstep with the in-file `rename_at`/`find_references` union).
+    // the answer is the whole group — every projection (references, rename,
+    // highlights, linked editing) then reads the same group by construction.
     if let Some(p) = analysis.field_projections_at(point) {
         // A cursor on an OVERRIDING subclass's own decl should resolve to the
         // same family group as the base under Hierarchy — bridge to the

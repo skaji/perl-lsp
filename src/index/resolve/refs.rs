@@ -163,6 +163,31 @@ pub fn group_refs(
     out
 }
 
+/// `refs_to` narrowed to ONE file: the same delegation aliases and the same
+/// matcher (`collect_from_analysis`), run against a single analysis. The
+/// highlights / linked-editing projections use it with the ORIGIN document,
+/// so their image is the in-file slice of `references()` by construction
+/// without paying the workspace walk per cursor move. No closure gate: the
+/// origin minted the target at its own cursor, so it sees it by definition
+/// (and a fragment origin — seen only by textual inclusion — must still
+/// answer its own highlights).
+pub(super) fn refs_to_in_file(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    target: &TargetRef,
+    key: &FileKey,
+    analysis: &FileAnalysis,
+    mask: RoleMask,
+) -> Vec<RefLocation> {
+    let aliases = delegation_aliases(files, module_index, target, mask);
+    let file_str = canonical_file_str(key);
+    let mut out = Vec::new();
+    collect_from_analysis(key, analysis, target, &aliases, module_index, &file_str, &mut out);
+    out.sort_by_key(|l| (l.span.start.row, l.span.start.column));
+    out.dedup_by(|a, b| a.span == b.span);
+    out
+}
+
 /// Reject a `newName` that would corrupt rather than rename: empty,
 /// whitespace, or just sigils (`$`/`@`/`%`). The LSP client normally validates
 /// the new name, but the server must not emit a token-*deleting* edit set when
