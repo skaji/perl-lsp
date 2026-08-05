@@ -126,7 +126,14 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 })),
                 document_range_formatting_provider: Some(OneOf::Left(true)),
-                linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+                // Off: clients with linked edits on by default (Zed) replay
+                // keystrokes into every returned range, so a mid-typed `$abel`
+                // whose `$a` prefix matches a declared variable live-renames
+                // the declaration (#116). Identifier occurrence sets don't fit
+                // this verb; re-enable only for an atomic slot like heredoc
+                // terminators. The co-edit projection stays CLI-queryable via
+                // --linked-editing.
+                linked_editing_range_provider: None,
                 completion_provider: Some(CompletionOptions {
                     // Union of every served language's trigger chars — Perl
                     // sigils/`->`/`{`, plus a pack language's `.`/`::` etc.
@@ -1308,36 +1315,13 @@ impl LanguageServer for Backend {
 
     async fn linked_editing_range(
         &self,
-        params: LinkedEditingRangeParams,
+        _params: LinkedEditingRangeParams,
     ) -> Result<Option<LinkedEditingRanges>> {
-        let uri = &params.text_document_position_params.text_document.uri;
-        let pos = params.text_document_position_params.position;
-        self.await_open_ready(uri, WaitPolicy::Interactive).await;
-        // Snapshot + drop the store guard before `resolve()` (reentrant
-        // `for_each_open`); see `Document::analysis`.
-        let (analysis, language) = match self.files.get_open(uri) {
-            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
-        };
-        // The co-edit set is the rename image's origin-file site set,
-        // projected from the same construction rename uses.
-        let uri = uri.clone();
-        let scope = self.override_scope();
-        self.run_query(move |cx| {
-            let routed = cx.routed(language);
-            let cs = cx.set(
-                routed.as_lookup(),
-                &analysis,
-                &uri,
-                symbols::position_to_point(pos),
-                scope,
-            );
-            symbols::linked_editing_ranges(&cs).map(|ranges| LinkedEditingRanges {
-                ranges,
-                word_pattern: None,
-            })
-        })
-        .await
+        // Capability is off (see initialize); null here keeps clients that
+        // ignore capabilities from co-editing anyway (#116). The co-edit
+        // projection (CandidateSet::linked_editing_spans) stays CLI-queryable
+        // via --linked-editing.
+        Ok(None)
     }
 }
 
