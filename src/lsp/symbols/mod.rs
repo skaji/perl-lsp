@@ -13,7 +13,9 @@ use crate::model::file_analysis::{
     SymKind as FaSymKind, SymbolDetail,
 };
 use crate::index::module_index::{ModuleIndex, SubInfo};
-use crate::index::resolve::{resolve_imported_function, ImportResolution};
+use crate::index::resolve::ImportResolution;
+#[cfg(test)]
+use crate::index::resolve::resolve_imported_function;
 
 // ---- Coordinate conversion ----
 

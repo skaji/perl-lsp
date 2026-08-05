@@ -495,7 +495,7 @@ sub beta  { my ($x) = @_; $x * 2 }
 /// Hover on a Perl builtin returns the seeded perlfunc.pod entry.
 /// The full POD parse pipeline is exercised separately in the
 /// builtins_pod unit tests; here we just confirm the wiring from
-/// hover_info → module_index.builtin_doc fires for builtin names.
+/// perl_hover → module_index.builtin_doc fires for builtin names.
 #[test]
 fn test_hover_on_builtin_uses_module_index() {
     let source = "push @items, 4;\n";
@@ -510,13 +510,18 @@ fn test_hover_on_builtin_uses_module_index() {
     let _tree = crate::index::document::Document::new(source.to_string())
         .unwrap()
         .tree;
-    let hover = hover_info(
+    let files = crate::index::file_store::FileStore::new();
+    let idx: &dyn crate::model::file_analysis::CrossFileLookup = &module_index;
+    let cs = crate::index::resolve::resolve(
+        &files,
         &analysis,
-        source,
-        Position { line: 0, character: 0 },
-        &module_index,
+        crate::index::file_store::FileKey::Url(Url::parse("file:///test.pl").unwrap()),
+        Point::new(0, 0),
+        Some(idx),
+        crate::index::resolve::OverrideScope::default(),
     )
-    .expect("expected hover on `push`");
+    .with_source(source);
+    let hover = perl_hover(&cs, &module_index).expect("expected hover on `push`");
     let text = match hover.contents {
         HoverContents::Markup(m) => m.value,
         _ => panic!("expected markdown hover"),

@@ -276,111 +276,98 @@ pub fn pack_hover(cs: &crate::index::resolve::CandidateSet, language: &str) -> O
     })
 }
 
-pub fn hover_info(
-    analysis: &FileAnalysis,
-    source: &str,
-    pos: Position,
+/// Perl hover: a presenter over one resolution. Local identity — symbols,
+/// method dispatch, hash keys — renders through the model's
+/// `FileAnalysis::hover_info`; the cross-file call lanes present what the
+/// CandidateSet resolved: builtin membership is the model's builtin table
+/// (doc VALUE from `module_index.builtin_doc`, hydrated from SQLite —
+/// parsed from `perlfunc.pod` only on cold-cache miss), and the
+/// import / FQ-package binding comes from `cs.function_binding()` — the
+/// same lanes `definitions()` jumps through — so hover presents exactly
+/// what goto-def would reach.
+pub fn perl_hover(
+    cs: &crate::index::resolve::CandidateSet,
     module_index: &ModuleIndex,
 ) -> Option<Hover> {
-    let point = position_to_point(pos);
+    let value = perl_hover_markdown(cs, module_index)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: None,
+    })
+}
 
-    // Try local hover first
+fn perl_hover_markdown(
+    cs: &crate::index::resolve::CandidateSet,
+    module_index: &ModuleIndex,
+) -> Option<String> {
+    let analysis = cs.origin_analysis();
+    let source = cs.origin_source()?;
+    let point = cs.cursor();
+
+    // Local hover first — the model renderer.
     if let Some(markdown) = analysis.hover_info(point, source, Some(module_index)) {
-        return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: markdown,
-            }),
-            range: None,
-        });
+        return Some(markdown);
     }
 
-    // Check if cursor is on an imported function call or a Perl
-    // builtin. Builtin docs come from `module_index.builtin_doc`,
-    // which the resolver thread hydrates from SQLite (parsed from
-    // `perlfunc.pod` only on cold-cache miss).
-    if let Some(r) = analysis.ref_at(point) {
-        if matches!(r.kind, RefKind::FunctionCall { .. }) {
-            if crate::model::builtins::is_builtin(&r.target_name) {
-                if let Some(markdown) = module_index.builtin_doc(&r.target_name) {
-                    return Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: markdown,
-                        }),
-                        range: None,
-                    });
-                }
-            }
-            if let Some((import, _path, remote_name)) =
-                resolve_imported_function(analysis, &r.target_name, module_index)
-            {
-                let mut parts = Vec::new();
-
-                // Show signature if available. Cross-file lookup uses
-                // the REMOTE name — for a renaming import (`del` →
-                // `delete`), cursor is on `del` but sub_info lives
-                // under `delete` in the cached module.
-                if let Some(cached) = module_index
-                    .defining_module_cached(&import.module_name, &remote_name)
-                    .or_else(|| module_index.get_cached(&import.module_name))
-                {
-                    let whole = module_index.bag_present(&cached);
-                    if let Some(sub_info) = whole.sub_info_view(&remote_name) {
-                        // Present the sig under the LOCAL name — that's
-                        // what the user typed and what hover should lead
-                        // with; the remote name is just how we fetched it.
-                        let sig = format_imported_signature(&r.target_name, &sub_info);
-                        parts.push(format!("```perl\n{}\n```", sig));
-                        if let Some(doc) = sub_info.doc() {
-                            parts.push(doc.to_string());
-                        }
-                    }
-                }
-
-                if remote_name != r.target_name {
-                    parts.push(format!(
-                        "*imported from `{}` (as `{}`)*",
-                        import.module_name, remote_name
-                    ));
-                } else {
-                    parts.push(format!("*imported from `{}`*", import.module_name));
-                }
-                let markdown = parts.join("\n\n");
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: markdown,
-                    }),
-                    range: None,
-                });
-            }
-
-            // Fully-qualified call with no import: resolve the sub in the
-            // package named by the qualifier (the `Function` binding).
-            if let (RefKind::FunctionCall, Some(pkg)) = (&r.kind, r.resolved_package()) {
-                let bare = r.unqualified_target_name();
-                if let Some(cached) = module_index.get_cached(pkg) {
-                    let whole = module_index.bag_present(&cached);
-                    if let Some(sub_info) = whole.sub_info_view(bare) {
-                        let sig = format_imported_signature(bare, &sub_info);
-                        let mut parts = vec![format!("```perl\n{}\n```", sig)];
-                        if let Some(doc) = sub_info.doc() {
-                            parts.push(doc.to_string());
-                        }
-                        parts.push(format!("*from `{}`*", pkg));
-                        return Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: parts.join("\n\n"),
-                            }),
-                            range: None,
-                        });
-                    }
-                }
-            }
+    let r = analysis.ref_at(point)?;
+    if !matches!(r.kind, RefKind::FunctionCall { .. }) {
+        return None;
+    }
+    if crate::model::builtins::is_builtin(&r.target_name) {
+        if let Some(markdown) = module_index.builtin_doc(&r.target_name) {
+            return Some(markdown);
         }
     }
+    match cs.function_binding()? {
+        crate::index::resolve::FunctionBinding::Imported { import, remote: remote_name, .. } => {
+            let mut parts = Vec::new();
 
-    None
+            // Show signature if available. Cross-file lookup uses
+            // the REMOTE name — for a renaming import (`del` →
+            // `delete`), cursor is on `del` but sub_info lives
+            // under `delete` in the cached module.
+            if let Some(cached) = module_index
+                .defining_module_cached(&import.module_name, &remote_name)
+                .or_else(|| module_index.get_cached(&import.module_name))
+            {
+                let whole = module_index.bag_present(&cached);
+                if let Some(sub_info) = whole.sub_info_view(&remote_name) {
+                    // Present the sig under the LOCAL name — that's
+                    // what the user typed and what hover should lead
+                    // with; the remote name is just how we fetched it.
+                    let sig = format_imported_signature(&r.target_name, &sub_info);
+                    parts.push(format!("```perl\n{}\n```", sig));
+                    if let Some(doc) = sub_info.doc() {
+                        parts.push(doc.to_string());
+                    }
+                }
+            }
+
+            if remote_name != r.target_name {
+                parts.push(format!(
+                    "*imported from `{}` (as `{}`)*",
+                    import.module_name, remote_name
+                ));
+            } else {
+                parts.push(format!("*imported from `{}`*", import.module_name));
+            }
+            Some(parts.join("\n\n"))
+        }
+        crate::index::resolve::FunctionBinding::Qualified { package: pkg } => {
+            let bare = r.unqualified_target_name();
+            let cached = module_index.get_cached(pkg)?;
+            let whole = module_index.bag_present(&cached);
+            let sub_info = whole.sub_info_view(bare)?;
+            let sig = format_imported_signature(bare, &sub_info);
+            let mut parts = vec![format!("```perl\n{}\n```", sig)];
+            if let Some(doc) = sub_info.doc() {
+                parts.push(doc.to_string());
+            }
+            parts.push(format!("*from `{}`*", pkg));
+            Some(parts.join("\n\n"))
+        }
+    }
 }

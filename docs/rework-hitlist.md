@@ -55,33 +55,21 @@ interpolated reads join, name-token spans) — re-pinned gold.
 `candidate_set_visibility_axis_flows_to_every_projection` asserts both
 verbs narrow with the others.
 
-### A3. Perl hover is a parallel resolution stack inside the thin adapter — **medium leverage / L**
+### A3. LANDED — Perl hover is a presenter over the set's resolution
 
-**The wrong embedding.** Pack hover is the ratified shape: the set resolves
-(`cs.hover_candidate()`), the adapter renders (`src/lsp/symbols/hover.rs:5-11,
-113`). Perl hover is a pre-set resolution chain living in the adapter:
-builtin-doc lookup, `resolve_imported_function`, `defining_module_cached` +
-`bag_present`, and an FQ-call arm reading `RefKind::FunctionCall{resolved_package}`
-(`hover.rs:279-386`) — real cross-file resolution in the layer rule 3 says
-makes no analysis decisions, re-deriving the import-binding classification
-`index/resolve` owns. Consequence: Perl hover CAN disagree with Perl goto-def,
-the failure the set exists to prevent. The ADR's carve-out
-(docs/adr/resolution-candidate-set.md:76) ratifies a language-specific
-*renderer*, not a second *resolver*.
-
-**Target shape.** The builtin / imported-call / FQ-call lanes become questions
-asked of the set (or of FileAnalysis queries the set consults); hover renders
-`hover_candidate()` plus a resolved-import-binding accessor through a
-Perl-specific presenter. Amend the ADR hover row to "set resolves for BOTH
-languages; each keeps its presenter."
-
-**Migration order.** After A2. The renderer-*placement* half (Perl markdown
-assembled in the model at `cursor_queries.rs:401` vs pack's in the adapter) is
-owned by the parked multi-language brief — do the resolution half now, the
-layer hoist as the opening move of that arc.
-
-**Gate.** Byte-identical gold hover rows, or conscious row promotion. Gold
-pins Perl hover output heavily; this is why the item is L, not M.
+Both hover handlers construct the CandidateSet (the same construction as
+goto-def) and present: pack renders `hover_candidate()`, Perl renders
+through the model hover primitives (`FileAnalysis::hover_info`) plus
+`CandidateSet::function_binding()` — the one spelling of the cross-file
+call-binding lanes (import classification first, then the FQ `Function`
+package), consumed by BOTH `definitions()` and the Perl presenter
+(`symbols::perl_hover`), so hover presents exactly what goto-def would
+reach. The adapter's own resolution chain (`resolve_imported_function` +
+FQ-arm re-derivation in `hover.rs`) is deleted; builtin hover keeps its B2
+shape (membership from `model::builtins`, doc value from
+`module_index.builtin_doc`). The renderer-*placement* half (Perl markdown
+assembled in the model vs pack's in the adapter) stays owned by the parked
+multi-language brief.
 
 ### A4. The "legacy text-based MCB resolver" is the load-bearing cross-file enrichment typer — **medium leverage / L**
 

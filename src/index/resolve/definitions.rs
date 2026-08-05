@@ -718,11 +718,12 @@ impl<'a> CandidateSet<'a> {
         }
 
         if let Some(r) = analysis.ref_at(point) {
-            // Function call matching an imported symbol.
-            if matches!(r.kind, RefKind::FunctionCall { .. }) {
-                if let Some((import, module_path, remote_name)) =
-                    resolve_imported_function(analysis, &r.target_name, idx)
-                {
+            // The call-binding lanes — identity from the set's own
+            // `function_binding` accessor (import classification first, then
+            // the FQ `Function` package), so hover presents the same binding
+            // this projection jumps through.
+            match self.function_binding() {
+                Some(FunctionBinding::Imported { import, path: module_path, remote: remote_name }) => {
                     // Cross-file sub_info lookup uses the REMOTE name —
                     // distinct from target_name for renaming imports.
                     // Re-export aware: the def may live in a module
@@ -761,9 +762,8 @@ impl<'a> CandidateSet<'a> {
 
                 // Fully-qualified call (`Foo::Bar::baz()`) with no import: the
                 // qualifier names the package directly; the defining package
-                // lives in another module. Resolve via the `Function` binding
-                // (the qualifier) and the bare sub name.
-                if let (RefKind::FunctionCall, Some(pkg)) = (&r.kind, r.resolved_package()) {
+                // lives in another module.
+                Some(FunctionBinding::Qualified { package: pkg }) => {
                     let bare = r.unqualified_target_name();
                     if let Some(cached) = idx.get_cached(pkg) {
                         if Url::from_file_path(&cached.path).is_ok() {
@@ -790,6 +790,7 @@ impl<'a> CandidateSet<'a> {
                         }
                     }
                 }
+                None => {}
             }
 
             // Fully-qualified variable read (`$Foo::Bar::x`, `@Pkg::arr`):

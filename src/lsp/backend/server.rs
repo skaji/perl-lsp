@@ -763,22 +763,23 @@ impl LanguageServer for Backend {
             Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
             None => return Ok(None),
         };
-        // Perl's hover renderer is Perl-specific; pack languages present the
-        // CandidateSet's hover projection (the top-ranked candidate goto-def
-        // would jump to) — constructed exactly like the goto-def handler's
-        // set, so the two verbs can't disagree at a position.
+        // Both languages present the set's resolution — constructed exactly
+        // like the goto-def handler's set, so the two verbs can't disagree
+        // at a position. Each keeps its own presenter: pack renders the
+        // hover projection (top-ranked candidate), Perl renders through the
+        // model primitives + the set's call-binding accessor.
+        let routed = self.module_index.lookup_for(language);
+        let base_idx = routed.as_lookup();
+        let cs = crate::index::resolve::resolve(
+            &self.files,
+            &analysis,
+            FileKey::Url(uri.clone()),
+            symbols::position_to_point(pos),
+            Some(base_idx),
+            crate::index::resolve::OverrideScope::default(),
+        )
+        .with_source(&text);
         if language != "perl" {
-            let routed = self.module_index.lookup_for(language);
-            let base_idx = routed.as_lookup();
-            let cs = crate::index::resolve::resolve(
-                &self.files,
-                &analysis,
-                FileKey::Url(uri.clone()),
-                symbols::position_to_point(pos),
-                Some(base_idx),
-                crate::index::resolve::OverrideScope::default(),
-            )
-            .with_source(&text);
             if let Some(h) = symbols::pack_hover(&cs, language) {
                 return Ok(Some(h));
             }
@@ -802,12 +803,7 @@ impl LanguageServer for Backend {
             }
             return Ok(None);
         }
-        Ok(symbols::hover_info(
-            &analysis,
-            &text,
-            pos,
-            &self.module_index,
-        ))
+        Ok(symbols::perl_hover(&cs, &self.module_index))
     }
 
     async fn completion(

@@ -330,3 +330,43 @@ pub(crate) fn resolve_imported_function<'b>(
     resolve_imported_function_classified(analysis, func_name, module_index)
         .and_then(|(import, path, remote, _)| path.map(|p| (import, p, remote)))
 }
+
+/// How the FunctionCall at the cursor binds across files: through a `use`
+/// import (classified via the consumer evaluator), or through its
+/// fully-qualified `Function` package binding. Minted by
+/// `CandidateSet::function_binding` — the one spelling of the lane order.
+pub enum FunctionBinding<'a> {
+    /// Bound through a `use` import: the matched import, the module's path,
+    /// and the REMOTE name (differs from the typed name only for renaming
+    /// imports like `del` → `delete`).
+    Imported {
+        import: &'a crate::model::file_analysis::Import,
+        path: PathBuf,
+        remote: String,
+    },
+    /// Fully-qualified call with no import: the qualifier names the defining
+    /// package directly.
+    Qualified { package: &'a str },
+}
+
+impl<'a> CandidateSet<'a> {
+    /// The cross-file binding of the FunctionCall under the cursor — the
+    /// SAME lanes `definitions()` jumps through, in the same order (import
+    /// classification first, then the FQ package), so a presenter (hover)
+    /// shows exactly what goto-def would reach. `None` = not a function
+    /// call, or nothing binds it cross-file.
+    pub fn function_binding(&self) -> Option<FunctionBinding<'a>> {
+        let r = self.origin_analysis().ref_at(self.cursor())?;
+        if !matches!(r.kind, RefKind::FunctionCall { .. }) {
+            return None;
+        }
+        let idx = self.idx()?;
+        if let Some((import, path, remote)) =
+            resolve_imported_function(self.origin_analysis(), &r.target_name, idx)
+        {
+            return Some(FunctionBinding::Imported { import, path, remote });
+        }
+        r.resolved_package()
+            .map(|package| FunctionBinding::Qualified { package })
+    }
+}
