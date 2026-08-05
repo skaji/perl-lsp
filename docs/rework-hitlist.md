@@ -427,27 +427,22 @@ Gate: outline/workspace-symbol tests; do alongside E2's SymbolTable phase.
 
 ## Theme F — The tree tells the truth: splits, placement, ledger hygiene
 
-### F1. file_analysis's query parts are cut by query flavor, not concern — hover, ancestry, and symbol-index primitives each smear across 2-3 parts — **high leverage / M**
+### F1. LANDED — file_analysis's query parts are cut by concern
 
-Hover rendering spans `cursor_queries.rs:401`, `resolution.rs:1740,2071`
-(whose own header confesses "hover formatting" inside "internal resolution"),
-and `class_queries.rs:406`. Ancestry spans `dispatch.rs:176-303` (the
-canonical seam), `resolution.rs:1029,1062,1320,1341` (including a SECOND
-`class_isa`), and `class_queries.rs:245`. `class_queries.rs:1186-1301` ends in
-generic symbol-table accessors (`symbols_named`, `sym_row_seeds` — a
-storage-engine concern whose contract partner is
-`module_cache::shred_derived_rows`, `refs_to`, …) that are not class queries.
-resolution.rs also name-shadows `index/resolve/`, the crate's one resolution
-entry point (it does NOT duplicate it — verified — but misdirects readers).
-
-**Target shape.** Recut by concern behind the unchanged mod.rs glob re-export
-(free per the oversized-module doctrine): `hover.rs` (all markdown rendering —
-also the file the parked multi-language hoist lifts from), `ancestry.rs`
-(placement only — the GraphView collapse stays a separate PARKED item),
-`sym_index.rs` (raw accessors; `sym_row_seeds` moves beside the row/Surface
-projections), and rename the resolution.rs residue to `target_at.rs` or
-`invocants.rs`. Gate: pure code motion — `cargo test` + layering suite; item
-paths unchanged by construction.
+Each concern lives in ONE part behind the unchanged mod.rs glob surface:
+`hover.rs` holds every markdown hover renderer (`hover_info`, `member_hover`,
+`format_handler_hover`, the `format_symbol_hover` pair — the file the parked
+multi-language hoist lifts from); `ancestry.rs` holds the parent-enumeration
+seam (`parents_of`), the bounded isa walkers (`walk_ancestry`, `class_isa`,
+`class_isa_prefix`), the include-self MRO walk with its method resolution
+(`for_each_ancestor_class`, `resolve_method_in_ancestors`,
+`resolve_super_method`, `method_resolution_on_class`,
+`class_has_unresolved_ancestor`), and the family/descendant walks (placement
+only — the GraphView collapse stays a separate PARKED item); `sym_index.rs`
+holds the raw symbol/ref index accessors, with `sym_row_seeds` beside the
+Surface classification gate in `surface_feed.rs`; the resolution residue is
+`invocants.rs` (target-at-cursor, the invocant/dispatch ladders, role
+contracts, class-content predicates), un-shadowing `index/resolve/`.
 
 ### F2. module_resolver.rs and module_cache.rs are the two monoliths the restructure skipped — **high leverage / L**
 
@@ -479,9 +474,9 @@ symbol-minting / package-range / call-arg infrastructure plus
 
 ### F4. Two unledgered bespoke ancestry walkers, blocked on a missing prune verdict in GraphView — **medium leverage / M**
 
-`trigger_view_at` (`class_queries.rs:1128-1148`) hand-rolls an UNCAPPED
+`trigger_view_at` (`class_queries.rs:903`) hand-rolls an UNCAPPED
 transitive-parent BFS (every sibling walk is budgeted/capped);
-`unfulfilled_role_requires` (`resolution.rs:1546-1560`) hand-rolls a
+`unfulfilled_role_requires` (`invocants.rs:1042`) hand-rolls a
 role-gated BFS with an idiosyncratic visited-size cap. Neither appears in the
 ledger (PARKED.md's four→one entry covers only the three isa DFSes and warns
 "not a fifth bespoke helper" — these are the fifth and sixth). The blocker is
@@ -547,7 +542,7 @@ declares no names exempts nothing, pinned by
 2. **Correctness-bearing seams (M):** E1 (SurfaceFeed + two backfills), A1
    (invocant ladder), B2 (builtins), B1 (diagnostics seams), G1 (Moo gate),
    C1 (pack routing — LANDED), D3 (PackInvalidator — LANDED), F1 (file_analysis
-   recut), E2 phase 1 (PackageFacts).
+   recut — LANDED), E2 phase 1 (PackageFacts).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
    (IndexCore), A2 (highlights/linked-editing projections), F2 (monolith
    directories, after D2), A3/A4, D4/D5, E3 (LANDED).

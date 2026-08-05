@@ -26,11 +26,15 @@ mod lifecycle;
 pub use lifecycle::*;
 mod surface_feed;
 pub use surface_feed::*;
+mod ancestry;
+pub use ancestry::*;
 mod queries;
 mod enrichment;
 mod class_queries;
 mod cursor_queries;
-mod resolution;
+mod invocants;
+mod hover;
+mod sym_index;
 mod completion;
 pub use completion::*;
 

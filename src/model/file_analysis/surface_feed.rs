@@ -144,4 +144,38 @@ impl FileAnalysis {
             analysis: self,
         }
     }
+
+    /// Project every symbol into its relational row seed
+    /// (`docs/adr/relational-ref-index.md`). A method on the analysis (not
+    /// on `Symbol`) because the linkage flag needs the owning scope's kind.
+    pub fn sym_row_seeds(&self) -> Vec<SymRowSeed> {
+        self.symbols
+            .iter()
+            .map(|s| {
+                let mut flags = 0u8;
+                if self.is_linkage_visible(s) {
+                    flags |= SymRowSeed::FLAG_LINKAGE_VISIBLE;
+                }
+                if s.hidden_in_outline() {
+                    flags |= SymRowSeed::FLAG_HIDDEN_IN_OUTLINE;
+                }
+                if matches!(&s.detail, SymbolDetail::Sub { lexical: true, .. }) {
+                    flags |= SymRowSeed::FLAG_LEXICAL_SUB;
+                }
+                // Exportedness reads the SAME `export`/`export_ok` surface the
+                // Surface projection does (`exports_name` → `export_lookup`),
+                // so "exported" never drifts between the two.
+                if self.exports_name(&s.name) {
+                    flags |= SymRowSeed::FLAG_EXPORTED;
+                }
+                SymRowSeed {
+                    name: s.name.clone(),
+                    kind: sym_kind_code(&s.kind),
+                    span: s.selection_span,
+                    container: s.package.clone(),
+                    flags,
+                }
+            })
+            .collect()
+    }
 }

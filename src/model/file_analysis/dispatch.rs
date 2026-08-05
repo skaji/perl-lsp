@@ -1,5 +1,5 @@
-//! Plugin namespaces, bridges, ancestry walking, receiver-gated dispatch,
-//! call bindings and deref/guard site records.
+//! Plugin namespaces, bridges, receiver-gated dispatch, call bindings
+//! and deref/guard site records.
 
 use super::*;
 
@@ -146,15 +146,6 @@ pub enum Bridge {
 /// the walk beyond contributing its bridge.
 pub const APP_SURFACE_CLASS: &str = "Mojolicious::_AppSurface";
 
-/// Inject the synthetic app-surface ancestor (`APP_SURFACE_CLASS`) when
-/// `class` is one of the declared `consumers`. The ONE place the
-/// synthetic-parent edge is added — every parent-enumeration site
-/// (`for_each_ancestor_class`, `collect_ancestor_methods`, and the
-/// `MethodOnClass` inheritance walk in `witnesses.rs`) routes through
-/// here so they can't drift. Real ancestors come first; the surface is
-/// appended last so same-name overrides on a real parent win. The
-/// surface has no parents of its own, so the walk's seen-set + depth cap
-/// bound it like any edge.
 /// The lexical scope chain `[start, parent, …, file]` over a bare
 /// `&[Scope]` slice — the single source of the parent-climb. A free
 /// function (not a `FileAnalysis` method) so the witness-bag query path,
@@ -171,154 +162,6 @@ pub fn scope_chain_of(scopes: &[Scope], start: ScopeId) -> Vec<ScopeId> {
         current = scopes[id.0 as usize].parent;
     }
     chain
-}
-
-pub fn parents_of(
-    class: &str,
-    package_parents: &HashMap<String, Vec<String>>,
-    module_index: Option<&dyn CrossFileLookup>,
-    consumers: &[String],
-) -> Vec<String> {
-    let mut parents: Vec<String> = package_parents.get(class).cloned().unwrap_or_default();
-    if let Some(idx) = module_index {
-        for p in idx.parents_cached(class) {
-            if !parents.contains(&p) {
-                parents.push(p);
-            }
-        }
-    }
-    if class != APP_SURFACE_CLASS
-        && consumers.iter().any(|c| c == class)
-        && !parents.iter().any(|p| p == APP_SURFACE_CLASS)
-    {
-        parents.push(APP_SURFACE_CLASS.to_string());
-    }
-    parents
-}
-
-/// Per-node classification returned by an ancestry-walk predicate.
-pub(super) enum WalkVerdict {
-    /// This class satisfies the query — short-circuit the walk to `true`.
-    Hit,
-    /// Not a match; keep walking its parents.
-    Miss,
-    /// Disqualifier — short-circuit the traversal (the walk returns `false`;
-    /// a predicate that needs to distinguish reject-from-exhaust reads its
-    /// own captured state, as `class_is_dbic_result` does).
-    Reject,
-}
-
-/// The single bounded ancestry DFS — `class_isa`, `class_isa_prefix`, and
-/// `class_is_dbic_result` all route here, so the inheritance graph is
-/// enumerated in exactly one place. `parents_of` supplies the per-node
-/// parent seam (local `package_parents` ∪ cross-file `parents_cached`, or
-/// cross-file-only for the DBIC gate); `predicate` classifies each visited
-/// class; `budget` caps TOTAL classes visited (not ancestry depth) — a
-/// per-call-site backstop against a pathological graph, set well above any
-/// real MRO. Returns `true` iff a `Hit` verdict terminated the walk; a
-/// `Reject` or exhaustion returns `false`. Cycle-guarded by `seen`.
-/// Long-term collapse target: GraphView's lazy `walk` over the inheritance
-/// edges (docs/adr/graph-walking.md).
-pub(super) fn walk_ancestry(
-    origin: &str,
-    budget: usize,
-    mut parents_of: impl FnMut(&str) -> Vec<String>,
-    mut predicate: impl FnMut(&str) -> WalkVerdict,
-) -> bool {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = vec![origin.to_string()];
-    let mut visited = 0;
-    while let Some(cur) = stack.pop() {
-        if visited > budget {
-            break;
-        }
-        visited += 1;
-        if !seen.insert(cur.clone()) {
-            continue;
-        }
-        match predicate(&cur) {
-            WalkVerdict::Hit => return true,
-            WalkVerdict::Reject => return false,
-            WalkVerdict::Miss => {}
-        }
-        for p in parents_of(&cur) {
-            stack.push(p);
-        }
-    }
-    false
-}
-
-/// The local+cross-file parent seam for the isa walkers: `package_parents`
-/// first (preserving push order under a budget truncation), then the
-/// cross-file graph via `module_index.parents_cached` (keyed by module
-/// name, which coincides with the class name here).
-fn isa_parents(
-    cur: &str,
-    package_parents: &HashMap<String, Vec<String>>,
-    module_index: Option<&dyn CrossFileLookup>,
-) -> Vec<String> {
-    let mut v = package_parents.get(cur).cloned().unwrap_or_default();
-    if let Some(idx) = module_index {
-        v.extend(idx.parents_cached(cur));
-    }
-    v
-}
-
-/// Does `class` equal `target` or descend from it? The single isa-walk seam
-/// — both the `ReceiverGated` gate and `FileAnalysis::class_isa` route
-/// through the shared [`walk_ancestry`] over the local+cross-file parent
-/// graph, so the MRO is enumerated in exactly one place.
-pub fn class_isa(
-    class: &str,
-    target: &str,
-    package_parents: &HashMap<String, Vec<String>>,
-    module_index: Option<&dyn CrossFileLookup>,
-) -> bool {
-    walk_ancestry(
-        class,
-        200,
-        |cur| isa_parents(cur, package_parents, module_index),
-        |c| {
-            if c == target {
-                WalkVerdict::Hit
-            } else {
-                WalkVerdict::Miss
-            }
-        },
-    )
-}
-
-/// Does `class`, or any of its transitive ancestors (cross-file), satisfy
-/// a plugin `ClassIsa(prefix)` trigger? The trigger's PREFIX semantics —
-/// exact match OR a `prefix::`-namespaced descendant — mirror
-/// `plugin::trigger_fires`, so this is the cross-file-aware analog of the
-/// build-time local-only `transitive_parents` gate. Shares [`walk_ancestry`]
-/// (the same local+cross-file seam as `class_isa`), so the graph is walked
-/// in one place; the only difference is the per-node predicate is a prefix
-/// test, not exact equality. Deliberately NOT `parents_of`: the synthetic
-/// `APP_SURFACE_CLASS` edge is a method-dispatch bridge (Mojo helpers), not
-/// an `isa` relation, so a plugin `ClassIsa` gate must not treat an
-/// app-surface consumer as a descendant of the surface. Both isa-walk seams
-/// exclude it by construction.
-pub fn class_isa_prefix(
-    class: &str,
-    prefix: &str,
-    package_parents: &HashMap<String, Vec<String>>,
-    module_index: Option<&dyn CrossFileLookup>,
-) -> bool {
-    let ns = format!("{prefix}::");
-    walk_ancestry(
-        class,
-        200,
-        |cur| isa_parents(cur, package_parents, module_index),
-        |c| {
-            if c == prefix || c.starts_with(&ns) {
-                WalkVerdict::Hit
-            } else {
-                WalkVerdict::Miss
-            }
-        },
-    )
 }
 
 /// Three-way outcome of resolving a [`ReceiverGated`] value against a
