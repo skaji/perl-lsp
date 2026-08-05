@@ -571,7 +571,7 @@ impl FileAnalysis {
         // exact-span match is what distinguishes "the value of
         // `$f->get_bar()->get_name()`" (the outer call's return) from
         // "the inner receiver `$f->get_bar()`" (which has its own,
-        // narrower span). `call_ref_by_start` deliberately points at the
+        // narrower span). `RefTable::call_at_start` deliberately points at the
         // innermost receiver, so we can't use it here — we want the ref
         // that exactly spans the queried expression.
         if let Some((recv_idx, kind)) = self.refs.iter().enumerate().find_map(|(i, r)| {

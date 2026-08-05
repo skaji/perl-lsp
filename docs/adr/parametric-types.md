@@ -96,7 +96,7 @@ Three paths in the emitter:
   `HashKeyAccess { owner: None }` eagerly. `FileAnalysis::
   fix_chain_receiver_hash_key_owners` runs from
   `finalize_post_walk` (no module_index — fills in-file chain
-  receivers via `call_ref_by_start` recursion) and from
+  receivers via the `RefTable` start-anchored call index recursion) and from
   `enrich_imported_types_with_keys` (with module_index —
   fills cross-file). Both routes share the same routine; the
   `module_index` argument is the only difference. Idempotent —

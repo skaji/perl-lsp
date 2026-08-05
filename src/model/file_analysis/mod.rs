@@ -448,6 +448,12 @@ impl PackageFrameworks for HashMap<String, PackageFacts> {
 /// Field-named so a swapped pair of same-typed tables can't compile
 /// silently the way positional args could, and hand-crafted test FAs
 /// spell only the tables they use (`..Default::default()`).
+///
+/// Lanes that own their fields on the analysis (`PackFacts`,
+/// `PluginFacts`, the per-package `PackageFacts` table) cross this
+/// boundary as themselves — `new` moves them in whole. The symbol and ref
+/// axes stay flat vecs: the builder appends to them as it walks, and
+/// `SymbolTable`/`RefTable` adopt the finished vec.
 #[derive(Default)]
 pub struct FileAnalysisParts {
     pub scopes: Vec<Scope>,
@@ -457,20 +463,18 @@ pub struct FileAnalysisParts {
     pub imports: Vec<Import>,
     pub call_bindings: Vec<CallBinding>,
     pub packages: HashMap<String, PackageFacts>,
+    pub pack: PackFacts,
+    pub plugin: PluginFacts,
     pub method_call_bindings: Vec<MethodCallBinding>,
     pub framework_imports: HashSet<String>,
     pub export: Vec<String>,
     pub export_ok: Vec<String>,
     pub export_tags: HashMap<String, Vec<String>>,
     pub reexport_modules: Vec<String>,
-    pub plugin_namespaces: Vec<PluginNamespace>,
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
     pub package_ranges: Vec<PackageRange>,
-    pub plugin_diagnostics: Vec<PluginDiagnostic>,
-    pub app_surface_consumers: Vec<String>,
     pub witnesses: crate::model::witnesses::WitnessBag,
     pub provisional_dispatches: Vec<ProvisionalDispatch>,
-    pub gated_emissions: Vec<GatedEmission>,
     pub guard_sites: Vec<GuardSite>,
     pub arrow_deref_sites: Vec<ArrowDerefSite>,
     pub gated_param_types: Vec<ReceiverGated<TypeConstraint>>,
@@ -481,13 +485,8 @@ pub struct FileAnalysisParts {
     pub dbic_source_name: Option<String>,
     pub column_keyed_verbs: HashSet<String>,
     pub dynamic_dispatch_sites: u32,
-    pub plugin_loads: Vec<PluginLoadFact>,
     pub loader_config_params: Vec<LoaderConfigParam>,
     pub flow_edges: Vec<FlowEdge>,
-    pub moved_from: Vec<(String, Span, ScopeId)>,
-    pub control_regions: Vec<Span>,
-    pub param_regions: Vec<Span>,
-    pub domain_sites: Vec<DomainSite>,
 }
 
 /// One domain-typing use-site: the `slot` field was compared/assigned

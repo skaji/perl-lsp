@@ -390,7 +390,7 @@ impl FileAnalysis {
         // receiver types resolve; the same routine runs from
         // `finalize_post_walk` with module_index=None for the
         // in-file-resolvable case (chain recursion via
-        // `call_ref_by_start` doesn't need module_index).
+        // `RefTable::call_at_start` doesn't need module_index).
         self.fix_chain_receiver_hash_key_owners(module_index);
 
         // Cross-file inheritance edges. Local writeback emits

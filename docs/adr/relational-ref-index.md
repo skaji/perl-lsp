@@ -7,9 +7,9 @@ changes must preserve: residency is bounded, coverage never is).
 
 ## Context: refs are the wall, and the scan is the reason they're pinned
 
-Post-Slice-2, every indexed file's `FileAnalysis` still pins its `refs`
-(`Vec<Ref>`, 1–3 heap strings per ref) plus the rebuilt `refs_by_name` /
-`refs_by_target` maps, resident forever — ~65% of the remaining
+Post-Slice-2, every indexed file's `FileAnalysis` still pins its `RefTable`
+(`Vec<Ref>`, 1–3 heap strings per ref, plus the rebuilt name / target /
+call indices over them), resident forever — ~65% of the remaining
 0.51 MB/file that projects whole-tree Chromium to ~67 GB. They are pinned
 because of how the one whole-tree backward walk works:
 
@@ -18,7 +18,7 @@ because of how the one whole-tree backward walk works:
   **every** `FileAnalysis` in all three tiers (open / workspace / cached) and
   runs `collect_from_analysis`, which is a **linear loop over that file's
   `refs` with a per-ref name compare**. There is no cross-file ref index of
-  any kind; the per-file `refs_by_target` map only accelerates the
+  any kind; the `RefTable`'s per-file target index only accelerates the
   *same-file* walk. Answering "who references X" over 131K files means
   touching 131K ref vectors, so all of them must be resident.
 

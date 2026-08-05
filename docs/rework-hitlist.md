@@ -276,57 +276,30 @@ flips the verdict to Changed. STUB_VERSION bumped (Surface rides the stubs
 table). R1 is restated as compiler-enforced in CLAUDE.md and
 `docs/adr/storage-engine.md`.
 
-### E2. FileAnalysis is ~50 flat serialized fields from seven fused models, spelled in quadruplicate — **high leverage / XL**
+### E2. LANDED — FileAnalysis carves along its own joints: five sub-structs, one owner each
 
-**The wrong embedding.** The struct (`src/model/file_analysis/mod.rs:41-431`)
-fuses core tables, export surface, plugin lane, narrowing lane, pack lane,
-and eviction bookkeeping as flat siblings; the field list is re-spelled in
-`FileAnalysisParts`, `new()`'s exhaustive destructure (`lifecycle.rs`), and
-`heap_estimate`'s hand-enumerated buckets — whose bucket names already NAME
-the natural sub-structs. Each `evict_*` must hand-clear its sibling index
-fields — a fourth parallel spelling.
-
-**Phase 1 landed** (commit `rework(E2.1): PackageFacts`) — `PackageFacts` (`parents`/`uses`/`framework`/
-`requires`/`is_role`/`dynamic_parents`) replaces the six per-package sibling
-maps; `FileAnalysis::packages` is the one table, `parents_of` and
-`Surface::project` read one entry, and `Surface::project` destructures
-`PackageFacts` exhaustively so E1's classification gate reaches the new
-per-package lane too.
-
-**Phase 2a landed** (commit `rework(E2.2): RefTable`) — `RefTable`
-(`model/file_analysis/ref_table.rs`) is the reference axis: the `Vec<Ref>`,
-the three indices over it (name, resolved-target, start-anchored call), its
-`evict()`, its `heap_add()` arm and its enrichment baseline in one owner.
-`FileAnalysis::refs` is private; consumers read `refs()` / `refs_to_symbol` /
-`ref_row_seeds`, and `evict_refs` / `finalize_post_walk` / enrichment
-delegate, so an index can no longer survive its refs.
-
-**Phase 2b landed** (commit `rework(E2.3): SymbolTable`) — `SymbolTable`
-(`model/file_analysis/symbol_table.rs`) is the symbol axis on RefTable's
-shape: the `Vec<Symbol>`, the name and scope indices over it, its
-`evict()`, its `heap_add()` arm, its enrichment baseline and its
-`row_seeds()` in one owner. `FileAnalysis::symbols` is private; consumers
-read `symbols()` / `symbols_mut()` / `symbols_named` / `symbols_in_scope` /
-`sym_row_seeds`, and `evict_symbols` / `finalize_post_walk` / enrichment
-delegate.
-
-**Target shape.** Cut along the seams the heap probe names, phased
-cheapest-leverage first: (1) `PackageFacts` — LANDED; (2a) `RefTable` —
-LANDED; (2b) `SymbolTable` — LANDED; (3) `PackFacts` and `PluginFacts`.
-`FileAnalysisParts` collapses to moving sub-structs; `new()` shrinks; serde
-field order preserved, one EXTRACT_VERSION bump at the end.
-
-**Migration order.** Phase 3 lands best AFTER E1 (surface_feed then
-destructures sub-structs). The builder still accumulates its
-walk-time per-package lanes as sibling maps and folds them at
-`PackageFacts::fold`; `LocalParents` / `PackageFrameworks` are the read seams
-that let both sides answer. Collapsing the builder onto the one shape is
-available once the `contains_key`-means-"has parents" sites
-(`visit_decl`, `plugin_emit`) are re-expressed.
-
-**Gate.** The residency tripwire and eviction tests already net phase 2;
-equality-net tests cover PackageFacts' Surface join; heap probe totals
-compared before/after.
+`FileAnalysis` is a table of lanes, not a flat field list. `PackageFacts`
+(`mod.rs`) is one entry per package — parents, uses, framework, requires,
+role-ness, dynamic-parents — behind `FileAnalysis::packages`, so a
+per-package join is one lookup and `Surface::project` destructures the
+entry exhaustively. `RefTable` (`ref_table.rs`) and `SymbolTable`
+(`symbol_table.rs`) are the reference and symbol axes: the vec, every
+index over it, its `evict()`, its `heap_add()` arm and its enrichment
+baseline in one owner, with the vec private so an index cannot survive its
+rows. `PackFacts` (`pack_facts.rs`) is the pack lane (receiver names,
+specialization edges, template params, macro defs, include directives and
+closure, domain sites, move/control/param regions) and `PluginFacts`
+(`plugin_facts.rs`) the plugin lane (namespaces, loader facts,
+diagnostics, gated emissions, app-surface consumers) — both empty by
+default, so "this is a plain Perl analysis" is two empty sub-structs.
+`FileAnalysisParts` and `new()`'s destructure carry the lanes as
+themselves (the symbol/ref axes stay flat vecs the builder appends to and
+the tables adopt), `surface_feed` destructures every sub-struct
+exhaustively so a new lane field is a compile error until its Surface fate
+is decided, and each sub-struct assembles its own heap-probe bucket.
+Phase commits: `rework(E2.1): PackageFacts`, `rework(E2.2): RefTable`,
+`rework(E2.3): SymbolTable`, `rework(E2.3b): PackFacts and PluginFacts`,
+`rework(E2.4): the Parts boundary moves lanes`.
 
 ### E3. LANDED — Ref's resolution outcome lives in one home: `Ref::binding`
 
@@ -343,8 +316,8 @@ accessors (`resolved_symbol` / `method_target` / `resolved_package` /
 against `RefKind` itself. `row_seed` derives the same qual columns from the
 binding (row format unchanged — no REF_ROWS_VERSION bump); EXTRACT_VERSION
 bumped (175→176). The `Function { sym }` slot was dropped — no path mints a
-FunctionCall→symbol link today, and a dead field is not a seam. Landed
-before E2's RefTable; when RefTable lands it inherits the field as-is.
+FunctionCall→symbol link today, and a dead field is not a seam. `RefTable` owns
+the field's home now; the binding shape is unchanged by that move.
 
 ### E4. LANDED — symbol presentation policy is one home: `Symbol.presentation`
 
@@ -475,11 +448,11 @@ declares no names exempts nothing, pinned by
 2. **Correctness-bearing seams (M):** E1 (SurfaceFeed + two backfills), A1
    (invocant ladder), B2 (builtins), B1 (diagnostics seams), G1 (Moo gate),
    C1 (pack routing — LANDED), D3 (PackInvalidator — LANDED), F1 (file_analysis
-   recut — LANDED), E2 phase 1 (PackageFacts).
+   recut — LANDED), E2 phase 1 (PackageFacts — LANDED).
 3. **Structural slices (L):** D1 (enrichment as derived artifact), D2
    (IndexCore — LANDED), A2 (highlights/linked-editing projections — LANDED), F2
    (monolith directories — LANDED), A3/A4, D4/D5, E3 (LANDED).
-4. **The arc:** E2 phases 2-3 (+ E4 alongside).
+4. **The arc:** E2 phases 2-3 (LANDED, + E4 alongside).
 
 ---
 

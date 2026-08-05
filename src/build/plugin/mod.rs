@@ -327,7 +327,7 @@ pub enum EmitAction {
     /// Emit a `HashKeyAccess` reference targeting a def (typically emitted
     /// by a partner call site — e.g. `->emit('x')` references the def
     /// produced by `->on('x', sub {})`). The owner + name pair is how
-    /// `refs_by_target` pairs accesses to their definition across files.
+    /// `refs_to_symbol` pairs accesses to their definition across files.
     HashKeyAccess {
         /// Key name (e.g. `"connect"`). This is the `target_name` on the Ref.
         name: String,

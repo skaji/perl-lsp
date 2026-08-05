@@ -792,7 +792,7 @@ finding — the capture/decide/emit split already carries them:
   diagnostic source (`perl-lsp/<plugin>`). Severity is an open string
   (`error`/`warning`/`info`, anything else renders HINT) — the
   vocabulary is the plugin's, core maps at render time only.
-- **`FileAnalysis.plugin_diagnostics`** (serde-default, rides the
+- **`FileAnalysis.plugin.diagnostics`** (serde-default, rides the
   cache blob — workspace `--check` sees plugin lints on cached files;
   `EXTRACT_VERSION` bumped). `collect_diagnostics` renders them
   alongside the native channels; no publish-path special-casing.

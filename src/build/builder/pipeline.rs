@@ -497,14 +497,20 @@ pub(super) fn build_with_plugins_inner(
         export_ok: b.export_ok,
         export_tags: b.export_tags,
         reexport_modules: b.reexport_modules,
-        plugin_namespaces: b.plugin_namespaces,
+        plugin: crate::model::file_analysis::PluginFacts {
+            namespaces: b.plugin_namespaces,
+            loads: b.plugin_loads,
+            diagnostics: b.plugin_diagnostics,
+            gated_emissions: b.gated_emissions,
+            app_surface_consumers: b.app_surface_consumers,
+        },
+        // The pack lane is empty for Perl: no macros, no include graph,
+        // no template params, no `std::move`.
+        pack: crate::model::file_analysis::PackFacts::default(),
         type_provenance: b.type_provenance,
         package_ranges: b.package_ranges,
-        plugin_diagnostics: b.plugin_diagnostics,
-        app_surface_consumers: b.app_surface_consumers,
         witnesses: b.bag,
         provisional_dispatches: b.provisional_dispatches,
-        gated_emissions: b.gated_emissions,
         guard_sites: b.guard_sites,
         arrow_deref_sites: b.arrow_deref_sites,
         attr_projections: b.attr_projections,
@@ -515,15 +521,8 @@ pub(super) fn build_with_plugins_inner(
         dynamic_dispatch_sites: b.dynamic_dispatch_sites,
         dbic_source_name: b.dbic_source_name,
         column_keyed_verbs: b.plugins.column_keyed_verbs().map(|s| s.to_string()).collect(),
-        plugin_loads: b.plugin_loads,
         loader_config_params: b.loader_config_params,
         flow_edges: b.flow_edges,
-        // use-after-move is a cpp-pack fact (`std::move`); Perl mints none.
-        moved_from: Vec::new(),
-        control_regions: Vec::new(),
-        param_regions: Vec::new(),
-        // domain-typing sites are a pack-language fact; Perl mints none here.
-        domain_sites: Vec::new(),
     });
     // Finalize: the MCB→bag bridge (`emit_method_call_binding_edges`)
     // publishes `Variable → Edge(MethodOnClass{...})` for every recorded

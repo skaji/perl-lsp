@@ -129,7 +129,7 @@ Members today:
   synthetic ancestor in the MRO walk (`file_analysis::parents_of`, the single
   edge-injection seam shared by every parent-enumeration site), so adding a
   consumer is one synthetic-parent edge and adding a helper is one bridge to the
-  surface. The builder bakes the union onto `FileAnalysis.app_surface_consumers`.
+  surface. The builder bakes the union onto `FileAnalysis.plugin.app_surface_consumers`.
   (`frameworks/mojo-helpers.rhai`.)
 
 The recurring rule: **a manifest entry is the plugin naming a property; the core

@@ -36,7 +36,7 @@ Nothing else in the type tier can say "this member's return *is the class's
 first type parameter*." Two halves:
 
 - **Template-def side.** `@tmpl.param` / `@tmpl.owner` skeleton captures feed
-  `FileAnalysis.template_params` (per-class ordered param names — primaries by
+  `FileAnalysis.pack.template_params` (per-class ordered param names — primaries by
   base, partial specs by canonical spelling). The writeback translates a
   param-mentioning member return into a deferred `ReturnExpr` on `Symbol(sid)`:
   a bare param → `Operator(ParamOf { index, of: Receiver })`; a param one hop

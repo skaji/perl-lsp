@@ -86,7 +86,7 @@ bytes live* changes (on disk + LRU-on-demand instead of resident-always).
 
 Held resident for **every** indexed file, exactly as today:
 
-- `refs` + the `refs_by_target` / `refs_by_name` reverse indices — answer
+- the `RefTable` (refs + their name/target/call indices) — answers
   `references` / `documentHighlight` with exact ranges.
 - the `SymbolTable` (symbols + their name/scope indices) — answers `goto-def` (via
   `Ref::binding`'s method target + symbol lookup), `hover` on a definition,
@@ -94,14 +94,14 @@ Held resident for **every** indexed file, exactly as today:
 - The pack `ModuleIndex`'s `all_files` / `all_defs` name→file index — answers
   `workspace/symbol` and "which files could reference X" without touching any
   body.
-- `include_closure`, `packages`, `specializes`, `return_types`,
-  `template_params` — the cross-file visibility / inheritance / baked-return
-  metadata the graph walk and MRO need.
+- `PackFacts` (the include closure, specialization edges, template params),
+  `packages`, `return_types` — the cross-file visibility / inheritance /
+  baked-return metadata the graph walk and MRO need.
 
 The completeness-critical, whole-tree queries are **bag-free by construction**
 (none of them call a reducer). So dropping the bag cannot make references or
 symbols incomplete — the abseil 13-refs-incl-`_test.cc` case rides
-`refs_by_target`, which stays pinned.
+the `RefTable` target index, which stays pinned.
 
 ### Evicted (the 71.5%)
 
@@ -185,7 +185,7 @@ kept as an optional **Slice 3** to chase clangd's ~320 MB, not needed to hit
 
 | Query | Projection reads | Bag? | Evicted-file behavior |
 |---|---|---|---|
-| `references` / `documentHighlight` | `refs`, `refs_by_target` | no | complete, resident |
+| `references` / `documentHighlight` | `RefTable` (refs + target index) | no | complete, resident |
 | `goto-def` | `Ref::binding` (method target), `symbols` | no | complete, resident |
 | `rename` / `prepareRename` | `refs`, `symbols` | no | complete, resident |
 | `workspace/symbol` | `all_defs` (name→file) | no | complete, resident |

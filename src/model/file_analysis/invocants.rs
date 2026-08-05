@@ -705,7 +705,7 @@ impl FileAnalysis {
 
         // Function-call receiver (`create_user(5)->name`): the ref spans
         // only the function NAME, so the exact-span read below can't see
-        // it — chase it here via `call_ref_by_start` (start-anchored,
+        // it — chase it here via `RefTable::call_at_start` (start-anchored,
         // contained in the invocant). A method-call receiver is left to
         // the exact-span read: its ref spans the whole receiver
         // expression, and the start-anchored index deliberately holds the

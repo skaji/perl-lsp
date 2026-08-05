@@ -65,7 +65,8 @@ mask and calling `refs_to`.
 
 The walk: start at the `from` namespace, DFS through `PackageFacts::parents`
 (soon: `namespace_parents`), filter file entries by mask. `refs_to` reads
-each file's `refs_by_target` for O(1) per-file lookup.
+each file's `RefTable` target index (`refs_to_symbol`) for O(1) per-file
+lookup.
 
 The inverse direction — `resolve_symbol` (cursor → target) — is the single
 entry point for "what does this position refer to, cross-file". It returns

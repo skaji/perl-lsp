@@ -1096,40 +1096,45 @@ impl SkeletonAnalysis {
         for (child, parent) in &self.parents {
             packages.entry(child.clone()).or_default().parents.push(parent.clone());
         }
+        let pack = crate::model::file_analysis::PackFacts {
+            // Pack-declared receiver names ride the FA so core's member /
+            // outline filters can exclude them generically (lang semantics in
+            // the pack, generic logic in core).
+            receiver_names: std::mem::take(&mut self.receiver_names),
+            // Specialization family edges (spec → primary). NOT an inheritance
+            // edge: a spec inherits nothing from its primary (it replaces
+            // wholesale), so member resolution must never fall through this
+            // edge — only the graph's `Specializes` family view reads it.
+            specializes: self.specializations.drain(..).collect(),
+            // Per-class ordered template params — the substitution axis the
+            // dispatch ladder + field substitution read (methods already carry
+            // `ParamOf` witnesses from the writeback above).
+            template_params,
+            // Include/import path tokens carry a span so goto-def can resolve
+            // the header (the bare `imports` list is span-less). Resolution to
+            // an absolute path happens where the file path is in hand (the
+            // driver), which also fills `macro_defs` / `include_closure`.
+            include_directives: self
+                .import_sites
+                .drain(..)
+                .map(|(raw, span)| (span, raw))
+                .collect(),
+            domain_sites: std::mem::take(&mut self.domain_sites),
+            moved_from: std::mem::take(&mut self.moved_from),
+            control_regions: std::mem::take(&mut self.control_regions),
+            param_regions: std::mem::take(&mut self.param_regions),
+            ..Default::default()
+        };
         let mut fa = FileAnalysis::new(FileAnalysisParts {
             scopes: self.scopes,
             symbols,
             refs,
             witnesses: bag,
             packages,
+            pack,
             flow_edges: std::mem::take(&mut self.flow_edges),
-            moved_from: std::mem::take(&mut self.moved_from),
-            control_regions: std::mem::take(&mut self.control_regions),
-            param_regions: std::mem::take(&mut self.param_regions),
-            domain_sites: std::mem::take(&mut self.domain_sites),
             ..Default::default()
         });
-        // Pack-declared receiver names ride the FA so core's member /
-        // outline filters can exclude them generically (lang semantics in
-        // the pack, generic logic in core).
-        fa.pack.receiver_names = std::mem::take(&mut self.receiver_names);
-        // Specialization family edges (spec → primary). NOT an inheritance edge:
-        // a spec inherits nothing from its primary (it replaces wholesale),
-        // so member resolution must never fall through this edge — only the
-        // graph's `Specializes` family view reads it.
-        fa.pack.specializes = self.specializations.drain(..).collect();
-        // Per-class ordered template params — the substitution axis the
-        // dispatch ladder + field substitution read (methods already carry
-        // `ParamOf` witnesses from the writeback above).
-        fa.pack.template_params = template_params;
-        // Include/import path tokens carry a span so goto-def can resolve the
-        // header (the bare `imports` list is span-less). Resolution to an
-        // absolute path happens where the file path is in hand (the driver).
-        fa.pack.include_directives = self
-            .import_sites
-            .drain(..)
-            .map(|(raw, span)| (span, raw))
-            .collect();
         // Seal base_*_count so a later enrich pass (the CLI/--batch path
         // runs it unconditionally) truncates to the FULL analysis, not to
         // zero — otherwise enrichment wipes every pack-language symbol.

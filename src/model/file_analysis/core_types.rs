@@ -699,7 +699,7 @@ pub enum SymbolDetail {
     /// sites and by hover to describe the handler shape.
     ///
     /// The plugin's choice of LSP kind rides `Symbol.presentation` —
-    /// handlers share internal machinery (refs_by_target, stacking
+    /// handlers share internal machinery (the ref target index, stacking
     /// semantics, cross-file resolution) but aren't all "events": Mojo
     /// events are, but routes are methods, config keys are fields, etc.
     Handler {
@@ -1187,7 +1187,7 @@ pub enum RefKind {
         invocant: crate::model::conventions::Invocant,
         /// Span of the invocant node. Used by
         /// `method_call_invocant_class` to find an inner-receiver
-        /// ref via `call_ref_by_start` (chain dispatch).
+        /// ref via `RefTable::call_at_start` (chain dispatch).
         invocant_span: Option<Span>,
         /// Span of just the method name (for rename — r.span covers the whole expression).
         method_name_span: Span,
