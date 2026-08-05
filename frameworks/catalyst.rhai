@@ -177,11 +177,15 @@ fn overrides() {
 fn param_types() {
     [
         // Controller actions: gated on the attribute the dispatcher requires.
+        // Private actions are dispatched by NAME alone (no attribute), so
+        // they ride the gate's declared exemption list.
         #{ in_role: "Catalyst::Controller", param: 1, type_class: "Catalyst",
-           requires_action_attr: true },
+           requires_action_attr: true,
+           implicit_action_names: ["begin", "end", "auto", "default", "index"] },
         // Catalyst::View action methods follow the same attribute convention.
         #{ in_role: "Catalyst::View", param: 1, type_class: "Catalyst",
-           requires_action_attr: true },
+           requires_action_attr: true,
+           implicit_action_names: ["begin", "end", "auto", "default", "index"] },
         // Catalyst::Model gets the context through `ACCEPT_CONTEXT($self, $c)`
         // / `COMPONENT($self, $app)` — fixed contract method names, no action
         // attribute — so these are *named* rules, not the attribute-gated

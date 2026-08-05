@@ -761,6 +761,7 @@ mod param_types_manifest {
                     param: 1,
                     type_class: "Mojolicious".into(),
                     requires_action_attr: false,
+                    implicit_action_names: vec![],
                     from_loader_config: false,
                 }]
             })
@@ -1031,8 +1032,12 @@ mod param_types_manifest {
                     param: 1,
                     type_class: "Catalyst".into(),
                     // Mirror the real catalyst.rhai: only attribute-carrying
-                    // actions get $c, not plain helper subs.
+                    // actions get $c, not plain helper subs — plus the
+                    // name-dispatched private actions the rule declares.
                     requires_action_attr: true,
+                    implicit_action_names: ["begin", "end", "auto", "default", "index"]
+                        .map(String::from)
+                        .to_vec(),
                     from_loader_config: false,
                 }]
             })
@@ -1202,8 +1207,9 @@ mod param_types_manifest {
     }
 
     /// Catalyst private-action names (`begin`/`end`/`auto`/`default`/`index`)
-    /// are dispatched by name alone — no action attribute. The `requires_action_attr`
-    /// gate must not exclude them, so `$c` still types.
+    /// are dispatched by name alone — no action attribute. The rule DECLARES
+    /// them (`implicit_action_names`, mirroring catalyst.rhai), so the
+    /// `requires_action_attr` gate lets them through and `$c` still types.
     #[test]
     fn catalyst_private_action_names_type_c_without_attr() {
         // `sub end { my ($self,$c)=@_ }` in a controller — no attribute.
@@ -1231,6 +1237,53 @@ mod param_types_manifest {
             fa.inferred_type_via_bag("$x", Point::new(4, 12)),
             None,
             "non-action, non-private-action helper must NOT have $x typed as Catalyst",
+        );
+    }
+
+    // The name-dispatched exemption is PER-RULE, not a core allowlist: an
+    // attribute-gated rule from another framework that declares NO
+    // implicit_action_names must not inherit Catalyst's private-action
+    // names — `sub begin` without an attribute stays untyped.
+    struct StrictAttrPlugin;
+    impl FrameworkPlugin for StrictAttrPlugin {
+        fn id(&self) -> &str { "strict-attr-test" }
+        fn triggers(&self) -> &[Trigger] {
+            static T: [Trigger; 1] = [Trigger::Always];
+            &T
+        }
+        fn param_types(&self) -> &[ParamType] {
+            use std::sync::OnceLock;
+            static PT: OnceLock<Vec<ParamType>> = OnceLock::new();
+            PT.get_or_init(|| {
+                vec![ParamType {
+                    method: None,
+                    in_role: "Other::Framework::Handler".into(),
+                    param: 1,
+                    type_class: "Other::Framework".into(),
+                    requires_action_attr: true,
+                    implicit_action_names: vec![],
+                    from_loader_config: false,
+                }]
+            })
+        }
+        fn on_signature_help(&self, _: &SigHelpQueryContext) -> Option<PluginSigHelpAnswer> { None }
+        fn on_completion(&self, _: &CompletionQueryContext) -> Option<PluginCompletionAnswer> { None }
+    }
+
+    #[test]
+    fn attr_gated_rule_without_declared_names_exempts_nothing() {
+        let mut reg = PluginRegistry::new();
+        reg.register(Box::new(StrictAttrPlugin));
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+        let src = "package My::Handler;\nuse parent 'Other::Framework::Handler';\nsub begin {\n    my ($self, $c) = @_;\n    my $r = $c;\n}\n1;\n";
+        let tree = parser.parse(src, None).unwrap();
+        let fa = crate::build::builder::build_with_plugins(&tree, src.as_bytes(), Arc::new(reg));
+        assert_eq!(
+            fa.inferred_type_via_bag("$c", Point::new(4, 12)),
+            None,
+            "`begin` is Catalyst vocabulary; a rule that declares no \
+             implicit_action_names must not exempt it from the attribute gate",
         );
     }
 }

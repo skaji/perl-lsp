@@ -1235,13 +1235,14 @@ impl<'a> Builder<'a> {
         sub_name: &str,
         out: &mut Vec<(String, String, String, bool)>,
     ) {
-        // Catalyst dispatches these private actions by name; over-inclusion of
-        // non-action-attributed subs is a documented follow-up.
-        const CATALYST_PRIVATE_ACTIONS: &[&str] =
-            &["begin", "end", "auto", "default", "index"];
-        let is_private_action = CATALYST_PRIVATE_ACTIONS.contains(&sub_name);
         for r in rules {
-            if r.requires_action_attr && !has_action_attr && !is_private_action {
+            // Attribute-gated rule: fires on attributed actions plus the
+            // rule's own name-dispatched exemptions (`implicit_action_names`
+            // — plugin-declared, so core carries no framework vocabulary).
+            if r.requires_action_attr
+                && !has_action_attr
+                && !r.implicit_action_names.iter().any(|n| n == sub_name)
+            {
                 continue;
             }
             if let Some(p) = params.get(r.param) {

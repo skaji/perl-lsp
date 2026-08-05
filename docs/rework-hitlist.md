@@ -554,20 +554,16 @@ flavor: native accessor + plugin options), pinned by
 `mouse_has_gets_both_native_accessor_and_plugin_predicate`; the open seam is
 pinned by `test_plugin_declared_framework_mode_maker_grants_has_semantics`.
 
-### G2. Catalyst private-action name allowlist hardcoded in core's generic param_types dispatcher — **medium leverage / S**
+### G2. LANDED — name-dispatched action exemptions are per-rule plugin vocabulary
 
-`collect_param_type_matches` hardcodes `CATALYST_PRIVATE_ACTIONS = ["begin",
-"end", "auto", "default", "index"]` and lets those names bypass the
-plugin-declared `requires_action_attr` gate for EVERY plugin's rules
-(`src/build/builder/visit_decl.rs:1240-1245`; the gate:
-`frameworks/catalyst.rhai:177-184`; the manifest doc:
-`src/build/plugin/mod.rs:952-961`). A non-Catalyst plugin using
-`requires_action_attr` inherits five Catalyst names it never asked for;
-Catalyst's set is frozen in core. The in-code "documented follow-up" claim
-points at no doc. Fix: `#[serde(default)] implicit_action_names: Vec<String>`
-on `plugin::ParamType`, declared by catalyst.rhai; the core check becomes
-per-rule; delete the const. Gate: a param_types test with a second manifest
-setting `requires_action_attr` and asserting `begin` is NOT exempt.
+`plugin::ParamType.implicit_action_names` (`#[serde(default)]`) declares the
+sub names a framework dispatches by name alone — they pass that rule's
+`requires_action_attr` gate; catalyst.rhai declares
+`begin`/`end`/`auto`/`default`/`index` on its two attribute-gated wildcard
+rules, and core's `collect_param_type_matches` checks per-rule (the
+`CATALYST_PRIVATE_ACTIONS` const is deleted). A non-Catalyst rule that
+declares no names exempts nothing, pinned by
+`attr_gated_rule_without_declared_names_exempts_nothing`.
 
 ---
 

@@ -977,6 +977,14 @@ pub struct ParamType {
     /// *named* rules that don't set this.
     #[serde(default)]
     pub requires_action_attr: bool,
+    /// Sub names the framework dispatches by NAME alone, with no attribute —
+    /// they pass this rule's `requires_action_attr` gate anyway. Catalyst's
+    /// private actions (`begin`/`end`/`auto`/`default`/`index`) are the
+    /// motivating set. Per-rule, plugin-declared: the framework owns its
+    /// vocabulary (rule #10), and another plugin's attribute-gated rule
+    /// never inherits names it didn't ask for.
+    #[serde(default)]
+    pub implicit_action_names: Vec<String>,
     /// The param's REAL type is whatever value the loader call passed
     /// (`plugin 'X', {...}` → register's `$conf`): enrichment joins
     /// the callee-side marker this mints with caller-side
