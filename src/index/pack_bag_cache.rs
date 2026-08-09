@@ -32,13 +32,20 @@ use crate::index::module_cache::RehydrateMiss;
 type Loader = Box<dyn Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync>;
 
 pub struct PackBagCache {
-    /// Rehydrated, bag-present analyses keyed by canonical path.
-    entries: DashMap<PathBuf, Arc<FileAnalysis>>,
+    /// Rehydrated, bag-present analyses keyed by canonical path, each paired
+    /// with the byte size CHARGED for it. The size travels with the entry so
+    /// a removal always credits back exactly what its insert debited — a
+    /// re-measured `heap_estimate` (or a lost race) would otherwise leave the
+    /// counter drifting upward, and this counter gates eviction.
+    entries: DashMap<PathBuf, (Arc<FileAnalysis>, usize)>,
     /// Last-touch stamp per retained path — the LRU recency source.
     recency: DashMap<PathBuf, u64>,
     /// Monotone recency clock; every touch bumps it.
     clock: AtomicU64,
-    /// Sum of retained analyses' estimated resident payload.
+    /// Sum of retained analyses' charged payload. Kept exactly equal to the
+    /// sum of `entries`' charges; `resync_bytes` repairs it if a concurrent
+    /// interleaving ever breaks that, because an over-count is a one-way
+    /// ratchet that collapses the cache to a single entry.
     bytes: AtomicUsize,
     /// `maxCacheMb * 1 MiB`. `0` ⇒ never retain (rehydrate-and-drop).
     cap_bytes: usize,
@@ -85,7 +92,7 @@ impl PackBagCache {
     /// collapsing every cause into "loader returned None".
     pub fn bag_for_diag(&self, path: &Path) -> Result<Arc<FileAnalysis>, RehydrateMiss> {
         if let Some(hit) = self.entries.get(path) {
-            let arc = hit.value().clone();
+            let arc = hit.value().0.clone();
             drop(hit);
             self.recency.insert(path.to_path_buf(), self.tick());
             return Ok(arc);
@@ -104,11 +111,27 @@ impl PackBagCache {
             return Ok(fa);
         }
         let sz = fa.heap_estimate().total();
-        self.entries.insert(path.to_path_buf(), fa.clone());
-        self.recency.insert(path.to_path_buf(), self.tick());
+        // Debit BEFORE the map write, credit the displaced entry after. Two
+        // threads racing to rehydrate one path both insert but only one entry
+        // survives, so the loser's charge must be refunded — and refunding it
+        // before its own debit landed would refund nothing (the counter reads
+        // zero) and strand the charge forever.
         self.bytes.fetch_add(sz, Ordering::Relaxed);
+        if let Some((_, old_sz)) = self.entries.insert(path.to_path_buf(), (fa.clone(), sz)) {
+            self.credit(old_sz);
+        }
+        self.recency.insert(path.to_path_buf(), self.tick());
         self.evict_to_cap(path);
         Ok(fa)
+    }
+
+    /// Refund a charge for an entry that has left the map. Saturating only as
+    /// a wrap guard — every credited size was debited before its entry became
+    /// visible, so the total can't legitimately go negative.
+    fn credit(&self, sz: usize) {
+        let _ = self.bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+            Some(b.saturating_sub(sz))
+        });
     }
 
     /// Drop LRU-tail entries until the retained byte total is within cap. Never
@@ -123,13 +146,28 @@ impl PackBagCache {
                 .filter(|e| e.key().as_path() != keep)
                 .min_by_key(|e| *e.value())
                 .map(|e| e.key().clone());
-            let Some(victim) = victim else { break };
+            let Some(victim) = victim else {
+                // Nothing left to evict but the counter still reads over cap:
+                // the charge total has drifted above what the map actually
+                // holds. Left alone this is a one-way ratchet — every later
+                // insert re-enters this loop and drains the cache to `keep`,
+                // so the LRU degenerates to one entry and every query pays a
+                // full blob decode. Repair from the map and stop.
+                self.resync_bytes();
+                return;
+            };
             self.recency.remove(&victim);
-            if let Some((_, fa)) = self.entries.remove(&victim) {
-                let sz = fa.heap_estimate().total();
-                self.bytes.fetch_sub(sz, Ordering::Relaxed);
+            if let Some((_, (_, sz))) = self.entries.remove(&victim) {
+                self.credit(sz);
             }
         }
+    }
+
+    /// Recompute the charge total from the map. O(entries), and only reached
+    /// when eviction has run out of victims while still reading over cap.
+    fn resync_bytes(&self) {
+        let truth: usize = self.entries.iter().map(|e| e.value().1).sum();
+        self.bytes.store(truth, Ordering::Relaxed);
     }
 
     /// Drop `path`'s retained bag (a changed/saved file's bag is stale) so the
@@ -137,9 +175,8 @@ impl PackBagCache {
     pub fn invalidate(&self, path: &Path) {
         *self.generation.entry(path.to_path_buf()).or_insert(0) += 1;
         self.recency.remove(path);
-        if let Some((_, fa)) = self.entries.remove(path) {
-            let sz = fa.heap_estimate().total();
-            self.bytes.fetch_sub(sz, Ordering::Relaxed);
+        if let Some((_, (_, sz))) = self.entries.remove(path) {
+            self.credit(sz);
         }
     }
 }
@@ -225,6 +262,72 @@ mod tests {
         assert!(
             !c.entries.contains_key(&p),
             "a decode overlapped by an invalidate must not be retained"
+        );
+    }
+
+    /// The charge total must equal the sum of what the map actually holds.
+    /// When it drifts ABOVE that, `evict_to_cap` can never get back under cap
+    /// and drains the LRU to a single entry on every insert — the cache stops
+    /// caching, every cross-file bag query pays a full blob decode, and a
+    /// long-lived session walks into multi-GB of decode churn.
+    #[test]
+    fn charge_total_tracks_the_map_and_cannot_ratchet() {
+        let one = empty_fa().heap_estimate().total();
+        let cache = PackBagCache::new(one * 8, move |_p| Ok(empty_fa()));
+        let paths: Vec<PathBuf> =
+            (0..24).map(|i| PathBuf::from(format!("/x/{i}.h"))).collect();
+        for p in &paths {
+            cache.bag_for(p);
+        }
+        // Poison the counter the way a lost concurrent credit would, then keep
+        // using the cache: it must self-repair, not collapse.
+        cache.bytes.fetch_add(one * 1000, Ordering::Relaxed);
+        for p in &paths {
+            cache.bag_for(p);
+        }
+        let truth: usize = cache.entries.iter().map(|e| e.value().1).sum();
+        assert_eq!(
+            cache.bytes.load(Ordering::Relaxed),
+            truth,
+            "charge total drifted from the map"
+        );
+        assert!(
+            cache.entries.len() > 1,
+            "cache collapsed to {} entries — the eviction ratchet is back",
+            cache.entries.len()
+        );
+        assert!(cache.bytes.load(Ordering::Relaxed) <= cache.cap_bytes);
+    }
+
+    /// Threads racing the same decode both insert; only one entry survives, so
+    /// only one charge may. Left unrefunded, the losers' charges are what push
+    /// the total past cap for good.
+    #[test]
+    fn concurrent_decodes_of_one_path_charge_once() {
+        let cache = Arc::new(PackBagCache::new(128 * 1024 * 1024, move |_p| {
+            // Wide enough for the misses to overlap on the insert.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            Ok(empty_fa())
+        }));
+        let p = PathBuf::from("/x/hot.h");
+        let hands: Vec<_> = (0..8)
+            .map(|_| {
+                let c = Arc::clone(&cache);
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    c.bag_for(&p);
+                })
+            })
+            .collect();
+        for h in hands {
+            h.join().unwrap();
+        }
+        let truth: usize = cache.entries.iter().map(|e| e.value().1).sum();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.bytes.load(Ordering::Relaxed),
+            truth,
+            "racing decodes stacked charges for one entry"
         );
     }
 

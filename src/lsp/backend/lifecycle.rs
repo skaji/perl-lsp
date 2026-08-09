@@ -393,6 +393,14 @@ impl Backend {
 /// the burst: only the latest fire surviving the settle window republishes.
 /// The tokio handle is captured at construction because the callback runs on
 /// the resolver thread, which has no tokio context.
+///
+/// The debounce bounds how many fires are SCHEDULED, not how many run at
+/// once: a body that outlives the settle window is overtaken by the next
+/// surviving fire, and on a large dep tree the bodies (a whole-analysis
+/// re-enrich each) stacked ~20 deep and took the process to multi-GB. `run`
+/// serializes them, and each waiter re-probes `Latest::still` after
+/// acquiring it, so a queue of superseded fires collapses to the newest
+/// instead of replaying every one.
 fn make_on_refresh(
     client: Client,
     files: Arc<FileStore>,
@@ -400,18 +408,26 @@ fn make_on_refresh(
     diag_options: Arc<std::sync::Mutex<symbols::DiagnosticOptions>>,
 ) -> impl Fn() + Send + Sync + 'static {
     let debounce = Arc::new(DebouncedLatest::default());
+    let run = Arc::new(tokio::sync::Mutex::new(()));
     let handle = tokio::runtime::Handle::current();
     move || {
         let client = client.clone();
         let files = Arc::clone(&files);
         let holder = Arc::clone(&holder);
         let diag_options = Arc::clone(&diag_options);
+        let run = Arc::clone(&run);
         log::debug!("diag-refresh fired");
-        debounce.fire(&handle, std::time::Duration::from_millis(120), move |_latest| async move {
+        debounce.fire(&handle, std::time::Duration::from_millis(120), move |latest| async move {
             let module_index = match holder.get() {
                 Some(idx) => idx,
                 None => return,
             };
+            // One refresh body at a time; whoever waited out a long one and
+            // was superseded meanwhile drops instead of re-running it.
+            let _serialized = run.lock().await;
+            if !latest.still() {
+                return;
+            }
             log::debug!("diag-refresh executing");
             // Derive (uri, diagnostics) first without holding the store lock
             // across the await — publishing is async and could deadlock.
