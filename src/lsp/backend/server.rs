@@ -426,6 +426,9 @@ impl LanguageServer for Backend {
         // the running loop's next `finish` sees Vacant and stops) and end the
         // degraded-window progress if one is still live.
         self.gather_reg.forget(&uri);
+        // The closed doc's rebuild gate has no further fires to collapse; an
+        // in-flight one holds its own Arc and finishes against that.
+        self.change_debounce.remove(&uri);
         if let Some((_, token)) = self.degraded_progress.remove(&uri) {
             progress_end(&self.client, token).await;
         }

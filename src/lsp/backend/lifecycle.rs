@@ -198,12 +198,13 @@ impl Backend {
     /// the edit that survives the settle window rebuilds, so a burst of
     /// keystrokes collapses to ONE analysis after typing settles.
     pub(super) fn spawn_debounced_rebuild(&self, uri: Url) {
-        let debounce = Arc::clone(
+        let gate = Arc::clone(
             self.change_debounce
                 .entry(uri.clone())
                 .or_default()
                 .value(),
         );
+        let debounce = Arc::clone(&gate.debounce);
         let files = Arc::clone(&self.files);
         let module_index = Arc::clone(&self.module_index);
         let client = self.client.clone();
@@ -212,6 +213,16 @@ impl Backend {
         let heal_ctx = self.pack_heal_ctx();
         let handle = tokio::runtime::Handle::current();
         debounce.fire(&handle, std::time::Duration::from_millis(150), move |latest| async move {
+            // One rebuild per URI at a time. The settle window collapses fires
+            // that are superseded BEFORE they start; a burst spaced wider than
+            // it would otherwise run several ~0.7s analyses of this file
+            // concurrently, each holding its own text + tree + analysis. The
+            // `still` re-probe below drops a superseded RESULT — it can't
+            // un-spend that work, so the coalescing has to happen here.
+            let _serialized = gate.run.lock().await;
+            if !latest.still() {
+                return;
+            }
             // Snapshot the latest text off the lock; build on a blocking
             // thread so the ~0.7s analysis never stalls completion/hover.
             let Some((text, path, language)) = files

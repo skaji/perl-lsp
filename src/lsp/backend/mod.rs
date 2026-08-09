@@ -84,7 +84,7 @@ pub struct Backend {
     /// so a burst of keystrokes triggers ONE analysis (~0.7s on a big
     /// macro-heavy C file) after typing settles, not one per keystroke.
     /// Pack languages only; Perl rebuilds synchronously (cheap).
-    change_debounce: Arc<dashmap::DashMap<Url, Arc<DebouncedLatest>>>,
+    change_debounce: Arc<dashmap::DashMap<Url, Arc<ChangeGate>>>,
     /// Workspace indexing is LAZY + per-language: a family's index runs on the
     /// first `did_open` of a file in it, not eagerly at `initialized`. So a C++
     /// session in a mixed tree (e.g. perl5) never pays to index the 4000+ `.pm`

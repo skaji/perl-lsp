@@ -85,6 +85,20 @@ impl DebouncedLatest {
     }
 }
 
+/// A debounce plus the serializer for its work body. `DebouncedLatest`
+/// collapses SCHEDULING — a fire that is superseded before its settle window
+/// elapses never starts. It says nothing about a fire already RUNNING, so a
+/// burst spaced wider than the window overlaps executions of an expensive
+/// body. Re-probing `Latest::still` afterwards discards the superseded
+/// RESULT; it cannot un-spend the work or the peak memory two bodies held at
+/// once. Sites whose body is expensive take `run` first and re-probe after
+/// acquiring, so a queue of superseded fires collapses to the newest.
+#[derive(Default)]
+pub(super) struct ChangeGate {
+    pub(super) debounce: Arc<DebouncedLatest>,
+    pub(super) run: tokio::sync::Mutex<()>,
+}
+
 /// The surviving fire's re-check handle.
 pub(super) struct Latest {
     gate: Arc<DebouncedLatest>,
