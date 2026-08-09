@@ -71,6 +71,50 @@ fn test_db_save_and_load_roundtrip() {
     let _ = std::fs::remove_file(&pm);
 }
 
+/// The @INC pool is keyed by scheme, not by writer. Every name-keyed
+/// producer (resolver thread, one-shot CLI) tags rows `NAME_KEYED_SOURCE`
+/// and `warm_cache` reads exactly that tag; a writer-specific tag stranded
+/// CLI-resolved rows unread, so each CLI verb re-resolved the whole tier.
+/// Path-keyed `workspace` rows must stay out — they stream separately.
+#[test]
+fn warm_cache_shares_the_name_keyed_pool_and_excludes_path_keyed_rows() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+
+    let inc = dir.join("WarmPoolInc.pm");
+    std::fs::write(&inc, "package WarmPoolInc;\nsub f { 1 }\n1;\n").unwrap();
+    let inc_cached = Some(parse_source_to_cached(
+        &std::fs::read_to_string(&inc).unwrap(),
+        &inc,
+    ));
+    save_to_db(&conn, "WarmPoolInc", &inc_cached, NAME_KEYED_SOURCE);
+
+    // Path-keyed: same table, different keying scheme.
+    let ws = dir.join("WarmPoolWorkspace.pm");
+    std::fs::write(&ws, "package WarmPoolWorkspace;\nsub g { 2 }\n1;\n").unwrap();
+    let ws_cached = Some(parse_source_to_cached(
+        &std::fs::read_to_string(&ws).unwrap(),
+        &ws,
+    ));
+    save_to_db(&conn, &ws.to_string_lossy(), &ws_cached, "workspace");
+
+    let cache: DashMap<String, Option<Arc<CachedModule>>> = DashMap::new();
+    let (n, _stale) = warm_cache(&conn, &cache, false);
+
+    assert_eq!(n, 1, "exactly the name-keyed row warms");
+    assert!(
+        cache.contains_key("WarmPoolInc"),
+        "a name-keyed row must warm back regardless of which writer resolved it"
+    );
+    assert!(
+        !cache.contains_key(&*ws.to_string_lossy()),
+        "path-keyed rows must not pollute the name-keyed cache"
+    );
+
+    let _ = std::fs::remove_file(&inc);
+    let _ = std::fs::remove_file(&ws);
+}
+
 /// Pin-the-fix: `plugin_namespaces` survives the bincode +
 /// zstd + SQLite round trip with entities, bridges, and
 /// plugin_id intact. Without this test, schema drift on the

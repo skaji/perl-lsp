@@ -65,7 +65,7 @@ pub(super) fn save_module_generation(
             return true;
         }
     }
-    let persisted = module_cache::save_to_db(conn, module_name, result, "import");
+    let persisted = module_cache::save_to_db(conn, module_name, result, module_cache::NAME_KEYED_SOURCE);
     if !persisted {
         // Blob didn't land (busy/encode failure): shredding rows now would
         // pair a NEW generation's rows with an OLD (or absent) blob —
@@ -79,7 +79,7 @@ pub(super) fn save_module_generation(
             if let Err(e) = module_cache::shred_derived_rows(
                 conn,
                 &m.path.to_string_lossy(),
-                "import",
+                module_cache::NAME_KEYED_SOURCE,
                 &seeds,
                 &sym_seeds,
             ) {

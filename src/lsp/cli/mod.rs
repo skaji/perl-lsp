@@ -342,7 +342,12 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             module_resolver::resolve_and_parse_with_memo(&inc_paths, &name, &mut parser, &mut parse_memo)
                 .map(|cached| {
                     if let Some(ref conn) = db {
-                        module_cache::save_to_db(conn, &name, &Some(std::sync::Arc::clone(&cached)), "cli");
+                        module_cache::save_to_db(
+                            conn,
+                            &name,
+                            &Some(std::sync::Arc::clone(&cached)),
+                            module_cache::NAME_KEYED_SOURCE,
+                        );
                     }
                     module_index.insert_cache(&name, Some(std::sync::Arc::clone(&cached)));
                     resolved += 1;

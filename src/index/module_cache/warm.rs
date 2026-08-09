@@ -252,15 +252,17 @@ pub fn warm_cache(
 ) -> (usize, Vec<String>) {
     // Name-keyed warm serves the @INC tier only; 'workspace' rows are
     // path-keyed and stream through `warm_cache_streaming` — loading them
-    // here would pollute the module cache with path-string keys.
+    // here would pollute the module cache with path-string keys. The tag is
+    // the keying scheme, never the writer: every name-keyed producer shares
+    // `NAME_KEYED_SOURCE` so a new writer cannot strand its rows unread.
     let mut stmt = match conn.prepare(
-        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules WHERE source = 'import'",
+        "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp FROM modules WHERE source = ?1",
     ) {
         Ok(s) => s,
         Err(_) => return (0, Vec::new()),
     };
 
-    let rows = match stmt.query_map([], |row| {
+    let rows = match stmt.query_map(params![NAME_KEYED_SOURCE], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
