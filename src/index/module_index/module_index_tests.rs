@@ -1441,3 +1441,125 @@ async fn resolver_fires_refresh_after_every_drained_batch() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---- Perl package identity: name → MANY files (the candidate relation) ----
+
+/// A multi-package `.pm` is ordinary Perl: EVERY declared package must be
+/// reachable by name, not just the first (`package_names`, not a
+/// first-package key).
+#[test]
+fn second_package_in_file_is_reachable_by_name() {
+    let idx = ModuleIndex::new_for_test();
+    let fa = build_fa(
+        "package Alpha::First;\nsub one { 1 }\npackage Alpha::Second;\nsub two { 2 }\n1;\n",
+    );
+    let path = PathBuf::from("/fake/pkgid/Alpha.pm");
+    let _ = idx.register_workspace_resident(path.clone(), Arc::new(fa));
+    for name in ["Alpha::First", "Alpha::Second"] {
+        let cm = idx.get_cached(name).unwrap_or_else(|| panic!("{name} unreachable"));
+        assert_eq!(cm.path, path);
+        assert!(idx.is_workspace_module(name), "{name} not marked workspace");
+    }
+    // The reverse index sees the second package's sub too.
+    assert!(!idx.modules_with_symbol("two").is_empty());
+}
+
+/// Two files reopening one package: the cache winner is decided by the
+/// candidate SET (smallest path), never by arrival order, and the candidate
+/// table keeps both files either way.
+#[test]
+fn same_package_two_files_is_order_independent() {
+    use crate::model::file_analysis::CrossFileLookup;
+    let src_a = "package Shared::Thing;\nsub from_alpha { 1 }\n1;\n";
+    let src_b = "package Shared::Thing;\nsub from_beta { 3 }\n1;\n";
+    let pa = PathBuf::from("/fake/pkgid/Alpha.pm");
+    let pb = PathBuf::from("/fake/pkgid/Beta.pm");
+    let mut winners = Vec::new();
+    for order in [[(&pa, src_a), (&pb, src_b)], [(&pb, src_b), (&pa, src_a)]] {
+        let idx = ModuleIndex::new_for_test();
+        for (path, src) in order {
+            let _ = idx.register_workspace_resident(path.clone(), Arc::new(build_fa(src)));
+        }
+        let cands = idx.def_candidates("Shared::Thing");
+        let mut paths: Vec<_> = cands.iter().map(|c| c.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, vec![pa.clone(), pb.clone()], "both files stay candidates");
+        winners.push(idx.get_cached("Shared::Thing").expect("winner").path.clone());
+    }
+    assert_eq!(winners[0], winners[1], "winner must not depend on registration order");
+    assert_eq!(winners[0], pa, "smallest-path tie-break");
+}
+
+/// Re-registering one file must not wipe a same-named sibling's edges
+/// (`purge_module` used to drop the loser's contributions with no replay).
+/// The sibling here is SYMBOL-EVICTED, so the re-feed exercises the
+/// path-keyed name-record replay, not a live symbol scan.
+#[test]
+fn reregistering_one_file_keeps_evicted_sibling_edges() {
+    let idx = ModuleIndex::new_for_test();
+    let src_a = "package Shared::Thing;\nsub from_alpha { 1 }\n1;\n";
+    let src_b = "package Shared::Thing;\nsub from_beta { 3 }\n1;\n";
+    let pa = PathBuf::from("/fake/pkgid/Alpha.pm");
+    let pb = PathBuf::from("/fake/pkgid/Beta.pm");
+    // The sibling registers through the stripping door: its resident copy
+    // has NO symbols, only the pre-strip name record.
+    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), true, true);
+    let _ = idx.register_workspace_resident(pa.clone(), Arc::new(build_fa(src_a)));
+    assert!(!idx.modules_with_symbol("from_beta").is_empty(), "sibling edges fed");
+    // Re-register the whole file; the evicted sibling's names must replay.
+    let _ = idx.register_workspace_resident(pa.clone(), Arc::new(build_fa(src_a)));
+    assert!(
+        !idx.modules_with_symbol("from_beta").is_empty(),
+        "re-registering Alpha.pm wiped the evicted sibling's name edges"
+    );
+    assert!(!idx.modules_with_symbol("from_alpha").is_empty());
+}
+
+/// A package reopened in three files: all three stay candidates; removing
+/// one re-picks deterministically among survivors; removing all empties the
+/// slot and the workspace mark.
+#[test]
+fn package_reopened_in_three_files_unregisters_cleanly() {
+    use crate::model::file_analysis::CrossFileLookup;
+    let idx = ModuleIndex::new_for_test();
+    let paths: Vec<PathBuf> = ["A", "B", "C"]
+        .iter()
+        .map(|n| PathBuf::from(format!("/fake/pkgid3/{n}.pm")))
+        .collect();
+    for (i, p) in paths.iter().enumerate() {
+        let src = format!("package Tri::Pod;\nsub sub{i} {{ {i} }}\n1;\n");
+        let _ = idx.register_workspace_resident(p.clone(), Arc::new(build_fa(&src)));
+    }
+    assert_eq!(idx.def_candidates("Tri::Pod").len(), 3);
+    assert_eq!(idx.get_cached("Tri::Pod").unwrap().path, paths[0]);
+
+    // Removing the WINNER re-picks the next-smallest path.
+    idx.unregister_workspace_path(&paths[0]);
+    assert_eq!(idx.def_candidates("Tri::Pod").len(), 2);
+    assert_eq!(idx.get_cached("Tri::Pod").unwrap().path, paths[1]);
+    // The departed file's sub left the reverse index; survivors' stayed.
+    assert!(idx.modules_with_symbol("sub0").is_empty());
+    assert!(!idx.modules_with_symbol("sub2").is_empty());
+
+    idx.unregister_workspace_path(&paths[1]);
+    idx.unregister_workspace_path(&paths[2]);
+    assert!(idx.get_cached("Tri::Pod").is_none(), "no survivors: slot removed");
+    assert!(!idx.is_workspace_module("Tri::Pod"));
+}
+
+/// An edit that drops a package must shed its name registrations (the
+/// adopt path diffs the per-path record, the Perl twin of
+/// `edit_swap_drops_names_the_new_version_lost`).
+#[test]
+fn reregister_sheds_dropped_package_names() {
+    let idx = ModuleIndex::new_for_test();
+    let path = PathBuf::from("/fake/pkgid/Edit.pm");
+    let v1 = build_fa("package Keep::Me;\nsub k { 1 }\npackage Drop::Me;\nsub d { 2 }\n1;\n");
+    let _ = idx.register_workspace_resident(path.clone(), Arc::new(v1));
+    assert!(idx.get_cached("Drop::Me").is_some());
+    let v2 = build_fa("package Keep::Me;\nsub k { 1 }\n1;\n");
+    let _ = idx.register_workspace_resident(path.clone(), Arc::new(v2));
+    assert!(idx.get_cached("Drop::Me").is_none(), "dropped package lingers");
+    assert!(!idx.is_workspace_module("Drop::Me"));
+    assert!(idx.get_cached("Keep::Me").is_some());
+}

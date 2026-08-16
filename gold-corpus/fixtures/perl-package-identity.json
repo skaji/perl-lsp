@@ -14,7 +14,7 @@
         "all": ["Alpha.pm:3:1"],
         "none": ["Beta.pm"]
       },
-      "status": "xfail"
+      "status": "gold"
     },
     {
       "id": "pkgid-02-second-package-in-file-unreachable",
@@ -29,7 +29,37 @@
         "all": ["Alpha.pm:7:1"],
         "none": []
       },
-      "status": "xfail"
+      "status": "gold"
+    },
+    {
+      "id": "pkgid-04-method-in-losing-file",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "The method twin of pkgid-01: `Shared::Widget` is declared in Widget.pm (holding `new`/`base_method`) AND WidgetExtra.pm (holding `extra_method`, loaded dynamically — the asker never `use`s it by file name, so no name-keyed @INC entry compensates). `$w->extra_method` must land in WidgetExtra.pm — the winner-keyed class lookup (`get_cached(class)` in the ancestry walk and the goto-def consumer) can only see one file's methods, so the losing file's method misses or misleads depending on registration order. Method resolution over a reopened package is ordinary OO Perl.",
+      "file": "lib/WidgetUser.pm",
+      "line": 6,
+      "col": 6,
+      "expect": {
+        "all": ["WidgetExtra.pm:3:1"],
+        "none": ["Widget.pm"]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "pkgid-05-method-in-winner-still-resolves",
+      "difficulty": "moderate",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "Control for pkgid-04: the class's main file's own method keeps resolving after the candidate-set change.",
+      "file": "lib/WidgetUser.pm",
+      "line": 7,
+      "col": 6,
+      "expect": {
+        "all": ["Widget.pm:5:1"],
+        "none": ["WidgetExtra.pm"]
+      },
+      "status": "gold"
     },
     {
       "id": "pkgid-03-winner-still-resolves",

@@ -23,7 +23,19 @@ impl ModuleIndex {
         path: std::path::PathBuf,
         cm: Arc<CachedModule>,
     ) {
-        self.all_files.insert(path, cm.clone());
+        self.all_files.insert(path.clone(), cm.clone());
+        // The path's `all_defs` candidates must track the same generation —
+        // a stale candidate would serve the pre-materialization analysis to
+        // every by-name candidate reader.
+        if let Some(rec) = self.registered_names.get(&path) {
+            for (n, _) in rec.iter() {
+                if let Some(mut v) = self.all_defs.get_mut(n) {
+                    if let Some(i) = v.iter().position(|c| c.path == path) {
+                        v[i] = cm.clone();
+                    }
+                }
+            }
+        }
         self.insert_cache(&name, Some(cm));
     }
 
@@ -75,14 +87,90 @@ impl ModuleIndex {
         // candidate paths through `cached_by_path`, and packageless files
         // (Mojolicious::Lite entrypoints) exist ONLY here.
         self.all_files.insert(cached.path.clone(), cached.clone());
-        let Some(module_name) = first_package_name(&analysis) else {
-            return sd;
-        };
-        self.workspace_modules.insert(module_name.clone(), ());
-        self.core.edges.purge_module(&module_name);
-        self.core.edges.feed(&module_name, &analysis);
-        self.core.cache.insert(module_name, Some(cached));
+        let names = package_names(&analysis);
+        if !names.is_empty() {
+            // Whole copy: the feed inside the rebuild records the name list.
+            self.core.edges.record_names(&cached.path, &analysis);
+        }
+        self.adopt_workspace_candidate(cached, names);
         sd
+    }
+
+    /// Adopt `cached` as a definition candidate for every package name it
+    /// declares (`names`, extracted from the WHOLE analysis pre-strip), then
+    /// rebuild the name-keyed registrations for every affected name — the
+    /// declared set plus any a previous registration of the same path
+    /// declared and this one dropped. Perl's package relation is
+    /// name → MANY files (a package reopens anywhere), so the candidate
+    /// table (`all_defs`) is the truth and the name-keyed cache slot is a
+    /// derived winner — recomputed from the SET, never from arrival order.
+    fn adopt_workspace_candidate(
+        &self,
+        cached: Arc<CachedModule>,
+        names: Vec<(String, bool)>,
+    ) {
+        let prev = self
+            .registered_names
+            .insert(cached.path.clone(), names.clone());
+        let mut affected: Vec<String> = names.iter().map(|(n, _)| n.clone()).collect();
+        for (n, _) in prev.into_iter().flatten() {
+            if !affected.contains(&n) {
+                // Declared before, dropped now: the rebuild below sheds it.
+                if let Some(mut v) = self.all_defs.get_mut(&n) {
+                    v.retain(|c| c.path != cached.path);
+                }
+                self.all_defs.remove_if(&n, |_, v| v.is_empty());
+                affected.push(n);
+            }
+        }
+        for (name, _) in &names {
+            let mut v = self.all_defs.entry(name.clone()).or_default();
+            match v.iter().position(|c| c.path == cached.path) {
+                Some(i) => v[i] = cached.clone(),
+                None => v.push(cached.clone()),
+            }
+        }
+        for name in &affected {
+            self.rebuild_name_registration(name);
+        }
+    }
+
+    /// Recompute everything keyed on `name` from the CURRENT candidate set:
+    /// the edge feeds (purge, then one feed per candidate — a sibling
+    /// file's edges survive any one file's re-registration by
+    /// construction), the name-keyed cache winner (`best_candidate`:
+    /// order-independent, smallest-path tie-break), and the workspace-name
+    /// mark. With no candidates left, a workspace-owned slot empties; an
+    /// occupant the workspace never owned (the @INC tier) is left alone.
+    /// Evicted candidates replay their name feeds from the per-path records.
+    fn rebuild_name_registration(&self, name: &str) {
+        // `get_cached` answers can move here without a registration-gen
+        // mint — the enrichment epoch must move too.
+        self.core.note_shape_change();
+        let cands: Vec<Arc<CachedModule>> = self
+            .all_defs
+            .get(name)
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        self.core.edges.purge_module(name);
+        for c in &cands {
+            self.core.edges.feed(name, &c.path, &c.analysis);
+        }
+        if cands.is_empty() {
+            if self.workspace_modules.remove(name).is_some() {
+                // The slot held the last workspace winner; an @INC
+                // re-resolve refills on demand.
+                self.core.cache.remove(name);
+            }
+            return;
+        }
+        self.workspace_modules.insert(name.to_string(), ());
+        let refs: Vec<&Arc<CachedModule>> = cands.iter().collect();
+        if let Some(best) =
+            best_candidate(&refs, name, &|m, n| self.module_defines_class(m, n))
+        {
+            self.core.cache.insert(name.to_string(), Some(best));
+        }
     }
 
     /// The freshness gate, single-sourced: record `fa`'s span-free surface
@@ -533,18 +621,24 @@ impl ModuleIndex {
         self.freshness.dirty_consumers(&canon)
     }
 
-    /// The name/edge feed half of workspace registration, run on the WHOLE
-    /// analysis BEFORE any strip (a stripped copy's `symbols` is empty and
-    /// would blind the feeds). Returns the module name the residency half
-    /// keys the cache slot on.
-    pub(crate) fn workspace_feed_prestrip(&self, fa: &FileAnalysis) -> Option<String> {
-        let module_name = first_package_name(fa);
-        if let Some(ref name) = module_name {
-            self.workspace_modules.insert(name.clone(), ());
-            self.core.edges.purge_module(name);
-            self.core.edges.feed(name, fa);
+    /// The pre-strip half of workspace registration: extract every declared
+    /// package name and record the indexable-name list from the WHOLE
+    /// analysis (a stripped copy's `symbols` is empty, so the later feeds
+    /// replay this record). The candidate tables, edge feeds, and cache
+    /// winner are all rebuilt by the residency half — on the deferred lane
+    /// that is AFTER the blob commits, so an evicted copy is never
+    /// name-reachable before it can rehydrate.
+    pub(crate) fn workspace_feed_prestrip(
+        &self,
+        path: &std::path::Path,
+        fa: &FileAnalysis,
+    ) -> Vec<(String, bool)> {
+        let names = package_names(fa);
+        if !names.is_empty() {
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            self.core.edges.record_names(&canon, fa);
         }
-        module_name
+        names
     }
 
     /// The residency half: the path-keyed registry + the cache slot. For a
@@ -560,14 +654,12 @@ impl ModuleIndex {
         path: std::path::PathBuf,
         parts: WorkspaceRegistrationParts,
     ) {
-        let WorkspaceRegistrationParts { arc, module_name, surface: _ } = parts;
+        let WorkspaceRegistrationParts { arc, names, surface: _ } = parts;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.bump_registration_gen(&path);
         let cached = Arc::new(CachedModule::new(path, arc));
         self.all_files.insert(cached.path.clone(), cached.clone());
-        if let Some(name) = module_name {
-            self.core.cache.insert(name, Some(cached));
-        }
+        self.adopt_workspace_candidate(cached, names);
     }
 
     /// Registration-owned strip: feed the name/edge registrations from the
@@ -584,7 +676,7 @@ impl ModuleIndex {
         strip_bag: bool,
         strip_rows: bool,
     ) -> Arc<FileAnalysis> {
-        let parts = self.prepare_workspace_parts(fa, strip_bag, strip_rows);
+        let parts = self.prepare_workspace_parts(&path, fa, strip_bag, strip_rows);
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_workspace_residency(path, parts);
@@ -599,12 +691,36 @@ impl ModuleIndex {
         crate::util::ghost_stats::count("epoch.shape.unregister_workspace_path");
         self.core.note_shape_change();
         self.remove_surface(path);
-        self.all_files.remove(path);
+        // Registration keyed everything canonical; a deleted file can't
+        // canonicalize, so rejoin through the parent (same fallback as
+        // `remove_surface`).
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            path.parent()
+                .and_then(|d| std::fs::canonicalize(d).ok())
+                .and_then(|d| path.file_name().map(|f| d.join(f)))
+                .unwrap_or_else(|| path.to_path_buf())
+        });
+        self.all_files.remove(&canon);
+        self.core.edges.remove_path_record(&canon);
+        if let Some((_, names)) = self.registered_names.remove(&canon) {
+            for (name, _) in &names {
+                if let Some(mut v) = self.all_defs.get_mut(name) {
+                    v.retain(|c| c.path != canon);
+                }
+                self.all_defs.remove_if(name, |_, v| v.is_empty());
+                // Survivors keep their edges and re-pick the winner; the
+                // last candidate's departure empties the slot.
+                self.rebuild_name_registration(name);
+            }
+            return;
+        }
+        // No record (registered through a legacy/test door): fall back to
+        // the cache scan.
         let name = self.core.cache.iter().find_map(|entry| {
             entry
                 .value()
                 .as_ref()
-                .filter(|cm| cm.path == path)
+                .filter(|cm| cm.path == canon || cm.path == path)
                 .map(|_| entry.key().clone())
         });
         if let Some(name) = name {
@@ -942,14 +1058,15 @@ impl ModuleIndex {
     /// evict ordering has one speller per tier.
     pub(crate) fn prepare_workspace_parts(
         &self,
+        path: &std::path::Path,
         mut fa: FileAnalysis,
         strip_bag: bool,
         strip_rows: bool,
     ) -> WorkspaceRegistrationParts {
-        let module_name = self.workspace_feed_prestrip(&fa);
+        let names = self.workspace_feed_prestrip(path, &fa);
         let surface = crate::model::surface::Surface::project(&fa);
         fa.evict_axes(strip_bag, strip_rows);
-        WorkspaceRegistrationParts { arc: Arc::new(fa), module_name, surface }
+        WorkspaceRegistrationParts { arc: Arc::new(fa), names, surface }
     }
 
     /// The ONE speller of the pack strip ordering: feed + specs + surface
@@ -1203,5 +1320,14 @@ impl ModuleIndex {
     /// calls the equivalent rebuild after its own warm.
     pub fn rebuild_reverse_index_from_cache(&self) {
         self.core.rebuild_reverse_index();
+        // The cache holds one WINNER per name; a same-name sibling file's
+        // edges live only through the candidate table — re-feed every
+        // candidate (idempotent) so a rebuild never blinds
+        // `modules_with_symbol` to a reopened package's other files.
+        for entry in self.all_defs.iter() {
+            for c in entry.value().iter() {
+                self.core.edges.feed(entry.key(), &c.path, &c.analysis);
+            }
+        }
     }
 }

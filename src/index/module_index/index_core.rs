@@ -163,7 +163,7 @@ impl IndexCore {
                 bc.invalidate(&m.path);
             }
             self.mint_registration_gen(&m.path);
-            self.edges.feed(module_name, &m.analysis);
+            self.edges.feed(module_name, &m.path, &m.analysis);
             self.record_loader_shapes(module_name, &m.analysis);
         } else if matches!(self.cache.get(module_name).as_deref(), Some(Some(_))) {
             return None;
@@ -207,7 +207,7 @@ impl IndexCore {
         self.edges.clear();
         for entry in self.cache.iter() {
             if let Some(ref cached) = *entry.value() {
-                self.edges.feed(entry.key(), &cached.analysis);
+                self.edges.feed(entry.key(), &cached.path, &cached.analysis);
             }
         }
     }

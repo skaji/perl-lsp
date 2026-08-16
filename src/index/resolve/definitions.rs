@@ -765,27 +765,51 @@ impl<'a> CandidateSet<'a> {
                 // lives in another module.
                 Some(FunctionBinding::Qualified { package: pkg }) => {
                     let bare = r.unqualified_target_name();
-                    if let Some(cached) = idx.get_cached(pkg) {
+                    // `pkg` may be declared in several files (a Perl package
+                    // reopens anywhere; C linkage is flat). The query names a
+                    // SYMBOL, and that is the disambiguator: the right file
+                    // is the one that defines `bare` — package-attributed
+                    // first (a reopened package's sub lives under `pkg`),
+                    // then any-package (cross-package installs), smallest
+                    // path among several definers so repeat runs are
+                    // byte-identical. The candidate SET is scope-narrowed by
+                    // `visible_def_candidates` (`CandidateSet::scoped` /
+                    // `ScopedLookup` — the ONE visibility seam; Perl's own
+                    // ranking tier plugs in there, never in a second filter
+                    // here).
+                    let mut cands = idx.visible_def_candidates(pkg);
+                    cands.sort_by(|a, b| a.path.cmp(&b.path));
+                    let chosen = cands
+                        .iter()
+                        .find(|c| idx.symbols_present(c).has_sub_in_package(bare, pkg))
+                        .or_else(|| {
+                            cands
+                                .iter()
+                                .find(|c| idx.symbols_present(c).sub_info_view(bare).is_some())
+                        });
+                    if let Some(cached) = chosen {
                         if Url::from_file_path(&cached.path).is_ok() {
-                            match idx
-                                .whole_present(&cached)
+                            if let Some(line) = idx
+                                .symbols_present(cached)
                                 .sub_info_view(bare)
                                 .map(|s| s.def_line())
                             {
-                                Some(line) => return vec![line_loc(cached.path.clone(), line)],
-                                // Fail safe for a pack `Scope::member` miss: the
-                                // owner-anchored member lookup already ran (and
-                                // missed), and `pkg` names no sub `bare` in the
-                                // resolved module — so `pkg::bare` is NOT a
-                                // module path. Manufacturing a file-top `1:1`
-                                // location is a confidently-wrong answer (worse
-                                // than none for goto-def: abseil's every-header
-                                // `namespace absl` makes `get_cached("absl")`
-                                // land on an arbitrary file). Perl keeps the
-                                // file-top fallback — landing on the `.pm` top
-                                // is meaningful there.
-                                None if self.pack => {}
-                                None => return vec![line_loc(cached.path.clone(), 0)],
+                                return vec![line_loc(cached.path.clone(), line)];
+                            }
+                        }
+                    }
+                    // No candidate defines `bare`. Fail safe for a pack
+                    // `Scope::member` miss: the owner-anchored member lookup
+                    // already ran (and missed), so `pkg::bare` is NOT a
+                    // module path — manufacturing a file-top `1:1` location
+                    // is a confidently-wrong answer (abseil's every-header
+                    // `namespace absl` would land on an arbitrary file).
+                    // Perl keeps the file-top fallback — landing on the
+                    // `.pm` top is meaningful there.
+                    if !self.pack {
+                        if let Some(cached) = idx.get_cached(pkg) {
+                            if Url::from_file_path(&cached.path).is_ok() {
+                                return vec![line_loc(cached.path.clone(), 0)];
                             }
                         }
                     }
@@ -798,10 +822,15 @@ impl<'a> CandidateSet<'a> {
             // global through the index, mirroring the FQ-call path. Honest
             // miss (no jump) when the package or its decl is absent.
             if let Some((pkg, name)) = r.qualified_var_target() {
-                if let Some(cached) = idx.get_cached(pkg) {
+                // Same candidate discipline as the FQ-call arm: the
+                // declaring file is whichever of `pkg`'s files defines the
+                // global, not the name-slot winner.
+                let mut cands = idx.visible_def_candidates(pkg);
+                cands.sort_by(|a, b| a.path.cmp(&b.path));
+                for cached in &cands {
                     if Url::from_file_path(&cached.path).is_ok() {
                         if let Some(def_line) =
-                            idx.whole_present(&cached).package_var_def_line(&name, pkg)
+                            idx.symbols_present(cached).package_var_def_line(&name, pkg)
                         {
                             return vec![line_loc(cached.path.clone(), def_line)];
                         }
@@ -904,7 +933,30 @@ impl<'a> CandidateSet<'a> {
                         // in `def_module` (the bridging file). Same lookup
                         // either way.
                         let module = def_module.as_deref().unwrap_or(class);
-                        if let Some(cached) = idx.get_cached(module) {
+                        // The class's package may span files (Perl reopens
+                        // packages anywhere) — pick the candidate that
+                        // declares `method` under `class`, then a name-level
+                        // match (bridged/materialized copies attribute
+                        // synthesized methods loosely), smallest path among
+                        // several definers; the name-slot winner only as the
+                        // last resort (data-member reads below).
+                        let chosen = {
+                            let mut cands = idx.visible_def_candidates(module);
+                            cands.sort_by(|a, b| a.path.cmp(&b.path));
+                            cands
+                                .iter()
+                                .find(|c| {
+                                    idx.symbols_present(c).has_sub_in_package(method, class)
+                                })
+                                .or_else(|| {
+                                    cands.iter().find(|c| {
+                                        idx.symbols_present(c).sub_info_view(method).is_some()
+                                    })
+                                })
+                                .cloned()
+                                .or_else(|| idx.get_cached(module))
+                        };
+                        if let Some(cached) = chosen {
                             // A cross-file DBIC accessor is a deferred emission
                             // MATERIALIZED into the whole cached copy at index
                             // completion (`materialize_gated_emissions`), so the

@@ -414,6 +414,18 @@ pub trait CrossFileLookup {
     fn def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
         self.get_cached(name).into_iter().collect()
     }
+    /// `def_candidates` AS SEEN from the querying scope — the forward-
+    /// resolution face of the candidate table. Raw indexes pass the full
+    /// relation through; `ScopedLookup` narrows a CLOSURE-scoped origin
+    /// (pack: flat linkage, where same-named candidates in unrelated TUs are
+    /// different entities) to candidates connected to the asker, degrading
+    /// to the scope-ranked winner. A scope with no closure axis (Perl, whose
+    /// package relation is name → MANY files by design) passes the relation
+    /// through — Perl's own visibility tier plugs into `CandidateSet::scoped`
+    /// when it lands, never into a second mechanism here.
+    fn visible_def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
+        self.def_candidates(name)
+    }
     /// A cached module's analysis with its witness bag GUARANTEED present.
     /// Slice 2 evicts the bag from resident pack-index copies; every TYPE
     /// query that reads a foreign file's bag (the `MethodOnClass` / `SlotType`
@@ -604,6 +616,12 @@ pub struct ScopedLookup<'a> {
     inner: &'a dyn CrossFileLookup,
     visible: std::collections::HashSet<String>,
     self_path: Option<std::path::PathBuf>,
+    /// Does the origin's LANGUAGE define visibility by include closure
+    /// (pack: C's flat linkage)? `false` = a scope with no closure axis —
+    /// Perl today, whose package relation is name → MANY files by design;
+    /// its own visibility tier (per-entrypoint @INC / use-closure) plugs in
+    /// HERE when it lands, flipping this on with its own edge kind.
+    closure_scoped: bool,
 }
 
 impl<'a> ScopedLookup<'a> {
@@ -614,6 +632,7 @@ impl<'a> ScopedLookup<'a> {
         inner: &'a dyn CrossFileLookup,
         include_closure: &path_intern::ClosureList,
         self_path: Option<&std::path::Path>,
+        closure_scoped: bool,
     ) -> Self {
         let mut visible: std::collections::HashSet<String> =
             include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
@@ -622,7 +641,7 @@ impl<'a> ScopedLookup<'a> {
             visible.insert(canon.to_string_lossy().into_owned());
             canon
         });
-        ScopedLookup { inner, visible, self_path }
+        ScopedLookup { inner, visible, self_path, closure_scoped }
     }
 }
 
@@ -642,6 +661,37 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // definition-ness themselves, and a definition legitimately lives
         // OUTSIDE the querying file's closure (a `.c` body nobody includes).
         self.inner.def_candidates(name)
+    }
+    fn visible_def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
+        if !self.closure_scoped {
+            // No closure axis (Perl): the whole relation is visible.
+            return self.inner.def_candidates(name);
+        }
+        // Flat linkage: keep candidates CONNECTED to the asker — visible in
+        // its include closure, or including the asker back (a `.c` body
+        // defining what the asker's own header declares) — the same
+        // connectivity rule `member_def_location` applies. None connected ⇒
+        // the scope-ranked winner, so an indirect resolution never regresses.
+        let self_str = self
+            .self_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let mut out: Vec<std::sync::Arc<CachedModule>> = self
+            .inner
+            .def_candidates(name)
+            .into_iter()
+            .filter(|c| {
+                let p = c.path.to_string_lossy();
+                self.visible.contains(p.as_ref())
+                    || self_str
+                        .as_ref()
+                        .is_some_and(|sp| c.analysis.pack.include_closure.contains(sp))
+            })
+            .collect();
+        if out.is_empty() {
+            out.extend(self.get_cached(name));
+        }
+        out
     }
     fn bag_present(
         &self,

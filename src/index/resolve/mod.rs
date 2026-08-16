@@ -128,11 +128,17 @@ pub fn resolve<'a>(
         FileKey::Path(p) => Some(p.clone()),
         FileKey::Url(u) => u.to_file_path().ok(),
     };
+    // The routing fact also names the scope's AXIS: pack languages scope by
+    // include closure; Perl's scope is transparent until its own visibility
+    // tier lands (see `ScopedLookup::closure_scoped`).
+    let pack =
+        crate::build::language_driver::LanguageRegistry::is_pack_language(&origin.language);
     let scoped = module_index.map(|idx| {
         crate::model::file_analysis::ScopedLookup::new(
             idx,
             &origin.pack.include_closure,
             self_path.as_deref(),
+            pack,
         )
     });
     CandidateSet {
@@ -145,7 +151,7 @@ pub fn resolve<'a>(
         // The routing fact rides the origin (its driver stamped
         // `language`), so every projection inherits pack policy by
         // construction — no per-handler declaration to forget.
-        pack: crate::build::language_driver::LanguageRegistry::is_pack_language(&origin.language),
+        pack,
         source: None,
         scope,
         resolution: std::sync::OnceLock::new(),

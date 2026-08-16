@@ -31,7 +31,11 @@ pub fn pack_completion(
     let base_idx = routed.as_lookup();
     // Scope member/type resolution to the file's include closure.
     let scoped = crate::model::file_analysis::ScopedLookup::new(
-        base_idx, &analysis.pack.include_closure, path);
+        base_idx,
+        &analysis.pack.include_closure,
+        path,
+        crate::build::language_driver::LanguageRegistry::is_pack_language(language),
+    );
     let xidx: &dyn crate::model::file_analysis::CrossFileLookup = &scoped;
     // The slot verdict — Member (sentinel reparse → receiver span →
     // type) or the bare-identifier fallback (no registered driver / no

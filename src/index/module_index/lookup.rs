@@ -325,7 +325,11 @@ impl CrossFileLookup for ModuleIndex {
     fn def_candidates(&self, name: &str) -> Vec<Arc<CachedModule>> {
         match self.all_defs.get(name) {
             Some(cands) if !cands.is_empty() => cands.clone(),
-            // Perl hub: `all_defs` is pack-only, fall back to the winner.
+            // No workspace candidates: fall back to the name-slot winner.
+            // The @INC tier lands here — single-provider by CURRENT
+            // construction (one resolve per name), not by Perl semantics:
+            // @INC is per-entrypoint, so the honest shape there is the same
+            // candidate relation scoped by the asker's @INC.
             _ => self.get_cached(name).into_iter().collect(),
         }
     }

@@ -895,10 +895,12 @@ pub(super) fn collect_from_analysis(
     let module_index: Option<&dyn CrossFileLookup> = match module_index {
         Some(idx) if !analysis.pack.include_closure.is_empty() => {
             let path = key_for_sort(key);
+            // Guarded by a non-empty include closure — a pack-only shape.
             scoped_storage = Some(crate::model::file_analysis::ScopedLookup::new(
                 idx,
                 &analysis.pack.include_closure,
                 Some(path.as_path()),
+                true,
             ));
             // SAFETY: scoped_storage was just set to Some(..) on the line above,
             // in this same match arm — a lifetime-extension idiom, not a fallible read.

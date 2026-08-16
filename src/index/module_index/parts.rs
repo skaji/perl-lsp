@@ -40,14 +40,18 @@ pub struct ModuleEdgeIndexes {
     /// `FileAnalysis.pack.specializes`). The `Specializes` family edge's
     /// cross-file half; member resolution never reads it.
     pub(super) specs: DashMap<String, Vec<String>>,
-    /// The indexable-name list each module last fed — the symbols-derived
-    /// half of `feed`, recorded from the WHOLE analysis so a rebuild over
+    /// The indexable-name list each FILE last fed — the symbols-derived
+    /// half of `feed`, recorded from the WHOLE analysis so a re-feed over
     /// symbol-EVICTED cache copies (`rebuild_reverse_index*` after the
-    /// workspace indexer strips) replays the names instead of reading empty
-    /// vecs and silently blinding `modules_with_symbol`/`find_exporters`
-    /// for every workspace module. `clear()` keeps it (rebuilds are exactly
-    /// when it's needed); `purge_module` drops it with the edges.
-    name_records: DashMap<String, Vec<String>>,
+    /// workspace indexer strips, sibling replay after a same-name purge)
+    /// replays the names instead of reading empty vecs and silently
+    /// blinding `modules_with_symbol`/`find_exporters`. Keyed by PATH, not
+    /// module name: several files can feed under one package name (Perl
+    /// reopens packages anywhere), and a name-keyed record would replay one
+    /// file's names for its siblings. `clear()` and `purge_module` keep it
+    /// (re-feeds are exactly when it's needed); `remove_path_record` drops
+    /// it when the file itself goes.
+    name_records: DashMap<std::path::PathBuf, Vec<String>>,
 }
 
 impl ModuleEdgeIndexes {
@@ -64,11 +68,14 @@ impl ModuleEdgeIndexes {
     /// Register every edge `analysis` contributes under `module_name`.
     /// The ONLY write path besides `purge_module`/`clear` — new edge
     /// maps get their extraction added here and nowhere else. Eviction-
-    /// aware: a symbol-stripped copy replays its recorded name list; a
-    /// whole copy recomputes and re-records it.
-    pub fn feed(&self, module_name: &str, analysis: &FileAnalysis) {
+    /// aware: a symbol-stripped copy replays `path`'s recorded name list;
+    /// a whole copy recomputes and re-records it. Idempotent per
+    /// (bucket, module_name): re-feeding never grows a bucket, so the
+    /// candidate-set rebuilds (purge + one feed per candidate) and the
+    /// warm rebuild can overlap without accumulation.
+    pub fn feed(&self, module_name: &str, path: &std::path::Path, analysis: &FileAnalysis) {
         let names: Vec<String> = if analysis.symbols_are_evicted() {
-            match self.name_records.get(module_name) {
+            match self.name_records.get(path) {
                 Some(rec) => rec.clone(),
                 // No record (a stripped copy fed without ever being fed
                 // whole — shouldn't happen, but degrade to the pinned
@@ -77,39 +84,44 @@ impl ModuleEdgeIndexes {
             }
         } else {
             let names = Self::indexable_names(analysis);
-            self.name_records
-                .insert(module_name.to_string(), names.clone());
+            self.name_records.insert(path.to_path_buf(), names.clone());
             names
         };
+        let push_unique = |map: &DashMap<String, Vec<String>>, key: String| {
+            let mut v = map.entry(key).or_default();
+            if !v.iter().any(|m| m == module_name) {
+                v.push(module_name.to_string());
+            }
+        };
         for name in names {
-            self.names
-                .entry(name)
-                .or_default()
-                .push(module_name.to_string());
+            push_unique(&self.names, name);
         }
         for class in Self::bridge_classes(analysis) {
-            self.bridges
-                .entry(class)
-                .or_default()
-                .push(module_name.to_string());
+            push_unique(&self.bridges, class);
         }
         for parent in Self::parent_classes(analysis) {
-            self.children
-                .entry(parent)
-                .or_default()
-                .push(module_name.to_string());
+            push_unique(&self.children, parent);
         }
         for primary in Self::spec_primaries(analysis) {
-            self.specs
-                .entry(primary)
-                .or_default()
-                .push(module_name.to_string());
+            push_unique(&self.specs, primary);
         }
+    }
+
+    /// Record `path`'s indexable-name list from a WHOLE analysis so a later
+    /// `feed` of its stripped copy replays it — the pre-strip half of the
+    /// split workspace registration, where the feed itself waits for the
+    /// blob COMMIT but only the whole analysis can spell the names.
+    pub fn record_names(&self, path: &std::path::Path, analysis: &FileAnalysis) {
+        debug_assert!(!analysis.symbols_are_evicted());
+        self.name_records
+            .insert(path.to_path_buf(), Self::indexable_names(analysis));
     }
 
     /// Remove `module_name` from every bucket of every map. Runs
     /// before re-registration so stale edges from a prior version of
     /// the same module don't accumulate (phantom-module lookups).
+    /// KEEPS `name_records` — they are per-PATH, and a same-name sibling
+    /// file's replay source must survive this file's re-registration.
     pub fn purge_module(&self, module_name: &str) {
         for map in [&self.names, &self.bridges, &self.children, &self.specs] {
             map.retain(|_key, mods| {
@@ -117,7 +129,11 @@ impl ModuleEdgeIndexes {
                 !mods.is_empty()
             });
         }
-        self.name_records.remove(module_name);
+    }
+
+    /// Drop `path`'s recorded name list (the file itself is gone).
+    pub fn remove_path_record(&self, path: &std::path::Path) {
+        self.name_records.remove(path);
     }
 
     /// Wipe the edge maps for a rebuild. Deliberately KEEPS `name_records`
@@ -261,7 +277,10 @@ impl PackRegistrationParts {
 /// minted only by `prepare_workspace_parts` (strip) in this module.
 pub(crate) struct WorkspaceRegistrationParts {
     pub(super) arc: Arc<FileAnalysis>,
-    pub(super) module_name: Option<String>,
+    /// EVERY package name the file declares (name, is-class), extracted
+    /// pre-strip — Perl allows any number of packages per file, and each
+    /// one must be reachable by name (`docs/adr/file-store-and-resolve.md`).
+    pub(super) names: Vec<(String, bool)>,
     pub(super) surface: crate::model::surface::Surface,
 }
 

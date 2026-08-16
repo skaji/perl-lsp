@@ -277,18 +277,23 @@ impl RoutedIndex<'_> {
 /// Return the parents of the primary package of a module, preferring the
 /// package with the same name as `module_name` and falling back to the
 /// single-package case if only one package exists in the file.
-/// First `package X;` declaration in a FileAnalysis. Used to decide
-/// under what name a workspace file should be registered in the
-/// module index so cross-file method resolution (which keys on
-/// package name, e.g. "Users" for `->to('Users#list')`) can find it.
-/// Returns `None` for scripts with no explicit package declaration.
-pub fn first_package_name(analysis: &FileAnalysis) -> Option<String> {
+/// Every `package X;` / `class X` a FileAnalysis declares, in declaration
+/// order, deduped — `(name, is-class)` in the `registered_names` record
+/// shape. Workspace registration keys the candidate tables on ALL of them:
+/// a multi-package `.pm` is ordinary Perl, and keying on the first name
+/// alone leaves every later package unreachable by name. Empty for scripts
+/// with no explicit package declaration.
+pub fn package_names(analysis: &FileAnalysis) -> Vec<(String, bool)> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
     for sym in analysis.symbols() {
-        if matches!(sym.kind, SymKind::Package | SymKind::Class) {
-            return Some(sym.name.clone());
+        if matches!(sym.kind, SymKind::Package | SymKind::Class)
+            && seen.insert(sym.name.as_str())
+        {
+            out.push((sym.name.clone(), matches!(sym.kind, SymKind::Class)));
         }
     }
-    None
+    out
 }
 
 pub fn primary_package_parents(analysis: &FileAnalysis, module_name: &str) -> Vec<String> {

@@ -444,7 +444,15 @@ impl FileAnalysis {
         // bridges from other workspace files (rule #8 — `for_each_entity_
         // bridged_to`).
         if let Some(idx) = module_index {
-            if let Some(cached) = idx.get_cached(cls) {
+            // EVERY file declaring `cls` that the QUERY can see is a
+            // candidate (a Perl package reopens anywhere; the name-slot
+            // winner alone would hide a method the losing file defines).
+            // `visible_def_candidates` applies the scope: a closure-scoped
+            // (pack) origin narrows to connected files — an unrelated TU's
+            // same-named class must not hijack the walk — while Perl gets
+            // the whole relation. The goto-def consumer re-picks the
+            // defining candidate with the same test.
+            for cached in idx.visible_def_candidates(cls) {
                 // Class-scoped, not file-scoped: a pack file holds MANY
                 // classes, so "some sub of this name exists in cls's file"
                 // would let an unrelated same-named member hijack

@@ -544,8 +544,9 @@ impl LanguageServer for Backend {
                 // — the raw word names a local-or-cross-file symbol. The lane
                 // sits outside the CandidateSet and still needs this file's
                 // closure scope; the set scopes itself at construction.
+                // Inside the `cross_file_words` caps gate — a pack-only lane.
                 let scoped = crate::model::file_analysis::ScopedLookup::new(
-                    base_idx, &analysis.pack.include_closure, self_path.as_deref());
+                    base_idx, &analysis.pack.include_closure, self_path.as_deref(), true);
                 if let Some((target, span, _)) =
                     cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
                 {
@@ -791,8 +792,9 @@ impl LanguageServer for Backend {
                 // — show its definition line.
                 if caps.cross_file_words {
                     let self_path = uri.to_file_path().ok();
+                    // Inside the `cross_file_words` caps gate — pack-only.
                     let scoped = crate::model::file_analysis::ScopedLookup::new(
-                        base_idx, &analysis.pack.include_closure, self_path.as_deref());
+                        base_idx, &analysis.pack.include_closure, self_path.as_deref(), true);
                     if let Some((_, _, line)) =
                         cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
                     {

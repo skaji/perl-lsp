@@ -415,7 +415,7 @@ pub fn index_workspace_with_index(
                         let (arc, parts) = match module_index {
                             Some(idx) => {
                                 let parts =
-                                    idx.prepare_workspace_parts(analysis, true, true);
+                                    idx.prepare_workspace_parts(&canon, analysis, true, true);
                                 parts.record_surface(idx, &canon);
                                 (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
@@ -444,7 +444,8 @@ pub fn index_workspace_with_index(
                         // this path's freshness behavior is unchanged.
                         let arc = match module_index {
                             Some(idx) => {
-                                let parts = idx.prepare_workspace_parts(analysis, false, false);
+                                let parts =
+                                    idx.prepare_workspace_parts(&canon, analysis, false, false);
                                 let arc = std::sync::Arc::clone(parts.arc());
                                 idx.register_workspace_residency(canon.clone(), parts);
                                 // Deliberate whole pin (unpersistable /
