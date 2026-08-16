@@ -58,6 +58,13 @@ notice (wrong/empty answers) as findings — they fix nothing.
 
 ## Reading the numbers honestly (traps that already bit)
 
+- **The driver must act like a real editor, or you measure the driver.**
+  It answers server->client requests and omits null `params` (both fixed in
+  `lsp_bench.py` — keep them). A server can legally block on client
+  behaviour: an unanswered `window/workDoneProgress/create` gated workspace
+  indexing, and the server then sat at 32 MB answering every query EMPTY,
+  which reads as a slow server rather than a wedged one. If a run looks
+  inexplicably empty or idle, suspect the client half first.
 - **`result_size` is the honesty column.** A fast cold answer with a
   small size next to a big warm size = the index served a PARTIAL result
   that looked complete (seen: abseil cold references 3.6 KB vs warm

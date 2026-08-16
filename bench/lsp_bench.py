@@ -13,6 +13,14 @@ The harness protocol around this driver lives in
 .claude/skills/edit-bench/SKILL.md; committed scenarios in
 bench/scenarios/; the running results ledger in bench/RESULTS.md.
 
+This driver must behave like a REAL editor, because a server can legally
+block on client behaviour: it answers server->client requests (a dropped
+`window/workDoneProgress/create` reply gates workspace indexing, and the
+server then answers every query empty — indistinguishable from a hang), and
+it omits `params` rather than sending null (tower-lsp rejects `"params":
+null` with -32602, so a param-less `shutdown` never lands). Both were real
+bugs here that cost measurable debugging time; keep the fidelity.
+
 Scenario JSON shape (all positions are 0-based LSP coordinates — note the
 binary's POSITIONAL CLI mirrors are also 0-based, so validated CLI coords
 transfer verbatim):
@@ -92,6 +100,13 @@ class Lsp:
                 ent = self.pending.pop(msg["id"], None)
                 if ent:
                     ent[0].put((msg, now_ms()))
+            elif "id" in msg and "method" in msg:
+                # A server->client REQUEST. A real editor answers these; a
+                # driver that drops them wedges any server that awaits the
+                # reply before doing work — `window/workDoneProgress/create`
+                # gates workspace indexing, so ignoring it looks exactly like
+                # a hung server that answers every query with an empty result.
+                self._send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
             else:
                 self.notif_q.put((msg, now_ms()))
 
@@ -106,7 +121,7 @@ class Lsp:
         q = queue.Queue()
         t0 = now_ms()
         self.pending[rid] = (q, t0)
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        self._send(self._envelope({"jsonrpc": "2.0", "id": rid, "method": method}, params))
         try:
             msg, t1 = q.get(timeout=timeout)
         except queue.Empty:
@@ -114,7 +129,17 @@ class Lsp:
         return msg, t1 - t0
 
     def notify(self, method, params):
-        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+        self._send(self._envelope({"jsonrpc": "2.0", "method": method}, params))
+
+    @staticmethod
+    def _envelope(msg, params):
+        # JSON-RPC 2.0 allows params to be an object or array — never null.
+        # tower-lsp rejects `"params": null` with -32602, so a param-less
+        # `shutdown` sent that way never reaches the server and the process
+        # is left to be killed instead of shutting down cleanly.
+        if params is not None:
+            msg["params"] = params
+        return msg
 
     def await_diagnostics(self, uri, timeout=30.0):
         deadline = time.monotonic() + timeout
@@ -124,7 +149,7 @@ class Lsp:
             except queue.Empty:
                 return None
             if msg.get("method") == "textDocument/publishDiagnostics" \
-               and msg["params"]["uri"] == uri:
+               and msg.get("params", {}).get("uri") == uri:
                 return t
         return None
 
