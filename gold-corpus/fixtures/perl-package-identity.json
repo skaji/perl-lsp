@@ -1,0 +1,50 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "pkgid-01-same-package-two-files-wrong-file",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "Two files declare `package Shared::Thing`. `from_alpha` is defined in Alpha.pm, but the name-keyed module cache holds ONE winner per package name (`cache.insert` is last-write-wins, and `purge_module` drops the loser's edges), so goto-def lands in Beta.pm. This is a WRONG answer, not a missing one — the user is navigated confidently to the wrong file. The fix is the name->candidates relation Perl lacks and the pack tier already has (`all_defs`), scoped by what the asker can see.",
+      "file": "lib/User.pm",
+      "line": 6,
+      "col": 17,
+      "expect": {
+        "all": ["Alpha.pm:3:1"],
+        "none": ["Beta.pm"]
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "pkgid-02-second-package-in-file-unreachable",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "`Alpha::Second` is the SECOND package declared in Alpha.pm. Registration keys on `first_package_name`, so every package after the first gets no name entry and is unreachable by name. Multi-package .pm files are ordinary Perl, so this is a common shape, not an exotic one.",
+      "file": "lib/User.pm",
+      "line": 8,
+      "col": 17,
+      "expect": {
+        "all": ["Alpha.pm:7:1"],
+        "none": []
+      },
+      "status": "xfail"
+    },
+    {
+      "id": "pkgid-03-winner-still-resolves",
+      "difficulty": "moderate",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "The control for the two xfails above: the package-name winner must keep resolving. A fix that introduces candidate sets has to keep this correct, not trade one wrong answer for another.",
+      "file": "lib/User.pm",
+      "line": 7,
+      "col": 17,
+      "expect": {
+        "all": ["Beta.pm:3:1"],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}
