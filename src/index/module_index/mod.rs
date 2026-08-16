@@ -201,6 +201,9 @@ pub struct ModuleIndex {
     /// provider change moves the key.
     enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
+    /// Report-only ghost-list accounting for the overlay
+    /// (`PERL_LSP_GHOST_STATS`). `None` when the gate is off.
+    enriched_ghost: Option<Arc<crate::util::ghost_stats::GhostStats>>,
     /// Memo for `enrichment_key` (path → (epoch, key)): the key is a
     /// transitive dep-closure walk and the overlay recomputes it on EVERY
     /// consult, hit or miss — measured 170k walks from one didOpen on a

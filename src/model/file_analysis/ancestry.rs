@@ -450,7 +450,10 @@ impl FileAnalysis {
                 // would let an unrelated same-named member hijack
                 // the walk at `cls` and stop it before the true ancestor.
                 // Re-exports fall through, same as the local arm.
-                let whole = idx.whole_present(&cached);
+                // Symbols-axis read only (existence, kind, package, class-
+                // content — never the bag/refs), so the import tier answers
+                // from its resident copy instead of decoding the whole blob.
+                let whole = idx.symbols_present(&cached);
                 let has_member = whole.symbols.iter().any(|s| {
                     s.name == method_name
                         && s.package.as_deref() == Some(cls)

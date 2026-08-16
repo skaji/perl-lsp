@@ -268,8 +268,21 @@ impl ModuleIndex {
         // BYTE-bounded first (enriched copies are whole analyses — 64 of a
         // tree's biggest generated modules would quietly re-pin the
         // gigabytes the eviction axes stripped), entry-bounded second.
-        const ENRICHED_CAP: usize = 64;
-        const ENRICHED_BYTE_CAP: usize = 128 * 1024 * 1024;
+        // `PERL_LSP_ENRICHED_CAP` / `PERL_LSP_ENRICHED_MB` are measurement-
+        // only overrides for cap-sweep experiments; unset ⇒ the stock bounds.
+        static CAPS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+        let &(enriched_cap, enriched_byte_cap) = CAPS.get_or_init(|| {
+            let entries = std::env::var("PERL_LSP_ENRICHED_CAP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(64);
+            let bytes = std::env::var("PERL_LSP_ENRICHED_MB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(128 * 1024 * 1024);
+            (entries, bytes)
+        });
         let path = &cached.path;
         let key = self.enrichment_key_memoized(cached);
         if let Some(e) = self.enriched.get(path) {
@@ -284,10 +297,21 @@ impl ModuleIndex {
                 // `None` = a remembered DECLINE (giant / cycle-tainted):
                 // repeat queries skip the deep-copy until the key moves.
                 crate::util::ghost_stats::count("enriched_snapshot.hit");
+                if let Some(g) = &self.enriched_ghost {
+                    g.on_hit();
+                }
                 return hit;
             }
         }
         crate::util::ghost_stats::count("enriched_snapshot.build");
+        if let Some(g) = &self.enriched_ghost {
+            g.on_miss(&path.to_string_lossy());
+            // A key mismatch on a live entry is an INVALIDATION (a provider
+            // changed), not capacity pressure.
+            if self.enriched.contains_key(path) {
+                g.on_invalidate(&path.to_string_lossy());
+            }
+        }
         let whole = crate::model::file_analysis::CrossFileLookup::whole_present(self, cached);
         // Deep copy via serde — enrichment must never write through the
         // shared Arc (the R4 rule the overlay exists to enforce).
@@ -312,7 +336,7 @@ impl ModuleIndex {
         // decline is CACHED so repeat queries don't rebuild the copy just
         // to re-decline it.
         let stored: Option<Arc<FileAnalysis>> =
-            if tainted || bytes > ENRICHED_BYTE_CAP { None } else { Some(arc) };
+            if tainted || bytes > enriched_byte_cap { None } else { Some(arc) };
         let entry_bytes = if stored.is_some() { bytes } else { 0 };
         self.enriched.insert(path.clone(), (key, stored.clone(), entry_bytes));
         {
@@ -327,11 +351,17 @@ impl ModuleIndex {
                     .sum::<usize>()
             };
             while order.len() > 1
-                && (order.len() > ENRICHED_CAP || total_bytes(&order) > ENRICHED_BYTE_CAP)
+                && (order.len() > enriched_cap || total_bytes(&order) > enriched_byte_cap)
             {
                 if let Some(evictee) = order.pop_front() {
                     self.enriched.remove(&evictee);
+                    if let Some(g) = &self.enriched_ghost {
+                        g.on_evict(&evictee.to_string_lossy());
+                    }
                 }
+            }
+            if let Some(g) = &self.enriched_ghost {
+                g.set_usage(total_bytes(&order) as u64, order.len() as u64);
             }
         }
         stored

@@ -59,6 +59,66 @@ fn bag_present_rehydrates_evicted_at_both_caps() {
     assert!(!got.bag_is_evicted());
 }
 
+/// The symbols-axis reader: a bag-only-evicted copy (the @INC strip) answers
+/// with the RESIDENT arc — no loader call, no whole-blob decode — because the
+/// MRO existence walk reads only symbols. A symbols-evicted copy (workspace
+/// strip) still rehydrates. If the fast path regressed, every idle-sweep
+/// ancestor hop would re-decode a blob to scan symbols it already holds.
+#[test]
+fn symbols_present_answers_resident_when_only_bag_evicted() {
+    use crate::index::pack_bag_cache::PackBagCache;
+    use crate::model::file_analysis::CrossFileLookup;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let path = full.path.clone();
+
+    // Loader that PANICS: proof the bag-only-evicted path never rehydrates.
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, |_p: &std::path::Path| {
+        panic!("symbols_present must not rehydrate a symbols-resident copy")
+    }));
+    let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
+
+    let mut bag_only = (*full.analysis).clone();
+    bag_only.evict_axes(true, false);
+    let bag_only_cached = Arc::new(CachedModule::new(path.clone(), Arc::new(bag_only)));
+    let got = idx.symbols_present(&bag_only_cached);
+    assert!(
+        Arc::ptr_eq(&got, &bag_only_cached.analysis),
+        "bag-only-evicted copy answers resident (ptr-identical)"
+    );
+    assert!(got.has_sub_in_package("make", "Widget"));
+
+}
+
+/// The absence-as-answer tripwire: a WORKSPACE-strip copy (bag + refs +
+/// SYMBOLS evicted) asked an existence question whose true answer is YES
+/// must rehydrate and answer YES. If `symbols_present` ever degrades to
+/// "resident or empty", the evicted-empty symbol table reads as "class
+/// defines nothing" — goto-def/hover silently resolve to nothing, no error,
+/// no crash. Empty from this reader must always mean genuinely-no-symbol.
+#[test]
+fn symbols_present_rehydrates_evicted_symbols_never_absence_by_eviction() {
+    use crate::index::pack_bag_cache::PackBagCache;
+    use crate::model::file_analysis::CrossFileLookup;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let full_for_loader = full.analysis.clone();
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, move |_p: &std::path::Path| {
+        Ok((*full_for_loader).clone())
+    }));
+    let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
+    let mut stripped = (*full.analysis).clone();
+    stripped.evict_axes(true, true);
+    assert!(stripped.symbols_are_evicted(), "fixture must model the workspace strip");
+    let stripped_cached = Arc::new(CachedModule::new(full.path.clone(), Arc::new(stripped)));
+    let got = idx.symbols_present(&stripped_cached);
+    assert!(!got.symbols_are_evicted(), "rehydrated view carries symbols");
+    assert!(
+        got.has_sub_in_package("make", "Widget"),
+        "true-YES existence must survive symbol eviction"
+    );
+}
+
 #[test]
 fn test_resolve_module_list_util() {
     let idx = ModuleIndex::new_for_test();

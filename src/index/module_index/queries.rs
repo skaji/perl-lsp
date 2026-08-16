@@ -17,6 +17,9 @@ impl ModuleIndex {
             freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
+            enriched_ghost: crate::util::ghost_stats::GhostStats::new_if_enabled(
+                "enriched-overlay".into(),
+            ),
             enrichment_key_memo: Arc::new(DashMap::new()),
             foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
@@ -235,7 +238,9 @@ impl ModuleIndex {
         let mut found = None;
         self.for_each_reexport_module(std::iter::once(entry.to_string()), |cached| {
             use crate::model::file_analysis::CrossFileLookup;
-            if self.whole_present(cached).sub_info_view(name).is_some() {
+            // Existence probe over symbols only — the caller takes the
+            // CachedModule and chooses its own view for detail reads.
+            if self.symbols_present(cached).sub_info_view(name).is_some() {
                 found = Some(Arc::clone(cached));
                 ControlFlow::Break(())
             } else {
@@ -369,7 +374,8 @@ impl ModuleIndex {
             .into_iter()
             .find(|mod_name| {
                 self.get_cached(mod_name)
-                    .map(|c| self.whole_present(&c).has_sub_in_package(name, class))
+                    // Symbols-axis existence scan — no bag/refs read.
+                    .map(|c| self.symbols_present(&c).has_sub_in_package(name, class))
                     .unwrap_or(false)
             })
     }

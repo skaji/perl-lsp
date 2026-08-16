@@ -456,6 +456,27 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         cached.analysis.clone()
     }
+    /// The SYMBOLS-axis view: the resident copy whenever its symbols
+    /// survived eviction, rehydrated otherwise. The @INC strip is
+    /// bag-only, so the import tier — exactly the ancestor set the MRO
+    /// existence walks hammer — answers with a cheap `Arc` bump instead of
+    /// a whole-blob decode; the workspace tier (symbols-evicted after
+    /// persist) rehydrates exactly as `whole_present` would.
+    ///
+    /// CONTRACT: the returned view's symbols axis is POPULATED — an empty
+    /// scan result means the file genuinely declares no matching symbol,
+    /// never "the axis was evicted". A reader that could answer
+    /// absence-by-eviction as absence-in-fact is the silent-wrong-goto-def
+    /// failure mode; implementations must rehydrate, never degrade to the
+    /// resident-or-empty copy. For existence/name scans that read `symbols`
+    /// plus never-evicted lanes (scopes, packages, plugin) ONLY; a consumer
+    /// that also reads the bag or refs takes `whole_present`.
+    fn symbols_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        self.whole_present(cached)
+    }
     /// Every indexed file holding at least one ref row keyed by one of
     /// `keys` — the relational reverse index's candidate-file retrieval
     /// (`SELECT DISTINCT path … WHERE name_id IN keys`). The backward walk
@@ -646,6 +667,15 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     ) -> std::sync::Arc<FileAnalysis> {
         // Same delegation rule as `bag_present` — the inner index owns the LRU.
         self.inner.whole_present(cached)
+    }
+    fn symbols_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `bag_present` — the inner index owns the
+        // residency answer (the default would re-route to OUR whole_present,
+        // losing the symbols-resident fast path).
+        self.inner.symbols_present(cached)
     }
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         // Unscoped by design, like `def_candidates`: the backward walk applies

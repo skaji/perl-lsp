@@ -531,7 +531,8 @@ impl FileAnalysis {
         }
         let idx = module_index?;
         let cached = idx.get_cached(value)?;
-        packaged(&idx.whole_present(&cached))
+        // Symbols-axis read only (name/kind/package scan).
+        packaged(&idx.symbols_present(&cached))
     }
 
     /// The canonical, language-generic `Field{owner, name}` subject for a

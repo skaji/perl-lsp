@@ -135,9 +135,11 @@ impl ModuleIndex {
         for mod_name in self.modules_bridging_to(class_name) {
             let Some(cached) = self.get_cached(&mod_name) else { continue };
             // Entities index into `symbols`, which may be evicted on the
-            // resident copy — resolve them against the whole view (same
-            // generation: the LRU is invalidated on every rewrite).
-            let whole = self.whole_present(&cached);
+            // resident copy — resolve them against the symbols-axis view
+            // (same generation: the LRU is invalidated on every rewrite).
+            // Namespaces ride the never-evicted plugin lane, so symbols are
+            // the only evictable axis this read touches.
+            let whole = self.symbols_present(&cached);
             for ns in &whole.plugin.namespaces {
                 let bridges_class = ns.bridges.iter().any(|b|
                     matches!(b, crate::model::file_analysis::Bridge::Class(c) if c == class_name));
@@ -225,6 +227,16 @@ impl CrossFileLookup for ModuleIndex {
 
     fn whole_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         if cached.analysis.is_fully_resident() {
+            return cached.analysis.clone();
+        }
+        self.rehydrate_or_resident(cached)
+    }
+
+    fn symbols_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        // The @INC strip is bag-only, so import-tier copies (the MRO
+        // walk's ancestor set) answer resident; workspace copies are
+        // symbol-evicted and pay the same rehydration as `whole_present`.
+        if !cached.analysis.symbols_are_evicted() {
             return cached.analysis.clone();
         }
         self.rehydrate_or_resident(cached)
