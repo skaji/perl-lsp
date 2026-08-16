@@ -164,6 +164,7 @@ impl FileStore {
         if language != "perl" {
             return Some(base);
         }
+        crate::util::ghost_stats::count("enrich_open.perl");
         let mut fa = (*base).clone();
         fa.enrich_imported_types_with_keys(Some(idx));
         let enriched = Arc::new(fa);

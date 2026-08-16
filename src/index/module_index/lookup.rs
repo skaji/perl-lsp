@@ -188,6 +188,7 @@ impl ModuleIndex {
         let inc_paths = module_resolver::discover_inc_paths();
         let mut parser = module_resolver::create_parser();
         let result = module_resolver::resolve_and_parse(&inc_paths, module_name, &mut parser);
+        self.core.note_shape_change();
         self.core.cache.insert(module_name.to_string(), result.clone());
         result
     }

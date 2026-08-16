@@ -126,6 +126,15 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
     loop {
         let batch = drain_next_batch(&core.queue);
 
+        // One diagnostics refresh per drained BATCH, not per module: a
+        // resolve takes longer than the refresh debounce's settle window,
+        // so per-module fires all survive debouncing and each one re-
+        // enriches + republishes every open doc (measured: 939 resolves →
+        // 346 full refresh bodies on one cold open). The queue keeps
+        // accumulating while a batch runs, so the LAST non-empty batch
+        // always ends with a fire — diagnostics converge once the queue
+        // drains.
+        let mut resolved_any = false;
         for module_name in batch {
             // Allow re-resolution when extract version is outdated.
             if let Some(&ver) = seen.get(&module_name) {
@@ -144,6 +153,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
                 log::info!("Resolving module '{}'", module_name);
             }
 
+            crate::util::ghost_stats::count("resolver.module_resolved");
             let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
             match &result {
                 Some(m) => log::info!(
@@ -282,12 +292,16 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
                 }
             }
 
-            // Signal waiters and trigger diagnostic refresh.
+            // Signal waiters (per module — bounded waits key on names).
             {
                 let _g = core.resolved.mu.lock().unwrap();
                 core.resolved.cv.notify_all();
             }
+            resolved_any = true;
+        }
+        if resolved_any {
             if let Some(srv) = &server {
+                crate::util::ghost_stats::count("resolver.on_resolved_fired");
                 (srv.on_resolved)();
             }
         }

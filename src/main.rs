@@ -185,6 +185,9 @@ async fn main() {
     // work (workspace indexing does `rt.block_on(client.send_request(..))`,
     // which parks forever once the client is gone) can otherwise keep the
     // runtime — and the process — alive, orphaning a 40-thread server to init.
-    // An LSP server has nothing to flush after the connection closes.
+    // An LSP server has nothing to flush after the connection closes —
+    // except the report-only ghost-stats trail, which is inert unless
+    // PERL_LSP_GHOST_STATS is set and must land before the hard exit.
+    util::ghost_stats::emit_all("eof");
     std::process::exit(0);
 }

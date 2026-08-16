@@ -227,6 +227,7 @@ impl FileAnalysis {
         &mut self,
         module_index: Option<&dyn CrossFileLookup>,
     ) {
+        crate::util::ghost_stats::count("enrich_imported_types_with_keys");
         // Truncate back to baseline so repeated enrichment doesn't
         // accumulate duplicates. Enrichment pushes Variable witnesses
         // via `push_type_constraint` and synthetic symbols + witnesses

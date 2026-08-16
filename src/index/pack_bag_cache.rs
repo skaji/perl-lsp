@@ -57,11 +57,27 @@ pub struct PackBagCache {
     generation: DashMap<PathBuf, u64>,
     /// Keyed single-file decode (opens the pack SQLite conn on demand).
     loader: Loader,
+    /// Report-only ghost-list accounting (`PERL_LSP_GHOST_STATS`). `None`
+    /// when the gate is off — no cache decision ever reads this.
+    ghost: Option<Arc<crate::util::ghost_stats::GhostStats>>,
 }
 
 impl PackBagCache {
+    /// Production sites use `new_labeled` so ghost-stats reports name their
+    /// tier; the unlabeled form serves tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         cap_bytes: usize,
+        loader: impl Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_labeled(cap_bytes, "pack-bag", loader)
+    }
+
+    /// `new` with a report label naming the owning tier (hub vs per-lang
+    /// sub-index) so the ghost-stats output attributes traffic correctly.
+    pub fn new_labeled(
+        cap_bytes: usize,
+        label: &str,
         loader: impl Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
     ) -> Self {
         PackBagCache {
@@ -72,6 +88,10 @@ impl PackBagCache {
             cap_bytes,
             generation: DashMap::new(),
             loader: Box::new(loader),
+            ghost: crate::util::ghost_stats::GhostStats::new_if_enabled(format!(
+                "{label} cap={}MiB",
+                cap_bytes / (1024 * 1024)
+            )),
         }
     }
 
@@ -95,7 +115,13 @@ impl PackBagCache {
             let arc = hit.value().0.clone();
             drop(hit);
             self.recency.insert(path.to_path_buf(), self.tick());
+            if let Some(g) = &self.ghost {
+                g.on_hit();
+            }
             return Ok(arc);
+        }
+        if let Some(g) = &self.ghost {
+            g.on_miss(&path.to_string_lossy());
         }
         let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
         let fa = Arc::new((self.loader)(path)?);
@@ -122,6 +148,12 @@ impl PackBagCache {
         }
         self.recency.insert(path.to_path_buf(), self.tick());
         self.evict_to_cap(path);
+        if let Some(g) = &self.ghost {
+            g.set_usage(
+                self.bytes.load(Ordering::Relaxed) as u64,
+                self.entries.len() as u64,
+            );
+        }
         Ok(fa)
     }
 
@@ -159,6 +191,9 @@ impl PackBagCache {
             self.recency.remove(&victim);
             if let Some((_, (_, sz))) = self.entries.remove(&victim) {
                 self.credit(sz);
+                if let Some(g) = &self.ghost {
+                    g.on_evict(&victim.to_string_lossy());
+                }
             }
         }
     }
@@ -173,6 +208,9 @@ impl PackBagCache {
     /// Drop `path`'s retained bag (a changed/saved file's bag is stale) so the
     /// next type query rehydrates the fresh blob.
     pub fn invalidate(&self, path: &Path) {
+        if let Some(g) = &self.ghost {
+            g.on_invalidate(&path.to_string_lossy());
+        }
         *self.generation.entry(path.to_path_buf()).or_insert(0) += 1;
         self.recency.remove(path);
         if let Some((_, (_, sz))) = self.entries.remove(path) {

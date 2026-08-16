@@ -100,7 +100,11 @@ pub fn index_pack_languages(
                 }
                 module_cache::open_and_load_diag(cache_key_owned.as_deref(), lang, &spellings)
             };
-            Arc::new(crate::index::pack_bag_cache::PackBagCache::new(bag_cache_bytes, loader))
+            Arc::new(crate::index::pack_bag_cache::PackBagCache::new_labeled(
+                bag_cache_bytes,
+                &format!("pack-{lang}"),
+                loader,
+            ))
         };
         let pack_index = Arc::new(
             crate::index::module_index::ModuleIndex::new_for_cli().with_bag_cache(bag_cache),

@@ -40,6 +40,13 @@ pub(crate) struct IndexCore {
     /// registration front door.
     pub(crate) registration_gen: DashMap<std::path::PathBuf, u64>,
     pub(crate) gen_counter: std::sync::atomic::AtomicU64,
+    /// Monotone count of index-shape mutations NOT already visible through
+    /// `gen_counter` or the freshness write count (cache-slot swaps on
+    /// unregister, loader-shape rewrites). Third leg of the enrichment-key
+    /// memo's validity epoch — over-invalidation is always safe here, a
+    /// missed bump is silent staleness, so mutators bump even when a gen
+    /// mint usually accompanies them.
+    pub(crate) shape_bumps: std::sync::atomic::AtomicU64,
     /// The witness seams' fallback-on-miss enriched retries only pay off
     /// when the process lives long enough to amortize the overlay (each
     /// miss is a whole-analysis deep copy + enrich). Off by default; the
@@ -81,6 +88,7 @@ impl IndexCore {
             },
             registration_gen: DashMap::new(),
             gen_counter: std::sync::atomic::AtomicU64::new(1),
+            shape_bumps: std::sync::atomic::AtomicU64::new(0),
             long_lived: std::sync::atomic::AtomicBool::new(false),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -133,6 +141,12 @@ impl IndexCore {
     /// cover), and clobbering would leave the reverse index pointing at a
     /// module the cache no longer holds (the orphan that broke cross-file
     /// Handler / dispatch lookup).
+    /// A shape mutation landed — invalidate every memo keyed on the
+    /// enrichment epoch. Over-invalidation is the safe direction.
+    pub(crate) fn note_shape_change(&self) {
+        self.shape_bumps.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn insert_resolved(
         &self,
         module_name: &str,
@@ -140,6 +154,7 @@ impl IndexCore {
         persisted: bool,
         strip: bool,
     ) -> Option<Arc<CachedModule>> {
+        self.note_shape_change();
         if let Some(ref m) = result {
             if let Some(bc) = self.bag_cache.read().ok().and_then(|g| g.clone()) {
                 bc.invalidate(&m.path);
@@ -162,6 +177,7 @@ impl IndexCore {
     /// local facts (the same tier as export names), not a cached
     /// cross-file resolution.
     pub(crate) fn record_loader_shapes(&self, contributor: &str, analysis: &FileAnalysis) {
+        self.note_shape_change();
         // re-registration: drop this contributor's old entries
         self.loader_config_shapes.retain(|_n, v| {
             v.retain(|(c, _)| c != contributor);

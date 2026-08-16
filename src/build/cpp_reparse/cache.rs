@@ -69,6 +69,9 @@ pub struct GatherCache<K, S, V> {
     state: std::sync::Mutex<GatherState<K, S, V>>,
     ready: std::sync::Condvar,
     cap_bytes: usize,
+    /// Report-only ghost-list accounting (`PERL_LSP_GHOST_STATS`). `None`
+    /// when the gate is off — no cache decision ever reads this.
+    ghost: Option<std::sync::Arc<crate::util::ghost_stats::GhostStats>>,
 }
 
 /// Releases an in-flight claim (and clears any cancel marker) even if `compute`
@@ -102,11 +105,20 @@ where
 
 impl<K, S, V> GatherCache<K, S, V>
 where
-    K: Eq + std::hash::Hash + Clone,
+    K: Eq + std::hash::Hash + Clone + std::fmt::Debug,
     S: PartialEq + Clone,
     V: Clone,
 {
+    /// Production sites use `new_labeled` so ghost-stats reports name their
+    /// tier; the unlabeled form serves tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(cap_bytes: usize) -> Self {
+        Self::new_labeled(cap_bytes, "gather")
+    }
+
+    /// `new` with a report label naming the tier so ghost-stats output
+    /// attributes traffic to the right cache.
+    pub(super) fn new_labeled(cap_bytes: usize, label: &str) -> Self {
         GatherCache {
             state: std::sync::Mutex::new(GatherState {
                 entries: HashMap::new(),
@@ -117,6 +129,10 @@ where
             }),
             ready: std::sync::Condvar::new(),
             cap_bytes,
+            ghost: crate::util::ghost_stats::GhostStats::new_if_enabled(format!(
+                "{label} cap={}MiB",
+                cap_bytes / (1024 * 1024)
+            )),
         }
     }
 
@@ -164,6 +180,9 @@ where
                     if let Some(e) = st.entries.get_mut(&key) {
                         e.last_used = c;
                     }
+                    if let Some(g) = &self.ghost {
+                        g.on_hit();
+                    }
                     return (Some(v), Resolution::Cached);
                 }
                 if st.in_flight.contains(&key) {
@@ -185,6 +204,9 @@ where
                     // waiter, where blocking is safe.
                     if rayon::current_thread_index().is_some() {
                         drop(st);
+                        if let Some(g) = &self.ghost {
+                            g.on_miss(&format!("{key:?}"));
+                        }
                         return match compute() {
                             // Store means the compute succeeded completely —
                             // the value is authoritative even though only the
@@ -203,6 +225,9 @@ where
         }
 
         // 2. Compute with NO lock held (siblings block on the condvar meanwhile).
+        if let Some(g) = &self.ghost {
+            g.on_miss(&format!("{key:?}"));
+        }
         let mut guard = FlightGuard { cache: self, key: &key, armed: true };
         let outcome = compute();
 
@@ -226,6 +251,9 @@ where
                         GatherEntry { stamp, value: v.clone(), bytes, last_used: c },
                     );
                     self.evict_to_cap(&mut st, &key);
+                    if let Some(g) = &self.ghost {
+                        g.set_usage(st.total_bytes as u64, st.entries.len() as u64);
+                    }
                 }
                 (Some(v), Resolution::Cached)
             }
@@ -250,6 +278,9 @@ where
             let Some(victim) = victim else { break };
             if let Some(e) = st.entries.remove(&victim) {
                 st.total_bytes -= e.bytes;
+                if let Some(g) = &self.ghost {
+                    g.on_evict(&format!("{victim:?}"));
+                }
             }
         }
     }
@@ -264,6 +295,9 @@ where
         for k in victims {
             if let Some(e) = st.entries.remove(&k) {
                 st.total_bytes -= e.bytes;
+                if let Some(g) = &self.ghost {
+                    g.on_invalidate(&format!("{k:?}"));
+                }
             }
         }
         let flight: Vec<K> = st.in_flight.iter().filter(|k| pred(k)).cloned().collect();
@@ -329,7 +363,9 @@ pub(super) const INCLUDE_CLOSURE_CACHE_MB: usize = 64;
 pub(super) fn macro_table_cache() -> &'static GatherCache<std::path::PathBuf, u64, std::sync::Arc<MacroTable>> {
     static C: OnceLock<GatherCache<std::path::PathBuf, u64, std::sync::Arc<MacroTable>>> =
         OnceLock::new();
-    C.get_or_init(|| GatherCache::new(gather_cap_bytes(MACRO_TABLE_CACHE_MB)))
+    C.get_or_init(|| {
+        GatherCache::new_labeled(gather_cap_bytes(MACRO_TABLE_CACHE_MB), "gather-macro-table")
+    })
 }
 
 /// Hash of the file's `#include` directives — the cache key's variable part.

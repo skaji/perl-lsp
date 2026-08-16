@@ -479,6 +479,12 @@ pub struct FreshnessIndex {
     /// consumer path → the provider names it last declared edges to
     /// (the removal half — edges must not accumulate across re-records).
     deps_of: dashmap::DashMap<std::path::PathBuf, Vec<String>>,
+    /// Monotone count of MUTATING writes (Changed/FirstSeen records and
+    /// removes; an Unchanged record touches nothing and doesn't count).
+    /// One leg of the enrichment-key memo's validity epoch: any freshness
+    /// mutation funnels through `record`/`remove` by construction, so the
+    /// bump cannot be forgotten at a call site.
+    writes: std::sync::atomic::AtomicU64,
 }
 
 impl FreshnessIndex {
@@ -512,6 +518,7 @@ impl FreshnessIndex {
             Some(_) => SurfaceVerdict::Changed,
         };
         if verdict != SurfaceVerdict::Unchanged {
+            self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let new_deps = Self::dep_names(&surface);
             let old_deps = self
                 .deps_of
@@ -561,8 +568,14 @@ impl FreshnessIndex {
         self.deps_of.get(path).map(|v| v.clone()).unwrap_or_default()
     }
 
+    /// The mutating-write count — see the `writes` field.
+    pub fn write_count(&self) -> u64 {
+        self.writes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Drop a deleted file's record and edges.
     pub fn remove(&self, path: &std::path::Path) {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.surfaces.remove(path);
         if let Some((_, deps)) = self.deps_of.remove(path) {
             for d in deps {

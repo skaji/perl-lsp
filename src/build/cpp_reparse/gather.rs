@@ -127,7 +127,9 @@ fn pre_expanded_cache() -> &'static GatherCache<std::path::PathBuf, u64, std::sy
     static C: OnceLock<
         GatherCache<std::path::PathBuf, u64, std::sync::Arc<PreExpandedExternal>>,
     > = OnceLock::new();
-    C.get_or_init(|| GatherCache::new(gather_cap_bytes(PRE_EXPANDED_CACHE_MB)))
+    C.get_or_init(|| {
+        GatherCache::new_labeled(gather_cap_bytes(PRE_EXPANDED_CACHE_MB), "gather-pre-expanded")
+    })
 }
 
 /// The full+alias expanded-variant payload ADDED on top of the raw table (the
@@ -317,7 +319,7 @@ fn header_cache(
     static C: OnceLock<
         GatherCache<std::path::PathBuf, std::time::SystemTime, std::sync::Arc<CachedHeader>>,
     > = OnceLock::new();
-    C.get_or_init(|| GatherCache::new(gather_cap_bytes(HEADER_CACHE_MB)))
+    C.get_or_init(|| GatherCache::new_labeled(gather_cap_bytes(HEADER_CACHE_MB), "gather-header"))
 }
 
 /// The default C/C++ toolchain's discovered surface (system include roots +
@@ -437,7 +439,9 @@ fn include_closure_cache(
 ) -> &'static GatherCache<std::path::PathBuf, u64, std::sync::Arc<Vec<String>>> {
     static C: OnceLock<GatherCache<std::path::PathBuf, u64, std::sync::Arc<Vec<String>>>> =
         OnceLock::new();
-    C.get_or_init(|| GatherCache::new(gather_cap_bytes(INCLUDE_CLOSURE_CACHE_MB)))
+    C.get_or_init(|| {
+        GatherCache::new_labeled(gather_cap_bytes(INCLUDE_CLOSURE_CACHE_MB), "gather-include-closure")
+    })
 }
 
 /// The transitive `#include` closure of `file_path`, as canonical path strings

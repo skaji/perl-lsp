@@ -201,6 +201,16 @@ pub struct ModuleIndex {
     /// provider change moves the key.
     enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
+    /// Memo for `enrichment_key` (path → (epoch, key)): the key is a
+    /// transitive dep-closure walk and the overlay recomputes it on EVERY
+    /// consult, hit or miss — measured 170k walks from one didOpen on a
+    /// large tree. Validity is the additive epoch from
+    /// `enrichment_epoch()`; any index mutation moves the epoch and every
+    /// entry lazily recomputes (over-invalidation by design). Bounded by
+    /// construction: ONE entry per distinct consulted path — superseded
+    /// (epoch, key) pairs overwrite in place, never accumulate — so the
+    /// ceiling is the registered-file count × ~100 bytes.
+    enrichment_key_memo: Arc<DashMap<std::path::PathBuf, (u64, u64)>>,
     /// The linkage-visible (name, declares-a-Class) pairs each file
     /// registered — the exact inverse list `unregister_file` walks AND the
     /// class-rank source for the cache-slot tie-break. Recorded at

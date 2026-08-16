@@ -82,6 +82,7 @@ pub fn collect_diagnostics(
     module_index: &ModuleIndex,
     options: DiagnosticOptions,
 ) -> Vec<Diagnostic> {
+    crate::util::ghost_stats::count("collect_diagnostics");
     let mut diagnostics = Vec::new();
 
     // Plugin-emitted diagnostics (pattern lints) — already decided at

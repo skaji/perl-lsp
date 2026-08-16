@@ -1220,3 +1220,164 @@ fn thread_path_resolution_feeds_loader_config_shapes() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Tripwire for the enrichment-key memo: every writer that mutates the
+/// key's read set (registration gens, freshness records/removes, cache
+/// slots, loader shapes) must move `enrichment_epoch()`, or the memo
+/// serves a stale key — silent wrong cross-file answers, not slowness.
+/// A new mutation path that fails this test needs a bump at its owning
+/// choke point (`gen_counter` mint, `FreshnessIndex` write, or
+/// `note_shape_change`), never a call-site bump.
+#[test]
+fn enrichment_epoch_moves_on_every_writer() {
+    let idx = ModuleIndex::new_for_test();
+    let mut last = idx.enrichment_epoch();
+    let mut expect_move = |idx: &ModuleIndex, what: &str| {
+        let now = idx.enrichment_epoch();
+        assert!(now > last, "{what} must move the enrichment epoch");
+        last = now;
+    };
+
+    // 1. Workspace registration front door (gen mint + surface record).
+    let a = parse_source_to_cached("package EpochA;\nsub go { 1 }\n1;\n", "EpochA");
+    idx.register_workspace_module(a.path.to_path_buf(), Arc::clone(&a.analysis));
+    expect_move(&idx, "register_workspace_module");
+
+    // 2. @INC/CLI cache insertion (insert_resolved).
+    let b = parse_source_to_cached("package EpochB;\nsub b { 2 }\n1;\n", "EpochB");
+    idx.insert_cache("EpochB", Some(Arc::clone(&b)));
+    expect_move(&idx, "insert_cache");
+
+    // 3. A CHANGED surface record (freshness write).
+    let a2 = build_fa("package EpochA;\nsub go { 1 }\nsub extra { 3 }\n1;\n");
+    idx.record_and_dirty(&a.path, &a2, SurfaceWrite::Background);
+    expect_move(&idx, "record_and_dirty (Changed)");
+
+    // 4. Loader-shape rewrite.
+    idx.record_workspace_projections(&a.path, &a.analysis);
+    expect_move(&idx, "record_workspace_projections");
+
+    // 5. Surface removal (file deleted).
+    idx.remove_surface(&a.path);
+    expect_move(&idx, "remove_surface");
+
+    // 6. Workspace unregistration (cache-slot drop).
+    idx.unregister_workspace_path(&a.path);
+    expect_move(&idx, "unregister_workspace_path");
+
+    // 7. Pack-file unregistration (cache-slot survivor re-pick).
+    idx.unregister_file(&b.path);
+    expect_move(&idx, "unregister_file");
+}
+
+/// The memo itself: identical epoch → the key is served from the memo
+/// (same value); any writer between consults → recompute. Guards the
+/// read-epoch-BEFORE-walk ordering too (a mid-walk mutation may store a
+/// mixed key, but only under the pre-mutation epoch).
+#[test]
+fn enrichment_key_memo_serves_stable_then_invalidates() {
+    let idx = ModuleIndex::new_for_test();
+    let consumer = parse_source_to_cached(
+        "package MemoApp;\nuse Memo::Dep 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "MemoApp",
+    );
+    idx.register_workspace_module(consumer.path.to_path_buf(), Arc::clone(&consumer.analysis));
+    let dep = parse_source_to_cached(
+        "package Memo::Dep;\nour @EXPORT_OK = ('make');\nsub make { return bless {}, 'M1' }\n1;\n",
+        "Memo::Dep",
+    );
+    idx.insert_cache("Memo::Dep", Some(dep));
+
+    let k1 = idx.enrichment_key_memoized(&consumer);
+    let k1b = idx.enrichment_key_memoized(&consumer);
+    assert_eq!(k1, k1b, "stable epoch: memoized key is identical");
+
+    // A dep re-resolve must invalidate the memo AND change the key.
+    let dep2 = parse_source_to_cached(
+        "package Memo::Dep;\nour @EXPORT_OK = ('make');\nsub make { return bless {}, 'M2' }\n1;\n",
+        "Memo::Dep",
+    );
+    idx.insert_cache("Memo::Dep", Some(dep2));
+    let k2 = idx.enrichment_key_memoized(&consumer);
+    assert_ne!(k1, k2, "dep re-resolve must move the memoized key");
+}
+
+/// The batch-fire convergence guarantee: every drained batch that resolved
+/// at least one module ends with an `on_resolved` fire, so once the queue
+/// drains the diagnostics refresh has fired AFTER the last resolution and
+/// open docs converge. Guards against a regression (fixed-size batches,
+/// timer-only fires) that would leave a trailing partial batch's
+/// resolutions unpublished. Three sequential resolves force three separate
+/// batches; each must be followed by its own fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resolver_fires_refresh_after_every_drained_batch() {
+    use tower_lsp::lsp_types::{InitializeParams, InitializeResult};
+    use tower_lsp::{jsonrpc, LanguageServer, LspService};
+    struct Stub;
+    #[tower_lsp::async_trait]
+    impl LanguageServer for Stub {
+        async fn initialize(
+            &self,
+            _: InitializeParams,
+        ) -> jsonrpc::Result<InitializeResult> {
+            Ok(InitializeResult::default())
+        }
+        async fn shutdown(&self) -> jsonrpc::Result<()> {
+            Ok(())
+        }
+    }
+    let (client_tx, client_rx) = std::sync::mpsc::channel();
+    let (_service, _socket) = LspService::new(move |client: tower_lsp::Client| {
+        client_tx.send(client.clone()).unwrap();
+        Stub
+    });
+    let client = client_rx.recv().unwrap();
+
+    let fires = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fires_cb = Arc::clone(&fires);
+    let idx = ModuleIndex::new(client, move || {
+        fires_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    // Project-local lib with three modules; no cpanfile, so the resolver
+    // sends no progress traffic over the unread socket.
+    let dir = std::env::temp_dir().join(format!(
+        "qx-batch-fire-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("lib/Batch")).unwrap();
+    for m in ["A", "B", "C"] {
+        std::fs::write(
+            dir.join(format!("lib/Batch/{m}.pm")),
+            format!("package Batch::{m};\nsub go {{ 1 }}\n1;\n"),
+        )
+        .unwrap();
+    }
+    idx.set_workspace_root(Some(&format!("file://{}", dir.display())));
+
+    for name in ["Batch::A", "Batch::B", "Batch::C"] {
+        let before = fires.load(std::sync::atomic::Ordering::SeqCst);
+        idx.request_resolve(name);
+        assert!(
+            idx.wait_resolved(name, std::time::Duration::from_secs(30)),
+            "{name} should resolve from the project lib"
+        );
+        // The fire lands right after the batch loop's last module; give the
+        // thread a moment to reach it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while fires.load(std::sync::atomic::Ordering::SeqCst) <= before
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            fires.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "queue drained after {name} but no diagnostics refresh fired"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

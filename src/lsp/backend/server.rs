@@ -241,6 +241,9 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        // Report-only cache instrumentation flush; inert unless
+        // PERL_LSP_GHOST_STATS is set.
+        crate::util::ghost_stats::emit_all("shutdown");
         Ok(())
     }
 

@@ -3,4 +3,5 @@
 //! charter — a util file referencing any crate path fails the walk, so
 //! this directory cannot become a laundering hole between layers.
 
+pub mod ghost_stats;
 pub mod timings;

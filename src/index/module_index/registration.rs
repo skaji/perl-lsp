@@ -260,6 +260,7 @@ impl ModuleIndex {
         }
         if !ENRICHING.with(|s| s.borrow_mut().insert(cached.path.clone())) {
             DECLINED.with(|c| c.set(c.get() + 1));
+            crate::util::ghost_stats::count("enriched_snapshot.cycle_decline");
             return None;
         }
         let _entered = Entered(cached.path.clone());
@@ -270,7 +271,7 @@ impl ModuleIndex {
         const ENRICHED_CAP: usize = 64;
         const ENRICHED_BYTE_CAP: usize = 128 * 1024 * 1024;
         let path = &cached.path;
-        let key = self.enrichment_key(cached);
+        let key = self.enrichment_key_memoized(cached);
         if let Some(e) = self.enriched.get(path) {
             if e.0 == key {
                 let hit = e.1.clone();
@@ -282,9 +283,11 @@ impl ModuleIndex {
                 order.push_back(path.clone());
                 // `None` = a remembered DECLINE (giant / cycle-tainted):
                 // repeat queries skip the deep-copy until the key moves.
+                crate::util::ghost_stats::count("enriched_snapshot.hit");
                 return hit;
             }
         }
+        crate::util::ghost_stats::count("enriched_snapshot.build");
         let whole = crate::model::file_analysis::CrossFileLookup::whole_present(self, cached);
         // Deep copy via serde — enrichment must never write through the
         // shared Arc (the R4 rule the overlay exists to enforce).
@@ -356,7 +359,52 @@ impl ModuleIndex {
     ///
     /// Extending enrichment with a new cross-file read means extending
     /// this key.
+    /// The additive validity epoch for the enrichment-key memo: three
+    /// monotone counters covering `enrichment_key`'s full read set —
+    /// `gen_counter` (registration gens; every registration front door and
+    /// @INC resolve mints), the freshness write count (fingerprints +
+    /// dep-name edges; every mutating record/remove funnels through
+    /// `FreshnessIndex` itself), and `shape_bumps` (cache-slot swaps +
+    /// loader-shape rewrites). All only increase, so the sum moves whenever
+    /// any leg does. A new mutation path must move one of the three legs —
+    /// prefer bumping at the owning choke point, never at call sites.
+    pub(super) fn enrichment_epoch(&self) -> u64 {
+        self.core.gen_counter.load(std::sync::atomic::Ordering::Relaxed)
+            + self.core.shape_bumps.load(std::sync::atomic::Ordering::Relaxed)
+            + self.freshness.write_count()
+    }
+
+    /// `enrichment_key` behind the epoch memo, optimistic-read validated.
+    ///
+    /// ORDERING IS LOAD-BEARING: the epoch is read BEFORE the walk and
+    /// re-read AFTER; the memo stores only when the two match. A key walk
+    /// that raced a mutation reads a mix of old and new state — storing it
+    /// under the post-mutation epoch would serve the torn key to every
+    /// later consult until the NEXT unrelated write (a cached wrong value,
+    /// amplified), where pre-memo a torn walk died after one use. The
+    /// validated store keeps the memo's guarantee exactly the pre-memo one:
+    /// a racing consult may answer from mixed state once, and the next
+    /// consult recomputes.
+    pub(super) fn enrichment_key_memoized(&self, cached: &Arc<CachedModule>) -> u64 {
+        let epoch = self.enrichment_epoch();
+        if let Some(m) = self.enrichment_key_memo.get(&cached.path) {
+            if m.0 == epoch {
+                crate::util::ghost_stats::count("enrichment_key.memo_hit");
+                return m.1;
+            }
+        }
+        let key = self.enrichment_key(cached);
+        if self.enrichment_epoch() == epoch {
+            // One overwritten-in-place entry per consulted path: bounded by
+            // the number of registered files (~100 bytes each), never a
+            // per-consult append.
+            self.enrichment_key_memo.insert(cached.path.clone(), (epoch, key));
+        }
+        key
+    }
+
     fn enrichment_key(&self, cached: &Arc<CachedModule>) -> u64 {
+        crate::util::ghost_stats::count("enrichment_key");
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.registration_gen_of(&cached.path).hash(&mut h);
@@ -505,6 +553,8 @@ impl ModuleIndex {
     /// entry plus its name-keyed cache row and edges (a dead file must not
     /// stay a retrieval candidate or a phantom module).
     pub fn unregister_workspace_path(&self, path: &std::path::Path) {
+        // The name-keyed cache slot drops below without a gen mint.
+        self.core.note_shape_change();
         self.remove_surface(path);
         self.all_files.remove(path);
         let name = self.core.cache.iter().find_map(|entry| {
@@ -1010,6 +1060,9 @@ impl ModuleIndex {
     /// file unregisters first so names its new version no longer defines
     /// don't linger).
     pub fn unregister_file(&self, path: &std::path::Path) {
+        // Cache-slot re-picks below change `get_cached` answers without a
+        // gen mint — the epoch must move or the enrichment-key memo lies.
+        self.core.note_shape_change();
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if self.all_files.remove(&canon).is_none() {
             return;

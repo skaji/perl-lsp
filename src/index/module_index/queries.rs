@@ -17,6 +17,7 @@ impl ModuleIndex {
             freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),
             enriched: Arc::new(DashMap::new()),
             enriched_order: Arc::new(std::sync::Mutex::new(Default::default())),
+            enrichment_key_memo: Arc::new(DashMap::new()),
             foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
             ref_rows_conn: std::sync::Mutex::new(None),
@@ -81,8 +82,16 @@ impl ModuleIndex {
             }
             crate::index::module_cache::open_and_load_diag(key.as_deref(), "perl", &spellings)
         };
-        self.set_bag_cache(Arc::new(crate::index::pack_bag_cache::PackBagCache::new(
-            128 * 1024 * 1024,
+        // Measurement-only override for ghost-stats cap experiments
+        // (`PERL_LSP_BAG_CACHE_MB`); unset ⇒ the stock 128 MiB.
+        let cap_bytes = std::env::var("PERL_LSP_BAG_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(128 * 1024 * 1024);
+        self.set_bag_cache(Arc::new(crate::index::pack_bag_cache::PackBagCache::new_labeled(
+            cap_bytes,
+            "perl-hub",
             loader,
         )));
     }

@@ -372,6 +372,7 @@ impl Backend {
     /// (clone-and-enrich off the store lock, ptr-guarded swap); this path
     /// reads the artifact it returns, never mutates a stored analysis.
     pub(super) async fn publish_diagnostics(&self, uri: &Url) {
+        crate::util::ghost_stats::count("publish_diagnostics");
         let options = self.diagnostic_options();
         let language = self.files.get_open(uri).map(|d| d.language);
         let diagnostics = match language {
@@ -427,6 +428,7 @@ fn make_on_refresh(
         let holder = Arc::clone(&holder);
         let diag_options = Arc::clone(&diag_options);
         let run = Arc::clone(&run);
+        crate::util::ghost_stats::count("on_refresh.fired");
         log::debug!("diag-refresh fired");
         debounce.fire(&handle, std::time::Duration::from_millis(120), move |latest| async move {
             let module_index = match holder.get() {
@@ -439,6 +441,7 @@ fn make_on_refresh(
             if !latest.still() {
                 return;
             }
+            crate::util::ghost_stats::count("on_refresh.executed");
             log::debug!("diag-refresh executing");
             // Derive (uri, diagnostics) first without holding the store lock
             // across the await — publishing is async and could deadlock.
@@ -473,6 +476,7 @@ pub(super) fn refresh_open_diagnostics(
     options: symbols::DiagnosticOptions,
     scope: OpenDocScope,
 ) -> Vec<(Url, Vec<Diagnostic>)> {
+    crate::util::ghost_stats::count("refresh_open_diagnostics");
     let mut docs: Vec<(Url, &'static str)> = Vec::new();
     files.for_each_open(|uri, doc| {
         if scope == OpenDocScope::All || doc.language == "perl" {
