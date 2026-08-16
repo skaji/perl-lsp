@@ -50,8 +50,29 @@ impl Backend {
             // Announces completion (or the no-root early-out) to bounded waiters
             // on Drop — every exit path of this closure, panic included.
             let _done = IndexDoneGuard { ready: index_ready, want_perl };
-            let Some(root_uri) = root else { return };
-            let Some(root_path) = root_uri.strip_prefix("file://") else { return };
+            // Every perl exit path below opens the gate BEFORE running the
+            // heal sweep (`open_perl_gate_then_heal`): a `publish_diagnostics`
+            // that read "index in flight" and deferred is guaranteed its doc
+            // is already in the store when the sweep collects — the doc
+            // insert precedes the publish, and the publish's gate check
+            // precedes open(). Without that order a doc opened between the
+            // sweep's collection and the guard's open() would defer into a
+            // window nobody republishes.
+            let Some(root_uri) = root else {
+                // Pack keeps its early-out shape (no heal without a root);
+                // perl must still sweep so a publish deferred against the
+                // kickoff-to-early-out window converges.
+                if want_perl {
+                    Self::open_perl_gate_then_heal(&_done, &heal_ctx, true);
+                }
+                return;
+            };
+            let Some(root_path) = root_uri.strip_prefix("file://") else {
+                if want_perl {
+                    Self::open_perl_gate_then_heal(&_done, &heal_ctx, true);
+                }
+                return;
+            };
             let root_path = PathBuf::from(root_path);
             let rt = tokio::runtime::Handle::current();
             let token = NumberOrString::String(format!(
@@ -200,8 +221,21 @@ impl Backend {
             // family so pull-verb answers baked in the cached-only open window
             // (truncated cross-file closure, `None` gd/hover) self-heal without
             // the user re-triggering.
-            Self::heal_open_docs(&heal_ctx, want_perl);
+            Self::open_perl_gate_then_heal(&_done, &heal_ctx, want_perl);
         });
+    }
+
+    /// Perl: open the ready gate, THEN run the heal sweep — the order that
+    /// makes deferred publishes race-free (see the comment at the guard).
+    /// Costs pull-verb waiters a slightly earlier wakeup (they answer from
+    /// the raw open doc while the sweep's enrichment is still running — the
+    /// same degraded window the deferral accepts). Pack keeps the guard's
+    /// drop-time open: its degraded window is owned by `degraded_open`.
+    fn open_perl_gate_then_heal(done: &IndexDoneGuard, ctx: &PackHealCtx, want_perl: bool) {
+        if want_perl {
+            done.ready.perl.open();
+        }
+        Self::heal_open_docs(ctx, want_perl);
     }
 
     /// Re-derive + re-publish every OPEN document in a language family after its

@@ -376,12 +376,33 @@ impl Backend {
         let options = self.diagnostic_options();
         let language = self.files.get_open(uri).map(|d| d.language);
         let diagnostics = match language {
-            Some("perl") => match self.files.enrich_open(uri, &*self.module_index) {
-                Some(analysis) => {
-                    symbols::collect_diagnostics(&analysis, &self.module_index, options)
+            Some("perl") => {
+                // Deferred while the Perl workspace index is landing: an
+                // enrichment cascade started mid-registration builds the
+                // overlay closure against keys the landing providers
+                // immediately invalidate (~75% of warm-open overlay builds
+                // were these rebuilds), and its diagnostics are derived from
+                // a half-loaded index anyway. Skip the publish entirely —
+                // no empty array either, which would clear prior diags on a
+                // didChange inside the window. Coverage: `heal_open_docs`
+                // republishes every open Perl doc at index completion, and
+                // the gate opens BEFORE its sweep collects, so a doc whose
+                // publish deferred is in the store by the time the sweep
+                // runs — nothing can slip between.
+                use std::sync::atomic::Ordering;
+                if self.perl_indexed.load(Ordering::Relaxed)
+                    && !self.index_ready.perl.is_open()
+                {
+                    crate::util::ghost_stats::count("publish_diagnostics.deferred");
+                    return;
                 }
-                None => vec![],
-            },
+                match self.files.enrich_open(uri, &*self.module_index) {
+                    Some(analysis) => {
+                        symbols::collect_diagnostics(&analysis, &self.module_index, options)
+                    }
+                    None => vec![],
+                }
+            }
             // Pack languages stay honest-silent EXCEPT the always-on
             // member-access operator mismatch and the opt-in use-after-move
             // (gated by `DiagnosticOptions.use_after_move`).
