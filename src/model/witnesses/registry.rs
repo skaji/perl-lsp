@@ -361,6 +361,7 @@ impl ReducerRegistry {
                             // return may chain through ITS OWN imports —
                             // invisible to the raw bag, present in the
                             // enriched overlay.
+                            crate::util::ghost_stats::count("consult.moc_primary");
                             let enriched = idx.enriched_present(&cached);
                             if !std::sync::Arc::ptr_eq(&enriched, &full)
                                 && !std::ptr::eq(bag, &enriched.witnesses)
@@ -442,6 +443,7 @@ impl ReducerRegistry {
                         // bridged hop, so mutual bridges recurse unbounded; the
                         // ENRICHING-guarded bake is the safe route to the same
                         // transitive answer.
+                        crate::util::ghost_stats::count("consult.bridged");
                         let enriched = idx.enriched_present(cached);
                         if !std::sync::Arc::ptr_eq(&enriched, &full) {
                             if let Some(t) = enriched.symbol_return_type_via_bag(sym.id, None) {
@@ -503,6 +505,7 @@ impl ReducerRegistry {
                             // seeding emits an unconditional edge. Pin the
                             // enriched Arc: this chase threads the SHARED
                             // QueryState, whose memo keys on bag pointers.
+                            crate::util::ghost_stats::count("consult.slot_type");
                             let enriched = idx.enriched_present(&cached);
                             if !std::sync::Arc::ptr_eq(&enriched, &full)
                                 && !std::ptr::eq(bag, &enriched.witnesses)

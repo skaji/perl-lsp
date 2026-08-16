@@ -99,6 +99,7 @@ impl IndexCore {
     /// @INC re-resolve) bumps the gen, moving every consumer's key — where a
     /// bare Arc pointer could be freed and its address reused.
     pub(crate) fn mint_registration_gen(&self, path: &std::path::Path) {
+        crate::util::ghost_stats::count("epoch.gen_mint");
         let g = self
             .gen_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -115,6 +116,7 @@ impl IndexCore {
         for entry in self.cache.iter() {
             if let Some(ref cm) = *entry.value() {
                 self.registration_gen.entry(cm.path.clone()).or_insert_with(|| {
+                    crate::util::ghost_stats::count("epoch.gen_stamp_missing");
                     self.gen_counter
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 });
@@ -154,6 +156,7 @@ impl IndexCore {
         persisted: bool,
         strip: bool,
     ) -> Option<Arc<CachedModule>> {
+        crate::util::ghost_stats::count("epoch.shape.insert_resolved");
         self.note_shape_change();
         if let Some(ref m) = result {
             if let Some(bc) = self.bag_cache.read().ok().and_then(|g| g.clone()) {
@@ -177,6 +180,7 @@ impl IndexCore {
     /// local facts (the same tier as export names), not a cached
     /// cross-file resolution.
     pub(crate) fn record_loader_shapes(&self, contributor: &str, analysis: &FileAnalysis) {
+        crate::util::ghost_stats::count("epoch.shape.record_loader_shapes");
         self.note_shape_change();
         // re-registration: drop this contributor's old entries
         self.loader_config_shapes.retain(|_n, v| {

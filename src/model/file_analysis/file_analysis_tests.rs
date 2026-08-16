@@ -625,6 +625,83 @@ sub get_config { return { host => 'h', port => 1 }; }
     );
 }
 
+/// Enrichment's imported-name scan is NEED-driven (call-bindings-keyed):
+/// an imported sub the file never calls contributes nothing to enrichment
+/// — and must not COST anything either. This pins both halves against a
+/// producer exporting a called sub and a never-called one:
+/// the called binding still gets its TC + owner stamp and its hash-key
+/// completion, while the never-called import leaves zero artifacts (no TC,
+/// no owner stamp — there is no receiver variable a completion or rename
+/// could even start from, so nothing user-visible can depend on scanning it).
+#[test]
+fn enrichment_scan_is_call_binding_keyed_uncalled_imports_contribute_nothing() {
+    use crate::index::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let producer = r#"
+package Cfg;
+use Exporter 'import';
+our @EXPORT = ('get_config', 'get_other');
+sub get_config { return { host => 'h', port => 1 }; }
+sub get_other  { return { secret => 's', token => 't' }; }
+1;
+"#;
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(
+        std::path::PathBuf::from("/tmp/Cfg.pm"),
+        Arc::new(build_fa_from_source(producer)),
+    );
+
+    let mut fa = build_fa_from_source(
+        "use Cfg;\nmy $c = get_config();\nmy $h = $c->{host};\nmy $x = $c->{};\n",
+    );
+    fa.enrich_imported_types_with_keys(Some(&idx));
+
+    // The CALLED import still enriches: owner stamp on the access...
+    let hka = fa
+        .refs
+        .iter()
+        .find(|r| matches!(r.kind, RefKind::HashKeyAccess { .. }) && r.target_name == "host")
+        .expect("HashKeyAccess host");
+    assert!(
+        matches!(
+            hka.hash_key_owner(),
+            Some(HashKeyOwner::Sub { package: Some(p), name })
+                if p == "Cfg" && name == "get_config"
+        ),
+        "called import keeps its enrichment owner stamp, got {:?}",
+        hka.hash_key_owner(),
+    );
+    // ...and hash-key completion for its receiver still answers cross-file.
+    let keys: std::collections::HashSet<String> = fa
+        .complete_hash_keys("$c", Point::new(3, 13), Some(&idx))
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert!(
+        keys.contains("host") && keys.contains("port"),
+        "called import keeps cross-file hash-key completion, got {:?}",
+        keys,
+    );
+
+    // The NEVER-called import contributes nothing — exactly as before the
+    // narrowing (its map entries were dead weight: every consumer of the
+    // scan's output is keyed by `call_bindings`).
+    assert!(
+        !fa.symbols.iter().any(|s| s.name == "secret" || s.name == "token"),
+        "no artifacts for an imported sub the file never calls",
+    );
+    assert!(
+        !fa.refs.iter().any(|r| {
+            matches!(
+                r.hash_key_owner(),
+                Some(HashKeyOwner::Sub { name, .. }) if name == "get_other"
+            )
+        }),
+        "no owner stamps referencing the never-called import",
+    );
+}
+
 /// End-to-end demo shape: mirrors `test_files/phase5_demo.pl` so a
 /// regression in the demo surfaces here first. Three access sites all
 /// flow through the qualified `Demo::phase5::get_config()` binding.

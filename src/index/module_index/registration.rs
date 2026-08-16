@@ -164,7 +164,17 @@ impl ModuleIndex {
         if write == SurfaceWrite::Background && self.open_doc_paths.contains_key(canon) {
             return crate::model::surface::SurfaceVerdict::Unchanged;
         }
-        self.freshness.record(canon, surface)
+        let verdict = self.freshness.record(canon, surface);
+        match verdict {
+            crate::model::surface::SurfaceVerdict::FirstSeen => {
+                crate::util::ghost_stats::count("epoch.freshness.record_first_seen")
+            }
+            crate::model::surface::SurfaceVerdict::Changed => {
+                crate::util::ghost_stats::count("epoch.freshness.record_changed")
+            }
+            crate::model::surface::SurfaceVerdict::Unchanged => {}
+        }
+        verdict
     }
 
     /// didOpen: the open-doc path owns `path`'s surface record until
@@ -219,10 +229,12 @@ impl ModuleIndex {
                 .and_then(|d| path.file_name().map(|f| d.join(f)))
                 .unwrap_or_else(|| path.to_path_buf())
         });
+        crate::util::ghost_stats::count("epoch.freshness.remove");
         self.freshness.remove(&canon);
         // Belt over braces: if the caller's raw spelling was the recorded
         // key (registration itself fell back), remove that too.
         if canon != path {
+            crate::util::ghost_stats::count("epoch.freshness.remove");
             self.freshness.remove(path);
         }
     }
@@ -584,6 +596,7 @@ impl ModuleIndex {
     /// stay a retrieval candidate or a phantom module).
     pub fn unregister_workspace_path(&self, path: &std::path::Path) {
         // The name-keyed cache slot drops below without a gen mint.
+        crate::util::ghost_stats::count("epoch.shape.unregister_workspace_path");
         self.core.note_shape_change();
         self.remove_surface(path);
         self.all_files.remove(path);
@@ -1092,6 +1105,7 @@ impl ModuleIndex {
     pub fn unregister_file(&self, path: &std::path::Path) {
         // Cache-slot re-picks below change `get_cached` answers without a
         // gen mint — the epoch must move or the enrichment-key memo lies.
+        crate::util::ghost_stats::count("epoch.shape.unregister_file");
         self.core.note_shape_change();
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if self.all_files.remove(&canon).is_none() {

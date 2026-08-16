@@ -137,6 +137,7 @@ pub fn query_sub_return_type(
                 }
             }
             for cached in retryable {
+                crate::util::ghost_stats::count("consult.imported_sub_return");
                 let full = idx.bag_present(&cached);
                 let enriched = idx.enriched_present(&cached);
                 if !std::sync::Arc::ptr_eq(&enriched, &full) {

@@ -4,12 +4,13 @@
 use super::*;
 
 impl FileAnalysis {
-    /// Resolve call bindings for imported functions and inject
-    /// synthetic HashKeyDef symbols. Walks `self.imports` against
-    /// `module_index` to derive each imported sub's return type and
-    /// hash-key set, reaching cross-file `Symbol(_)` witnesses through
-    /// `BagContext.module_index` directly. Call after building, when the
-    /// module index is available.
+    /// Resolve call bindings for imported functions: return-type TCs plus
+    /// hash-key owner stamps on their accesses (the producer's real
+    /// HashKeyDef is the single source — no consumer-side stub). Walks
+    /// `self.imports` against `module_index` for exactly the names this
+    /// file's `call_bindings` reference, reaching cross-file `Symbol(_)`
+    /// witnesses through `BagContext.module_index` directly. Call after
+    /// building, when the module index is available.
     /// The enrichment half of loader-config param typing
     /// (`prompt-long-distance.md`): for each `from_loader_config`
     /// marker, gather the config-arg shapes from every caller's
@@ -265,7 +266,24 @@ impl FileAnalysis {
         // the index already knows.
         let mut imported_hash_keys: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
         let mut imported_returns: HashMap<String, InferredType> = HashMap::new();
-        if let Some(idx) = module_index {
+        // NEED-driven: both maps are consumed only through `call_bindings`
+        // lookups (the return-TC push and the hash-key owner fixup below), so
+        // only names this file actually binds are worth querying. Scanning
+        // every exported symbol instead runs a cross-file registry chase per
+        // export — and each raw-bag miss force-builds the exporter's enriched
+        // overlay, whose own enrichment recurses into ITS imports: one warm
+        // didOpen cascaded into deep-copying + enriching the entire dep
+        // closure (~340 overlay builds, ~146k overlay consults on crm) for
+        // answers nothing consumed.
+        let needed_names: std::collections::HashSet<&str> = self
+            .call_bindings
+            .iter()
+            .flat_map(|b| {
+                [b.func_name.as_str(), split_qualified(&b.func_name).1]
+            })
+            .collect();
+        // A file with no call bindings needs no provider walk at all.
+        if let Some(idx) = module_index.filter(|_| !needed_names.is_empty()) {
             for import in &self.imports {
                 let Some(cached) = idx.get_cached(&import.module_name) else { continue };
                 // Return-shape reads go through the bag — the resident index
@@ -281,6 +299,9 @@ impl FileAnalysis {
                 let mut enriched: Option<std::sync::Arc<FileAnalysis>> = None;
                 for sym in &whole.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                        continue;
+                    }
+                    if !needed_names.contains(sym.name.as_str()) {
                         continue;
                     }
                     if !whole.exports_name(&sym.name) {
@@ -900,8 +921,8 @@ impl FileAnalysis {
     /// Rebuild the indices affected by enrichment (symbols, the ref
     /// name/target lookups, HashKeyAccess linkage).
     ///
-    /// Enrichment injects synthetic HashKeyDef symbols for imported subs and
-    /// drops stale HashKeyDef links on re-owned HashKeyAccess refs. This
+    /// Enrichment re-owns HashKeyAccess refs (dropping their stale
+    /// HashKeyDef links) and gated emissions can mint symbols. This
     /// method re-runs the same `(target_name, owner)` linker that
     /// `build_indices` uses, so the ref→target index stays accurate after a
     /// cross-file hash-key binding resolves.
