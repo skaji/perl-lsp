@@ -192,17 +192,14 @@ impl LanguageServer for Backend {
         // build. Correctness-inert: it only populates the cache earlier.
         tokio::task::spawn_blocking(|| {
             let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
-            for id in reg.languages() {
-                if id == "perl" {
-                    continue;
-                }
-                if let Some(driver) = reg.for_id(id) {
-                    // A non-trivial snippet so `parser.parse` yields a tree and
-                    // the analyze reaches `query_extract::extract` (which is
-                    // where `Query::new` fires); empty source can parse to
-                    // `None` and skip it, leaving the cache cold.
-                    let _ = driver.analyze_with_path("int _perl_lsp_warm;\n", None);
-                }
+            // Only pack-served drivers compile a query engine worth warming
+            // (the reference driver warms on its normal first build).
+            for driver in reg.pack_drivers() {
+                // A non-trivial snippet so `parser.parse` yields a tree and
+                // the analyze reaches `query_extract::extract` (which is
+                // where `Query::new` fires); empty source can parse to
+                // `None` and skip it, leaving the cache cold.
+                let _ = driver.analyze_with_path("int _perl_lsp_warm;\n", None);
             }
         });
 
@@ -298,9 +295,13 @@ impl LanguageServer for Backend {
                 // Lazily index this file's language family (once) so a C++
                 // open doesn't wait on the perl tree.
                 self.ensure_workspace_indexed(&doc.language);
-                // A pack file's first analyze was cached-only; warm the gather
-                // and re-analyze in the background so full cross-file macros land.
-                needs_gather_refresh = doc.language != "perl";
+                // A gather-dependent file's first analyze was cached-only;
+                // warm the gather and re-analyze in the background so full
+                // cross-file macros land. The language declares whether a
+                // gather exists at all.
+                needs_gather_refresh =
+                    crate::build::language_driver::LanguageRegistry::caps(doc.language)
+                        .context_gather;
                 // Enqueue imports for background resolution (non-blocking).
                 for imp in &doc.analysis.imports {
                     self.module_index.request_resolve(&imp.module_name);
@@ -320,7 +321,12 @@ impl LanguageServer for Backend {
         let mut opened_dirty = None;
         if opened {
             if let (Ok(path), Some(doc)) = (uri.to_file_path(), self.files.get_open(&uri)) {
-                if doc.language == "perl" {
+                // Hub-integrated languages record @INC residency + the
+                // build-time Surface here; pack freshness is the
+                // invalidator's disk-side gate.
+                if crate::build::language_driver::LanguageRegistry::caps(doc.language)
+                    .hub_enrichment
+                {
                     self.module_index.mark_doc_open(&path);
                     opened_dirty = self.record_open_doc_surface(&uri);
                 }
@@ -359,11 +365,11 @@ impl LanguageServer for Backend {
             Some(doc) => doc.language,
             None => return,
         };
-        // Perl rebuilds synchronously — its build is cheap. Pack languages
+        // A cheap-build language rebuilds synchronously; the rest
         // (macro-heavy C: ~0.7s/rebuild) update the tree/text immediately so
         // position features stay live, and DEBOUNCE the analysis so a burst
         // of keystrokes pays one rebuild after typing settles, not one each.
-        if language == "perl" {
+        if crate::build::language_driver::LanguageRegistry::caps(language).synchronous_rebuild {
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(change.text);
                 for imp in &doc.analysis.imports {
@@ -393,10 +399,15 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
+        // A save of an invalidator-owned language forwards to the
+        // invalidation seam below; hub languages take the direct path.
         let pack_path = self
             .files
             .get_open(&uri)
-            .filter(|doc| doc.language != "perl")
+            .filter(|doc| {
+                crate::build::language_driver::LanguageRegistry::caps(doc.language)
+                    .pack_invalidation
+            })
             .and_then(|_| uri.to_file_path().ok());
         if let Some(text) = params.text {
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
@@ -528,7 +539,7 @@ impl LanguageServer for Backend {
             }
             // Member access (`obj->field`) flows through the set above: cpp
             // mints a `MethodCall` ref core resolves like any other.
-            if language != "perl" {
+            if crate::build::language_driver::LanguageRegistry::caps(language).cross_file_words {
                 // A macro / enum-constant / global usage (`OP_NULL`, `BASEOP`)
                 // — the raw word names a local-or-cross-file symbol. The lane
                 // sits outside the CandidateSet and still needs this file's
@@ -770,27 +781,30 @@ impl LanguageServer for Backend {
                     crate::index::resolve::OverrideScope::default(),
                 )
                 .with_source(&text);
-            if language != "perl" {
+            let caps = crate::build::language_driver::LanguageRegistry::caps(language);
+            if !caps.hover_info {
                 if let Some(h) = symbols::pack_hover(&cs, language) {
                     return Some(h);
                 }
                 // The raw-word fallback outside the set (mirrors goto-def's):
                 // a macro / enum-constant / global whose token no ref captures
                 // — show its definition line.
-                let self_path = uri.to_file_path().ok();
-                let scoped = crate::model::file_analysis::ScopedLookup::new(
-                    base_idx, &analysis.pack.include_closure, self_path.as_deref());
-                if let Some((_, _, line)) =
-                    cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
-                {
-                    if !line.is_empty() {
-                        return Some(Hover {
-                            contents: HoverContents::Markup(MarkupContent {
-                                kind: MarkupKind::Markdown,
-                                value: format!("```{}\n{}\n```", language, line),
-                            }),
-                            range: None,
-                        });
+                if caps.cross_file_words {
+                    let self_path = uri.to_file_path().ok();
+                    let scoped = crate::model::file_analysis::ScopedLookup::new(
+                        base_idx, &analysis.pack.include_closure, self_path.as_deref());
+                    if let Some((_, _, line)) =
+                        cx.pack_xfile_word_at(&text, &analysis, pos, &scoped)
+                    {
+                        if !line.is_empty() {
+                            return Some(Hover {
+                                contents: HoverContents::Markup(MarkupContent {
+                                    kind: MarkupKind::Markdown,
+                                    value: format!("```{}\n{}\n```", language, line),
+                                }),
+                                range: None,
+                            });
+                        }
                     }
                 }
                 return None;
@@ -823,7 +837,7 @@ impl LanguageServer for Backend {
                 ),
                 None => return Ok(None),
             };
-        if language != "perl" {
+        if !crate::build::language_driver::LanguageRegistry::caps(language).cursor_context {
             let (items, is_incomplete) = pack_completion(
                 &self.files,
                 &analysis,
@@ -894,8 +908,8 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        if doc.language != "perl" {
-            return Ok(None); // Perl cursor-context handler
+        if !crate::build::language_driver::LanguageRegistry::caps(doc.language).signature_help {
+            return Ok(None); // the verb is declared per language
         }
         Ok(symbols::signature_help(&doc.analysis, &doc.tree, &doc.text, pos, &self.module_index))
     }
@@ -942,8 +956,8 @@ impl LanguageServer for Backend {
             Some(doc) => doc,
             None => return Ok(None),
         };
-        if doc.language != "perl" {
-            return Ok(None); // tree-shape handler, Perl-tuned for v1
+        if !crate::build::language_driver::LanguageRegistry::caps(doc.language).selection_range {
+            return Ok(None); // tree-shape handler, declared per language
         }
         let ranges: Vec<SelectionRange> = params
             .positions
@@ -1172,16 +1186,17 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        // Route by language: pack files go through the invalidation seam
-        // (re-register + reverse-closure eviction — the old path parsed
-        // them with the Perl parser); Perl keeps the direct re-index.
+        // Route by the driver's declared invalidation owner: an
+        // invalidator-owned language goes through the invalidation seam
+        // (re-register + reverse-closure eviction); the rest take the hub's
+        // direct re-index.
         let mut perl_changes: Vec<(PathBuf, FileChangeType)> = Vec::new();
         {
             let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
             for change in params.changes {
                 let Ok(path) = change.uri.to_file_path() else { continue };
-                match reg.for_path(&path).map(|d| d.id()) {
-                    Some(id) if id != "perl" => {
+                match reg.for_path(&path) {
+                    Some(d) if d.caps().pack_invalidation => {
                         self.schedule_pack_invalidate(
                             path,
                             change.typ == FileChangeType::DELETED,

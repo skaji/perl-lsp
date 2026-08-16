@@ -82,7 +82,10 @@ impl PackHealCtx {
         let Some((text, path, language)) = self
             .files
             .get_open(uri)
-            .filter(|d| d.language != "perl")
+            .filter(|d| {
+                // Only a gather-dependent language has anything to re-gather.
+                crate::build::language_driver::LanguageRegistry::caps(d.language).context_gather
+            })
             .map(|d| (d.text.clone(), d.path.clone(), d.language))
         else {
             return;
@@ -278,9 +281,9 @@ impl Backend {
             // (so `await_open_full` holds Complete verbs until the heal lands),
             // announce it via progress (Part 1), then route the heal through
             // the single-flight registry (Part 2) so a typing burst coalesces
-            // into ONE gather instead of abandoning one per keystroke. Perl has
-            // no gather and is skipped.
-            if language != "perl" {
+            // into ONE gather instead of abandoning one per keystroke. A
+            // language with no gather has nothing to heal and is skipped.
+            if crate::build::language_driver::LanguageRegistry::caps(language).context_gather {
                 degraded_open
                     .entry(uri.clone())
                     .or_insert_with(|| Arc::new(ReadyGate::default()));
@@ -376,7 +379,7 @@ impl Backend {
         let options = self.diagnostic_options();
         let language = self.files.get_open(uri).map(|d| d.language);
         let diagnostics = match language {
-            Some("perl") => {
+            Some(l) if crate::build::language_driver::LanguageRegistry::caps(l).hub_enrichment => {
                 // Deferred while the Perl workspace index is landing: an
                 // enrichment cascade started mid-registration builds the
                 // overlay closure against keys the landing providers
@@ -479,16 +482,16 @@ fn make_on_refresh(
 /// Which open docs a bulk diagnostics refresh covers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum OpenDocScope {
-    /// Every open doc (the resolver refresh storm — perl docs re-enrich,
-    /// pack docs re-read).
+    /// Every open doc (the resolver refresh storm — hub-enriched docs
+    /// re-enrich, the rest re-read).
     All,
-    /// Perl docs only (the perl-family cold-open heal).
+    /// Hub-enriched docs only (the hub-family cold-open heal).
     PerlFamily,
 }
 
-/// Re-derive diagnostics for open docs: perl docs re-enrich through
+/// Re-derive diagnostics for open docs: hub-enriched docs re-enrich through
 /// `FileStore::enrich_open` (the one enrichment writer) and are read from
-/// the returned artifact; pack docs are read as-is. URIs are collected
+/// the returned artifact; the rest are read as-is. URIs are collected
 /// under the read iterator first, then each doc is derived with no store
 /// guard held — safe to run from any task, publish after.
 pub(super) fn refresh_open_diagnostics(
@@ -499,14 +502,17 @@ pub(super) fn refresh_open_diagnostics(
 ) -> Vec<(Url, Vec<Diagnostic>)> {
     crate::util::ghost_stats::count("refresh_open_diagnostics");
     let mut docs: Vec<(Url, &'static str)> = Vec::new();
+    let hub = |language: &str| {
+        crate::build::language_driver::LanguageRegistry::caps(language).hub_enrichment
+    };
     files.for_each_open(|uri, doc| {
-        if scope == OpenDocScope::All || doc.language == "perl" {
+        if scope == OpenDocScope::All || hub(doc.language) {
             docs.push((uri.clone(), doc.language));
         }
     });
     let mut pending: Vec<(Url, Vec<Diagnostic>)> = Vec::new();
     for (uri, language) in docs {
-        let diagnostics = if language == "perl" {
+        let diagnostics = if hub(language) {
             match files.enrich_open(&uri, module_index) {
                 Some(analysis) => symbols::collect_diagnostics(&analysis, module_index, options),
                 None => continue, // closed mid-iteration

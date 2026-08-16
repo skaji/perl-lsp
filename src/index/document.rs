@@ -30,7 +30,7 @@ pub struct Document {
     /// Driver id: "perl" (the reference path) or a pack language ("cpp").
     /// The FileAnalysis-based handlers are language-agnostic; the
     /// tree/cursor handlers (completion, signature-help, selection-range)
-    /// are Perl cursor-context-specific and skip when this isn't "perl".
+    /// consult the driver's declared `DriverCaps` through this id.
     pub language: &'static str,
     /// The freshness record's source: this doc's Surface, projected at BUILD
     /// time from the pristine analysis — before `FileStore::enrich_open`
@@ -102,14 +102,17 @@ impl Document {
         })
     }
 
-    /// Pack-language FAST path for a keystroke: reparse the tree + swap text,
-    /// WITHOUT the expensive `FileAnalysis` rebuild (macro gather/expand/
-    /// extract — ~0.7s on a big macro-heavy C file). Position features stay
-    /// live on the fresh tree/text; the caller debounces `rebuild_analysis`
-    /// so typing doesn't pay the rebuild per keystroke. No-op for Perl (its
-    /// build is cheap — it uses the synchronous `update`).
+    /// Debounced-rebuild FAST path for a keystroke: reparse the tree + swap
+    /// text, WITHOUT the expensive `FileAnalysis` rebuild (macro gather/
+    /// expand/extract — ~0.7s on a big macro-heavy C file). Position features
+    /// stay live on the fresh tree/text; the caller debounces
+    /// `rebuild_analysis` so typing doesn't pay the rebuild per keystroke.
+    /// No-op for a synchronous-rebuild language (its build is cheap — it
+    /// uses the synchronous `update`).
     pub fn update_text_only(&mut self, new_text: String) {
-        if self.language == "perl" {
+        if crate::build::language_driver::LanguageRegistry::caps(self.language)
+            .synchronous_rebuild
+        {
             return;
         }
         let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
@@ -125,7 +128,9 @@ impl Document {
     /// Write back an analysis built off-lock (from a text snapshot) +
     /// refresh the outline. Pairs with a `spawn_blocking` rebuild.
     pub fn apply_rebuilt(&mut self, analysis: crate::model::file_analysis::FileAnalysis) {
-        if self.language == "perl" {
+        // The build-time Surface record is the hub freshness lane's input;
+        // other languages' freshness is the invalidator's disk-side gate.
+        if crate::build::language_driver::LanguageRegistry::caps(self.language).hub_enrichment {
             self.baseline_surface = Some(crate::model::surface::Surface::project(&analysis));
         }
         self.analysis = Arc::new(analysis);
@@ -133,10 +138,15 @@ impl Document {
     }
 
     pub fn update(&mut self, new_text: String) {
-        // Pack languages: full reparse + analyze through the driver (no
-        // incremental edit path yet). The reparse/text-swap is exactly
-        // `update_text_only`; this just isn't debounced. Perl falls through.
-        if self.language != "perl" {
+        // Debounced-rebuild languages: full reparse + analyze through the
+        // driver (no incremental edit path yet). The reparse/text-swap is
+        // exactly `update_text_only`; this just isn't debounced. A
+        // synchronous-rebuild language falls through to the incremental
+        // edit + immediate rebuild below (the same axis `update_text_only`
+        // no-ops on, so the two paths can't disagree).
+        if !crate::build::language_driver::LanguageRegistry::caps(self.language)
+            .synchronous_rebuild
+        {
             self.update_text_only(new_text);
             let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
             if let Some(driver) = reg.for_id(self.language) {

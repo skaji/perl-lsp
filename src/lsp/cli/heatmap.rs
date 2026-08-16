@@ -22,15 +22,14 @@ fn heatmap_symbol_eligible(sym: &file_analysis::Symbol) -> bool {
         )
 }
 
-/// One heatmap row for one symbol — the shared body both the Perl and the
-/// pack-language (C/C++/…) gather loops call, so their fan-in counts come
-/// from the SAME `references()` projection by construction (no second ref
-/// walk). `is_pack` names the caller's sweep tier: pack sweeps pass their
-/// per-language sub-index as `routing_idx` and skip the Perl `mask` override
-/// (the set's construction-derived pack routing already widens to VISIBLE —
-/// pack workspace files ride the DEPENDENCY role, a storage artifact of the
-/// per-language cache), and the pack-only entry-point guard (C's `main` is
-/// reached through the ABI, not a call site) unlocks.
+/// One heatmap row for one symbol — the shared body every gather loop
+/// calls, so fan-in counts come from the SAME `references()` projection by
+/// construction (no second ref walk). Tier-specific behavior arrives as
+/// data, never a family flag: `visibility` is the mask override to apply
+/// (`None` when the set's construction-derived routing already widens to
+/// VISIBLE — pack workspace files ride the DEPENDENCY role, a storage
+/// artifact of the per-language cache), and the entry-point guard reads the
+/// analysis language's declared `entrypoint_symbols`.
 /// Returns `(row, is_callable, dead, dead_export)`.
 ///
 /// `forced_fan_in` is the relational pre-prune verdict: `Some(0)` means the
@@ -51,8 +50,7 @@ fn heatmap_symbol_row(
     path: &std::path::Path,
     analysis: &file_analysis::FileAnalysis,
     sym: &file_analysis::Symbol,
-    is_pack: bool,
-    mask: resolve::RoleMask,
+    visibility: Option<resolve::RoleMask>,
     scope: resolve::OverrideScope,
     has_dynamic_dispatch: bool,
     forced_fan_in: Option<usize>,
@@ -89,7 +87,7 @@ fn heatmap_symbol_row(
                 Some(routing_idx),
                 scope,
             );
-            if !is_pack {
+            if let Some(mask) = visibility {
                 cs = cs.with_visibility(mask);
             }
             let locs = cs.references();
@@ -147,9 +145,14 @@ fn heatmap_symbol_row(
         Some("constructor")
     } else if !native {
         Some("framework-synthesized")
-    } else if is_pack && is_callable && sym.name == "main" {
-        // C/C++ entry point: the runtime enters through `main` over the ABI,
-        // never a source call site the static graph can see.
+    } else if is_callable
+        && crate::build::language_driver::LanguageRegistry::caps(&analysis.language)
+            .entrypoint_symbols
+            .contains(&sym.name.as_str())
+    {
+        // Runtime entry (C/C++ `main`): entered over the ABI, never a source
+        // call site the static graph can see. The language declares which
+        // names are entry points; nothing here compares names or families.
         Some("entry-point")
     } else if matches!(sym.kind, SymKind::Package | SymKind::Class | SymKind::Module) {
         Some("package-implicit-use")
@@ -283,7 +286,7 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
                      routing: &dyn file_analysis::CrossFileLookup,
                      path: &std::path::Path,
                      analysis: &file_analysis::FileAnalysis,
-                     is_pack: bool,
+                     visibility: Option<resolve::RoleMask>,
                      checked: &mut usize,
                      mismatched: &mut usize| {
         for sym in analysis.symbols() {
@@ -305,8 +308,8 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
                 Some(routing),
                 scope,
             );
-            if !is_pack {
-                cs = cs.with_visibility(resolve::RoleMask::VISIBLE);
+            if let Some(mask) = visibility {
+                cs = cs.with_visibility(mask);
             }
             resolve::set_ref_rows_override(Some(false));
             let resident = normalize(&cs.references());
@@ -335,10 +338,11 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
     };
 
     for (path, analysis) in &entries {
-        check(&ws, &idx, path, analysis, false, &mut checked, &mut mismatched);
+        check(&ws, &idx, path, analysis, Some(resolve::RoleMask::VISIBLE), &mut checked, &mut mismatched);
     }
     for (path, analysis, pack) in &pack_entries {
-        check(&ws, pack.as_ref(), path, analysis, true, &mut checked, &mut mismatched);
+        // Pack routing widens to VISIBLE at set construction — no override.
+        check(&ws, pack.as_ref(), path, analysis, None, &mut checked, &mut mismatched);
     }
 
     println!(
@@ -526,8 +530,8 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
                   routing: &dyn file_analysis::CrossFileLookup,
                   path: &std::path::Path,
                   analysis: &file_analysis::FileAnalysis,
-                  is_pack: bool,
-                  row_mask: resolve::RoleMask,
+                  prune: Option<&(std::collections::HashSet<String>, std::collections::HashSet<(String, String, usize, usize)>)>,
+                  visibility: Option<resolve::RoleMask>,
                   symbol_rows: &mut Vec<serde_json::Value>,
                   dead_rows: &mut Vec<serde_json::Value>,
                   dead_export_rows: &mut Vec<serde_json::Value>,
@@ -536,10 +540,11 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
             if sym.hidden_in_outline() || !heatmap_symbol_eligible(sym) {
                 continue;
             }
-            // Perl symbols consult the pre-prune; pack symbols always take the
-            // full projection (see the gate rationale above).
-            let (forced_fan_in, dead_export_override) = match (is_pack, perl_prune.as_ref()) {
-                (false, Some((referenced_names, dead_keys))) => {
+            // The caller passes its tier's pre-prune (row-store-backed tiers
+            // only); a `None` tier always takes the full projection (see the
+            // gate rationale above).
+            let (forced_fan_in, dead_export_override) = match prune {
+                Some((referenced_names, dead_keys)) => {
                     let key = file_analysis::name_match_key(&sym.name);
                     let forced = if referenced_names.contains(&key) {
                         None // has reference rows — the projection must run
@@ -578,8 +583,7 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
                 path,
                 analysis,
                 sym,
-                is_pack,
-                row_mask,
+                visibility,
                 scope,
                 has_dynamic_dispatch,
                 forced_fan_in,
@@ -604,8 +608,8 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
             &idx,
             path,
             analysis,
-            false,
-            mask,
+            perl_prune.as_ref(),
+            Some(mask),
             &mut symbol_rows,
             &mut dead_rows,
             &mut dead_export_rows,
@@ -615,7 +619,8 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
 
     // Pack languages route through their own sub-index (VISIBLE-wide — pack
     // workspace files ride the DEPENDENCY role); the set derives that from
-    // the origin's stamped language, so `mask` here is only the Perl knob.
+    // the origin's stamped language, so no visibility override — and no
+    // pre-prune: their refs aren't in the hub's row store.
     for (path, analysis, pack) in &pack_entries {
         let routing: &dyn file_analysis::CrossFileLookup = pack.as_ref();
         gather(
@@ -623,8 +628,8 @@ pub(crate) fn cli_heatmap(root: &str, opts: &[String]) {
             routing,
             path,
             analysis,
-            true,
-            resolve::RoleMask::VISIBLE,
+            None,
+            None,
             &mut symbol_rows,
             &mut dead_rows,
             &mut dead_export_rows,

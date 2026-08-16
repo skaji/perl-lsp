@@ -81,25 +81,27 @@ impl FileStore {
     /// exists for the same path, it's replaced by the Open entry.
     pub fn open(&self, url: Url, text: String) -> bool {
         // Route by extension, falling back to a content sniff when no driver
-        // claims it: a PACK language (cpp, ...) goes through
-        // its driver; Perl and truly-unrecognized files keep the exact
-        // existing path (Document::new) so the reference behaviour is
-        // byte-for-byte.
+        // claims it. A hub-enriched language (and a truly-unrecognized file,
+        // which the fallback driver serves) keeps the native constructor —
+        // `Document::new` is the reference pipeline the hub's freshness/
+        // enrichment lanes are built around; the rest go through the generic
+        // driver constructor.
         let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
         let path = url.to_file_path().ok();
-        let pack = path
+        let driver = path
             .as_ref()
-            .and_then(|p| reg.for_path_sniffed(p, &text))
-            .filter(|d| d.id() != "perl");
-        let doc = match pack {
-            Some(driver) => match Document::new_routed(text, driver, path.clone()) {
+            .map(|p| reg.driver_or_fallback(p, &text))
+            .unwrap_or_else(|| reg.fallback());
+        let doc = if !driver.caps().hub_enrichment {
+            match Document::new_routed(text, driver, path.clone()) {
                 Some(d) => d,
                 None => return false,
-            },
-            None => match Document::new(text) {
+            }
+        } else {
+            match Document::new(text) {
                 Some(d) => d,
                 None => return false,
-            },
+            }
         };
         if let Some(path) = path {
             self.workspace.remove(&path);
@@ -161,7 +163,8 @@ impl FileStore {
             let doc = self.open.get(url)?;
             (Arc::clone(&doc.analysis), doc.language)
         };
-        if language != "perl" {
+        // Enrichment is the hub lane; other languages answer as-built.
+        if !crate::build::language_driver::LanguageRegistry::caps(language).hub_enrichment {
             return Some(base);
         }
         crate::util::ghost_stats::count("enrich_open.perl");

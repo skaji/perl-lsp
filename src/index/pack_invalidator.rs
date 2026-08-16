@@ -292,7 +292,9 @@ impl PackInvalidator {
         use rayon::prelude::*;
         let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
         let Some(driver) = reg.for_path(path) else { return false };
-        if driver.id() == "perl" {
+        // Only invalidator-owned languages route here; a hub-indexed
+        // language's changes are the direct re-index path's business.
+        if !driver.caps().pack_invalidation {
             return false;
         }
         let lang = driver.id();

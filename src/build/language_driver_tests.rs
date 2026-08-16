@@ -931,3 +931,64 @@ void RE::Init() {\n\
         "a genuinely declared local is recognised as local",
     );
 }
+
+// The DriverCaps exhaustiveness witness: destructure every field with no
+// `..`, so ADDING a capability is a compile error here until every
+// driver's declared answer has been reviewed (the same enforcement shape
+// as `FileAnalysis::surface_feed`). A silently-defaulted axis is how a
+// caps struct decays back into the language branching it replaced.
+#[test]
+fn driver_caps_axes_are_reviewed_exhaustively() {
+    let reg = LanguageRegistry::with_enabled();
+    for d in reg.languages().into_iter().filter_map(|id| reg.for_id(id)) {
+        let DriverCaps {
+            hub_enrichment,
+            cursor_context,
+            hover_info,
+            signature_help,
+            selection_range,
+            synchronous_rebuild,
+            context_gather,
+            pack_invalidation,
+            cross_file_words,
+            entrypoint_symbols,
+            include_path_tokens,
+            preprocessor_macros,
+        } = d.caps();
+        // The hub lanes (enrichment, native cursor/hover/rebuild verbs) and
+        // the pack lanes (invalidator, gather, bare words) are disjoint
+        // architectures today — one driver never straddles both.
+        let hub_family = hub_enrichment
+            || cursor_context
+            || hover_info
+            || signature_help
+            || selection_range
+            || synchronous_rebuild;
+        let pack_family = pack_invalidation
+            || context_gather
+            || cross_file_words
+            || include_path_tokens
+            || preprocessor_macros
+            || !entrypoint_symbols.is_empty();
+        assert!(
+            !(hub_family && pack_family),
+            "driver {} declares capabilities from both serving architectures",
+            d.id()
+        );
+    }
+}
+
+// Exactly one driver serves unclaimed files — the fallback is a declared
+// property, never a registry position.
+#[test]
+fn exactly_one_fallback_driver() {
+    let reg = LanguageRegistry::with_enabled();
+    let n = reg
+        .languages()
+        .into_iter()
+        .filter_map(|id| reg.for_id(id))
+        .filter(|d| d.claims_unclaimed())
+        .count();
+    assert_eq!(n, 1, "exactly one driver claims unclaimed files");
+    assert!(reg.fallback().claims_unclaimed());
+}

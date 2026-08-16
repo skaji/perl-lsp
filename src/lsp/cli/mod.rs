@@ -1,7 +1,7 @@
 //! The CLI machinery behind the `perl-lsp --…` modes: one-shot startup
 //! helpers, usage text, and the utility commands `main()` dispatches to.
 
-use crate::build::{builder, language_driver, plugin};
+use crate::build::{language_driver, plugin};
 use crate::index::{document, file_store, module_cache, module_index, module_resolver, resolve};
 use crate::lsp::{backend, symbols};
 use crate::model::{conventions, file_analysis, witnesses};
@@ -168,30 +168,22 @@ fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnal
         eprintln!("Cannot read {}: {}", path, e);
         std::process::exit(1);
     });
-    // Route a pack language (cpp, ...) through its driver so the CLI
-    // capabilities (--outline, --hover, --batch/gold) match the LSP
-    // server. Perl + truly-unrecognized files keep the existing path; an
-    // extension no driver claims falls back to a content sniff
-    // (`commands.def` is C, not Perl, despite its unowned extension).
+    // Route by driver so the CLI capabilities (--outline, --hover,
+    // --batch/gold) match the LSP server; an extension no driver claims
+    // falls back to a content sniff (`commands.def` is C, not Perl, despite
+    // its unowned extension), then to the fallback driver. A driver that
+    // builds from the caller's tree (no pre-parse transform) analyzes the
+    // one parse we already hold; the rest analyze independently.
     let reg = language_driver::LanguageRegistry::with_enabled();
-    if let Some(driver) = reg
-        .for_path_sniffed(std::path::Path::new(path), &source)
-        .filter(|d| d.id() != "perl")
-    {
-        let mut parser = driver.make_parser();
-        let tree = parser.parse(&source, None).unwrap_or_else(|| {
-            eprintln!("Parse failed: {}", path);
-            std::process::exit(1);
-        });
-        let analysis = driver.analyze_with_path(&source, Some(std::path::Path::new(path)));
-        return (source, tree, analysis);
-    }
-    let mut parser = module_resolver::create_parser();
+    let driver = reg.driver_or_fallback(std::path::Path::new(path), &source);
+    let mut parser = driver.make_parser();
     let tree = parser.parse(&source, None).unwrap_or_else(|| {
         eprintln!("Parse failed: {}", path);
         std::process::exit(1);
     });
-    let analysis = builder::build(&tree, source.as_bytes());
+    let analysis = driver
+        .analyze_from_tree(&tree, &source)
+        .unwrap_or_else(|| driver.analyze_with_path(&source, Some(std::path::Path::new(path))));
     (source, tree, analysis)
 }
 
@@ -271,10 +263,8 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
         // not a term that only makes sense from inside this codebase.
         let reg = language_driver::LanguageRegistry::with_enabled();
         let langs: Vec<&'static str> = reg
-            .languages()
-            .into_iter()
-            .filter(|id| *id != "perl")
-            .map(language_driver::LanguageRegistry::display_name)
+            .pack_drivers()
+            .map(|d| language_driver::LanguageRegistry::display_name(d.id()))
             .collect();
         eprintln!("Indexed {} {} files", pack_indexed, langs.join("/"));
     }
@@ -466,8 +456,8 @@ pub(crate) fn cli_parse(path: &str, lang: Option<&str>) {
     // Route to a grammar: an explicit `lang` id (stdin can't route by
     // extension) wins, else the file's extension (cpp/python/r/cmake), else
     // a content sniff for an extension no driver claims, so
-    // --parse shows the SAME tree the pack extractor sees. Perl + stdin +
-    // truly-unrecognized files keep the Perl grammar.
+    // --parse shows the SAME tree the pack extractor sees. stdin +
+    // truly-unrecognized files take the fallback driver's grammar.
     let mut parser = if let Some(id) = lang {
         let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
         match reg.for_id(id) {
@@ -483,12 +473,11 @@ pub(crate) fn cli_parse(path: &str, lang: Option<&str>) {
         }
     } else if path != "-" {
         let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
-        reg.for_path_sniffed(std::path::Path::new(path), &source)
-            .filter(|d| d.id() != "perl")
-            .map(|d| d.make_parser())
-            .unwrap_or_else(builder::create_parser)
+        reg.driver_or_fallback(std::path::Path::new(path), &source).make_parser()
     } else {
-        builder::create_parser()
+        // stdin has no path to route on — the fallback driver's grammar.
+        let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+        reg.fallback().make_parser()
     };
     let Some(tree) = parser.parse(&source, None) else {
         eprintln!("parse failed");

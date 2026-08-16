@@ -93,29 +93,26 @@ pub(crate) fn cli_outline(file: &str) {
 pub(crate) fn cli_hover_single_file(file: &str, line_str: &str, col_str: &str) {
     let point = parse_point(line_str, col_str);
     let (source, _tree, analysis) = parse_file(file);
-    // Pack languages get the language-agnostic renderer (matches the LSP); no
-    // index here, so cross-file function hover is unavailable in this form (use
-    // the root form for that). Perl keeps hover_info.
+    // A language without the analysis-native `hover_info` renderer gets the
+    // language-agnostic set projection (matches the LSP); no index here, so
+    // cross-file function hover is unavailable in this form (use the root
+    // form for that).
     let reg = language_driver::LanguageRegistry::with_enabled();
-    let pack_lang = reg
-        .for_path_sniffed(std::path::Path::new(file), &source)
-        .map(|d| d.id())
-        .filter(|id| *id != "perl");
-    let markdown = match pack_lang {
-        Some(lang) => {
-            let files = file_store::FileStore::new();
-            let cs = resolve::resolve(
-                &files,
-                &analysis,
-                file_store::FileKey::Path(std::path::PathBuf::from(file)),
-                point,
-                None,
-                resolve::OverrideScope::default(),
-            )
-            .with_source(&source);
-            symbols::pack_hover_markdown(&cs, lang)
-        }
-        None => analysis.hover_info(point, &source, None),
+    let driver = reg.driver_or_fallback(std::path::Path::new(file), &source);
+    let markdown = if !driver.caps().hover_info {
+        let files = file_store::FileStore::new();
+        let cs = resolve::resolve(
+            &files,
+            &analysis,
+            file_store::FileKey::Path(std::path::PathBuf::from(file)),
+            point,
+            None,
+            resolve::OverrideScope::default(),
+        )
+        .with_source(&source);
+        symbols::pack_hover_markdown(&cs, driver.id())
+    } else {
+        analysis.hover_info(point, &source, None)
     };
     if let Some(markdown) = markdown {
         println!("{}", markdown);
@@ -220,14 +217,14 @@ fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::D
         eprintln!("Cannot read {}: {}", file, e);
         std::process::exit(1);
     });
-    // Route a pack language (cpp, ...) through its driver so the CLI
-    // cursor handlers (definition/references/highlight/…) match the LSP
-    // server. Perl + truly-unrecognized files keep Document::new + enrichment.
+    // Route by driver so the CLI cursor handlers (definition/references/
+    // highlight/…) match the LSP server. A hub-enriched language keeps the
+    // native constructor + enrichment (`Document::new` is the reference
+    // pipeline the hub's freshness/enrichment lanes are built around);
+    // everything else goes through the generic driver constructor.
     let reg = language_driver::LanguageRegistry::with_enabled();
-    let pack = reg
-        .for_path_sniffed(std::path::Path::new(file), &text)
-        .filter(|d| d.id() != "perl");
-    if let Some(driver) = pack {
+    let driver = reg.driver_or_fallback(std::path::Path::new(file), &text);
+    if !driver.caps().hub_enrichment {
         return tphase!("Document::new_routed", document::Document::new_routed(text, driver, Some(std::path::PathBuf::from(file))).unwrap_or_else(|| {
             eprintln!("Parse failed: {}", file);
             std::process::exit(1);
@@ -355,19 +352,18 @@ fn run_one(
             let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
             let uri = tower_lsp::lsp_types::Url::from_file_path(&abs)
                 .unwrap_or_else(|_| tower_lsp::lsp_types::Url::parse("file:///unknown").unwrap());
-            // Pack languages resolve cross-file through their sub-index
-            // (matches the LSP server); Perl uses the hub. `lookup_for` is
-            // the one speller of that store selection.
+            // Store selection by driver id — `lookup_for` is the one
+            // speller (a language's own sub-index when attached, else the
+            // hub).
             let reg = language_driver::LanguageRegistry::with_enabled();
-            let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &source)
-                .map(|d| d.id()).filter(|id| *id != "perl");
-            let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
+            let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &source).id();
+            let routed = idx.lookup_for(lang_id);
             let base_idx = routed.as_lookup();
             // `#include "x.h"` path → the resolved header (`#include` = `use`).
             // A path token, not a name — slot-shaped, stays ahead of the set.
             // The pack declares whether it has include tokens; asked, never
             // named (rule #10) — the same gate the LSP handler asks.
-            if language_driver::LanguageRegistry::has_include_tokens(lang_id.unwrap_or("perl")) {
+            if language_driver::LanguageRegistry::has_include_tokens(lang_id) {
                 if let Some(loc) = symbols::pack_include_definition(&analysis, point, Some(abs.as_path())) {
                     let path = loc.uri.to_file_path().map(|p| p.display().to_string())
                         .unwrap_or_else(|_| loc.uri.to_string());
@@ -417,20 +413,19 @@ fn run_one(
                 .unwrap_or_else(|_| std::path::PathBuf::from(file));
             let mut sources = SourceCache::new(fmt);
             let mut results = Vec::new();
-            // Pack languages route through their sub-index (matches goto-def
-            // and the LSP server) — the hub only knows Perl modules, so
-            // resolving/collecting against it silently misses every
-            // cross-file cpp use. Perl keeps the hub (empty closure = no-op).
+            // Store selection by driver id (matches goto-def and the LSP
+            // server): a sub-indexed language must route to its own store —
+            // the hub only knows Perl modules, so resolving/collecting
+            // against it silently misses every cross-file cpp use.
             let reg = language_driver::LanguageRegistry::with_enabled();
-            let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
-                .map(|d| d.id()).filter(|id| *id != "perl");
-            let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
+            let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &s).id();
+            let routed = idx.lookup_for(lang_id);
             let base_idx = routed.as_lookup();
             // `#include` reverse — "who includes this header" — owns the path
             // token exclusively (its backward mirror of include goto-def).
             // The pack declares whether it has include tokens; asked, never
             // named (rule #10) — the same gate the LSP handler asks.
-            if language_driver::LanguageRegistry::has_include_tokens(lang_id.unwrap_or("perl")) {
+            if language_driver::LanguageRegistry::has_include_tokens(lang_id) {
                 if let Some(incs) = symbols::pack_include_references(
                     &analysis, point, Some(file_path.as_path()), base_idx)
                 {
@@ -477,11 +472,8 @@ fn run_one(
             // diverge: the domain bridge (enum def → field-slot sites) and
             // the family/spec walks are one projection.
             let reg = language_driver::LanguageRegistry::with_enabled();
-            let lang_id = reg
-                .for_path_sniffed(std::path::Path::new(file), &s)
-                .map(|d| d.id())
-                .filter(|id| *id != "perl");
-            let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
+            let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &s).id();
+            let routed = idx.lookup_for(lang_id);
             let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
             let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
                 .expect("origin staged above");
@@ -502,13 +494,13 @@ fn run_one(
         }
         "hover" => {
             let (source, _t, mut analysis) = parse_file(file);
-            // Pack languages present the CandidateSet's hover projection
-            // (matches the LSP server — the same construction goto-def uses);
-            // Perl keeps its rich renderer.
+            // A language without the analysis-native `hover_info` renderer
+            // presents the CandidateSet's hover projection (matches the LSP
+            // server — the same construction goto-def uses).
             let reg = language_driver::LanguageRegistry::with_enabled();
-            if let Some(lang) = reg.for_path_sniffed(std::path::Path::new(file), &source)
-                .map(|d| d.id()).filter(|id| *id != "perl")
-            {
+            let driver = reg.driver_or_fallback(std::path::Path::new(file), &source);
+            if !driver.caps().hover_info {
+                let lang = driver.id();
                 let routed = idx.lookup_for(lang);
                 let abs = std::fs::canonicalize(file)
                     .unwrap_or_else(|_| std::path::PathBuf::from(file));
@@ -545,9 +537,10 @@ fn run_one(
         }
         "completion" => {
             let doc = cli_open_document(file, idx);
-            // Pack languages: member (sentinel) → in-scope, via the same
-            // path the LSP server uses; Perl keeps cursor-context.
-            let items = if doc.language != "perl" {
+            // A language whose completion context comes from the sentinel
+            // reparse (no native cursor-context) takes the pack path — the
+            // same one the LSP server uses.
+            let items = if !language_driver::LanguageRegistry::caps(doc.language).cursor_context {
                 tphase!("completion_items", backend::pack_completion(
                     ws, &doc.analysis, &doc.text, &doc.tree, point, doc.language,
                     doc.path.as_deref(), idx).0)
@@ -874,9 +867,8 @@ fn run_rename(
     // once, project the rename — the per-arm policy (cross-file vs group vs
     // single-file, rewritability, the pack full-or-refuse) lives on the set.
     let reg = language_driver::LanguageRegistry::with_enabled();
-    let lang_id = reg.for_path_sniffed(std::path::Path::new(file), &s)
-        .map(|d| d.id()).filter(|id| *id != "perl");
-    let routed = idx.lookup_for(lang_id.unwrap_or("perl"));
+    let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &s).id();
+    let routed = idx.lookup_for(lang_id);
     let _staged = ScopedWorkspaceEntry::insert(ws, file_path.clone(), analysis);
     let origin = ws.workspace_raw().get(&file_path).map(|r| r.value().clone())
         .expect("origin staged above");

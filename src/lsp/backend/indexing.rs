@@ -197,10 +197,8 @@ impl Backend {
                             } else {
                                 let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
                                 let langs: Vec<&str> = reg
-                                    .languages()
-                                    .into_iter()
-                                    .filter(|id| *id != "perl")
-                                    .map(crate::build::language_driver::LanguageRegistry::display_name)
+                                    .pack_drivers()
+                                    .map(|d| crate::build::language_driver::LanguageRegistry::display_name(d.id()))
                                     .collect();
                                 format!("Indexed {} {} files", count, langs.join("/"))
                             }),
@@ -269,7 +267,11 @@ impl Backend {
         } else {
             let mut uris: Vec<Url> = Vec::new();
             ctx.files.for_each_open(|uri, doc| {
-                if doc.language != "perl" {
+                // Only gather-dependent docs have a cold-open window to heal
+                // (a context-free analyze was already full quality).
+                if crate::build::language_driver::LanguageRegistry::caps(doc.language)
+                    .context_gather
+                {
                     uris.push(uri.clone());
                 }
             });

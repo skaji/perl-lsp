@@ -44,14 +44,9 @@ pub fn index_pack_languages(
     // denominator) is known before any file is analyzed — a single monotone
     // 0→100% stream across all pack languages on the one shared token.
     let mut lang_paths: Vec<(&'static str, Vec<PathBuf>)> = Vec::new();
-    for lang in reg.languages() {
-        if lang == "perl" {
-            continue;
-        }
-        let exts: Vec<&'static str> = reg
-            .for_id(lang)
-            .map(|d| d.extensions().to_vec())
-            .unwrap_or_default();
+    for driver in reg.pack_drivers() {
+        let lang = driver.id();
+        let exts: Vec<&'static str> = driver.extensions().to_vec();
         if exts.is_empty() {
             continue;
         }

@@ -12,6 +12,68 @@
 use crate::model::file_analysis::FileAnalysis;
 use std::path::Path;
 
+/// Per-language behavioral capabilities — the properties core layers ask
+/// instead of naming languages (rule #10). Each field is one behavior a
+/// serving site genuinely tests; a driver declares the ones that hold for
+/// its language. `Default` is every capability OFF/empty — the honest
+/// answer for an id no driver claims (which also matches how the serving
+/// paths treated an unrecognized language before the capabilities existed).
+///
+/// This is the CLOSED set of axes on which served languages may differ in
+/// core; growing it should feel expensive — the first question on a new
+/// flag is whether the difference should exist at all. The exhaustiveness
+/// witness in `language_driver_tests.rs` destructures every field (no
+/// `..`), so adding one is a compile error until every declared answer is
+/// reviewed — a capability added-and-silently-defaulted is how a caps
+/// struct decays back into the branching it replaced.
+#[derive(Clone, Copy, Default)]
+pub struct DriverCaps {
+    /// Analyses integrate with the Perl module hub's cross-file lane:
+    /// import/export enrichment (`enrich_imported_types_with_keys`),
+    /// build-time Surface freshness records (`Document::baseline_surface`),
+    /// @INC open-doc residency (`mark_doc_open`), and the enrichment-derived
+    /// diagnostics pipeline. Off = diagnostics read the analysis as-is and
+    /// freshness is the pack invalidator's disk-side gate.
+    pub hub_enrichment: bool,
+    /// Completion / cursor-slot context derives from the LIVE document tree
+    /// (`lsp/cursor_context`). Off = the sentinel-reparse pack path
+    /// (`build/cursor_sentinel`) supplies member/identifier context.
+    pub cursor_context: bool,
+    /// `FileAnalysis::hover_info` renders hover for this language (the
+    /// analysis-native renderer: POD docs, sigil semantics). Off = hover is
+    /// the CandidateSet's language-agnostic projection (`pack_hover`).
+    pub hover_info: bool,
+    /// The signatureHelp verb is served (the cursor-context handler).
+    pub signature_help: bool,
+    /// The selectionRange verb is served (the tree-shape handler).
+    pub selection_range: bool,
+    /// A didChange rebuild is cheap enough to run synchronously on the
+    /// message loop. Off = the document swaps tree/text immediately and
+    /// DEBOUNCES the analysis rebuild (macro-heavy C: ~0.7s per rebuild).
+    pub synchronous_rebuild: bool,
+    /// Full-quality analysis needs a cross-file context gather beyond the
+    /// file's own bytes (C++: `#include`d macro tables) — so an open built
+    /// cached-only is degraded until the heal lane re-gathers, and index
+    /// completion re-runs open docs through the gather.
+    pub context_gather: bool,
+    /// Disk-change lifecycle is owned by `PackInvalidator` (per-language
+    /// sub-index registration + include-closure consumer eviction). Off =
+    /// the hub's direct re-index path handles watcher/save events.
+    pub pack_invalidation: bool,
+    /// A bare identifier can name a CROSS-FILE entity with no import
+    /// binding (macro / enum constant / global reached through the include
+    /// closure) — enables the raw-word goto-def/hover fallback lane outside
+    /// the CandidateSet.
+    pub cross_file_words: bool,
+    /// See `LangPack::entrypoint_symbols` — symbols the runtime enters
+    /// through the ABI, alive at zero fan-in by contract.
+    pub entrypoint_symbols: &'static [&'static str],
+    /// See `LangPack::include_path_tokens`.
+    pub include_path_tokens: bool,
+    /// See `LangPack::preprocessor_macros`.
+    pub preprocessor_macros: bool,
+}
+
 /// Everything the server needs to host one language: parse + analyze a
 /// file to a `FileAnalysis`, claim its extensions, and resolve a
 /// module name to candidate paths (cross-file).
@@ -31,6 +93,27 @@ pub trait LanguageDriver: Send + Sync {
     fn make_parser(&self) -> tree_sitter::Parser;
     /// Source → `FileAnalysis`.
     fn analyze(&self, source: &str) -> FileAnalysis;
+    /// Build an analysis directly from the CALLER's already-parsed tree —
+    /// only possible when the driver runs no pre-parse transform, so its
+    /// analysis speaks the same tree/coordinates the caller holds (the
+    /// native Perl builder). `None` = the driver analyzes independently
+    /// (`analyze_with_path` may transform + reparse internally), so callers
+    /// keep their tree for positions only.
+    fn analyze_from_tree(&self, _tree: &tree_sitter::Tree, _source: &str) -> Option<FileAnalysis> {
+        None
+    }
+    /// The behavioral capabilities this driver declares — see `DriverCaps`.
+    /// Default: none (every serving site's generic arm).
+    fn caps(&self) -> DriverCaps {
+        DriverCaps::default()
+    }
+    /// Does this driver serve files NO driver claims (the registry's
+    /// unclaimed-file fallback)? Exactly one registered driver answers true
+    /// — the reference driver. A property, not a position: reordering the
+    /// registry can't silently move the fallback.
+    fn claims_unclaimed(&self) -> bool {
+        false
+    }
     /// Source + the file's path → `FileAnalysis`. The path lets a driver
     /// resolve cross-file context (C++ gathers `#define`s from `#include`d
     /// headers so namespace/export macros expand). Default ignores it.
@@ -89,6 +172,23 @@ impl LanguageDriver for PerlDriver {
             Some(tree) => crate::build::builder::build(&tree, source.as_bytes()),
             None => FileAnalysis::new(Default::default()),
         }
+    }
+    fn analyze_from_tree(&self, tree: &tree_sitter::Tree, source: &str) -> Option<FileAnalysis> {
+        Some(crate::build::builder::build(tree, source.as_bytes()))
+    }
+    fn caps(&self) -> DriverCaps {
+        DriverCaps {
+            hub_enrichment: true,
+            cursor_context: true,
+            hover_info: true,
+            signature_help: true,
+            selection_range: true,
+            synchronous_rebuild: true,
+            ..Default::default()
+        }
+    }
+    fn claims_unclaimed(&self) -> bool {
+        true
     }
     fn trigger_chars(&self) -> &[&'static str] {
         // Sigils open variable completion; `>`/`:`/`{` open
@@ -250,6 +350,22 @@ impl LanguageDriver for PackDriver {
     }
     fn lang_pack(&self) -> Option<crate::build::query_extract::LangPack> {
         Some((self.pack)())
+    }
+    fn caps(&self) -> DriverCaps {
+        let pack = (self.pack)();
+        DriverCaps {
+            // Full quality needs a gather exactly when the driver reads
+            // cross-file context at all (macro tables / include closure).
+            // Packs without either (python/r/cmake) analyze context-free —
+            // a cached-only open is already full quality, nothing to heal.
+            context_gather: self.gather_macros.is_some() || self.include_closure.is_some(),
+            pack_invalidation: true,
+            cross_file_words: true,
+            entrypoint_symbols: pack.entrypoint_symbols,
+            include_path_tokens: pack.include_path_tokens,
+            preprocessor_macros: pack.preprocessor_macros,
+            ..Default::default()
+        }
     }
     fn trigger_chars(&self) -> &[&'static str] {
         (self.pack)().trigger_chars
@@ -1345,9 +1461,9 @@ impl LanguageRegistry {
 
     /// `for_path`, falling back to a content sniff when no driver claims the
     /// extension. `source` is the file text the caller
-    /// already has in hand — no extra I/O. Perl never sniffs (it's the
-    /// default fallback the caller uses when this also returns `None`), so
-    /// only pack drivers get a vote.
+    /// already has in hand — no extra I/O. Only a driver that positively
+    /// recognizes its own shape votes (`sniff` defaults to no-opinion); the
+    /// fallback driver serves whatever no sniff claims.
     pub fn for_path_sniffed(&self, path: &Path, source: &str) -> Option<&dyn LanguageDriver> {
         if let Some(d) = self.for_path(path) {
             return Some(d);
@@ -1357,7 +1473,7 @@ impl LanguageRegistry {
             cut -= 1;
         }
         let prefix = &source[..cut];
-        self.drivers.iter().find(|d| d.id() != "perl" && d.sniff(prefix)).map(|d| d.as_ref())
+        self.drivers.iter().find(|d| d.sniff(prefix)).map(|d| d.as_ref())
     }
 
     /// Configured language ids — what this distribution serves.
@@ -1385,31 +1501,60 @@ impl LanguageRegistry {
             .any(|l| *l == id)
     }
 
+    /// The declared capabilities of `id`'s driver — THE generic capability
+    /// asker (the collapse the two-boolean ceiling in docs/PARKED.md
+    /// called for). An id no driver claims answers `DriverCaps::default()`
+    /// (everything off), which is also what every serving site's generic
+    /// arm assumed of an unknown language before the capabilities existed.
+    pub fn caps(id: &str) -> DriverCaps {
+        LanguageRegistry::with_enabled()
+            .for_id(id)
+            .map(|d| d.caps())
+            .unwrap_or_default()
+    }
+
     /// Does this language's pack declare `#include`-style path tokens (the
     /// header-is-the-module reference goto-def resolves and references
     /// reverses)? THE gate for the include-token lanes on BOTH serving
     /// surfaces — the LSP handlers and their CLI/--batch mirrors — so
-    /// editor and gold cannot answer it differently. Asked of the pack via
-    /// the single `for_id` lookup; Perl's driver has no `LangPack` so it
-    /// answers false without a language-name branch (rule #10).
+    /// editor and gold cannot answer it differently.
     pub fn has_include_tokens(id: &str) -> bool {
-        LanguageRegistry::with_enabled()
-            .for_id(id)
-            .and_then(|d| d.lang_pack())
-            .is_some_and(|p| p.include_path_tokens)
+        Self::caps(id).include_path_tokens
     }
 
     /// Does this language's pack declare a C-style preprocessor — `#define`
     /// macros reachable through `#include`s that identifier-context
     /// completion offers? Same asked-never-named contract as
-    /// `has_include_tokens`. (Two boolean capability askers is the recorded
-    /// ceiling — a third collapses the family to a generic
-    /// `pack_cap(lang, sel)`, see docs/PARKED.md.)
+    /// `has_include_tokens`.
     pub fn has_preprocessor_macros(id: &str) -> bool {
-        LanguageRegistry::with_enabled()
-            .for_id(id)
-            .and_then(|d| d.lang_pack())
-            .is_some_and(|p| p.preprocessor_macros)
+        Self::caps(id).preprocessor_macros
+    }
+
+    /// The driver that serves files no driver claims — found by asking each
+    /// driver (`claims_unclaimed`), never by registry position. Exactly one
+    /// registered driver declares it (the reference driver), enforced by
+    /// the registry tests.
+    pub fn fallback(&self) -> &dyn LanguageDriver {
+        self.drivers
+            .iter()
+            .find(|d| d.claims_unclaimed())
+            .expect("a fallback driver is always registered")
+            .as_ref()
+    }
+
+    /// `for_path_sniffed`, resolving to the fallback driver when no driver
+    /// claims the file — the one speller of "every file is served by SOME
+    /// driver" for callers that route by driver id (store selection,
+    /// capability asks).
+    pub fn driver_or_fallback(&self, path: &Path, source: &str) -> &dyn LanguageDriver {
+        self.for_path_sniffed(path, source).unwrap_or_else(|| self.fallback())
+    }
+
+    /// The pack-served drivers (those carrying a `LangPack`) — the bulk
+    /// pack indexer's universe, the warm-up set, and the progress-message
+    /// roster. Asked of each driver, never an id filter.
+    pub fn pack_drivers(&self) -> impl Iterator<Item = &dyn LanguageDriver> {
+        self.drivers.iter().filter(|d| d.lang_pack().is_some()).map(|d| d.as_ref())
     }
 
     /// Human-facing name for a pack language id, for startup banners and
