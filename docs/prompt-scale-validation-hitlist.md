@@ -59,6 +59,34 @@ workspace-scale tools.
 
 ---
 
+# Landed against this hitlist
+
+Newest last. Every row was base-verified — the test fails (or the binary
+crashes) on the commit before its fix, not just passes after.
+
+| commit | row | what changed |
+|---|---|---|
+| `f47c002b` | T2 POD panic | char-boundary truncation, shared with `for_path_sniffed` |
+| `336fc624` | (found en route) | `RUST_LOG` + ghost stats now reach CLI verbs at all |
+| `9d5e1cc0` | T2 `gen_stamp_missing` | closed as explained; not a bug |
+| `98bf42da` | (found en route) | qualified calls stop binding to same-named local subs |
+| `fed8ac00` | **T1 #2** + T2 fold-64 | depth gate before the recursion; monotone propagator repair |
+
+Verified at the full bar with the cpp feature on: 1,505 unit · 489 gold
+(0 FAIL / 0 CRASH) · e2e 113/0 · e2e-cpp 0.
+
+Two notes worth keeping:
+
+- **The box was loaded** (four agents, one an hour-scale cpp soak) and both
+  e2e suites showed a one-off flake under it — a perl run reporting 113
+  passed / 0 failed while exiting 1, and a cpp member-completion race
+  returning empty labels. Both clean on rerun, three consecutive times for
+  the perl one. Harness timing under load, not a test failure, but it is the
+  kind of thing that reads as a regression at 2am.
+- **The gold canary for the depth crash needs a cold cache.** A warm module
+  cache serves the blob and never re-walks the tree, so the crash hides and
+  the row passes for the wrong reason. Documented in `gold-corpus/README.md`.
+
 # Tier 1 — blocks the target market
 
 ### 1. Post-cold-index availability hole
@@ -78,7 +106,7 @@ added +286 MB — mild live growth, not clean reuse. The live-vs-allocator
 split was **not** cleanly separable because the background phase never went
 quiet; the availability hole is the sharper finding.
 
-### 2. Fatal stack overflow on deep CSTs — P0
+### 2. Fatal stack overflow on deep CSTs — P0 — **FIXED `fed8ac00`**
 The builder's `visit_node` → `visit_children` → `visit_function_call` walk
 recurses once per CST level. A 50 KB XML-as-`.pm` yields ~2,200 levels and
 overflows a 2 MB rayon worker stack: **fatal abort of the whole server, and
@@ -134,11 +162,15 @@ named inputs.
   the wrong one survives). The regression test sweeps a byte-shift: the first
   version of it passed with the bug fully present, because whether the cap
   straddles a character depends on alignment.
-- **Fold-64 non-convergence** — the debug safety net firing in production;
-  the lattice is not reaching a fixed point. Offenders:
-  `Module-Generic-v1.7.0/lib/Module/Generic.pm`,
-  `Config-Universal-0.5/lib/Config/Universal.pm`,
-  `File-stat-Extra-0.010/lib/File/stat/Extra.pm` (3 in 138k).
+- ~~**Fold-64 non-convergence**~~ — **fixed, `fed8ac00`.** All three offenders
+  (`Module-Generic`, `Config-Universal`, `File-stat-Extra`) were period-2
+  oscillations on tag `call_binding`. Root cause worth remembering:
+  **clear-and-emit is only sound when re-derivation does not depend on the
+  pass's own output.** In a recursive cluster the propagator's own published
+  witness is what resolves the recursive return arm, so clearing it
+  un-resolved the arm, dropped the answer, and prevented the re-push — flip
+  forever. CLAUDE.md's worklist invariant states clear-and-emit as
+  unconditional; it now has exactly one known exception, and this is it.
 - **`query_rec` 512-depth cap hit** on `MethodOnClass` — cross-dist
   class-name collisions make merged ancestry pathological at corpus scale.
   This is the package-identity candidate relation meeting the real world, and
