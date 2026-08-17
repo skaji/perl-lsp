@@ -101,6 +101,18 @@ QA tail:
 - Per-row known gaps: `gold-corpus/KNOWN-GAPS.md` (xfail rows are the
   live tracker).
 
+Protocol surface (breadth, not depth):
+- **Advertised-capability parity** — our `initialize` surface is a
+  strict SUBSET of the incumbent's (15 verbs we don't advertise), while
+  answer quality runs the other way (85/98 vs 24/98 on structural gold).
+  A feature-list comparison reads the capability response, not the
+  answers, so we lose a comparison we'd win on merit. The cluster worth
+  doing is type hierarchy + call hierarchy + typeDefinition: all three
+  are projections over machinery that already exists (`GraphView`,
+  the `references()` projection, `dispatch_class()`), and together they
+  close most of the visible gap. Non-goals and the reasoning are in
+  `prompt-lsp-surface-parity.md`; `linkedEditingRange` stays OFF (#117).
+
 ## Parked (explicit unblock conditions)
 
 - **Instance brands** — per-object dispatch scoping (`$app->minion`
