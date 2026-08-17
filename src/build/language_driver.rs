@@ -79,6 +79,9 @@ pub struct DriverCaps {
 /// module name to candidate paths (cross-file).
 pub trait LanguageDriver: Send + Sync {
     fn id(&self) -> &'static str;
+    /// How finished this language is. Required, with no default, so adding
+    /// a driver forces the call rather than inheriting a flattering one.
+    fn maturity(&self) -> Maturity;
     fn extensions(&self) -> &[&'static str];
     /// Exact filenames the driver claims (e.g. `CMakeLists.txt`), beyond
     /// extensions. Default none.
@@ -154,9 +157,41 @@ pub trait LanguageDriver: Send + Sync {
 
 /// Perl — the reference driver. Wraps the production builder; behaviour
 /// is exactly the current single-file analysis path.
+/// How finished a language's support is, declared by its driver and shown
+/// by `--languages`. This is a PROMISE TO THE USER, not a capability: it
+/// gates nothing, it tells someone whether to trust the answers. Kept off
+/// `DriverCaps` for exactly that reason — caps are behaviour the engine
+/// branches on, this is editorial.
+///
+/// The bar, so the label means something: `Stable` = the gold corpus
+/// asserts the verb surface and regressions are caught; `Beta` = broad gold
+/// coverage, known gaps documented; `Alpha` = it parses and answers, with
+/// little or no net watching it — expect wrong answers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Maturity {
+    Stable,
+    Beta,
+    Alpha,
+}
+
+impl Maturity {
+    /// The parenthetical `--languages` appends. `Stable` is unmarked: the
+    /// default expectation needs no annotation.
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Maturity::Stable => "",
+            Maturity::Beta => " (beta)",
+            Maturity::Alpha => " (alpha)",
+        }
+    }
+}
+
 pub struct PerlDriver;
 
 impl LanguageDriver for PerlDriver {
+    fn maturity(&self) -> Maturity {
+        Maturity::Stable
+    }
     fn id(&self) -> &'static str {
         "perl"
     }
@@ -205,6 +240,7 @@ impl LanguageDriver for PerlDriver {
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
 pub struct PackDriver {
     id: &'static str,
+    maturity: Maturity,
     exts: &'static [&'static str],
     /// Exact filenames this driver also claims (extensionless conventions
     /// like `CMakeLists.txt`). Matched before extension.
@@ -277,6 +313,9 @@ struct PackContext {
 
 #[cfg(any(feature = "cpp", feature = "python", feature = "r", feature = "cmake"))]
 impl LanguageDriver for PackDriver {
+    fn maturity(&self) -> Maturity {
+        self.maturity
+    }
     fn id(&self) -> &'static str {
         self.id
     }
@@ -614,6 +653,7 @@ impl PackDriver {
 fn cpp_driver() -> PackDriver {
     PackDriver {
         id: "cpp",
+        maturity: Maturity::Beta,
         // `.c` too — tree-sitter-cpp parses C (a near-subset), and MISRA /
         // embedded code is C-heavy. One driver serves both.
         exts: &["cpp", "cc", "cxx", "hpp", "hh", "h", "c"],
@@ -641,6 +681,7 @@ fn cpp_driver() -> PackDriver {
 fn python_driver() -> PackDriver {
     PackDriver {
         id: "python",
+        maturity: Maturity::Alpha,
         exts: &["py"],
         filenames: &[],
         make_parser: || {
@@ -664,6 +705,7 @@ fn python_driver() -> PackDriver {
 fn r_driver() -> PackDriver {
     PackDriver {
         id: "r",
+        maturity: Maturity::Alpha,
         exts: &["R", "r"],
         filenames: &[],
         make_parser: || {
@@ -688,6 +730,7 @@ fn cmake_driver() -> PackDriver {
     PackDriver {
         // CMakeLists.txt (no extension match) is a follow-up; `.cmake` now.
         id: "cmake",
+        maturity: Maturity::Alpha,
         exts: &["cmake"],
         filenames: &["CMakeLists.txt"],
         make_parser: || {

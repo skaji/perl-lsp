@@ -63,8 +63,15 @@ die "binary not found: $bin (cargo build --release)\n" unless -x $bin;
 # always run.) This is the multi-language seam for the gold corpus.
 my %served = do {
     my $out = qx{$bin --languages 2>/dev/null};
-    my @langs = $out =~ /languages:\s*(.+?)\s*$/m ? split /\s*,\s*/, $1 : ('perl');
-    map { $_ => 1 } @langs;
+    # Entries may carry a maturity parenthetical ("cpp (beta)"); the id is
+    # what a row's `lang` tag matches, so strip it. DIE rather than default
+    # on an unparseable line: falling back to perl-only would silently SKIP
+    # every cpp row and still print a green summary — a wrong answer that
+    # looks like a pass, which is the one failure this harness must never have.
+    my ($list) = $out =~ /languages:\s*(.+?)\s*$/m;
+    die "cannot read served languages from `$bin --languages` (got: "
+      . ($out =~ s/\s+\z//r) . ")\n" unless defined $list && length $list;
+    map { s/\s*\(.*\)\z//r => 1 } split /\s*,\s*/, $list;
 };
 unless (-d $corpus) {
     die "substrate not found at $corpus.\n"

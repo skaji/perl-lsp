@@ -28,10 +28,23 @@ pub(crate) use query::*;
 /// prints `perl, cpp`.
 pub(crate) fn cli_languages() {
     let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+    // `id` first, maturity as a trailing parenthetical: consumers that parse
+    // this line split on `, ` and read the id up to ` (`. `gold-corpus/run.pl`
+    // is one — it decides which fixture rows to run from this output, so a
+    // format change that hides an id silently SKIPS that language's rows
+    // while still reporting green.
+    let listed: Vec<String> = reg
+        .languages()
+        .into_iter()
+        .map(|id| {
+            let suffix = reg.for_id(id).map(|d| d.maturity().suffix()).unwrap_or("");
+            format!("{id}{suffix}")
+        })
+        .collect();
     println!(
         "perl-lsp {} — languages: {}",
         env!("CARGO_PKG_VERSION"),
-        reg.languages().join(", "),
+        listed.join(", "),
     );
 }
 
