@@ -497,6 +497,68 @@ pub(crate) fn string_content_span(node: Node) -> Span {
     node_to_span(node)
 }
 
+/// The template node a `map` callback contributes. `map EXPR, LIST` is
+/// the callback itself; `map { ... } LIST` (the block form — at least
+/// as idiomatic) yields the block's tail expression, since Perl
+/// returns the last evaluated expression. A tail that is a lexical
+/// scalar bound exactly once by a plain `my $x = EXPR;` in the same
+/// block chases to that EXPR (`map { my $n = "Role::$_"; $n }`) — the
+/// same one-binding rule as the `my $m = 'process'` constant fold,
+/// applied block-locally where the builder's constant table can't
+/// reach (the template still holds an unresolved `$_`). A tail that's
+/// conditional, re-assigned, or not an expression statement is an
+/// honest miss: no fold beats a wrong parent.
+fn map_callback_template<'a>(cb: Node<'a>, src: &[u8]) -> Option<Node<'a>> {
+    if cb.kind() != "block" {
+        return Some(cb);
+    }
+    let stmts: Vec<Node> = cb
+        .named()
+        .filter(|c| !matches!(c.kind(), "comment" | "pod"))
+        .collect();
+    if stmts.is_empty() || !stmts.iter().all(|s| s.kind() == "expression_statement") {
+        return None;
+    }
+    let tail = stmts.last()?.named_child(0)?;
+    if tail.kind() != "scalar" {
+        return Some(tail);
+    }
+    let name = tail.utf8_text(src).ok()?;
+    let mut init: Option<Node> = None;
+    for s in &stmts[..stmts.len() - 1] {
+        let Some(expr) = s.named_child(0) else { continue };
+        if expr.kind() != "assignment_expression" {
+            continue;
+        }
+        let Some(left) = expr.child_by_field_name("left") else { continue };
+        let declares = left.kind() == "variable_declaration"
+            && left
+                .named()
+                .any(|c| c.kind() == "scalar" && c.utf8_text(src).ok() == Some(name));
+        if declares {
+            if init.is_some() {
+                return None; // two bindings — not a static value
+            }
+            // Structural RHS pick (last named child that isn't the
+            // left side) rather than the `right:` field — field
+            // presence has drifted across grammar versions; structure
+            // hasn't.
+            let mut rhs = None;
+            for i in 0..expr.named_child_count() {
+                if let Some(c) = expr.named_child(i) {
+                    if c.id() != left.id() {
+                        rhs = Some(c);
+                    }
+                }
+            }
+            init = Some(rhs?);
+        } else if left.utf8_text(src).ok() == Some(name) {
+            return None; // re-assigned after (or instead of) the decl
+        }
+    }
+    init
+}
+
 /// Strings of a list-ish node — qw(), paren/comma lists, arrayrefs,
 /// bare string literals — with per-word spans, INCLUDING the case
 /// where `node` itself is the leaf (a parenless call's `arguments` IS
@@ -521,6 +583,7 @@ fn map_built_strings(
         return vec![];
     }
     let Some(cb) = node.child_by_field_name("callback") else { return vec![] };
+    let Some(cb) = map_callback_template(cb, src) else { return vec![] };
     if cb.kind() != "interpolated_string_literal" {
         return vec![];
     }

@@ -802,6 +802,79 @@ with map \"My::Roles::$_\", qw/Alpha Beta/;
     );
 }
 
+/// `map BLOCK LIST` — the block spelling of the same template map (at
+/// least as idiomatic as the expression form). The callback is a real
+/// `block` node; the fold descends to its tail expression, and a tail
+/// scalar bound exactly once by `my $x = TEMPLATE` chases to the
+/// template. A re-assigned binding is an honest miss — no fold beats a
+/// wrong parent.
+#[test]
+fn map_block_built_role_parents() {
+    let src = "\
+package My::Class;
+use Moo;
+with map { \"My::Roles::$_\" } qw/Alpha Beta/;
+";
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.declared_parents("My::Class"),
+        &["My::Roles::Alpha".to_string(), "My::Roles::Beta".to_string()],
+    );
+
+    let src = "\
+package My::Stmt;
+use Moo;
+with map { my $n = \"My::Roles::$_\"; $n } qw/Alpha Beta/;
+";
+    let fa = build_fa(src);
+    assert_eq!(
+        fa.declared_parents("My::Stmt"),
+        &["My::Roles::Alpha".to_string(), "My::Roles::Beta".to_string()],
+    );
+
+    let src = "\
+package My::Reassigned;
+use Moo;
+with map { my $n = \"My::Roles::$_\"; $n = lc $n; $n } qw/Alpha Beta/;
+";
+    let fa = build_fa(src);
+    assert!(
+        fa.declared_parents("My::Reassigned").is_empty(),
+        "re-assigned tail binding must not fold to a wrong parent",
+    );
+}
+
+/// `require Foo::Bar;` — the bareword module form gets the same
+/// PackageRef the `use` path emits (rule #7) plus a binds-nothing
+/// Import row so @INC resolution sees the module. `require VERSION`
+/// is a different node kind and must emit neither.
+#[test]
+fn require_bareword_module_ref() {
+    let src = "\
+package My::User;
+require Some::Module;
+require 5.010;
+require v5.36;
+";
+    let fa = build_fa(src);
+    assert!(
+        fa.refs()
+            .iter()
+            .any(|r| r.target_name == "Some::Module" && matches!(r.kind, RefKind::PackageRef)),
+        "bareword require emits a PackageRef",
+    );
+    let imp: Vec<_> =
+        fa.imports.iter().filter(|i| i.module_name == "Some::Module").collect();
+    assert_eq!(imp.len(), 1, "one Import row for the required module");
+    assert!(imp[0].empty_import, "require binds nothing — the `use Foo ()` shape");
+    assert!(imp[0].imported_symbols.is_empty());
+    assert!(
+        !fa.refs().iter().any(|r| r.target_name.contains("5.010")
+            || r.target_name.contains("v5.36")),
+        "version asserts must not mint module refs",
+    );
+}
+
 /// A bareword naming an in-scope sub IS a call (Perl prefers the
 /// defined sub over the class-name reading), so value-position
 /// barewords get the full function treatment: a FunctionCall ref per

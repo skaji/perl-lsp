@@ -591,8 +591,9 @@ impl<'a> Builder<'a> {
                     | "package_statement"
                     | "class_statement"
                     | "use_statement"
-                    | "require_statement"
-                    | "no_statement"
+                    // `no Foo;` parses as use_statement too — there is
+                    // no separate no_statement kind in this grammar.
+                    | "require_expression"
             ) {
                 return;
             }
@@ -687,6 +688,39 @@ impl<'a> Builder<'a> {
                 lexical: false,
             },
         );
+    }
+
+    /// `require Foo::Bar;` — the bareword module form. Emits the same
+    /// `PackageRef` the `use` path emits (rule #7: goto-def reaches the
+    /// module's file, references count the load site) plus an `Import`
+    /// row that binds nothing (`empty_import`, the `use Foo ()` shape —
+    /// `require` never calls `import`) so on-demand @INC resolution
+    /// sees the module like any `use`. No `package_uses` entry: a
+    /// runtime `require` grants no compile-time keyword surface, so
+    /// framework/plugin `UsesModule` triggers must not fire. `require
+    /// VERSION` is a different node kind (`require_version_expression`)
+    /// and never reaches here; string-path and `$var` operands keep
+    /// their normal visitors (documentLink / variable navigation).
+    pub(super) fn visit_require(&mut self, node: Node<'a>) {
+        let Some(operand) = node.named_child(0) else { return };
+        if operand.kind() != "bareword" {
+            self.visit_children(node);
+            return;
+        }
+        let Ok(name) = operand.utf8_text(self.source) else { return };
+        self.add_ref(
+            RefKind::PackageRef,
+            node_to_span(operand),
+            name.to_string(),
+            AccessKind::Read,
+        );
+        self.imports.push(Import {
+            module_name: name.to_string(),
+            imported_symbols: vec![],
+            span: node_to_span(node),
+            qw_close_paren: None,
+            empty_import: true,
+        });
     }
 
     /// Strings of a list-ish node, per-word spans included. Syntax

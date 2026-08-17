@@ -17,6 +17,7 @@ impl<'a> Builder<'a> {
             "for_statement" => self.visit_for(node),
             "postfix_for_expression" => self.visit_postfix_for(node),
             "use_statement" => self.visit_use(node),
+            "require_expression" => self.visit_require(node),
             "assignment_expression" => self.visit_assignment(node),
 
             // A bare `{ ... }` statement is its own block node in this

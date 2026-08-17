@@ -1,0 +1,17 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "require-bareword-module",
+      "difficulty": "simple",
+      "semantic_area": "modules",
+      "root": "gold-corpus/require-fixture",
+      "file": "lib/My/Requirer.pm",
+      "line": 2,
+      "col": 13,
+      "expect": { "all": ["Target.pm:1:9"], "none": [] },
+      "status": "gold",
+      "note": "`require Req::Target;` — bareword module form. `use Foo::Bar` resolves; `require Foo::Bar` emits no ref at all (rule #7 gap). CST trap: `require_expression` has NO module: field, just a bareword child (require VERSION is a separate `require_version_expression` kind, so version asserts are structurally excluded). String-path `require \"x.pl\"` is documentLink's territory, not this row."
+    }
+  ]
+}

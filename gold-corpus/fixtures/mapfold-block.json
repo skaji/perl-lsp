@@ -1,0 +1,53 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "mapfold-expr-alpha-control",
+      "difficulty": "simple",
+      "semantic_area": "roles",
+      "root": "gold-corpus/mapfold-fixture",
+      "file": "lib/My/ExprUser.pm",
+      "line": 2,
+      "col": 25,
+      "expect": { "all": ["Alpha.pm:1:9"], "none": [] },
+      "status": "gold",
+      "note": "Control: `with map \"Role::$_\", qw(Alpha Beta)` — the EXPRESSION-form template map folds statically; goto-def on the qw element Alpha reaches the role package. Pins that the fold itself works so the block-form rows isolate the callback-shape gap."
+    },
+    {
+      "id": "mapfold-block-alpha",
+      "difficulty": "tricky",
+      "semantic_area": "roles",
+      "root": "gold-corpus/mapfold-fixture",
+      "file": "lib/My/BlockUser.pm",
+      "line": 2,
+      "col": 28,
+      "expect": { "all": ["Alpha.pm:1:9"], "none": [] },
+      "status": "gold",
+      "note": "`with map { \"Role::$_\" } qw(Alpha Beta)` — BLOCK form of the same template map (at least as idiomatic as the expression form). CST: callback is a real `block` node wrapping an expression_statement with the same interpolated template; the folder must descend into the block tail."
+    },
+    {
+      "id": "mapfold-block-beta",
+      "difficulty": "tricky",
+      "semantic_area": "roles",
+      "root": "gold-corpus/mapfold-fixture",
+      "file": "lib/My/BlockUser.pm",
+      "line": 2,
+      "col": 34,
+      "expect": { "all": ["Beta.pm:1:9"], "none": [] },
+      "status": "gold",
+      "note": "Second qw element of the block-form map — pins that the fold produces one parent per list element with per-element spans, not just the first."
+    },
+    {
+      "id": "mapfold-block-stmt-tail",
+      "difficulty": "tricky",
+      "semantic_area": "roles",
+      "root": "gold-corpus/mapfold-fixture",
+      "file": "lib/My/StmtUser.pm",
+      "line": 2,
+      "col": 40,
+      "expect": { "all": ["Alpha.pm:1:9"], "none": [] },
+      "status": "gold",
+      "note": "`with map { my $n = \"Role::$_\"; $n } qw(Alpha Beta)` — multi-statement block whose tail is a lexical bound once to the template. Perl returns the block's last expression; the fold must chase the single `my $n = TEMPLATE` binding to the template rather than pattern-matching a literal tail."
+    }
+  ]
+}

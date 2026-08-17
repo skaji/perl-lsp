@@ -9,6 +9,29 @@ why parked, what unblocks it. Prune on landing.
 All entries below re-ratified by the tighten-2 drain (2026-07-17) unless
 marked otherwise; the drain re-derived each rationale against current code.
 
+- **Dead node-kind comparisons — a silent-no-op correctness class, not
+  tidiness** (found 2026-08-17). A `kind()` comparison against a string
+  the grammar doesn't have never matches, and beside a working sibling
+  arm it reads as handled behaviour; `"require_statement"` in
+  `visit_const_usage`'s skip list wasn't merely dead — it made a real
+  skip fail to happen, minting a bogus constant-FunctionCall ref under
+  every bareword `require` (fixed with the `require_expression` work).
+  Swept against ts-parser-perl 1.1.4's node-types.json, two dead kinds
+  remain: `"no_statement"` (removed at the one site) and
+  `"parenthesized_expression"` — **27 dead Perl-side comparisons**
+  (`build/builder/`: frameworks 8, visit_method 5, visit_use 3,
+  visit_calls 2, extract 2, visit_decl 1, infra 1; `cst.rs` 4;
+  `lsp/cursor_context.rs` 1). **WARNING: the kind IS real in
+  tree-sitter-cpp — the 4 pack-side comparisons are LIVE**
+  (`build/cpp_reparse/defs.rs` 2, `build/query_extract/packs.rs` 2);
+  a sweep that deletes by string match breaks C++ paren handling.
+  The durable fix is worth more than the sweep: a test that extracts
+  each grammar's node kinds and asserts every string compared against
+  `kind()` in that language's code is one of them
+  (`layering_tests.rs` is the precedent for this kind of structural
+  assertion) — that turns the class into a build-time guarantee
+  instead of a periodic hunt.
+
 - **Two include-BFS walkers + two `file_stamp` fns** (cpp_reparse vs
   module_cache): thrice examined, thrice left (different contracts/layers:
   parse-heavy macro gather vs memoized line-scan closure; `(hash,size)`
