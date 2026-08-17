@@ -58,6 +58,52 @@ fn inferred_type_matches(expected: &InferredType, actual: &InferredType) -> bool
         )
 }
 
+/// Payload ceiling for one completion response. The unbounded tiers (the
+/// auto-import export firehose, the module-name universe, a pack include
+/// closure) scale with the WORKSPACE, not the cursor — measured 7.8 MB /
+/// ~50k items per keystroke at the 138k-file corpus. An editor renders
+/// ~a dozen rows; 200 leaves client-side fuzzy filtering ample headroom
+/// between keystrokes while keeping the worst-case payload ~30 KB
+/// (~160 B/item measured), and it sits ABOVE the bounded tiers' typical
+/// sizes (in-scope + imports + builtins ≈ low hundreds) so ordinary files
+/// still get their complete list with `isIncomplete: false`.
+pub const MAX_COMPLETION_ITEMS: usize = 200;
+
+/// Rank-then-cut to `MAX_COMPLETION_ITEMS`. Returns `true` when the list
+/// was reduced — the LSP `isIncomplete` flag, the honest "there are more,
+/// re-query as you type" signal (a silently truncated list that claims
+/// completeness makes the client cache it and never ask again).
+///
+/// Order of operations is the design: narrow by the TYPED prefix first
+/// (each keystroke re-queries under `isIncomplete`, so the server-side
+/// filter converges to the complete answer), then rank by the same key the
+/// client sorts on (`sort_text`, label fallback) so the cut keeps the
+/// useful half — local/in-scope/imported tiers carry lower sort_text than
+/// the workspace firehose by construction. Under the cap nothing changes:
+/// the full list returns as a complete (client-cacheable) response.
+pub(crate) fn cap_completion_items(items: &mut Vec<CompletionItem>, typed_prefix: &str) -> bool {
+    if items.len() <= MAX_COMPLETION_ITEMS {
+        return false;
+    }
+    if !typed_prefix.is_empty() {
+        items.retain(|i| {
+            i.filter_text
+                .as_deref()
+                .unwrap_or(&i.label)
+                .starts_with(typed_prefix)
+        });
+    }
+    if items.len() > MAX_COMPLETION_ITEMS {
+        items.sort_by(|a, b| {
+            let ka = a.sort_text.as_deref().unwrap_or(&a.label);
+            let kb = b.sort_text.as_deref().unwrap_or(&b.label);
+            ka.cmp(kb).then_with(|| a.label.cmp(&b.label))
+        });
+        items.truncate(MAX_COMPLETION_ITEMS);
+    }
+    true
+}
+
 pub(crate) fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {
     let additional_text_edits = if c.additional_edits.is_empty() {
         None
@@ -164,7 +210,7 @@ pub fn completion_items(
     pos: Position,
     module_index: &ModuleIndex,
     stable_packages: Option<&[(String, usize)]>,
-) -> Vec<CompletionItem> {
+) -> (Vec<CompletionItem>, bool) {
     let point = position_to_point(pos);
 
     // Plugin query hook — runs BEFORE the native path. A plugin can
@@ -198,13 +244,13 @@ pub fn completion_items(
             }
         }
         if exclusive {
-            return plugin_items;
+            return (plugin_items, false);
         }
         if !plugin_items.is_empty() {
-            let native = completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages);
+            let (native, is_incomplete) = completion_items_native(files, origin_key, analysis, tree, source, pos, module_index, stable_packages);
             let mut out = plugin_items;
             out.extend(native);
-            return out;
+            return (out, is_incomplete);
         }
     }
 
@@ -225,7 +271,7 @@ pub fn completion_items_for_test(
 ) -> Vec<CompletionItem> {
     let files = crate::index::file_store::FileStore::new();
     let key = crate::index::file_store::FileKey::Path(std::path::PathBuf::from("/test/origin.pl"));
-    completion_items(&files, &key, analysis, tree, source, pos, module_index, stable_packages)
+    completion_items(&files, &key, analysis, tree, source, pos, module_index, stable_packages).0
 }
 
 /// The native completion path — the plugin-aware `completion_items`
@@ -240,7 +286,7 @@ fn completion_items_native(
     pos: Position,
     module_index: &ModuleIndex,
     stable_packages: Option<&[(String, usize)]>,
-) -> Vec<CompletionItem> {
+) -> (Vec<CompletionItem>, bool) {
     let point = position_to_point(pos);
     // Candidate GATHERING routes through the resolution CandidateSet — the
     // same visible universe references/rename/goto-def project from
@@ -280,7 +326,7 @@ fn completion_items_native(
                     analysis, module_index, invocant.text(), source, point, r.span,
                 );
                 if !early.is_empty() {
-                    return early;
+                    return (early, false);
                 }
             }
         }
@@ -367,7 +413,7 @@ fn completion_items_native(
                     .filter(|c| matches!(c.kind, FaSymKind::Variable | FaSymKind::Field))
                     .collect();
                 candidates.extend(vars_only);
-                return candidates.drain(..).map(candidate_to_completion_item).collect();
+                return (candidates.drain(..).map(candidate_to_completion_item).collect(), false);
             }
         }
     }
@@ -422,17 +468,20 @@ fn completion_items_native(
                 // candidate's detail wins).
                 let cands = module_index.visible_def_candidates(name);
                 if cands.is_empty() {
-                    return vec![import_list_loading_placeholder(name)];
+                    return (vec![import_list_loading_placeholder(name)], false);
                 }
                 let mut seen = std::collections::HashSet::new();
-                return cands
-                    .iter()
-                    .flat_map(|cached| {
-                        module_index.whole_present(cached).import_list_candidates()
-                    })
-                    .filter(|c| seen.insert(c.label.clone()))
-                    .map(candidate_to_completion_item)
-                    .collect();
+                return (
+                    cands
+                        .iter()
+                        .flat_map(|cached| {
+                            module_index.whole_present(cached).import_list_candidates()
+                        })
+                        .filter(|c| seen.insert(c.label.clone()))
+                        .map(candidate_to_completion_item)
+                        .collect(),
+                    false,
+                );
             }
             Vec::new()
         }
@@ -447,7 +496,12 @@ fn completion_items_native(
             } else {
                 cs.complete_qualified_path(module_index, prefix)
             };
-            return candidates.into_iter().map(candidate_to_completion_item).collect();
+            let mut items: Vec<CompletionItem> =
+                candidates.into_iter().map(candidate_to_completion_item).collect();
+            // The candidate sources already narrowed by the qualifier
+            // prefix, so the cap's own prefix pass has nothing to add.
+            let is_incomplete = cap_completion_items(&mut items, "");
+            return (items, is_incomplete);
         }
         Slot::Identifier { .. } if sigil_trigger.is_some() => {
             analysis.complete_variables(point, sigil_trigger.expect("checked by guard"))
@@ -543,7 +597,16 @@ fn completion_items_native(
         }
     }
 
-    items
+    // Payload cap over the assembled universe (the identifier slot's
+    // auto-import firehose is the workspace-scaled tier). The typed
+    // prefix narrows server-side only when the cap fires — under it,
+    // clients keep their complete list and filter locally.
+    let typed_prefix = match &slot {
+        Slot::Identifier { prefix } if sigil_trigger.is_none() => prefix.as_str(),
+        _ => "",
+    };
+    let is_incomplete = cap_completion_items(&mut items, typed_prefix);
+    (items, is_incomplete)
 }
 
 /// The `use Module qw(|)` "still indexing" affordance — shown while the
@@ -691,4 +754,65 @@ pub(super) fn format_imported_signature(name: &str, sub_info: &SubInfo<'_>) -> S
         sig.push_str(&format!(" → {}", format_inferred_type(&rt)));
     }
     sig
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    fn item(label: &str, priority: u8) -> CompletionItem {
+        CompletionItem {
+            label: label.to_string(),
+            sort_text: Some(format!("{:03}{}", priority, label)),
+            filter_text: Some(label.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Under the cap the list is untouched and reported complete — ordinary
+    /// files keep the exact behavior they had before the cap existed.
+    #[test]
+    fn under_cap_is_complete_and_untouched() {
+        let mut items: Vec<CompletionItem> =
+            (0..50).map(|i| item(&format!("name{i:03}"), 25)).collect();
+        let before: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
+        assert!(!cap_completion_items(&mut items, ""));
+        assert_eq!(before, items.iter().map(|i| i.label.clone()).collect::<Vec<_>>());
+    }
+
+    /// Over the cap: rank by sort_text THEN cut, so the low-priority tiers
+    /// (local/in-scope/imported) survive and the workspace firehose is what
+    /// gets truncated. The flag is the LSP isIncomplete signal.
+    #[test]
+    fn over_cap_keeps_the_ranked_head() {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        // Firehose tier first in gathering order — ranking must still save
+        // the locals appended after it.
+        for i in 0..MAX_COMPLETION_ITEMS + 50 {
+            items.push(item(&format!("export{i:05}"), 25));
+        }
+        for i in 0..10 {
+            items.push(item(&format!("local{i}"), 0));
+        }
+        assert!(cap_completion_items(&mut items, ""));
+        assert_eq!(items.len(), MAX_COMPLETION_ITEMS);
+        for i in 0..10 {
+            let l = format!("local{i}");
+            assert!(items.iter().any(|it| it.label == l), "local tier survived the cut: {l}");
+        }
+    }
+
+    /// A typed prefix narrows server-side before the rank+cut — each
+    /// keystroke's re-query (isIncomplete) converges on the complete answer.
+    #[test]
+    fn typed_prefix_narrows_before_the_cut() {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        for i in 0..MAX_COMPLETION_ITEMS + 50 {
+            items.push(item(&format!("noise{i:05}"), 25));
+        }
+        items.push(item("get_config", 25));
+        assert!(cap_completion_items(&mut items, "get_"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "get_config");
+    }
 }

@@ -111,20 +111,52 @@ impl PackBagCache {
     /// strict-residency tripwire can name WHY rehydration missed instead of
     /// collapsing every cause into "loader returned None".
     pub fn bag_for_diag(&self, path: &Path) -> Result<Arc<FileAnalysis>, RehydrateMiss> {
+        self.get_or_load(path, true)
+    }
+
+    /// The rows-axes flavor of `bag_for`: refs + symbols GUARANTEED present,
+    /// the bag not promised. A miss decodes the same whole blob but strips the
+    /// bag BEFORE retaining, so backward-walk traffic (whose matcher reads
+    /// refs + symbols only) caches at roughly half the bytes per entry — the
+    /// witness bag is ~half a Perl analysis's heap — under the SAME byte cap,
+    /// one budget, one recency clock, one invalidation. A whole entry already
+    /// resident answers as-is (superset); a stripped entry never satisfies a
+    /// later `bag_for` (it re-decodes whole and replaces the entry).
+    pub fn rows_for(&self, path: &Path) -> Option<Arc<FileAnalysis>> {
+        self.get_or_load(path, false).ok()
+    }
+
+    /// `rows_for` with the discriminated miss, for the strict-residency
+    /// tripwire — same pairing as `bag_for` / `bag_for_diag`.
+    pub fn rows_for_diag(&self, path: &Path) -> Result<Arc<FileAnalysis>, RehydrateMiss> {
+        self.get_or_load(path, false)
+    }
+
+    fn get_or_load(&self, path: &Path, want_bag: bool) -> Result<Arc<FileAnalysis>, RehydrateMiss> {
         if let Some(hit) = self.entries.get(path) {
             let arc = hit.value().0.clone();
             drop(hit);
-            self.recency.insert(path.to_path_buf(), self.tick());
-            if let Some(g) = &self.ghost {
-                g.on_hit();
+            // A stripped entry (retained for a rows-axes reader) cannot serve
+            // a bag request — fall through to a whole re-decode that REPLACES
+            // it. Serving it would be absence-by-eviction: the type query
+            // reads an empty bag as "no type facts", silently.
+            if !want_bag || !arc.bag_is_evicted() {
+                self.recency.insert(path.to_path_buf(), self.tick());
+                if let Some(g) = &self.ghost {
+                    g.on_hit();
+                }
+                return Ok(arc);
             }
-            return Ok(arc);
         }
         if let Some(g) = &self.ghost {
             g.on_miss(&path.to_string_lossy());
         }
         let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
-        let fa = Arc::new((self.loader)(path)?);
+        let mut loaded = (self.loader)(path)?;
+        if !want_bag {
+            loaded.evict_witness_bag();
+        }
+        let fa = Arc::new(loaded);
         if self.cap_bytes == 0 {
             return Ok(fa); // rehydrate-and-drop
         }
@@ -367,6 +399,36 @@ mod tests {
             truth,
             "racing decodes stacked charges for one entry"
         );
+    }
+
+    /// The rows lane retains bag-STRIPPED copies (that's its byte-density
+    /// point), and a later bag request must never be served the stripped
+    /// entry — it re-decodes whole and replaces it. Serving stripped to a
+    /// bag reader is absence-by-eviction on the type axis.
+    #[test]
+    fn rows_lane_strips_and_bag_request_upgrades() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| {
+            c.fetch_add(1, Ordering::Relaxed);
+            Ok(empty_fa())
+        });
+        let p = PathBuf::from("/x/a.pm");
+        let rows = cache.rows_for(&p).unwrap();
+        assert!(rows.bag_is_evicted(), "rows-lane entry retains without the bag");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // rows hit — no reload.
+        let rows2 = cache.rows_for(&p).unwrap();
+        assert!(Arc::ptr_eq(&rows, &rows2));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // bag request over a stripped entry re-decodes whole.
+        let whole = cache.bag_for(&p).unwrap();
+        assert!(!whole.bag_is_evicted(), "bag reader never sees the stripped entry");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        // ...and the whole entry now serves BOTH flavors.
+        let rows3 = cache.rows_for(&p).unwrap();
+        assert!(Arc::ptr_eq(&whole, &rows3), "whole entry is a superset for rows readers");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

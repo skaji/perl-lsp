@@ -830,9 +830,29 @@ impl ModuleIndex {
     /// panics so a run serving absence-as-answer fails loudly instead of
     /// scoring wrong results.
     pub(super) fn rehydrate_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        self.rehydrate_axes_or_resident(cached, true)
+    }
+
+    /// The rows-axes twin: refs + symbols guaranteed, bag not promised —
+    /// the LRU retains these entries bag-stripped so backward-walk traffic
+    /// caches denser under the same cap. Same miss policy, same tripwire.
+    pub(super) fn rehydrate_rows_or_resident(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        self.rehydrate_axes_or_resident(cached, false)
+    }
+
+    fn rehydrate_axes_or_resident(
+        &self,
+        cached: &Arc<CachedModule>,
+        want_bag: bool,
+    ) -> Arc<FileAnalysis> {
         let mut stage = "no bag cache installed on this index".to_string();
         if let Some(bc) = self.bag_cache_ref() {
-            match bc.bag_for_diag(&cached.path) {
+            let got = if want_bag {
+                bc.bag_for_diag(&cached.path)
+            } else {
+                bc.rows_for_diag(&cached.path)
+            };
+            match got {
                 Ok(full) => return full,
                 // Discriminated cause (see `RehydrateMiss`) so the tripwire
                 // below names the mechanism instead of shrugging.
@@ -845,7 +865,7 @@ impl ModuleIndex {
         // sibling's CACHE directly (never its `rehydrate_or_resident` — no
         // recursion): sub-index → the hub's cell; hub → the pack sibling
         // that registered the path.
-        if let Some(fa) = self.rehydrate_foreign(&cached.path) {
+        if let Some(fa) = self.rehydrate_foreign(&cached.path, want_bag) {
             return fa;
         }
 
@@ -871,13 +891,16 @@ impl ModuleIndex {
     /// through the sibling's cache (never its miss path), so routing can't
     /// recurse. `None` when no sibling owns the path — the caller's miss
     /// handling then applies.
-    fn rehydrate_foreign(&self, path: &std::path::Path) -> Option<Arc<FileAnalysis>> {
+    fn rehydrate_foreign(&self, path: &std::path::Path, want_bag: bool) -> Option<Arc<FileAnalysis>> {
+        let ask = |bc: &crate::index::pack_bag_cache::PackBagCache| {
+            if want_bag { bc.bag_for(path) } else { bc.rows_for(path) }
+        };
         // Sub-index → the hub's cell (shared at `attach_pack_index`).
         let hub_cell = self.foreign_bag_cache.read().ok().and_then(|g| g.clone());
         if let Some(cell) = hub_cell {
             let hub_cache = cell.read().ok().and_then(|g| g.clone());
             if let Some(bc) = hub_cache {
-                if let Some(fa) = bc.bag_for(path) {
+                if let Some(fa) = ask(&bc) {
                     return Some(fa);
                 }
             }
@@ -887,7 +910,7 @@ impl ModuleIndex {
             let sub = entry.value();
             if sub.all_files.contains_key(path) {
                 if let Some(bc) = sub.bag_cache_ref() {
-                    if let Some(fa) = bc.bag_for(path) {
+                    if let Some(fa) = ask(&bc) {
                         return Some(fa);
                     }
                 }

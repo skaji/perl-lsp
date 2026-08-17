@@ -247,7 +247,7 @@ def main():
                       "position": {"line": step["line"], "character": step["character"]}}
             if act == "references":
                 params["context"] = {"includeDeclaration": True}
-            msg, ms = lsp.request(method, params, timeout=120)
+            msg, ms = lsp.request(method, params, timeout=float(os.environ.get("BENCH_REQ_TIMEOUT","120")))
             metrics["steps"].append({"name": name, "action": act, "ms": ms,
                                      "result_size": len(json.dumps((msg or {}).get("result")))})
         elif act == "documentSymbol":

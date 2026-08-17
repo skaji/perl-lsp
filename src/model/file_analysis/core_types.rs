@@ -914,6 +914,26 @@ impl Ref {
         }
     }
 
+    /// Whether matching this ref against a target consults only the frozen
+    /// build-time verdict on the ref itself. `false` means the matcher's
+    /// fallback arm re-derives the verdict at query time through this FILE's
+    /// witness bag (`method_call_invocant_class` on an unstamped method
+    /// call / `deferred_hash_key_owner` on an unowned or variable-owned
+    /// key), so a bag-stripped `refs_present` view could silently drop the
+    /// site — the caller upgrades that file to `whole_present` instead.
+    /// Over-approximates on purpose: a `false` that would never have
+    /// matched costs one whole decode, never a wrong answer.
+    pub fn match_verdict_baked(&self) -> bool {
+        match &self.kind {
+            RefKind::MethodCall { .. } => self.method_target().is_some(),
+            RefKind::HashKeyAccess { .. } => matches!(
+                self.hash_key_owner(),
+                Some(o) if !matches!(o, HashKeyOwner::Variable { .. })
+            ),
+            _ => true,
+        }
+    }
+
     pub fn bind_symbol(&mut self, sym: SymbolId) {
         self.binding = Some(RefBinding::Symbol(sym));
     }

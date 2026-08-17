@@ -528,6 +528,25 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         self.whole_present(cached)
     }
+    /// The ROWS-axes view — refs AND symbols populated: the backward-walk
+    /// matcher's axes (usage sites + declaration sites). The @INC strip is
+    /// bag-only, so import-tier copies answer resident; the workspace strip
+    /// (bag + refs + symbols) rehydrates.
+    ///
+    /// CONTRACT: the returned view's refs and symbols are POPULATED — an
+    /// empty match result means the file genuinely holds no matching
+    /// site, never "the axis was evicted". Absence-by-eviction here is
+    /// `references` silently under-reporting with no error; implementations
+    /// must rehydrate, never degrade to the resident-or-empty copy. The BAG
+    /// is NOT promised: a consumer whose match needs query-time type
+    /// inference — a name-matching ref whose verdict isn't baked
+    /// (`Ref::match_verdict_baked`) — upgrades that file to `whole_present`.
+    fn refs_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        self.whole_present(cached)
+    }
     /// Every indexed file holding at least one ref row keyed by one of
     /// `keys` — the relational reverse index's candidate-file retrieval
     /// (`SELECT DISTINCT path … WHERE name_id IN keys`). The backward walk
@@ -781,6 +800,13 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // residency answer (the default would re-route to OUR whole_present,
         // losing the symbols-resident fast path).
         self.inner.symbols_present(cached)
+    }
+    fn refs_present(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+    ) -> std::sync::Arc<FileAnalysis> {
+        // Same delegation rule as `symbols_present`.
+        self.inner.refs_present(cached)
     }
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         // Unscoped by design, like `def_candidates`: the backward walk applies

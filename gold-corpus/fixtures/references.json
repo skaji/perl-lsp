@@ -452,6 +452,27 @@
         "none": []
       },
       "status": "gold"
+    },
+    {
+      "id": "ref-uri-uri_escape-evicted-candidates",
+      "difficulty": "tricky",
+      "semantic_area": "exporter",
+      "file": "URI/Escape.pm",
+      "line": 166,
+      "col": 5,
+      "query": "",
+      "newname": "",
+      "note": "Rehydrate-arm tripwire for the refs-axis reader (refs_present): every cross-file site below lives in a workspace-stripped (refs+symbols-evicted) candidate. If the reader ever degrades to resident-or-empty, these files silently vanish from the answer with no error.",
+      "expect": {
+        "all": [
+          "\"file\":\"Escape.pm\",\"line\":\"167\"",
+          "\"file\":\"Baker.pm\",\"line\":\"41\"",
+          "\"file\":\"file.pm\",\"line\":\"95\"",
+          "\"file\":\"Request.pm\",\"line\":\"190\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

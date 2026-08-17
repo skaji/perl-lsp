@@ -673,10 +673,10 @@ fn run_one(
             // A language whose completion context comes from the sentinel
             // reparse (no native cursor-context) takes the pack path — the
             // same one the LSP server uses.
-            let items = if !language_driver::LanguageRegistry::caps(doc.language).cursor_context {
+            let (items, is_incomplete) = if !language_driver::LanguageRegistry::caps(doc.language).cursor_context {
                 tphase!("completion_items", backend::pack_completion(
                     ws, &doc.analysis, &doc.text, &doc.tree, point, doc.language,
-                    doc.path.as_deref(), idx).0)
+                    doc.path.as_deref(), idx))
             } else {
                 let file_path = std::path::Path::new(file).canonicalize()
                     .unwrap_or_else(|_| std::path::PathBuf::from(file));
@@ -691,6 +691,15 @@ fn run_one(
                     Some(d) if !d.is_empty() => out.push_str(&format!("{}\t{}\n", it.label, d)),
                     _ => out.push_str(&format!("{}\n", it.label)),
                 }
+            }
+            if is_incomplete {
+                // The server-mode response would carry `isIncomplete: true`;
+                // surface it as a trailing marker so CLI/gold can pin the
+                // payload cap AND the honesty flag in one assertion.
+                out.push_str(&format!(
+                    "# isIncomplete: capped at {} items\n",
+                    symbols::MAX_COMPLETION_ITEMS
+                ));
             }
             Ok(out.trim_end_matches('\n').to_string())
         }

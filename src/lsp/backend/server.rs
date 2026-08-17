@@ -954,8 +954,10 @@ impl LanguageServer for Backend {
             // branching, visibility (incl. the origin's include-closure scope
             // and the pack VISIBLE widening), and the cross-file walk all live
             // inside the set.
-            let cs = cx.set(base_idx, &analysis, &uri, point, scope);
-            refs_to_locations(cs.references())
+            let cs = crate::util::timings::phase("refs.resolve", || {
+                cx.set(base_idx, &analysis, &uri, point, scope)
+            });
+            refs_to_locations(crate::util::timings::phase("refs.project", || cs.references()))
         })
         .await
     }
@@ -1160,7 +1162,7 @@ impl LanguageServer for Backend {
                 CompletionResponse::Array(items)
             }));
         }
-        let items = symbols::completion_items(
+        let (items, capped) = symbols::completion_items(
             &self.files,
             &FileKey::Url(uri.clone()),
             &analysis,
@@ -1173,9 +1175,11 @@ impl LanguageServer for Backend {
         if items.is_empty() {
             Ok(None)
         } else {
-            // If any item is a loading placeholder (empty insert_text), mark as incomplete
-            // so the editor re-requests on next keystroke after the module resolves.
-            let is_incomplete = items.iter().any(|i| i.insert_text.as_deref() == Some(""));
+            // Incomplete when the payload cap fired (re-query narrows
+            // server-side as the prefix grows) or any item is a loading
+            // placeholder (re-request after the module resolves).
+            let is_incomplete =
+                capped || items.iter().any(|i| i.insert_text.as_deref() == Some(""));
             if is_incomplete {
                 // Trigger resolution for the module being loaded
                 for i in &items {

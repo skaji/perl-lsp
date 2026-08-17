@@ -241,11 +241,26 @@ impl CrossFileLookup for ModuleIndex {
     fn symbols_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         // The @INC strip is bag-only, so import-tier copies (the MRO
         // walk's ancestor set) answer resident; workspace copies are
-        // symbol-evicted and pay the same rehydration as `whole_present`.
+        // symbol-evicted and rehydrate through the rows-axes lane —
+        // bag-stripped LRU entries, so the ancestry storm's working set
+        // fits the cap instead of cycling whole copies through it.
         if !cached.analysis.symbols_are_evicted() {
             return cached.analysis.clone();
         }
-        self.rehydrate_or_resident(cached)
+        self.rehydrate_rows_or_resident(cached)
+    }
+
+    fn refs_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
+        // Backward-walk view: refs AND symbols usable (the matcher reads
+        // usage rows + declaration rows). The @INC strip is bag-only, so
+        // import-tier copies answer resident; the workspace strip evicts
+        // both row axes and rehydrates — never resident-or-empty, or an
+        // evicted-empty ref table would read as "this file has no matching
+        // refs" and `references` silently under-reports.
+        if !cached.analysis.refs_are_evicted() && !cached.analysis.symbols_are_evicted() {
+            return cached.analysis.clone();
+        }
+        self.rehydrate_rows_or_resident(cached)
     }
 
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {

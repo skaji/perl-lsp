@@ -202,12 +202,29 @@ already-decoded analysis — no separate migration pass, no re-parse.
 (`evict_symbols`) — each the same shape: clear the field(s) (and their
 rebuilt indexes), set a `#[serde(skip)]` `*_evicted` flag, called at the
 register seams always AFTER the blob and rows are persisted. The disk
-blob keeps everything, so rehydration is lossless. The one single-axis
-accessor is `bag_present` (resident-if-not-evicted, else rehydrate through
-the shared blob LRU); the refs axis has no single-axis reader — the
-backward walk reaches refs through `whole_present` — and readers needing
-more than one axis on the same copy take `whole_present`, gated by
-`is_fully_resident()`.
+blob keeps everything, so rehydration is lossless. Readers ask for the
+axes they read: `bag_present` (bag), `symbols_present` (symbols),
+`refs_present` (refs + symbols — the backward-walk matcher's axes), and
+`whole_present` (everything, gated by `is_fully_resident()`). Each is
+resident-if-its-axes-survived, else rehydrate through the shared blob
+LRU — never resident-or-empty (eviction must not read as absence).
+
+The rows-axes readers (`refs_present` / `symbols_present`) rehydrate
+through the LRU's **rows lane** (`PackBagCache::rows_for`): a miss decodes
+the same blob but retains the copy BAG-STRIPPED — the witness bag is ~half
+a Perl analysis's heap — so backward-walk and ancestry traffic caches
+about twice as dense under the same byte cap (one budget, one recency
+clock, one invalidation; a later `bag_for` on a stripped entry re-decodes
+whole and replaces it, never serves it). Because the returned view may
+lack the bag, `refs_to` runs the matcher on `matcher_view`: the refs view,
+upgraded per-file to `whole_present` when a name-matching ref's verdict is
+not baked (`Ref::match_verdict_baked` — an unstamped MethodCall or an
+unowned/variable-owned hash key, exactly the matcher arms that re-derive
+through the file's bag at query time; Handler targets with provisional
+dispatches take the whole view for the same reason). The upgrade
+over-approximates on purpose: a needless `true` costs one decode, a missed
+`true` silently drops chained-call sites (measured: 106 sites at Koha
+under a naive bag-strip).
 
 Registration is REGISTRATION-OWNED: every feed that needs symbol/edge data
 (`ModuleEdgeIndexes::feed`, the class-rank tie-break, the unregister

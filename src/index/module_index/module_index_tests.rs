@@ -119,6 +119,57 @@ fn symbols_present_rehydrates_evicted_symbols_never_absence_by_eviction() {
     );
 }
 
+/// The refs-axis reader's resident fast path: a bag-only-evicted copy (the
+/// @INC strip leaves refs AND symbols resident) answers with the resident
+/// arc — no decode. The panicking loader is the proof.
+#[test]
+fn refs_present_answers_resident_when_only_bag_evicted() {
+    use crate::index::pack_bag_cache::PackBagCache;
+    use crate::model::file_analysis::CrossFileLookup;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\nWidget::make('Widget');\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, |_p: &std::path::Path| {
+        panic!("refs_present must not rehydrate a rows-resident copy")
+    }));
+    let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
+    let mut bag_only = (*full.analysis).clone();
+    bag_only.evict_axes(true, false);
+    let cached = Arc::new(CachedModule::new(full.path.clone(), Arc::new(bag_only)));
+    let got = idx.refs_present(&cached);
+    assert!(Arc::ptr_eq(&got, &cached.analysis), "rows-resident copy answers resident");
+    assert!(!got.refs().is_empty(), "refs axis is populated on the fast path");
+}
+
+/// The absence-as-answer tripwire for the refs axis: a WORKSPACE-strip copy
+/// (bag + refs + symbols evicted) asked a refs question whose true answer is
+/// non-empty must rehydrate and answer it. If `refs_present` ever degrades
+/// to "resident or empty", the evicted-empty ref table reads as "this file
+/// has no matching refs" — `references` under-reports with no error, and
+/// gold may hold no row covering the missing file.
+#[test]
+fn refs_present_rehydrates_evicted_refs_never_absence_by_eviction() {
+    use crate::index::pack_bag_cache::PackBagCache;
+    use crate::model::file_analysis::CrossFileLookup;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\nWidget::make('Widget');\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    let full_for_loader = full.analysis.clone();
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, move |_p: &std::path::Path| {
+        Ok((*full_for_loader).clone())
+    }));
+    let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
+    let mut stripped = (*full.analysis).clone();
+    stripped.evict_axes(true, true);
+    assert!(stripped.refs_are_evicted(), "fixture must model the workspace strip");
+    let cached = Arc::new(CachedModule::new(full.path.clone(), Arc::new(stripped)));
+    let got = idx.refs_present(&cached);
+    assert!(!got.refs_are_evicted(), "rehydrated view carries refs");
+    assert!(!got.symbols_are_evicted(), "rehydrated view carries symbols (matcher reads both)");
+    assert!(
+        got.refs().iter().any(|r| r.target_name.contains("make")),
+        "true non-empty refs answer must survive eviction"
+    );
+}
+
 #[test]
 fn test_resolve_module_list_util() {
     let idx = ModuleIndex::new_for_test();

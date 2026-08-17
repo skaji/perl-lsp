@@ -250,6 +250,25 @@
       },
       "status": "gold",
       "note": "$self-> completion offers methods inherited from Mojo::Base via `use Mojo::Base -base` (tap/with_roles)."
+    },
+    {
+      "id": "completion-payload-cap-isincomplete",
+      "difficulty": "simple",
+      "semantic_area": "classic",
+      "file": "Mojolicious/Controller.pm",
+      "line": 284,
+      "col": 13,
+      "note": "The payload cap (MAX_COMPLETION_ITEMS=200) over the auto-import firehose: rank-then-cut keeps the in-scope tier (cookie/finish are Controller subs) and the response is honestly marked isIncomplete (the CLI marker line). max_items pins 200 items + 1 marker line.",
+      "expect": {
+        "all": [
+          "cookie\tsub",
+          "finish\tsub",
+          "# isIncomplete: capped at 200 items"
+        ],
+        "none": [],
+        "max_items": 201
+      },
+      "status": "gold"
     }
   ]
 }

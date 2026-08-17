@@ -304,6 +304,50 @@ pub(super) fn retrieval_keys(target: &TargetRef, aliases: &[DelegationAlias]) ->
     keys
 }
 
+/// The analysis view the backward-walk matcher runs on for one closed file:
+/// the rows-axes view (`refs_present` — refs + symbols, bag not promised),
+/// upgraded to `whole_present` only when some name-matching ref's verdict
+/// isn't baked (`Ref::match_verdict_baked`) — those are exactly the matcher
+/// arms that re-derive through the file's witness bag at query time
+/// (unstamped method-call invocants, unowned hash keys), and a bag-stripped
+/// view would silently drop their sites. Handler targets additionally
+/// resolve receiver-gated dispatch candidates through the bag, so any file
+/// carrying provisional dispatches takes the whole view for them.
+///
+/// The pre-scan runs on the rows view's OWN refs, so the upgrade decision
+/// can never miss a row the matcher would see. Cost model: verdict-baked
+/// files (the vast majority) cache bag-stripped at ~half the bytes, so the
+/// walk's working set fits the LRU instead of cycling it.
+pub(super) fn matcher_view(
+    idx: &dyn CrossFileLookup,
+    cached: &std::sync::Arc<crate::model::file_analysis::CachedModule>,
+    target: &TargetRef,
+) -> std::sync::Arc<FileAnalysis> {
+    let view = idx.refs_present(cached);
+    let needs_whole = match &target.kind {
+        TargetKind::Handler { .. } => !view.provisional_dispatches.is_empty(),
+        TargetKind::Sub { .. } | TargetKind::Method { .. } => view.refs().iter().any(|r| {
+            matches!(r.kind, RefKind::MethodCall { .. })
+                && r.unqualified_target_name() == target.name
+                && !r.match_verdict_baked()
+        }),
+        TargetKind::HashKeyOfSub { .. }
+        | TargetKind::HashKeyOfBridged(_)
+        | TargetKind::InternalHashKey { .. } => view.refs().iter().any(|r| {
+            matches!(r.kind, RefKind::HashKeyAccess { .. })
+                && r.target_name == target.name
+                && !r.match_verdict_baked()
+        }),
+        _ => false,
+    };
+    if needs_whole {
+        crate::util::ghost_stats::count("refs.matcher_upgrade");
+        return idx.whole_present(cached);
+    }
+    crate::util::ghost_stats::count("refs.matcher_rows_view");
+    view
+}
+
 /// Collect every reference to `target` across the masked file set.
 ///
 /// - `files`   — open + workspace store
@@ -320,7 +364,9 @@ pub fn refs_to(
     // BACKWARD half of goto-def's see-through (`#define IncRef(sv)
     // Perl_Inc(sv)` means every `IncRef(...)` call site is a reference to
     // `Perl_Inc`). Computed once per query; empty for Perl.
-    let aliases = delegation_aliases(files, module_index, target, mask);
+    let aliases = crate::util::timings::phase("refs.aliases", || {
+        delegation_aliases(files, module_index, target, mask)
+    });
 
     // Textual-inclusion extension of the closure gate: a file whose own
     // closure reaches no def path still sees the target when a DIRECT seer
@@ -479,8 +525,9 @@ pub fn refs_to(
                     continue;
                 }
                 // The matcher reads refs (usage sites) AND symbols
-                // (declaration sites) — take the whole view.
-                let full = idx.whole_present(&cached);
+                // (declaration sites) — the rows-axes view, upgraded to
+                // whole only when a matching ref needs the bag.
+                let full = matcher_view(idx, &cached, target);
                 collect_from_analysis(
                     &key, &full, target, &aliases, module_index, &file_str, &mut out,
                 );
@@ -506,7 +553,7 @@ pub fn refs_to(
             if !gate(entry.value(), &file_str) {
                 continue;
             }
-            // Same whole-view routing as the sibling sweeps: a workspace
+            // Same rows-axes routing as the sibling sweeps: a workspace
             // copy with rows persisted is refs+symbols-STRIPPED, and the
             // matcher reading it raw silently drops the file's matches.
             let full = match module_index {
@@ -517,7 +564,7 @@ pub fn refs_to(
                             std::sync::Arc::clone(entry.value()),
                         ),
                     );
-                    idx.whole_present(&cached)
+                    matcher_view(idx, &cached, target)
                 }
                 None => std::sync::Arc::clone(entry.value()),
             };
@@ -547,9 +594,9 @@ pub fn refs_to(
                     return;
                 }
                 // Rows-off fallback sweep: copies here may still be
-                // symbol-evicted (rows exist, retrieval switched off) —
-                // the matcher needs symbols, so take the whole view.
-                let full = idx.whole_present(cached);
+                // row-axes-evicted (rows exist, retrieval switched off) —
+                // the matcher needs refs + symbols, so take the rows view.
+                let full = matcher_view(idx, cached, target);
                 collect_from_analysis(&key, &full, target, &aliases, module_index, &file_str, &mut out);
             });
         }
@@ -613,7 +660,8 @@ pub fn implementations_of(
             );
             for pkg in &descendants {
                 for cached in idx.def_candidates(pkg) {
-                    let whole = idx.whole_present(&cached);
+                    // Declaration-site scan reads symbols only.
+                    let whole = idx.symbols_present(&cached);
                     for s in whole.symbols() {
                         if &s.name == pkg && matches!(s.kind, SymKind::Class) {
                             out.push(RefLocation {
@@ -726,7 +774,7 @@ pub fn implementations_of(
         if homes.is_empty() {
             for m in idx.modules_with_symbol(pkg) {
                 for c in idx.visible_def_candidates(&m) {
-                    let declares = idx.whole_present(&c).symbols().iter().any(|s| {
+                    let declares = idx.symbols_present(&c).symbols().iter().any(|s| {
                         matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
                     });
                     if declares {
@@ -744,7 +792,9 @@ pub fn implementations_of(
             if is_marker {
                 continue;
             }
-            let whole = idx.whole_present(&cached);
+            // Override-def scan reads symbols only (role markers read the
+            // pinned `packages` lane on the resident copy above).
+            let whole = idx.symbols_present(&cached);
             for s in whole.symbols() {
                 if s.name == target.name
                     && matches!(s.kind, SymKind::Sub | SymKind::Method)
@@ -805,7 +855,8 @@ pub(super) fn specialization_family(
         // keys everything on — every file defining this spec spelling.
         let Some(idx) = module_index else { continue };
         for cached in idx.def_candidates(spec) {
-            let whole = idx.whole_present(&cached);
+            // Spec-class def-site scan reads symbols only.
+            let whole = idx.symbols_present(&cached);
             for s in whole.symbols() {
                 if &s.name == spec && matches!(s.kind, SymKind::Class) {
                     out.push(RefLocation {
