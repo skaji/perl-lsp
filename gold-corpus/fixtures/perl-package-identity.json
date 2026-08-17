@@ -11,8 +11,12 @@
       "line": 6,
       "col": 17,
       "expect": {
-        "all": ["Alpha.pm:3:1"],
-        "none": ["Beta.pm"]
+        "all": [
+          "Alpha.pm:3:1"
+        ],
+        "none": [
+          "Beta.pm"
+        ]
       },
       "status": "gold"
     },
@@ -26,7 +30,9 @@
       "line": 8,
       "col": 17,
       "expect": {
-        "all": ["Alpha.pm:7:1"],
+        "all": [
+          "Alpha.pm:7:1"
+        ],
         "none": []
       },
       "status": "gold"
@@ -41,8 +47,12 @@
       "line": 6,
       "col": 6,
       "expect": {
-        "all": ["WidgetExtra.pm:3:1"],
-        "none": ["Widget.pm"]
+        "all": [
+          "WidgetExtra.pm:3:1"
+        ],
+        "none": [
+          "Widget.pm"
+        ]
       },
       "status": "gold"
     },
@@ -56,8 +66,32 @@
       "line": 7,
       "col": 6,
       "expect": {
-        "all": ["Widget.pm:5:1"],
-        "none": ["WidgetExtra.pm"]
+        "all": [
+          "Widget.pm:5:1"
+        ],
+        "none": [
+          "WidgetExtra.pm"
+        ]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "pkgid-06-inherited-method-via-losing-file-parent",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "The `parents_cached` twin of pkgid-04: `Shared::Panel` is split across Panel.pm (winner by smallest-path) and PanelHooks.pm (loser), and ONLY the loser declares `use parent -norequire, 'Shared::PanelBase'`. Winner-keyed `parents_cached` never sees that edge, so goto-def on the inherited `panel_render` misses. The parent relation must be the union over every file declaring the package.",
+      "file": "lib/PanelUser.pm",
+      "line": 6,
+      "col": 6,
+      "expect": {
+        "all": [
+          "PanelBase.pm:3:1"
+        ],
+        "none": [
+          "Panel.pm",
+          "PanelHooks.pm"
+        ]
       },
       "status": "gold"
     },
@@ -71,7 +105,9 @@
       "line": 7,
       "col": 17,
       "expect": {
-        "all": ["Beta.pm:3:1"],
+        "all": [
+          "Beta.pm:3:1"
+        ],
         "none": []
       },
       "status": "gold"

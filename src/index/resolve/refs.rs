@@ -718,12 +718,14 @@ pub fn implementations_of(
         // class → home module(s): exact cache key for the common
         // single-package file; the names index covers cross-named and
         // multi-package homes.
-        let mut homes: Vec<std::sync::Arc<crate::model::file_analysis::CachedModule>> = Vec::new();
-        if let Some(c) = idx.get_cached(pkg) {
-            homes.push(c);
-        } else {
+        // EVERY file declaring `pkg` is a home (the package relation is
+        // name → set of files); the names index covers cross-named and
+        // multi-package homes when the direct registration is empty.
+        let mut homes: Vec<std::sync::Arc<crate::model::file_analysis::CachedModule>> =
+            idx.visible_def_candidates(pkg);
+        if homes.is_empty() {
             for m in idx.modules_with_symbol(pkg) {
-                if let Some(c) = idx.get_cached(&m) {
+                for c in idx.visible_def_candidates(&m) {
                     let declares = idx.whole_present(&c).symbols().iter().any(|s| {
                         matches!(s.kind, SymKind::Package | SymKind::Class) && &s.name == pkg
                     });

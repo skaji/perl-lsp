@@ -123,13 +123,19 @@ pub fn collect_diagnostics(
         .imports
         .iter()
         .map(|import| {
-            let cached = module_index.get_cached(&import.module_name);
-            let (bound, exported) = if let Some(c) = &cached {
-                let surface = c.analysis.export_surface_with_index(module_index);
-                let bound = crate::model::file_analysis::imported_names(import, &surface)
-                    .into_iter()
-                    .collect();
-                (bound, Some(surface.all_names()))
+            // Union the export surface across EVERY candidate file of the
+            // producer — a split exporter's surface (and thus a false
+            // "not exported" verdict) must not hinge on the name-slot winner.
+            let cands = module_index.visible_def_candidates(&import.module_name);
+            let (bound, exported) = if !cands.is_empty() {
+                let mut bound: HashMap<String, String> = HashMap::new();
+                let mut all: std::collections::HashSet<String> = Default::default();
+                for c in &cands {
+                    let surface = c.analysis.export_surface_with_index(module_index);
+                    bound.extend(crate::model::file_analysis::imported_names(import, &surface));
+                    all.extend(surface.all_names());
+                }
+                (bound, Some(all))
             } else {
                 // Producer not cached yet: only an explicitly-named import can be
                 // judged `Brought` (tags / bare-use defaults need the surface).

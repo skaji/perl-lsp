@@ -27,9 +27,12 @@ pub(super) fn attr_group_via_ancestors(
             .field_projections_named(bare, c)
             .filter(ok)
             .or_else(|| {
-                idx.get_cached(c)
-                    .and_then(|cc| idx.whole_present(&cc).field_projections_named(bare, c))
-                    .filter(ok)
+                // Whichever candidate file declaring `c` mints the group.
+                idx.visible_def_candidates(c)
+                    .iter()
+                    .find_map(|cc| {
+                        idx.whole_present(cc).field_projections_named(bare, c).filter(&ok)
+                    })
             })
     };
     // A `has`/column group is SHARED storage: under Hierarchy mint from the
@@ -63,13 +66,13 @@ pub(super) fn attr_group_via_ancestors(
             return Some(group_from_projections(p, origin, None, Some(idx)));
         }
     }
-    let cached = idx.get_cached(&defining)?;
-    let whole = idx.whole_present(&cached);
-    let p = whole.field_projections_named(bare, &defining)?;
-    if !ok(&p) {
-        return None;
-    }
-    Some(group_from_projections(p, &whole, Some(cached.path.clone()), Some(idx)))
+    // The defining class's declaring file is whichever candidate mints the
+    // projection group, not the name-slot winner.
+    idx.visible_def_candidates(&defining).iter().find_map(|cached| {
+        let whole = idx.whole_present(cached);
+        let p = whole.field_projections_named(bare, &defining).filter(&ok)?;
+        Some(group_from_projections(p, &whole, Some(cached.path.clone()), Some(idx)))
+    })
 }
 
 /// Cursor → cross-file target with the default override scope. Production
@@ -313,15 +316,17 @@ pub fn resolve_symbol_scoped(
                     Some(None)
                 }
                 None => module_index.and_then(|idx| {
-                    let cached = idx.get_cached(&r.target_name)?;
                     // Whole view: the class-content / file-scope shape tests
                     // walk symbols, which the resident copy may have evicted.
-                    let whole = idx.whole_present(&cached);
-                    whole
-                        .symbols()
-                        .iter()
-                        .filter(|s| s.name == r.target_name)
-                        .find_map(|s| class_or_value(&whole, s))
+                    // Any candidate file declaring the name may claim.
+                    idx.visible_def_candidates(&r.target_name).iter().find_map(|cached| {
+                        let whole = idx.whole_present(cached);
+                        whole
+                            .symbols()
+                            .iter()
+                            .filter(|s| s.name == r.target_name)
+                            .find_map(|s| class_or_value(&whole, s))
+                    })
                 }),
             };
             match resolved {
@@ -414,7 +419,11 @@ pub(super) fn pack_member_of_class(
             .map(|s| a.class_content_is_bare_constant(s))
     };
     check(origin).or_else(|| {
-        idx.and_then(|i| i.get_cached(class))
-            .and_then(|c| check(&c.analysis))
+        idx.and_then(|i| {
+            // Whichever candidate file declaring `class` holds the member.
+            i.visible_def_candidates(class)
+                .iter()
+                .find_map(|c| check(&i.whole_present(c)))
+        })
     })
 }

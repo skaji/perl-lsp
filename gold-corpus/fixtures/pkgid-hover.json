@@ -1,0 +1,58 @@
+{
+  "capability": "hover",
+  "rows": [
+    {
+      "id": "pkgid-hv-01-method-in-losing-file",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "Hover twin of pkgid-04: `extra_method` lives in WidgetExtra.pm, the losing file of the reopened `Shared::Widget` (Widget.pm wins by smallest-path). The hover cross-file arm reads the single `get_cached` winner, so hover answers nothing for a method the losing file defines.",
+      "file": "lib/WidgetUser.pm",
+      "line": 6,
+      "col": 6,
+      "expect": {
+        "all": [
+          "sub extra_method",
+          "Shared::Widget"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "pkgid-hv-02-winner-control",
+      "difficulty": "moderate",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "Control: hover on the winner file's own method must keep answering after the candidate-set conversion.",
+      "file": "lib/WidgetUser.pm",
+      "line": 7,
+      "col": 6,
+      "expect": {
+        "all": [
+          "sub base_method",
+          "Shared::Widget"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "pkgid-hv-03-inherited-via-losing-parent",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "`Shared::Panel` is split across Panel.pm (winner) and PanelHooks.pm (loser); ONLY the loser declares `use parent 'Shared::PanelBase'`. `parents_cached` is winner-keyed, so the inheritance edge is invisible and hover on the inherited `panel_render` answers nothing.",
+      "file": "lib/PanelUser.pm",
+      "line": 6,
+      "col": 6,
+      "expect": {
+        "all": [
+          "sub panel_render"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

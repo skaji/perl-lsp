@@ -254,9 +254,13 @@ impl FileAnalysis {
         }
         if let Some(idx) = module_index {
             for (spec, module) in idx.direct_specializations_of(base) {
-                if let Some(cached) = idx.get_cached(&module) {
-                    push_cand(&spec, cached.analysis.pack.template_params.get(&spec), &mut cands);
-                }
+                // The spec's params live in whichever candidate file
+                // declares it (pack lane — never evicted).
+                let params = idx
+                    .visible_def_candidates(&module)
+                    .iter()
+                    .find_map(|c| c.analysis.pack.template_params.get(&spec).cloned());
+                push_cand(&spec, params.as_ref(), &mut cands);
             }
         }
         let mut out: Vec<(String, Vec<InferredType>, u32)> = Vec::new();
@@ -281,9 +285,15 @@ impl FileAnalysis {
         if let Some(p) = self.pack.template_params.get(class) {
             return p.clone();
         }
-        if let Some(cached) = module_index.and_then(|idx| idx.get_cached(class)) {
-            if let Some(p) = cached.analysis.pack.template_params.get(class) {
-                return p.clone();
+        if let Some(idx) = module_index {
+            // Any candidate file declaring `class` may carry its template
+            // params (pack lane — never evicted).
+            if let Some(p) = idx
+                .visible_def_candidates(class)
+                .iter()
+                .find_map(|c| c.analysis.pack.template_params.get(class).cloned())
+            {
+                return p;
             }
         }
         Vec::new()
@@ -997,9 +1007,13 @@ impl FileAnalysis {
             return None;
         };
         // CrossFile{def_module: Some} covers typeglob installs too —
-        // bridge-classify by the providing module's own declaration.
+        // bridge-classify by the providing module's own declaration. The
+        // provider may be a losing candidate of its own name slot — pick
+        // the candidate that defines the sub.
         let idx = module_index?;
-        let cached = idx.get_cached(&module)?;
+        let cached = idx
+            .candidate_defining_sub_in_package(&module, &on_class, &name)
+            .or_else(|| idx.get_cached(&module))?;
         let whole = idx.whole_present(&cached);
         let is_bridge = whole.plugin.namespaces.iter().any(|ns| {
             ns.bridges
@@ -1061,11 +1075,13 @@ impl FileAnalysis {
                 }
                 return Some(self.role_requires(c).to_vec());
             }
-            let cached = module_index?.get_cached(c)?;
-            if !cached.analysis.is_role_package(c) {
-                return None;
-            }
-            Some(cached.analysis.role_requires(c).to_vec())
+            // Role-ness and requires live in the packages lane (never
+            // evicted) of whichever candidate file declares the role.
+            module_index?
+                .visible_def_candidates(c)
+                .iter()
+                .find(|cached| cached.analysis.is_role_package(c))
+                .map(|cached| cached.analysis.role_requires(c).to_vec())
         };
 
         let mut out: Vec<UnfulfilledRequire> = Vec::new();
@@ -1127,8 +1143,8 @@ impl FileAnalysis {
                 self.for_each_ancestor_class(pkg, module_index, |a| {
                     let here = self.class_provides_method(a, &name)
                         || module_index.is_some_and(|idx| {
-                            idx.get_cached(a).is_some_and(|c| {
-                                idx.whole_present(&c).provides_method_anywhere(&name)
+                            idx.visible_def_candidates(a).iter().any(|c| {
+                                idx.whole_present(c).provides_method_anywhere(&name)
                             })
                         })
                         || module_index.is_some_and(|idx| {
@@ -1140,9 +1156,12 @@ impl FileAnalysis {
                             // and contract-excluded, or every requires
                             // satisfies itself.
                             idx.module_declaring_method_in_package(&name, a)
-                                .and_then(|home| idx.get_cached(&home))
-                                .is_some_and(|c| {
-                                    idx.whole_present(&c).provides_method_in_package(&name, a)
+                                .is_some_and(|home| {
+                                    // The definer may be a losing candidate
+                                    // of its own name slot.
+                                    idx.visible_def_candidates(&home).iter().any(|c| {
+                                        idx.whole_present(c).provides_method_in_package(&name, a)
+                                    })
                                 }) || {
                                 let mut hit = false;
                                 idx.for_each_entity_bridged_to(a, &mut |_m, _c, sym| {

@@ -848,18 +848,20 @@ impl FileAnalysis {
                     .map(|t| t.invocant_class().to_string())
                     .or_else(|| self.method_call_invocant_class(enclosing, module_index))
                 {
-                    let is_column = idx.get_cached(&class).is_some_and(|c| {
-                        // A class defining its OWN `sub <verb>` overrode DBIC's
-                        // verb — the call isn't column-keyed (same gate as the
-                        // builder's `user_shadows_verb`).
-                        let whole = idx.whole_present(&c);
-                        let shadows = whole.symbols.iter().any(|s| {
+                    // The class's files as a SET: a shadow in ANY candidate
+                    // overrides DBIC's verb (same gate as the builder's
+                    // `user_shadows_verb`); the column may be minted by any.
+                    let cands = idx.visible_def_candidates(&class);
+                    let shadows = cands.iter().any(|c| {
+                        idx.whole_present(c).symbols.iter().any(|s| {
                             matches!(s.kind, SymKind::Sub | SymKind::Method)
                                 && s.name == verb
                                 && s.package.as_deref() == Some(class.as_str())
-                        });
-                        !shadows
-                            && whole
+                        })
+                    });
+                    let is_column = !shadows
+                        && cands.iter().any(|c| {
+                            idx.whole_present(c)
                                 .field_projections_named(&key_ref.target_name, &class)
                                 // ONLY a real `Class`-owned column (DBIC /
                                 // Class::Accessor). A Moo/Corinna attr is also a
@@ -867,7 +869,7 @@ impl FileAnalysis {
                                 // `Sub{class,new}`-owned — leave it to the
                                 // return-deref case below, which mints that.
                                 .is_some_and(|p| p.has_class_key)
-                    });
+                        });
                     if is_column {
                         return Some(HashKeyOwner::Bridged { class });
                     }
@@ -940,14 +942,16 @@ impl FileAnalysis {
         let idx = module_index?;
         let name = call_ref.unqualified_target_name();
         // Later `use` wins, mirroring `resolve_call_package`'s import scan.
+        // A split exporter's surface lives across its candidate files.
         for import in self.imports.iter().rev() {
-            let Some(cached) = idx.get_cached(&import.module_name) else { continue };
-            let surface = cached.analysis.export_surface_with_index(idx);
-            if imported_names(import, &surface)
-                .iter()
-                .any(|(local, _)| local.as_str() == name)
-            {
-                return Some(import.module_name.clone());
+            for cached in idx.visible_def_candidates(&import.module_name) {
+                let surface = cached.analysis.export_surface_with_index(idx);
+                if imported_names(import, &surface)
+                    .iter()
+                    .any(|(local, _)| local.as_str() == name)
+                {
+                    return Some(import.module_name.clone());
+                }
             }
         }
         None

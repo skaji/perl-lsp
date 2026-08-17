@@ -324,9 +324,11 @@ impl ReducerRegistry {
         // The shared visited set breaks local and cross-file cycles.
         if let WitnessAttachment::MethodOnClass { class, name } = q.attachment {
             if let Some(ctx) = q.context {
-                // (1) Cross-file primary lookup.
+                // (1) Cross-file primary lookup — every candidate file
+                // declaring `class` (a reopened package's method lives in
+                // whichever file defines it, not the name-slot winner).
                 if let Some(idx) = ctx.module_index {
-                    if let Some(cached) = idx.get_cached(class) {
+                    for cached in idx.visible_def_candidates(class) {
                         // Rehydrate the target file's bag if its resident copy
                         // was Slice-2-evicted; the cross-file chase reads its
                         // witnesses (`docs/adr/memory-slice-2-lru.md`).
@@ -467,7 +469,7 @@ impl ReducerRegistry {
         if let WitnessAttachment::SlotType { class, key } = q.attachment {
             if let Some(ctx) = q.context {
                 if let Some(idx) = ctx.module_index {
-                    if let Some(cached) = idx.get_cached(class) {
+                    for cached in idx.visible_def_candidates(class) {
                         let attempt =
                             |full: &std::sync::Arc<crate::model::file_analysis::FileAnalysis>,
                              state: &mut _| {
@@ -557,7 +559,7 @@ impl ReducerRegistry {
         if let WitnessAttachment::TypeName(name) = q.attachment {
             if let Some(ctx) = q.context {
                 if let Some(idx) = ctx.module_index {
-                    if let Some(cached) = idx.get_cached(name) {
+                    for cached in idx.visible_def_candidates(name) {
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {

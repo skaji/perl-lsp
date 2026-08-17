@@ -555,33 +555,36 @@ impl ModuleIndex {
                     continue;
                 }
                 dep.hash(&mut h);
-                match self.get_cached(&dep) {
-                    None => 0u8.hash(&mut h),
-                    Some(cm) => {
-                        // Generation ALWAYS on the key, fingerprint too when
-                        // recorded: enrichment's ctx-ful passes bake
-                        // BODY-dependent provider facts the span-free
-                        // fingerprint deliberately ignores, so a provider
-                        // re-registration must move every consumer's key
-                        // (over-invalidation, never staleness).
-                        self.registration_gen_of(&cm.path).hash(&mut h);
-                        match self.freshness.fingerprint_of(&cm.path) {
-                            Some(fp) => {
-                                1u8.hash(&mut h);
-                                fp.hash(&mut h);
-                                next.extend(self.freshness.deps_of_names(&cm.path));
-                            }
-                            None => {
-                                2u8.hash(&mut h);
-                                // @INC/recordless tier: its registration
-                                // generation (minted at insert/warm by the
-                                // resolver thread + `insert_cache`) already
-                                // rode the key above — a re-resolve bumps it.
-                                // No deps_of record; its parents ride the
-                                // analysis itself.
-                                for (_pkg, parents) in cm.analysis.package_parent_edges() {
-                                    next.extend(parents.iter().cloned());
-                                }
+                // EVERY candidate file of the dep rides the key — a losing
+                // file's re-registration must move consumers' keys too
+                // (over-invalidation, never staleness).
+                let cands = crate::model::file_analysis::CrossFileLookup::def_candidates(self, &dep);
+                if cands.is_empty() {
+                    0u8.hash(&mut h);
+                }
+                for cm in &cands {
+                    // Generation ALWAYS on the key, fingerprint too when
+                    // recorded: enrichment's ctx-ful passes bake
+                    // BODY-dependent provider facts the span-free
+                    // fingerprint deliberately ignores, so a provider
+                    // re-registration must move every consumer's key.
+                    self.registration_gen_of(&cm.path).hash(&mut h);
+                    match self.freshness.fingerprint_of(&cm.path) {
+                        Some(fp) => {
+                            1u8.hash(&mut h);
+                            fp.hash(&mut h);
+                            next.extend(self.freshness.deps_of_names(&cm.path));
+                        }
+                        None => {
+                            2u8.hash(&mut h);
+                            // @INC/recordless tier: its registration
+                            // generation (minted at insert/warm by the
+                            // resolver thread + `insert_cache`) already
+                            // rode the key above — a re-resolve bumps it.
+                            // No deps_of record; its parents ride the
+                            // analysis itself.
+                            for (_pkg, parents) in cm.analysis.package_parent_edges() {
+                                next.extend(parents.iter().cloned());
                             }
                         }
                     }

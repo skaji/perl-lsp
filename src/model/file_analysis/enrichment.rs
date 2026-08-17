@@ -285,7 +285,8 @@ impl FileAnalysis {
         // A file with no call bindings needs no provider walk at all.
         if let Some(idx) = module_index.filter(|_| !needed_names.is_empty()) {
             for import in &self.imports {
-                let Some(cached) = idx.get_cached(&import.module_name) else { continue };
+                // A split exporter's subs live across its candidate files.
+                for cached in idx.visible_def_candidates(&import.module_name) {
                 // Return-shape reads go through the bag — the resident index
                 // copy may be bag-evicted (workspace tier included), so take
                 // the bag-present view for the whole scan.
@@ -327,6 +328,7 @@ impl FileAnalysis {
                                 .insert(sym.name.clone(), (sym.package.clone(), hk.to_vec()));
                         }
                     }
+                }
                 }
             }
         }
@@ -446,7 +448,8 @@ impl FileAnalysis {
                     if parent == child {
                         continue;
                     }
-                    let Some(cached) = idx.get_cached(parent) else { continue };
+                    // The parent's methods may span its candidate files.
+                    for cached in idx.visible_def_candidates(parent) {
                     let whole = idx.whole_present(&cached);
                     for sym in &whole.symbols {
                         if sym.package.as_deref() != Some(parent.as_str()) {
@@ -470,6 +473,7 @@ impl FileAnalysis {
                             }),
                             span: zero,
                         });
+                    }
                     }
                 }
             }

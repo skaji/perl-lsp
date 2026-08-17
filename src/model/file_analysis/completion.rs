@@ -352,7 +352,10 @@ impl FileAnalysis {
         module_index: &dyn CrossFileLookup,
     ) -> Option<(Option<String>, Vec<String>)> {
         for import in &self.imports {
-            let Some(cached) = module_index.get_cached(&import.module_name) else { continue };
+            // The exporting package may be split — the sub (and its keys)
+            // live in whichever candidate defines it.
+            let Some(cached) = module_index.candidate_defining_sub(&import.module_name, sub_name)
+            else { continue };
             let whole = module_index.whole_present(&cached);
             for sym in &whole.symbols {
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }
@@ -793,7 +796,8 @@ impl FileAnalysis {
                 }
                 Some(MethodResolution::CrossFile { ref class, .. }) => {
                     if let Some(idx) = module_index {
-                        if let Some(cached) = idx.get_cached(class) {
+                        // Symbol-disambiguated: the candidate defining `name`.
+                        if let Some(cached) = idx.candidate_defining_sub(class, name) {
                             let whole = idx.bag_present(&cached);
                             if let Some(sub_info) = whole.sub_info_view(name) {
                                 return Some(cross_file_resolved(&sub_info));
@@ -822,18 +826,29 @@ impl FileAnalysis {
         if !is_method {
             if let Some(idx) = module_index {
                 for import in &self.imports {
-                    let Some(cached) = idx.get_cached(&import.module_name) else { continue };
-                    let surface = cached.analysis.export_surface_with_index(idx);
-                    let bound = imported_names(import, &surface);
-                    if let Some((_local, remote)) = bound.iter().find(|(local, _)| local == name) {
-                        // The name may be defined in the directly-`use`d module
-                        // or in a module it re-exports. `defining_module_cached`
-                        // chases the same re-export edges (seen-set bounded).
-                        if let Some(cached) = idx.defining_module_cached(&import.module_name, remote) {
-                            let whole = idx.bag_present(&cached);
-                            if let Some(sub_info) = whole.sub_info_view(remote) {
-                                return Some(cross_file_resolved(&sub_info));
-                            }
+                    // A split exporter's surface lives across its candidates.
+                    let bound_remote = idx
+                        .visible_def_candidates(&import.module_name)
+                        .iter()
+                        .find_map(|cached| {
+                            let surface = cached.analysis.export_surface_with_index(idx);
+                            imported_names(import, &surface)
+                                .iter()
+                                .find(|(local, _)| local == name)
+                                .map(|(_local, remote)| remote.clone())
+                        });
+                    let Some(remote) = bound_remote else { continue };
+                    // The name may be defined in the directly-`use`d module
+                    // or in a module it re-exports. `defining_module_cached`
+                    // chases the same re-export edges (seen-set bounded);
+                    // the candidate pick covers a split module's own subs.
+                    if let Some(cached) = idx
+                        .defining_module_cached(&import.module_name, &remote)
+                        .or_else(|| idx.candidate_defining_sub(&import.module_name, &remote))
+                    {
+                        let whole = idx.bag_present(&cached);
+                        if let Some(sub_info) = whole.sub_info_view(&remote) {
+                            return Some(cross_file_resolved(&sub_info));
                         }
                     }
                 }

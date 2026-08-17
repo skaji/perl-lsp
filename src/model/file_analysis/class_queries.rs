@@ -379,7 +379,9 @@ impl FileAnalysis {
             // cached module so cross-file member completion is complete
             // (methods already cross via collect_ancestor_methods).
             if let Some(mi) = module_index {
-                if let Some(cached) = mi.get_cached(cls) {
+                // Every file declaring `cls` — fields of a reopened class
+                // live across the set (`seen` dedups).
+                for cached in mi.visible_def_candidates(cls) {
                     mi.whole_present(&cached).collect_class_fields(
                         cls, &mut candidates, &mut seen, requesting_class,
                     );
@@ -450,17 +452,19 @@ impl FileAnalysis {
             }
             MethodResolution::CrossFile { class, .. } => {
                 let idx = module_index?;
-                let cached = idx.get_cached(&class)?;
+                // Whichever of `class`'s candidate files holds the field.
                 // The field's type lives in the OWNING file's bag; the symbol
                 // scan needs symbols too; take the whole view.
-                let full = idx.whole_present(&cached);
-                let sym = full.symbols.iter().find(|s| {
-                    matches!(s.kind, SymKind::Variable | SymKind::Field)
-                        && s.name == field
-                        && s.package.as_deref() == Some(class.as_str())
-                        && full.symbol_is_class_content(s)
-                })?;
-                full.inferred_type_via_bag(field, sym.span.end)
+                idx.visible_def_candidates(&class).iter().find_map(|cached| {
+                    let full = idx.whole_present(cached);
+                    let sym = full.symbols.iter().find(|s| {
+                        matches!(s.kind, SymKind::Variable | SymKind::Field)
+                            && s.name == field
+                            && s.package.as_deref() == Some(class.as_str())
+                            && full.symbol_is_class_content(s)
+                    })?;
+                    full.inferred_type_via_bag(field, sym.span.end)
+                })
             }
         }
     }
@@ -485,16 +489,18 @@ impl FileAnalysis {
             }
             MethodResolution::CrossFile { class, .. } => {
                 let idx = module_index?;
-                let cached = idx.get_cached(&class)?;
                 // `type_name_edge_of` reads the field's `Edge(TypeName(_))`
-                // witness — plus the symbol scan; take the whole view.
-                let full = idx.whole_present(&cached);
-                let sym = full.symbols.iter().find(|s| {
-                    matches!(s.kind, SymKind::Variable | SymKind::Field)
-                        && s.name == field
-                        && s.package.as_deref() == Some(class.as_str())
-                })?;
-                full.type_name_edge_of(&sym.name, sym.scope)
+                // witness — plus the symbol scan; take the whole view of
+                // whichever candidate file holds the field.
+                idx.visible_def_candidates(&class).iter().find_map(|cached| {
+                    let full = idx.whole_present(cached);
+                    let sym = full.symbols.iter().find(|s| {
+                        matches!(s.kind, SymKind::Variable | SymKind::Field)
+                            && s.name == field
+                            && s.package.as_deref() == Some(class.as_str())
+                    })?;
+                    full.type_name_edge_of(&sym.name, sym.scope)
+                })
             }
         }
     }
@@ -530,9 +536,11 @@ impl FileAnalysis {
             return Some(p);
         }
         let idx = module_index?;
-        let cached = idx.get_cached(value)?;
-        // Symbols-axis read only (name/kind/package scan).
-        packaged(&idx.symbols_present(&cached))
+        // Symbols-axis read only (name/kind/package scan) — first candidate
+        // file that attributes the value to a package.
+        idx.visible_def_candidates(value)
+            .iter()
+            .find_map(|cached| packaged(&idx.symbols_present(cached)))
     }
 
     /// The canonical, language-generic `Field{owner, name}` subject for a
@@ -771,8 +779,11 @@ impl FileAnalysis {
         }
         module_index
             .and_then(|idx| {
-                idx.get_cached(enum_name)
-                    .map(|cached| collect(&idx.whole_present(&cached)))
+                // First candidate file whose analysis yields members.
+                idx.visible_def_candidates(enum_name)
+                    .iter()
+                    .map(|cached| collect(&idx.whole_present(cached)))
+                    .find(|v| !v.is_empty())
             })
             .unwrap_or_default()
     }

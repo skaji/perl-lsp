@@ -18,18 +18,21 @@ impl<'a> CandidateSet<'a> {
         {
             return Some(self.origin_decl(sym.selection_span));
         }
-        let cached = idx.get_cached(type_name)?;
-        let whole = idx.whole_present(&cached);
-        let sym = whole
-            .symbols()
-            .iter()
-            .find(|s| s.name == type_name && wanted(&s.kind))?;
-        Some(RefLocation {
-            key: FileKey::Path(cached.path.clone()),
-            span: sym.selection_span,
-            access: AccessKind::Declaration,
-            rewritable: true,
-            label: None
+        // Whichever candidate file declares the type symbol — not the
+        // name-slot winner.
+        idx.visible_def_candidates(type_name).iter().find_map(|cached| {
+            let whole = idx.whole_present(cached);
+            let sym = whole
+                .symbols()
+                .iter()
+                .find(|s| s.name == type_name && wanted(&s.kind))?;
+            Some(RefLocation {
+                key: FileKey::Path(cached.path.clone()),
+                span: sym.selection_span,
+                access: AccessKind::Declaration,
+                rewritable: true,
+                label: None
+            })
         })
     }
 

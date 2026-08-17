@@ -1,0 +1,42 @@
+{
+  "capability": "completion",
+  "rows": [
+    {
+      "id": "pkgid-cp-01-losing-file-method-offered",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "Method completion on `$w->` where `Shared::Widget` is reopened: the winner file's methods (new/base_method) appear, but `extra_method` from the losing file (WidgetExtra.pm) is dropped by the winner-keyed ancestor-method gather. Both must be offered.",
+      "file": "lib/WidgetUser.pm",
+      "line": 6,
+      "col": 6,
+      "expect": {
+        "all": [
+          "extra_method\tShared::Widget",
+          "base_method\tShared::Widget"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "pkgid-cp-02-inherited-and-sibling",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "comment": "Completion on `$p->` for the split `Shared::Panel`: `hook` lives in the losing file, and `panel_render` is inherited through the losing file's `use parent` edge (winner-keyed `parents_cached` hides it). Both must be offered alongside the winner's `new`.",
+      "file": "lib/PanelUser.pm",
+      "line": 6,
+      "col": 6,
+      "expect": {
+        "all": [
+          "panel_render",
+          "hook\tShared::Panel",
+          "new\tShared::Panel"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}

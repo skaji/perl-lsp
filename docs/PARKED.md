@@ -34,7 +34,7 @@ marked otherwise; the drain re-derived each rationale against current code.
   vs. type-matching locals kept at `PRIORITY_LOCAL`). No shared gatherer to
   factor. [re-ratified 2026-07-17]
 - **`class_isa_prefix` walks `parents_cached`, not `parents_of`**
-  (`file_analysis.rs`): deliberate, verdict recorded. The synthetic
+  (`model/file_analysis/ancestry.rs`): deliberate, verdict recorded. The synthetic
   `APP_SURFACE_CLASS` edge that `parents_of` injects is a method-dispatch
   bridge (Mojo helpers), not an `isa` relation — a plugin `ClassIsa` gate
   must not treat an app-surface consumer as a descendant of the surface.
@@ -44,7 +44,8 @@ marked otherwise; the drain re-derived each rationale against current code.
   T2-A consolidated all three isa walks onto one `walk_ancestry` — the
   seam distinction is now a parameter, not a copy]
 - **CLI workspace-symbol dedup inlines the identity tuple**
-  (`main.rs` `workspace-symbol` vs `symbols::dedup_workspace_symbols`):
+  (`lsp/cli/query.rs` `workspace-symbol` vs
+  `symbols::dedup_workspace_symbols`):
   type-forced duplicate, leave-alone (mirrors the two-rankers precedent).
   The LSP handler dedups a `Vec<SymbolInformation>` as a post-pass
   (`retain`); the CLI gates inline while building `serde_json` rows from
@@ -52,12 +53,14 @@ marked otherwise; the drain re-derived each rationale against current code.
   identity, different pipeline stage and value shape (u32 uri/line vs
   usize path/row). A shared key helper would be a bare tuple literal each
   caller still populates from different fields — no gatherer to factor.
-  [re-ratified 2026-07-17; note the CLI has THREE inline `seen.insert`
-  dedups with three deliberately different keys — the third at the
-  single-file outline gates framework twin accessors on
-  `(kind,name,row,col)` — none a shared-helper candidate]
+  [re-ratified 2026-07-17; re-checked 2026-08-17: TWO inline
+  `seen.insert` dedups remain in `lsp/cli/query.rs`, deliberately
+  different keys — the second at the single-file outline gates framework
+  twin accessors on `(kind,name,row,col)` — neither a shared-helper
+  candidate]
 - **`load_components` DBIC-namespace default lives in core**
-  (`builder.rs::visit_load_components`, bare names default to `DBIx::Class`):
+  (`build/builder/frameworks.rs::visit_load_components`, bare names default
+  to `DBIx::Class`):
   KEEP IN CORE, rationale rewritten 2026-07-17 (the old blocker — no
   parent-edge EmitAction — is obsolete: `EmitAction::PackageParent` exists
   and is wired). The standing reason: `load_components` is generic mixin
@@ -69,7 +72,7 @@ marked otherwise; the drain re-derived each rationale against current code.
   prefix policy must reproduce core's exact strings or inherited-component
   goto-def/rename silently breaks.
 - **Four→one ancestry walkers, GraphView as the end state**
-  (`file_analysis.rs::walk_ancestry`, T2-A 2026-07-17): the three isa DFSes
+  (`model/file_analysis/ancestry.rs::walk_ancestry`, T2-A 2026-07-17): the three isa DFSes
   now share one predicate-parameterized walker (per-call-site budgets 200/
   200/40 and seam scopes preserved). The recorded end state is collapsing
   `walk_ancestry` onto `GraphView`'s lazy walk (docs/adr/graph-walking.md) —
@@ -85,13 +88,6 @@ marked otherwise; the drain re-derived each rationale against current code.
   roots, rejects `::Schema`/`::ResultSet`) that a prefix test cannot; a
   schema class is a DBIx::Class descendant but not a result class.
   [recorded 2026-07-17]
-- **Boolean pack-capability askers** — RESOLVED: the third asker arrived
-  (the language-predicate cleanup) and the family collapsed into the
-  generic `DriverCaps` / `LanguageRegistry::caps(id)` home;
-  `has_include_tokens` / `has_preprocessor_macros` remain as thin
-  wrappers over it. New per-language behavior differences go in
-  `DriverCaps` (exhaustiveness-witnessed in language_driver_tests.rs),
-  never as a fresh one-off asker. [recorded 2026-07-19; resolved 2026-08-16]
 - **Three byte-capped LRU eviction cores** (PackBagCache plain; enrichment
   overlay adds entry-count cap; GatherCache adds single-flight condvar):
   shared discipline (`evict_to_cap`, never-evict-just-inserted), genuinely

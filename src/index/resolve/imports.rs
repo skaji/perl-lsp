@@ -21,7 +21,9 @@ pub(super) fn import_candidates(
     let mut seen = std::collections::HashSet::new();
 
     for import in &origin.imports {
-        let cached = idx.get_cached(&import.module_name);
+        // Every candidate file of the producer — a split exporter's surface
+        // and subs span the set.
+        let cands = idx.visible_def_candidates(&import.module_name);
 
         // Explicitly imported symbols (from the qw list): origin-file names.
         // Dedup/dispatch by LOCAL name (what the user types); resolve detail
@@ -38,7 +40,9 @@ pub(super) fn import_candidates(
             if !mask.contains(RoleMask::OPEN) {
                 continue;
             }
-            let whole = cached.as_ref().map(|c| idx.bag_present(c));
+            // Detail from whichever candidate defines the remote sub.
+            let def = idx.candidate_defining_sub(&import.module_name, is.remote());
+            let whole = def.as_ref().map(|c| idx.bag_present(c));
             let detail =
                 completion_detail_for_import(is.remote(), whole.as_deref(), &import.module_name);
             out.push(CompletionCandidate {
@@ -57,7 +61,7 @@ pub(super) fn import_candidates(
         if !mask.contains(RoleMask::DEPENDENCY) {
             continue;
         }
-        if let Some(ref cached) = cached {
+        for cached in &cands {
             let fa = &cached.analysis;
             let all_exported: Vec<&String> = if import.imported_symbols.is_empty() {
                 // Bare `use Foo;` — offer @EXPORT
@@ -205,21 +209,24 @@ pub(super) fn dispatch_handler_locations(
     use crate::model::file_analysis::SymbolDetail;
     let mut locs: Vec<RefLocation> = Vec::new();
     for module_name in module_index.modules_with_symbol(name) {
-        let Some(cached) = module_index.get_cached(&module_name) else { continue };
-        let whole = module_index.whole_present(&cached);
-        for sym in whole.symbols() {
-            if sym.name != name {
-                continue;
-            }
-            if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
-                if o == owner {
-                    locs.push(RefLocation {
-                        key: FileKey::Path(cached.path.clone()),
-                        span: sym.selection_span,
-                        access: AccessKind::Declaration,
-                        rewritable: true,
-                        label: None
-                    });
+        // Every file registered under the name — stacked registrations
+        // may live in a losing candidate.
+        for cached in module_index.visible_def_candidates(&module_name) {
+            let whole = module_index.whole_present(&cached);
+            for sym in whole.symbols() {
+                if sym.name != name {
+                    continue;
+                }
+                if let SymbolDetail::Handler { owner: o, .. } = &sym.detail {
+                    if o == owner {
+                        locs.push(RefLocation {
+                            key: FileKey::Path(cached.path.clone()),
+                            span: sym.selection_span,
+                            access: AccessKind::Declaration,
+                            rewritable: true,
+                            label: None
+                        });
+                    }
                 }
             }
         }
@@ -303,9 +310,31 @@ pub(crate) fn resolve_imported_function_classified<'b>(
         ImportResolution,
     )> = None;
     for import in &analysis.imports {
-        let cached = module_index.get_cached(&import.module_name);
-        let Some((res, remote)) = classify_import(import, func_name, cached.as_deref(), module_index) else { continue };
-        let path = cached.as_ref().map(|c| c.path.clone());
+        // Classify against EVERY candidate file of the imported module —
+        // a split exporter's surface (and the sub itself) may live in a
+        // losing candidate. `Brought` is the strongest verdict per import.
+        let cands = module_index.visible_def_candidates(&import.module_name);
+        let mut hit: Option<(Option<PathBuf>, String, ImportResolution)> = None;
+        if cands.is_empty() {
+            if let Some((res, remote)) = classify_import(import, func_name, None, module_index) {
+                hit = Some((None, remote, res));
+            }
+        } else {
+            for c in &cands {
+                if let Some((res, remote)) =
+                    classify_import(import, func_name, Some(c.as_ref()), module_index)
+                {
+                    let brought = matches!(res, ImportResolution::Brought);
+                    if hit.is_none() || brought {
+                        hit = Some((Some(c.path.clone()), remote, res));
+                    }
+                    if brought {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((path, remote, res)) = hit else { continue };
         // `Brought` is the strongest verdict; once found, keep it.
         if matches!(best, Some((_, _, _, ImportResolution::Brought))) {
             continue;

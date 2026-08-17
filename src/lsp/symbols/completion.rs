@@ -417,15 +417,22 @@ fn completion_items_native(
                 // The export surface is entity content on `CachedModule`;
                 // the "still indexing" placeholder is a slot affordance
                 // (no entity to gather yet), so it stays adapter-side.
-                return match module_index.get_cached(name) {
-                    Some(cached) => module_index
-                        .whole_present(&cached)
-                        .import_list_candidates()
-                        .into_iter()
-                        .map(candidate_to_completion_item)
-                        .collect(),
-                    None => vec![import_list_loading_placeholder(name)],
-                };
+                // Union across every candidate file of the module — a split
+                // exporter's surface spans the set (dedup by label, first
+                // candidate's detail wins).
+                let cands = module_index.visible_def_candidates(name);
+                if cands.is_empty() {
+                    return vec![import_list_loading_placeholder(name)];
+                }
+                let mut seen = std::collections::HashSet::new();
+                return cands
+                    .iter()
+                    .flat_map(|cached| {
+                        module_index.whole_present(cached).import_list_candidates()
+                    })
+                    .filter(|c| seen.insert(c.label.clone()))
+                    .map(candidate_to_completion_item)
+                    .collect();
             }
             Vec::new()
         }

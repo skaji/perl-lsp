@@ -331,6 +331,10 @@ fn perl_hover_markdown(
             // under `delete` in the cached module.
             if let Some(cached) = module_index
                 .defining_module_cached(&import.module_name, &remote_name)
+                // A split exporter's sub may live in a losing candidate —
+                // pick by the queried symbol, keeping the plain winner as
+                // the last resort (hover still names the module's file).
+                .or_else(|| module_index.candidate_defining_sub(&import.module_name, &remote_name))
                 .or_else(|| module_index.get_cached(&import.module_name))
             {
                 let whole = module_index.bag_present(&cached);
@@ -358,7 +362,9 @@ fn perl_hover_markdown(
         }
         crate::index::resolve::FunctionBinding::Qualified { package: pkg } => {
             let bare = r.unqualified_target_name();
-            let cached = module_index.get_cached(pkg)?;
+            // Symbol-disambiguated: the file defining `bare`, not the
+            // name-slot winner (same rule as the FQ goto-def lane).
+            let cached = module_index.candidate_defining_sub(pkg, bare)?;
             let whole = module_index.bag_present(&cached);
             let sub_info = whole.sub_info_view(bare)?;
             let sig = format_imported_signature(bare, &sub_info);

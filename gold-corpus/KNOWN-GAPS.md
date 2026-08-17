@@ -313,17 +313,14 @@ repros; recorded here so a fix flips a real observation, not just narrative.
   Refs, and outline-skip so they don't flood `--outline`.
 - **C `goto` labels.** `label:` / `goto label;` are real navigation targets;
   not yet handled.
-- **Perl package identity is name-keyed and lossy** (`pkgid-01`, `pkgid-02`).
-  Registration keys the module cache on `first_package_name`, and
-  `cache.insert` is last-write-wins with `purge_module` dropping the loser's
-  edges. Two consequences, both in ordinary Perl: when two files declare the
-  same package, goto-def on a sub from the losing file lands in the WINNING
-  file — a confidently wrong answer, not a miss; and every package after the
-  first in a multi-package `.pm` gets no name entry at all, so it is
-  unreachable by name. Perl's `package` may live in any file and be reopened
-  anywhere, so `name -> one provider` is a model of well-behaved Perl rather
-  than of Perl. The pack tier already carries the honest shape for the same
-  problem (`all_defs`: `name -> Vec<candidate>`, ranked by what the asker can
-  see, because C linkage is globally flat); Perl needs the same relation,
-  scoped by the transitive `use` closure from the entry point. Fixture:
-  `gold-corpus/pkgsplit-fixture`.
+- **Perl package identity: the @INC tier is still single-provider.** The
+  workspace tier carries the honest relation (`all_defs`: `name ->
+  Vec<candidate>`, the derived name-slot winner, symbol-disambiguated
+  consumers — pinned by the `pkgid-*` rows over
+  `gold-corpus/pkgsplit-fixture`), but the @INC resolver caches one file per
+  module name by construction (one resolve per name), not by Perl semantics:
+  a dependency package split across two @INC files (an XS/PP twin reopening
+  the same package) still answers from whichever file the resolver parsed.
+  The honest shape is the same candidate relation keyed by inc-root, scoped
+  per entrypoint's @INC. Needs a substrate-tier fixture (the split must live
+  OUTSIDE the workspace so the workspace relation can't compensate).

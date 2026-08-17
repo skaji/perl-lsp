@@ -602,9 +602,13 @@ impl FileAnalysis {
             // unresolved as a named parent we can't find — the
             // recorded list isn't the whole ancestry.
             let dynamic_here = self.has_dynamic_parents(cls)
-                || module_index
-                    .and_then(|idx| idx.get_cached(cls))
-                    .is_some_and(|c| c.analysis.has_dynamic_parents(cls));
+                || module_index.is_some_and(|idx| {
+                    // ANY file declaring `cls` may hold the runtime-generated
+                    // parent edge (packages lane — never evicted).
+                    idx.visible_def_candidates(cls)
+                        .iter()
+                        .any(|c| c.analysis.has_dynamic_parents(cls))
+                });
             if dynamic_here {
                 incomplete = true;
                 return std::ops::ControlFlow::Break(());
@@ -753,8 +757,10 @@ impl FileAnalysis {
                     display_override,
                 });
             }
-            // (2) Real methods on class_name's own cached module.
-            if let Some(cached) = idx.get_cached(class_name) {
+            // (2) Real methods on class_name's own cached module — EVERY
+            // file declaring the class (a reopened package's methods live
+            // across the set; `seen_names` keeps child-shadows-parent).
+            for cached in idx.visible_def_candidates(class_name) {
                 let whole = idx.whole_present(&cached);
                 for sym in &whole.symbols {
                     if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { continue; }

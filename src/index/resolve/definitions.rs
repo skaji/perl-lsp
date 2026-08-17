@@ -35,8 +35,9 @@ impl<'a> CandidateSet<'a> {
             })
         };
         // Class-keyed cached module — the fast path when `class` names a
-        // struct/class/enum that is itself a cache key.
-        if let Some(cached) = idx.get_cached(class) {
+        // struct/class/enum that is itself a cache key. Every candidate
+        // file declaring the class may hold the member.
+        for cached in idx.visible_def_candidates(class) {
             if let Some(span) = member_span_in(&idx.whole_present(&cached)) {
                 return loc_of(&cached, span);
             }
@@ -397,7 +398,7 @@ impl<'a> CandidateSet<'a> {
         // owner-matched member directly from `get_cached(class)` so the
         // ranking can float it above the frees.
         if let Some(p) = &pkg {
-            if let Some(cached) = idx.get_cached(p) {
+            for cached in idx.visible_def_candidates(p) {
                 let key = FileKey::Path(cached.path.clone());
                 let whole = idx.whole_present(&cached);
                 for s in whole.symbols().iter().filter(|s| {
@@ -697,9 +698,11 @@ impl<'a> CandidateSet<'a> {
                     _ => None,
                 };
                 if let (Some(owner), Some(class)) = (owner, class) {
-                    if let Some(cached) = idx.get_cached(&class) {
-                        if let Some(def) = cached
-                            .analysis
+                    // Whichever candidate file of the class holds the key
+                    // def (whole view — HashKeyDefs ride the symbols axis).
+                    for cached in idx.visible_def_candidates(&class) {
+                        if let Some(def) = idx
+                            .whole_present(&cached)
                             .hash_key_defs_for_owner(&owner)
                             .into_iter()
                             .find(|d| d.name == r.target_name)
@@ -777,20 +780,10 @@ impl<'a> CandidateSet<'a> {
                     // `ScopedLookup` — the ONE visibility seam; Perl's own
                     // ranking tier plugs in there, never in a second filter
                     // here).
-                    let mut cands = idx.visible_def_candidates(pkg);
-                    cands.sort_by(|a, b| a.path.cmp(&b.path));
-                    let chosen = cands
-                        .iter()
-                        .find(|c| idx.symbols_present(c).has_sub_in_package(bare, pkg))
-                        .or_else(|| {
-                            cands
-                                .iter()
-                                .find(|c| idx.symbols_present(c).sub_info_view(bare).is_some())
-                        });
-                    if let Some(cached) = chosen {
+                    if let Some(cached) = idx.candidate_defining_sub(pkg, bare) {
                         if Url::from_file_path(&cached.path).is_ok() {
                             if let Some(line) = idx
-                                .symbols_present(cached)
+                                .symbols_present(&cached)
                                 .sub_info_view(bare)
                                 .map(|s| s.def_line())
                             {
@@ -847,45 +840,55 @@ impl<'a> CandidateSet<'a> {
             // `get_cached`'s range splices two candidates when the name is
             // defined in more than one file.
             if matches!(r.kind, RefKind::PackageRef) {
-                if let Some(cached) = idx.get_cached(&r.target_name) {
+                // EVERY file declaring the package is a legitimate landing —
+                // a reopened package surfaces as a multi-location picker.
+                // Two tiers: files whose symbol lives in TYPE space
+                // (Package/Class/Module) arbitrate over value-shape
+                // fallbacks — a same-named macro/value file must not join
+                // the picker when a real type declaration exists.
+                let mut type_hits: Vec<RefLocation> = Vec::new();
+                let mut value_hits: Vec<RefLocation> = Vec::new();
+                for cached in idx.visible_def_candidates(&r.target_name) {
                     if Url::from_file_path(&cached.path).is_ok() {
                         let whole = idx.whole_present(&cached);
-                        let span = whole
-                            .symbols()
-                            .iter()
-                            .find(|s| {
-                                s.name == r.target_name
-                                    && matches!(
-                                        s.kind,
-                                        SymKind::Package | SymKind::Class | SymKind::Module
-                                    )
-                            })
-                            // Type space missed: a pack grammar's TYPE guess in
-                            // a type/value-ambiguous slot (template argument)
-                            // can name a VALUE the pack index registered under
-                            // this same bare name — land on ITS decl, not the
-                            // file top. Pack-only structural gates; Perl module
-                            // lookups keep the file-top fallback.
-                            .or_else(|| {
-                                whole.symbols().iter().find(|s| {
-                                    s.name == r.target_name
-                                        && (whole.symbol_is_class_content(s)
-                                            || whole.symbol_is_file_scope_value(s))
-                                })
-                            })
-                            .map(|s| s.selection_span)
-                            .unwrap_or(Span {
-                                start: tree_sitter::Point::new(0, 0),
-                                end: tree_sitter::Point::new(0, 0),
-                            });
-                        return vec![RefLocation {
+                        let loc = |span| RefLocation {
                             key: FileKey::Path(cached.path.clone()),
                             span,
                             access: AccessKind::Declaration,
                             rewritable: true,
-                            label: None
-                        }];
+                            label: None,
+                        };
+                        if let Some(s) = whole.symbols().iter().find(|s| {
+                            s.name == r.target_name
+                                && matches!(
+                                    s.kind,
+                                    SymKind::Package | SymKind::Class | SymKind::Module
+                                )
+                        }) {
+                            type_hits.push(loc(s.selection_span));
+                        // Type space missed: a pack grammar's TYPE guess in
+                        // a type/value-ambiguous slot (template argument)
+                        // can name a VALUE the pack index registered under
+                        // this same bare name — land on ITS decl, not the
+                        // file top. Pack-only structural gates; Perl module
+                        // lookups keep the file-top fallback.
+                        } else if let Some(s) = whole.symbols().iter().find(|s| {
+                            s.name == r.target_name
+                                && (whole.symbol_is_class_content(s)
+                                    || whole.symbol_is_file_scope_value(s))
+                        }) {
+                            value_hits.push(loc(s.selection_span));
+                        } else {
+                            value_hits.push(loc(Span {
+                                start: tree_sitter::Point::new(0, 0),
+                                end: tree_sitter::Point::new(0, 0),
+                            }));
+                        }
                     }
+                }
+                let out = if !type_hits.is_empty() { type_hits } else { value_hits };
+                if !out.is_empty() {
+                    return out;
                 }
                 // No analysis cached: the path map alone still beats no
                 // answer — land at the top of the file.
@@ -940,22 +943,9 @@ impl<'a> CandidateSet<'a> {
                         // synthesized methods loosely), smallest path among
                         // several definers; the name-slot winner only as the
                         // last resort (data-member reads below).
-                        let chosen = {
-                            let mut cands = idx.visible_def_candidates(module);
-                            cands.sort_by(|a, b| a.path.cmp(&b.path));
-                            cands
-                                .iter()
-                                .find(|c| {
-                                    idx.symbols_present(c).has_sub_in_package(method, class)
-                                })
-                                .or_else(|| {
-                                    cands.iter().find(|c| {
-                                        idx.symbols_present(c).sub_info_view(method).is_some()
-                                    })
-                                })
-                                .cloned()
-                                .or_else(|| idx.get_cached(module))
-                        };
+                        let chosen = idx
+                            .candidate_defining_sub_in_package(module, class, method)
+                            .or_else(|| idx.get_cached(module));
                         if let Some(cached) = chosen {
                             // A cross-file DBIC accessor is a deferred emission
                             // MATERIALIZED into the whole cached copy at index
@@ -1035,7 +1025,7 @@ impl<'a> CandidateSet<'a> {
         if let Some(r) = analysis.ref_at(point) {
             if matches!(r.kind, RefKind::FunctionCall { .. } | RefKind::Variable) {
                 let name = r.unqualified_target_name();
-                if let Some(cached) = idx.get_cached(name) {
+                for cached in idx.visible_def_candidates(name) {
                     let whole = idx.whole_present(&cached);
                     if let Some(sym) = whole.symbols().iter().find(|s| {
                         s.name == name

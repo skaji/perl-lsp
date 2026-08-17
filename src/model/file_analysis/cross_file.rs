@@ -426,6 +426,45 @@ pub trait CrossFileLookup {
     fn visible_def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
         self.def_candidates(name)
     }
+    /// Among the files declaring `pkg`, the one that DEFINES sub/method
+    /// `member` — package-attributed first (a reopened package's sub lives
+    /// under `pkg`), then any-package (cross-package typeglob installs,
+    /// bridged-helper modules). Candidates arrive path-ordered, so ties
+    /// break to the smallest path and repeat runs are byte-identical.
+    /// `None` when no candidate defines it — callers keep their own
+    /// fallbacks. This is THE symbol-disambiguation rule for a name that
+    /// maps to a SET of files; consumers resolving "where does `pkg`'s
+    /// `member` live" route here, never through the one-winner
+    /// `get_cached`.
+    fn candidate_defining_sub(
+        &self,
+        pkg: &str,
+        member: &str,
+    ) -> Option<std::sync::Arc<CachedModule>> {
+        self.candidate_defining_sub_in_package(pkg, pkg, member)
+    }
+    /// The two-key form of `candidate_defining_sub`: candidates come from
+    /// `module_key`'s registration (a bridging/typeglob-installing module
+    /// whose NAME differs from the class), package attribution is tested
+    /// against `pkg`. `candidate_defining_sub` is the common
+    /// module-IS-package spelling.
+    fn candidate_defining_sub_in_package(
+        &self,
+        module_key: &str,
+        pkg: &str,
+        member: &str,
+    ) -> Option<std::sync::Arc<CachedModule>> {
+        let cands = self.visible_def_candidates(module_key);
+        cands
+            .iter()
+            .find(|c| self.symbols_present(c).has_sub_in_package(member, pkg))
+            .or_else(|| {
+                cands
+                    .iter()
+                    .find(|c| self.symbols_present(c).sub_info_view(member).is_some())
+            })
+            .cloned()
+    }
     /// A cached module's analysis with its witness bag GUARANTEED present.
     /// Slice 2 evicts the bag from resident pack-index copies; every TYPE
     /// query that reads a foreign file's bag (the `MethodOnClass` / `SlotType`
@@ -518,7 +557,23 @@ pub trait CrossFileLookup {
     ) -> Option<std::sync::Arc<CachedModule>> {
         None
     }
-    fn parents_cached(&self, module_name: &str) -> Vec<String>;
+    /// Parent classes of `module_name` — the UNION over every file
+    /// declaring the package (any file may push `@ISA` / `use parent`; the
+    /// name-slot winner alone hides a losing file's edges). Winner-file
+    /// parents come first (candidates are path-ordered), so the DFS MRO
+    /// stays deterministic. The `packages` lane is never evicted, so the
+    /// raw candidate analyses answer without rehydration.
+    fn parents_cached(&self, module_name: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for c in self.visible_def_candidates(module_name) {
+            for p in c.analysis.declared_parents(module_name) {
+                if !out.iter().any(|x| x == p) {
+                    out.push(p.clone());
+                }
+            }
+        }
+        out
+    }
     fn modules_with_symbol(&self, name: &str) -> Vec<String>;
     fn find_exporters(&self, func_name: &str) -> Vec<String>;
     fn defining_module_cached(&self, entry: &str, name: &str) -> Option<std::sync::Arc<CachedModule>>;
@@ -742,9 +797,9 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     ) -> Option<std::sync::Arc<CachedModule>> {
         self.inner.cached_by_path(path)
     }
-    fn parents_cached(&self, module_name: &str) -> Vec<String> {
-        self.inner.parents_cached(module_name)
-    }
+    // `parents_cached` deliberately NOT delegated: the provided default
+    // unions over THIS decorator's `visible_def_candidates`, so the scope
+    // (pack closure narrowing) applies to the parent relation too.
     fn modules_with_symbol(&self, name: &str) -> Vec<String> {
         self.inner.modules_with_symbol(name)
     }

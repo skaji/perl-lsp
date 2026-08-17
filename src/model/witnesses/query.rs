@@ -128,12 +128,15 @@ pub fn query_sub_return_type(
             let mut retryable: Vec<std::sync::Arc<crate::model::file_analysis::CachedModule>> =
                 Vec::new();
             for module_name in idx.find_exporters(sub_name) {
-                let Some(cached) = idx.get_cached(&module_name) else { continue };
-                let full = idx.bag_present(&cached);
-                match try_in(&full) {
-                    Some(Some(t)) => return Some(t),
-                    Some(None) => retryable.push(cached),
-                    None => {}
+                // Every candidate file registered under the exporter's name —
+                // a split exporter's sub lives in whichever file defines it.
+                for cached in idx.visible_def_candidates(&module_name) {
+                    let full = idx.bag_present(&cached);
+                    match try_in(&full) {
+                        Some(Some(t)) => return Some(t),
+                        Some(None) => retryable.push(cached),
+                        None => {}
+                    }
                 }
             }
             for cached in retryable {

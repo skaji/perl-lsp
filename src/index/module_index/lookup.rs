@@ -91,7 +91,9 @@ impl ModuleIndex {
                 break;
             }
             for module_name in self.modules_with_parent(&current) {
-                let Some(cached) = self.get_cached(&module_name) else { continue };
+                // Every candidate file of the name — the parent edge may
+                // live in a losing candidate (packages lane, never evicted).
+                for cached in crate::model::file_analysis::CrossFileLookup::def_candidates(self, &module_name) {
                 // A module can hold several packages; only the ones
                 // actually listing `current` as a parent are children.
                 for (pkg, parents) in cached.analysis.package_parent_edges() {
@@ -105,6 +107,7 @@ impl ModuleIndex {
                         return;
                     }
                     queue.push_back(pkg.clone());
+                }
                 }
             }
         }
@@ -133,7 +136,9 @@ impl ModuleIndex {
     ) {
         use crate::model::file_analysis::CrossFileLookup;
         for mod_name in self.modules_bridging_to(class_name) {
-            let Some(cached) = self.get_cached(&mod_name) else { continue };
+            // Every candidate file of the name — the bridging namespace may
+            // live in a losing candidate.
+            for cached in CrossFileLookup::def_candidates(self, &mod_name) {
             // Entities index into `symbols`, which may be evicted on the
             // resident copy — resolve them against the symbols-axis view
             // (same generation: the LRU is invalidated on every rewrite).
@@ -155,6 +160,7 @@ impl ModuleIndex {
                     let Some(sym) = whole.symbols().get(idx) else { continue };
                     visit(&mod_name, &cached, sym);
                 }
+            }
             }
         }
     }
@@ -294,9 +300,8 @@ impl CrossFileLookup for ModuleIndex {
         self.rehydrate_or_resident(cached)
     }
 
-    fn parents_cached(&self, module_name: &str) -> Vec<String> {
-        self.parents_cached(module_name)
-    }
+    // `parents_cached`: the trait default unions over `def_candidates`
+    // (every file declaring the package), which is the honest Perl relation.
 
     fn module_path_cached(&self, module_name: &str) -> Option<std::path::PathBuf> {
         self.module_path_cached(module_name)
@@ -324,7 +329,15 @@ impl CrossFileLookup for ModuleIndex {
 
     fn def_candidates(&self, name: &str) -> Vec<Arc<CachedModule>> {
         match self.all_defs.get(name) {
-            Some(cands) if !cands.is_empty() => cands.clone(),
+            Some(cands) if !cands.is_empty() => {
+                // Path-ordered HERE, the one speller of candidate order —
+                // `all_defs` vecs are insertion-ordered (parallel indexing),
+                // and every consumer scan/union/tie-break leans on this
+                // being deterministic.
+                let mut v = cands.clone();
+                v.sort_by(|a, b| a.path.cmp(&b.path));
+                v
+            }
             // No workspace candidates: fall back to the name-slot winner.
             // The @INC tier lands here — single-provider by CURRENT
             // construction (one resolve per name), not by Perl semantics:
@@ -375,10 +388,12 @@ impl CrossFileLookup for ModuleIndex {
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for module in self.modules_with_parent(class) {
-            let Some(cached) = self.get_cached(&module) else { continue };
-            for (pkg, parents) in cached.analysis.package_parent_edges() {
-                if parents.iter().any(|p| p == class) {
-                    out.push((pkg.clone(), module.clone()));
+            // The child edge may live in a losing candidate (packages lane).
+            for cached in CrossFileLookup::def_candidates(self, &module) {
+                for (pkg, parents) in cached.analysis.package_parent_edges() {
+                    if parents.iter().any(|p| p == class) {
+                        out.push((pkg.clone(), module.clone()));
+                    }
                 }
             }
         }
@@ -397,10 +412,13 @@ impl CrossFileLookup for ModuleIndex {
             .map(|v| v.clone())
             .unwrap_or_default();
         for module in modules {
-            let Some(cached) = self.get_cached(&module) else { continue };
-            for (spec, prim) in &cached.analysis.pack.specializes {
-                if prim == primary {
-                    out.push((spec.clone(), module.clone()));
+            // The specialization edge may live in a losing candidate
+            // (pack lane, never evicted).
+            for cached in CrossFileLookup::def_candidates(self, &module) {
+                for (spec, prim) in &cached.analysis.pack.specializes {
+                    if prim == primary {
+                        out.push((spec.clone(), module.clone()));
+                    }
                 }
             }
         }

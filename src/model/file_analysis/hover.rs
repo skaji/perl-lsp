@@ -53,8 +53,12 @@ impl FileAnalysis {
                                         if let Some(idx) = module_index {
                                             // Bridged helper lives in `def_module`; real
                                             // inherited method in `class`'s own module.
+                                            // Either name maps to a SET of files — the
+                                            // definer may be a losing candidate.
                                             let module = def_module.as_deref().unwrap_or(class.as_str());
-                                            if let Some(cached) = idx.get_cached(module) {
+                                            if let Some(cached) =
+                                                idx.candidate_defining_sub_in_package(module, class, mname)
+                                            {
                                                 let whole = idx.bag_present(&cached);
                                                 if let Some(sub_info) = whole.sub_info_view(mname) {
                                                     let sig = format_cross_file_signature(mname, &sub_info);
@@ -105,7 +109,11 @@ impl FileAnalysis {
                             let matched = import.imported_symbols.iter()
                                 .find(|s| s.local_name == r.target_name);
                             let Some(is) = matched else { continue };
-                            let Some(cached) = idx.get_cached(&import.module_name) else { continue };
+                            // The exporting package may be split — pick the
+                            // candidate file that defines the remote sub.
+                            let Some(cached) =
+                                idx.candidate_defining_sub(&import.module_name, is.remote())
+                            else { continue };
                             let whole = idx.whole_present(&cached);
                             let Some(sub_info) = whole.sub_info_view(is.remote()) else { continue };
 
@@ -163,8 +171,12 @@ impl FileAnalysis {
                                 if let Some(idx) = module_index {
                                     // Bridged helper lives in `def_module`; real
                                     // inherited method in `class`'s own module.
+                                    // Either name maps to a SET of files — the
+                                    // definer may be a losing candidate.
                                     let module = def_module.as_deref().unwrap_or(class.as_str());
-                                    if let Some(cached) = idx.get_cached(module) {
+                                    if let Some(cached) =
+                                        idx.candidate_defining_sub_in_package(module, class, method)
+                                    {
                                         let whole = idx.bag_present(&cached);
                                         if let Some(sub_info) = whole.sub_info_view(method) {
                                             let class_label = if class != cn {
@@ -281,17 +293,20 @@ impl FileAnalysis {
             MethodResolution::Local { sym_id, .. } => Some(render(self, self.symbol(sym_id))),
             MethodResolution::CrossFile { class, .. } => {
                 let idx = module_index?;
-                let cached = idx.get_cached(&class)?;
-                // `render` reads the field's flow type from its OWNING bag —
-                // the symbol scan needs symbols too; take the whole view.
-                let full = idx.whole_present(&cached);
-                let sym = full.symbols.iter().find(|s| {
-                    matches!(s.kind, SymKind::Variable | SymKind::Field)
-                        && s.name == field
-                        && s.package.as_deref() == Some(class.as_str())
-                        && full.symbol_is_class_content(s)
-                })?;
-                Some(render(&full, sym))
+                // The declaring file is whichever of `class`'s candidates
+                // holds the field, not the name-slot winner. `render` reads
+                // the field's flow type from its OWNING bag — the symbol
+                // scan needs symbols too; take the whole view.
+                idx.visible_def_candidates(&class).iter().find_map(|cached| {
+                    let full = idx.whole_present(cached);
+                    let sym = full.symbols.iter().find(|s| {
+                        matches!(s.kind, SymKind::Variable | SymKind::Field)
+                            && s.name == field
+                            && s.package.as_deref() == Some(class.as_str())
+                            && full.symbol_is_class_content(s)
+                    })?;
+                    Some(render(&full, sym))
+                })
             }
         }
     }
@@ -334,16 +349,19 @@ impl FileAnalysis {
         // workspace is skipped without any per-module inspection.
         if let Some(idx) = module_index {
             for module_name in idx.modules_with_symbol(name) {
-                let Some(cached) = idx.get_cached(&module_name) else { continue };
-                let whole = idx.whole_present(&cached);
-                for sym in &whole.symbols {
-                    if sym.name != name { continue; }
-                    if let SymbolDetail::Handler { owner: o, params, .. } = &sym.detail {
-                        if o == owner {
-                            registrations.push((
-                                sym.selection_span.start.row + 1,
-                                display_handler_params(params),
-                            ));
+                // Every file registered under the name — a registration
+                // gathering must not stop at the name-slot winner.
+                for cached in idx.visible_def_candidates(&module_name) {
+                    let whole = idx.whole_present(&cached);
+                    for sym in &whole.symbols {
+                        if sym.name != name { continue; }
+                        if let SymbolDetail::Handler { owner: o, params, .. } = &sym.detail {
+                            if o == owner {
+                                registrations.push((
+                                    sym.selection_span.start.row + 1,
+                                    display_handler_params(params),
+                                ));
+                            }
                         }
                     }
                 }
@@ -376,12 +394,13 @@ impl FileAnalysis {
         if dispatchers.is_empty() {
             if let Some(idx) = module_index {
                 for module_name in idx.modules_with_symbol(name) {
-                    let Some(cached) = idx.get_cached(&module_name) else { continue };
-                    let whole = idx.whole_present(&cached);
-                    for sym in &whole.symbols {
-                        if sym.name != name { continue; }
-                        if let SymbolDetail::Handler { owner: o, dispatchers: ds, .. } = &sym.detail {
-                            if o == owner { dispatchers.extend(ds.clone()); }
+                    for cached in idx.visible_def_candidates(&module_name) {
+                        let whole = idx.whole_present(&cached);
+                        for sym in &whole.symbols {
+                            if sym.name != name { continue; }
+                            if let SymbolDetail::Handler { owner: o, dispatchers: ds, .. } = &sym.detail {
+                                if o == owner { dispatchers.extend(ds.clone()); }
+                            }
                         }
                     }
                 }

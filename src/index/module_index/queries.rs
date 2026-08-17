@@ -213,13 +213,16 @@ impl ModuleIndex {
             if visited > MAX {
                 break;
             }
-            let Some(cached) = self.get_cached(&module) else { continue };
-            if visit(&cached).is_break() {
-                return;
-            }
-            for next in &cached.analysis.reexport_modules {
-                if !seen.contains(next) {
-                    queue.push_back(next.clone());
+            // Every candidate file registered under the name — a split
+            // module's re-export edges (and defs) span the set.
+            for cached in crate::model::file_analysis::CrossFileLookup::def_candidates(self, &module) {
+                if visit(&cached).is_break() {
+                    return;
+                }
+                for next in &cached.analysis.reexport_modules {
+                    if !seen.contains(next) {
+                        queue.push_back(next.clone());
+                    }
                 }
             }
         }
@@ -255,15 +258,6 @@ impl ModuleIndex {
         self.core.cache
             .get(module_name)
             .and_then(|entry| entry.as_ref().map(|m| m.path.clone()))
-    }
-
-    /// Return cached parent classes for a module's primary package.
-    pub fn parents_cached(&self, module_name: &str) -> Vec<String> {
-        let cached = match self.get_cached(module_name) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        primary_package_parents(&cached.analysis, module_name)
     }
 
     /// Iterate all cached modules. Callback receives (module_name, CachedModule).
@@ -329,10 +323,11 @@ impl ModuleIndex {
         let mut result: Vec<String> = self.modules_with_symbol(func_name)
             .into_iter()
             .filter(|m| {
-                self.get_cached(m)
-                    .map(|c| c.analysis.export.iter().any(|e| e == func_name)
+                // ANY candidate file of the module may carry the export list.
+                crate::model::file_analysis::CrossFileLookup::def_candidates(self, m)
+                    .iter()
+                    .any(|c| c.analysis.export.iter().any(|e| e == func_name)
                         || c.analysis.export_ok.iter().any(|e| e == func_name))
-                    .unwrap_or(false)
             })
             .collect();
         result.sort();
@@ -373,10 +368,12 @@ impl ModuleIndex {
         self.modules_with_symbol(name)
             .into_iter()
             .find(|mod_name| {
-                self.get_cached(mod_name)
-                    // Symbols-axis existence scan — no bag/refs read.
-                    .map(|c| self.symbols_present(&c).has_sub_in_package(name, class))
-                    .unwrap_or(false)
+                // EVERY file registered under this module name — the definer
+                // may be a losing candidate of its own name slot. Symbols-axis
+                // existence scan — no bag/refs read.
+                self.def_candidates(mod_name)
+                    .iter()
+                    .any(|c| self.symbols_present(c).has_sub_in_package(name, class))
             })
     }
 
