@@ -110,6 +110,22 @@ Protocol surface (breadth, not depth):
   projection, `dispatch_class()`). Non-goals and the reasoning are in
   `prompt-lsp-surface-parity.md`; `linkedEditingRange` stays OFF (#117).
 
+## Scale validation (2026-08-17) — the Tier 1 queue
+
+The first measurements outside `crm`: a 4.65 h soak, Koha (3.1x), and a
+5,000-dist CPAN sample (122x — the target rung). Storage and startup hold
+scale-free; query paths break. Findings, tiers, corpora and repros:
+`prompt-scale-validation-hitlist.md`. Tier 1, in order:
+
+1. **Post-cold-index availability hole** — ~10 min where every verb times
+   out; a warm restart of the same state is ready in 1 s. Restarting beats
+   staying up.
+2. **Fatal stack overflow on deep CSTs (P0)** — one XML-as-`.pm` aborts the
+   whole server; `catch_unwind` cannot catch it. Depth gate before build.
+3. **`references` terminal at scale** — no refs-axis reader, so the backward
+   walk decodes a whole blob per candidate (~4x of the cost).
+4. **Completion payload unbounded** — 7.8 MB / ~50k items per keystroke.
+
 ## Parked (explicit unblock conditions)
 
 - **Instance brands** — per-object dispatch scoping (`$app->minion`
