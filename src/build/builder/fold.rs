@@ -211,8 +211,14 @@ impl<'a> Builder<'a> {
                  lattice argument or dependency tracking is broken"
             );
             if iters >= MAX_FOLD_ITERATIONS {
+                // Name the input: at corpus scale an un-located bail is
+                // unactionable. The bulk indexers set the thread's current
+                // file; other build sites (open docs) leave it unset.
+                let whom = crate::util::timings::current_file()
+                    .map(|f| format!(" in {f}"))
+                    .unwrap_or_default();
                 eprintln!(
-                    "perl-lsp: type-inference fold exceeded {MAX_FOLD_ITERATIONS} iterations; \
+                    "perl-lsp: type-inference fold exceeded {MAX_FOLD_ITERATIONS} iterations{whom}; \
                      bailing out to keep the LSP responsive"
                 );
                 break;

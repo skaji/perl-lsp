@@ -391,12 +391,23 @@ pub fn index_pack_languages(
                 }
                 let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
                 let Some(driver) = reg.for_path(path).filter(|d| d.id() == lang) else { return };
+                crate::util::timings::trace_file(&canon);
+                crate::util::timings::set_current_file(Some(&canon));
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     analyze_stamped(path, || {
                         let source = std::fs::read_to_string(path).ok()?;
                         Some(driver.analyze_with_path(&source, Some(path)))
                     })
                 }));
+                crate::util::timings::set_current_file(None);
+                if res.is_err() {
+                    // eprintln, not log::warn — the CLI runs without a logger,
+                    // and a panic that doesn't name its file costs a bisection.
+                    eprintln!(
+                        "perl-lsp: panic while indexing {}; file skipped",
+                        canon.display()
+                    );
+                }
                 if let Ok(Some((analysis, stamp))) = res {
                     // Encode the FULL analysis for the disk write, then strip
                     // the resident copy — one struct, no clone

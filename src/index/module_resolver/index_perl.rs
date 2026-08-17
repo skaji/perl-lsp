@@ -364,6 +364,8 @@ pub fn index_workspace_with_index(
                 }
                 return;
             }
+            crate::util::timings::trace_file(&canon);
+            crate::util::timings::set_current_file(Some(&canon));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 analyze_stamped(path, || {
                     let source = std::fs::read_to_string(path).ok()?;
@@ -475,9 +477,15 @@ pub fn index_workspace_with_index(
                 }
                 Ok(None) => { /* parse failed, skip */ }
                 Err(_) => {
-                    log::warn!("Panic while indexing {:?}, skipping", path);
+                    // eprintln, not log::warn — the CLI runs without a logger,
+                    // and a panic that doesn't name its file costs a bisection.
+                    eprintln!(
+                        "perl-lsp: panic while indexing {}; file skipped",
+                        canon.display()
+                    );
                 }
             }
+            crate::util::timings::set_current_file(None);
             if let Some(cb) = progress {
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 cb(d, total);

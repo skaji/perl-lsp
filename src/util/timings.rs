@@ -263,3 +263,43 @@ pub fn phase<T>(label: &str, body: impl FnOnce() -> T) -> T {
     );
     out
 }
+
+// ---------------------------------------------------------------------------
+// Per-file breadcrumbs. At corpus scale (100k+ files) any failure that doesn't
+// name its input costs a debugging session — a stack overflow in a rayon
+// worker is uncatchable, so the only way to locate the culprit after the
+// abort is the last breadcrumb printed before it.
+
+/// Cached `PERL_LSP_TRACE_FILE` gate: when set, the bulk indexers announce
+/// each file on stderr immediately BEFORE analyzing it. Completely inert
+/// when unset.
+pub fn trace_files_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PERL_LSP_TRACE_FILE").is_some())
+}
+
+/// Breadcrumb: print `path` before its analysis starts (gated, flushed —
+/// stderr is unbuffered). If the analysis aborts the process, this is the
+/// line that names the culprit.
+pub fn trace_file(path: &std::path::Path) {
+    if trace_files_enabled() {
+        eprintln!("[trace-file] {}", path.display());
+    }
+}
+
+thread_local! {
+    static CURRENT_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Record the file this thread is currently analyzing, so failure messages
+/// emitted deep inside the build (fold bail, panics caught per-file) can name
+/// their input. Ungated: one PathBuf clone per file is noise next to a parse.
+pub fn set_current_file(path: Option<&std::path::Path>) {
+    CURRENT_FILE.with(|c| *c.borrow_mut() = path.map(|p| p.to_path_buf()));
+}
+
+/// The file this thread is analyzing, if the current work unit declared one.
+pub fn current_file() -> Option<String> {
+    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|p| p.display().to_string()))
+}
