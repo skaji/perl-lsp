@@ -1511,11 +1511,7 @@ impl LanguageRegistry {
         if let Some(d) = self.for_path(path) {
             return Some(d);
         }
-        let mut cut = source.len().min(1024);
-        while cut > 0 && !source.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let prefix = &source[..cut];
+        let prefix = crate::util::text::truncate_on_char_boundary(source, 1024);
         self.drivers.iter().find(|d| d.sniff(prefix)).map(|d| d.as_ref())
     }
 

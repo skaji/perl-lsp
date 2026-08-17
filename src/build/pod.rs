@@ -4,9 +4,13 @@
 //! then walks the tree to render markdown. Handles nested lists,
 //! data regions, multi-angle-bracket formatting, and proper inline nesting.
 
+use crate::util::text::truncate_on_char_boundary;
 use tree_sitter::{Node, Parser};
 
-/// Convert raw POD text to markdown. Caps output at ~2000 chars.
+/// Max bytes of rendered markdown a single POD block contributes to hover.
+const POD_MARKDOWN_CAP: usize = 2000;
+
+/// Convert raw POD text to markdown, capped at `POD_MARKDOWN_CAP` bytes.
 pub fn pod_to_markdown(pod_text: &str) -> String {
     let tree = match parse_pod(pod_text) {
         Some(t) => t,
@@ -15,12 +19,7 @@ pub fn pod_to_markdown(pod_text: &str) -> String {
     let mut out = String::new();
     render_children(tree.root_node(), pod_text.as_bytes(), &mut out);
 
-    let result = out.trim_end().to_string();
-    if result.len() > 2000 {
-        result[..2000].to_string()
-    } else {
-        result
-    }
+    truncate_on_char_boundary(out.trim_end(), POD_MARKDOWN_CAP).to_string()
 }
 
 /// Extract a =head2 section for a given sub name from a POD block.

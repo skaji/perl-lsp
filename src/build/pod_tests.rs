@@ -290,3 +290,31 @@ fn test_eof_without_cut() {
     assert!(md.contains("### NAME"), "got: {}", md);
     assert!(md.contains("Module - description"), "got: {}", md);
 }
+
+/// Non-ASCII POD longer than the output cap used to panic: the cap fell inside
+/// a multibyte char and `&result[..2000]` sliced it in half. The panic was
+/// caught per-file, so the module's whole analysis vanished silently.
+/// Found on `Test-BDD-Cucumber-Definitions` (Russian POD) in the CPAN corpus.
+///
+/// Sweeps a byte-shift because whether the cap lands mid-character depends on
+/// alignment — a single fixture can straddle the cap cleanly and pass while the
+/// bug is fully present.
+#[test]
+fn test_multibyte_pod_over_cap_does_not_panic() {
+    // Cyrillic is 2 bytes/char, so shifting the body by one byte flips the
+    // parity of the cap offset; some shift in this range must land mid-char.
+    for pad in 0..4 {
+        let body = "\u{041f}\u{0440}\u{043e}\u{0432}\u{0435}\u{0440}\u{043a}\u{0430} ".repeat(400);
+        let pod = format!("=head1 NAME\n\n{}{}\n\n=cut\n", "x".repeat(pad), body);
+        assert!(pod.len() > 2000, "fixture must exceed the cap");
+
+        let md = pod_to_markdown(&pod);
+        assert!(
+            md.len() <= 2000,
+            "pad={}: cap not applied, got {} bytes",
+            pad,
+            md.len()
+        );
+        assert!(md.starts_with("### NAME"), "pad={}: got: {}", pad, md);
+    }
+}
