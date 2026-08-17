@@ -1,0 +1,72 @@
+{
+  "capability": "type-definition",
+  "rows": [
+    {
+      "id": "td-split-package-var-yields-every-declaring-file",
+      "difficulty": "tricky",
+      "semantic_area": "pkg-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "file": "lib/WidgetUser.pm",
+      "line": 5,
+      "col": 5,
+      "expect": {
+        "all": [
+          "Widget.pm:1:9",
+          "WidgetExtra.pm:1:9"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "goto-type-definition on $w (inferred Shared::Widget) returns BOTH files declaring the package — a package is a set of files, the candidate relation flows through the type axis too."
+    },
+    {
+      "id": "td-firstparam-class-resolves-to-package-decl",
+      "difficulty": "simple",
+      "semantic_area": "oo-isa",
+      "file": "URI.pm",
+      "line": 55,
+      "col": 8,
+      "expect": {
+        "all": [
+          "URI.pm:1:9"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "$class in URI::new types as FirstParam{URI}; its type definition is the `package URI` declaration."
+    },
+    {
+      "id": "td-honest-miss-on-sub-decl",
+      "difficulty": "simple",
+      "semantic_area": "honest-miss",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "file": "lib/User.pm",
+      "line": 5,
+      "col": 4,
+      "expect": {
+        "all": [],
+        "none": [
+          ".pm:"
+        ]
+      },
+      "status": "gold",
+      "note": "cursor on a sub NAME carries no value; the verb answers nothing rather than guessing (the ->new-flood rule: no name-only fallback)."
+    },
+    {
+      "id": "td-honest-miss-on-string-typed-var",
+      "difficulty": "simple",
+      "semantic_area": "honest-miss",
+      "file": "URI.pm",
+      "line": 100,
+      "col": 4,
+      "expect": {
+        "all": [],
+        "none": [
+          ".pm:"
+        ]
+      },
+      "status": "gold",
+      "note": "$str types as Str — no dispatch class, so no location; answering URI.pm here would be the confident-wrong failure mode."
+    }
+  ]
+}

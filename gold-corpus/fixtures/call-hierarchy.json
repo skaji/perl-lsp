@@ -1,0 +1,75 @@
+{
+  "capability": "call-hierarchy",
+  "rows": [
+    {
+      "id": "ch-incoming-cross-file-grouped-by-caller",
+      "difficulty": "simple",
+      "semantic_area": "pkg-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "file": "lib/PanelBase.pm",
+      "line": 2,
+      "col": 4,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"PanelUser.pm\",\"kind\":\"Sub\",\"line\":\"5\",\"name\":\"go\",\"sites\":[{\"col\":\"7\",\"line\":\"7\"}]}"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "incoming calls of panel_render: the references() image (the same projection heatmap fan-in counts) grouped under the calling sub PanelUser::go with its call-site span."
+    },
+    {
+      "id": "ch-outgoing-resolves-each-callee-def",
+      "difficulty": "simple",
+      "semantic_area": "pkg-identity",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "file": "lib/PanelUser.pm",
+      "line": 4,
+      "col": 4,
+      "expect": {
+        "all": [
+          "{\"col\":\"1\",\"file\":\"Panel.pm\",\"kind\":\"Sub\",\"line\":\"3\",\"name\":\"new\",\"sites\":[{\"col\":\"26\",\"line\":\"6\"}]}",
+          "{\"col\":\"1\",\"file\":\"PanelBase.pm\",\"kind\":\"Sub\",\"line\":\"3\",\"name\":\"panel_render\",\"sites\":[{\"col\":\"7\",\"line\":\"7\"}]}"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "outgoing calls of PanelUser::go: the in-body call refs (heatmap's fan-out lane), each callee resolved to its cross-file definition."
+    },
+    {
+      "id": "ch-substrate-uric-escape-both-directions",
+      "difficulty": "tricky",
+      "semantic_area": "classic",
+      "file": "URI.pm",
+      "line": 138,
+      "col": 4,
+      "expect": {
+        "all": [
+          "{\"col\":\"5\",\"file\":\"URI.pm\",\"kind\":\"Sub\",\"line\":\"95\",\"name\":\"_init\",\"sites\":[{\"col\":\"20\",\"line\":\"100\"}]}",
+          "{\"col\":\"5\",\"file\":\"_server.pm\",\"kind\":\"Sub\",\"line\":\"12\",\"name\":\"_uric_escape\",\"sites\":[{\"col\":\"27\",\"line\":\"22\"}]}",
+          "\"name\":\"escape_char\""
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "URI::_uric_escape on the real corpus: incoming from URI::_init (same file) and URI::_server::_uric_escape (cross-file), outgoing reaches URI::Escape::escape_char."
+    },
+    {
+      "id": "ch-honest-miss-on-package-decl",
+      "difficulty": "simple",
+      "semantic_area": "honest-miss",
+      "root": "gold-corpus/pkgsplit-fixture",
+      "file": "lib/PanelUser.pm",
+      "line": 0,
+      "col": 10,
+      "expect": {
+        "all": [],
+        "none": [
+          "incoming"
+        ]
+      },
+      "status": "gold",
+      "note": "a package declaration is not a callable; prepare answers nothing rather than inventing an item."
+    }
+  ]
+}

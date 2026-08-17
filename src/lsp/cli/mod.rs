@@ -131,13 +131,17 @@ pub(crate) fn print_usage() {
     eprintln!("  perl-lsp --hover [<root>] <file> <line> <col>         Type info and docs (root = cross-file)");
     eprintln!("  perl-lsp --type-at <file> <line> <col>                 Single type query");
     eprintln!("  perl-lsp --definition <root> <file> <line> <col>       Cross-file goto-def");
+    eprintln!("  perl-lsp --type-definition <root> <file> <line> <col>  Def of the value's inferred class");
     eprintln!("  perl-lsp --implementations <root> <file> <line> <col>  Descendant defs (role composers, overrides)");
+    eprintln!("  perl-lsp --type-hierarchy <root> <file> <line> <col>   Class item + direct supertypes/subtypes");
+    eprintln!("  perl-lsp --call-hierarchy <root> <file> <line> <col>   Callable item + incoming/outgoing calls");
     eprintln!("  perl-lsp --references <root> <file> <line> <col>       Cross-file find-refs");
     eprintln!("  perl-lsp --completion <root> <file> <line> <col>       Completion items at point");
     eprintln!("  perl-lsp --signature-help <root> <file> <line> <col>   Signature help at point");
     eprintln!("  perl-lsp --document-highlight <root> <file> <line> <col> In-file occurrences (read/write)");
     eprintln!("  perl-lsp --linked-editing <root> <file> <line> <col>   Linked-editing occurrence set");
     eprintln!("  perl-lsp --semantic-tokens <root> <file>               Semantic token classification");
+    eprintln!("  perl-lsp --document-link <root> <file>                 POD L<> links, comment URLs, path loads");
     eprintln!();
     eprintln!("REFACTORING:");
     eprintln!("  perl-lsp --rename <root> <file> <line> <col> <new>     Cross-file rename");

@@ -192,6 +192,22 @@ pub(crate) fn cli_cursor(q: &str, root: &str, rest: &[String]) {
     print_run_one(&ws, &idx, &req, target.fmt);
 }
 
+/// --document-link <root> <file> — the non-symbol clickable ranges (POD
+/// L<> links, comment URLs, string-path loads).
+pub(crate) fn cli_document_link(root: &str, file: &str) {
+    let (ws, idx) = cli_full_startup(root);
+    let req = BatchReq {
+        id: String::new(),
+        q: "document-link".into(),
+        file: file.to_string(),
+        line: 0,
+        col: 0,
+        query: None,
+        newname: None,
+    };
+    print_run_one(&ws, &idx, &req, CoordFmt::EditorOneBasedChar);
+}
+
 /// --semantic-tokens <root> <file> — token classification for the file.
 pub(crate) fn cli_semantic_tokens(root: &str, file: &str) {
     let (ws, idx) = cli_full_startup(root);
@@ -492,6 +508,123 @@ fn run_one(
             }
             Ok(serde_json::to_string_pretty(&results).unwrap())
         }
+        "type-definition" => {
+            let (s, _t, mut analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
+            analysis.enrich_imported_types_with_keys(Some(idx));
+            let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            // Same store routing + staging as goto-def; the projection is the
+            // type axis of the same set (value type → dispatch class → def).
+            let reg = language_driver::LanguageRegistry::with_enabled();
+            let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &s).id();
+            let routed = idx.lookup_for(lang_id);
+            let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
+            let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(abs), point,
+                Some(routed.as_lookup()), resolve::OverrideScope::default(),
+            )
+            .with_source(&s);
+            let locs = cs.type_definitions();
+            if locs.is_empty() {
+                return Err(format!("No type definition at {}:{}", req.line, req.col));
+            }
+            let mut sources = SourceCache::new(fmt);
+            let mut lines = Vec::new();
+            for loc in locs {
+                let path = key_display(&loc.key);
+                let (line, col) = sources.display(&path, loc.span.start.row, loc.span.start.column);
+                lines.push(format!("{}:{}:{}", path, line, col));
+            }
+            Ok(lines.join("\n"))
+        }
+        "type-hierarchy" | "call-hierarchy" => {
+            let (s, _t, mut analysis) = parse_file(file);
+            resolve_imports_blocking(idx, &analysis);
+            analysis.enrich_imported_types_with_keys(Some(idx));
+            let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let reg = language_driver::LanguageRegistry::with_enabled();
+            let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &s).id();
+            let routed = idx.lookup_for(lang_id);
+            let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
+            let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(abs), point,
+                Some(routed.as_lookup()), resolve::OverrideScope::default(),
+            );
+            let is_type = req.q == "type-hierarchy";
+            let item = if is_type { cs.hierarchy_type_item() } else { cs.hierarchy_call_item() };
+            let Some(item) = item else {
+                return Err(format!(
+                    "No {} item at {}:{}",
+                    if is_type { "type hierarchy" } else { "call hierarchy" },
+                    req.line, req.col
+                ));
+            };
+            drop(cs);
+            // Re-anchor at the item's own declaration — exactly what the LSP
+            // does when the client hands the prepare item back to the
+            // supertypes/subtypes/incoming/outgoing requests. The declaring
+            // file's OWN analysis carries its local edges (parents, body
+            // refs); the cursor file only had the call/use site.
+            let anchor = item.location.clone();
+            let anchor_analysis =
+                resolve::analysis_for_key(ws, Some(routed.as_lookup()), &anchor.key)
+                    .unwrap_or_else(|| std::sync::Arc::clone(&origin));
+            let acs = resolve::resolve(
+                ws, &anchor_analysis, anchor.key.clone(), anchor.span.start,
+                Some(routed.as_lookup()), resolve::OverrideScope::default(),
+            );
+            let mut sources = SourceCache::new(fmt);
+            let mut item_json = |sources: &mut SourceCache, it: &resolve::HierarchyItem| {
+                let path = key_display(&it.location.key);
+                let (line, col) =
+                    sources.display(&path, it.location.span.start.row, it.location.span.start.column);
+                serde_json::json!({
+                    "name": it.name, "kind": format!("{:?}", it.kind),
+                    "file": path, "line": line, "col": col,
+                })
+            };
+            let out = if is_type {
+                let supertypes: Vec<_> =
+                    acs.supertypes().iter().map(|i| item_json(&mut sources, i)).collect();
+                let subtypes: Vec<_> =
+                    acs.subtypes().iter().map(|i| item_json(&mut sources, i)).collect();
+                serde_json::json!({
+                    "item": item_json(&mut sources, &item),
+                    "supertypes": supertypes,
+                    "subtypes": subtypes,
+                })
+            } else {
+                let mut edge_json = |sources: &mut SourceCache,
+                                     e: &resolve::CallEdge,
+                                     sites_path: &str| {
+                    let mut j = item_json(sources, &e.item);
+                    j["sites"] = e.sites.iter().map(|sp| {
+                        let (line, col) = sources.display(sites_path, sp.start.row, sp.start.column);
+                        serde_json::json!({"line": line, "col": col})
+                    }).collect();
+                    j
+                };
+                let anchor_path = key_display(&anchor.key);
+                let incoming: Vec<_> = acs.incoming_calls().iter().map(|e| {
+                    // Incoming sites live in the CALLER's file.
+                    let p = key_display(&e.item.location.key);
+                    edge_json(&mut sources, e, &p)
+                }).collect();
+                let outgoing: Vec<_> = acs.outgoing_calls().iter()
+                    .map(|e| edge_json(&mut sources, e, &anchor_path))
+                    .collect();
+                serde_json::json!({
+                    "item": item_json(&mut sources, &item),
+                    "incoming": incoming,
+                    "outgoing": outgoing,
+                })
+            };
+            Ok(serde_json::to_string_pretty(&out).unwrap())
+        }
         "hover" => {
             let (source, _t, mut analysis) = parse_file(file);
             // A language without the analysis-native `hover_info` renderer
@@ -645,6 +778,32 @@ fn run_one(
                 None => Err(format!("No linked-editing ranges at {}:{} (need >= 2 occurrences)", req.line, req.col)),
             }
         }
+        "document-link" => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| format!("Cannot read {}: {}", file, e))?;
+            let abs = std::fs::canonicalize(file).unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let reg = language_driver::LanguageRegistry::with_enabled();
+            let lang_id = reg.driver_or_fallback(std::path::Path::new(file), &text).id();
+            let routed = idx.lookup_for(lang_id);
+            let root = idx
+                .workspace_root()
+                .and_then(|r| tower_lsp::lsp_types::Url::parse(&r).ok())
+                .and_then(|u| u.to_file_path().ok());
+            let links = symbols::document_links(
+                &text,
+                abs.parent(),
+                root.as_deref(),
+                Some(routed.as_lookup()),
+            );
+            let mut sources = SourceCache::new(fmt);
+            let path = abs.display().to_string();
+            let mut out = String::new();
+            for l in &links {
+                let (line, col) = sources.display(&path, l.span.start.row, l.span.start.column);
+                out.push_str(&format!("{}:{}\t{}\n", line, col, l.target.display()));
+            }
+            Ok(out.trim_end_matches('\n').to_string())
+        }
         "semantic-tokens" => {
             let doc = cli_open_document(file, idx);
             let tokens = symbols::semantic_tokens(&doc.analysis);
@@ -752,6 +911,18 @@ fn run_one(
         }
         "diagnostics" => Ok(batch_diagnostics(ws, idx)),
         other => Err(format!("unknown query: {}", other)),
+    }
+}
+
+/// Render a `FileKey` as a display path (the repeated match every
+/// location-emitting arm needs).
+fn key_display(key: &file_store::FileKey) -> String {
+    match key {
+        file_store::FileKey::Path(p) => p.display().to_string(),
+        file_store::FileKey::Url(u) => u
+            .to_file_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| u.to_string()),
     }
 }
 

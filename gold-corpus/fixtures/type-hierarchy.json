@@ -1,0 +1,81 @@
+{
+  "capability": "type-hierarchy",
+  "rows": [
+    {
+      "id": "th-multibase-supertypes-are-direct-parents",
+      "difficulty": "simple",
+      "semantic_area": "oo-isa",
+      "root": "gold-corpus/mixin-fixture",
+      "file": "lib/My/Child.pm",
+      "line": 0,
+      "col": 10,
+      "expect": {
+        "all": [
+          "{\"col\":\"9\",\"file\":\"Mixin.pm\",\"kind\":\"Package\",\"line\":\"1\",\"name\":\"My::Mixin\"}",
+          "{\"col\":\"9\",\"file\":\"Base.pm\",\"kind\":\"Package\",\"line\":\"1\",\"name\":\"My::Base\"}",
+          "\"subtypes\":[]"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "supertypes of a multi-base class are BOTH direct parents (use base qw(Mixin Base)); Child has no subtypes."
+    },
+    {
+      "id": "th-subtypes-are-direct-children",
+      "difficulty": "simple",
+      "semantic_area": "oo-isa",
+      "root": "gold-corpus/mixin-fixture",
+      "file": "lib/My/Base.pm",
+      "line": 0,
+      "col": 10,
+      "expect": {
+        "all": [
+          "{\"col\":\"9\",\"file\":\"Child.pm\",\"kind\":\"Package\",\"line\":\"1\",\"name\":\"My::Child\"}",
+          "{\"col\":\"9\",\"file\":\"Comp.pm\",\"kind\":\"Package\",\"line\":\"1\",\"name\":\"My::Comp\"}"
+        ],
+        "none": [
+          "Mixin.pm"
+        ]
+      },
+      "status": "gold",
+      "note": "subtypes of My::Base are its INHERITS_INV children. My::Mixin is a SIBLING parent of Child, not a subtype of Base — it participates in goto-implementation's dispatch fan-out but must not appear here."
+    },
+    {
+      "id": "th-substrate-uri-http-one-level-each-way",
+      "difficulty": "tricky",
+      "semantic_area": "oo-isa",
+      "file": "URI/http.pm",
+      "line": 0,
+      "col": 9,
+      "expect": {
+        "all": [
+          "{\"col\":\"9\",\"file\":\"_server.pm\",\"kind\":\"Package\",\"line\":\"1\",\"name\":\"URI::_server\"}",
+          "\"name\":\"URI::https\"",
+          "\"name\":\"URI::ws\""
+        ],
+        "none": [
+          "URI.pm"
+        ]
+      },
+      "status": "gold",
+      "note": "URI::http: supertype is the DIRECT parent URI::_server only (URI itself is two hops up and must not appear — the protocol is one level per request, the client recurses); subtypes include https/ws."
+    },
+    {
+      "id": "th-honest-miss-on-sub-decl",
+      "difficulty": "simple",
+      "semantic_area": "honest-miss",
+      "root": "gold-corpus/mixin-fixture",
+      "file": "lib/My/Base.pm",
+      "line": 4,
+      "col": 5,
+      "expect": {
+        "all": [],
+        "none": [
+          "Base.pm"
+        ]
+      },
+      "status": "gold",
+      "note": "a sub declaration is not a type; prepare answers nothing (call hierarchy owns callables)."
+    }
+  ]
+}

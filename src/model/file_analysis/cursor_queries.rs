@@ -18,6 +18,19 @@ impl FileAnalysis {
         self.symbols.iter().find(|s| contains_point(&s.selection_span, point))
     }
 
+    /// The innermost callable (Sub/Method) whose body span contains the
+    /// point — the "who is calling from here" question the call-hierarchy
+    /// incoming projection groups reference sites by. `None` for top-level
+    /// code (import-time calls, scripts): there is no callable to report.
+    pub fn enclosing_callable_at(&self, point: Point) -> Option<&Symbol> {
+        self.symbols
+            .iter()
+            .filter(|s| {
+                matches!(s.kind, SymKind::Sub | SymKind::Method) && contains_point(&s.span, point)
+            })
+            .min_by_key(|s| span_size(&s.span))
+    }
+
     /// The build-time-resolved owner of the hash key under the cursor —
     /// from the access ref (`$cfg->{key}`) or the key's def symbol (Moo
     /// `has`, return-shape keys). `None` = the key is lexical/unowned and

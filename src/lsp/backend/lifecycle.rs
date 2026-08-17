@@ -183,6 +183,7 @@ impl Backend {
             perl_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pack_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_done_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            type_hierarchy_dynamic: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pack_invalidator: Arc::new(crate::index::pack_invalidator::PackInvalidator::default()),
             diag_options,
             rename_options: Arc::new(std::sync::Mutex::new(crate::index::resolve::RenameOptions::default())),

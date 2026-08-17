@@ -1,9 +1,32 @@
 # LSP surface parity — the advertised-capability gap
 
-Forward-design brief. Not scheduled; this is the shape of the work if and
-when breadth becomes the priority. Origin: a capability audit against
+Forward-design brief. Origin: a capability audit against
 EffortlessMetrics/perl-lsp v0.17.0 (2026-08-17), done server-to-server by
 installing the rival binary and diffing `initialize` responses.
+
+**Status: the cluster below (1–3) plus a re-scoped documentLink LANDED.**
+Each is a CandidateSet/Model projection + CLI verb + LSP handler + gold
+rows (`fixtures/type-definition.json`, `type-hierarchy.json`,
+`call-hierarchy.json`, `document-link.json`). Two findings that amend this
+brief's own argument:
+
+- **typeHierarchy cannot appear in our `initialize` response.** lsp-types
+  0.94.1 (pinned by tower-lsp 0.20, its final release) has no
+  `type_hierarchy_provider` field — the request/response types exist, the
+  capability field doesn't. We serve the verb and advertise it via dynamic
+  registration (`initialized`, gated on the client's
+  `typeHierarchy.dynamicRegistration`); VS Code sees it, a static
+  capability diff still shows a miss. Closing THAT gap means leaving
+  tower-lsp 0.20 (the incumbent advertises it statically, so they already
+  have) — a maintainer decision, out of this batch's scope.
+- **documentLink's original rationale was wrong twice** — goto-def already
+  resolves module identifiers in `use`/`use parent`/`use base qw()`/`with`
+  (empirically verified). The landed verb covers ONLY the non-symbol
+  ranges nothing else reaches: POD `L<...>` links, URLs in comments/POD,
+  and existence-checked string-path loads. The empirical coverage table
+  lives with the 2026-08-17 audit notes; the durable rule: a verb that
+  duplicates goto-def with an underline is not worth surface area, so
+  measure coverage before believing a capability-diff line item.
 
 ## The finding
 

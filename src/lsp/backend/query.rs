@@ -73,6 +73,53 @@ impl QueryCx {
         )
     }
 
+    /// `set()` for a caller that already holds a `FileKey` — the hierarchy
+    /// handlers re-anchor at an ITEM's file, which is Path-keyed when closed.
+    pub(super) fn set_at<'a>(
+        &'a self,
+        lookup: &'a dyn crate::model::file_analysis::CrossFileLookup,
+        analysis: &'a crate::model::file_analysis::FileAnalysis,
+        key: FileKey,
+        point: tree_sitter::Point,
+        scope: crate::index::resolve::OverrideScope,
+    ) -> crate::index::resolve::CandidateSet<'a> {
+        crate::index::resolve::resolve(&self.files, analysis, key, point, Some(lookup), scope)
+    }
+
+    /// The analysis + key + language a hierarchy ITEM re-anchors at.
+    /// Hierarchy requests (supertypes/subtypes/incoming/outgoing) hand back
+    /// an item pointing at a file that need not be open; this resolves it
+    /// across the same tiers the reference walk sweeps (open doc, workspace
+    /// entry, cached registration — rehydrated when evicted). Closed files
+    /// key by Path so tier attribution matches the CLI mirrors.
+    pub(super) fn item_anchor(
+        &self,
+        uri: &Url,
+    ) -> Option<(
+        Arc<crate::model::file_analysis::FileAnalysis>,
+        FileKey,
+        String,
+    )> {
+        if let Some(doc) = self.files.get_open(uri) {
+            return Some((
+                Arc::clone(&doc.analysis),
+                FileKey::Url(uri.clone()),
+                doc.language.to_string(),
+            ));
+        }
+        let path = uri.to_file_path().ok()?;
+        let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
+        let lang = reg
+            .for_path(&path)
+            .map(|d| d.id().to_string())
+            .unwrap_or_else(|| reg.fallback().id().to_string());
+        let routed = self.module_index.lookup_for(&lang);
+        let key = FileKey::Path(path);
+        let analysis =
+            crate::index::resolve::analysis_for_key(&self.files, Some(routed.as_lookup()), &key)?;
+        Some((analysis, key, lang))
+    }
+
     /// workspace/symbol's relational pass (SQLite over every attached tier).
     pub(super) fn sym_rows(&self, query: &str) -> Vec<crate::index::module_cache::SymRowHit> {
         symbols::sym_row_search(&self.module_index, query)

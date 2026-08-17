@@ -63,7 +63,8 @@ async fn main() {
         // (positional, 0-based/byte) or `--at <file>:<line>:<col>` (editor,
         // 1-based/char). Flag names map 1:1 to the `run_one` query string.
         Some(
-            flag @ ("--definition" | "--references" | "--implementations" | "--completion"
+            flag @ ("--definition" | "--type-definition" | "--references" | "--implementations"
+            | "--type-hierarchy" | "--call-hierarchy" | "--completion"
             | "--signature-help" | "--document-highlight" | "--linked-editing"),
         ) if args.len() >= 4 => {
             cli_cursor(&flag[2..], &args[2], &args[3..]);
@@ -71,6 +72,10 @@ async fn main() {
         }
         Some("--semantic-tokens") if args.len() >= 4 => {
             cli_semantic_tokens(&args[2], &args[3]);
+            return;
+        }
+        Some("--document-link") if args.len() >= 4 => {
+            cli_document_link(&args[2], &args[3]);
             return;
         }
         // `--rename <root> <file> <line> <col> <new>` or

@@ -124,6 +124,8 @@ mod outline;
 pub use outline::*;
 mod navigate;
 pub use navigate::*;
+mod links;
+pub use links::*;
 mod completion;
 pub use completion::*;
 mod hover;

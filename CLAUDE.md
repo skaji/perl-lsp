@@ -256,7 +256,7 @@ Inspect any snippet's CST with `perl-lsp --parse <file>` (or `echo '...' | perl-
 
 ## LSP capabilities
 
-documentSymbol, definition, references, hover, rename (+ prepareRename), completion, signatureHelp, inlayHint, documentHighlight, selectionRange, foldingRange, formatting (perltidy), rangeFormatting, semanticTokens/full, codeAction (auto-import), workspace/symbol, diagnostics (unresolved function/method warnings).
+documentSymbol, definition, typeDefinition, references, hover, rename (+ prepareRename), completion, signatureHelp, inlayHint, documentHighlight, selectionRange, foldingRange, formatting (perltidy), rangeFormatting, semanticTokens/full, codeAction (auto-import), workspace/symbol, diagnostics (unresolved function/method warnings), callHierarchy (incoming = the heatmap's `references()` projection, outgoing = the fan-out lane), typeHierarchy (one `GraphView` level per request; advertised via DYNAMIC registration only — lsp-types 0.94 has no `type_hierarchy_provider` field), documentLink (non-symbol ranges only: POD `L<>`, comment/POD URLs, existence-checked `require "path"`/`use lib` paths — module identifiers stay goto-def's job; client-POLLED, so it must stay text-scan cheap and never kick resolution).
 
 ## Key dependencies
 

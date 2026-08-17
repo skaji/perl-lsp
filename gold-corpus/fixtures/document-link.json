@@ -1,0 +1,47 @@
+{
+  "capability": "document-link",
+  "rows": [
+    {
+      "id": "dlink-pod-links-and-comment-url",
+      "difficulty": "simple",
+      "semantic_area": "non-symbol-ranges",
+      "root": "gold-corpus/doclink-fixture",
+      "file": "lib/DL/Doc.pm",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "5:12\thttps:example.com/tracker/42",
+          "11:1\tTarget.pm",
+          "12:23\thttps:example.com/spec"
+        ],
+        "none": [
+          "No::Such"
+        ]
+      },
+      "status": "gold",
+      "note": "documentLink covers ONLY what goto-def can't reach: a comment URL, POD L<Module> (resolved against the registered universe), POD L<url>. L<No::Such::Module> yields NO link (unresolvable → honest miss, never a guessed target), and `use DL::Target` gets no link at all — module identifiers are goto-def's job. (The https:example.com spelling is the harness path-normalizer eating `//` before `example.com` — raw output carries the full URL.)"
+    },
+    {
+      "id": "dlink-string-path-loads-existence-gated",
+      "difficulty": "simple",
+      "semantic_area": "non-symbol-ranges",
+      "root": "gold-corpus/doclink-fixture",
+      "file": "script/main.pl",
+      "line": 0,
+      "col": 0,
+      "expect": {
+        "all": [
+          "2:10\t",
+          "doclink-fixture/lib",
+          "3:10\tutil.pl"
+        ],
+        "none": [
+          "nope"
+        ]
+      },
+      "status": "gold",
+      "note": "`use lib 'lib'` links to the existing dir (root-anchored), `require \"helpers/util.pl\"` to the existing file; `require \"missing/nope.pl\"` yields NO link — existence-gated, a wrong-file link is worse than none."
+    }
+  ]
+}

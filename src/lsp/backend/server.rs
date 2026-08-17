@@ -47,6 +47,19 @@ impl LanguageServer for Backend {
         self.work_done_progress
             .store(wdp, std::sync::atomic::Ordering::Relaxed);
 
+        // lsp-types 0.94 can't spell a static `typeHierarchyProvider`, so the
+        // verb is advertised by dynamic registration — only to clients that
+        // opted in (registering at a client that didn't is a spec violation).
+        let th_dyn = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|t| t.type_hierarchy.as_ref())
+            .and_then(|t| t.dynamic_registration)
+            .unwrap_or(false);
+        self.type_hierarchy_dynamic
+            .store(th_dyn, std::sync::atomic::Ordering::Relaxed);
+
         // Opt-in diagnostics from `initializationOptions.diagnostics`.
         // The `diagnostics` sub-object deserializes straight into
         // `DiagnosticOptions` (the struct is the schema — camelCase keys,
@@ -118,7 +131,12 @@ impl LanguageServer for Backend {
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                // NOTE: no `type_hierarchy_provider` field exists in lsp-types
+                // 0.94 — the verb is served and advertised via dynamic
+                // registration in `initialized` (see `type_hierarchy_dynamic`).
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 rename_provider: Some(OneOf::Right(RenameOptions {
@@ -149,6 +167,12 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
                 document_highlight_provider: Some(OneOf::Left(true)),
+                // Links are fully resolved in the initial pass (registered-
+                // only lookups), so no lazy documentLink/resolve round-trip.
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
@@ -222,13 +246,26 @@ impl LanguageServer for Backend {
                 })
                 .collect()
         };
-        let registrations = vec![Registration {
+        let mut registrations = vec![Registration {
             id: "perl-file-watcher".to_string(),
             method: "workspace/didChangeWatchedFiles".to_string(),
             register_options: Some(serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
                 watchers,
             }).unwrap()),
         }];
+        // typeHierarchy: dynamic-only advertisement (lsp-types 0.94 has no
+        // static field). Registering `prepare` implies the supertypes/
+        // subtypes requests per spec.
+        if self
+            .type_hierarchy_dynamic
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            registrations.push(Registration {
+                id: "perl-type-hierarchy".to_string(),
+                method: "textDocument/prepareTypeHierarchy".to_string(),
+                register_options: None,
+            });
+        }
         let _ = self.client.register_capability(registrations).await;
 
         // Workspace indexing is LAZY + per-language — the first `did_open` of a
@@ -557,6 +594,267 @@ impl LanguageServer for Backend {
                 }
             }
             None
+        })
+        .await
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: request::GotoTypeDefinitionParams,
+    ) -> Result<Option<request::GotoTypeDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        // Cold-open bounded waits, mirroring goto-def: the value's type may
+        // resolve through imports, so the family index matters here too.
+        self.await_open_ready(uri, WaitPolicy::Interactive).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Interactive).await;
+        }
+        // Snapshot + drop the store guard before `resolve()` (reentrant
+        // `for_each_open`); see `Document::analysis`.
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+        let uri = uri.clone();
+        self.run_query(move |cx| {
+            // The type axis of the same set goto-def projects: value type →
+            // dispatch class → class definition(s). Honest miss when the
+            // type doesn't infer — no name-only fallback.
+            let routed = cx.routed(language);
+            let cs = cx.set(
+                routed.as_lookup(),
+                &analysis,
+                &uri,
+                symbols::position_to_point(pos),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            refs_to_locations(cs.type_definitions()).map(GotoDefinitionResponse::Array)
+        })
+        .await
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Complete).await;
+        }
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+        let uri = uri.clone();
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let cs = cx.set(
+                routed.as_lookup(),
+                &analysis,
+                &uri,
+                symbols::position_to_point(pos),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            cs.hierarchy_type_item()
+                .as_ref()
+                .and_then(symbols::to_type_hierarchy_item)
+                .map(|i| vec![i])
+        })
+        .await
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let item = params.item;
+        self.run_query(move |cx| {
+            // Re-anchor at the item's own declaration file — the analysis
+            // that carries the class's local parent edges.
+            let (analysis, key, language) = cx.item_anchor(&item.uri)?;
+            let routed = cx.routed(&language);
+            let cs = cx.set_at(
+                routed.as_lookup(),
+                &analysis,
+                key,
+                symbols::position_to_point(item.selection_range.start),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            let items: Vec<TypeHierarchyItem> = cs
+                .supertypes()
+                .iter()
+                .filter_map(symbols::to_type_hierarchy_item)
+                .collect();
+            Some(items)
+        })
+        .await
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let item = params.item;
+        self.run_query(move |cx| {
+            let (analysis, key, language) = cx.item_anchor(&item.uri)?;
+            let routed = cx.routed(&language);
+            let cs = cx.set_at(
+                routed.as_lookup(),
+                &analysis,
+                key,
+                symbols::position_to_point(item.selection_range.start),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            let items: Vec<TypeHierarchyItem> = cs
+                .subtypes()
+                .iter()
+                .filter_map(symbols::to_type_hierarchy_item)
+                .collect();
+            Some(items)
+        })
+        .await
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        self.await_open_ready(uri, WaitPolicy::Complete).await;
+        if let Some(language) = self.files.get_open(uri).map(|d| d.language) {
+            self.await_index_ready(language, WaitPolicy::Complete).await;
+        }
+        let (analysis, language) = match self.files.get_open(uri) {
+            Some(doc) => (Arc::clone(&doc.analysis), doc.language),
+            None => return Ok(None),
+        };
+        let uri = uri.clone();
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let cs = cx.set(
+                routed.as_lookup(),
+                &analysis,
+                &uri,
+                symbols::position_to_point(pos),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            cs.hierarchy_call_item()
+                .as_ref()
+                .and_then(symbols::to_call_hierarchy_item)
+                .map(|i| vec![i])
+        })
+        .await
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let item = params.item;
+        let scope = self.override_scope();
+        self.run_query(move |cx| {
+            let (analysis, key, language) = cx.item_anchor(&item.uri)?;
+            let routed = cx.routed(&language);
+            // The set minted at the DECLARATION — incoming is its
+            // `references()` image (the same projection heatmap fan-in
+            // counts), grouped by each site's enclosing callable.
+            let cs = cx.set_at(
+                routed.as_lookup(),
+                &analysis,
+                key,
+                symbols::position_to_point(item.selection_range.start),
+                scope,
+            );
+            let calls: Vec<CallHierarchyIncomingCall> = cs
+                .incoming_calls()
+                .iter()
+                .filter_map(|e| {
+                    Some(CallHierarchyIncomingCall {
+                        from: symbols::to_call_hierarchy_item(&e.item)?,
+                        from_ranges: e.sites.iter().map(|s| symbols::span_to_range(*s)).collect(),
+                    })
+                })
+                .collect();
+            Some(calls)
+        })
+        .await
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let item = params.item;
+        self.run_query(move |cx| {
+            let (analysis, key, language) = cx.item_anchor(&item.uri)?;
+            let routed = cx.routed(&language);
+            let cs = cx.set_at(
+                routed.as_lookup(),
+                &analysis,
+                key,
+                symbols::position_to_point(item.selection_range.start),
+                crate::index::resolve::OverrideScope::default(),
+            );
+            let calls: Vec<CallHierarchyOutgoingCall> = cs
+                .outgoing_calls()
+                .iter()
+                .filter_map(|e| {
+                    Some(CallHierarchyOutgoingCall {
+                        to: symbols::to_call_hierarchy_item(&e.item)?,
+                        from_ranges: e.sites.iter().map(|s| symbols::span_to_range(*s)).collect(),
+                    })
+                })
+                .collect();
+            Some(calls)
+        })
+        .await
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        let uri = &params.text_document.uri;
+        // Client-POLLED verb (editors ask on every open/change): no waits,
+        // no resolution kicks — one text scan over the stored buffer plus
+        // registered-only map lookups. An unknown module yields no link and
+        // appears once registration lands.
+        let (text, language) = match self.files.get_open(uri) {
+            Some(doc) => (doc.text.clone(), doc.language),
+            None => return Ok(None),
+        };
+        let self_dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let root = self
+            .module_index
+            .workspace_root()
+            .and_then(|r| Url::parse(&r).ok())
+            .and_then(|u| u.to_file_path().ok());
+        self.run_query(move |cx| {
+            let routed = cx.routed(language);
+            let links: Vec<DocumentLink> = symbols::document_links(
+                &text,
+                self_dir.as_deref(),
+                root.as_deref(),
+                Some(routed.as_lookup()),
+            )
+            .into_iter()
+            .filter_map(|l| {
+                Some(DocumentLink {
+                    range: symbols::span_to_range(l.span),
+                    target: Some(l.target.to_url()?),
+                    tooltip: None,
+                    data: None,
+                })
+            })
+            .collect();
+            (!links.is_empty()).then_some(links)
         })
         .await
     }

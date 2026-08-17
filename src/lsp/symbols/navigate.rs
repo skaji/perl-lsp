@@ -2,6 +2,43 @@
 
 use super::*;
 
+/// A hierarchy projection node → LSP `TypeHierarchyItem`. Pure mapping;
+/// unlocatable items (no URL) drop.
+pub fn to_type_hierarchy_item(
+    it: &crate::index::resolve::HierarchyItem,
+) -> Option<TypeHierarchyItem> {
+    let uri = it.location.to_url()?;
+    let range = span_to_range(it.location.span);
+    Some(TypeHierarchyItem {
+        name: it.name.clone(),
+        kind: fa_sym_kind_to_lsp(&it.kind),
+        tags: None,
+        detail: it.detail.clone(),
+        uri,
+        range,
+        selection_range: range,
+        data: None,
+    })
+}
+
+/// A hierarchy projection node → LSP `CallHierarchyItem`. Pure mapping.
+pub fn to_call_hierarchy_item(
+    it: &crate::index::resolve::HierarchyItem,
+) -> Option<CallHierarchyItem> {
+    let uri = it.location.to_url()?;
+    let range = span_to_range(it.location.span);
+    Some(CallHierarchyItem {
+        name: it.name.clone(),
+        kind: fa_sym_kind_to_lsp(&it.kind),
+        tags: None,
+        detail: it.detail.clone(),
+        uri,
+        range,
+        selection_range: range,
+        data: None,
+    })
+}
+
 /// Goto-definition: the forward projection of the resolution CandidateSet,
 /// adapted to LSP types. One location → Scalar; several (stacked handler
 /// registrations) → Array so the editor shows a picker. The LSP handler and

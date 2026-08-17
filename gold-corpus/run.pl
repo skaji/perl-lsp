@@ -90,8 +90,11 @@ $ENV{PERL_LSP_STRICT_RESIDENCY} //= '1';
 
 my %CAP = (
     'definition'         => { flag => '--definition',        root => 1, file => 1, lc => 1 },
+    'type-definition'    => { flag => '--type-definition',   root => 1, file => 1, lc => 1 },
     'references'         => { flag => '--references',         root => 1, file => 1, lc => 1 },
     'implementations'    => { flag => '--implementations',    root => 1, file => 1, lc => 1 },
+    'type-hierarchy'     => { flag => '--type-hierarchy',     root => 1, file => 1, lc => 1 },
+    'call-hierarchy'     => { flag => '--call-hierarchy',     root => 1, file => 1, lc => 1 },
     'hover'              => { flag => '--hover',              root => 1, file => 1, lc => 1 },
     'type-at'            => { flag => '--type-at',            root => 0, file => 1, lc => 1 },
     'completion'         => { flag => '--completion',         root => 1, file => 1, lc => 1 },
@@ -99,12 +102,13 @@ my %CAP = (
     'document-highlight' => { flag => '--document-highlight', root => 1, file => 1, lc => 1 },
     'linked-editing'     => { flag => '--linked-editing',     root => 1, file => 1, lc => 1 },
     'semantic-tokens'    => { flag => '--semantic-tokens',    root => 1, file => 1, lc => 0 },
+    'document-link'      => { flag => '--document-link',      root => 1, file => 1, lc => 0 },
     'outline'            => { flag => '--outline',            root => 0, file => 1, lc => 0 },
     'workspace-symbol'   => { flag => '--workspace-symbol',   root => 1, qarg => 1 },
     'rename'             => { flag => '--rename',             root => 1, file => 1, lc => 1, rename => 1 },
     'diagnostics'        => { check => 1 },
 );
-my %JSON_CAP = map { $_ => 1 } qw(references implementations workspace-symbol outline rename diagnostics);
+my %JSON_CAP = map { $_ => 1 } qw(references implementations type-hierarchy call-hierarchy workspace-symbol outline rename diagnostics);
 
 sub run_cmd {                       # argv -> (stdout, crashed?)  [stderr dropped]
     my ($argv) = @_;

@@ -97,6 +97,13 @@ pub struct Backend {
     /// useful — when it did; sending it anyway wedges indexing behind a
     /// request minimal clients never answer.
     work_done_progress: Arc<std::sync::atomic::AtomicBool>,
+    /// Did the client advertise `textDocument.typeHierarchy.dynamicRegistration`?
+    /// lsp-types 0.94 (pinned by tower-lsp 0.20) has no
+    /// `type_hierarchy_provider` field on `ServerCapabilities`, so the verb —
+    /// fully served (`prepare_type_hierarchy`/`supertypes`/`subtypes`) — is
+    /// advertised the only spec-legal way left: dynamic registration in
+    /// `initialized`, gated on this flag.
+    type_hierarchy_dynamic: Arc<std::sync::atomic::AtomicBool>,
     /// The pack-file invalidation owner (`index::pack_invalidator`): the
     /// serialization lock, the H9-2 bulk-index coordinator, and the H9-1
     /// generation discipline live THERE. Backend only forwards events

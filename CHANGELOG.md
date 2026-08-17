@@ -6,6 +6,26 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+### Four new LSP verbs, all projections of existing machinery
+
+- **Go to type definition** — `$obj` jumps to the definition of its
+  inferred class (every file declaring a split package). Strictly
+  type-driven: when nothing infers, it answers nothing. CLI:
+  `--type-definition <root> <file> <line> <col>`.
+- **Type hierarchy** — supertypes/subtypes one inheritance level per
+  request over the same edge graph goto-implementation walks. Advertised
+  via dynamic registration (lsp-types 0.94 cannot spell the static
+  capability). CLI: `--type-hierarchy`.
+- **Call hierarchy** — incoming calls are the same references projection
+  the heatmap counts fan-in from (the two agree by construction); outgoing
+  calls are the in-body call refs behind heatmap fan-out, each resolved to
+  its definition. CLI: `--call-hierarchy`.
+- **Document links** — only the ranges goto-def cannot reach: POD `L<...>`
+  links, URLs in comments/POD, and existence-checked string-path loads
+  (`require "path.pl"`, `use lib 'lib'`). Module names in `use`/`require`
+  stay goto-def's job. Unresolvable targets yield no link. CLI:
+  `--document-link <root> <file>`.
+
 ## v0.7.0 — 2026-07-12
 
 ### C/C++ support (opt-in build feature `cpp`)
