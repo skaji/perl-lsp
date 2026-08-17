@@ -124,10 +124,16 @@ workspace/in-scope tier has no scale cap. Broken at any size; invisible below
 Each of these was anonymous until `3fef0120` added breadcrumbs; all now have
 named inputs.
 
-- **`src/build/pod.rs:20`** — `result[..2000]` byte-slices inside a multibyte
-  char. Victims: `Test-BDD-Cucumber-Definitions-0.38/-0.39
-  lib/.../Base/Ru.pm` (Russian POD). Caught per-file, so the file's analysis
-  is silently lost. Minutes to fix.
+- ~~**`src/build/pod.rs:20`**~~ — **fixed, `f47c002b`.** `result[..2000]`
+  byte-sliced inside a multibyte char. Victims:
+  `Test-BDD-Cucumber-Definitions-0.38/-0.39 lib/.../Base/Ru.pm` (Russian POD).
+  Caught per-file, so the file's analysis vanished silently — not a crash, a
+  disappearance. The rule now lives once, in
+  `util::text::truncate_on_char_boundary`, shared with `for_path_sniffed`
+  (which had the correct spelling all along; two spellings of one rule is how
+  the wrong one survives). The regression test sweeps a byte-shift: the first
+  version of it passed with the bug fully present, because whether the cap
+  straddles a character depends on alignment.
 - **Fold-64 non-convergence** — the debug safety net firing in production;
   the lattice is not reaching a fixed point. Offenders:
   `Module-Generic-v1.7.0/lib/Module/Generic.pm`,
@@ -141,9 +147,15 @@ named inputs.
 - **hover empty on a `Koha::Database` module-name token** where goto-def works
   at the same position — adjacent to the require/hover family fixed in
   `5e97516b`.
-- **`epoch.gen_stamp_missing = 1074`** in the soak's shutdown dump, with no
-  workload twin. Correlated with nothing; a counter incrementing a thousand
-  times unexplained is worth one look.
+- ~~**`epoch.gen_stamp_missing = 1074`**~~ — **closed, not a bug.** It counts
+  warm @INC providers that needed a registration generation, stamped once at
+  resolver startup. Measured on crm: 1,151 warm entries → 1,080 distinct paths
+  (71 rows are name-aliases sharing a file) → 1,073 stamped (7 already carried
+  a generation from the concurrent workspace front door). The run-to-run ±1 is
+  that race, and `or_insert` makes it benign by design — the front-door
+  generation wins, exactly as the function's doc comment says. Each stamp also
+  bumps `gen_counter`, a leg of `enrichment_epoch`, so no memo taken during the
+  window survives it.
 
 # Tier 3 — correctness debt
 
