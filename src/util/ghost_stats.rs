@@ -178,13 +178,35 @@ pub fn emit_attribution(moment: &str) {
     emit_text(&out);
 }
 
+/// Emits `emit_all` when it goes out of scope.
+///
+/// `main`'s CLI arms each `return` on their own, so one guard at the top of
+/// `main` reaches every verb without twenty call sites having to remember.
+/// It deliberately does NOT cover `std::process::exit`, which skips `Drop`:
+/// the server path emits explicitly before its hard exit, and the CLI's
+/// `exit(1)`/`exit(2)` arms are argument and I/O errors with no run to report.
+pub struct EmitOnDrop(&'static str);
+
+impl EmitOnDrop {
+    pub fn new(moment: &'static str) -> Self {
+        Self(moment)
+    }
+}
+
+impl Drop for EmitOnDrop {
+    fn drop(&mut self) {
+        emit_all(self.0);
+    }
+}
+
 fn registry() -> &'static Mutex<Vec<Weak<GhostStats>>> {
     static R: OnceLock<Mutex<Vec<Weak<GhostStats>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Emit every live cache's report now ("on demand" — wired to LSP shutdown
-/// and CLI end-of-run). No-op when the gate is off.
+/// Emit every live cache's report now. Wired to LSP shutdown (explicitly,
+/// before the hard exit) and to CLI end-of-run (via `EmitOnDrop` in `main`).
+/// No-op when the gate is off.
 pub fn emit_all(moment: &str) {
     if !enabled() {
         return;

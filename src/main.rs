@@ -19,6 +19,14 @@ use tower_lsp::{LspService, Server};
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // Both of these must precede the CLI dispatch, because every verb returns
+    // out of it: the logger so `RUST_LOG` reaches CLI runs (a CLI verb does
+    // the same startup the server does, and it is the cheaper thing to debug),
+    // and the ghost trail as a scope guard rather than one emit per arm.
+    // Both inert unless their env var is set.
+    env_logger::init();
+    let _ghost_trail = util::ghost_stats::EmitOnDrop::new("cli-eof");
+
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return;
@@ -161,8 +169,6 @@ async fn main() {
         }
         _ => {}
     }
-
-    env_logger::init();
 
     // Bridge stdio through dedicated OS threads instead of `tokio::io::stdin()`
     // / `stdout()`. Tokio's stdin wrapper has a lost-wakeup race under load: a
