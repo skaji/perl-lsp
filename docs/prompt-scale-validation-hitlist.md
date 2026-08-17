@@ -71,9 +71,21 @@ crashes) on the commit before its fix, not just passes after.
 | `9d5e1cc0` | T2 `gen_stamp_missing` | closed as explained; not a bug |
 | `98bf42da` | (found en route) | qualified calls stop binding to same-named local subs |
 | `fed8ac00` | **T1 #2** + T2 fold-64 | depth gate before the recursion; monotone propagator repair |
+| `b6312ea2` | **T1 #3** + **T1 #4** | `refs_present` axis reader + rows lane; completion capped at 200 |
+| `d9053e4f` | **T1 #1** (the "no answers" half) | no synchronous CPU in a handler — they share one task |
 
-Verified at the full bar with the cpp feature on: 1,505 unit · 489 gold
-(0 FAIL / 0 CRASH) · e2e 113/0 · e2e-cpp 0.
+Verified at the full bar with the cpp feature on, after each integration:
+1,511 unit · 491 gold (0 FAIL / 0 XPASS / 0 CRASH) · e2e 113/0 · e2e-cpp 0.
+
+**All four Tier 1 rows have moved.** #2, #3 and #4 are closed; #1 is closed
+for the half that made it worst-in-class (no answers) with the writer-drain
+diagnostics blackout characterized and deliberately deferred.
+
+**Corpus-scale corroboration.** The 138k cold walk on the fixed binary
+produced ZERO `pod.rs` multibyte panics and ZERO fold-64 bails, against 2 pod
+panics and 3+ fold bails on every baseline walk. `f47c002b` and `fed8ac00`
+ship with single-file tests; this run is the only thing that exercises them at
+122x, which makes it the stronger evidence of the two.
 
 Two notes worth keeping:
 
@@ -89,7 +101,7 @@ Two notes worth keeping:
 
 # Tier 1 — blocks the target market
 
-### 1. Post-cold-index availability hole
+### 1. Post-cold-index availability hole — **"no answers" FIXED `d9053e4f`**
 After the bulk walk, a ~10-minute resolve/enrichment phase **wedges every
 verb** — opens, hovers, completions all hit the 120 s timeout — at 7.6–8.0 GB
 RSS. A warm **restart of the identical state is ready in 1 s at 255 MB**:
@@ -105,6 +117,42 @@ Memory is all anonymous heap (`RssAnon` 7.65/7.69 GB); work during the window
 added +286 MB — mild live growth, not clean reuse. The live-vs-allocator
 split was **not** cleanly separable because the background phase never went
 quiet; the availability hole is the sharper finding.
+
+**Root cause — and it is a property of the runtime, not of `did_open`.**
+tower-lsp 0.20's `serve()` polls the stdin reader and every handler future
+inside ONE joined task (`buffer_unordered` is concurrency *within* the task,
+not across threads). Any synchronous CPU in any handler therefore stalls every
+other handler and the message reader until it yields. `did_open` ran
+`enrich_open` synchronously in its handler: 344 s of CPU for one `Dancer2.pm`
+against the 138k index, answering nothing meanwhile. Smoking gun: `def-d2`
+returned at the *exact millisecond* Dancer2's diagnostics published, having
+had no work of its own to do. Lock contention was ruled out — busy threads were
+R-state in decode, idle workers parked in futex normally. The standing rule
+(**no synchronous CPU in a handler future, ever**) now lives in
+`src/lsp/backend/query.rs`'s module doc.
+
+Measured, cpan5k cold: hover 120,000 ms TIMEOUT → 0.7 ms; def 44,498 ms →
+0.3 ms; recovery instant vs +1,471 s. Baseline at load 1–8, after at 7–32 on
+20 cores — only categorical results banked; the 691 s → 612 s gate-open delta
+is **not** claimed.
+
+**Still open — the writer-drain window.** Diagnostics stay deferred for the
+~7–9 min the single-threaded persist writer drains its unbounded backlog
+(~7 GB RSS), and Complete verbs still wait their 120 s cap in it. Now
+honestly announced ("Saving index to cache…") instead of a silent 100%.
+The gate cannot simply open at walk end: stripped fresh copies register only
+post-commit, so an evicted copy without a committed blob rehydrates to
+wrong-empty and rows-based queries would be silently partial. The fix is a
+`attached` / `durable` gate split plus worker-time registration behind a
+pending-blob overlay — it touches exactly the residency seams the narrow-seam
+review still owes, so it waits for that review rather than being rushed here.
+
+**Also handed off** (resolve/enrichment lane, not availability): three heavy
+opens cost 279 enrichments / ~1.77M blob decodes / 730k `cycle_declines`.
+Roots are the package→SET-of-files candidate relation at 122x (5–12 declaring
+files for a common name), transitive overlay fan-out, and Perl's still-empty
+`ScopedLookup` slot (T3). This is why one doc's diagnostics take 68 s — real
+cost, but background cost now.
 
 ### 2. Fatal stack overflow on deep CSTs — P0 — **FIXED `fed8ac00`**
 The builder's `visit_node` → `visit_children` → `visit_function_call` walk
@@ -122,7 +170,7 @@ walk removes the class but is a core-traversal rewrite and belongs in its own
 arc. A gold fixture of the two-copy dir is a free crash canary — `run.pl`
 already hard-fails aborts.
 
-### 3. `references` terminal at scale — the missing refs axis reader
+### 3. `references` terminal at scale — **FIXED `b6312ea2`**, and the attribution was half wrong
 120 s DNF at 122×; 5.6 s at Koha. Root-caused by controlled A/B:
 `PERL_LSP_NO_EVICT=1` collapses the walk 5,613 → 1,357 ms (repeat
 3,647 → 842 ms). **~4× of the cost is blob decode of evicted candidates, not
@@ -137,15 +185,40 @@ over (that one took decodes 29,988 → 182).
 NO_EVICT is *not* the fix: whole-copy residency was 977 MB at 3.5k files,
 ≈28 GB at 100k.
 
+**What landed, and the correction.** `refs_present` serves resident when refs
+and symbols survived and rehydrates otherwise, through a rows lane that
+retains bag-stripped copies (the bag is 52% of a Koha analysis's heap, so the
+same 128 MiB budget caches ~2x denser). Koha `store`: 5,493 → 3,362 ms cold,
+~8,000 → ~4,300 decodes, RSS 852 → 657 MB, answers byte-identical.
+
+A naive bag-strip **loses 106 sites** at Koha, because a chained
+`->set(..)->store` re-derives its invocant through the candidate's own bag.
+The matcher therefore runs on a view that upgrades per file to whole when a
+ref's verdict isn't baked — over-approximating on purpose, since a wrong
+upgrade costs one decode and never an answer.
+
+**The cpan5k attribution above was wrong.** Decode-per-candidate was the real
+root cause at Koha, but at 122x the walk is already **181 ms** (91 candidates)
+and the 120 s DNF is *entirely* `references`' Complete wait on an open-doc
+heal that never lands — i.e. row #1's territory. Neither fix alone clears that
+number; **the two together are what should**, and that combination is
+unmeasured. See "Validation still owed".
+
 Related, same root: **repeat refs never cache-hit** — RSS plateaus
 (566→635 MB over 6 identical queries, bounded, not a leak) while latency stays
 ~3.4 s. Capacity thrash; memory grows and buys nothing. `refs_present` makes
 it moot — no decode, nothing to cache.
 
-### 4. Completion payload unbounded
+### 4. Completion payload unbounded — **FIXED `b6312ea2`**
 7.8 MB / ~50k items per keystroke (21.3 MB in the post-cold state). The
 workspace/in-scope tier has no scale cap. Broken at any size; invisible below
 ~10k files.
+
+Capped at 200: narrowed by the typed prefix first, then ranked by the client's
+own sort key before the cut, so the in-scope and imported tiers survive and
+the auto-import firehose is what goes; `isIncomplete` makes the client
+re-query as the prefix grows. **7,289,367 B / 236 ms → 55,853 B / 4 ms.**
+Under the cap nothing changes at all — an ordinary file's list is untouched.
 
 # Tier 2 — cheap, and now debuggable
 
@@ -229,6 +302,11 @@ named inputs.
 
 # Validation still owed
 
+- **The T1 #1 + T1 #3 combination on cpan5k.** Neither fix alone clears the
+  120 s `references` DNF: the walk is 181 ms, and the rest was the availability
+  wait that `d9053e4f` addresses. They are now both in, and the combined number
+  has NOT been measured. This is the cheapest outstanding measurement and the
+  one most likely to close a headline row outright — do it first.
 - **Differential sweep** — main vs branch over thousands of positions, turning
   "review 130k lines" into "adjudicate a divergence list".
 - **Pack-language soak** — today's was Perl-only, so `PackBagCache`, where the
