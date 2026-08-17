@@ -246,14 +246,17 @@ impl<'a> Builder<'a> {
                 if crate::model::conventions::is_current_package_token(text) {
                     return self.package_for_node(node).map(InferredType::ClassName);
                 }
-                let bare = bare_name(text);
                 // Bareword invocant is ambiguous: class-name reference
                 // OR zero-arg function call whose return type seeds
                 // the chain (`app->routes` where `sub app :: Mojolicious`).
                 // Prefer the function-call interpretation; fall back
-                // to treating the text as a class.
-                if let Some(t) = self.bag_query_named_sub(bare, Some(0)) {
-                    return Some(t);
+                // to treating the text as a class. A qualified bareword the
+                // file declares no package for is a class name, never a local
+                // sub — `Foo::Bar` must not bind to some `sub Bar` here.
+                if let Some(bare) = self.local_callee_name(text) {
+                    if let Some(t) = self.bag_query_named_sub(bare, Some(0)) {
+                        return Some(t);
+                    }
                 }
                 Some(InferredType::ClassName(text.to_string()))
             }
@@ -331,10 +334,15 @@ impl<'a> Builder<'a> {
                 }
                 let func = node.child_by_field_name("function")?;
                 let name = func.utf8_text(self.source).ok()?;
+                // The cross-file arm below pairs this tail with an EXPLICITLY
+                // resolved package, so it is entitled to the bare name; only
+                // the local lookup has to clear the qualifier gate.
                 let bare = bare_name(name);
                 let arg_count = self.extract_call_args(node).len() as u32;
-                if let Some(t) = self.bag_query_named_sub(bare, Some(arg_count)) {
-                    return Some(t);
+                if let Some(local) = self.local_callee_name(name) {
+                    if let Some(t) = self.bag_query_named_sub(local, Some(arg_count)) {
+                        return Some(t);
+                    }
                 }
                 // Parity with the method form: an imported function resolves
                 // its return like the remote class method it aliases, so a

@@ -301,7 +301,11 @@ impl<'a> Builder<'a> {
             | "ambiguous_function_call_expression"
             | "bareword"
             | "scoped_identifier" => {
-                let bare = self.forward_callee_name(node)?;
+                let called = self.forward_callee_name(node)?;
+                // The constraint-name table keys on the bare name; the symbol
+                // lookup below gets the qualified spelling, which is the half
+                // that decides whether a local sub is even a candidate.
+                let bare = bare_name(&called).to_string();
                 // Type::Tiny constraint constructor (`InstanceOf['Foo']`): the
                 // call is a *value* of type `TypeConstraintOf(inner)` — you
                 // call `->check` on it, not Foo's methods. The plugin folds the
@@ -314,7 +318,7 @@ impl<'a> Builder<'a> {
                         ));
                     }
                 }
-                let sid = self.find_callee_symbol(&bare)?;
+                let sid = self.find_callee_symbol(&called)?;
                 Some(WitnessPayload::Edge(WitnessAttachment::Symbol(sid)))
             }
 
@@ -514,11 +518,13 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Bare callee name for an expression node whose `expr_payload`
-    /// arm resolves to `Edge(Symbol(sid))`. `None` for any other
-    /// kind. Sole source of truth for "what sub-name does this node
-    /// reference" — `expr_payload`'s call arm calls this for the
-    /// live lookup.
+    /// Callee name for an expression node whose `expr_payload` arm resolves
+    /// to `Edge(Symbol(sid))`, **as written** — a qualifier is kept, because
+    /// `Foo::bar()` and `bar()` do not name the same sub and only the
+    /// qualifier says which. `None` for any other kind. Sole source of truth
+    /// for "what sub does this node reference" — `expr_payload`'s call arm
+    /// calls this for the live lookup, and `find_callee_symbol` is what
+    /// decides whether the qualifier admits a local sub.
     pub(super) fn forward_callee_name(&self, node: Node<'a>) -> Option<String> {
         let raw = match node.kind() {
             "function_call_expression" | "ambiguous_function_call_expression" => {
@@ -527,7 +533,7 @@ impl<'a> Builder<'a> {
             "bareword" | "scoped_identifier" => node.utf8_text(self.source).ok()?,
             _ => return None,
         };
-        Some(bare_name(raw).to_string())
+        Some(raw.to_string())
     }
 
     /// Post-walk: re-call `expr_payload` on every queued node. By

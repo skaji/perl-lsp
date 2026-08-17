@@ -1507,11 +1507,39 @@ impl<'a> Builder<'a> {
     /// time and post-walk via `resolve_forward_expr_witnesses`'s
     /// retry. One lookup, two emission paths, byte-identical
     /// witnesses.
-    pub(super) fn find_callee_symbol(&self, bare: &str) -> Option<SymbolId> {
+    pub(super) fn find_callee_symbol(&self, name: &str) -> Option<SymbolId> {
+        let (qualifier, bare) = crate::model::file_analysis::split_qualified(name);
         self.symbols
             .iter()
-            .find(|s| s.name == bare && matches!(s.kind, SymKind::Sub | SymKind::Method))
+            .find(|s| {
+                s.name == bare
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && qualifier_admits_local_sub(qualifier, s.package.as_deref())
+            })
             .map(|s| s.id)
+    }
+
+    /// The bare name to look a call up by, for callers that resolve through a
+    /// name-keyed query rather than a symbol id — `None` when the call's
+    /// qualifier rules out every sub this file declares.
+    ///
+    /// The name-keyed queries can only be asked about a bare name, so the
+    /// qualifier has to be honoured *before* the question is put to them.
+    /// Same predicate as `find_callee_symbol`, so the two cannot drift into
+    /// disagreeing about whether `Foo::bar()` is local.
+    pub(super) fn local_callee_name<'n>(&self, name: &'n str) -> Option<&'n str> {
+        let (qualifier, bare) = crate::model::file_analysis::split_qualified(name);
+        if qualifier.is_none() {
+            return Some(bare);
+        }
+        self.symbols
+            .iter()
+            .any(|s| {
+                s.name == bare
+                    && matches!(s.kind, SymKind::Sub | SymKind::Method)
+                    && qualifier_admits_local_sub(qualifier, s.package.as_deref())
+            })
+            .then_some(bare)
     }
 
     /// Locate the SymbolId for a Sub/Method named `name` whose body's
@@ -1632,5 +1660,29 @@ impl<'a> Builder<'a> {
                 d.plugin_id.clone(),
             );
         }
+    }
+}
+
+/// Whether a call written with `qualifier` may bind to a sub this file
+/// declares in `sym_package`.
+///
+/// The qualifier is not decoration: `Data::Dumper::stat()` and `stat()` name
+/// different subs, and `CORE::stat()` names the builtin *precisely because*
+/// something else called `stat` is in scope. Dropping it made every qualified
+/// call bind to any same-named local sub, which inverts the one thing the
+/// author wrote the qualifier to say.
+///
+/// An unqualified call keeps the plain name match. A qualified one has to name
+/// the declaring package — with `main` (and its bare `::foo` shorthand)
+/// covering subs in a file that declares no package at all. Nothing here knows
+/// about `CORE`: it names no package this file declares, so it falls out.
+fn qualifier_admits_local_sub(qualifier: Option<&str>, sym_package: Option<&str>) -> bool {
+    let Some(qualifier) = qualifier else {
+        return true;
+    };
+    let qualifier = if qualifier.is_empty() { "main" } else { qualifier };
+    match sym_package {
+        Some(pkg) => pkg == qualifier,
+        None => qualifier == "main",
     }
 }

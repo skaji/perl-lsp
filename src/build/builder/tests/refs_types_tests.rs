@@ -1215,3 +1215,74 @@ fn test_non_block_package_unaffected() {
     assert_eq!(b.package.as_deref(), Some("Bar"));
     assert_eq!(c.package.as_deref(), Some("Bar"));
 }
+
+// ---- Qualified call names ----
+//
+// A qualifier is not decoration. `Foo::bar()` and `bar()` name different subs,
+// and `CORE::stat()` names the builtin *precisely because* something else
+// called `stat` is in scope. Dropping it made every qualified call bind to any
+// same-named local sub, which inverts what the author wrote the qualifier to
+// say — and the wrong type then propagated into the caller's return.
+
+/// The declaring package's own name still binds: this is the case the strip
+/// existed to serve, and it has to keep working.
+#[test]
+fn qualified_call_to_own_package_binds_locally() {
+    let fa = build_fa(
+        "package T;\nsub helper { return 'x' }\nsub probe { my $s = T::helper(); return $s; }\n",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$s", Point::new(2, 20)),
+        Some(InferredType::String),
+    );
+}
+
+#[test]
+fn unqualified_call_binds_locally() {
+    let fa = build_fa(
+        "package T;\nsub helper { return 'x' }\nsub probe { my $s = helper(); return $s; }\n",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$s", Point::new(2, 20)),
+        Some(InferredType::String),
+    );
+}
+
+/// A qualifier naming a package this file does not declare must NOT reach a
+/// same-named local sub — the bug this pair of tests pins.
+#[test]
+fn qualified_call_to_foreign_package_does_not_bind_to_local_sub() {
+    let fa = build_fa(
+        "package T;\nsub stat { return 'x' }\nsub probe { my $s = Data::Dumper::stat('/tmp'); return $s; }\n",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$s", Point::new(2, 20)),
+        None,
+        "Data::Dumper::stat must not resolve to T::stat",
+    );
+}
+
+/// `CORE::` needs no special case: it names no package the file declares, so
+/// the general rule already excludes it.
+#[test]
+fn core_qualified_call_does_not_bind_to_local_sub() {
+    let fa = build_fa(
+        "package T;\nsub stat { return 'x' }\nsub probe { my $s = CORE::stat('/tmp'); return $s; }\n",
+    );
+    assert_eq!(
+        fa.inferred_type_via_bag("$s", Point::new(2, 20)),
+        None,
+        "CORE::stat names the builtin, never the local sub it is written to bypass",
+    );
+}
+
+/// A file that declares no package is `main`, so the `main::` spelling of its
+/// own subs still binds.
+#[test]
+fn main_qualified_call_binds_in_a_package_less_file() {
+    let fa = build_fa("sub helper { return 'x' }\nsub probe { my $s = main::helper(); return $s; }\n");
+    assert_eq!(
+        fa.inferred_type_via_bag("$s", Point::new(1, 20)),
+        Some(InferredType::String),
+    );
+}
