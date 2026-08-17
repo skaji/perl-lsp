@@ -16,21 +16,37 @@ marked otherwise; the drain re-derived each rationale against current code.
   `visit_const_usage`'s skip list wasn't merely dead — it made a real
   skip fail to happen, minting a bogus constant-FunctionCall ref under
   every bareword `require` (fixed with the `require_expression` work).
-  Swept against ts-parser-perl 1.1.4's node-types.json, two dead kinds
-  remain: `"no_statement"` (removed at the one site) and
-  `"parenthesized_expression"` — **27 dead Perl-side comparisons**
-  (`build/builder/`: frameworks 8, visit_method 5, visit_use 3,
-  visit_calls 2, extract 2, visit_decl 1, infra 1; `cst.rs` 4;
-  `lsp/cursor_context.rs` 1). **WARNING: the kind IS real in
-  tree-sitter-cpp — the 4 pack-side comparisons are LIVE**
-  (`build/cpp_reparse/defs.rs` 2, `build/query_extract/packs.rs` 2);
-  a sweep that deletes by string match breaks C++ paren handling.
-  The durable fix is worth more than the sweep: a test that extracts
-  each grammar's node kinds and asserts every string compared against
-  `kind()` in that language's code is one of them
-  (`layering_tests.rs` is the precedent for this kind of structural
-  assertion) — that turns the class into a build-time guarantee
-  instead of a periodic hunt.
+  Swept against ts-parser-perl 1.1.4's node-types.json. One genuinely
+  dead kind remains: `"no_statement"` (removed at the one site;
+  `no Foo;` parses as `use_statement`).
+
+  **`"parenthesized_expression"` is NOT debt — do not sweep it.** The 27
+  Perl-side arms (`build/builder/`: frameworks 8, visit_method 5,
+  visit_use 3, visit_calls 2, extract 2, visit_decl 1, infra 1;
+  `cst.rs` 4; `lsp/cursor_context.rs` 1) are deliberate forward-compat:
+  the kind is **coming in the next ts-parser-perl release** and has been
+  slow-walked because it is a breaking change. Essentially every
+  tree-sitter grammar carries this wrapper node — without it, aliases
+  and fields misbehave. The arms are inert today and correct the day the
+  parser lands; deleting them means writing them again. The 4 pack-side
+  comparisons (`build/cpp_reparse/defs.rs` 2,
+  `build/query_extract/packs.rs` 2) are live NOW — it is already a real
+  tree-sitter-cpp kind.
+  The durable fix is worth more than the sweep, but the naive version
+  is wrong: a test asserting every `kind()`-compared string exists in
+  the grammar would fail on the forward-compat arms above, and the
+  obvious response — deleting them — is the harmful outcome. The
+  tripwire has to distinguish a TYPO from an ANTICIPATION, and only a
+  declaration can do that. So: one named home for
+  forward-compat kinds (a `grammar_future` constant per kind, used at
+  every anticipating site), and a test asserting each `kind()`-compared
+  string is either a current grammar kind or a declared future one
+  (`layering_tests.rs` is the precedent for the structural assertion).
+  Then `"require_statement"` fails the test the day it is written,
+  `"parenthesized_expression"` passes because it is declared, and when
+  the parser lands the constant deletes and every site keeps working.
+  Without the declaration half, the tripwire is a hazard rather than
+  a net.
 
 - **Two include-BFS walkers + two `file_stamp` fns** (cpp_reparse vs
   module_cache): thrice examined, thrice left (different contracts/layers:
