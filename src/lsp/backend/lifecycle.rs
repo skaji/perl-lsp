@@ -180,6 +180,7 @@ impl Backend {
             client,
             files,
             change_debounce: Arc::new(dashmap::DashMap::new()),
+            diag_debounce: Arc::new(dashmap::DashMap::new()),
             perl_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pack_indexed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             work_done_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -324,22 +325,110 @@ impl Backend {
         });
     }
 
+    /// Build the shared context a background diagnostics derivation runs
+    /// with — Arcs only, safe to move into a spawned task.
+    pub(super) fn diag_ctx(&self) -> DiagCtx {
+        DiagCtx {
+            files: Arc::clone(&self.files),
+            module_index: Arc::clone(&self.module_index),
+            client: self.client.clone(),
+            options: self.diagnostic_options(),
+            perl_indexed: Arc::clone(&self.perl_indexed),
+            index_ready: Arc::clone(&self.index_ready),
+        }
+    }
+
+    /// Debounced, OFF-pipeline diagnostics refresh for one open doc: surface
+    /// record → publish → dirty-consumer republish, the exact sequence
+    /// `did_open`/`did_change`/`did_save` used to run INLINE in their handler
+    /// futures. tower-lsp polls every handler future (and the stdin reader)
+    /// inside ONE joined task, so the synchronous enrichment this sequence
+    /// pays (minutes against a 100k-file index) head-of-line blocked every
+    /// other verb — the post-cold-index availability hole. Here the fire is
+    /// (a) debounced per URI so a keystroke burst pays one enrichment,
+    /// (b) serialized per URI so bodies never stack, and (c) derived on the
+    /// blocking pool so no reactor thread ever runs it.
+    pub(super) fn schedule_diag_refresh(&self, uri: Url) {
+        let gate = Arc::clone(
+            self.diag_debounce
+                .entry(uri.clone())
+                .or_default()
+                .value(),
+        );
+        let ctx = self.diag_ctx();
+        let handle = tokio::runtime::Handle::current();
+        let debounce = Arc::clone(&gate.debounce);
+        debounce.fire(&handle, std::time::Duration::from_millis(150), move |latest| async move {
+            // One refresh body per URI at a time; a waiter superseded while
+            // queued drops instead of replaying a stale generation.
+            let _serialized = gate.run.lock().await;
+            if !latest.still() {
+                return;
+            }
+            let recorded = ctx.record_surface(&uri);
+            ctx.publish(&uri).await;
+            // Surface-gated consumer refresh: a body edit stops here
+            // (Unchanged → empty dirty set); a contract change republishes
+            // the open docs that can see it.
+            if let Some(sd) = recorded {
+                ctx.republish_dirty(&sd.dirty).await;
+            }
+        });
+    }
+
+    /// Fire-and-forget republish of a dirty closure's OPEN docs — the
+    /// didClose/watcher spelling. Never awaited by a handler: each publish
+    /// re-enriches, and enrichment must not run (or be waited on) inside the
+    /// message pipeline.
+    pub(super) fn spawn_republish(&self, dirty: std::collections::HashSet<std::path::PathBuf>) {
+        if dirty.is_empty() {
+            return;
+        }
+        let ctx = self.diag_ctx();
+        tokio::spawn(async move {
+            ctx.republish_dirty(&dirty).await;
+        });
+    }
+}
+
+/// Everything a background diagnostics derivation needs, detached from
+/// `Backend` so it can move into spawned tasks (the diagnostics twin of
+/// `PackHealCtx`). Holds Arcs/handles only.
+#[derive(Clone)]
+pub(super) struct DiagCtx {
+    files: Arc<FileStore>,
+    module_index: Arc<ModuleIndex>,
+    client: Client,
+    options: symbols::DiagnosticOptions,
+    perl_indexed: Arc<std::sync::atomic::AtomicBool>,
+    index_ready: Arc<IndexReady>,
+}
+
+impl DiagCtx {
     /// The freshness engine's consumption half for OPEN docs: after an
     /// edit to `uri` rebuilt its analysis, record the new surface. An
     /// `Unchanged` verdict is the early-cutoff — a body edit refreshes
-    /// nobody. `Changed` re-enriches + republishes exactly the OPEN docs
-    /// in the transitive dirty closure (closed workspace consumers stay
-    /// correct through the query-time walks; their always-enriched
-    /// materialization is the next phase).
-    /// Records `Document::baseline_surface` — the build-time, pre-enrichment
-    /// projection — through `record_and_dirty_value`, the shared
-    /// record→verdict→dirty seam. Enrichment state can't reach the record by
-    /// construction, so this may run before or after any publish. The caller
-    /// acts on the returned set (republish).
-    pub(super) fn record_open_doc_surface(&self, uri: &Url) -> Option<crate::index::module_index::SurfaceDirty> {
+    /// nobody. Records `Document::baseline_surface` — the build-time,
+    /// pre-enrichment projection — through `record_and_dirty_value`, the
+    /// shared record→verdict→dirty seam. Enrichment state can't reach the
+    /// record by construction, so this may run before or after any publish.
+    /// The caller acts on the returned set (republish). Hub languages only —
+    /// pack freshness is the invalidator's disk-side gate.
+    pub(super) fn record_surface(
+        &self,
+        uri: &Url,
+    ) -> Option<crate::index::module_index::SurfaceDirty> {
+        let surface = {
+            let doc = self.files.get_open(uri)?;
+            if !crate::build::language_driver::LanguageRegistry::caps(doc.language)
+                .hub_enrichment
+            {
+                return None;
+            }
+            doc.baseline_surface.clone()?
+        };
         let path = uri.to_file_path().ok()?;
         let canon = std::fs::canonicalize(&path).unwrap_or(path);
-        let surface = self.files.get_open(uri)?.baseline_surface.clone()?;
         Some(self.module_index.record_and_dirty_value(
             &canon,
             surface,
@@ -350,7 +439,7 @@ impl Backend {
     /// Re-enrich + republish every OPEN doc in a dirty closure — the one
     /// speller of the membership rule (canonical-path match), shared by
     /// the in-editor verdict path and the watcher's aggregated closure.
-    pub(super) async fn republish_open_docs_in(
+    pub(super) async fn republish_dirty(
         &self,
         dirty: &std::collections::HashSet<std::path::PathBuf>,
     ) {
@@ -367,7 +456,7 @@ impl Backend {
             }
         });
         for u in to_refresh {
-            self.publish_diagnostics(&u).await;
+            self.publish(&u).await;
         }
     }
 
@@ -375,9 +464,11 @@ impl Backend {
     /// analysis. The one enrichment writer is `FileStore::enrich_open`
     /// (clone-and-enrich off the store lock, ptr-guarded swap); this path
     /// reads the artifact it returns, never mutates a stored analysis.
-    pub(super) async fn publish_diagnostics(&self, uri: &Url) {
+    /// The derivation (enrichment + collection) runs on the BLOCKING pool:
+    /// it is minutes of synchronous CPU against a large index, and any
+    /// future that runs it inline stalls tower-lsp's single serve task.
+    pub(super) async fn publish(&self, uri: &Url) {
         crate::util::ghost_stats::count("publish_diagnostics");
-        let options = self.diagnostic_options();
         let language = self.files.get_open(uri).map(|d| d.language);
         let diagnostics = match language {
             Some(l) if crate::build::language_driver::LanguageRegistry::caps(l).hub_enrichment => {
@@ -400,20 +491,29 @@ impl Backend {
                     crate::util::ghost_stats::count("publish_diagnostics.deferred");
                     return;
                 }
-                match self.files.enrich_open(uri, &*self.module_index) {
-                    Some(analysis) => {
-                        symbols::collect_diagnostics(&analysis, &self.module_index, options)
+                let files = Arc::clone(&self.files);
+                let idx = Arc::clone(&self.module_index);
+                let options = self.options;
+                let uri = uri.clone();
+                tokio::task::spawn_blocking(move || {
+                    match files.enrich_open(&uri, &*idx) {
+                        Some(analysis) => {
+                            symbols::collect_diagnostics(&analysis, &idx, options)
+                        }
+                        None => vec![],
                     }
-                    None => vec![],
-                }
+                })
+                .await
+                .unwrap_or_default()
             }
             // Pack languages stay honest-silent EXCEPT the always-on
             // member-access operator mismatch and the opt-in use-after-move
-            // (gated by `DiagnosticOptions.use_after_move`).
+            // (gated by `DiagnosticOptions.use_after_move`) — a cheap
+            // per-file read, no blocking hop needed.
             Some(_) => self
                 .files
                 .get_open(uri)
-                .map(|doc| symbols::pack_diagnostics(&doc.analysis, options))
+                .map(|doc| symbols::pack_diagnostics(&doc.analysis, self.options))
                 .unwrap_or_default(),
             None => vec![],
         };
@@ -470,9 +570,19 @@ fn make_on_refresh(
             log::debug!("diag-refresh executing");
             // Derive (uri, diagnostics) first without holding the store lock
             // across the await — publishing is async and could deadlock.
+            // The derive runs on the BLOCKING pool: this body is a tokio
+            // task, and a whole-open-set re-enrich is synchronous CPU that
+            // must never pin a reactor worker.
             let options = *diag_options.lock().unwrap();
-            let pending =
-                refresh_open_diagnostics(&files, module_index, options, OpenDocScope::All);
+            let pending = {
+                let files = Arc::clone(&files);
+                let module_index = Arc::clone(module_index);
+                tokio::task::spawn_blocking(move || {
+                    refresh_open_diagnostics(&files, &module_index, options, OpenDocScope::All)
+                })
+                .await
+                .unwrap_or_default()
+            };
             for (uri, diags) in pending {
                 client.publish_diagnostics(uri, diags, None).await;
             }

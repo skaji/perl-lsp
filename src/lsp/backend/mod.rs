@@ -85,6 +85,12 @@ pub struct Backend {
     /// macro-heavy C file) after typing settles, not one per keystroke.
     /// Pack languages only; Perl rebuilds synchronously (cheap).
     change_debounce: Arc<dashmap::DashMap<Url, Arc<ChangeGate>>>,
+    /// Per-document DIAGNOSTICS debounce (`schedule_diag_refresh`): the
+    /// enrich+collect+republish sequence runs off the message pipeline,
+    /// debounced and serialized per URI. Separate from `change_debounce` —
+    /// sharing one `DebouncedLatest` would let a diagnostics fire supersede
+    /// a pending pack rebuild (and vice versa).
+    diag_debounce: Arc<dashmap::DashMap<Url, Arc<ChangeGate>>>,
     /// Workspace indexing is LAZY + per-language: a family's index runs on the
     /// first `did_open` of a file in it, not eagerly at `initialized`. So a C++
     /// session in a mixed tree (e.g. perl5) never pays to index the 4000+ `.pm`

@@ -175,6 +175,7 @@ fn test_demo_file_chain_to_resolves_on_line_71() {
         &files,
         Some(&idx),
         None,
+        None,
     );
 
     // Use the ACTUAL Mojolicious library from @INC — the same
@@ -582,6 +583,7 @@ fn test_demo_chain_empirical_truth_table() {
         &root.join("test_files"),
         &files,
         Some(&idx),
+        None,
         None,
     );
 

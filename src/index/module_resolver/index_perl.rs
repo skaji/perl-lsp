@@ -68,6 +68,14 @@ pub fn index_workspace_with_index(
     // policy. Invoked once per path processed (success OR skip), so `done`
     // reaches `total` at the end.
     progress: Option<&(dyn Fn(usize, usize) + Sync)>,
+    // Fired once when the parallel WALK has processed every file but the
+    // persist writer is still draining its backlog (at 100k+ files the drain
+    // outlives the walk by minutes). Lets the caller announce the phase
+    // honestly instead of sitting at 100% looking hung. The ready gate still
+    // opens only on RETURN — registration of stripped fresh copies is
+    // deferred to post-commit, so the index is not fully attached until the
+    // drain completes.
+    walk_done: Option<&(dyn Fn() + Sync)>,
 ) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
@@ -493,6 +501,9 @@ pub fn index_workspace_with_index(
         });
 
         drop(fresh_tx);
+        if let Some(cb) = walk_done {
+            cb();
+        }
         let _ = writer.join();
     });
 

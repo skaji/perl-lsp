@@ -8,6 +8,18 @@
 //! `spawn_blocking`, so holding one proves the code is off the reactor.
 //! `layering_tests::query_verbs_route_through_run_query` pins the raw
 //! spellings out of the handler file.
+//!
+//! WHY THE DISCIPLINE IS ABSOLUTE: tower-lsp 0.20's `serve()` polls the
+//! stdin reader and EVERY handler future inside ONE `join!`ed task —
+//! `buffer_unordered(4)` gives concurrency within that single task, not
+//! across threads. Synchronous CPU inside any handler future therefore
+//! stalls every other in-flight verb AND the message reader until it
+//! yields (measured: one inline open-doc enrichment against a 138k-file
+//! workspace took 344 s and made every hover/definition/completion time
+//! out behind it — the post-cold-index availability hole). The rule this
+//! implies: NO synchronous CPU in a handler future, ever — heavy work
+//! goes through `run_query`, `spawn_blocking` (diagnostics derivation:
+//! `DiagCtx::publish`), or a spawned task.
 
 use super::*;
 

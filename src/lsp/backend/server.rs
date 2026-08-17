@@ -353,26 +353,27 @@ impl LanguageServer for Backend {
         }
         // The open-doc path now owns this file's surface record (buffer
         // shadows disk for every cross-file consumer — `SurfaceWrite`).
-        // Recording here also catches an open-after-external-change: the
-        // buffer's surface vs the indexer's record → Changed → refresh.
-        let mut opened_dirty = None;
+        // The record itself + the publish + the dirty-consumer republish all
+        // run OFF the message pipeline (`schedule_diag_refresh`): the publish
+        // re-enriches against the cross-file index — minutes of synchronous
+        // CPU on a large workspace — and tower-lsp polls every handler
+        // future inside one task, so awaiting it here head-of-line blocked
+        // every other verb (the post-cold-index availability hole).
         if opened {
             if let (Ok(path), Some(doc)) = (uri.to_file_path(), self.files.get_open(&uri)) {
-                // Hub-integrated languages record @INC residency + the
-                // build-time Surface here; pack freshness is the
-                // invalidator's disk-side gate.
+                // Hub-integrated languages record @INC residency here; pack
+                // freshness is the invalidator's disk-side gate. The Surface
+                // record rides the scheduled refresh (`DiagCtx::record_surface`),
+                // which also catches an open-after-external-change (buffer's
+                // surface vs the indexer's record → Changed → refresh).
                 if crate::build::language_driver::LanguageRegistry::caps(doc.language)
                     .hub_enrichment
                 {
                     self.module_index.mark_doc_open(&path);
-                    opened_dirty = self.record_open_doc_surface(&uri);
                 }
             }
         }
-        self.publish_diagnostics(&uri).await;
-        if let Some(sd) = opened_dirty {
-            self.republish_open_docs_in(&sd.dirty).await;
-        }
+        self.schedule_diag_refresh(uri.clone());
         if needs_gather_refresh {
             // The open build was cached-only: mark the degraded window BEFORE
             // spawning the heal, so a cross-file verb racing this open waits
@@ -418,14 +419,11 @@ impl LanguageServer for Backend {
                     }
                 }
             }
-            let recorded = self.record_open_doc_surface(&uri);
-            self.publish_diagnostics(&uri).await;
-            // Surface-gated consumer refresh: a body edit stops here
-            // (Unchanged → empty dirty set); a contract change republishes
-            // the open docs that can see it.
-            if let Some(sd) = recorded {
-                self.republish_open_docs_in(&sd.dirty).await;
-            }
+            // Surface record + publish + surface-gated consumer refresh, all
+            // debounced OFF the pipeline: the publish re-enriches (heavy),
+            // and per-keystroke inline enrichment was the "diagnostics after
+            // edit: never" finding at scale.
+            self.schedule_diag_refresh(uri);
             return;
         }
         if let Some(mut doc) = self.files.get_open_mut(&uri) {
@@ -450,11 +448,7 @@ impl LanguageServer for Backend {
             if let Some(mut doc) = self.files.get_open_mut(&uri) {
                 doc.update(text);
             }
-            let recorded = self.record_open_doc_surface(&uri);
-            self.publish_diagnostics(&uri).await;
-            if let Some(sd) = recorded {
-                self.republish_open_docs_in(&sd.dirty).await;
-            }
+            self.schedule_diag_refresh(uri.clone());
         }
         // The saved bytes are on disk: re-register this file's indexed copy,
         // evict the macro/closure caches it participates in, and refresh its
@@ -477,9 +471,11 @@ impl LanguageServer for Backend {
         // the running loop's next `finish` sees Vacant and stops) and end the
         // degraded-window progress if one is still live.
         self.gather_reg.forget(&uri);
-        // The closed doc's rebuild gate has no further fires to collapse; an
-        // in-flight one holds its own Arc and finishes against that.
+        // The closed doc's rebuild/diagnostics gates have no further fires to
+        // collapse; an in-flight one holds its own Arc and finishes against
+        // that (its publish then reads a closed doc → empty diagnostics).
         self.change_debounce.remove(&uri);
+        self.diag_debounce.remove(&uri);
         if let Some((_, token)) = self.degraded_progress.remove(&uri) {
             progress_end(&self.client, token).await;
         }
@@ -489,7 +485,8 @@ impl LanguageServer for Backend {
         // stale and gets republished here.
         if let Ok(path) = uri.to_file_path() {
             if let Some(sd) = self.module_index.mark_doc_closed(&path) {
-                self.republish_open_docs_in(&sd.dirty).await;
+                // Off-pipeline: each republish re-enriches.
+                self.spawn_republish(sd.dirty);
             }
         }
     }
@@ -1139,17 +1136,26 @@ impl LanguageServer for Backend {
                 ),
                 None => return Ok(None),
             };
+        // Both gathers run through `run_query`'s blocking hop: at workspace
+        // scale the in-scope tier is tens of thousands of items (multi-MB,
+        // ~60 s measured on CPAN-5k), and inline sync work in a handler
+        // future stalls tower-lsp's single serve task for every verb.
         if !crate::build::language_driver::LanguageRegistry::caps(language).cursor_context {
-            let (items, is_incomplete) = pack_completion(
-                &self.files,
-                &analysis,
-                &text,
-                &tree,
-                symbols::position_to_point(pos),
-                language,
-                path.as_deref(),
-                &self.module_index,
-            );
+            let point = symbols::position_to_point(pos);
+            let (items, is_incomplete) = self
+                .run_query(move |cx| {
+                    pack_completion(
+                        cx.files(),
+                        &analysis,
+                        &text,
+                        &tree,
+                        point,
+                        language,
+                        path.as_deref(),
+                        cx.index(),
+                    )
+                })
+                .await?;
             if items.is_empty() && !is_incomplete {
                 return Ok(None);
             }
@@ -1162,16 +1168,24 @@ impl LanguageServer for Backend {
                 CompletionResponse::Array(items)
             }));
         }
-        let (items, capped) = symbols::completion_items(
-            &self.files,
-            &FileKey::Url(uri.clone()),
-            &analysis,
-            &tree,
-            &text,
-            pos,
-            &self.module_index,
-            Some(&package_lines),
-        );
+        // Both halves are load-bearing: the gather runs through `run_query`
+        // so it cannot stall the shared serve task, and it returns the cap
+        // flag that decides `isIncomplete` below.
+        let key = FileKey::Url(uri.clone());
+        let (items, capped) = self
+            .run_query(move |cx| {
+                symbols::completion_items(
+                    cx.files(),
+                    &key,
+                    &analysis,
+                    &tree,
+                    &text,
+                    pos,
+                    cx.index(),
+                    Some(&package_lines),
+                )
+            })
+            .await?;
         if items.is_empty() {
             Ok(None)
         } else {
@@ -1590,7 +1604,8 @@ impl LanguageServer for Backend {
         })
         .await
         .unwrap_or_default();
-        self.republish_open_docs_in(&dirty).await;
+        // Off-pipeline: each republish re-enriches.
+        self.spawn_republish(dirty);
     }
 
     async fn range_formatting(

@@ -259,7 +259,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     module_index.set_workspace_root(Some(root_uri.as_str()));
     let ws = file_store::FileStore::new();
     let indexed =
-        module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None);
+        module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None, None);
     // Label the tier: a pack-only workspace printing a bare "Indexed 0 files"
     // reads as "indexing failed" when the pack line below says otherwise.
     if indexed > 0 {

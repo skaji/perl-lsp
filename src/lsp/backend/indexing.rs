@@ -165,11 +165,38 @@ impl Backend {
             let cb_ref: Option<&(dyn Fn(usize, usize) + Sync)> =
                 cb.as_ref().map(|c| c as &(dyn Fn(usize, usize) + Sync));
             let count = if want_perl {
+                // Once the walk finishes, the persist writer may keep
+                // draining for minutes on a large tree — announce that phase
+                // instead of sitting at 100% looking hung.
+                let walk_done = progress.then(|| {
+                    let client = client.clone();
+                    let token = token.clone();
+                    let rt = rt.clone();
+                    move || {
+                        rt.block_on(client.send_notification::<notification::Progress>(
+                            ProgressParams {
+                                token: token.clone(),
+                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                                    WorkDoneProgressReport {
+                                        cancellable: Some(false),
+                                        message: Some(
+                                            "Saving index to cache...".into(),
+                                        ),
+                                        percentage: Some(100),
+                                    },
+                                )),
+                            },
+                        ));
+                    }
+                });
+                let walk_done_ref: Option<&(dyn Fn() + Sync)> =
+                    walk_done.as_ref().map(|c| c as &(dyn Fn() + Sync));
                 crate::index::module_resolver::index_workspace_with_index(
                     &root_path,
                     &files,
                     Some(&module_index),
                     cb_ref,
+                    walk_done_ref,
                 )
             } else {
                 crate::index::module_resolver::index_pack_languages(
