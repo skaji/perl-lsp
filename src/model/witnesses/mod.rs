@@ -182,6 +182,30 @@ impl WitnessBag {
         removed
     }
 
+    /// Drop `Builder(tag)`-sourced witnesses on ONE attachment emitted at ONE
+    /// point. The call-binding propagator's replacement granularity: one
+    /// binding = one witness, identified by (attachment, span.start) — so a
+    /// binding can refine its published type without touching a sibling
+    /// binding of the same variable at another site.
+    pub fn remove_attachment_source_at(
+        &mut self,
+        att: &WitnessAttachment,
+        tag: &str,
+        at: Point,
+    ) -> usize {
+        let before = self.witnesses.len();
+        self.witnesses.retain(|w| {
+            !(&w.attachment == att
+                && w.span.start == at
+                && matches!(&w.source, WitnessSource::Builder(s) if s == tag))
+        });
+        let removed = before - self.witnesses.len();
+        if removed > 0 {
+            self.rebuild_index();
+        }
+        removed
+    }
+
     pub fn len(&self) -> usize {
         self.witnesses.len()
     }

@@ -1694,32 +1694,40 @@ impl<'a> Builder<'a> {
     /// Inline expression propagation (`get_config()->{key}` without an
     /// intermediate variable) is a separate code path — not handled here.
     ///
-    /// Idempotent across re-runs — clears every prior `call_binding`
-    /// witness from the bag and drops any matching TC before
-    /// re-emitting. The worklist driver calls `resolve_return_types`
-    /// repeatedly until fixed point; without this clear-and-emit, each
-    /// iteration would duplicate the (variable, scope, span) TCs and
-    /// Variable witnesses for every binding.
+    /// Idempotent across re-runs — each binding's witness is REPLACED
+    /// (targeted remove at its own attachment+point, then re-push) when
+    /// the callee's return type is currently known, so refinement flows
+    /// through without duplication. A binding whose callee answer is
+    /// currently unknown KEEPS its previously-published witness: in a
+    /// recursive cluster (`my $t = FetchObject(...); return $t;` —
+    /// Config::Universal, File::stat::Extra) the published witness is
+    /// itself what resolves the recursive return arm, and the arms then
+    /// DISAGREE → the sub's answer drops to None → a wholesale
+    /// clear-and-emit would retract the witness → the arm un-resolves →
+    /// the answer comes back → period-2 oscillation, and the fold rides
+    /// the 64-iteration bail every build. Never retracting is the
+    /// monotone repair: the cluster settles (deterministically) instead
+    /// of flipping.
     pub(super) fn propagate_call_bindings_to_constraints(
         &mut self,
         return_types: &std::collections::HashMap<String, InferredType>,
     ) {
         use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
 
-        // Clear-and-emit on tag `call_binding` so the witnesses stay
-        // canonical across worklist iterations.
-        self.bag.remove_by_source_tag("call_binding");
         for binding in &self.call_bindings {
             let rt = return_types
                 .get(&binding.func_name)
                 .cloned()
                 .or_else(|| crate::model::builtins::builtin_return_type(&binding.func_name));
             if let Some(rt) = rt {
+                let att = WitnessAttachment::Variable {
+                    name: binding.variable.clone(),
+                    scope: binding.scope,
+                };
+                self.bag
+                    .remove_attachment_source_at(&att, "call_binding", binding.span.start);
                 self.bag.push(Witness {
-                    attachment: WitnessAttachment::Variable {
-                        name: binding.variable.clone(),
-                        scope: binding.scope,
-                    },
+                    attachment: att,
                     source: WitnessSource::Builder("call_binding".into()),
                     payload: WitnessPayload::InferredType(rt),
                     span: Span {

@@ -374,3 +374,53 @@ fn provenance_accessor_and_round_trip() {
         assert_eq!(orig, decoded, "round-trip lost variant: {encoded}");
     }
 }
+
+/// A self-recursive sub whose recursive result is bound to a variable
+/// and returned as one of several disagreeing arms (the
+/// Config::Universal / File::stat::Extra shape from the CPAN-5k scale
+/// pass). The call-binding propagator publishes the callee's return
+/// type onto `$tempobj`; that resolves the recursive arm; the arms then
+/// disagree and the sub's answer drops to None — and a wholesale
+/// clear-and-emit propagator would RETRACT the witness on the next
+/// iteration, un-resolving the arm and flipping the answer back:
+/// a period-2 oscillation that rides the fold to the 64-iteration bail
+/// (debug builds: the `debug_assert!` in `fold_to_fixed_point` panics,
+/// which is what this test pins). The propagator must never retract a
+/// published binding type merely because the callee's answer is
+/// currently unknown.
+#[test]
+fn fold_converges_on_self_recursive_call_binding() {
+    let source = r#"
+        package Config::Mini;
+        sub fetch_object
+        {
+           my $src=shift;
+           my $name=shift;
+           my $hname=undef;
+           my %mybuf=();
+           foreach my $key (keys(%{$src})){
+              if ((ref($src->{$key}) eq "HASH")){
+                 $hname=$key;
+              }
+           }
+           if ($hname){
+              my $tempobj=fetch_object($src->{$hname},$hname);
+              return($tempobj);
+           }
+           return(undef) if (!defined($name));
+           return({$name=>\%mybuf});
+        }
+        1;
+    "#;
+    let plugins = super::default_plugin_registry();
+    // Convergence is the assertion: a non-convergent fold panics the
+    // debug_assert at MAX_FOLD_ITERATIONS before we get here.
+    let fa_once = build_with(source, plugins.clone());
+    let fa_twice = build_with_extra_re_fold(source, plugins);
+    // And the settled answer must be stable under one more fold pass.
+    assert_eq!(
+        fa_once.sub_return_type_at_arity("fetch_object", Some(2)),
+        fa_twice.sub_return_type_at_arity("fetch_object", Some(2)),
+        "settled answer changed under an extra fold pass"
+    );
+}

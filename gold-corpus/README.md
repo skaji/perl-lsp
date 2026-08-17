@@ -75,6 +75,19 @@ mutation-extension rows pin that an unconditional write joins the
 shape — the written key reads back typed, the typo beside it still
 hints; the literal-hash rows pin the `%plain` spelling of both).
 
+**Deep-CST fixture.** `fixtures/deepcst.json` + `fixtures/deepcst-diagnostics.json`
+run against `deepcst-fixture/`: two copies of a 12,003-level synthetic CST
+(the XML-shipped-as-`.pm` family — a recursive builder walk on these
+stack-overflows a 2 MB rayon worker, a fatal abort `catch_unwind` cannot
+catch) plus an ordinary goto-def target. The definition row is the crash
+canary — the abort kills the whole `--batch`, and the harness hard-fails a
+CRASH; the diagnostics row pins the degradation contract (`cst-too-deep`
+warning per skipped file, rest of the workspace unaffected). Two copies so
+at least one lands on a worker stack regardless of rayon scheduling.
+**Authoring trap:** a warm module cache masks the crash (cached blobs skip
+the walk entirely) — run `perl-lsp --clear-cache gold-corpus/deepcst-fixture`
+before trusting a base-failure check here.
+
 **Re-export fixture.** Three rows (`fixtures/reexport.json`, capability `definition` — folded under `definition` in `--list`) run against a small **committed, self-contained workspace** at `reexport-fixture/` instead of the snapshot substrate, via a per-row `root`. They flex the transitive export-surface feature: `goto-def` from a consumer of a re-exporter resolves to the *original* sub through both re-export forms — static splice (`our @EXPORT = (@RexBase::EXPORT)`) and loop-push (`push @EXPORT, @{"${m}::EXPORT"}`). The harness groups rows by `root` and runs one `--batch` per root.
 
 ## Already in corpus

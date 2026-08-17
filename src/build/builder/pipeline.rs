@@ -65,6 +65,86 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     build_with_plugins(tree, source, default_plugin_registry())
 }
 
+/// Hard ceiling on CST depth before the recursive walk is allowed to start.
+///
+/// The walk (`visit_node` → visitor → `visit_children`, a few frames per CST
+/// level) overflows a 2 MB rayon worker stack near ~2,200 levels (a 50 KB XML
+/// document shipped as `.pm`), and a stack overflow is a fatal abort that
+/// `catch_unwind` cannot catch — so the gate must run BEFORE the recursion,
+/// not around it. Measured 2026-08-17: Koha (3,553 files) tops out at depth
+/// 64; the deepest of 138,806 CPAN-5k files is 247 (generated encoding
+/// tables), plus one 5,336-level generated data table (`uts46data.pl`).
+/// 500 sits 2× above the deepest observed real Perl and ~4× under the
+/// observed overflow depth.
+pub(crate) const MAX_CST_DEPTH: usize = 500;
+
+/// Maximum node depth of the tree, measured iteratively (`TreeCursor`, no
+/// recursion — safe to run on exactly the trees the walk cannot handle).
+pub(crate) fn cst_depth(tree: &Tree) -> usize {
+    let mut cursor = tree.root_node().walk();
+    let mut depth = 0usize;
+    let mut max_depth = 0usize;
+    loop {
+        if cursor.goto_first_child() {
+            depth += 1;
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return max_depth;
+            }
+            depth -= 1;
+        }
+    }
+}
+
+/// Honest degradation for a tree too deep to walk: no analysis, and a
+/// first-line diagnostic saying so. Killing the server (the alternative)
+/// is never the right trade for one generated/non-Perl file.
+fn too_deep_analysis(tree: &Tree, depth: usize) -> FileAnalysis {
+    log::warn!(
+        "CST depth {} exceeds MAX_CST_DEPTH ({}); skipping analysis of this file \
+         (deeply nested generated or non-Perl content)",
+        depth,
+        MAX_CST_DEPTH
+    );
+    let mut fa = FileAnalysis::new(crate::model::file_analysis::FileAnalysisParts {
+        scopes: vec![Scope {
+            id: ScopeId(0),
+            parent: None,
+            kind: ScopeKind::File,
+            span: node_to_span(tree.root_node()),
+            package: Some("main".to_string()),
+        }],
+        plugin: crate::model::file_analysis::PluginFacts {
+            diagnostics: vec![PluginDiagnostic {
+                message: format!(
+                    "analysis skipped: parse tree depth {} exceeds the {} limit \
+                     (deeply nested generated or non-Perl content)",
+                    depth, MAX_CST_DEPTH
+                ),
+                span: Span {
+                    start: Point { row: 0, column: 0 },
+                    end: Point { row: 1, column: 0 },
+                },
+                severity: "warning".to_string(),
+                code: "cst-too-deep".to_string(),
+                plugin_id: "core".to_string(),
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    fa.finalize_post_walk();
+    fa
+}
+
 /// The compiled `@flow` query (`queries/perl/flow.scm`), compiled once.
 /// `Query::new` is expensive and `build` runs per file — see `warm_flow_query`
 /// for why this is warmed at startup rather than lazily on the first build.
@@ -122,6 +202,12 @@ pub(super) fn build_with_plugins_inner(
     plugins: Arc<PluginRegistry>,
     extra_re_fold: bool,
 ) -> FileAnalysis {
+    // Depth gate FIRST: past ~2,200 CST levels the recursive walk is a fatal
+    // stack overflow no unwind net can catch. See `MAX_CST_DEPTH`.
+    let depth = cst_depth(tree);
+    if depth > MAX_CST_DEPTH {
+        return too_deep_analysis(tree, depth);
+    }
     let topic_dsls: Vec<plugin::TopicRouteDsl> =
         plugins.all().filter_map(|pl| pl.topic_route_dsl()).collect();
     let mut b = Builder {

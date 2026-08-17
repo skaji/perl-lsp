@@ -1,0 +1,27 @@
+{
+  "capability": "diagnostics",
+  "rows": [
+    {
+      "id": "deepcst-honest-degradation",
+      "difficulty": "simple",
+      "semantic_area": "robustness",
+      "root": "gold-corpus/deepcst-fixture",
+      "file": "",
+      "line": 0,
+      "col": 0,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [
+          "\"code\":\"cst-too-deep\"",
+          "\"file\":\"deep_a.pm\"",
+          "\"file\":\"deep_b.pm\"",
+          "analysis skipped: parse tree depth 12003 exceeds the 500 limit"
+        ],
+        "none": []
+      },
+      "status": "gold",
+      "note": "The depth gate's degradation contract: a file past MAX_CST_DEPTH gets no analysis and SAYS SO — one cst-too-deep warning per skipped file, while the rest of the workspace analyzes normally."
+    }
+  ]
+}

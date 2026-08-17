@@ -1,0 +1,17 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "deepcst-ordinary-query-survives",
+      "difficulty": "simple",
+      "semantic_area": "robustness",
+      "root": "gold-corpus/deepcst-fixture",
+      "file": "main.pl",
+      "line": 1,
+      "col": 0,
+      "expect": { "all": ["main.pl:1:5"], "none": [] },
+      "status": "gold",
+      "note": "Crash canary for the deep-CST class: deep_a.pm/deep_b.pm (12,003-level CSTs, the XML-as-.pm family) are indexed by the same batch startup that answers this ordinary goto-def. Without the pre-walk depth gate the recursive builder walk stack-overflows a 2 MB rayon worker — a fatal abort catch_unwind cannot catch — and the harness reports CRASH. Two copies so at least one lands on a worker stack regardless of scheduling."
+    }
+  ]
+}

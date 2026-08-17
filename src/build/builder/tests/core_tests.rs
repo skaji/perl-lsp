@@ -950,3 +950,29 @@ fn test_use_symbol() {
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].name, "Foo::Bar");
 }
+
+/// The pre-walk depth gate: a CST past `MAX_CST_DEPTH` gets NO analysis
+/// (the recursive walk would fatally overflow a worker stack — an abort
+/// catch_unwind cannot catch) and SAYS SO via a `cst-too-deep`
+/// diagnostic. Ordinary files far below the cap are untouched.
+#[test]
+fn depth_gate_degrades_honestly() {
+    let deep = format!("my $x =\n{}1{};\n1;\n", "[".repeat(600), "]".repeat(600));
+    let fa = build_fa(&deep);
+    assert!(fa.symbols().is_empty(), "gated file must carry no symbols");
+    assert!(fa.refs().is_empty(), "gated file must carry no refs");
+    assert_eq!(fa.plugin.diagnostics.len(), 1);
+    let d = &fa.plugin.diagnostics[0];
+    assert_eq!(d.code, "cst-too-deep");
+    assert!(
+        d.message.contains("analysis skipped"),
+        "diagnostic must state the skip: {}",
+        d.message
+    );
+
+    // Control: same shape under the cap analyzes normally.
+    let shallow = "my $x = [[1]];\nsub greet { 1 }\n";
+    let fa = build_fa(shallow);
+    assert!(fa.plugin.diagnostics.is_empty());
+    assert!(fa.symbols().iter().any(|s| s.name == "greet"));
+}
