@@ -20,9 +20,10 @@ Detail for each is in its section below.
 |---|---|---|
 | 1 | Post-cold-index availability hole | **PARTIAL** — "no answers" fixed `d9053e4f`; writer-drain diagnostics blackout still open, gate split adjudicated in PR #121 |
 | 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** — depth gate `fed8ac00`, then the recursion class itself removed (PR #123): descent is queued, cap 500 → 100,000, measured |
-| 3 | `references` terminal at scale | **OPEN** — Koha 5,493→3,362 ms `b6312ea2`, but cpan5k still never returns; measured, see below |
+| 3 | `references` terminal at scale | **OPEN** — cpan5k still never returns after every fix; peak RSS 7.16 → 4.55 GB across three of them. Bottleneck now measured as enrichment fan-out, not the walk (66 candidate views) |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
-| 5 | Every CLI verb hangs at 122x | **ROOT-CAUSED** (C) — two quadratic terms in the index build; 8k synthetic 15.4 → 3.0 s, curve now linear; unconfirmed at 138k |
+| 5 | Every CLI verb hangs at 122x | **CLOSED** PR #125 — **confirmed at 138k: DNF → exit 0 in 350 s** with a real answer. Finite, not fast; the residual is a new row (#6) |
+| 6 | Pack indexing dominates startup on a Perl corpus | **OPEN** — new; `cli::index_pack` is 188 s of a 350 s Perl query |
 
 ### Tier 2
 | item | status |
@@ -308,7 +309,32 @@ the auto-import firehose is what goes; `isIncomplete` makes the client
 re-query as the prefix grows. **7,289,367 B / 236 ms → 55,853 B / 4 ms.**
 Under the cap nothing changes at all — an ordinary file's list is untouched.
 
-### 5. `cli_full_startup` never reaches queryable state at 122x — ROOT-CAUSED
+### 6. Pack indexing dominates startup on a Perl corpus — NEW
+
+Found confirming #5. `PERL_LSP_PHASE_TIMING` on a warm `--definition` at 138k:
+
+```
+  cli::index_pack        188,173 ms   <- 54% of the run
+  cli::index_workspace   145,934 ms
+  cli::resolve_imports    12,098 ms
+  cpp.transform           32,083 ms   (single worst file; many more in the 5-12 s band)
+```
+
+The corpus is "Perl", but CPAN dists ship XS: **10,834 C/C++/XS files** (4,680
+`.c`, 4,301 `.h`, 755 `.xs`, 551 `.cc`, 357 `.cpp`, 190 `.hpp`) against 138,822
+Perl files. So 7.8% of the files take 54% of the time — C++ costs ~17 ms/file
+against Perl's ~1 ms, because header expansion (`cpp.transform`) is expensive.
+
+**For a Perl query none of that work can affect the answer.** Perl analysis
+never consults pack data; the XS `.c` beside a `.pm` is not what `--definition`
+on a Perl symbol resolves through. The server defers workspace indexing to the
+first `didOpen`; the CLI eagerly indexes *every* language it serves.
+
+The fix should not branch on "is this a Perl query" (rule #10). The property
+wanted is "index the languages this query can consult" — or match the server
+and make pack indexing lazy until a pack file is actually opened.
+
+### 5. `cli_full_startup` never reaches queryable state at 122x — CLOSED
 Found while probing row #3. Every CLI verb hangs at 138k files: `--references`,
 `--definition` and a rare-name query (8 occurrences) all DNF at exit 124, zero
 bytes, ~100% CPU on ONE thread, 1.5–2.0 GB. Verb-independent and
