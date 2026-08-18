@@ -139,9 +139,44 @@ fn is_subclass_of(child: &str, ancestor: &str, ctx: &BagContext) -> bool {
 
 /// Depth backstop for `query_rec`. The `(bag, attachment)` visited set is
 /// the primary cycle guard; this cap is belt-and-braces against a new,
-/// unaccounted-for recursion shape blowing the stack. On hit, log once
+/// unaccounted-for recursion shape blowing the stack. On hit, warn once
 /// per process and return `None` (give up cleanly rather than abort).
+///
+/// **It fires in production** (Tier 2 of the scale hitlist, seen again in
+/// the row-#3 probe), so treat it as a live degradation path, not a
+/// should-never-happen. Every hit is counted as `query_rec.depth_cap`
+/// under `PERL_LSP_GHOST_STATS` — the one-shot warning says it happened,
+/// the counter says how often, and only the second one can tell a rare
+/// pathological file from a systematic truncation.
+///
+/// Known interaction, unfixed: a subtree truncated here still gets
+/// MEMOIZED by the caller. `VisitedKey` is `(bag, attachment, receiver,
+/// arity)` — depth is not in it — so a node first reached near the cap
+/// caches its truncated answer and every later, shallower consult reads
+/// that instead of re-deriving the full one. Which nodes lose depends on
+/// traversal order, so the degradation is order-dependent as well as
+/// silent. Not fixed here because declining to memoize truncated subtrees
+/// means MORE re-derivation in exactly the pathological case the
+/// cross-file budget gate exists to bound; it wants the cpan5k corpus to
+/// measure, not a guess.
+///
+/// **Profile-aware, because the stack ceiling is.** Measured on a 2 MiB stack
+/// (the tokio blocking-pool and rayon worker size) with an `@ISA` chain of N
+/// packages, one `query_rec` level per hop:
+///
+/// | build | deepest chain that answers | at 512 |
+/// |---|---|---|
+/// | release | ≥2,000 (cap fires first) | cap fires, answer degrades to `None` |
+/// | debug | 400 | **stack overflow — the process aborts** |
+///
+/// So a single value cannot serve both: 512 is under the release ceiling and
+/// over the debug one, and a debug abort is a `cargo test` that dies rather
+/// than fails. Release keeps 512 — this changes no shipped answer — and debug
+/// drops to a value with margin under its own measured ceiling.
+#[cfg(not(debug_assertions))]
 const QUERY_REC_DEPTH_CAP: u32 = 512;
+#[cfg(debug_assertions)]
+const QUERY_REC_DEPTH_CAP: u32 = 256;
 
 thread_local! {
     static QUERY_REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -237,15 +272,19 @@ impl ReducerRegistry {
             d
         });
         if depth >= QUERY_REC_DEPTH_CAP {
+            // Counted on EVERY hit: the one-shot warning below says the cap
+            // fired, but only a count distinguishes one pathological file
+            // from a systematic truncation across the corpus.
+            crate::util::ghost_stats::count("query_rec.depth_cap");
             QUERY_REC_DEPTH_WARNED.with(|w| {
                 if !w.get() {
                     w.set(true);
-                    eprintln!(
-                        "perl-lsp: query_rec depth cap ({}) hit on attachment {:?} — \
-                         returning None to avoid stack overflow. \
-                         This indicates an un-broken recursion path; \
-                         please report.",
-                        QUERY_REC_DEPTH_CAP, q.attachment,
+                    log::warn!(
+                        "query_rec depth cap ({}) hit on attachment {:?} — returning \
+                         None, so this answer is silently incomplete. Further hits are \
+                         counted as `query_rec.depth_cap` (PERL_LSP_GHOST_STATS).",
+                        QUERY_REC_DEPTH_CAP,
+                        q.attachment,
                     );
                 }
             });
