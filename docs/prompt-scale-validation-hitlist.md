@@ -22,7 +22,7 @@ Detail for each is in its section below.
 | 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** `fed8ac00` — depth gate; iterative walk that removes the class is in flight (B) |
 | 3 | `references` terminal at scale | **OPEN** — Koha 5,493→3,362 ms `b6312ea2`, but cpan5k still never returns; measured, see below |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
-| 5 | Every CLI verb hangs at 122x | **OPEN** — new, found probing #3 |
+| 5 | Every CLI verb hangs at 122x | **ROOT-CAUSED** (C) — two quadratic terms in the index build; 8k synthetic 15.4 → 3.0 s, curve now linear; unconfirmed at 138k |
 
 ### Tier 2
 | item | status |
@@ -36,7 +36,7 @@ Detail for each is in its section below.
 ### Tier 3 / Tier 4
 | item | status |
 |---|---|
-| `@INC` single-provider tier | **IN FLIGHT** (C) — stages 1–2 done and base-verified |
+| `@INC` single-provider tier | **CLOSED** (C) — all four stages, PR #122 |
 | ~10 bookkeeping `get_cached` sites | **OPEN** — deliberate |
 | `cursor_slot.rs:205` | **OPEN** — deferred, reducible |
 | Merge the two index families | **OPEN** |
@@ -300,17 +300,59 @@ the auto-import firehose is what goes; `isIncomplete` makes the client
 re-query as the prefix grows. **7,289,367 B / 236 ms → 55,853 B / 4 ms.**
 Under the cap nothing changes at all — an ordinary file's list is untouched.
 
-### 5. `cli_full_startup` never reaches queryable state at 122x — NEW
+### 5. `cli_full_startup` never reaches queryable state at 122x — ROOT-CAUSED
 Found while probing row #3. Every CLI verb hangs at 138k files: `--references`,
 `--definition` and a rare-name query (8 occurrences) all DNF at exit 124, zero
 bytes, ~100% CPU on ONE thread, 1.5–2.0 GB. Verb-independent and
-candidate-count-independent, so it is stuck **before** the query runs — and the
-LSP server is ready in 793 ms off the *identical* `modules.db`, so the CLI is
-not taking the warm streaming path the server takes.
+candidate-count-independent, so it is stuck **before** the query runs.
 
-That makes `--check` / `--heatmap` / `--workspace-symbol` / `--dump-package`
-unusable at workspace scale, and it means **the CLI is not a valid measurement
-fallback there** — a trap for anyone reaching for the cheap probe.
+**The 793 ms comparison does not mean what it looks like.** The LSP server
+and the CLI run the SAME warm lane and the SAME indexer — `initialize`
+simply does neither. It sets the workspace root (waking the resolver
+thread) and returns capabilities; the workspace index is lazy, fired by the
+first `didOpen` onto `spawn_blocking`, and `@INC` resolution is on-demand
+on the resolver thread. So 793 ms is "accepting requests", while
+`cli_full_startup` returning is "queryable" — the CLI pays synchronously
+what the server defers, and a verb cannot answer early because there is no
+partial answer to give.
+
+What made that synchronous cost unpayable was two quadratic terms in the
+index build, neither CLI-specific — **the server pays them too, in the
+background, and its index takes just as long to become complete.** The CLI
+is what made them visible.
+
+1. **`push_unique`'s bucket scan** (`ModuleEdgeIndexes::feed`). Reverse-index
+   buckets were `Vec<String>` with a linear membership scan per insert, so a
+   bulk feed cost O(bucket²). The worst case is also the common one: `new` is
+   declared by every module in the workspace, so its bucket IS the workspace.
+2. **`purge_module`'s full sweep.** Removing one module's edges scans every
+   bucket of every map, and `rebuild_name_registration` calls it once per
+   registered package name — O(names × buckets) over a bulk index.
+
+Measured on a synthetic workspace (`--definition`, warm, per-phase via
+`PERL_LSP_PHASE_TIMING`; every other startup phase stays under 40 ms):
+
+| files | `index_workspace` | `rebuild_reverse_index` | total |
+|---|---|---|---|
+| 1,000 | 927 → 877 ms | 22 → 15 ms | 1.00 → 0.95 s |
+| 2,000 | 1,477 → 1,108 ms | 83 → 31 ms | 1.66 → 1.20 s |
+| 4,000 | 2,682 → 1,637 ms | 560 → 90 ms | — → 1.82 s |
+| 8,000 | 8,853 → 2,763 ms | 4,108 → 236 ms | 15.41 → **3.03 s** |
+
+`rebuild_reverse_index` grew as ~n^2.5 (190× for 8× the files) and is now
+linear; the whole startup is 5.1× faster at 8k and no longer superlinear.
+Each term was isolated by ablation before being fixed — removing the
+uniqueness check alone took 8k from 4,108 → 137 ms, and skipping the purge
+alone took `index_workspace` from 9,840 → 2,601 ms.
+
+Not verified at 138k (no corpus here). Linear extrapolation from 8k puts the
+two phases in the tens of seconds rather than the hours the old curve implies,
+but the claim that matters is the exponent, not the constant.
+
+Until confirmed at scale, `--check` / `--heatmap` / `--workspace-symbol` /
+`--dump-package` should still be treated as unproven at workspace scale, and
+**the CLI is not yet a validated measurement fallback there** — a trap for
+anyone reaching for the cheap probe.
 
 (The probe's first write-up blamed a CPU grind in the refs walk; the rare-name
 and `--definition` controls refuted that and the retraction is in its log. The

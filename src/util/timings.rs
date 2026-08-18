@@ -264,6 +264,36 @@ pub fn phase<T>(label: &str, body: impl FnOnce() -> T) -> T {
     out
 }
 
+/// A scoped `phase` for a region that cannot be wrapped in a closure —
+/// a loop that borrows its surroundings mutably. Times from `start` to
+/// drop and prints the same `[PHASE]` line, so a call site chooses the
+/// shape that fits without a second output format.
+pub struct PhaseGuard {
+    label: &'static str,
+    started: Option<std::time::Instant>,
+}
+
+impl PhaseGuard {
+    pub fn start(label: &'static str) -> Self {
+        PhaseGuard {
+            label,
+            started: phases_enabled().then(std::time::Instant::now),
+        }
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!(
+                "[PHASE] {:<32} {:>8.2} ms",
+                self.label,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-file breadcrumbs. At corpus scale (100k+ files) any failure that doesn't
 // name its input costs a debugging session — a stack overflow in a rayon

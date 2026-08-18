@@ -1614,3 +1614,86 @@ fn reregister_sheds_dropped_package_names() {
     assert!(!idx.is_workspace_module("Drop::Me"));
     assert!(idx.get_cached("Keep::Me").is_some());
 }
+
+// ---- Reverse-index bucket contracts ----
+//
+// `ModuleBucket` replaced a `Vec<String>` whose per-insert linear scan made
+// bulk feeds quadratic in bucket size, and `purge_module` gained a
+// never-fed guard because its sweep is O(every bucket of every map). Both
+// are performance changes whose FAILURE MODE is silent wrong answers — a
+// dropped edge, or a stale one that survives a purge — so the contracts
+// they rest on are pinned here.
+
+#[test]
+fn a_bucket_dedups_and_keeps_first_fed_order() {
+    use crate::index::module_index::ModuleBucket;
+    let mut b = ModuleBucket::default();
+    b.insert("B");
+    b.insert("A");
+    b.insert("B"); // re-feed must not grow the bucket
+    assert_eq!(b.as_slice(), &["B".to_string(), "A".to_string()]);
+    b.remove("B");
+    assert_eq!(b.as_slice(), &["A".to_string()]);
+    assert!(!b.is_empty());
+    b.remove("A");
+    assert!(b.is_empty());
+}
+
+#[test]
+fn a_bucket_still_dedups_past_the_set_threshold() {
+    // The membership set materializes only once a bucket is big enough for
+    // the scan to cost more than the hash. Crossing that boundary must not
+    // change behavior — the worst real bucket (`new`, declared by every
+    // module in the workspace) lives far past it.
+    use crate::index::module_index::ModuleBucket;
+    let mut b = ModuleBucket::default();
+    for i in 0..200 {
+        b.insert(&format!("M{i}"));
+    }
+    assert_eq!(b.as_slice().len(), 200);
+    for i in 0..200 {
+        b.insert(&format!("M{i}")); // every one a duplicate
+    }
+    assert_eq!(b.as_slice().len(), 200, "re-feed grew a set-backed bucket");
+    b.remove("M150");
+    assert_eq!(b.as_slice().len(), 199);
+    b.insert("M150"); // removed from the set too, so it can come back
+    assert_eq!(b.as_slice().len(), 200);
+}
+
+#[test]
+fn purge_reaches_every_edge_a_publication_created() {
+    // The never-fed guard makes `purge_module` a no-op for a module with no
+    // edges. If ANY write path published edges without marking, the guard
+    // would skip a module that does have them and the stale edge would
+    // outlive its file — which is why the spec/children writes go through
+    // `publish_*` rather than touching the maps directly.
+    use crate::index::module_index::ModuleEdgeIndexes;
+    let edges = ModuleEdgeIndexes::new();
+    edges.publish_spec("Primary", "Spec::Impl");
+    edges.publish_child("Base", "Derived");
+    assert!(!edges.specs_for("Primary").is_empty());
+    assert!(!edges.children_of("Base").is_empty());
+
+    edges.purge_module("Spec::Impl");
+    edges.purge_module("Derived");
+    assert!(
+        edges.specs_for("Primary").is_empty(),
+        "a directly-published spec edge survived its module's purge",
+    );
+    assert!(
+        edges.children_of("Base").is_empty(),
+        "a directly-published child edge survived its module's purge",
+    );
+}
+
+#[test]
+fn purging_a_never_fed_module_is_a_no_op_not_a_wipe() {
+    use crate::index::module_index::ModuleEdgeIndexes;
+    let edges = ModuleEdgeIndexes::new();
+    edges.publish_child("Base", "Derived");
+    // A name nothing ever fed: the guard skips the sweep, and the sweep
+    // skipping must not be observable as lost edges for OTHER modules.
+    edges.purge_module("Never::Fed");
+    assert_eq!(edges.children_of("Base"), vec!["Derived".to_string()]);
+}

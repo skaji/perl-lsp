@@ -32,14 +32,84 @@ use super::*;
 /// registration — a map fed on insert but not on rebuild serves cold
 /// sessions and starves warm ones (the twice-paid B6 lesson). One
 /// `feed()` per site makes a missed map unrepresentable.
+/// One reverse-index bucket: the module list readers iterate, plus the
+/// membership test that keeps insertion O(1).
+///
+/// `seen` is not a cache of `modules` — it IS the uniqueness test. A linear
+/// scan per insert makes a bulk feed quadratic in bucket size, and the
+/// worst case is also the common one: `new` is declared by every module in
+/// the workspace, so its bucket IS the workspace. Measured at 8k synthetic
+/// modules, the scan cost `rebuild_reverse_index` 4,108 ms of a 15 s CLI
+/// startup and grew as ~n^2.5; without it, 137 ms and linear.
+///
+/// The set materializes only once a bucket is big enough for the scan to
+/// cost more than the hash — a size threshold on the data, not a branch on
+/// what the data means, so behavior is identical either way. Buckets are
+/// overwhelmingly tiny (most sub names are declared once), so the extra
+/// strings land only on the few buckets that were the whole problem.
+#[derive(Default, Clone)]
+pub struct ModuleBucket {
+    modules: Vec<String>,
+    seen: Option<std::collections::HashSet<String>>,
+}
+
+/// Below this a scan is cheaper than a hash and the set is pure overhead.
+const BUCKET_SET_THRESHOLD: usize = 32;
+
+impl ModuleBucket {
+    /// Add `module` if absent. Idempotent per (bucket, module) — every
+    /// feed path relies on re-feeding never growing a bucket.
+    pub fn insert(&mut self, module: &str) {
+        if let Some(seen) = &mut self.seen {
+            if seen.insert(module.to_string()) {
+                self.modules.push(module.to_string());
+            }
+            return;
+        }
+        if self.modules.iter().any(|m| m == module) {
+            return;
+        }
+        self.modules.push(module.to_string());
+        if self.modules.len() >= BUCKET_SET_THRESHOLD {
+            self.seen = Some(self.modules.iter().cloned().collect());
+        }
+    }
+
+    /// Drop `module` from this bucket. Left O(bucket): removal happens per
+    /// re-registration, not per bulk feed, so it is not on the hot path.
+    pub fn remove(&mut self, module: &str) {
+        self.modules.retain(|m| m != module);
+        if let Some(seen) = &mut self.seen {
+            seen.remove(module);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+
+    /// The module names, in first-fed order.
+    pub fn as_slice(&self) -> &[String] {
+        &self.modules
+    }
+}
+
+impl<'a> IntoIterator for &'a ModuleBucket {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.modules.iter()
+    }
+}
+
 pub struct ModuleEdgeIndexes {
-    pub(super) names: DashMap<String, Vec<String>>,
-    pub(super) bridges: DashMap<String, Vec<String>>,
-    pub(super) children: DashMap<String, Vec<String>>,
+    pub(super) names: DashMap<String, ModuleBucket>,
+    pub(super) bridges: DashMap<String, ModuleBucket>,
+    pub(super) children: DashMap<String, ModuleBucket>,
     /// primary template → modules declaring a specialization of it (inverse
     /// `FileAnalysis.pack.specializes`). The `Specializes` family edge's
     /// cross-file half; member resolution never reads it.
-    pub(super) specs: DashMap<String, Vec<String>>,
+    pub(super) specs: DashMap<String, ModuleBucket>,
     /// The indexable-name list each FILE last fed — the symbols-derived
     /// half of `feed`, recorded from the WHOLE analysis so a re-feed over
     /// symbol-EVICTED cache copies (`rebuild_reverse_index*` after the
@@ -52,6 +122,15 @@ pub struct ModuleEdgeIndexes {
     /// (re-feeds are exactly when it's needed); `remove_path_record` drops
     /// it when the file itself goes.
     name_records: DashMap<std::path::PathBuf, Vec<String>>,
+    /// Every module name `feed` has published edges under. `purge_module`
+    /// removes one module from every bucket of every map — an O(all
+    /// buckets) sweep — and a bulk index calls it once per registered
+    /// package name, which is the second quadratic term in workspace
+    /// registration. A name that was never fed has nothing to remove, and
+    /// during a cold bulk index that is every name: the sweep only earns
+    /// its cost on RE-registration (a watcher edit, a reopened package's
+    /// second file), which is not the hot path.
+    fed_modules: DashMap<String, ()>,
 }
 
 impl ModuleEdgeIndexes {
@@ -62,6 +141,7 @@ impl ModuleEdgeIndexes {
             children: DashMap::new(),
             specs: DashMap::new(),
             name_records: DashMap::new(),
+            fed_modules: DashMap::new(),
         }
     }
 
@@ -87,11 +167,9 @@ impl ModuleEdgeIndexes {
             self.name_records.insert(path.to_path_buf(), names.clone());
             names
         };
-        let push_unique = |map: &DashMap<String, Vec<String>>, key: String| {
-            let mut v = map.entry(key).or_default();
-            if !v.iter().any(|m| m == module_name) {
-                v.push(module_name.to_string());
-            }
+        self.fed_modules.insert(module_name.to_string(), ());
+        let push_unique = |map: &DashMap<String, ModuleBucket>, key: String| {
+            map.entry(key).or_default().insert(module_name);
         };
         for name in names {
             push_unique(&self.names, name);
@@ -105,6 +183,33 @@ impl ModuleEdgeIndexes {
         for primary in Self::spec_primaries(analysis) {
             push_unique(&self.specs, primary);
         }
+    }
+
+    /// Publish ONE specialization edge (primary → spec). The pack path
+    /// records these outside `feed`, and every publication must mark its
+    /// member fed or `purge_module`'s guard will skip a module that does
+    /// have edges.
+    pub fn publish_spec(&self, primary: &str, spec: &str) {
+        self.fed_modules.insert(spec.to_string(), ());
+        self.specs.entry(primary.to_string()).or_default().insert(spec);
+    }
+
+    /// Publish ONE inverse-inheritance edge (parent → child). Same
+    /// marking contract as `publish_spec`.
+    pub fn publish_child(&self, parent: &str, child: &str) {
+        self.fed_modules.insert(child.to_string(), ());
+        self.children.entry(parent.to_string()).or_default().insert(child);
+    }
+
+    /// Test-only bucket readers: the maps are `pub(super)`, and these
+    /// contracts are what the perf rewrite rests on.
+    #[cfg(test)]
+    pub fn specs_for(&self, primary: &str) -> Vec<String> {
+        self.specs.get(primary).map(|b| b.as_slice().to_vec()).unwrap_or_default()
+    }
+    #[cfg(test)]
+    pub fn children_of(&self, parent: &str) -> Vec<String> {
+        self.children.get(parent).map(|b| b.as_slice().to_vec()).unwrap_or_default()
     }
 
     /// Record `path`'s indexable-name list from a WHOLE analysis so a later
@@ -123,10 +228,16 @@ impl ModuleEdgeIndexes {
     /// KEEPS `name_records` — they are per-PATH, and a same-name sibling
     /// file's replay source must survive this file's re-registration.
     pub fn purge_module(&self, module_name: &str) {
+        // Never fed ⇒ no bucket can hold it. The sweep below is O(every
+        // bucket of every map); a cold bulk index would otherwise pay it
+        // once per registered name for nothing.
+        if self.fed_modules.remove(module_name).is_none() {
+            return;
+        }
         for map in [&self.names, &self.bridges, &self.children, &self.specs] {
-            map.retain(|_key, mods| {
-                mods.retain(|m| m != module_name);
-                !mods.is_empty()
+            map.retain(|_key, bucket| {
+                bucket.remove(module_name);
+                !bucket.is_empty()
             });
         }
     }
@@ -144,6 +255,10 @@ impl ModuleEdgeIndexes {
         self.bridges.clear();
         self.children.clear();
         self.specs.clear();
+        // The marks describe the maps just emptied; keeping them would let
+        // a later purge take the sweep for a module with no edges left,
+        // and — worse — a re-feed would find its mark already set.
+        self.fed_modules.clear();
     }
 
     /// Every name `find_exporters` might need to locate a module by:

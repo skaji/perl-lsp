@@ -1233,10 +1233,7 @@ impl ModuleIndex {
         // self-heals at read: `direct_specializations_of` re-checks the pair
         // against the CURRENT analysis.
         for (spec, primary) in specializes {
-            let mut v = self.core.edges.specs.entry(primary.clone()).or_default();
-            if !v.iter().any(|m| m == spec) {
-                v.push(spec.clone());
-            }
+            self.core.edges.publish_spec(primary, spec);
         }
         // Inverse inheritance edges: parent → child NAMES, so
         // `direct_children_of` (the INHERITS_INV cross-file leg the
@@ -1251,10 +1248,7 @@ impl ModuleIndex {
         // carries it on the fresh, warm, and whole paths alike.
         for (child, parents) in analysis.package_parent_edges() {
             for parent in parents {
-                let mut v = self.core.edges.children.entry(parent.clone()).or_default();
-                if !v.iter().any(|m| m == child) {
-                    v.push(child.clone());
-                }
+                self.core.edges.publish_child(parent, child);
             }
         }
     }

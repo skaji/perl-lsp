@@ -36,10 +36,11 @@ impl ModuleIndex {
 
     pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
         match self.core.edges.bridges.get(class_name) {
-            Some(mods) => {
-                let mut result = mods.clone();
+            Some(bucket) => {
+                // The bucket is unique by construction; sort only, so the
+                // order is stable across runs.
+                let mut result = bucket.as_slice().to_vec();
                 result.sort();
-                result.dedup();
                 result
             }
             None => Vec::new(),
@@ -53,10 +54,11 @@ impl ModuleIndex {
     /// depth-1 edge it composes.
     pub fn modules_with_parent(&self, class_name: &str) -> Vec<String> {
         match self.core.edges.children.get(class_name) {
-            Some(mods) => {
-                let mut result = mods.clone();
+            Some(bucket) => {
+                // The bucket is unique by construction; sort only, so the
+                // order is stable across runs.
+                let mut result = bucket.as_slice().to_vec();
                 result.sort();
-                result.dedup();
                 result
             }
             None => Vec::new(),
@@ -438,7 +440,7 @@ impl CrossFileLookup for ModuleIndex {
             .edges
             .specs
             .get(primary)
-            .map(|v| v.clone())
+            .map(|b| b.as_slice().to_vec())
             .unwrap_or_default();
         for module in modules {
             // The specialization edge may live in a losing candidate
