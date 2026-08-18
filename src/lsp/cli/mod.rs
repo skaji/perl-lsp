@@ -238,7 +238,10 @@ fn canonical_root_and_uri(root: &str) -> (std::path::PathBuf, String) {
 /// minus the resolver thread (one-shot, synchronous). Used by every
 /// CLI command that needs cross-file resolution to behave like the
 /// running server.
-fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleIndex) {
+fn cli_full_startup(
+    root: &str,
+    scope: language_driver::LanguageScope,
+) -> (file_store::FileStore, module_index::ModuleIndex) {
     // `--check --timings` already flipped this on; the env var lets any
     // startup-driven CLI mode (dump-package, etc.) opt in too.
     timings::enable_from_env();
@@ -258,9 +261,17 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // @INC scan + SQLite warm.
     module_index.set_workspace_root(Some(root_uri.as_str()));
     let ws = file_store::FileStore::new();
-    let indexed = timings::phase("cli::index_workspace", || {
-        module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None, None)
-    });
+    // The reference language's tree is walked only when the scope wants it
+    // — a `.cc` query indexes the pack family alone, which is what the
+    // server's per-family `didOpen` latch already does.
+    let reference_lang = language_driver::LanguageRegistry::with_enabled().reference_language();
+    let indexed = if scope.wants(reference_lang) {
+        timings::phase("cli::index_workspace", || {
+            module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None, None)
+        })
+    } else {
+        0
+    };
     // Label the tier: a pack-only workspace printing a bare "Indexed 0 files"
     // reads as "indexing failed" when the pack line below says otherwise.
     if indexed > 0 {
@@ -275,6 +286,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             &module_index,
             None,
             crate::lsp::backend::max_cache_mb_default() as usize * 1024 * 1024,
+            &scope,
         )
     });
     if pack_indexed > 0 {

@@ -23,7 +23,7 @@ Detail for each is in its section below.
 | 3 | `references` terminal at scale | **OPEN — root-caused.** Never returns at 1500 s. A/B proves the fan-out is INHERENT, not cache thrash: with caches effectively unlimited (100% hit) it ran 6.6x MORE consult work and still gave no answer. Fix is a missing memo, not sizing |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
 | 5 | Every CLI verb hangs at 122x | **CLOSED** PR #125 — **confirmed at 138k: DNF → exit 0 in 350 s** with a real answer. Finite, not fast; the residual is a new row (#6) |
-| 6 | Pack indexing dominates startup on a Perl corpus | **OPEN** — new; `cli::index_pack` is 188 s of a 350 s Perl query |
+| 6 | Pack indexing dominates startup on a Perl corpus | **ROOT-CAUSED** (C) — `LanguageScope`: a verb declares the families it can consult. Synthetic Perl query −52% CPU, pack phase 936 ms → 0.11 ms; unconfirmed at 138k |
 
 ### Tier 2
 | item | status |
@@ -352,7 +352,7 @@ the auto-import firehose is what goes; `isIncomplete` makes the client
 re-query as the prefix grows. **7,289,367 B / 236 ms → 55,853 B / 4 ms.**
 Under the cap nothing changes at all — an ordinary file's list is untouched.
 
-### 6. Pack indexing dominates startup on a Perl corpus — NEW
+### 6. Pack indexing dominates startup on a Perl corpus — ROOT-CAUSED
 
 Found confirming #5. `PERL_LSP_PHASE_TIMING` on a warm `--definition` at 138k:
 
@@ -373,9 +373,48 @@ never consults pack data; the XS `.c` beside a `.pm` is not what `--definition`
 on a Perl symbol resolves through. The server defers workspace indexing to the
 first `didOpen`; the CLI eagerly indexes *every* language it serves.
 
-The fix should not branch on "is this a Perl query" (rule #10). The property
-wanted is "index the languages this query can consult" — or match the server
-and make pack indexing lazy until a pack file is actually opened.
+**Fixed by scoping the startup, not by deferring it.** `LanguageScope` is
+declared by the VERB and read by the indexer, which never asks what kind of
+query it is serving: a verb with a target file wants only that file's family
+(`LanguageScope::of_file`), a verb that sweeps the workspace wants `All`.
+`--batch` stays `All` because its requests arrive on stdin AFTER startup, so
+their languages are not knowable there.
+
+Laziness was the other candidate and was NOT taken. In a process that exits
+after one answer, "lazy" means "build the index on first consult", and the
+only consult seam is `lookup_for` — inside a query, under whatever locks it
+holds, with no progress reporting. It also saves nothing for a pack query,
+which needs the index anyway. Its benefit collapses to "don't build what you
+won't read", which is exactly what the scope does, without a mid-query build.
+The server's laziness earns its keep because the server is long-lived and
+cannot know the future; a CLI verb knows its target before it starts. Note
+also that the scope is what actually MATCHES the server: `ensure_workspace_-
+indexed(language)` is latched per family, so opening a `.cc` never walks the
+Perl tree — the CLI was the odd one out for indexing both.
+
+The asymmetry that shaped the design: over-indexing is wasted work, but
+under-indexing is a WRONG answer and a quiet one. An unattached pack
+sub-index does not answer empty — `lookup_for` routes that language's queries
+to the Perl hub — so a C++ goto-def would have resolved against Perl and
+looked plausible. The guard test asserts a cross-file C++ answer names both
+the header and the body, not merely that it is non-empty.
+
+Measured on a CPAN-proportioned synthetic (2,000 `.pm` + 158 C/C++, ~12.8:1
+like the real corpus), `--definition` on a Perl symbol:
+
+| | before | after |
+|---|---|---|
+| `cli::index_pack` (cold) | 936 ms | **0.11 ms** |
+| total wall (cold) | 2.635 s | **1.624 s** (−38%) |
+| total CPU (cold) | 5.405 s | **2.620 s** (−52%) |
+
+The CPU figure is the one that transfers: −52% matches the 54% share measured
+at 138k. Two honesty notes. The synthetic's headers are trivial, so its
+C++ is far cheaper per file than real XS pulling `perl.h` — the saving here
+UNDERSTATES the real one. And WARM, base already pays only 53 ms for 158 pack
+files (the warm-stub path), so at this scale the warm saving is small; the
+188 s measured at 138k must have been a cold pack index. Whether warm pack
+stays cheap at 10,834 files is unconfirmed.
 
 ### 5. `cli_full_startup` never reaches queryable state at 122x — CLOSED
 Found while probing row #3. Every CLI verb hangs at 138k files: `--references`,
