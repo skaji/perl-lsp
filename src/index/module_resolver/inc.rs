@@ -35,14 +35,15 @@ pub fn resolve_module_paths(inc_paths: &[PathBuf], module_name: &str) -> Vec<Pat
     for inc in inc_paths {
         let full = inc.join(&rel_path);
         if full.is_file() {
-            // Distinct roots can name the same file (a symlinked `lib`, a
-            // duplicated @INC entry); the relation holds FILES, so dedup
-            // on the canonical path rather than trusting root identity.
-            let key = std::fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
-            if !out.iter().any(|p| {
-                std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == key
-            }) {
-                out.push(full);
+            // Canonical, so the relation holds FILES: distinct roots can
+            // name the same file (a symlinked `lib`, a duplicated @INC
+            // entry) and must dedup to one candidate. It also lets the
+            // per-asker search-path rank prefix-match a candidate against
+            // canonical roots with no query-time `canonicalize` — that is
+            // filesystem I/O, and it would land on a request path.
+            let canon = std::fs::canonicalize(&full).unwrap_or(full);
+            if !out.contains(&canon) {
+                out.push(canon);
             }
         }
     }

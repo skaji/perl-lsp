@@ -18,6 +18,11 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
         add_project_lib_paths(&mut inc_paths, &root_path);
     }
 
+    // Publish the resolved search path before anything can query: an
+    // origin's visibility rank prefix-matches candidates against it, and
+    // discovery shells out to `perl`, so no request path may re-derive it.
+    core.set_inc_roots(&inc_paths);
+
     // Scan @INC for available module names (fast, no parsing — just readdir)
     scan_inc_module_names(&inc_paths, &core.available_modules);
     log::info!("@INC scan: {} modules available", core.available_modules.len());
@@ -360,6 +365,6 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
     guard.clone().flatten()
 }
 
-pub(super) fn uri_to_path(uri: &str) -> Option<PathBuf> {
+pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
 }

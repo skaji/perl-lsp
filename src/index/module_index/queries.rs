@@ -413,6 +413,13 @@ impl ModuleIndex {
 
     // ---- Test-only methods ----
 
+    /// Test-only: publish an `@INC` without a resolver thread (discovery
+    /// shells out to `perl`, and a unit net needs its own roots).
+    #[cfg(test)]
+    pub fn set_inc_roots_for_test(&self, roots: &[std::path::PathBuf]) {
+        self.core.set_inc_roots(roots);
+    }
+
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         let idx = Self::new_for_cli();

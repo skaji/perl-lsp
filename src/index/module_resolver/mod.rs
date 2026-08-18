@@ -75,6 +75,7 @@ pub use index_perl::*;
 mod persist;
 pub(crate) use persist::*;
 mod thread;
+pub use thread::uri_to_path;
 use thread::*;
 
 #[cfg(test)]

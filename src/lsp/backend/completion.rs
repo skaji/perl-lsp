@@ -34,7 +34,12 @@ pub fn pack_completion(
         base_idx,
         &analysis.pack.include_closure,
         path,
-        crate::build::language_driver::LanguageRegistry::is_pack_language(language),
+        crate::model::file_analysis::VisibilityAxis::for_origin(
+            analysis,
+            path,
+            base_idx,
+            crate::build::language_driver::LanguageRegistry::is_pack_language(language),
+        ),
     );
     let xidx: &dyn crate::model::file_analysis::CrossFileLookup = &scoped;
     // The slot verdict — Member (sentinel reparse → receiver span →

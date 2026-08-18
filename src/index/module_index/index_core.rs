@@ -42,6 +42,11 @@ pub(crate) struct IndexCore {
     /// Shared: the resolver thread adopts @INC providers here, the async
     /// side adopts workspace candidates.
     pub(crate) all_defs: DashMap<String, Vec<Arc<CachedModule>>>,
+    /// The `@INC` roots this process resolves from, canonical, most-
+    /// preferred first. Recorded ONCE by the resolver thread (discovery
+    /// shells out to `perl`, so no query path may re-derive it) and read by
+    /// every origin's `VisibilityAxis::for_origin`.
+    pub(crate) inc_roots: std::sync::RwLock<Arc<Vec<std::path::PathBuf>>>,
     pub(crate) queue: ResolveQueue,
     pub(crate) resolved: ResolveNotify,
     pub(crate) workspace_root: WorkspaceRootChannel,
@@ -88,6 +93,7 @@ impl IndexCore {
             builtins: DashMap::new(),
             available_modules: DashMap::new(),
             all_defs: DashMap::new(),
+            inc_roots: std::sync::RwLock::new(Arc::new(Vec::new())),
             queue: ResolveQueue {
                 priority: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
@@ -103,6 +109,18 @@ impl IndexCore {
             shape_bumps: std::sync::atomic::AtomicU64::new(0),
             long_lived: std::sync::atomic::AtomicBool::new(false),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Record the process `@INC`, canonicalized so the per-asker rank can
+    /// prefix-match candidate paths without query-time filesystem I/O.
+    pub(crate) fn set_inc_roots(&self, roots: &[std::path::PathBuf]) {
+        let canon: Vec<std::path::PathBuf> = roots
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
+        if let Ok(mut g) = self.inc_roots.write() {
+            *g = Arc::new(canon);
         }
     }
 

@@ -597,6 +597,23 @@ pub trait CrossFileLookup {
     fn find_exporters(&self, func_name: &str) -> Vec<String>;
     fn defining_module_cached(&self, entry: &str, name: &str) -> Option<std::sync::Arc<CachedModule>>;
     fn module_declaring_method_in_package(&self, name: &str, class: &str) -> Option<String>;
+    /// The search-path roots this index resolved modules from — the
+    /// process-wide `@INC`, most-preferred first, ALREADY CANONICAL
+    /// (canonicalized once when the resolver published it, never per
+    /// query: this is read on request paths). Shared, so the common origin
+    /// — one with no `use lib` of its own — builds its axis with an Arc
+    /// clone and no filesystem I/O at all. Default empty (an index with no
+    /// module universe), which makes the search-path axis transparent
+    /// rather than blind.
+    fn inc_roots(&self) -> std::sync::Arc<Vec<std::path::PathBuf>> {
+        std::sync::Arc::new(Vec::new())
+    }
+    /// The workspace root, for resolving an origin's relative `use lib`
+    /// entries — Perl resolves those against the process CWD, which for a
+    /// language server is the project root.
+    fn workspace_root_path(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     /// The on-disk path a module name resolves to (Perl module goto-def).
     /// Default `None` for impls without a path map.
     fn module_path_cached(&self, _module_name: &str) -> Option<std::path::PathBuf> {
@@ -690,12 +707,133 @@ pub struct ScopedLookup<'a> {
     inner: &'a dyn CrossFileLookup,
     visible: std::collections::HashSet<String>,
     self_path: Option<std::path::PathBuf>,
-    /// Does the origin's LANGUAGE define visibility by include closure
-    /// (pack: C's flat linkage)? `false` = a scope with no closure axis —
-    /// Perl today, whose package relation is name → MANY files by design;
-    /// its own visibility tier (per-entrypoint @INC / use-closure) plugs in
-    /// HERE when it lands, flipping this on with its own edge kind.
-    closure_scoped: bool,
+    /// How THIS origin decides which same-named candidates it can see.
+    /// The scope carries its own rule, so the decorator never asks what
+    /// language it is serving.
+    axis: VisibilityAxis,
+}
+
+/// The rule an origin's language uses to decide which of a name's
+/// candidates it can see, and in what order.
+///
+/// This is the ONE place a visibility model is named. A consumer asks the
+/// axis, never "is this pack" — a new model (a `use`-closure tier, an
+/// explicit module map) is a variant here and every projection over the
+/// `CandidateSet` inherits it by construction.
+#[derive(Debug, Clone, Default)]
+pub enum VisibilityAxis {
+    /// No model: every candidate is visible, unranked. An origin whose
+    /// language has no visibility rule, or one whose scope is not yet
+    /// known (an unwarmed on-open doc).
+    #[default]
+    Transparent,
+    /// Flat linkage (C): a candidate is visible when the asker's `#include`
+    /// closure reaches it, or when it includes the asker back.
+    IncludeClosure,
+    /// Search-path order (Perl `@INC`): a candidate is visible when it
+    /// lives under one of the asker's roots, and ranks by that root's
+    /// position — the asker's own `use lib` first, then project libs, then
+    /// system. Roots are canonical directory paths, most-preferred first.
+    /// Empty ⇒ behaves as `Transparent`: an origin whose roots are unknown
+    /// must not have its answers narrowed to nothing.
+    SearchPath(std::sync::Arc<Vec<std::path::PathBuf>>),
+}
+
+impl VisibilityAxis {
+    /// THE derivation of an origin's visibility rule. Call sites pass the
+    /// origin and its index; none of them decides which model applies, so
+    /// a new model reaches every projection by changing this one function.
+    ///
+    /// `pack_language` is the routing fact the driver stamped on the
+    /// analysis — the caller reads it from the registry rather than this
+    /// layer importing the driver.
+    pub fn for_origin(
+        origin: &FileAnalysis,
+        self_path: Option<&std::path::Path>,
+        index: &dyn CrossFileLookup,
+        pack_language: bool,
+    ) -> Self {
+        if pack_language {
+            return VisibilityAxis::IncludeClosure;
+        }
+        let inc = index.inc_roots();
+        // The overwhelmingly common origin declares no `use lib`, and this
+        // runs on every request path — so that case is an Arc clone with
+        // ZERO filesystem calls. Only a file that actually names its own
+        // roots pays to resolve them.
+        if origin.lib_roots.is_empty() {
+            return if inc.is_empty() {
+                // Roots unknown (no resolver has run yet): narrowing on an
+                // empty set would answer "no such module" everywhere.
+                VisibilityAxis::Transparent
+            } else {
+                VisibilityAxis::SearchPath(inc)
+            };
+        }
+        let ws = index.workspace_root_path();
+        let self_dir = self_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        let mut push = |p: std::path::PathBuf| {
+            let canon = std::fs::canonicalize(&p).unwrap_or(p);
+            // `canonicalize` already failed for a path that does not exist,
+            // so the survivors are real; the dir test rejects a `use lib`
+            // pointing at a FILE.
+            if canon.is_dir() && !roots.contains(&canon) {
+                roots.push(canon);
+            }
+        };
+        // The origin's OWN roots first — `use lib 't/lib'` is exactly the
+        // statement "for me, this root wins". An entry naming no directory
+        // (an interpolated `"$FindBin::Bin/../lib"`) drops out here.
+        for raw in &origin.lib_roots {
+            let p = std::path::Path::new(raw);
+            if p.is_absolute() {
+                push(p.to_path_buf());
+                continue;
+            }
+            // Relative entries are CWD-relative in Perl; for a server that
+            // is the project root, with the file's own directory as the
+            // fallback a script run from its own directory would see.
+            if let Some(ref ws) = ws {
+                push(ws.join(p));
+            }
+            if let Some(ref d) = self_dir {
+                push(d.join(p));
+            }
+        }
+        // The index's roots are already canonical — appended, never re-stat'd.
+        for r in inc.iter() {
+            if !roots.contains(r) {
+                roots.push(r.clone());
+            }
+        }
+        if roots.is_empty() {
+            return VisibilityAxis::Transparent;
+        }
+        VisibilityAxis::SearchPath(std::sync::Arc::new(roots))
+    }
+
+    /// The asker's rank for a candidate path: `Some(0)` is most preferred,
+    /// `None` means "not visible under this axis". `Transparent` ranks
+    /// everything equally visible.
+    fn rank(&self, path: &std::path::Path) -> Option<usize> {
+        match self {
+            VisibilityAxis::Transparent | VisibilityAxis::IncludeClosure => Some(0),
+            VisibilityAxis::SearchPath(roots) if roots.is_empty() => Some(0),
+            VisibilityAxis::SearchPath(roots) => {
+                // Longest-prefix wins, THEN root order: a vendored
+                // `local/lib/perl5` nested inside the project root would
+                // otherwise be attributed to whichever of the two roots
+                // came first, and the nested one is the more specific fact.
+                roots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| path.starts_with(r))
+                    .min_by_key(|(i, r)| (std::cmp::Reverse(r.as_os_str().len()), *i))
+                    .map(|(i, _)| i)
+            }
+        }
+    }
 }
 
 impl<'a> ScopedLookup<'a> {
@@ -706,7 +844,7 @@ impl<'a> ScopedLookup<'a> {
         inner: &'a dyn CrossFileLookup,
         include_closure: &path_intern::ClosureList,
         self_path: Option<&std::path::Path>,
-        closure_scoped: bool,
+        axis: VisibilityAxis,
     ) -> Self {
         let mut visible: std::collections::HashSet<String> =
             include_closure.iter_strs().map(|a| a.as_ref().to_owned()).collect();
@@ -715,12 +853,27 @@ impl<'a> ScopedLookup<'a> {
             visible.insert(canon.to_string_lossy().into_owned());
             canon
         });
-        ScopedLookup { inner, visible, self_path, closure_scoped }
+        ScopedLookup { inner, visible, self_path, axis }
+    }
+
+    /// The origin's visibility rule — read by projections that must agree
+    /// with forward resolution about which candidates the asker can see.
+    pub fn axis(&self) -> &VisibilityAxis {
+        &self.axis
     }
 }
 
 impl<'a> CrossFileLookup for ScopedLookup<'a> {
     fn get_cached(&self, module_name: &str) -> Option<std::sync::Arc<CachedModule>> {
+        // A search-path origin's winner is PER-ASKER: the same name means
+        // whichever provider this file's own @INC reaches first. Falling
+        // back to the global slot keeps a name with no ranked candidate
+        // answering exactly as before.
+        if matches!(self.axis, VisibilityAxis::SearchPath(_)) {
+            if let Some(best) = self.visible_def_candidates(module_name).into_iter().next() {
+                return Some(best);
+            }
+        }
         self.inner.get_cached_scoped(module_name, &self.visible)
     }
     fn get_cached_scoped(
@@ -728,7 +881,13 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         module_name: &str,
         _visible: &std::collections::HashSet<String>,
     ) -> Option<std::sync::Arc<CachedModule>> {
-        self.inner.get_cached_scoped(module_name, &self.visible)
+        self.get_cached(module_name)
+    }
+    fn inc_roots(&self) -> std::sync::Arc<Vec<std::path::PathBuf>> {
+        self.inner.inc_roots()
+    }
+    fn workspace_root_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.workspace_root_path()
     }
     fn def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
         // Unscoped by design: consumers of the full candidate table weigh
@@ -737,35 +896,59 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         self.inner.def_candidates(name)
     }
     fn visible_def_candidates(&self, name: &str) -> Vec<std::sync::Arc<CachedModule>> {
-        if !self.closure_scoped {
-            // No closure axis (Perl): the whole relation is visible.
-            return self.inner.def_candidates(name);
+        match &self.axis {
+            VisibilityAxis::Transparent => self.inner.def_candidates(name),
+            VisibilityAxis::IncludeClosure => {
+                // Flat linkage: keep candidates CONNECTED to the asker —
+                // visible in its include closure, or including the asker
+                // back (a `.c` body defining what the asker's own header
+                // declares) — the same connectivity rule
+                // `member_def_location` applies. None connected ⇒ the
+                // scope-ranked winner, so an indirect resolution never
+                // regresses.
+                let self_str = self
+                    .self_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let mut out: Vec<std::sync::Arc<CachedModule>> = self
+                    .inner
+                    .def_candidates(name)
+                    .into_iter()
+                    .filter(|c| {
+                        let p = c.path.to_string_lossy();
+                        self.visible.contains(p.as_ref())
+                            || self_str
+                                .as_ref()
+                                .is_some_and(|sp| c.analysis.pack.include_closure.contains(sp))
+                    })
+                    .collect();
+                if out.is_empty() {
+                    out.extend(self.get_cached(name));
+                }
+                out
+            }
+            // Search-path order: keep the candidates the asker's own @INC
+            // reaches, best-ranked root first. A candidate under NO root of
+            // the asker's is a file this file could not load — but dropping
+            // every candidate would answer "no such module" where the tier
+            // simply doesn't know the asker's roots, so an empty result
+            // degrades to the full relation rather than to nothing.
+            VisibilityAxis::SearchPath(_) => {
+                let mut ranked: Vec<(usize, std::sync::Arc<CachedModule>)> = self
+                    .inner
+                    .def_candidates(name)
+                    .into_iter()
+                    .filter_map(|c| self.axis.rank(&c.path).map(|r| (r, c)))
+                    .collect();
+                if ranked.is_empty() {
+                    return self.inner.def_candidates(name);
+                }
+                // Stable within a rank: `def_candidates` arrives path-ordered
+                // and every consumer's tie-break leans on that staying so.
+                ranked.sort_by_key(|(r, _)| *r);
+                ranked.into_iter().map(|(_, c)| c).collect()
+            }
         }
-        // Flat linkage: keep candidates CONNECTED to the asker — visible in
-        // its include closure, or including the asker back (a `.c` body
-        // defining what the asker's own header declares) — the same
-        // connectivity rule `member_def_location` applies. None connected ⇒
-        // the scope-ranked winner, so an indirect resolution never regresses.
-        let self_str = self
-            .self_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned());
-        let mut out: Vec<std::sync::Arc<CachedModule>> = self
-            .inner
-            .def_candidates(name)
-            .into_iter()
-            .filter(|c| {
-                let p = c.path.to_string_lossy();
-                self.visible.contains(p.as_ref())
-                    || self_str
-                        .as_ref()
-                        .is_some_and(|sp| c.analysis.pack.include_closure.contains(sp))
-            })
-            .collect();
-        if out.is_empty() {
-            out.extend(self.get_cached(name));
-        }
-        out
     }
     fn bag_present(
         &self,
@@ -844,9 +1027,7 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // scoped range splices two different files (wrong file at a
         // nonexistent position). Fall back to the raw path map only when no
         // analysis is cached at all.
-        self.inner
-            .get_cached_scoped(module_name, &self.visible)
-            .map(|c| c.path.clone())
+        self.get_cached(module_name).map(|c| c.path.clone())
             .or_else(|| self.inner.module_path_cached(module_name))
     }
     fn visibility_scope(

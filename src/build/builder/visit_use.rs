@@ -17,6 +17,19 @@ impl<'a> Builder<'a> {
         let raw_args = self.extract_mojo_base_args(node);
         let (imports, _qw_close) = self.extract_use_import_list(node);
 
+        // `use lib` is not an import — it prepends search-path roots to the
+        // asker's @INC, which is what decides WHICH file a module name means
+        // for this file (`t/lib` for a test, `lib` for the app). Recorded as
+        // written; resolution against a root happens at query time.
+        if module_name == "lib" {
+            for arg in &imports {
+                if arg.is_empty() || self.lib_roots.iter().any(|r| r == arg) {
+                    continue;
+                }
+                self.lib_roots.push(arg.clone());
+            }
+        }
+
         // Importer consumer form: `use Importer 'M' => qw/foo bar/` imports
         // foo/bar *from M*, not from Importer. Re-target so the import refs
         // and the `Import` entry pin to M — then the existing imported-symbol

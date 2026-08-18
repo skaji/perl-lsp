@@ -241,6 +241,7 @@ pub(super) fn build_with_plugins_inner(
         export_ok: Vec::new(),
         export_tags: std::collections::HashMap::new(),
         reexport_modules: Vec::new(),
+        lib_roots: Vec::new(),
         plugin_namespaces: Vec::new(),
         type_provenance: std::collections::HashMap::new(),
         bag: crate::model::witnesses::WitnessBag::new(),
@@ -583,6 +584,7 @@ pub(super) fn build_with_plugins_inner(
         export_ok: b.export_ok,
         export_tags: b.export_tags,
         reexport_modules: b.reexport_modules,
+        lib_roots: b.lib_roots,
         plugin: crate::model::file_analysis::PluginFacts {
             namespaces: b.plugin_namespaces,
             loads: b.plugin_loads,

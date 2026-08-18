@@ -370,3 +370,91 @@ fn a_workspace_file_still_shadows_an_inc_provider_of_the_same_name() {
     // Both remain candidates — shadowing decides the winner, not membership.
     assert_eq!(idx.def_candidates("Shadowed").len(), 2);
 }
+
+#[test]
+fn use_lib_declares_the_files_own_search_path_roots() {
+    // `use lib` is the per-asker half of module visibility: a test with
+    // `use lib 't/lib'` and an app file without it do NOT see the same
+    // provider for the same module name.
+    let src = r#"
+use lib 't/lib';
+use lib qw(lib local/lib/perl5);
+use lib "$FindBin::Bin/../lib";
+use strict;
+package App;
+1;
+"#;
+    let mut parser = create_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = crate::build::builder::build(&tree, src.as_bytes());
+    assert_eq!(
+        fa.lib_roots,
+        vec!["t/lib", "lib", "local/lib/perl5", "$FindBin::Bin/../lib"],
+        "both the single-string and qw spellings count; roots are stored as \
+         written, and one that names no directory drops out at resolution",
+    );
+    // `use strict` is not a search-path declaration.
+    assert!(!fa.lib_roots.iter().any(|r| r == "strict"));
+}
+
+#[test]
+fn two_askers_with_different_use_lib_see_different_providers() {
+    // The point of the exercise: `@INC` is per-entrypoint, so the SAME
+    // module name means different files to different askers. A test file
+    // with `use lib 't/lib'` must resolve `Twin` to the t/lib copy while
+    // the app file resolves it to the lib copy — one relation, two
+    // visibility rules, decided at CandidateSet construction so every
+    // projection inherits it.
+    use crate::model::file_analysis::{CrossFileLookup, ScopedLookup, VisibilityAxis};
+    let base = std::env::temp_dir().join(format!("perl-lsp-asker-{}", std::process::id()));
+    let (applib, testlib) = (base.join("lib"), base.join("t").join("lib"));
+    std::fs::create_dir_all(&applib).unwrap();
+    std::fs::create_dir_all(&testlib).unwrap();
+    std::fs::write(applib.join("Twin.pm"), "package Twin;\nsub which { 'app' }\n1;\n").unwrap();
+    std::fs::write(testlib.join("Twin.pm"), "package Twin;\nsub which { 'test' }\n1;\n").unwrap();
+
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let mut parser = create_parser();
+    let mut memo: ParseMemo = HashMap::new();
+    // The process @INC has only the app lib: `t/lib` is a root ONLY the
+    // test file declares, which is exactly the discriminator.
+    idx.set_inc_roots_for_test(&[applib.clone()]);
+    let providers = resolve_and_parse_with_memo(
+        &[applib.clone(), testlib.clone()],
+        "Twin",
+        &mut parser,
+        &mut memo,
+    )
+    .expect("Twin resolves");
+    assert_eq!(providers.len(), 2);
+    idx.insert_cache_providers("Twin", Some(providers));
+
+    let mut build_origin = |src: &str| {
+        let tree = parser.parse(src, None).unwrap();
+        crate::build::builder::build(&tree, src.as_bytes())
+    };
+    let app_fa = build_origin("package App;\nuse Twin;\n1;\n");
+    let test_fa = build_origin(&format!(
+        "use lib '{}';\nuse Twin;\n1;\n",
+        testlib.display()
+    ));
+
+    let empty = Default::default();
+    let resolved_by = |fa: &crate::model::file_analysis::FileAnalysis| {
+        let axis = VisibilityAxis::for_origin(fa, None, &idx, false);
+        let scoped = ScopedLookup::new(&idx, &empty, None, axis);
+        scoped.get_cached("Twin").map(|c| c.path.clone())
+    };
+
+    assert_eq!(
+        resolved_by(&app_fa),
+        Some(applib.join("Twin.pm")),
+        "the app file sees only the process @INC, so Twin is the lib copy",
+    );
+    assert_eq!(
+        resolved_by(&test_fa),
+        Some(testlib.join("Twin.pm")),
+        "`use lib 't/lib'` puts that root FIRST for this asker, so the same \
+         name means the t/lib copy",
+    );
+}
