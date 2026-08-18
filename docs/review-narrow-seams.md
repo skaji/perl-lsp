@@ -12,10 +12,9 @@ reason is a result, and four of the five are mostly that.
 
 ---
 
-## 1. `PackInvalidator::swap` strips against a persist it never checked
+## 1. `PackInvalidator::swap` strips against a persist it never checked — **fixed, `586823d`**
 
-`src/index/pack_invalidator.rs:413-484`. **Reported, not fixed — see "why not
-landed".**
+`src/index/pack_invalidator.rs`.
 
 The watcher's re-analysis path hand-rolls its own persist loop instead of
 using `run_persist_writer`, and discards both signals that say whether a blob
@@ -60,47 +59,45 @@ resident copies were stripped is unrecoverable for the session"* — and
 mitigates only the BUSY lane with a 10 s `busy_timeout`. `PackInvalidator::swap`
 is the one persist site that opted out of all of it.
 
-Fix shape: thread the real signal per path.
+The persist collapses onto `run_persist_writer` rather than threading a
+second spelling of the same verdict through the hand-rolled loop: it already
+owns BEGIN IMMEDIATE / COMMIT / ROLLBACK and the committed/fallback fork, and
+two spellings of "did the blob land" is how the wrong one survives. Per-path
+truth rides `save_to_db`'s verdict into the committed lane, so one file's
+failure no longer licenses its siblings' strip; rows are no longer shredded
+for a blob that did not land. Registration is one method both writer lanes
+and the no-cache-DB path share — the writer's own no-connection arm drains
+its channel unregistered, which would otherwise have dropped those files.
 
-```rust
-let mut landed: HashSet<PathBuf> = HashSet::new();
-...
-    if module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace") {
-        landed.insert(p.clone());
-    }
-...
-    let committed = match tx {
-        Some(tx) => match tx.commit() {
-            Ok(()) => true,
-            Err(e) => { log::error!("pack swap: commit failed ({e}) — registering whole copies"); false }
-        },
-        None => true,   // autocommit: each save_to_db reported for itself
-    };
-    if !committed { landed.clear(); }
-```
-then gate the strip on `landed.contains(p)`.
+Base-verified on both lanes, which finding #2 made possible: a `RAISE(ROLLBACK)`
+trigger discards the whole transaction (every copy must stay whole) and a
+`RAISE(ABORT)` trigger scoped to one path fails that blob alone under a
+succeeding commit (that file stays whole, its sibling still strips). Both
+assertions fail against the previous `swap`. A third test is the control —
+with a healthy DB the copies DO strip, so "registered whole" is evidence
+about the failure lane rather than evidence the branch was never reached.
 
-**Why not landed.** `open_cache_db` is `#[cfg(test)] -> None` unconditionally
-(`module_cache/conn.rs:97-100`), so under `cargo test` `persisted` is always
-`false` and the strip branch never executes. The entire persist-then-strip path
-in `PackInvalidator::swap` has **zero unit coverage by construction** — which
-is also why the bug is comfortable there. A fix cannot be base-verified without
-first giving the harness a real cache DB, which is a larger change than the fix.
-That harness gap is finding #2.
+## 2. The persist/strip licence is untestable, and it is the one thing worth testing — **fixed, `3e14958`**
 
-## 2. The persist/strip licence is untestable, and it is the one thing worth testing
-
-`#[cfg(test)] open_cache_db -> None` makes every strip-licensing decision —
+`#[cfg(test)] open_cache_db -> None` made every strip-licensing decision —
 `persisted`, `strip_import_copy`'s gate, the writer's committed/fallback fork —
 unreachable from `cargo test`. Everything that decides whether a resident copy
 may be stripped is therefore exercised only by the gold harness and by
 corpus runs, and only when those happen to take the failure lane, which they
 essentially never do.
 
-This is the coverage shape that lets #1 exist and would let the gate split's
-two failure lanes (below) ship unexercised. A test-mode `open_cache_db` that
-opens a temp-dir DB (env-keyed, or a `#[cfg(test)]` override cell) is the
-enabling change for all of it.
+This is the coverage shape that let #1 exist and would let the gate split's
+two failure lanes (below) ship unexercised.
+
+The real writer open is now factored behind `open_cache_db_at`, so both
+profiles drive the same body — WAL, busy handling, schema init, the
+corruption-only recreate — rather than a test-shaped parallel one, and
+`with_test_cache_dir` installs a real DB for the current thread only. Unset
+(the default) `open_cache_db` still answers `None`, so no existing test
+changed behaviour; the short busy timeout it carries is what lets a test
+drive a contended writer without waiting out the production one. Failure
+lanes are injected with SQLite triggers rather than lock timing, which makes
+each one deterministic.
 
 ## 3. `ResolveQueue`'s priority lane can lose its wakeup — **fixed, `7febd2b`**
 

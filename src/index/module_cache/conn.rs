@@ -34,9 +34,6 @@ pub fn cache_dir_for_workspace(workspace_root: Option<&str>) -> Option<PathBuf> 
 /// pack language gets its own `modules-{lang}.db` so names never comingle on
 /// disk (a Perl `Box` and a C++ class `Box` live in different files). The
 /// ONE spelling both openers share.
-// Every consumer is a real-DB opener, itself `#[cfg(not(test))]` (tests
-// stub the opens out) — match their cfg so the test profile stays clean.
-#[cfg(not(test))]
 pub(super) fn db_path_for(dir: &std::path::Path, lang: &str) -> PathBuf {
     if lang == "perl" {
         dir.join("modules.db")
@@ -48,8 +45,26 @@ pub(super) fn db_path_for(dir: &std::path::Path, lang: &str) -> PathBuf {
 #[cfg(not(test))]
 pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
     let dir = cache_dir_for_workspace(workspace_root)?;
-    std::fs::create_dir_all(&dir).ok()?;
-    let db_path = db_path_for(&dir, lang);
+    open_cache_db_at(&dir, lang, WRITER_BUSY_TIMEOUT)
+}
+
+/// How long a writer waits on a busy DB before failing its statement. Two
+/// writers share the Perl DB (resolver thread + workspace indexer), and a
+/// failed commit after resident copies were stripped is unrecoverable for
+/// the session — so waiting beats failing.
+pub(super) const WRITER_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The writer open, given the cache directory: WAL, busy handling, schema
+/// init, and the corruption-only recreate. Both the production opener and
+/// the test override (`with_test_cache_dir`) route here, so a test drives
+/// the real body rather than a parallel one.
+pub(super) fn open_cache_db_at(
+    dir: &std::path::Path,
+    lang: &str,
+    busy: std::time::Duration,
+) -> Option<Connection> {
+    std::fs::create_dir_all(dir).ok()?;
+    let db_path = db_path_for(dir, lang);
     log::info!("Module cache: {:?}", db_path);
 
     match Connection::open(&db_path) {
@@ -59,7 +74,7 @@ pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connect
             // indexer); a busy writer must wait, not fail its txn — a failed
             // commit after resident copies were stripped is unrecoverable
             // for the session.
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+            let _ = conn.busy_timeout(busy);
             match init_schema(&conn) {
                 Ok(()) => Some(conn),
                 Err(e) => {
@@ -81,7 +96,7 @@ pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connect
                     let _ = std::fs::remove_file(&db_path);
                     let conn = Connection::open(&db_path).ok()?;
                     let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
-                    let _ = conn.busy_timeout(std::time::Duration::from_secs(10));
+                    let _ = conn.busy_timeout(busy);
                     init_schema(&conn).ok()?;
                     Some(conn)
                 }
@@ -95,8 +110,40 @@ pub fn open_cache_db(workspace_root: Option<&str>, lang: &str) -> Option<Connect
 }
 
 #[cfg(test)]
-pub fn open_cache_db(_workspace_root: Option<&str>, _lang: &str) -> Option<Connection> {
-    None
+thread_local! {
+    /// Opt-in real cache DB for the current test thread: `(dir, busy timeout)`.
+    /// Unset — the default — keeps `open_cache_db` answering `None` exactly as
+    /// a stubbed-out open always did, so no existing test changes behaviour.
+    /// A test that needs the persist/strip lanes (whose whole point is a
+    /// *committed blob*, and which are otherwise unreachable from `cargo test`)
+    /// installs one with `with_test_cache_dir`.
+    static TEST_CACHE_DIR: std::cell::RefCell<Option<(PathBuf, std::time::Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `open_cache_db` backed by a real SQLite DB under `dir` on
+/// THIS thread. Thread-local, so parallel tests can't see each other's; the
+/// short busy timeout is what lets a test drive a *contended* writer without
+/// waiting out the production `WRITER_BUSY_TIMEOUT`.
+#[cfg(test)]
+pub fn with_test_cache_dir<R>(dir: &std::path::Path, busy: std::time::Duration, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<(PathBuf, std::time::Duration)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            TEST_CACHE_DIR.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let prev = TEST_CACHE_DIR.with(|c| c.borrow_mut().replace((dir.to_path_buf(), busy)));
+    let _restore = Restore(prev);
+    f()
+}
+
+#[cfg(test)]
+pub fn open_cache_db(_workspace_root: Option<&str>, lang: &str) -> Option<Connection> {
+    let installed = TEST_CACHE_DIR.with(|c| c.borrow().clone());
+    let (dir, busy) = installed?;
+    open_cache_db_at(&dir, lang, busy)
 }
 
 /// Read-only open for query-path consumers (the relational retrieval, bag

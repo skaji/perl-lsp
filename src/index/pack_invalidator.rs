@@ -405,87 +405,139 @@ impl PackInvalidator {
         if let Some(fa) = changed_fa {
             results.push((canon.clone(), fa));
         }
-        // Persist the FULL analyses (bag present) FIRST so the on-disk blob can
-        // rehydrate, then register bag-STRIPPED resident copies and drop each
-        // file's now-stale entry from the rehydration LRU. `results` holds the
-        // full arcs; `save_to_db` encodes them whole. Strip only when we
-        // actually persisted — else the bag would be unrecoverable, so keep it.
-        let persisted = if let Some(conn) = module_cache::open_cache_db(root_uri, lang) {
+        // Persist FIRST so a stripped copy always has a blob to rehydrate
+        // from, then register. The fork is `run_persist_writer`'s: it owns
+        // BEGIN IMMEDIATE / COMMIT / ROLLBACK and routes every entry to the
+        // committed or the fallback lane. The strip licence is a LANDED blob
+        // for that path — `save_to_db`'s verdict, under a transaction that
+        // committed — and exactly one thing gets to decide it.
+        let conn = module_cache::open_cache_db(root_uri, lang);
+        if let Some(ref conn) = conn {
             if deleted {
-                module_cache::delete_ref_rows(&conn, &canon_str);
-            }
-            let tx = conn.unchecked_transaction().ok();
-            for (p, arc) in &results {
-                let p_str = p.to_string_lossy();
-                let cached = Arc::new(CachedModule::new(p.clone(), arc.clone()));
-                module_cache::save_to_db(&conn, &p_str, &Some(cached), "workspace");
-                if !arc.degraded {
-                    let seeds: Vec<_> = arc.ref_row_seeds();
-                    let sym_seeds = arc.sym_row_seeds();
-                    if let Err(e) = module_cache::shred_derived_rows(
-                        &conn, &p_str, "workspace", &seeds, &sym_seeds,
-                    ) {
-                        log::warn!("Failed to shred derived rows for {:?}: {}", p, e);
-                    }
-                }
+                module_cache::delete_ref_rows(conn, &canon_str);
             }
             if skip_consumers {
                 // Unchanged gate: the consumers' rows/blobs/stubs are still
                 // valid, but the edited header's mtime moved every consumer's
                 // closure stamp — refresh them or the next warm rejects every
-                // consumer row (the restart cold storm).
+                // consumer row (the restart cold storm). Outside the writer's
+                // transaction: these rows are already valid, so a refresh that
+                // lands while the changed file's blob does not costs nothing.
                 let mut memo = std::collections::HashMap::new();
                 for (p, closure) in &consumer_closures {
                     module_cache::refresh_deps_stamp(
-                        &conn,
+                        conn,
                         &p.to_string_lossy(),
                         closure,
                         &mut memo,
                     );
                 }
             }
-            if let Some(tx) = tx {
-                let _ = tx.commit();
-            }
-            true
-        } else {
-            false
-        };
-        if let Some(ref pack) = pack {
-            for (p, arc) in &results {
-                // H9-1 generation guard: claim BEFORE unregistering, so a rejected
-                // (strictly-older) result leaves the fresher registration intact
-                // rather than tearing it down. A stale re-analysis that read
-                // pre-save bytes loses to nothing — it simply isn't registered, and
-                // the writer that read post-save bytes (or a later save's event)
-                // wins. This also closes hazard 3: an under-invalidated consumer the
-                // bulk pass registered from pre-save bytes carries a lower generation
-                // than the reconcile that reads current disk, so the reconcile wins
-                // and no pre-save bytes are silently served.
-                if !self.claim_source_gen(p, event_gen) {
-                    log::debug!(
-                        "pack swap: skip stale re-register of {:?} (event gen {} < registered)",
-                        p,
-                        event_gen
-                    );
-                    continue;
+        }
+        match conn {
+            Some(ref conn) => {
+                // Paths whose blob row actually landed. Read by the committed
+                // lane only — the fallback lane's transaction is gone, so
+                // nothing in it landed whatever the per-file verdict said.
+                let landed: std::cell::RefCell<std::collections::HashSet<PathBuf>> =
+                    Default::default();
+                let (tx, rx) = std::sync::mpsc::channel();
+                for (p, arc) in &results {
+                    let _ = tx.send((p.clone(), Arc::clone(arc)));
                 }
-                pack.unregister_file(p);
-                // Drop the stale LRU pin BEFORE the new stripped copy becomes
-                // reachable — a query racing this re-register must not
-                // rehydrate the pre-edit generation against the new
-                // registration (the blob+rows committed above).
-                pack.invalidate_bag_cache(p);
-                if persisted && !arc.degraded && crate::index::module_resolver::eviction_enabled() {
-                    // Registration-owned strip (feeds read the whole copy).
-                    let _ = pack.register_symbols_stripping((*p).clone(), (**arc).clone(), true, true);
-                } else {
-                    pack.register_symbols(p.clone(), arc.clone());
+                drop(tx);
+                crate::index::module_resolver::run_persist_writer(
+                    rx,
+                    Some(conn),
+                    "pack swap persist",
+                    |conn, batch: &[(PathBuf, Arc<FileAnalysis>)]| {
+                        for (p, arc) in batch {
+                            let p_str = p.to_string_lossy();
+                            let cached = Arc::new(CachedModule::new(p.clone(), Arc::clone(arc)));
+                            if !module_cache::save_to_db(conn, &p_str, &Some(cached), "workspace") {
+                                // Shredding now would pair a new generation's
+                                // rows with a blob that isn't there — the same
+                                // write invariant `save_module_generation` holds.
+                                continue;
+                            }
+                            if !arc.degraded {
+                                let seeds: Vec<_> = arc.ref_row_seeds();
+                                let sym_seeds = arc.sym_row_seeds();
+                                if let Err(e) = module_cache::shred_derived_rows(
+                                    conn, &p_str, "workspace", &seeds, &sym_seeds,
+                                ) {
+                                    log::warn!("Failed to shred derived rows for {:?}: {}", p, e);
+                                }
+                            }
+                            landed.borrow_mut().insert(p.clone());
+                        }
+                    },
+                    |(p, arc): (PathBuf, Arc<FileAnalysis>)| {
+                        let ok = landed.borrow().contains(&p);
+                        self.register_after_swap(pack.as_ref(), &p, &arc, ok, event_gen);
+                    },
+                    |(p, arc): (PathBuf, Arc<FileAnalysis>)| {
+                        self.register_after_swap(pack.as_ref(), &p, &arc, false, event_gen);
+                    },
+                );
+            }
+            // No cache DB at all: nothing can land, so nothing may be
+            // stripped. (`run_persist_writer`'s own no-connection arm drains
+            // its channel unregistered, which would drop these files.)
+            None => {
+                for (p, arc) in &results {
+                    self.register_after_swap(pack.as_ref(), p, arc, false, event_gen);
                 }
             }
         }
         skip_consumers
     }
+
+    /// The registration half of a swap, for one file. `landed` is the strip
+    /// licence — a blob committed for THIS path — because a stripped copy
+    /// without one does not read as absent: `load_one_diag` skips stamp
+    /// validation on a single-row path, so it rehydrates the PREVIOUS
+    /// generation and the file answers pre-edit for the rest of the session,
+    /// with no rehydration miss counted and no strict-residency panic.
+    fn register_after_swap(
+        &self,
+        pack: Option<&Arc<ModuleIndex>>,
+        path: &Path,
+        arc: &Arc<FileAnalysis>,
+        landed: bool,
+        event_gen: i64,
+    ) {
+        let Some(pack) = pack else { return };
+        // H9-1 generation guard: claim BEFORE unregistering, so a rejected
+        // (strictly-older) result leaves the fresher registration intact rather
+        // than tearing it down. A stale re-analysis that read pre-save bytes
+        // loses to nothing — it simply isn't registered, and the writer that
+        // read post-save bytes (or a later save's event) wins. This also closes
+        // hazard 3: an under-invalidated consumer the bulk pass registered from
+        // pre-save bytes carries a lower generation than the reconcile that
+        // reads current disk, so the reconcile wins and no pre-save bytes are
+        // silently served.
+        if !self.claim_source_gen(path, event_gen) {
+            log::debug!(
+                "pack swap: skip stale re-register of {:?} (event gen {} < registered)",
+                path,
+                event_gen
+            );
+            return;
+        }
+        pack.unregister_file(path);
+        // Drop the stale LRU pin BEFORE the new copy becomes reachable — a
+        // query racing this re-register must not rehydrate the pre-edit
+        // generation against the new registration.
+        pack.invalidate_bag_cache(path);
+        if landed && !arc.degraded && crate::index::module_resolver::eviction_enabled() {
+            // Registration-owned strip (feeds read the whole copy).
+            let _ = pack.register_symbols_stripping(path.to_path_buf(), (**arc).clone(), true, true);
+        } else {
+            pack.register_symbols(path.to_path_buf(), Arc::clone(arc));
+        }
+    }
+
 }
 
 #[cfg(test)]
