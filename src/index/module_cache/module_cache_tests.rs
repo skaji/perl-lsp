@@ -529,12 +529,17 @@ fn shred_ref_rows_roundtrip() {
     let hits = ref_candidate_files(&conn, &["helper".to_string()]);
     assert_eq!(hits, vec![path_str.clone()]);
     assert!(ref_candidate_files(&conn, &["nonesuch".to_string()]).is_empty());
-    let n = ref_count_named(&conn, "helper");
-    assert!(n >= 2, "two call sites expected, got {n}");
+    // Two call sites in ONE file are ONE row: rows are (name, file) pairs,
+    // and every reader projects onto exactly that.
+    assert_eq!(
+        ref_candidate_file_count(&conn, "helper"),
+        1,
+        "a file's repeated mentions of a name must collapse to one row",
+    );
 
     // Re-shred replaces: same seeds again must not double the rows.
     shred_derived_rows(&conn, &path_str, "workspace", &seeds, &[]).unwrap();
-    assert_eq!(ref_count_named(&conn, "helper"), n);
+    assert_eq!(ref_candidate_file_count(&conn, "helper"), 1);
 
     // A zero-ref shred still marks the file as shredded (the backfill marker).
     let other = dir.join("TestModule_shred_empty.pm");
@@ -1127,4 +1132,167 @@ fn load_one_diag_discriminates_failures() {
         RehydrateMiss::DecodeFailed
     ));
     let _ = std::fs::remove_file(&pm);
+}
+
+// ---- The deduped ref-row model ----
+//
+// Rows are `(name_id, file_id)` pairs. Every reader is a set-valued
+// projection onto exactly that, so the dedup is bit-identical rather than
+// approximately safe — but the two ways it could go wrong are silent, so
+// both are pinned here.
+
+#[test]
+fn ref_rows_dedup_per_file_and_not_across_files() {
+    // Collapsing a file's repeated mentions is the win; collapsing ACROSS
+    // files would drop candidates and silently shrink every backward walk.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let mk = |name: &str, body: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        let cached = parse_source_to_cached(body, &p);
+        (p.to_string_lossy().to_string(), cached.analysis.ref_row_seeds())
+    };
+    // `helper` mentioned many times in one file, and once in another.
+    let (a_path, a_seeds) = mk(
+        "dedup_a.pm",
+        "package A;\nsub helper { 1 }\nsub go { helper(); helper(); helper(); helper(); }\n1;\n",
+    );
+    let (b_path, b_seeds) = mk("dedup_b.pm", "package B;\nsub go { helper(); }\n1;\n");
+
+    shred_derived_rows(&conn, &a_path, "workspace", &a_seeds, &[]).unwrap();
+    assert_eq!(
+        ref_candidate_file_count(&conn, "helper"),
+        1,
+        "four call sites in one file must be one row",
+    );
+
+    shred_derived_rows(&conn, &b_path, "workspace", &b_seeds, &[]).unwrap();
+    assert_eq!(
+        ref_candidate_file_count(&conn, "helper"),
+        2,
+        "a second FILE is a second candidate — dedup is per file, never global",
+    );
+
+    let mut hits = ref_candidate_files(&conn, &["helper".to_string()]);
+    hits.sort();
+    let mut want = vec![a_path, b_path];
+    want.sort();
+    assert_eq!(hits, want, "both files must stay retrievable");
+}
+
+#[test]
+fn wiping_the_strings_table_does_not_leave_dangling_name_ids() {
+    // The shredder memoizes interned `str_id`s for the writer's lifetime.
+    // `clear_derived_rows` empties `strings`, so without the
+    // `strings_generation` guard the memo would keep handing out ids for
+    // rows that no longer exist — refs would be written with a `name_id`
+    // nothing joins to, and retrieval would answer EMPTY rather than fail.
+    // That is the failure this test exists for, so it asserts on retrieval.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let p = dir.join("dangling_probe.pm");
+    let src = "package D;\nsub helper { 1 }\nsub go { helper(); }\n1;\n";
+    std::fs::write(&p, src).unwrap();
+    let path_str = p.to_string_lossy().to_string();
+    let seeds = parse_source_to_cached(src, &p).analysis.ref_row_seeds();
+
+    shred_derived_rows(&conn, &path_str, "workspace", &seeds, &[]).unwrap();
+    assert_eq!(ref_candidate_files(&conn, &["helper".to_string()]), vec![path_str.clone()]);
+
+    // The wipe every hard-clear performs, on the SAME connection and thread
+    // that just populated the memo.
+    clear_derived_rows(&conn).unwrap();
+    assert!(ref_candidate_files(&conn, &["helper".to_string()]).is_empty());
+
+    shred_derived_rows(&conn, &path_str, "workspace", &seeds, &[]).unwrap();
+    assert_eq!(
+        ref_candidate_files(&conn, &["helper".to_string()]),
+        vec![path_str],
+        "post-wipe rows carry a name_id that joins to nothing",
+    );
+}
+
+#[test]
+fn the_intern_memo_stays_bounded_and_correct_past_its_cap() {
+    // The memo is per-thread and lives for the writer's lifetime, so an
+    // unbounded one would accumulate a corpus's whole unique-name set per
+    // Rayon worker. Crossing the cap must not change what gets written —
+    // a cleared memo just re-interns, it never invents an id.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    // Far more distinct names than the cap, spread over several files so the
+    // memo carries across shred calls the way it does in the writer.
+    let mut all_names: Vec<String> = Vec::new();
+    for f in 0..4 {
+        let mut src = format!("package Cap{f};\n");
+        for i in 0..12_000 {
+            let n = format!("nm_{f}_{i}");
+            src.push_str(&format!("sub {n} {{ 1 }}\n"));
+            all_names.push(n);
+        }
+        src.push_str("1;\n");
+        let p = dir.join(format!("cap_probe_{f}.pm"));
+        std::fs::write(&p, &src).unwrap();
+        let path_str = p.to_string_lossy().to_string();
+        let cached = parse_source_to_cached(&src, &p);
+        shred_derived_rows(
+            &conn,
+            &path_str,
+            "workspace",
+            &cached.analysis.ref_row_seeds(),
+            &cached.analysis.sym_row_seeds(),
+        )
+        .unwrap();
+    }
+    // 48k distinct names went through a 32k-entry memo; every one must still
+    // have interned to a real row that retrieval can join to.
+    for probe in [&all_names[0], &all_names[all_names.len() / 2], all_names.last().unwrap()] {
+        assert!(
+            !ref_candidate_files(&conn, &[probe.to_string()]).is_empty(),
+            "name {probe} lost its row after the memo wrapped",
+        );
+    }
+}
+
+#[test]
+fn a_qualified_symbols_declaring_file_is_a_ref_candidate() {
+    // Refs are keyed by `Ref::match_key` — the LAST segment — while a symbol
+    // row's display name is whatever it is called. For a qualified name
+    // (`package Deep::Pkg::Thing`) those differ, so a row storing only the
+    // display name is undiscoverable by retrieval, and a file that mentions
+    // the name nowhere but its own declaration drops out of the candidate set
+    // entirely. That is the `syms` union failing at exactly the job it exists
+    // for. The row carries both, and this pins it.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let p = dir.join("qualified_decl.pm");
+    // Declares the package and never mentions the name again.
+    let src = "package Deep::Pkg::Thing;\nsub helper { 1 }\n1;\n";
+    std::fs::write(&p, src).unwrap();
+    let path_str = p.to_string_lossy().to_string();
+    let cached = parse_source_to_cached(src, &p);
+    shred_derived_rows(
+        &conn,
+        &path_str,
+        "workspace",
+        &cached.analysis.ref_row_seeds(),
+        &cached.analysis.sym_row_seeds(),
+    )
+    .unwrap();
+
+    // The key a REFERENCE to this package carries.
+    let key = crate::model::file_analysis::name_match_key("Deep::Pkg::Thing");
+    assert_eq!(key, "Thing");
+    assert_eq!(
+        ref_candidate_files(&conn, &[key]),
+        vec![path_str.clone()],
+        "the declaring file must be retrievable by the key references use",
+    );
+    // And the display name still finds it, so workspace/symbol is unaffected.
+    assert_eq!(
+        ref_candidate_files(&conn, &["Deep::Pkg::Thing".to_string()]),
+        Vec::<String>::new(),
+        "the display name is not a retrieval key — that is what key_id is for",
+    );
 }

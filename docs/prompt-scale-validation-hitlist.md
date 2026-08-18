@@ -547,7 +547,7 @@ anyone reaching for the cheap probe.
 and `--definition` controls refuted that and the retraction is in its log. The
 row #3 conclusion rests only on the LSP measurement.)
 
-### 7. Cold-index write pressure — RESEARCHED, patch plan ready
+### 7. Cold-index write pressure — dedup + interner LANDED, backpressure open
 
 ~17M rows into 1.73 GB through SQLite's single writer; the 20-core walk
 outpaces it ~4x, so ~4/5 of the corpus sits in an unbounded channel (the ~7 GB
@@ -609,6 +609,39 @@ cheaper.
 Order: SELECT-first interning + drop the discarded `parts.surface` from the
 channel (no bump) → bounded channel with the lock audit → writer-lifetime memo
 → dedup + `REF_ROWS_VERSION` 5 → 6.
+
+**Landed: the dedup, the interner, and `REF_ROWS_VERSION` 6.** `refs` is
+`(name_id, file_id)` `WITHOUT ROWID` — the table IS the name index, so
+`idx_refs_name` is gone. The shredder dedups the pairs in memory rather than
+leaning on the primary key's conflict handling, which collapses the STATEMENT
+count along with the row count; the statements were the write pressure.
+Interning is SELECT-first with a writer-lifetime memo keyed by a new
+`strings_generation` counter in `meta`, bumped by `clear_derived_rows` and by
+the row-format rebuild — without that key a wipe leaves cached `str_id`s
+pointing at rows that are gone, and the refs written afterwards carry a
+`name_id` nothing joins to: retrieval answers EMPTY rather than failing, which
+is why it has its own test.
+
+`ref_count_named` is now `ref_candidate_file_count`. Its old name described
+occurrence counting, which the row model no longer does — and a row count
+being mistaken for a reference count is exactly the confusion that produced
+the ten dead columns.
+
+**`--refs-parity` is ALREADY RED on the substrate, before this change.**
+Identical mismatches on `b4971c3f` and on the branch — same symbols, same
+counts — so the dedup is parity-neutral, but the net cannot be read as
+"mismatches ⇒ the dedup broke it". Compare base-vs-branch, not against zero.
+
+The pre-existing bug it exposes: **a package's own declaring file is not in
+the rows candidate set** when that file mentions the package name nowhere but
+its own `package` statement. `--references` on `Mojolicious::Sessions` returns
+the external hit in `Mojolicious.pm` from rows and additionally the
+self-declaration at `Sessions.pm:0:8` from the resident walk. `PPI::Statement::-
+Unknown` is the same shape. `ref_candidate_files` unions `syms` precisely so
+declaration-only files stay candidates, so the union is not covering Package
+symbols — either the key the walk passes or the name the sym row carries.
+Left unfixed deliberately: fixing it inside this change would confound the
+parity signal that verifies the dedup.
 
 # Tier 2 — cheap, and now debuggable
 

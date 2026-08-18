@@ -4,6 +4,59 @@
 
 use super::*;
 
+/// String-intern cache for the shredder, held for the WRITER's lifetime
+/// rather than rebuilt per file.
+///
+/// Interning was two statements per name per file, and a cold corpus index
+/// re-interned the same few thousand names (`$self`, `@_`, `new`) across
+/// every file — millions of round trips against the unique index, all
+/// redundant. Keyed by `strings_generation` so a `clear_derived_rows` (or a
+/// row-format rebuild) that empties `strings` can never leave a cached
+/// `str_id` pointing at a row that is gone: a dangling `name_id` writes rows
+/// that no retrieval can ever match, which fails silently rather than loudly.
+///
+/// Thread-local because the bulk indexers shred from Rayon workers; each
+/// keeps its own cache and they converge on the same ids.
+struct InternMemo {
+    generation: i64,
+    map: std::collections::HashMap<String, i64>,
+}
+
+/// Entry cap. The redundancy this memo removes is concentrated in a few
+/// thousand names (`$self`, `@_`, `new`) repeated across every file; the
+/// long tail is interned once anyway and caching it buys nothing. Left
+/// unbounded, a worker thread would accumulate the corpus's whole unique-name
+/// set — 556k strings at 138k files, times a Rayon worker each — so it is
+/// capped rather than byte-accounted, per the residency discipline that says
+/// a derived cache must be bounded by construction.
+const INTERN_MEMO_CAP: usize = 32_768;
+
+impl InternMemo {
+    fn reset_if_stale(&mut self, generation: i64) {
+        if self.generation != generation {
+            self.map.clear();
+            self.generation = generation;
+        }
+    }
+
+    fn remember(&mut self, s: &str, id: i64) {
+        // Clear-on-overflow rather than an LRU: the hot set re-warms within a
+        // few files, and eviction bookkeeping would cost more than the misses.
+        if self.map.len() >= INTERN_MEMO_CAP {
+            self.map.clear();
+        }
+        self.map.insert(s.to_string(), id);
+    }
+}
+
+thread_local! {
+    static INTERN_MEMO: std::cell::RefCell<InternMemo> = std::cell::RefCell::new(InternMemo {
+        // No real generation is negative, so the first shred always resets.
+        generation: -1,
+        map: std::collections::HashMap::new(),
+    });
+}
+
 /// Replace one file's derived rows — refs AND symbols — in the relational
 /// index. One function so both families are the same generation by
 /// construction (`files` presence is the single "already shredded" marker;
@@ -36,70 +89,95 @@ pub fn shred_derived_rows(
     )?;
     conn.execute("DELETE FROM refs WHERE file_id = ?1", params![file_id])?;
     conn.execute("DELETE FROM syms WHERE file_id = ?1", params![file_id])?;
-    let mut intern = conn.prepare_cached("INSERT OR IGNORE INTO strings (s) VALUES (?1)")?;
-    let mut lookup = conn.prepare_cached("SELECT str_id FROM strings WHERE s = ?1")?;
-    let mut insert = conn.prepare_cached(
-        "INSERT INTO refs (file_id, name_id, kind, start_row, start_col, end_row, end_col,
-                           access, flags, qual_kind, qual_id, arg_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-    )?;
-    // Per-call interning memo: files repeat the same handful of names heavily.
-    let mut memo: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    let mut intern_str = |s: &str,
-                          memo: &mut std::collections::HashMap<String, i64>|
-     -> rusqlite::Result<i64> {
-        if let Some(id) = memo.get(s) {
-            return Ok(*id);
+
+    let generation = crate::index::module_cache::strings_generation(conn);
+    INTERN_MEMO.with(|cell| -> rusqlite::Result<()> {
+        let mut memo = cell.borrow_mut();
+        memo.reset_if_stale(generation);
+
+        let mut intern = conn.prepare_cached("INSERT OR IGNORE INTO strings (s) VALUES (?1)")?;
+        let mut lookup = conn.prepare_cached("SELECT str_id FROM strings WHERE s = ?1")?;
+        // SELECT first. `INSERT OR IGNORE` for a name already interned is a
+        // write statement that does nothing, and at corpus scale almost every
+        // name is already there — `$self` was re-interned once per FILE.
+        let mut intern_str = |s: &str, memo: &mut InternMemo| -> rusqlite::Result<i64> {
+            if let Some(id) = memo.map.get(s) {
+                return Ok(*id);
+            }
+            let id: i64 = match lookup.query_row(params![s], |row| row.get(0)) {
+                Ok(id) => id,
+                Err(_) => {
+                    intern.execute(params![s])?;
+                    lookup.query_row(params![s], |row| row.get(0))?
+                }
+            };
+            memo.remember(s, id);
+            Ok(id)
+        };
+
+        // Only the (name, file) PAIR is stored, so a file's thousands of
+        // `$self` refs are ONE row. Deduping HERE rather than leaning on the
+        // primary key's conflict handling is the point: it collapses the
+        // statement count along with the row count, and the statements were
+        // the write pressure.
+        let mut insert = conn.prepare_cached(
+            // OR IGNORE, not a bare INSERT: the per-file DELETE above should
+            // leave every pair fresh, but a duplicate would otherwise abort
+            // the whole chunk transaction and take other files' rows with it.
+            "INSERT OR IGNORE INTO refs (name_id, file_id) VALUES (?1, ?2)",
+        )?;
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for seed in seeds {
+            if !seen.insert(seed.key.as_str()) {
+                continue;
+            }
+            let name_id = intern_str(&seed.key, &mut memo)?;
+            insert.execute(params![name_id, file_id])?;
         }
-        intern.execute(params![s])?;
-        let id: i64 = lookup.query_row(params![s], |row| row.get(0))?;
-        memo.insert(s.to_string(), id);
-        Ok(id)
-    };
-    for seed in seeds {
-        let name_id = intern_str(&seed.key, &mut memo)?;
-        let qual_id = match seed.qual.as_deref() {
-            Some(q) => Some(intern_str(q, &mut memo)?),
-            None => None,
-        };
-        insert.execute(params![
-            file_id,
-            name_id,
-            seed.kind,
-            seed.span.start.row as i64,
-            seed.span.start.column as i64,
-            seed.span.end.row as i64,
-            seed.span.end.column as i64,
-            seed.access,
-            seed.flags,
-            seed.qual_kind,
-            qual_id,
-            seed.arg_count,
-        ])?;
-    }
-    let mut insert_sym = conn.prepare_cached(
-        "INSERT INTO syms (file_id, name_id, kind, start_row, start_col, end_row, end_col,
-                           container_id, flags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
-    for seed in sym_seeds {
-        let name_id = intern_str(&seed.name, &mut memo)?;
-        let container_id = match seed.container.as_deref() {
-            Some(c) => Some(intern_str(c, &mut memo)?),
-            None => None,
-        };
-        insert_sym.execute(params![
-            file_id,
-            name_id,
-            seed.kind,
-            seed.span.start.row as i64,
-            seed.span.start.column as i64,
-            seed.span.end.row as i64,
-            seed.span.end.column as i64,
-            container_id,
-            seed.flags,
-        ])?;
-    }
+        drop(insert);
+
+        // Symbols keep their full row shape — every column has a reader
+        // (`sym_rows_matching`, the dead-export view, workspace/symbol).
+        let mut insert_sym = conn.prepare_cached(
+            "INSERT INTO syms (file_id, name_id, key_id, kind, start_row, start_col, end_row,
+                               end_col, container_id, flags)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        for seed in sym_seeds {
+            let name_id = intern_str(&seed.name, &mut memo)?;
+            // A symbol row carries BOTH names: `name_id` is what it is called
+            // (`Mojolicious::Sessions` — what workspace/symbol searches and
+            // reports), `key_id` is what a REFERENCE to it is keyed by
+            // (`Sessions` — `Ref::match_key` keeps only the last segment).
+            // Retrieval probes the key, so a row that stored only the display
+            // name was undiscoverable for every qualified symbol: a package's
+            // own declaration could not be found through the `syms` union that
+            // exists to make declaration-only files candidates.
+            let key = crate::model::file_analysis::name_match_key(&seed.name);
+            let key_id = if key == seed.name {
+                name_id
+            } else {
+                intern_str(&key, &mut memo)?
+            };
+            let container_id = match seed.container.as_deref() {
+                Some(c) => Some(intern_str(c, &mut memo)?),
+                None => None,
+            };
+            insert_sym.execute(params![
+                file_id,
+                name_id,
+                key_id,
+                seed.kind,
+                seed.span.start.row as i64,
+                seed.span.start.column as i64,
+                seed.span.end.row as i64,
+                seed.span.end.column as i64,
+                container_id,
+                seed.flags,
+            ])?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -184,7 +262,7 @@ pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
          UNION
          SELECT DISTINCT f.path FROM syms y
            JOIN files f ON f.file_id = y.file_id
-          WHERE y.name_id = (SELECT str_id FROM strings WHERE s = ?1)",
+          WHERE y.key_id = (SELECT str_id FROM strings WHERE s = ?1)",
     ) else {
         return out;
     };
@@ -324,10 +402,16 @@ pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
     out
 }
 
-/// Row count for one match key — the count-first surface for hot-name
-/// capping (`docs/adr/relational-ref-index.md`).
+/// How many FILES carry a ref row for one match key.
+///
+/// Deliberately not called a reference count: rows are `(name_id, file_id)`
+/// pairs, so this is a CANDIDATE count — how many files the backward walk
+/// would rehydrate — and it is an over-approximation of the answer by
+/// construction. That over-approximation is load-bearing (`unused_exported_-
+/// syms` is sound only because absence means zero, while presence means
+/// "maybe"), so nothing may present this as "how many times X is used".
 #[cfg(test)]
-pub fn ref_count_named(conn: &Connection, key: &str) -> u64 {
+pub fn ref_candidate_file_count(conn: &Connection, key: &str) -> u64 {
     conn.query_row(
         "SELECT COUNT(*) FROM refs
           WHERE name_id = (SELECT str_id FROM strings WHERE s = ?1)",
@@ -439,8 +523,14 @@ pub fn unused_exported_syms(conn: &Connection) -> Vec<DeadExportRow> {
           WHERE f.source = 'workspace'
             AND (y.flags & ?1) != 0
             AND NOT EXISTS (
+                  -- Against the KEY: refs are keyed by `Ref::match_key`, so
+                  -- comparing them to a symbol's display name is what let the
+                  -- two families drift apart in the first place. A no-op for
+                  -- the rows this view gates on (an `@EXPORT` name is bare, so
+                  -- key and name are the same string) — it is here so the next
+                  -- reader cannot reintroduce the mismatch.
                   SELECT 1 FROM refs r
-                   WHERE r.name_id = y.name_id
+                   WHERE r.name_id = y.key_id
                      AND r.file_id != y.file_id
                 )",
     ) else {
