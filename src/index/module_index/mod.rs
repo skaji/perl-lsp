@@ -121,6 +121,23 @@ pub(crate) struct ResolveQueue {
     pub condvar: Condvar,
 }
 
+impl ResolveQueue {
+    /// Wake the drain after enqueueing. The notify is taken under `pending`
+    /// — the mutex `drain_next_batch` parks on — so it cannot land in the
+    /// window between the drain's queue checks and its park, where a condvar
+    /// has nobody to signal and the wakeup is simply lost. Free for a
+    /// `pending` push (that mutex already serializes it), load-bearing for a
+    /// `priority` one, whose own mutex gives no such ordering.
+    ///
+    /// The caller must have RELEASED `priority` first: the drain acquires
+    /// pending-then-priority, so holding both the other way round closes a
+    /// cycle.
+    pub fn notify_new_work(&self) {
+        let _pending = self.pending.lock().unwrap();
+        self.condvar.notify_one();
+    }
+}
+
 /// Signaled after each module is resolved.
 pub(crate) struct ResolveNotify {
     pub mu: Mutex<()>,

@@ -61,9 +61,11 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
         // re-resolve on demand (`request_resolve` queues stale names with
         // priority).
         if server.is_some() && !stale_names.is_empty() {
-            let mut pq = core.queue.priority.lock().unwrap();
-            pq.extend(stale_names);
-            core.queue.condvar.notify_one();
+            {
+                let mut pq = core.queue.priority.lock().unwrap();
+                pq.extend(stale_names);
+            }
+            core.queue.notify_new_work();
         }
         // Build reverse index from warmed cache.
         core.rebuild_reverse_index();
@@ -309,23 +311,28 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
 }
 
 /// Drain the next batch from the queue, checking priority first.
-fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
-    // Check priority first
-    {
-        let mut priority = queue.priority.lock().unwrap();
-        if !priority.is_empty() {
-            return std::mem::take(&mut *priority);
-        }
-    }
-    // Wait for pending
+///
+/// Both checks live INSIDE the wait loop and `pending` is held across them.
+/// `priority` has its own mutex, so — unlike a `pending` push — a priority
+/// push is not serialized against this park by the condvar's mutex: a check
+/// made before taking `pending` could be overtaken by a push whose notify
+/// then reaches nobody, and the batch would sleep until unrelated `pending`
+/// traffic arrived (forever, in an all-stale workload where every
+/// `request_resolve` takes the priority branch). Producers close the other
+/// half by notifying under `pending` (`ResolveQueue::notify_new_work`).
+///
+/// Lock order here is pending-then-priority; producers must never hold
+/// `priority` while acquiring `pending`.
+pub(super) fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
     let mut pending = queue.pending.lock().unwrap();
     loop {
-        if !pending.is_empty() {
-            // Before draining pending, re-check priority
+        {
             let mut priority = queue.priority.lock().unwrap();
             if !priority.is_empty() {
                 return std::mem::take(&mut *priority);
             }
+        }
+        if !pending.is_empty() {
             return std::mem::take(&mut *pending);
         }
         pending = queue.condvar.wait(pending).unwrap();
