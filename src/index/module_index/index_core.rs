@@ -21,6 +21,14 @@ pub(crate) struct IndexCore {
     /// contributor's own build. Fed by `record_workspace_projections`
     /// (before the packageless early-return) AND `insert_resolved`.
     pub(crate) loader_config_shapes: DashMap<String, Vec<(String, InferredTypeOwned)>>,
+    /// Reverse index: contributor → the load-names it recorded a shape under.
+    /// Retracting a contributor used to `retain` over the whole shape map — an
+    /// ALL-SHARD write barrier, run once per registered file by the bulk walk.
+    /// Almost no file contributes a shape, so the scan was pure overhead
+    /// 124k times over at workspace scale; with this, a non-contributor's
+    /// retraction is one lookup miss and a contributor's touches only its own
+    /// names.
+    shapes_by_contributor: DashMap<String, Vec<String>>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     pub(crate) stale_modules: DashMap<String, ()>,
@@ -89,6 +97,7 @@ impl IndexCore {
             cache: DashMap::new(),
             edges: ModuleEdgeIndexes::new(),
             loader_config_shapes: DashMap::new(),
+            shapes_by_contributor: DashMap::new(),
             stale_modules: DashMap::new(),
             builtins: DashMap::new(),
             available_modules: DashMap::new(),
@@ -239,11 +248,31 @@ impl IndexCore {
     /// name with several providers purges once and accumulates the union.
     pub(crate) fn purge_loader_shapes(&self, contributor: &str) {
         crate::util::ghost_stats::count("epoch.shape.record_loader_shapes");
+        // The epoch always moves: this runs from a registration writer, and
+        // over-invalidation is the safe direction. It is one relaxed add and
+        // was never the cost here — the whole-map `retain` this replaced was,
+        // being an ALL-SHARD write barrier run once per registered file.
         self.note_shape_change();
-        self.loader_config_shapes.retain(|_n, v| {
-            v.retain(|(c, _)| c != contributor);
-            !v.is_empty()
-        });
+        // Retract only THIS contributor's names. A file that recorded no shape
+        // — nearly all of them at workspace scale — is one lookup miss.
+        let Some((_, names)) = self.shapes_by_contributor.remove(contributor) else {
+            crate::util::ghost_stats::count("epoch.shape.purge_skipped_empty");
+            return;
+        };
+        for name in names {
+            let now_empty = match self.loader_config_shapes.get_mut(&name) {
+                Some(mut v) => {
+                    v.retain(|(c, _)| c != contributor);
+                    v.is_empty()
+                }
+                None => false,
+            };
+            if now_empty {
+                // Keep the "no shapes under this name" state indistinguishable
+                // from never-recorded, so readers need no empty-vec arm.
+                self.loader_config_shapes.remove_if(&name, |_, v| v.is_empty());
+            }
+        }
     }
 
     /// Project each `PluginLoad` fact's config value into a stored
@@ -265,6 +294,10 @@ impl IndexCore {
                     .entry(f.name.clone())
                     .or_default()
                     .push((contributor.to_string(), t));
+                self.shapes_by_contributor
+                    .entry(contributor.to_string())
+                    .or_default()
+                    .push(f.name.clone());
             }
         }
     }
