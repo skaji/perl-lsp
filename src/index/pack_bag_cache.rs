@@ -47,6 +47,11 @@ pub struct PackBagCache {
     /// interleaving ever breaks that, because an over-count is a one-way
     /// ratchet that collapses the cache to a single entry.
     bytes: AtomicUsize,
+    /// How many times `resync_bytes` found the charge total actually wrong
+    /// and repaired it. The ghost-stats counter reports the same event but
+    /// only under `PERL_LSP_GHOST_STATS`; this one is always live so the
+    /// alarm is assertable.
+    resyncs: AtomicUsize,
     /// `maxCacheMb * 1 MiB`. `0` ⇒ never retain (rehydrate-and-drop).
     cap_bytes: usize,
     /// Per-path invalidation generation: `invalidate` bumps, a loading
@@ -85,6 +90,7 @@ impl PackBagCache {
             recency: DashMap::new(),
             clock: AtomicU64::new(0),
             bytes: AtomicUsize::new(0),
+            resyncs: AtomicUsize::new(0),
             cap_bytes,
             generation: DashMap::new(),
             loader: Box::new(loader),
@@ -233,14 +239,19 @@ impl PackBagCache {
     /// Recompute the charge total from the map. O(entries), and only reached
     /// when eviction has run out of victims while still reading over cap.
     ///
-    /// This is a self-heal for an invariant that should never break, so it
-    /// firing at all is the signal — a drifting counter is what collapsed this
-    /// LRU to a single entry and grew the process to 13.9 GB. Silent
-    /// self-healing would hide the next instance, hence the counter.
+    /// This is a self-heal for an invariant that should never break, so a
+    /// REPAIR is the signal — a drifting counter is what collapsed this LRU to
+    /// a single entry and grew the process to 13.9 GB. But running out of
+    /// victims does not imply drift: `evict_to_cap` never evicts `keep`, so an
+    /// entry bigger than the whole cap lands here every insert with the total
+    /// perfectly correct. Counting that would train the reader to ignore the
+    /// one number that names the ratchet, so only an actual correction reports.
     fn resync_bytes(&self) {
-        crate::util::ghost_stats::count("pack_bag_cache.resync_bytes_fired");
         let truth: usize = self.entries.iter().map(|e| e.value().1).sum();
-        self.bytes.store(truth, Ordering::Relaxed);
+        if self.bytes.swap(truth, Ordering::Relaxed) != truth {
+            crate::util::ghost_stats::count("pack_bag_cache.resync_bytes_fired");
+            self.resyncs.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Drop `path`'s retained bag (a changed/saved file's bag is stale) so the
@@ -435,6 +446,58 @@ mod tests {
         let rows3 = cache.rows_for(&p).unwrap();
         assert!(Arc::ptr_eq(&whole, &rows3), "whole entry is a superset for rows readers");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// `evict_to_cap` deliberately never evicts `keep`, so an entry larger
+    /// than the whole cap leaves the loop unable to get back under it — a
+    /// DESIGNED state ("a single oversized bag over the whole cap still
+    /// resolves the query it was loaded for"), not drift. It must not trip
+    /// the drift alarm: an alarm that fires on a benign, reachable case is
+    /// one the next real 13.9 GB ratchet gets to hide behind.
+    #[test]
+    fn an_oversized_entry_is_not_reported_as_drift() {
+        let one = empty_fa().heap_estimate().total();
+        assert!(one > 1);
+        // Cap below a single entry: the first insert is permanently over.
+        let cache = PackBagCache::new(one - 1, move |_p| Ok(empty_fa()));
+        let a = PathBuf::from("/x/a.h");
+        cache.bag_for(&a);
+        assert!(
+            cache.bytes.load(Ordering::Relaxed) > cache.cap_bytes,
+            "precondition: the entry alone exceeds the cap"
+        );
+        let truth: usize = cache.entries.iter().map(|e| e.value().1).sum();
+        assert_eq!(
+            cache.bytes.load(Ordering::Relaxed),
+            truth,
+            "precondition: nothing actually drifted"
+        );
+        assert_eq!(
+            cache.resyncs.load(Ordering::Relaxed),
+            0,
+            "the oversized-keep case is by design, not a byte-accounting drift"
+        );
+    }
+
+    /// The other half: a genuinely wrong counter MUST still raise the alarm.
+    #[test]
+    fn a_drifted_counter_is_reported() {
+        let one = empty_fa().heap_estimate().total();
+        let cache = PackBagCache::new(one * 8, move |_p| Ok(empty_fa()));
+        let paths: Vec<PathBuf> =
+            (0..4).map(|i| PathBuf::from(format!("/x/{i}.h"))).collect();
+        for p in &paths {
+            cache.bag_for(p);
+        }
+        assert_eq!(cache.resyncs.load(Ordering::Relaxed), 0);
+        // Poison the counter the way a lost concurrent credit would, then
+        // force an INSERT (a hit never reaches `evict_to_cap`).
+        cache.bytes.fetch_add(one * 1000, Ordering::Relaxed);
+        cache.bag_for(&PathBuf::from("/x/fresh.h"));
+        assert!(
+            cache.resyncs.load(Ordering::Relaxed) > 0,
+            "a real drift must still fire the alarm"
+        );
     }
 
     #[test]

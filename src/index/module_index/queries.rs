@@ -121,7 +121,10 @@ impl ModuleIndex {
             let mut pending = self.core.queue.pending.lock().unwrap();
             pending.push(module_name.to_string());
         }
-        self.core.queue.condvar.notify_one();
+        // Both guards are out of scope here — `notify_new_work` takes
+        // `pending`, and the drain's lock order forbids holding `priority`
+        // across it.
+        self.core.queue.notify_new_work();
     }
 
     /// Return the cached CachedModule for a module name. Never does I/O.

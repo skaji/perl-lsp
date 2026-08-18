@@ -239,3 +239,46 @@ fn import_tier_strip_gates_on_persistence() {
     assert!(strip_import_copy(&None, true, true).is_none());
 }
 
+
+/// The priority lane is guarded by its OWN mutex while the drain waits on the
+/// `pending` one, so a `request_resolve` for a stale module can land after the
+/// drain's priority check and before it parks — the notify reaches nobody and
+/// the wait loop, which only re-checked `pending`, never looks at priority
+/// again. In an all-stale workload (an `EXTRACT_VERSION` bump: every
+/// `request_resolve` takes the priority branch) nothing ever pushes `pending`,
+/// so the resolver sleeps for the rest of the session and cross-file
+/// resolution silently never completes.
+#[test]
+fn priority_push_wakes_a_parked_drain() {
+    use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex};
+
+    let queue = Arc::new(ResolveQueue {
+        priority: Mutex::new(Vec::new()),
+        pending: Mutex::new(Vec::new()),
+        condvar: Condvar::new(),
+    });
+    let (tx, rx) = mpsc::channel();
+    let q = Arc::clone(&queue);
+    std::thread::spawn(move || {
+        let _ = tx.send(drain_next_batch(&q));
+    });
+
+    // Let the drain get past its priority check and park in `wait(pending)`.
+    // Generous: the drain reaches the park in microseconds, so an early push
+    // (which the first priority check would catch, hiding the bug) is not a
+    // realistic outcome here.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Exactly what `ModuleIndex::request_resolve` does for a stale module.
+    {
+        let mut p = queue.priority.lock().unwrap();
+        p.push("Stale::Module".to_string());
+    }
+    queue.condvar.notify_one();
+
+    let batch = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a priority push must wake the parked drain");
+    assert_eq!(batch, vec!["Stale::Module".to_string()]);
+}
