@@ -153,11 +153,19 @@ sub root_for {
     return File::Spec->rel2abs("$RealBin/../$row->{root}");
 }
 # @INC for a given root: the substrate keeps its pinned PERL5LIB (corpus+arch);
-# a fixture root resolves against its own lib/.
+# a fixture root resolves against its own lib/. A row may name `incRoots`
+# (repo-relative dirs) to put PROVIDERS OUTSIDE ITS WORKSPACE on @INC — the
+# only way to exercise the @INC tier honestly, since a twin inside the
+# workspace is answered by the workspace relation instead.
 sub p5lib_for {
-    my ($root) = @_;
-    return $ENV{PERL5LIB} if $root eq $corpus;
-    return "$root/lib:$root";
+    my ($root, $extra) = @_;
+    my $base = $root eq $corpus ? $ENV{PERL5LIB} : "$root/lib:$root";
+    return length($extra // '') ? "$extra:$base" : $base;
+}
+# A row's extra @INC roots, absolute and ':'-joined ('' when it declares none).
+sub inc_roots_for {
+    my ($row) = @_;
+    join ':', map { File::Spec->rel2abs("$RealBin/../$_") } @{ $row->{incRoots} // [] };
 }
 sub batch_req {
     my ($cap, $spec, $row, $key, $root) = @_;
@@ -307,15 +315,17 @@ for my $r (@rows) {
     # PERL_LSP_RENAME_SCOPE set — the override-fan-out mode is process-wide,
     # so it groups separately from the default (hierarchy) rows for that root.
     my $scope = $r->{renameScope} // '';
-    my $gkey = "$root\x00$scope";
-    $gctx{$gkey} //= { root => $root, scope => $scope };
+    # PERL5LIB is process-wide per batch, so rows differing in @INC group apart.
+    my $inc = inc_roots_for($r);
+    my $gkey = "$root\x00$scope\x00$inc";
+    $gctx{$gkey} //= { root => $root, scope => $scope, inc => $inc };
     push @{ $groups{$gkey} }, batch_req($r->{capability}, $spec, $r, $key, $root);
 }
 my $resp = {};
 my @batch_metrics;
 for my $gkey (sort keys %groups) {
-    my ($root, $scope) = @{ $gctx{$gkey} }{qw(root scope)};
-    my ($by, $met) = run_batch($groups{$gkey}, $root, p5lib_for($root), $scope);
+    my ($root, $scope, $inc) = @{ $gctx{$gkey} }{qw(root scope inc)};
+    my ($by, $met) = run_batch($groups{$gkey}, $root, p5lib_for($root, $inc), $scope);
     %$resp = (%$resp, %$by);
     push @batch_metrics, $met;
 }

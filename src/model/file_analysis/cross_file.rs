@@ -855,12 +855,6 @@ impl<'a> ScopedLookup<'a> {
         });
         ScopedLookup { inner, visible, self_path, axis }
     }
-
-    /// The origin's visibility rule — read by projections that must agree
-    /// with forward resolution about which candidates the asker can see.
-    pub fn axis(&self) -> &VisibilityAxis {
-        &self.axis
-    }
 }
 
 impl<'a> CrossFileLookup for ScopedLookup<'a> {

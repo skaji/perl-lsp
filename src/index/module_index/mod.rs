@@ -139,7 +139,7 @@ pub use parts::*;
 mod index_core;
 pub(crate) use index_core::IndexCore;
 #[cfg(test)]
-pub(crate) use index_core::strip_import_copy;
+pub(crate) use index_core::strip_import_copy_one;
 
 mod lookup;
 mod queries;

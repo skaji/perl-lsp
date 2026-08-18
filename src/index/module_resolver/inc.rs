@@ -52,6 +52,9 @@ pub fn resolve_module_paths(inc_paths: &[PathBuf], module_name: &str) -> Vec<Pat
 
 /// The `@INC`-order winner among `resolve_module_paths` — what a `require`
 /// would load. The relation's other providers stay reachable as candidates.
+/// Production resolves the whole set; this spelling is the winner alone,
+/// which only the test-side `ModuleIndex::resolve_module` still asks for.
+#[cfg(test)]
 pub fn resolve_module_path(inc_paths: &[PathBuf], module_name: &str) -> Option<PathBuf> {
     resolve_module_paths(inc_paths, module_name).into_iter().next()
 }

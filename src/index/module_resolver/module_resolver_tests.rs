@@ -1,5 +1,5 @@
 use super::*;
-use crate::index::module_index::strip_import_copy;
+use crate::index::module_index::strip_import_copy_one;
 
 #[test]
 fn test_resolve_module_list_util() {
@@ -222,21 +222,20 @@ fn import_tier_strip_gates_on_persistence() {
     let tree = parser.parse(source, None).unwrap();
     let fa = crate::build::builder::build(&tree, source.as_bytes());
     assert!(!fa.witnesses.is_empty());
-    let cm = Some(Arc::new(CachedModule::new(
+    let cm = Arc::new(CachedModule::new(
         PathBuf::from("/inc/Strip.pm"),
         Arc::new(fa),
-    )));
+    ));
 
-    let stripped = strip_import_copy(&cm, true, true).unwrap();
+    let stripped = strip_import_copy_one(&cm, true, true);
     assert!(stripped.analysis.bag_is_evicted(), "persisted + eviction → bag drops");
     assert!(!stripped.analysis.symbols_are_evicted(), "symbols stay resident this slice");
     assert!(!stripped.analysis.refs_are_evicted(), "refs stay resident this slice");
 
-    let whole = strip_import_copy(&cm, false, true).unwrap();
+    let whole = strip_import_copy_one(&cm, false, true);
     assert!(!whole.analysis.bag_is_evicted(), "unpersisted → bag unrecoverable → keep");
-    let whole2 = strip_import_copy(&cm, true, false).unwrap();
+    let whole2 = strip_import_copy_one(&cm, true, false);
     assert!(!whole2.analysis.bag_is_evicted(), "NO_EVICT → keep");
-    assert!(strip_import_copy(&None, true, true).is_none());
 }
 
 

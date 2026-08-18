@@ -1,0 +1,53 @@
+{
+  "capability": "definition",
+  "rows": [
+    {
+      "id": "incdual-01-relation-keeps-every-provider",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/incdual-fixture",
+      "incRoots": ["gold-corpus/incdual-app", "gold-corpus/incdual-vendor"],
+      "comment": "Two @INC roots each provide Gold::Dual, and BOTH live OUTSIDE the workspace — a twin inside it would be answered by the workspace relation and the row would pass for the wrong reason (the trap pkgid-04 hit). Goto-def on the module name offers every provider. The @INC tier used to walk the path list, stop at the first hit and cache one file per name, so the second location did not exist to be offered. The two copies are told apart by LINE (the harness basenames paths, and both are Gold/Dual.pm by construction): package at 1 in the app copy, at 8 in the vendored one.",
+      "file": "lib/App.pm",
+      "line": 3,
+      "col": 6,
+      "expect": {
+        "all": ["Dual.pm:1:9", "Dual.pm:8:9"],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "incdual-02-plain-asker-dispatches-into-app-provider",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/incdual-fixture",
+      "incRoots": ["gold-corpus/incdual-app", "gold-corpus/incdual-vendor"],
+      "comment": "`which_provider` is defined by BOTH providers, at line 15 in the app copy and 16 in the vendored one, so the answer names which file this asker resolves Gold::Dual to. This one declares no `use lib` and sees the process @INC in order, so it lands in the app copy.",
+      "file": "lib/App.pm",
+      "line": 9,
+      "col": 18,
+      "expect": {
+        "all": ["Dual.pm:15:1"],
+        "none": ["Dual.pm:16:1"]
+      },
+      "status": "gold"
+    },
+    {
+      "id": "incdual-03-use-lib-asker-dispatches-into-vendor-provider",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "root": "gold-corpus/incdual-fixture",
+      "incRoots": ["gold-corpus/incdual-app", "gold-corpus/incdual-vendor"],
+      "comment": "The SAME call on the SAME module name from a file that declares `use lib '../incdual-vendor'` — and it lands in the OTHER file. @INC is per-entrypoint, and this row is the one that says so. The rule is filled at CandidateSet construction, so every verb inherits it; nothing here is a definition-handler special case. This is the row a single-provider @INC tier cannot pass: with one file cached per name, both askers answer the same.",
+      "file": "t/asker.t",
+      "line": 8,
+      "col": 14,
+      "expect": {
+        "all": ["Dual.pm:16:1"],
+        "none": ["Dual.pm:15:1"]
+      },
+      "status": "gold"
+    }
+  ]
+}

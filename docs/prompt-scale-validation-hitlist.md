@@ -266,11 +266,13 @@ named inputs.
 
 # Tier 3 — correctness debt
 
-- **@INC tier is single-provider.** Staged plan in `gold-corpus/KNOWN-GAPS.md`:
-  `(name, inc-root)` relation → `modules.module_name` PK migration → fill
-  `CandidateSet::scoped` from the asker's @INC → substrate-tier fixture (the
-  twin must live outside the workspace or the workspace relation compensates
-  and the row passes for the wrong reason).
+- ~~**@INC tier is single-provider.**~~ CLOSED. All four stages landed: the
+  `(name, inc-root)` relation, the `modules` PK migration to
+  `(module_name, path)` at schema v10, `CandidateSet::scoped` filled from
+  the asker's `@INC` via `VisibilityAxis`, and the substrate-tier
+  `incdual-*` rows whose twins live outside the workspace. The residual is
+  ACQUISITION — a `use lib` root outside the workspace that is not on the
+  process `@INC` is ranked but never scanned; see `gold-corpus/KNOWN-GAPS.md`.
 - **~10 bookkeeping `get_cached` sites** left on the derived winner
   deliberately (existence checks equivalent by construction, last-resort
   fallbacks, CLI).

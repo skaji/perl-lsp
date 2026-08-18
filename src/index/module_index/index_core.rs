@@ -291,18 +291,6 @@ impl IndexCore {
 /// the import tier is the follow-up in
 /// `docs/prompt-storage-residuals.md`. Degraded
 /// analyses keep the bag (their rows never persist).
-pub(crate) fn strip_import_copy(
-    result: &Option<Arc<CachedModule>>,
-    persisted: bool,
-    strip: bool,
-) -> Option<Arc<CachedModule>> {
-    result
-        .as_ref()
-        .map(|m| strip_import_copy_one(m, persisted, strip))
-}
-
-/// The strip for ONE provider — every provider in a name's set runs this
-/// same body, the @INC winner included.
 pub(crate) fn strip_import_copy_one(
     m: &Arc<CachedModule>,
     persisted: bool,
