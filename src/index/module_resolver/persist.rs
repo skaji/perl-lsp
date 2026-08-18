@@ -141,7 +141,7 @@ pub(super) fn analyze_stamped<T>(
 /// transient failure degrades gracefully, a permanent one can't OOM.
 pub(super) const FALLBACK_WHOLE_BYTE_CAP: usize = 128 * 1024 * 1024;
 
-/// The persist-writer harness both bulk indexers share: batches entries off
+/// The persist-writer harness every persist site shares: batches entries off
 /// the channel (≤128 per txn), owns BEGIN IMMEDIATE / COMMIT / ROLLBACK
 /// (IMMEDIATE — a deferred txn that reads before writing can hit an
 /// unretryable SQLITE_BUSY_SNAPSHOT against a concurrent writer), and hands
@@ -152,7 +152,7 @@ pub(super) const FALLBACK_WHOLE_BYTE_CAP: usize = 128 * 1024 * 1024;
 /// unregistered. Registration runs inside the panic guard, mirroring the
 /// txn: entries a mid-batch registration panic leaves behind take the
 /// fallback lane instead of vanishing.
-pub(super) fn run_persist_writer<E>(
+pub(crate) fn run_persist_writer<E>(
     rx: std::sync::mpsc::Receiver<E>,
     conn: Option<&rusqlite::Connection>,
     label: &str,
