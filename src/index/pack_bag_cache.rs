@@ -232,7 +232,13 @@ impl PackBagCache {
 
     /// Recompute the charge total from the map. O(entries), and only reached
     /// when eviction has run out of victims while still reading over cap.
+    ///
+    /// This is a self-heal for an invariant that should never break, so it
+    /// firing at all is the signal — a drifting counter is what collapsed this
+    /// LRU to a single entry and grew the process to 13.9 GB. Silent
+    /// self-healing would hide the next instance, hence the counter.
     fn resync_bytes(&self) {
+        crate::util::ghost_stats::count("pack_bag_cache.resync_bytes_fired");
         let truth: usize = self.entries.iter().map(|e| e.value().1).sum();
         self.bytes.store(truth, Ordering::Relaxed);
     }

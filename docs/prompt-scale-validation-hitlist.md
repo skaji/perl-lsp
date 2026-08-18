@@ -73,6 +73,8 @@ crashes) on the commit before its fix, not just passes after.
 | `fed8ac00` | **T1 #2** + T2 fold-64 | depth gate before the recursion; monotone propagator repair |
 | `b6312ea2` | **T1 #3** + **T1 #4** | `refs_present` axis reader + rows lane; completion capped at 200 |
 | `d9053e4f` | **T1 #1** (the "no answers" half) | no synchronous CPU in a handler — they share one task |
+| `fc863769` | — | Tier 1 rows rewritten to measured outcomes |
+| (this) | pack soak | `resync_bytes` alarm made permanent |
 
 Verified at the full bar with the cpp feature on, after each integration:
 1,511 unit · 491 gold (0 FAIL / 0 XPASS / 0 CRASH) · e2e 113/0 · e2e-cpp 0.
@@ -309,9 +311,33 @@ named inputs.
   one most likely to close a headline row outright — do it first.
 - **Differential sweep** — main vs branch over thousands of positions, turning
   "review 130k lines" into "adjudicate a divergence list".
-- **Pack-language soak** — today's was Perl-only, so `PackBagCache`, where the
-  13.9 GB ratchet lived, was never exercised at hour scale. A real hole in the
-  clean bill.
+- ~~**Pack-language soak**~~ — **run, 3h20m on abseil (873 files), clean.**
+  `resync_bytes` **fired zero times** across 297,268 `pack-cpp` lookups and
+  296,852 capacity evictions, with `peak_bytes` pinned at exactly the cap
+  (134,217,696 B) for the whole run — the byte-accounting invariant behind the
+  13.9 GB ratchet holds under sustained churn, which is the one thing a
+  Perl-only soak could never show. Zero bytes on stderr; no latency drift
+  (references got *faster*, 755 → 478 ms median).
+
+  Honest residuals:
+  - **RSS did not fully flatten**: 497 → 963 MB, decelerating hard (+195,
+    +132, +66, +39, +15, +19 MB per 30-min bucket), tail slope ~35–37 MB/h and
+    still converging. Both 10-minute idle windows were *perfectly* flat
+    (byte-identical across consecutive samples), so the growth is edit-driven
+    cache/index fill, not a background leak — but "converging" is not
+    "converged", and 3h20m did not reach the asymptote.
+  - **The 963 MB is not fully decomposed.** Bounded caches account for ~235 MB
+    and the post-ready baseline ~190 MB; the remainder is *inferred* to be
+    workspace-index residency for the corpus and was not heap-profiled.
+    Recorded as inferred, not measured.
+  - **It ran on `737b3cc8`, before `b6312ea2` added the rows lane to
+    `PackBagCache`.** The clean bill covers the cache as it was, not as it is.
+    A short re-soak on the current tip is owed before treating that file as
+    hour-scale-proven again.
+
+  The missing alarm the run needed is now permanent: `resync_bytes` increments
+  `pack_bag_cache.resync_bytes_fired`, so the next drift is visible instead of
+  silently self-healed.
 - **Narrow seam review** — the few hundred lines where a bug is silent and
   catastrophic (cache accounting, residency, invalidation, the enrichment
   writer, `IndexCore` shared state).
