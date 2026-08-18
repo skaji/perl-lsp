@@ -657,7 +657,21 @@ fn run_one(
             }
             resolve_imports_blocking(idx, &analysis);
             analysis.enrich_imported_types_with_keys(Some(idx));
-            analysis.hover_info(point, &source, Some(idx))
+            // Perl routes through the SAME renderer the LSP handler calls, so
+            // the CLI cannot answer a different verb than the server: the
+            // ladder's import/qualified signature lookups and the projection
+            // fallback are both reachable here or in neither.
+            let abs = std::fs::canonicalize(file)
+                .unwrap_or_else(|_| std::path::PathBuf::from(file));
+            let _staged = ScopedWorkspaceEntry::insert(ws, abs.clone(), analysis);
+            let origin = ws.workspace_raw().get(&abs).map(|r| r.value().clone())
+                .expect("origin staged above");
+            let cs = resolve::resolve(
+                ws, &origin, file_store::FileKey::Path(abs), point,
+                Some(idx), resolve::OverrideScope::default(),
+            )
+            .with_source(&source);
+            symbols::perl_hover_markdown(&cs, idx)
                 .ok_or_else(|| format!("No hover info at {}:{}", req.line, req.col))
         }
         "type-at" => {

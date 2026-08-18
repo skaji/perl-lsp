@@ -299,7 +299,29 @@ pub fn perl_hover(
     })
 }
 
-fn perl_hover_markdown(
+pub fn perl_hover_markdown(
+    cs: &crate::index::resolve::CandidateSet,
+    module_index: &ModuleIndex,
+) -> Option<String> {
+    if let Some(markdown) = perl_hover_named(cs, module_index) {
+        return Some(markdown);
+    }
+    // Nothing the name-keyed ladder above knows how to render. Present the
+    // hover projection's candidate — the definition goto-def would jump to —
+    // exactly as `pack_hover_markdown` does, so the two verbs cannot disagree
+    // about whether a token resolves (`docs/adr/resolution-candidate-set.md`).
+    // A module-name token was the standing case: `Koha::Database->new` is a
+    // `PackageRef` whose package lives in another file, which the ladder's
+    // local `symbols_named` sweep can never see.
+    let loc = cs.hover_candidate()?;
+    render_candidate_hover(cs, &loc, "perl")
+}
+
+/// The name-keyed Perl ladder: whatever the model can render from the ref or
+/// symbol under the cursor, plus the import/qualified-call signature lookups
+/// that read a cross-file `SubInfo` by NAME. Everything here is richer than a
+/// rendered declaration line, so it runs before the projection fallback.
+fn perl_hover_named(
     cs: &crate::index::resolve::CandidateSet,
     module_index: &ModuleIndex,
 ) -> Option<String> {

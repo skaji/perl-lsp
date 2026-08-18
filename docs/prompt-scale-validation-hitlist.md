@@ -31,7 +31,7 @@ Detail for each is in its section below.
 | `pod.rs` multibyte panic | **CLOSED** `f47c002b` |
 | Fold-64 non-convergence | **CLOSED** `fed8ac00` |
 | `query_rec` 512-depth cap | **OPEN** — seen again during the #3 probe |
-| hover empty on a module-name token | **OPEN** |
+| hover empty on a module-name token | **CLOSED** (B) — two defects: the `PackageRef` arm swept only LOCAL symbols, and the CLI never built a CandidateSet for Perl at all |
 | `epoch.gen_stamp_missing = 1074` | **CLOSED** — explained, never a bug |
 
 ### Tier 3 / Tier 4
@@ -672,9 +672,19 @@ named inputs.
   This is the package-identity candidate relation meeting the real world, and
   it argues for filling the `ScopedLookup` visibility slot Perl still passes
   empty.
-- **hover empty on a `Koha::Database` module-name token** where goto-def works
-  at the same position — adjacent to the require/hover family fixed in
-  `5e97516b`.
+- ~~**hover empty on a `Koha::Database` module-name token**~~ — **fixed.**
+  Two defects stacked, and the second is why the first was awkward to
+  reproduce. (1) `hover_info`'s `RefKind::PackageRef` arm resolves through
+  `self.symbols_named` — a LOCAL sweep — so a package defined in another file
+  was unreachable from it by construction, and the arm falling through hit
+  `perl_hover_markdown`'s `FunctionCall`-only gate and returned `None`. Hover
+  now ends where `pack_hover_markdown` already ended: on the CandidateSet's
+  hover projection, so both verbs read one resolution. (2) The CLI `hover`
+  verb called `analysis.hover_info` **directly** for Perl — it built no
+  CandidateSet and so never entered `perl_hover_markdown`, meaning the CLI and
+  the server answered measurably different verbs. `--hover` now routes through
+  the same renderer the LSP handler calls. Pinned by `modname-hover.json`,
+  base-verified: both rows FAIL without the fix.
 - ~~**`epoch.gen_stamp_missing = 1074`**~~ — **closed, not a bug.** It counts
   warm @INC providers that needed a registration generation, stamped once at
   resolver startup. Measured on crm: 1,151 warm entries → 1,080 distinct paths

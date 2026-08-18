@@ -1,0 +1,40 @@
+{
+  "capability": "hover",
+  "rows": [
+    {
+      "id": "modname-hv-01-invocant",
+      "difficulty": "moderate",
+      "semantic_area": "modules",
+      "comment": "Hover twin of goto-def on a MODULE-NAME token: `Text::SimpleTable->new(...)` in Catalyst.pm. Definition answers `SimpleTable.pm:3:9` at this exact position while hover answered nothing, because the model's `PackageRef` arm only sweeps LOCAL `symbols_named` — a package defined in another file is unreachable from it by construction. Hover now falls back to the CandidateSet's hover projection, so the two verbs resolve once and cannot disagree about whether a token resolves.",
+      "file": "Catalyst.pm",
+      "line": 103,
+      "col": 20,
+      "expect": {
+        "all": [
+          "package Text::SimpleTable",
+          "SimpleTable.pm"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "modname-hv-02-require-bareword",
+      "difficulty": "moderate",
+      "semantic_area": "modules",
+      "root": "gold-corpus/require-fixture",
+      "comment": "Hover twin of `require-bareword-module`, same file/line/col: the bareword `require` form emits the PackageRef goto-def navigates, and hover must read the same resolution.",
+      "file": "lib/My/Requirer.pm",
+      "line": 2,
+      "col": 13,
+      "expect": {
+        "all": [
+          "package Req::Target",
+          "Target.pm"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    }
+  ]
+}
