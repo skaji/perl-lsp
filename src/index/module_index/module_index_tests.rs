@@ -985,7 +985,7 @@ fn bridged_entity_return_resolves_through_enriched_overlay() {
     // overlay and resolves Widget.
     let t = idx_find_method_return(&idx, "Painter", "render");
     assert_eq!(
-        t.as_ref().and_then(|t| t.class_name()).as_deref(),
+        t.as_ref().and_then(|t| t.class_name().map(|s| s.to_string())).as_deref(),
         Some("Widget"),
         "bridged entity resolved through Br's enriched overlay: {t:?}"
     );
@@ -1034,7 +1034,7 @@ fn cross_file_slot_type_primary_resolves_hop1() {
         Some(&idx),
     );
     assert_eq!(
-        t.as_ref().and_then(|t| t.class_name()).as_deref(),
+        t.as_ref().and_then(|t| t.class_name().map(|s| s.to_string())).as_deref(),
         Some("Conn"),
         "read narrows via Store's own slot write (cross-file SlotType primary): {t:?}"
     );
@@ -1696,4 +1696,123 @@ fn purging_a_never_fed_module_is_a_no_op_not_a_wipe() {
     // skipping must not be observable as lost edges for OTHER modules.
     edges.purge_module("Never::Fed");
     assert_eq!(edges.children_of("Base"), vec!["Derived".to_string()]);
+}
+
+// ---- the resolution session (docs/adr/resolution-session.md) ----
+
+/// One backward walk asks the same cross-file question at every call site.
+/// Without the session each ask re-derives the whole `MethodOnClass`
+/// lattice; with it the candidate's contribution is derived ONCE and the
+/// answer must not move. Both halves are asserted here — a memo whose
+/// failure mode is a wrong answer needs the answer pinned, not just the
+/// consult count.
+#[test]
+fn a_session_derives_a_cross_file_answer_once_and_answers_the_same() {
+    use crate::model::witnesses::ResolutionSession;
+    let provider = parse_source_to_cached(
+        "package Prov;\nsub make { return bless {}, 'Res' }\n1;\n",
+        "Prov",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(provider.path.to_path_buf(), Arc::clone(&provider.analysis));
+    let caller = parse_source_to_cached(
+        "package Caller;\nuse Prov;\nsub go { my $r = Prov->make(); return $r }\n1;\n",
+        "Caller",
+    );
+    let lookup: &dyn crate::model::file_analysis::CrossFileLookup = &idx;
+
+    let ask = || {
+        caller
+            .analysis
+            .find_method_return_type("Prov", "make", Some(lookup), None)
+            .and_then(|t| t.class_name().map(|s| s.to_string()))
+    };
+
+    let unsessioned: Vec<_> = (0..8).map(|_| ask()).collect();
+    assert_eq!(
+        unsessioned[0].as_deref(),
+        Some("Res"),
+        "fixture must resolve cross-file, or the test proves nothing"
+    );
+
+    let sessioned: Vec<_> = {
+        let _s = ResolutionSession::enter(Some(lookup));
+        let answers: Vec<_> = (0..8).map(|_| ask()).collect();
+        let stats = ResolutionSession::stats().expect("session is open");
+        assert_eq!(
+            stats.consults, 1,
+            "8 identical asks must consult the provider once, not eight times"
+        );
+        assert_eq!(stats.hits, 7, "the other seven ride the memo");
+        answers
+    };
+    assert_eq!(sessioned, unsessioned, "the memo changed an answer");
+
+    // And the memo is scoped to the walk: outside it, consults resume.
+    assert!(ResolutionSession::stats().is_none());
+    assert_eq!(ask(), unsessioned[0]);
+}
+
+/// The memo rides `resolution_epoch`. A registration moves it, so a
+/// remembered answer never survives the index change that could invalidate
+/// it — over-invalidation is the safe direction.
+#[test]
+fn a_session_memo_drops_when_the_index_moves() {
+    use crate::model::witnesses::ResolutionSession;
+    let provider = parse_source_to_cached(
+        "package Prov;\nsub make { return bless {}, 'Res' }\n1;\n",
+        "Prov",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(provider.path.to_path_buf(), Arc::clone(&provider.analysis));
+    let caller = parse_source_to_cached("package Caller;\nuse Prov;\n1;\n", "Caller");
+    let lookup: &dyn crate::model::file_analysis::CrossFileLookup = &idx;
+    let ask = || {
+        caller
+            .analysis
+            .find_method_return_type("Prov", "make", Some(lookup), None)
+            .and_then(|t| t.class_name().map(|s| s.to_string()))
+    };
+
+    let _s = ResolutionSession::enter(Some(lookup));
+    assert_eq!(ask().as_deref(), Some("Res"));
+    assert_eq!(ask().as_deref(), Some("Res"));
+    assert_eq!(ResolutionSession::stats().unwrap().consults, 1);
+
+    let other = parse_source_to_cached("package Other;\nsub o { 1 }\n1;\n", "Other");
+    idx.register_workspace_module(other.path.to_path_buf(), Arc::clone(&other.analysis));
+
+    assert_eq!(ask().as_deref(), Some("Res"), "answer survives the drop");
+    assert_eq!(
+        ResolutionSession::stats().unwrap().consults,
+        2,
+        "an index mutation must invalidate the remembered answer"
+    );
+}
+
+/// Even memoized, some query at some scale outruns any bound. The budget
+/// makes that case DEGRADE — a marked-incomplete answer, promptly — rather
+/// than run forever. Zero fuel is the extreme: every cross-file consult is
+/// refused, the walk still terminates and still answers what it can.
+#[test]
+fn an_exhausted_consult_budget_degrades_instead_of_running_forever() {
+    use crate::model::witnesses::ResolutionSession;
+    let provider = parse_source_to_cached(
+        "package Prov;\nsub make { return bless {}, 'Res' }\n1;\n",
+        "Prov",
+    );
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(provider.path.to_path_buf(), Arc::clone(&provider.analysis));
+    let caller = parse_source_to_cached("package Caller;\nuse Prov;\n1;\n", "Caller");
+    let lookup: &dyn crate::model::file_analysis::CrossFileLookup = &idx;
+
+    let _s = ResolutionSession::enter_with_budget(Some(lookup), 0);
+    let answer = caller
+        .analysis
+        .find_method_return_type("Prov", "make", Some(lookup), None);
+    assert!(answer.is_none(), "no budget ⇒ no cross-file answer");
+    assert!(
+        ResolutionSession::degraded(),
+        "and the walk must SAY it under-answered"
+    );
 }

@@ -74,6 +74,18 @@ struct SessionState {
     /// Set when `fuel` ran out — the walk's answer is an
     /// under-approximation from that point on.
     exhausted: bool,
+    stats: SessionStats,
+}
+
+/// What the session did — the memo's whole point, in two numbers.
+/// Always accounted (the session only exists inside a walk, so this is two
+/// increments per consult, not a gated instrument).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionStats {
+    /// Candidate evaluations actually performed.
+    pub consults: u64,
+    /// Candidate evaluations answered from the memo.
+    pub hits: u64,
 }
 
 thread_local! {
@@ -103,6 +115,15 @@ impl ResolutionSession {
     /// Open a session for `idx`. `None` (no cross-file index) opens
     /// nothing: every memoizable consult goes through a lookup.
     pub fn enter(idx: Option<&dyn CrossFileLookup>) -> ResolutionSession {
+        Self::enter_with_budget(idx, default_fuel())
+    }
+
+    /// `enter` with an explicit consult budget — the seam a caller with its
+    /// own latency contract (or a test) sets the bound from.
+    pub fn enter_with_budget(
+        idx: Option<&dyn CrossFileLookup>,
+        fuel: u64,
+    ) -> ResolutionSession {
         let Some(idx) = idx else {
             return ResolutionSession { owns: false };
         };
@@ -119,8 +140,9 @@ impl ResolutionSession {
                 paths: HashMap::new(),
                 memo: HashMap::new(),
                 candidates: HashMap::new(),
-                fuel: default_fuel(),
+                fuel,
                 exhausted: false,
+                stats: SessionStats::default(),
             });
             ResolutionSession { owns: true }
         })
@@ -131,6 +153,12 @@ impl ResolutionSession {
     /// this before the guard drops.
     pub fn degraded() -> bool {
         SESSION.with(|s| s.borrow().as_ref().is_some_and(|st| st.exhausted))
+    }
+
+    /// Consults performed vs answered from the memo for the open session.
+    /// `None` when no session is open.
+    pub fn stats() -> Option<SessionStats> {
+        SESSION.with(|s| s.borrow().as_ref().map(|st| st.stats))
     }
 }
 
@@ -214,6 +242,7 @@ pub(super) fn candidate_answer(
         let key = candidate_key(id, q);
         let hit = st.memo.get(&key).map(Arc::clone);
         if hit.is_some() {
+            st.stats.hits += 1;
             crate::util::ghost_stats::count("session.memo_hit");
         }
         hit
@@ -273,6 +302,7 @@ pub(super) fn spend_consult(idx: &dyn CrossFileLookup) -> bool {
             return false;
         }
         st.fuel -= 1;
+        st.stats.consults += 1;
         true
     })
     .unwrap_or(true)
