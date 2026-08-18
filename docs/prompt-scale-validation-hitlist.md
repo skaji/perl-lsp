@@ -474,6 +474,69 @@ anyone reaching for the cheap probe.
 and `--definition` controls refuted that and the retraction is in its log. The
 row #3 conclusion rests only on the LSP measurement.)
 
+### 7. Cold-index write pressure — RESEARCHED, patch plan ready
+
+~17M rows into 1.73 GB through SQLite's single writer; the 20-core walk
+outpaces it ~4x, so ~4/5 of the corpus sits in an unbounded channel (the ~7 GB
+cold spike) and the drain holds the readiness gate ~9 min. Batching already
+exists (≤128 files/txn); `synchronous` is measured as a no-op (~973 commits).
+
+**Ten of `refs`' twelve columns have no reader anywhere in the tree.**
+`kind`, all four span coordinates, `access`, `flags`, `qual_kind`, `qual_id`,
+`arg_count` are written 12.87M times per cold index and read zero times. The
+enumeration is closed — there is no dynamic SQL. This is a design that
+half-landed: `docs/adr/relational-ref-index.md` intended rows to carry
+post-fold verdicts so common matcher arms run on rows alone, and explicitly
+*rejected* a bare name→file posting list. **What shipped is the rejected
+alternative** — `refs_to` runs the full matcher on the rehydrated analysis for
+every candidate, unconditionally. The verdict columns pay rent for a fast path
+that was never built.
+
+Every reader is a set-valued projection onto `(name_id, file_id)`:
+`SELECT DISTINCT file_id WHERE name_id = ?`, `SELECT DISTINCT name_id`, or
+`EXISTS(name_id, file_id)`. So dedup is bit-identical, not approximately safe.
+Verified on the real DB: the candidate set for `$self` is 33,368 paths either
+way. **The heatmap does not block it** — it takes a boolean and a set
+membership, never a count; every non-zero fan-in still comes from
+`references()`.
+
+| | rows | table | indexes | total |
+|---|---|---|---|---|
+| today | 12,870,448 | 386.2 MB | 331.0 MB | **717.2 MB** |
+| `(name_id, file_id)` `WITHOUT ROWID` | 3,325,026 | 39.7 MB | 34.8 MB | **74.6 MB** |
+
+−642 MB on the refs family (−89.6%), −36% of the whole database, −9.5M rows.
+Hot-name retrieval measured 591 → 170 ms. **Do not add an occurrence `count`
+column**: a row count is a *candidate* count, not a reference count, and
+shipping one invites exactly the mistake that produced the ten dead columns.
+
+**The interner is the other half, and needs no version bump.**
+`shred_derived_rows` allocates its memo per FILE, so `$self`/`@_`/`new` are
+re-interned against the 556k-row unique index in all 124,689 files — ~5M
+interns, each two statements (`INSERT OR IGNORE` then `SELECT`), ≈ 10M
+statements ≈ 38% of the writer's total, all redundant. SELECT-first is free;
+a writer-lifetime memo needs a `strings_generation` guard because
+`clear_derived_rows` can race and dangling `name_id`s would be silently dead.
+
+**Backpressure is complementary, not an alternative.** The writer is on the
+critical path for the whole run (walk ~10 min, writer ~19 min), so bounding the
+channel costs ≈0 wall time, caps the spike by construction, and makes progress
+honest — but it does NOT shorten time-to-ready. Only cutting writer work does
+that. Hazard to audit first: a worker blocking on a full channel while holding
+a lock `on_committed` needs is the deadlock family from
+`filestore-guard-discipline`; prefer `try_send` + park over blocking `send`.
+
+**The `REF_ROWS_VERSION` bump is one degraded startup, not free** — the ADR
+undersells this. With no rows present, `strip_rows` is false so every workspace
+copy stays whole for that session, the pack warm-stub lane is bypassed, and
+`pending_backfill` holds every file's seeds at once (~2 GB). Blobs survive, so
+it is one bad session, not a re-index — and dedup makes the *next* bump ~4x
+cheaper.
+
+Order: SELECT-first interning + drop the discarded `parts.surface` from the
+channel (no bump) → bounded channel with the lock audit → writer-lifetime memo
+→ dedup + `REF_ROWS_VERSION` 5 → 6.
+
 # Tier 2 — cheap, and now debuggable
 
 Each of these was anonymous until `3fef0120` added breadcrumbs; all now have
