@@ -57,6 +57,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS syms (
             file_id      INTEGER NOT NULL,
             name_id      INTEGER NOT NULL,
+            key_id       INTEGER NOT NULL,
             kind         INTEGER NOT NULL,
             start_row    INTEGER NOT NULL,
             start_col    INTEGER NOT NULL,
@@ -66,6 +67,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             flags        INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_syms_name ON syms(name_id);
+        CREATE INDEX IF NOT EXISTS idx_syms_key ON syms(key_id);
         CREATE INDEX IF NOT EXISTS idx_syms_file ON syms(file_id);
         CREATE TABLE IF NOT EXISTS stubs (
             path TEXT PRIMARY KEY,
@@ -92,7 +94,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         .prepare("SELECT source FROM files LIMIT 1")
         .map(|_| ())
         .and_then(|_| conn.prepare("SELECT name_id, file_id FROM refs LIMIT 1").map(|_| ()))
-        .and_then(|_| conn.prepare("SELECT flags FROM syms LIMIT 1").map(|_| ()))
+        .and_then(|_| conn.prepare("SELECT flags, key_id FROM syms LIMIT 1").map(|_| ()))
         .is_ok()
         // The columns the current format DROPPED must be gone. Probing only
         // for what the new shape HAS would pass on the old twelve-column
@@ -129,6 +131,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              CREATE TABLE syms (
                 file_id      INTEGER NOT NULL,
                 name_id      INTEGER NOT NULL,
+                key_id       INTEGER NOT NULL,
                 kind         INTEGER NOT NULL,
                 start_row    INTEGER NOT NULL,
                 start_col    INTEGER NOT NULL,
@@ -138,6 +141,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                 flags        INTEGER NOT NULL
              );
              CREATE INDEX idx_syms_name ON syms(name_id);
+             CREATE INDEX idx_syms_key ON syms(key_id);
              CREATE INDEX idx_syms_file ON syms(file_id);",
         )?;
         conn.execute(

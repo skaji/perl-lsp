@@ -110,7 +110,7 @@
       "query": "",
       "newname": "",
       "renameScope": "dispatch",
-      "comment": "DISPATCH mode: references for URI::http::canonical are the def + dispatch-to-it sites only — NOT the base URI.pm::canonical nor sibling _server.pm. The default hierarchy mode lists the whole family (see ref-uri-canonical-hierarchy).",
+      "comment": "DISPATCH mode: references for URI::http::canonical are the def + dispatch-to-it sites only \u2014 NOT the base URI.pm::canonical nor sibling _server.pm. The default hierarchy mode lists the whole family (see ref-uri-canonical-hierarchy).",
       "expect": {
         "all": [
           "\"file\":\"http.pm\",\"line\":\"12\""
@@ -131,7 +131,7 @@
       "col": 4,
       "query": "",
       "newname": "",
-      "comment": "HIERARCHY mode (default): references for URI::http::canonical span the whole override family — the base URI.pm def + `URI->new(...)->canonical` call sites corpus-wide (CGI.pm), edge-gated so unrelated same-named methods (Mojo::Path) stay out.",
+      "comment": "HIERARCHY mode (default): references for URI::http::canonical span the whole override family \u2014 the base URI.pm def + `URI->new(...)->canonical` call sites corpus-wide (CGI.pm), edge-gated so unrelated same-named methods (Mojo::Path) stay out.",
       "expect": {
         "all": [
           "\"file\":\"http.pm\"",
@@ -432,14 +432,14 @@
         "none": []
       },
       "status": "gold",
-      "note": "one field subject, source-agnostic: refs on `has charset` splat over BOTH the `$self->{charset}` hash-slot derefs (line 26) AND the `$self->charset` accessor calls (lines 84, 106). Guards the Field{owner,name} bridge — the consumer never branches on hash-key vs accessor flavor."
+      "note": "one field subject, source-agnostic: refs on `has charset` splat over BOTH the `$self->{charset}` hash-slot derefs (line 26) AND the `$self->charset` accessor calls (lines 84, 106). Guards the Field{owner,name} bridge \u2014 the consumer never branches on hash-key vs accessor flavor."
     },
     {
       "id": "ref-belongsto-package-verb-crossfile-descendants",
       "difficulty": "tricky",
       "semantic_area": "crossfile-inheritance",
       "root": "gold-corpus/belongsto-fixture",
-      "comment": "H7-9: references on a relationship verb (`link_to`, the DBIC `belongs_to`/`has_many` shape) defined in a component ancestor, anchored on the `sub` decl, reaches every `__PACKAGE__->link_to(...)` call site in descendant classes across files. Each call's receiver is `__PACKAGE__` (the descendant), which `isa` the verb's owner only through a CROSS-FILE parent chain (CD/Track -> Core -> Rel) — the ref matcher must confirm that ancestry via the index, exactly as CD -> BaseResult -> ...Core -> ...BelongsTo does.",
+      "comment": "H7-9: references on a relationship verb (`link_to`, the DBIC `belongs_to`/`has_many` shape) defined in a component ancestor, anchored on the `sub` decl, reaches every `__PACKAGE__->link_to(...)` call site in descendant classes across files. Each call's receiver is `__PACKAGE__` (the descendant), which `isa` the verb's owner only through a CROSS-FILE parent chain (CD/Track -> Core -> Rel) \u2014 the ref matcher must confirm that ancestry via the index, exactly as CD -> BaseResult -> ...Core -> ...BelongsTo does.",
       "file": "lib/My/Rel.pm",
       "line": 4,
       "col": 4,
@@ -469,6 +469,26 @@
           "\"file\":\"Baker.pm\",\"line\":\"41\"",
           "\"file\":\"file.pm\",\"line\":\"95\"",
           "\"file\":\"Request.pm\",\"line\":\"190\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "ref-package-includes-own-declaration",
+      "difficulty": "hard",
+      "semantic_area": "package-identity",
+      "comment": "references on a package name must include the `package` statement that declares it. The relational row store keys refs by `Ref::match_key` (the LAST segment \u2014 `Sessions`) but stored a symbol row under its display name (`Mojolicious::Sessions`), so the `syms` union that exists to keep declaration-only files as candidates could never fire for a qualified symbol. Sessions.pm mentions the name nowhere but its own `package` line, so it dropped out of the candidate set entirely and the rows path \u2014 the production path \u2014 answered with the external uses only.",
+      "file": "Mojolicious/Sessions.pm",
+      "line": 0,
+      "col": 8,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [
+          "\"file\":\"Sessions.pm\",\"line\":\"1\"",
+          "\"file\":\"Mojolicious.pm\",\"line\":\"19\"",
+          "\"file\":\"Mojolicious.pm\",\"line\":\"53\""
         ],
         "none": []
       },

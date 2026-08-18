@@ -139,12 +139,26 @@ pub fn shred_derived_rows(
         // Symbols keep their full row shape — every column has a reader
         // (`sym_rows_matching`, the dead-export view, workspace/symbol).
         let mut insert_sym = conn.prepare_cached(
-            "INSERT INTO syms (file_id, name_id, kind, start_row, start_col, end_row, end_col,
-                               container_id, flags)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO syms (file_id, name_id, key_id, kind, start_row, start_col, end_row,
+                               end_col, container_id, flags)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for seed in sym_seeds {
             let name_id = intern_str(&seed.name, &mut memo)?;
+            // A symbol row carries BOTH names: `name_id` is what it is called
+            // (`Mojolicious::Sessions` — what workspace/symbol searches and
+            // reports), `key_id` is what a REFERENCE to it is keyed by
+            // (`Sessions` — `Ref::match_key` keeps only the last segment).
+            // Retrieval probes the key, so a row that stored only the display
+            // name was undiscoverable for every qualified symbol: a package's
+            // own declaration could not be found through the `syms` union that
+            // exists to make declaration-only files candidates.
+            let key = crate::model::file_analysis::name_match_key(&seed.name);
+            let key_id = if key == seed.name {
+                name_id
+            } else {
+                intern_str(&key, &mut memo)?
+            };
             let container_id = match seed.container.as_deref() {
                 Some(c) => Some(intern_str(c, &mut memo)?),
                 None => None,
@@ -152,6 +166,7 @@ pub fn shred_derived_rows(
             insert_sym.execute(params![
                 file_id,
                 name_id,
+                key_id,
                 seed.kind,
                 seed.span.start.row as i64,
                 seed.span.start.column as i64,
@@ -247,7 +262,7 @@ pub fn ref_candidate_files(conn: &Connection, keys: &[String]) -> Vec<String> {
          UNION
          SELECT DISTINCT f.path FROM syms y
            JOIN files f ON f.file_id = y.file_id
-          WHERE y.name_id = (SELECT str_id FROM strings WHERE s = ?1)",
+          WHERE y.key_id = (SELECT str_id FROM strings WHERE s = ?1)",
     ) else {
         return out;
     };
@@ -508,8 +523,14 @@ pub fn unused_exported_syms(conn: &Connection) -> Vec<DeadExportRow> {
           WHERE f.source = 'workspace'
             AND (y.flags & ?1) != 0
             AND NOT EXISTS (
+                  -- Against the KEY: refs are keyed by `Ref::match_key`, so
+                  -- comparing them to a symbol's display name is what let the
+                  -- two families drift apart in the first place. A no-op for
+                  -- the rows this view gates on (an `@EXPORT` name is bare, so
+                  -- key and name are the same string) — it is here so the next
+                  -- reader cannot reintroduce the mismatch.
                   SELECT 1 FROM refs r
-                   WHERE r.name_id = y.name_id
+                   WHERE r.name_id = y.key_id
                      AND r.file_id != y.file_id
                 )",
     ) else {

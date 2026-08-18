@@ -1254,3 +1254,45 @@ fn the_intern_memo_stays_bounded_and_correct_past_its_cap() {
         );
     }
 }
+
+#[test]
+fn a_qualified_symbols_declaring_file_is_a_ref_candidate() {
+    // Refs are keyed by `Ref::match_key` — the LAST segment — while a symbol
+    // row's display name is whatever it is called. For a qualified name
+    // (`package Deep::Pkg::Thing`) those differ, so a row storing only the
+    // display name is undiscoverable by retrieval, and a file that mentions
+    // the name nowhere but its own declaration drops out of the candidate set
+    // entirely. That is the `syms` union failing at exactly the job it exists
+    // for. The row carries both, and this pins it.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let p = dir.join("qualified_decl.pm");
+    // Declares the package and never mentions the name again.
+    let src = "package Deep::Pkg::Thing;\nsub helper { 1 }\n1;\n";
+    std::fs::write(&p, src).unwrap();
+    let path_str = p.to_string_lossy().to_string();
+    let cached = parse_source_to_cached(src, &p);
+    shred_derived_rows(
+        &conn,
+        &path_str,
+        "workspace",
+        &cached.analysis.ref_row_seeds(),
+        &cached.analysis.sym_row_seeds(),
+    )
+    .unwrap();
+
+    // The key a REFERENCE to this package carries.
+    let key = crate::model::file_analysis::name_match_key("Deep::Pkg::Thing");
+    assert_eq!(key, "Thing");
+    assert_eq!(
+        ref_candidate_files(&conn, &[key]),
+        vec![path_str.clone()],
+        "the declaring file must be retrievable by the key references use",
+    );
+    // And the display name still finds it, so workspace/symbol is unaffected.
+    assert_eq!(
+        ref_candidate_files(&conn, &["Deep::Pkg::Thing".to_string()]),
+        Vec::<String>::new(),
+        "the display name is not a retrieval key — that is what key_id is for",
+    );
+}
