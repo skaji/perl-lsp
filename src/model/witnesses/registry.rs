@@ -149,16 +149,31 @@ fn is_subclass_of(child: &str, ancestor: &str, ctx: &BagContext) -> bool {
 /// the counter says how often, and only the second one can tell a rare
 /// pathological file from a systematic truncation.
 ///
-/// Known interaction, unfixed: a subtree truncated here still gets
-/// MEMOIZED by the caller. `VisitedKey` is `(bag, attachment, receiver,
-/// arity)` — depth is not in it — so a node first reached near the cap
-/// caches its truncated answer and every later, shallower consult reads
-/// that instead of re-deriving the full one. Which nodes lose depends on
-/// traversal order, so the degradation is order-dependent as well as
-/// silent. Not fixed here because declining to memoize truncated subtrees
-/// means MORE re-derivation in exactly the pathological case the
-/// cross-file budget gate exists to bound; it wants the cpan5k corpus to
-/// measure, not a guess.
+/// Known interaction, unfixed and now MEASURED rather than guessed at: a
+/// subtree truncated here still gets MEMOIZED by the caller. `VisitedKey` is
+/// `(bag, attachment, receiver, arity)` — depth is not in it — so a node
+/// first reached near the cap caches its truncated answer and a later,
+/// shallower consult reads that instead of re-deriving the full one. Which
+/// nodes lose depends on traversal order.
+///
+/// Two facts bound how much this matters, both worth knowing before anyone
+/// "fixes" it:
+///
+/// 1. **It cannot outlive one top-level query.** `QueryState` — memo included
+///    — is minted in `query` and dropped when it returns. So this is not a
+///    cache that poisons a session; the window is a single query's traversal.
+/// 2. **Guarding it is expensive and, so far, buys nothing observable.** A
+///    prototype tagged each entry with the depth that produced it and refused
+///    to serve a truncated entry to a shallower consult. On a synthetic
+///    diamond (a 400-hop branch and a 2-hop branch meeting at a node whose
+///    own tail crosses the cap) it rejected 80,200 entries and re-derived
+///    them — 5.6x the wall time, 7s to 39s — and the top-level answer was
+///    IDENTICAL with and without it. The mechanism fires constantly; a shape
+///    where it changes what a user sees was not found.
+///
+/// So the cost is confirmed real and the benefit is still unevidenced. A fix
+/// wants a corpus case where the served answer actually differs — not a
+/// reproduction of the mechanism, which is easy and proves nothing.
 ///
 /// **Profile-aware, because the stack ceiling is.** Measured on a 2 MiB stack
 /// (the tokio blocking-pool and rayon worker size) with an `@ISA` chain of N

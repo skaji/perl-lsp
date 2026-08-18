@@ -667,6 +667,15 @@ named inputs.
   un-resolved the arm, dropped the answer, and prevented the re-push — flip
   forever. CLAUDE.md's worklist invariant states clear-and-emit as
   unconditional; it now has exactly one known exception, and this is it.
+- **`query_rec` memo poisoning** — a truncated subtree is memoized under a
+  depth-free `VisitedKey` and served to a later shallower consult in the same
+  query. Measured, not fixed, and the measurement argues against fixing it
+  blind: the memo dies with its top-level query (so this poisons a traversal,
+  never a session), and a depth-tagged-entry prototype rejected 80,200 entries
+  on a synthetic truncating diamond for a **5.6x wall-time cost (7s -> 39s)**
+  with an IDENTICAL top-level answer. The mechanism is trivially reproducible;
+  a shape where it changes a served answer is not, and that is what a fix
+  needs. See the `QUERY_REC_DEPTH_CAP` doc comment.
 - **`query_rec` 512-depth cap hit** on `MethodOnClass` — cross-dist
   class-name collisions make merged ancestry pathological at corpus scale.
   This is the package-identity candidate relation meeting the real world, and
