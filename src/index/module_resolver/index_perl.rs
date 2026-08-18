@@ -510,7 +510,15 @@ pub fn index_workspace_with_index(
         if let Some(cb) = walk_done {
             cb();
         }
-        let _ = writer.join();
+        // The window the readiness gate is held open by AFTER every file has
+        // been analyzed — the "100% walked, still saving" phase. Bounding the
+        // persist queue makes this a function of the queue depth rather than
+        // of the corpus: the walk cannot outrun the writer by more than the
+        // depth, so only that much is left to drain here. Timed because that
+        // is the claim, and it is the number to check on a real tree.
+        crate::util::timings::phase("index.writer_drain_after_walk", || {
+            let _ = writer.join();
+        });
     });
 
     // Workspace-tier residency tripwire, mirroring the pack indexer's:
