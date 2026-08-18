@@ -951,14 +951,24 @@ fn test_use_symbol() {
     assert_eq!(modules[0].name, "Foo::Bar");
 }
 
-/// The pre-walk depth gate: a CST past `MAX_CST_DEPTH` gets NO analysis
-/// (the recursive walk would fatally overflow a worker stack — an abort
-/// catch_unwind cannot catch) and SAYS SO via a `cst-too-deep`
-/// diagnostic. Ordinary files far below the cap are untouched.
+/// The depth gate: a CST past `MAX_CST_DEPTH` gets NO analysis and SAYS SO
+/// via a `cst-too-deep` diagnostic. Ordinary files far below the cap are
+/// untouched.
+///
+/// The gate no longer stands between the walk and a stack overflow — the walk
+/// is iterative, and `deep_file_gets_a_real_analysis` pins that a file well
+/// past the old overflow depth is analyzed for real. What is pinned here is
+/// the honest-degradation contract for input past the sanity bound.
 #[test]
 fn depth_gate_degrades_honestly() {
-    let deep = format!("my $x =\n{}1{};\n1;\n", "[".repeat(600), "]".repeat(600));
-    let fa = build_fa(&deep);
+    let over = crate::build::builder::pipeline::MAX_CST_DEPTH + 10;
+    let deep = format!("my $x =\n{}1{};\n1;\n", "[".repeat(over), "]".repeat(over));
+    let fa = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || build_fa(&deep))
+        .expect("spawn")
+        .join()
+        .expect("the gate must screen this without overflowing");
     assert!(fa.symbols().is_empty(), "gated file must carry no symbols");
     assert!(fa.refs().is_empty(), "gated file must carry no refs");
     assert_eq!(fa.plugin.diagnostics.len(), 1);
@@ -975,4 +985,123 @@ fn depth_gate_degrades_honestly() {
     let fa = build_fa(shallow);
     assert!(fa.plugin.diagnostics.is_empty());
     assert!(fa.symbols().iter().any(|s| s.name == "greet"));
+}
+
+/// The point of the iterative walk: a file far deeper than the recursive
+/// descent could survive gets a REAL analysis, not the degraded one.
+///
+/// 4,000 nested `[` is ~2.2× the depth at which the recursive walk aborted
+/// (measured: real analysis at 1,803, fatal stack overflow by 2,503, release
+/// build, 2 MiB stack). Base-verify by reverting to the recursive walk — the
+/// abort is a process abort, not a test failure, so a green run here is only
+/// meaningful because that abort is what it replaced.
+///
+/// Runs on a 2 MiB stack explicitly, matching a rayon worker: the harness's
+/// own thread size is not something this test should depend on.
+#[test]
+fn deep_file_gets_a_real_analysis() {
+    const NEST: usize = 4_000;
+    let src = format!("my $deep =\n{}42{};\nsub marker {{ 7 }}\n", "[".repeat(NEST), "]".repeat(NEST));
+    let fa = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || build_fa(&src))
+        .expect("spawn")
+        .join()
+        .expect("the walk must not overflow the stack");
+
+    assert!(
+        fa.plugin.diagnostics.iter().all(|d| d.code != "cst-too-deep"),
+        "a file this deep must be analyzed, not refused: {:?}",
+        fa.plugin.diagnostics
+    );
+    // Real analysis means the walk reached BOTH ends of the file: the
+    // declaration before the deep literal and the sub after it.
+    assert!(
+        fa.symbols().iter().any(|s| s.name == "marker"),
+        "the sub after the deep literal must be reached"
+    );
+    assert!(
+        fa.refs().iter().any(|r| r.target_name == "$deep"),
+        "the declaration before the deep literal must emit its ref"
+    );
+}
+
+
+/// The two walks agree, over every Perl file checked into the repo.
+///
+/// This is the landed half of the equivalence proof. The other half is the
+/// whole-suite sweep — `PERL_LSP_WALK_EQUIV=1 cargo test` re-builds every file
+/// any test touches both ways — which covers far more visitor arms but has to
+/// be asked for. This one runs by default, so the recursive descent stays
+/// exercised and cannot quietly rot into something that no longer agrees.
+///
+/// Compared as serde projections rather than bincode bytes: `HashMap`
+/// iteration order differs between two builds in one thread, and would report
+/// differences that are not there. See `walk::assert_walks_agree`.
+#[test]
+fn walk_equivalence_over_repo_fixtures() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_perl_files(root, &mut files, 0);
+    assert!(
+        files.len() > 50,
+        "expected the repo's fixture corpus, found {} files",
+        files.len()
+    );
+
+    let mut compared = 0usize;
+    for path in &files {
+        let Ok(src) = std::fs::read(path) else { continue };
+        let tree = {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
+            match p.parse(&src, None) {
+                Some(t) => t,
+                None => continue,
+            }
+        };
+        // The deep fixtures are past what the recursive walk can survive at
+        // all — that is the point of them, and `deep_file_gets_a_real_analysis`
+        // is where they are covered.
+        if crate::build::builder::pipeline::cst_depth(&tree) > 256 {
+            continue;
+        }
+        let plugins = crate::build::plugin::default_plugin_registry();
+        let iterative =
+            crate::build::builder::walk::with_walk_mode(false, || {
+                build_with_plugins(&tree, &src, plugins.clone())
+            });
+        let recursive =
+            crate::build::builder::walk::with_walk_mode(true, || {
+                build_with_plugins(&tree, &src, plugins.clone())
+            });
+        crate::build::builder::walk::assert_walks_agree(&iterative, || recursive);
+        compared += 1;
+    }
+    assert!(compared > 50, "only {} files actually compared", compared);
+}
+
+fn collect_perl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            // `target/` is build output and `gold-corpus/local/` is the CPAN
+            // substrate — neither is this repo's source, and both are huge.
+            if name == "target" || name == "local" || name == ".git" {
+                continue;
+            }
+            collect_perl_files(&path, out, depth + 1);
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("pm") | Some("pl") | Some("t")
+        ) {
+            out.push(path);
+        }
+    }
 }

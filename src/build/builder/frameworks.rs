@@ -740,7 +740,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Extract a string from a bareword or string-literal node.
-    pub(super) fn extract_node_string(&self, node: Node<'_>) -> Option<String> {
+    pub(super) fn extract_node_string(&self, node: Node<'a>) -> Option<String> {
         match node.kind() {
             "bareword" | "autoquoted_bareword" => node.utf8_text(self.source).ok().map(|s| s.to_string()),
             "string_literal" | "interpolated_string_literal" => self.extract_string_content(node),
@@ -751,7 +751,7 @@ impl<'a> Builder<'a> {
     /// Flatten a fat-comma hash node into alternating key/value strings,
     /// recursing into tree-sitter-perl's right-associative nested
     /// `list_expression` wrappers.
-    pub(super) fn collect_hash_tokens(&self, node: Node<'_>, out: &mut Vec<String>) {
+    pub(super) fn collect_hash_tokens(&self, node: Node<'a>, out: &mut Vec<String>) {
         match node.kind() {
             "anonymous_hash_expression" => {
                 for i in 0..node.child_count() {
@@ -775,7 +775,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub(super) fn collect_hash_tokens_flat(&self, node: Node<'_>, out: &mut Vec<String>) {
+    pub(super) fn collect_hash_tokens_flat(&self, node: Node<'a>, out: &mut Vec<String>) {
         let count = node.child_count();
         let mut i = 0;
         while i < count {
