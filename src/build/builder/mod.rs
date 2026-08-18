@@ -353,6 +353,9 @@ struct Builder<'a> {
     /// Flushed into `FileAnalysis.reexport_modules`; the surface walks them
     /// transitively at query time. Dedup'd on insert via `record_reexport_edge`.
     reexport_modules: Vec<String>,
+    /// `use lib` arguments, as written. Flushed into
+    /// `FileAnalysis.lib_roots` — the per-asker half of module visibility.
+    lib_roots: Vec<String>,
     /// Plugin-declared namespaces collected during the walk via
     /// `EmitAction::PluginNamespace`. Flushed into the final
     /// `FileAnalysis.plugin.namespaces`.

@@ -16,7 +16,9 @@ use tree_sitter::Parser;
 
 use crate::build::cpanfile;
 use crate::index::module_cache;
-use crate::index::module_index::{CachedModule, IndexCore, ResolveQueue, WorkspaceRootChannel};
+use crate::index::module_index::{
+    CachedModule, IndexCore, Providers, ResolveQueue, WorkspaceRootChannel,
+};
 
 /// Callback invoked after each module is resolved. Used to trigger diagnostic refresh.
 pub type OnResolved = Box<dyn Fn() + Send + Sync>;
@@ -73,6 +75,7 @@ pub use index_perl::*;
 mod persist;
 pub(crate) use persist::*;
 mod thread;
+pub use thread::uri_to_path;
 use thread::*;
 
 #[cfg(test)]

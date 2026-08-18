@@ -313,51 +313,27 @@ repros; recorded here so a fix flips a real observation, not just narrative.
   Refs, and outline-skip so they don't flood `--outline`.
 - **C `goto` labels.** `label:` / `goto label;` are real navigation targets;
   not yet handled.
-- **Perl package identity: the @INC tier is still single-provider.** The
-  workspace tier carries the honest relation (`all_defs`: `name ->
-  Vec<candidate>`, a derived name-slot winner, symbol-disambiguated
-  consumers — pinned by the `pkgid-*` rows over
-  `gold-corpus/pkgsplit-fixture`). The @INC resolver does not: it walks the
-  path list, stops at the first hit, and caches one file per module name. So
-  a *dependency* package that legitimately lives in more than one file still
-  answers from whichever file was parsed first, which is the same
-  wrong-answer class `pkgid-01` fixed for workspace code.
+- **Perl package identity: an @INC `use lib` root outside the workspace is
+  never acquired.** The @INC tier is no longer single-provider: a name maps
+  to its SET of files, the providers persist per-file, and which one an
+  asker gets is decided by that asker's own search path (`incdual-*` rows
+  over `gold-corpus/incdual-fixture`, whose twins live outside the
+  workspace so the workspace relation cannot compensate). What is left is
+  ACQUISITION. The resolver walks the process `@INC`; a root a file names
+  with `use lib` is used to RANK candidates, not to go find them. So:
 
-  **When it bites:** XS/PP twins (a dist ships a compiled and a pure-Perl
-  implementation of one package); a project-local `lib/JSON/PP.pm` shadowing
-  the installed copy; dual-life core modules (`lib/` in perl5 core vs the
-  CPAN release); and above all **per-entrypoint @INC** — `t/lib` for tests,
-  `lib` for the app, a vendored `local/lib/perl5`, system perl, or deps in a
-  container while source is on the host. Same name, different file, decided
-  by who is asking. Per-entrypoint @INC is the general case, not an exotic
-  one.
+  - `use lib 't/lib'` where `t/lib` is inside the workspace works
+    end-to-end — the workspace walk already acquired that file, and the
+    per-asker rank picks it. This is the common shape (a test double
+    shadowing the real module).
+  - `use lib '../vendored'` pointing OUTSIDE the workspace, at a directory
+    that is not on the process `@INC`, resolves to nothing new: no tier
+    ever scanned it, so there is no candidate to rank.
 
-  **Why it wasn't fixed with the workspace tier — three separable reasons:**
-  1. *Acquisition.* The workspace walk sees every file, so the candidate set
-     is free. @INC resolution stops at the first hit and never learns the
-     alternatives exist; finding them changes resolution, not storage.
-  2. *Schema.* `modules.module_name` is a PRIMARY KEY. Workspace rows dodge
-     it by storing the PATH there; @INC rows store the real module name, so
-     **two providers for one name cannot both persist** without a migration.
-     This is a wall, not scope.
-  3. *It needs the deferred tier.* Choosing among providers means knowing the
-     asker's @INC, which is per-entrypoint — the entrypoint-closure analysis
-     deliberately not built. Storing candidates without it just relocates the
-     guess.
-
-  **Plan, in dependency order:**
-  1. Key the name-keyed relation `(name, inc-root)` — `all_defs`-shaped, one
-     entry per root that provides the name.
-  2. Migrate the `modules` schema so the @INC tier can hold multiple
-     providers per name (or key those rows by path, as workspace rows do).
-  3. Populate `CandidateSet::scoped` / `ScopedLookup` from the asker's @INC,
-     so the existing per-origin visibility seam picks the provider. Perl
-     passes an empty closure today; this is the slot to fill, and it is the
-     same seam the `use`-closure tier would use.
-  4. Only then pin it. A row needs a **substrate-tier** fixture: the twin
-     must live OUTSIDE the workspace, or the workspace candidate relation
-     compensates and the row passes for the wrong reason — the trap
-     `pkgid-04` hit during authoring.
-
-  Steps 1–2 are self-contained; step 3 is the expensive one and is shared
-  with entrypoint analysis generally.
+  The fix is to feed the workspace's declared `lib_roots` into the
+  resolver's search path (the union over indexed files), which makes
+  acquisition follow the same declaration visibility already reads. It is
+  a resolver-thread change, not a new mechanism: `FileAnalysis.lib_roots`
+  already carries the roots and `IndexCore.inc_roots` already publishes the
+  process set. Deferred because acquisition widening changes what gets
+  parsed at startup, and that wants its own measurement.

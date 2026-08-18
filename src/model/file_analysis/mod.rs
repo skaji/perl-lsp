@@ -120,6 +120,19 @@ pub struct FileAnalysis {
     #[serde(default)]
     pub reexport_modules: Vec<String>,
 
+    /// Search-path roots this file prepends to `@INC` — the literal
+    /// arguments of its `use lib` lines, AS WRITTEN. THE per-asker half of
+    /// module visibility: `t/lib` for a test, `lib` for the app, a vendored
+    /// `local/lib/perl5`. Stored unresolved because the analysis must stay
+    /// location-independent to ride the cache; relative entries resolve
+    /// against the workspace root and the file's own directory at query
+    /// time, and an entry that names no directory (an interpolated
+    /// `"$FindBin::Bin/../lib"`) drops out THERE. Nothing is filtered here:
+    /// a text test for "looks interpolated" would be a guess, while
+    /// "resolves to a real directory" is the question that actually matters.
+    #[serde(default)]
+    pub lib_roots: Vec<String>,
+
     /// Per-symbol provenance for return types. Populated for plugin
     /// `overrides()` and for reducer-driven folds over the witness bag.
     /// Missing entry == `TypeProvenance::Inferred`.
@@ -471,6 +484,7 @@ pub struct FileAnalysisParts {
     pub export_ok: Vec<String>,
     pub export_tags: HashMap<String, Vec<String>>,
     pub reexport_modules: Vec<String>,
+    pub lib_roots: Vec<String>,
     pub type_provenance: HashMap<SymbolId, TypeProvenance>,
     pub package_ranges: Vec<PackageRange>,
     pub witnesses: crate::model::witnesses::WitnessBag,

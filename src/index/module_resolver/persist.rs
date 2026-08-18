@@ -53,7 +53,26 @@ pub(super) fn residency_tripwire(tier: &str, whole: usize, expected: usize) {
 /// same analysis or neither exists). `save_to_db` skips degraded analyses;
 /// mirror that here so no rows exist for an unpersisted blob.
 /// Returns whether the blob row landed (the strip-legality signal).
+/// Persist EVERY provider of `module_name` — one row per file, because the
+/// name maps to a set. `true` only when all of them landed: a partial write
+/// must not license the resident strip, or the un-persisted provider loses
+/// the axes it can no longer rehydrate.
 pub(super) fn save_module_generation(
+    conn: &rusqlite::Connection,
+    module_name: &str,
+    result: &Option<Providers>,
+) -> bool {
+    let Some(providers) = result else {
+        return save_one_provider(conn, module_name, &None);
+    };
+    let mut all = true;
+    for m in providers {
+        all &= save_one_provider(conn, module_name, &Some(m.clone()));
+    }
+    all
+}
+
+fn save_one_provider(
     conn: &rusqlite::Connection,
     module_name: &str,
     result: &Option<Arc<CachedModule>>,

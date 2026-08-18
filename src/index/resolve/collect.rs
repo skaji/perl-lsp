@@ -900,7 +900,7 @@ pub(super) fn collect_from_analysis(
                 idx,
                 &analysis.pack.include_closure,
                 Some(path.as_path()),
-                true,
+                crate::model::file_analysis::VisibilityAxis::IncludeClosure,
             ));
             // SAFETY: scoped_storage was just set to Some(..) on the line above,
             // in this same match arm — a lifetime-extension idiom, not a fallible read.

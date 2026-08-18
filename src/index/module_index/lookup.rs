@@ -322,6 +322,20 @@ impl CrossFileLookup for ModuleIndex {
         self.module_path_cached(module_name)
     }
 
+    fn inc_roots(&self) -> Arc<Vec<std::path::PathBuf>> {
+        self.core
+            .inc_roots
+            .read()
+            .map(|g| Arc::clone(&g))
+            .unwrap_or_default()
+    }
+
+    fn workspace_root_path(&self) -> Option<std::path::PathBuf> {
+        self.workspace_root()
+            .as_deref()
+            .and_then(crate::index::module_resolver::uri_to_path)
+    }
+
     fn modules_with_symbol(&self, name: &str) -> Vec<String> {
         self.modules_with_symbol(name)
     }
@@ -343,7 +357,7 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn def_candidates(&self, name: &str) -> Vec<Arc<CachedModule>> {
-        match self.all_defs.get(name) {
+        match self.core.all_defs.get(name) {
             Some(cands) if !cands.is_empty() => {
                 // Path-ordered HERE, the one speller of candidate order —
                 // `all_defs` vecs are insertion-ordered (parallel indexing),

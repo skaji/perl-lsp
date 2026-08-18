@@ -1,5 +1,5 @@
 use super::*;
-use crate::index::module_index::strip_import_copy;
+use crate::index::module_index::strip_import_copy_one;
 
 #[test]
 fn test_resolve_module_list_util() {
@@ -80,7 +80,7 @@ sub new {
     let cached = Arc::new(CachedModule::new(PathBuf::from("/x/Demo/Has/Event.pm"), analysis));
 
     // Workspace-index style insert: a resolved module.
-    core.insert_resolved("Demo::Has::Event", Some(cached), false, false);
+    core.insert_resolved("Demo::Has::Event", Some(vec![cached]), false, false);
     assert!(core.cache.get("Demo::Has::Event").as_deref().unwrap().is_some());
 
     // On-demand resolver miss: `None`. Must NOT clobber the indexed copy.
@@ -95,7 +95,7 @@ sub new {
     let tree2 = parser.parse(source, None).unwrap();
     let analysis2 = std::sync::Arc::new(crate::build::builder::build(&tree2, source.as_bytes()));
     let cached2 = Arc::new(CachedModule::new(PathBuf::from("/y/Demo/Has/Event.pm"), analysis2));
-    core.insert_resolved("Demo::Has::Event", Some(cached2), false, false);
+    core.insert_resolved("Demo::Has::Event", Some(vec![cached2]), false, false);
     assert_eq!(
         core.cache.get("Demo::Has::Event").as_deref().unwrap().as_ref().unwrap().path,
         PathBuf::from("/y/Demo/Has/Event.pm"),
@@ -222,21 +222,20 @@ fn import_tier_strip_gates_on_persistence() {
     let tree = parser.parse(source, None).unwrap();
     let fa = crate::build::builder::build(&tree, source.as_bytes());
     assert!(!fa.witnesses.is_empty());
-    let cm = Some(Arc::new(CachedModule::new(
+    let cm = Arc::new(CachedModule::new(
         PathBuf::from("/inc/Strip.pm"),
         Arc::new(fa),
-    )));
+    ));
 
-    let stripped = strip_import_copy(&cm, true, true).unwrap();
+    let stripped = strip_import_copy_one(&cm, true, true);
     assert!(stripped.analysis.bag_is_evicted(), "persisted + eviction → bag drops");
     assert!(!stripped.analysis.symbols_are_evicted(), "symbols stay resident this slice");
     assert!(!stripped.analysis.refs_are_evicted(), "refs stay resident this slice");
 
-    let whole = strip_import_copy(&cm, false, true).unwrap();
+    let whole = strip_import_copy_one(&cm, false, true);
     assert!(!whole.analysis.bag_is_evicted(), "unpersisted → bag unrecoverable → keep");
-    let whole2 = strip_import_copy(&cm, true, false).unwrap();
+    let whole2 = strip_import_copy_one(&cm, true, false);
     assert!(!whole2.analysis.bag_is_evicted(), "NO_EVICT → keep");
-    assert!(strip_import_copy(&None, true, true).is_none());
 }
 
 
@@ -281,4 +280,223 @@ fn priority_push_wakes_a_parked_drain() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("a priority push must wake the parked drain");
     assert_eq!(batch, vec!["Stale::Module".to_string()]);
+}
+
+// ---- The @INC tier's candidate relation ----
+//
+// A module name maps to a SET of files, not to one file — XS/PP twins, a
+// project `lib/` shadowing an installed copy, `t/lib` vs `lib` per
+// entrypoint. `gold-corpus/KNOWN-GAPS.md`, "the @INC tier is still
+// single-provider".
+
+/// Two `@INC` roots, each providing `Twin`, with a sub only ONE of them
+/// defines. Returns (root_a, root_b).
+fn twin_roots(tag: &str) -> (PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!("perl-lsp-twin-{}-{}", tag, std::process::id()));
+    let (a, b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(
+        a.join("Twin.pm"),
+        "package Twin;\nsub only_in_a { 1 }\nsub shared { 1 }\n1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("Twin.pm"),
+        "package Twin;\nsub only_in_b { 1 }\nsub shared { 1 }\n1;\n",
+    )
+    .unwrap();
+    (a, b)
+}
+
+#[test]
+fn inc_resolution_enumerates_every_providing_root_in_inc_order() {
+    let (a, b) = twin_roots("paths");
+    let found = resolve_module_paths(&[a.clone(), b.clone()], "Twin");
+    assert_eq!(
+        found,
+        vec![a.join("Twin.pm"), b.join("Twin.pm")],
+        "both roots provide Twin; the relation must hold both, @INC order first",
+    );
+    // The winner is still exactly what `require` would load.
+    assert_eq!(
+        resolve_module_path(&[a.clone(), b.clone()], "Twin"),
+        Some(a.join("Twin.pm")),
+    );
+    // Reversing @INC reverses the winner, not the membership.
+    assert_eq!(
+        resolve_module_path(&[b.clone(), a.clone()], "Twin"),
+        Some(b.join("Twin.pm")),
+    );
+}
+
+#[test]
+fn a_name_keeps_every_provider_not_just_the_last_inserted() {
+    // Base behavior (single-provider tier): the second insert REPLACED the
+    // first in the one name-keyed slot and `def_candidates` fell back to
+    // that winner — one candidate, and the other provider's subs were
+    // unreachable. Both providers must survive as candidates.
+    use crate::model::file_analysis::CrossFileLookup;
+    let (a, b) = twin_roots("relation");
+    let mut parser = create_parser();
+    let mut memo: ParseMemo = HashMap::new();
+    let providers =
+        resolve_and_parse_with_memo(&[a.clone(), b.clone()], "Twin", &mut parser, &mut memo)
+            .expect("Twin resolves");
+    assert_eq!(providers.len(), 2, "both providers parse");
+
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    // One insert per provider — the single-copy front door, called twice,
+    // is exactly the shape that used to lose the first provider.
+    for m in &providers {
+        idx.insert_cache("Twin", Some(Arc::clone(m)));
+    }
+
+    let cands = idx.def_candidates("Twin");
+    assert_eq!(
+        cands.len(),
+        2,
+        "the relation dropped a provider: {:?}",
+        cands.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+    );
+
+    // The payoff: a sub that lives ONLY in the shadowed provider still
+    // resolves to the file that defines it.
+    let owner = idx
+        .candidate_defining_sub("Twin", "only_in_b")
+        .expect("only_in_b is defined by the shadowed provider");
+    assert_eq!(owner.path, b.join("Twin.pm"));
+    let owner_a = idx
+        .candidate_defining_sub("Twin", "only_in_a")
+        .expect("only_in_a is defined by the winning provider");
+    assert_eq!(owner_a.path, a.join("Twin.pm"));
+}
+
+#[test]
+fn a_workspace_file_still_shadows_an_inc_provider_of_the_same_name() {
+    // The two tiers now SHARE `all_defs`, so the winner pick must stay
+    // tier-aware: project code shadows an installed copy, and the path
+    // tie-break has no opinion about which tier a candidate came from.
+    use crate::model::file_analysis::CrossFileLookup;
+    let base = std::env::temp_dir().join(format!("perl-lsp-shadow-{}", std::process::id()));
+    let (inc, ws) = (base.join("inc"), base.join("ws"));
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+    // The @INC path sorts BEFORE the workspace path, so a tier-blind
+    // smallest-path tie-break would hand it the slot.
+    let inc_pm = inc.join("Shadowed.pm");
+    let ws_pm = ws.join("Shadowed.pm");
+    assert!(inc_pm < ws_pm, "fixture needs the @INC path to sort first");
+    let inc_src = "package Shadowed;\nsub from_inc { 1 }\n1;\n";
+    let ws_src = "package Shadowed;\nsub from_workspace { 1 }\n1;\n";
+    std::fs::write(&inc_pm, inc_src).unwrap();
+    std::fs::write(&ws_pm, ws_src).unwrap();
+
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let mut parser = create_parser();
+    let mut build = |src: &str| {
+        let tree = parser.parse(src, None).unwrap();
+        Arc::new(crate::build::builder::build(&tree, src.as_bytes()))
+    };
+    let inc_fa = build(inc_src);
+    let ws_fa = build(ws_src);
+
+    idx.insert_cache("Shadowed", Some(Arc::new(CachedModule::new(inc_pm.clone(), inc_fa))));
+    idx.register_workspace_module(ws_pm.clone(), ws_fa);
+
+    assert_eq!(
+        idx.get_cached("Shadowed").map(|c| c.path.clone()),
+        Some(std::fs::canonicalize(&ws_pm).unwrap_or(ws_pm.clone())),
+        "the workspace file must hold the name slot",
+    );
+    // Both remain candidates — shadowing decides the winner, not membership.
+    assert_eq!(idx.def_candidates("Shadowed").len(), 2);
+}
+
+#[test]
+fn use_lib_declares_the_files_own_search_path_roots() {
+    // `use lib` is the per-asker half of module visibility: a test with
+    // `use lib 't/lib'` and an app file without it do NOT see the same
+    // provider for the same module name.
+    let src = r#"
+use lib 't/lib';
+use lib qw(lib local/lib/perl5);
+use lib "$FindBin::Bin/../lib";
+use strict;
+package App;
+1;
+"#;
+    let mut parser = create_parser();
+    let tree = parser.parse(src, None).unwrap();
+    let fa = crate::build::builder::build(&tree, src.as_bytes());
+    assert_eq!(
+        fa.lib_roots,
+        vec!["t/lib", "lib", "local/lib/perl5", "$FindBin::Bin/../lib"],
+        "both the single-string and qw spellings count; roots are stored as \
+         written, and one that names no directory drops out at resolution",
+    );
+    // `use strict` is not a search-path declaration.
+    assert!(!fa.lib_roots.iter().any(|r| r == "strict"));
+}
+
+#[test]
+fn two_askers_with_different_use_lib_see_different_providers() {
+    // The point of the exercise: `@INC` is per-entrypoint, so the SAME
+    // module name means different files to different askers. A test file
+    // with `use lib 't/lib'` must resolve `Twin` to the t/lib copy while
+    // the app file resolves it to the lib copy — one relation, two
+    // visibility rules, decided at CandidateSet construction so every
+    // projection inherits it.
+    use crate::model::file_analysis::{CrossFileLookup, ScopedLookup, VisibilityAxis};
+    let base = std::env::temp_dir().join(format!("perl-lsp-asker-{}", std::process::id()));
+    let (applib, testlib) = (base.join("lib"), base.join("t").join("lib"));
+    std::fs::create_dir_all(&applib).unwrap();
+    std::fs::create_dir_all(&testlib).unwrap();
+    std::fs::write(applib.join("Twin.pm"), "package Twin;\nsub which { 'app' }\n1;\n").unwrap();
+    std::fs::write(testlib.join("Twin.pm"), "package Twin;\nsub which { 'test' }\n1;\n").unwrap();
+
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let mut parser = create_parser();
+    let mut memo: ParseMemo = HashMap::new();
+    // The process @INC has only the app lib: `t/lib` is a root ONLY the
+    // test file declares, which is exactly the discriminator.
+    idx.set_inc_roots_for_test(&[applib.clone()]);
+    let providers = resolve_and_parse_with_memo(
+        &[applib.clone(), testlib.clone()],
+        "Twin",
+        &mut parser,
+        &mut memo,
+    )
+    .expect("Twin resolves");
+    assert_eq!(providers.len(), 2);
+    idx.insert_cache_providers("Twin", Some(providers));
+
+    let mut build_origin = |src: &str| {
+        let tree = parser.parse(src, None).unwrap();
+        crate::build::builder::build(&tree, src.as_bytes())
+    };
+    let app_fa = build_origin("package App;\nuse Twin;\n1;\n");
+    let test_fa = build_origin(&format!(
+        "use lib '{}';\nuse Twin;\n1;\n",
+        testlib.display()
+    ));
+
+    let empty = Default::default();
+    let resolved_by = |fa: &crate::model::file_analysis::FileAnalysis| {
+        let axis = VisibilityAxis::for_origin(fa, None, &idx, false);
+        let scoped = ScopedLookup::new(&idx, &empty, None, axis);
+        scoped.get_cached("Twin").map(|c| c.path.clone())
+    };
+
+    assert_eq!(
+        resolved_by(&app_fa),
+        Some(applib.join("Twin.pm")),
+        "the app file sees only the process @INC, so Twin is the lib copy",
+    );
+    assert_eq!(
+        resolved_by(&test_fa),
+        Some(testlib.join("Twin.pm")),
+        "`use lib 't/lib'` puts that root FIRST for this asker, so the same \
+         name means the t/lib copy",
+    );
 }

@@ -130,17 +130,23 @@ pub fn resolve<'a>(
         FileKey::Path(p) => Some(p.clone()),
         FileKey::Url(u) => u.to_file_path().ok(),
     };
-    // The routing fact also names the scope's AXIS: pack languages scope by
-    // include closure; Perl's scope is transparent until its own visibility
-    // tier lands (see `ScopedLookup::closure_scoped`).
+    // The routing fact names the scope's AXIS, and `for_origin` owns the
+    // derivation — pack scopes by include closure, Perl by the asker's own
+    // search path (`use lib` roots ahead of the process @INC).
     let pack =
         crate::build::language_driver::LanguageRegistry::is_pack_language(&origin.language);
     let scoped = module_index.map(|idx| {
+        let axis = crate::model::file_analysis::VisibilityAxis::for_origin(
+            origin,
+            self_path.as_deref(),
+            idx,
+            pack,
+        );
         crate::model::file_analysis::ScopedLookup::new(
             idx,
             &origin.pack.include_closure,
             self_path.as_deref(),
-            pack,
+            axis,
         )
     });
     CandidateSet {

@@ -29,8 +29,24 @@ pub(crate) struct IndexCore {
     /// `perlfunc.pod` on first cold-cache miss). Empty until the
     /// resolver has run its warmup path.
     pub(crate) builtins: DashMap<String, String>,
-    /// Known module names from @INC scan. Name → path. No exports until resolved.
+    /// Known module names from @INC scan. Name → the @INC-order-winning
+    /// path. No exports until resolved.
     pub(crate) available_modules: DashMap<String, std::path::PathBuf>,
+    /// ALL cross-file candidates per name, not just the winner in `cache` —
+    /// the honest relation for every tier, because a name maps to a SET of
+    /// files. Pack: C's flat linkage lets unrelated files each define
+    /// `class Box`. Perl: a package reopens in any file, and @INC is
+    /// per-entrypoint, so one module name legitimately has several
+    /// providers. The winner in `cache` is DERIVED from this set; the
+    /// per-origin visibility rule (`ScopedLookup`) picks among them.
+    /// Shared: the resolver thread adopts @INC providers here, the async
+    /// side adopts workspace candidates.
+    pub(crate) all_defs: DashMap<String, Vec<Arc<CachedModule>>>,
+    /// The `@INC` roots this process resolves from, canonical, most-
+    /// preferred first. Recorded ONCE by the resolver thread (discovery
+    /// shells out to `perl`, so no query path may re-derive it) and read by
+    /// every origin's `VisibilityAxis::for_origin`.
+    pub(crate) inc_roots: std::sync::RwLock<Arc<Vec<std::path::PathBuf>>>,
     pub(crate) queue: ResolveQueue,
     pub(crate) resolved: ResolveNotify,
     pub(crate) workspace_root: WorkspaceRootChannel,
@@ -76,6 +92,8 @@ impl IndexCore {
             stale_modules: DashMap::new(),
             builtins: DashMap::new(),
             available_modules: DashMap::new(),
+            all_defs: DashMap::new(),
+            inc_roots: std::sync::RwLock::new(Arc::new(Vec::new())),
             queue: ResolveQueue {
                 priority: Mutex::new(Vec::new()),
                 pending: Mutex::new(Vec::new()),
@@ -91,6 +109,18 @@ impl IndexCore {
             shape_bumps: std::sync::atomic::AtomicU64::new(0),
             long_lived: std::sync::atomic::AtomicBool::new(false),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Record the process `@INC`, canonicalized so the per-asker rank can
+    /// prefix-match candidate paths without query-time filesystem I/O.
+    pub(crate) fn set_inc_roots(&self, roots: &[std::path::PathBuf]) {
+        let canon: Vec<std::path::PathBuf> = roots
+            .iter()
+            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+            .collect();
+        if let Ok(mut g) = self.inc_roots.write() {
+            *g = Arc::new(canon);
         }
     }
 
@@ -152,25 +182,68 @@ impl IndexCore {
     pub(crate) fn insert_resolved(
         &self,
         module_name: &str,
-        result: Option<Arc<CachedModule>>,
+        result: Option<Providers>,
         persisted: bool,
         strip: bool,
-    ) -> Option<Arc<CachedModule>> {
+    ) -> Option<Providers> {
         crate::util::ghost_stats::count("epoch.shape.insert_resolved");
         self.note_shape_change();
-        if let Some(ref m) = result {
-            if let Some(bc) = self.bag_cache.read().ok().and_then(|g| g.clone()) {
-                bc.invalidate(&m.path);
+        if let Some(ref providers) = result {
+            // One purge, then one push per provider: `record_loader_shapes`
+            // clears the contributor's entries before pushing, so calling it
+            // per provider would leave only the last one's shapes.
+            self.purge_loader_shapes(module_name);
+            for m in providers {
+                if let Some(bc) = self.bag_cache.read().ok().and_then(|g| g.clone()) {
+                    bc.invalidate(&m.path);
+                }
+                self.mint_registration_gen(&m.path);
+                self.edges.feed(module_name, &m.path, &m.analysis);
+                self.push_loader_shapes(module_name, &m.analysis);
             }
-            self.mint_registration_gen(&m.path);
-            self.edges.feed(module_name, &m.path, &m.analysis);
-            self.record_loader_shapes(module_name, &m.analysis);
         } else if matches!(self.cache.get(module_name).as_deref(), Some(Some(_))) {
             return None;
         }
-        let stored = strip_import_copy(&result, persisted, strip);
-        self.cache.insert(module_name.to_string(), stored.clone());
+        let stored: Option<Providers> = result.as_ref().map(|providers| {
+            providers
+                .iter()
+                .map(|m| strip_import_copy_one(m, persisted, strip))
+                .collect()
+        });
+        // The relation holds every provider; the name-keyed slot holds the
+        // @INC-order winner (what `require` would load) — derived from the
+        // set, never the only thing kept.
+        if let Some(ref providers) = stored {
+            self.adopt_inc_providers(module_name, providers);
+        }
+        let primary = stored.as_ref().and_then(|p| p.first().cloned());
+        self.cache.insert(module_name.to_string(), primary);
         stored
+    }
+
+    /// Adopt `providers` as `@INC` candidates for `module_name`, keyed by
+    /// path so a re-resolve REPLACES its own entry instead of stacking, and
+    /// a workspace candidate for the same name is left untouched (the tiers
+    /// share the relation; precedence stays with the cache slot).
+    pub(crate) fn adopt_inc_providers(&self, module_name: &str, providers: &[Arc<CachedModule>]) {
+        let mut v = self.all_defs.entry(module_name.to_string()).or_default();
+        for cand in providers {
+            match v.iter().position(|c| c.path == cand.path) {
+                Some(i) => v[i] = cand.clone(),
+                None => v.push(cand.clone()),
+            }
+        }
+    }
+
+    /// Drop `contributor`'s loader-shape entries. Split from the push so a
+    /// name with several providers purges once and accumulates the union.
+    pub(crate) fn purge_loader_shapes(&self, contributor: &str) {
+        crate::util::ghost_stats::count("epoch.shape.record_loader_shapes");
+        self.note_shape_change();
+        self.loader_config_shapes.retain(|_n, v| {
+            v.retain(|(c, _)| c != contributor);
+            !v.is_empty()
+        });
     }
 
     /// Project each `PluginLoad` fact's config value into a stored
@@ -180,13 +253,11 @@ impl IndexCore {
     /// local facts (the same tier as export names), not a cached
     /// cross-file resolution.
     pub(crate) fn record_loader_shapes(&self, contributor: &str, analysis: &FileAnalysis) {
-        crate::util::ghost_stats::count("epoch.shape.record_loader_shapes");
-        self.note_shape_change();
-        // re-registration: drop this contributor's old entries
-        self.loader_config_shapes.retain(|_n, v| {
-            v.retain(|(c, _)| c != contributor);
-            !v.is_empty()
-        });
+        self.purge_loader_shapes(contributor);
+        self.push_loader_shapes(contributor, analysis);
+    }
+
+    fn push_loader_shapes(&self, contributor: &str, analysis: &FileAnalysis) {
         for f in &analysis.plugin.loads {
             let Some(span) = f.config_span else { continue };
             if let Some(t) = analysis.expr_type_at_span(span, None) {
@@ -220,17 +291,16 @@ impl IndexCore {
 /// the import tier is the follow-up in
 /// `docs/prompt-storage-residuals.md`. Degraded
 /// analyses keep the bag (their rows never persist).
-pub(crate) fn strip_import_copy(
-    result: &Option<Arc<CachedModule>>,
+pub(crate) fn strip_import_copy_one(
+    m: &Arc<CachedModule>,
     persisted: bool,
     strip: bool,
-) -> Option<Arc<CachedModule>> {
-    match result {
-        Some(m) if persisted && strip && !m.analysis.degraded => {
-            let mut fa = (*m.analysis).clone();
-            fa.evict_axes(true, false);
-            Some(Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa))))
-        }
-        _ => result.clone(),
+) -> Arc<CachedModule> {
+    if persisted && strip && !m.analysis.degraded {
+        let mut fa = (*m.analysis).clone();
+        fa.evict_axes(true, false);
+        Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa)))
+    } else {
+        m.clone()
     }
 }

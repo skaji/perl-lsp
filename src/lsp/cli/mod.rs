@@ -299,7 +299,8 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
         );
         let (warmed, stale) = module_cache::warm_cache(
             conn,
-            &module_index.cache_raw(),
+            module_index.cache_raw(),
+            module_index.all_defs_raw(),
             module_index.is_long_lived() && module_resolver::eviction_enabled(),
         );
         // Stamp generations for the warm-loaded @INC providers (the warm
@@ -341,30 +342,43 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
         {
             already_cached += 1;
             timings::record_cached(&name);
-            module_index.get_cached(&name)
+            // The relation, not the winner — the descent below must see
+            // every provider's re-export edges.
+            let cands = {
+                use crate::model::file_analysis::CrossFileLookup;
+                module_index.def_candidates(&name)
+            };
+            (!cands.is_empty()).then_some(cands)
         } else {
             if stale_set.contains(&name) {
                 parse_memo.remove(&name);
             }
             module_resolver::resolve_and_parse_with_memo(&inc_paths, &name, &mut parser, &mut parse_memo)
-                .map(|cached| {
+                .map(|providers| {
                     if let Some(ref conn) = db {
-                        module_cache::save_to_db(
-                            conn,
-                            &name,
-                            &Some(std::sync::Arc::clone(&cached)),
-                            module_cache::NAME_KEYED_SOURCE,
-                        );
+                        // One row per provider — the name maps to a set.
+                        for m in &providers {
+                            module_cache::save_to_db(
+                                conn,
+                                &name,
+                                &Some(std::sync::Arc::clone(m)),
+                                module_cache::NAME_KEYED_SOURCE,
+                            );
+                        }
                     }
-                    module_index.insert_cache(&name, Some(std::sync::Arc::clone(&cached)));
+                    module_index.insert_cache_providers(&name, Some(providers.clone()));
                     resolved += 1;
-                    cached
+                    providers
                 })
         };
-        if let Some(cached) = cached_arc {
-            for re in &cached.analysis.reexport_modules {
-                if queued.insert(re.clone()) {
-                    queue.push_back(re.clone());
+        if let Some(providers) = cached_arc {
+            // Every provider's re-export edges: a shadowed twin can name a
+            // producer the winner never mentions.
+            for cached in &providers {
+                for re in &cached.analysis.reexport_modules {
+                    if queued.insert(re.clone()) {
+                        queue.push_back(re.clone());
+                    }
                 }
             }
         }

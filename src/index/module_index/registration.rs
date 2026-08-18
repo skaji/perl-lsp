@@ -29,7 +29,7 @@ impl ModuleIndex {
         // every by-name candidate reader.
         if let Some(rec) = self.registered_names.get(&path) {
             for (n, _) in rec.iter() {
-                if let Some(mut v) = self.all_defs.get_mut(n) {
+                if let Some(mut v) = self.core.all_defs.get_mut(n) {
                     if let Some(i) = v.iter().position(|c| c.path == path) {
                         v[i] = cm.clone();
                     }
@@ -44,7 +44,14 @@ impl ModuleIndex {
     /// with the resolver thread. CLI/test copies stay whole (`persisted:
     /// false` — nothing was written here, so the strip has no license).
     pub fn insert_cache(&self, module_name: &str, cached: Option<Arc<CachedModule>>) {
-        self.core.insert_resolved(module_name, cached, false, false);
+        self.insert_cache_providers(module_name, cached.map(|c| vec![c]));
+    }
+
+    /// `insert_cache` for a name's WHOLE provider set (`@INC` order). The
+    /// single-copy front door above is this one with a one-element set —
+    /// there is no separate one-provider path.
+    pub fn insert_cache_providers(&self, module_name: &str, providers: Option<Providers>) {
+        self.core.insert_resolved(module_name, providers, false, false);
     }
 
     /// The workspace-registration reads that need the FULL analysis:
@@ -116,15 +123,15 @@ impl ModuleIndex {
         for (n, _) in prev.into_iter().flatten() {
             if !affected.contains(&n) {
                 // Declared before, dropped now: the rebuild below sheds it.
-                if let Some(mut v) = self.all_defs.get_mut(&n) {
+                if let Some(mut v) = self.core.all_defs.get_mut(&n) {
                     v.retain(|c| c.path != cached.path);
                 }
-                self.all_defs.remove_if(&n, |_, v| v.is_empty());
+                self.core.all_defs.remove_if(&n, |_, v| v.is_empty());
                 affected.push(n);
             }
         }
         for (name, _) in &names {
-            let mut v = self.all_defs.entry(name.clone()).or_default();
+            let mut v = self.core.all_defs.entry(name.clone()).or_default();
             match v.iter().position(|c| c.path == cached.path) {
                 Some(i) => v[i] = cached.clone(),
                 None => v.push(cached.clone()),
@@ -148,6 +155,7 @@ impl ModuleIndex {
         // mint — the enrichment epoch must move too.
         self.core.note_shape_change();
         let cands: Vec<Arc<CachedModule>> = self
+            .core
             .all_defs
             .get(name)
             .map(|v| v.clone())
@@ -165,7 +173,20 @@ impl ModuleIndex {
             return;
         }
         self.workspace_modules.insert(name.to_string(), ());
-        let refs: Vec<&Arc<CachedModule>> = cands.iter().collect();
+        // The relation is shared with the @INC tier, but the winner is not:
+        // project code shadows an installed copy of the same name, and
+        // `best_candidate`'s path tie-break has no opinion about which tier
+        // a file came from. `registered_names` holds exactly the paths a
+        // workspace/pack front door registered, so it IS the tier test —
+        // no second marker to keep in sync.
+        let refs: Vec<&Arc<CachedModule>> = cands
+            .iter()
+            .filter(|c| self.registered_names.contains_key(&c.path))
+            .collect();
+        if refs.is_empty() {
+            // Only @INC providers left: leave their slot alone.
+            return;
+        }
         if let Some(best) =
             best_candidate(&refs, name, &|m, n| self.module_defines_class(m, n))
         {
@@ -707,10 +728,10 @@ impl ModuleIndex {
         self.core.edges.remove_path_record(&canon);
         if let Some((_, names)) = self.registered_names.remove(&canon) {
             for (name, _) in &names {
-                if let Some(mut v) = self.all_defs.get_mut(name) {
+                if let Some(mut v) = self.core.all_defs.get_mut(name) {
                     v.retain(|c| c.path != canon);
                 }
-                self.all_defs.remove_if(name, |_, v| v.is_empty());
+                self.core.all_defs.remove_if(name, |_, v| v.is_empty());
                 // Survivors keep their edges and re-pick the winner; the
                 // last candidate's departure empties the slot.
                 self.rebuild_name_registration(name);
@@ -1161,7 +1182,7 @@ impl ModuleIndex {
             // REPLACES its own candidate so the scoped lookup never serves a
             // stale analysis, and duplicate paths never stack.
             {
-                let mut v = self.all_defs.entry(sym_name.clone()).or_default();
+                let mut v = self.core.all_defs.entry(sym_name.clone()).or_default();
                 match v.iter().position(|c| c.path == cached.path) {
                     Some(i) => v[i] = cached.clone(),
                     None => v.push(cached.clone()),
@@ -1264,11 +1285,12 @@ impl ModuleIndex {
             .map(|(_, v)| v)
             .unwrap_or_default();
         for (name, _) in &names {
-            if let Some(mut v) = self.all_defs.get_mut(name) {
+            if let Some(mut v) = self.core.all_defs.get_mut(name) {
                 v.retain(|c| c.path != canon);
             }
-            self.all_defs.remove_if(name, |_, v| v.is_empty());
+            self.core.all_defs.remove_if(name, |_, v| v.is_empty());
             let survivor = self
+                .core
                 .all_defs
                 .get(name)
                 .and_then(|v| best_candidate(&v.iter().collect::<Vec<_>>(), name, &|m, n| {
@@ -1291,7 +1313,7 @@ impl ModuleIndex {
                     }
                 }
             }
-            if !self.all_defs.contains_key(name) {
+            if !self.core.all_defs.contains_key(name) {
                 self.workspace_modules.remove(name);
             }
         }
@@ -1350,7 +1372,7 @@ impl ModuleIndex {
         // edges live only through the candidate table — re-feed every
         // candidate (idempotent) so a rebuild never blinds
         // `modules_with_symbol` to a reopened package's other files.
-        for entry in self.all_defs.iter() {
+        for entry in self.core.all_defs.iter() {
             for c in entry.value().iter() {
                 self.core.edges.feed(entry.key(), &c.path, &c.analysis);
             }

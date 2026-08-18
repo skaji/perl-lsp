@@ -1,4 +1,4 @@
-//! SQLite persistence for the module cache (schema v9).
+//! SQLite persistence for the module cache (schema v10).
 //!
 //! Stores a full `Option<FileAnalysis>` per module, serialized via bincode
 //! and compressed with zstd. Validates entries against mtime + file size to
