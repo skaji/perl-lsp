@@ -16,7 +16,7 @@ pub const EXTRACT_VERSION: i64 = 183;
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
 /// the derived `refs`/`files`/`strings` tables — the blobs stay valid and the
 /// next warm re-shreds rows from the already-decoded analyses for free.
-pub(super) const REF_ROWS_VERSION: &str = "5";
+pub(super) const REF_ROWS_VERSION: &str = "6";
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -49,20 +49,10 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             s      TEXT NOT NULL UNIQUE
         );
         CREATE TABLE IF NOT EXISTS refs (
-            file_id   INTEGER NOT NULL,
-            name_id   INTEGER NOT NULL,
-            kind      INTEGER NOT NULL,
-            start_row INTEGER NOT NULL,
-            start_col INTEGER NOT NULL,
-            end_row   INTEGER NOT NULL,
-            end_col   INTEGER NOT NULL,
-            access    INTEGER NOT NULL,
-            flags     INTEGER NOT NULL,
-            qual_kind INTEGER NOT NULL,
-            qual_id   INTEGER,
-            arg_count INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name_id);
+            name_id INTEGER NOT NULL,
+            file_id INTEGER NOT NULL,
+            PRIMARY KEY (name_id, file_id)
+        ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
         CREATE TABLE IF NOT EXISTS syms (
             file_id      INTEGER NOT NULL,
@@ -101,9 +91,15 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let shape_ok = conn
         .prepare("SELECT source FROM files LIMIT 1")
         .map(|_| ())
-        .and_then(|_| conn.prepare("SELECT qual_kind FROM refs LIMIT 1").map(|_| ()))
+        .and_then(|_| conn.prepare("SELECT name_id, file_id FROM refs LIMIT 1").map(|_| ()))
         .and_then(|_| conn.prepare("SELECT flags FROM syms LIMIT 1").map(|_| ()))
-        .is_ok();
+        .is_ok()
+        // The columns the current format DROPPED must be gone. Probing only
+        // for what the new shape HAS would pass on the old twelve-column
+        // table (it has those two as well), so a lying stamp would keep a
+        // pre-dedup table alive and every shred would fail on the columns
+        // it no longer writes.
+        && conn.prepare("SELECT qual_kind FROM refs LIMIT 1").is_err();
     if rows_version.as_deref() != Some(REF_ROWS_VERSION) || !shape_ok {
         // DROP, not DELETE: a format change may alter the table SHAPE, and
         // `CREATE TABLE IF NOT EXISTS` above no-ops on the old shape — a
@@ -125,20 +121,10 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                 s      TEXT NOT NULL UNIQUE
              );
              CREATE TABLE refs (
-                file_id   INTEGER NOT NULL,
-                name_id   INTEGER NOT NULL,
-                kind      INTEGER NOT NULL,
-                start_row INTEGER NOT NULL,
-                start_col INTEGER NOT NULL,
-                end_row   INTEGER NOT NULL,
-                end_col   INTEGER NOT NULL,
-                access    INTEGER NOT NULL,
-                flags     INTEGER NOT NULL,
-                qual_kind INTEGER NOT NULL,
-                qual_id   INTEGER,
-                arg_count INTEGER
-             );
-             CREATE INDEX idx_refs_name ON refs(name_id);
+                name_id INTEGER NOT NULL,
+                file_id INTEGER NOT NULL,
+                PRIMARY KEY (name_id, file_id)
+             ) WITHOUT ROWID;
              CREATE INDEX idx_refs_file ON refs(file_id);
              CREATE TABLE syms (
                 file_id      INTEGER NOT NULL,
@@ -158,6 +144,9 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('ref_rows_version', ?1)",
             params![REF_ROWS_VERSION],
         )?;
+        // The rebuild above DROPPED `strings`; every id a live writer memoized
+        // for the previous generation is now dangling.
+        bump_strings_generation(conn)?;
     }
     // Pre-existing tables (same schema version) predate `deps_stamp`; add it
     // in place rather than bumping SCHEMA_VERSION (a bump drops every row —
@@ -224,7 +213,34 @@ pub fn clear_derived_rows(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "DELETE FROM refs; DELETE FROM syms; DELETE FROM files; DELETE FROM strings; \
          DELETE FROM stubs;",
+    )?;
+    bump_strings_generation(conn)
+}
+
+/// Invalidate every cached `str_id`. The shredder memoizes interned strings
+/// for the writer's lifetime — without this, a wipe would leave those ids
+/// pointing at rows that no longer exist and the refs rows written after it
+/// would carry dangling `name_id`s: retrieval silently dead, nothing failing
+/// loudly. Every path that empties `strings` bumps this.
+pub fn bump_strings_generation(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('strings_generation', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(meta.value AS INTEGER) + 1 AS TEXT)",
+        [],
     )
+    .map(|_| ())
+}
+
+/// The current `strings` generation. `0` when unstamped (a fresh DB) — the
+/// memo keys on it, so an unstamped and a stamped-1 database never share
+/// cached ids.
+pub fn strings_generation(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'strings_generation'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
 }
 
 pub fn compute_inc_hash(inc_paths: &[PathBuf]) -> String {
