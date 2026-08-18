@@ -452,6 +452,50 @@ fn inferred_type_has_no_production_caller() {
     );
 }
 
+/// Slot detection asks the DRIVER which detector serves a language
+/// (`DriverCaps::cursor_context`), never the language's name. A name compare
+/// is a partial enumeration: it serves the languages someone remembered to
+/// list, and a second tree-native driver would be routed to the sentinel path
+/// while its cap says otherwise — silently, because both arms return a
+/// well-formed `DetectedSlot`. The cap is the value-borne property, so the
+/// consumer asks it and the driver answers. This is the source half of the
+/// pin; the behavioural half is `cursor_slot_tests`, whose Perl slots
+/// (`Slot::ModulePath` on `use Foo::`) only the tree-native arm produces, so
+/// flipping the cap off fails there.
+#[test]
+fn slot_detection_dispatches_on_driver_caps_not_language_names() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/lsp/cursor_slot.rs");
+    let text = fs::read_to_string(&path).unwrap();
+    // Every id the registry can hand this file, whatever features are on.
+    let ids = crate::build::language_driver::LanguageRegistry::with_enabled()
+        .ids()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut violations = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.starts_with("//") || t.starts_with("///") {
+            continue;
+        }
+        for id in &ids {
+            let quoted = format!("\"{}\"", id);
+            if line.contains(&format!("== {}", quoted))
+                || line.contains(&format!("{} ==", quoted))
+                || line.contains(&format!("matches!(language, {}", quoted))
+            {
+                violations.push(format!("{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "cursor_slot.rs compares a language id to a literal — ask the driver's \
+         caps instead (DriverCaps::cursor_context selects the tree-native arm):\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// D4: the blocking decision rides the query API, not per-handler memory.
 /// Handlers reach set construction, the relational row search, and the
 /// rehydration readers only through `run_query`'s `QueryCx` (minted on the

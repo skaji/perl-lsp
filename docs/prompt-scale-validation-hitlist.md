@@ -707,8 +707,21 @@ named inputs.
 - **~10 bookkeeping `get_cached` sites** left on the derived winner
   deliberately (existence checks equivalent by construction, last-resort
   fallbacks, CLI).
-- **`cursor_slot.rs:205`** — driver-owned slot detection; recorded as
-  reducible-but-deferred, not irreducible.
+- ~~**`cursor_slot.rs:205`**~~ — **CLOSED (B).** It was `language == "perl"`
+  selecting the detector. `DriverCaps::cursor_context` already existed and
+  already documented that exact split ("slots derive from the LIVE document
+  tree; off = the sentinel-reparse pack path") — the consumer simply wasn't
+  asking it. `detect_slot` now reads the cap, and the arm is named for what it
+  IS (`detect_slot_tree_native`) rather than for the one language that has the
+  cap today, so a second tree-native driver is served without being listed
+  here. Pinned by `layering_tests::slot_detection_dispatches_on_driver_caps_not_language_names`
+  (source half — base-verified: reinstating the compare fails it) plus the
+  existing `cursor_slot_tests` Perl slots (behavioural half — only the
+  tree-native arm produces `Slot::ModulePath`, so flipping the cap off fails
+  there). Remaining `== "perl"` sites are a different question and stay open:
+  `backend/indexing.rs` x2 is the perl-vs-pack INDEX FAMILY latch (Tier 4's
+  "merge the two index families"), and `module_cache/conn.rs:38` is a
+  back-compat on-disk filename, not a behaviour enumeration.
 
 # Tier 4 — structural, own arcs
 

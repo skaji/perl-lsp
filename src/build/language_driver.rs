@@ -1608,6 +1608,12 @@ impl LanguageRegistry {
         self.drivers.iter().filter(|d| d.lang_pack().is_some()).map(|d| d.as_ref())
     }
 
+    /// Every id this build can serve — the feature-dependent set, so a caller
+    /// enumerating languages never carries its own list to drift.
+    pub fn ids(&self) -> Vec<&'static str> {
+        self.drivers.iter().map(|d| d.id()).collect()
+    }
+
     /// Human-facing name for a pack language id, for startup banners and
     /// progress messages. Purely cosmetic — `for_id` still speaks the short
     /// id everywhere else. Falls back to the id itself for a language this

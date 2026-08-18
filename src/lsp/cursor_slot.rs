@@ -188,12 +188,14 @@ impl Slot {
     }
 }
 
-/// The one identity-question entry (`docs/adr/cursor-slots.md`): Perl
-/// wraps `cursor_context`'s tree-then-text detector chain; pack languages
-/// wrap `cursor_sentinel`'s member-access sentinel reparse (looking up the
-/// language's driver/parser/`LangPack` itself). Falls back to a bare
-/// `Identifier` slot when a pack language isn't registered or has no
-/// `LangPack`.
+/// The one identity-question entry (`docs/adr/cursor-slots.md`). Which
+/// detector serves a language is the DRIVER's answer, not this function's:
+/// `DriverCaps::cursor_context` means "my slots come from the live document
+/// tree via `lsp/cursor_context`", and its absence means the sentinel-reparse
+/// pack path. Asking the cap rather than comparing the id keeps a second
+/// tree-native language from having to be named here to be served. Falls back
+/// to a bare `Identifier` slot when the language isn't registered, or is a
+/// pack language with no `LangPack`.
 pub fn detect_slot(
     analysis: &FileAnalysis,
     tree: &Tree,
@@ -202,9 +204,6 @@ pub fn detect_slot(
     language: &str,
     module_index: Option<&dyn CrossFileLookup>,
 ) -> DetectedSlot {
-    if language == "perl" {
-        return detect_slot_perl(analysis, tree, source, point, module_index);
-    }
     let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
     let cursor = crate::build::cursor_sentinel::point_to_byte(source, point);
     let bare_identifier = || DetectedSlot {
@@ -214,6 +213,9 @@ pub fn detect_slot(
     let Some(driver) = reg.for_id(language) else {
         return bare_identifier();
     };
+    if driver.caps().cursor_context {
+        return detect_slot_tree_native(analysis, tree, source, point, module_index);
+    }
     let Some(lang_pack) = driver.lang_pack() else {
         return bare_identifier();
     };
@@ -260,7 +262,11 @@ pub fn detect_slot(
     bare_identifier()
 }
 
-fn detect_slot_perl(
+/// The `cursor_context` arm: slots read off the LIVE document tree, with the
+/// text-scan detector as the incomplete-source fallback. Serves any driver
+/// whose `DriverCaps::cursor_context` is set — Perl today, by cap and not by
+/// name.
+fn detect_slot_tree_native(
     analysis: &FileAnalysis,
     tree: &Tree,
     source: &str,
