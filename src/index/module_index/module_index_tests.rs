@@ -1919,3 +1919,58 @@ fn for_strip_never_yields_rows_without_bag() {
     assert_eq!(Residency::for_strip(true, false), Residency::RowsOnly);
     assert_eq!(Residency::for_strip(true, true), Residency::Skeleton);
 }
+
+/// A deleted file's loader-config shapes must go with it. `record_workspace_projections`
+/// records them keyed by the contributor's path, and `record_loader_shapes`
+/// retracts a contributor's entries only when that SAME file re-registers — so a
+/// file that is deleted rather than edited never retracts, and its shapes type
+/// `$conf` in a plugin's `register` for the rest of the session from a
+/// contributor that no longer exists.
+///
+/// (`loaded_modules` deliberately has no inverse: several files may load one
+/// module, so removing on one file's deletion would wrongly un-suppress the
+/// entrypoint lint. Its reader is biased honest-quiet, so never-remove is the
+/// safe direction there — unlike here, where the stale value is a TYPE.)
+#[test]
+fn unregistering_a_workspace_file_retracts_its_loader_shapes() {
+    let dir = std::env::temp_dir().join(format!(
+        "qx-unreg-shapes-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("App.pm");
+    std::fs::write(
+        &path,
+        "package My::App;\nuse Mojolicious::Lite;\nplugin 'CloveApp', { minion => 1 };\n1;\n",
+    )
+    .unwrap();
+    let canon = std::fs::canonicalize(&path).unwrap();
+
+    let idx = ModuleIndex::new_for_test();
+    let fa = build_fa(&std::fs::read_to_string(&path).unwrap());
+    idx.record_workspace_projections(&canon, &fa);
+    let _ = idx.register_workspace_resident(canon.clone(), Arc::new(fa));
+
+    let shapes = |idx: &ModuleIndex| {
+        let mut out: Vec<String> = Vec::new();
+        idx.for_each_loader_shape(&mut |name, _t| out.push(name.to_string()));
+        out
+    };
+    assert!(
+        shapes(&idx).iter().any(|n| n == "CloveApp"),
+        "precondition: registration records the shape; got {:?}",
+        shapes(&idx)
+    );
+
+    idx.unregister_workspace_path(&canon);
+    assert!(
+        !shapes(&idx).iter().any(|n| n == "CloveApp"),
+        "a departed contributor's loader shape survived unregistration: {:?}",
+        shapes(&idx)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

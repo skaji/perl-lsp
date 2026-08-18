@@ -761,6 +761,16 @@ impl ModuleIndex {
         });
         self.all_files.remove(&canon);
         self.core.edges.remove_path_record(&canon);
+        // The inverse of `record_workspace_projections`' shape half. Its own
+        // retraction only fires when the SAME file re-registers, so a deleted
+        // file would otherwise keep typing `$conf` in a plugin's `register`
+        // from a contributor that no longer exists. Keyed exactly as the
+        // recording side spells it.
+        self.core.purge_loader_shapes(&canon.display().to_string());
+        // `loaded_modules` deliberately has NO inverse: several files may load
+        // one module, so dropping on one file's deletion would wrongly
+        // un-suppress the entrypoint lint. Its reader is biased honest-quiet,
+        // so never-remove is the safe direction there.
         if let Some((_, names)) = self.registered_names.remove(&canon) {
             for (name, _) in &names {
                 if let Some(mut v) = self.core.all_defs.get_mut(name) {
