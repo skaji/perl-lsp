@@ -497,7 +497,11 @@ pub fn index_pack_languages(
             });
 
             drop(fresh_tx);
-            let _ = writer.join();
+            // The pack twin of the workspace tier's drain window — see
+            // `index_perl`'s use of this label for what the number means.
+            crate::util::timings::phase("index.writer_drain_after_walk", || {
+                let _ = writer.join();
+            });
         });
         if strip {
             residency_tripwire(
