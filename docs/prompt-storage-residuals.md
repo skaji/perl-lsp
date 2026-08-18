@@ -123,3 +123,26 @@ Two unverified observations from the cpp adversarial review:
   writers' panic-arm LRU-pin fix is the drift it would have prevented.
 - **Stamp-capture helper.** The stamp-before-read + re-stat-after-parse
   protocol is spelled in both fresh workers.
+
+## The reader side of the residency ladder
+
+`Residency` closed the WRITER side: the strip is one ladder, and
+`(rows evicted, bag kept)` is no longer expressible. The reader side is still
+open. `symbols_present` / `refs_present` hand back BAG-STRIPPED copies, so a
+bag-backed query on one answers `None` — not an error, not a panic, just a
+quietly missing type that reads as "no type known".
+
+Every site today is a deliberate symbols-axis read and says so in a comment.
+A comment is not a type, so `layering_tests::a_narrow_axis_view_is_never_asked_a_bag_question`
+scans for the shape instead: a narrow view chained straight into a bag-backed
+accessor, or bound and asked one later in the same scope. It is a heuristic —
+scope end is approximated by dedent, because a brace matcher that desyncs on a
+single string literal swallows the rest of the file and reports nonsense, and a
+tripwire that cries wolf gets deleted. False negatives are acceptable; false
+positives are not.
+
+The real fix is the reader-side axis-typed view, still deferred for the reason
+recorded in `docs/review-narrow-seams.md`: consumers read `.symbols`,
+`.plugin.namespaces`, `.provisional_dispatches` as public FIELDS, so a wrapper
+would have to re-export the struct's whole shape across ~106 sites — it drags
+the residency model behind it rather than hiding it.

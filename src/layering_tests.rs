@@ -452,6 +452,104 @@ fn inferred_type_has_no_production_caller() {
     );
 }
 
+/// A narrow-axis view is BAG-STRIPPED. `symbols_present` / `refs_present`
+/// hand back a copy whose witness bag may be gone, so a bag-backed query on
+/// one answers `None` — not an error, not a panic, just a quietly missing
+/// type. Every site today is a deliberate symbols-axis read and says so in a
+/// comment, but a comment is not a type: this scans for the shape instead.
+///
+/// The residency ADR's reader-side typed view would make this unwritable;
+/// until then this is the tripwire. Bind a narrow view, call a bag-backed
+/// accessor on it, and the test names the line and tells you to take
+/// `bag_present` (or `whole_present`) instead.
+#[test]
+fn a_narrow_axis_view_is_never_asked_a_bag_question() {
+    // Accessors that consult the witness bag. `return_type` covers the
+    // `SubInfo` projection, whose answer is a bag query one hop away.
+    const BAG_BACKED: &[&str] = &[
+        "inferred_type_via_bag",
+        "inferred_type_via_bag_ctx",
+        "sub_return_type_at_arity",
+        "find_method_return_type",
+        "method_call_return_type_via_bag",
+        "expr_type_at_span",
+        "mutated_keys_on_class",
+        "applicable_dispatches",
+        "witness_bag",
+        "return_type(",
+    ];
+    const NARROW: &[&str] = &["symbols_present", "refs_present"];
+    let mut violations = Vec::new();
+    for (path, _layer, _stem) in source_files() {
+        if path.to_string_lossy().contains("layering_tests") {
+            continue;
+        }
+        // `source_files()` hands back the file STEM, not its contents — read
+        // the text here, or this scans a one-word string and passes vacuously.
+        let text = fs::read_to_string(&path).expect("read source");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(reader) = NARROW.iter().find(|r| line.contains(**r)) else {
+                continue;
+            };
+            let t = line.trim_start();
+            if t.starts_with("//") || t.starts_with("///") {
+                continue;
+            }
+            // Chained directly off the reader: `.symbols_present(x).return_type()`.
+            if let Some(rest) = line.split_once(*reader).map(|(_, r)| r) {
+                if let Some(acc) = BAG_BACKED.iter().find(|a| rest.contains(**a)) {
+                    violations.push(format!(
+                        "{}:{}: `{}` chained onto `{}` — the view is bag-stripped",
+                        path.display(),
+                        i + 1,
+                        acc,
+                        reader
+                    ));
+                }
+            }
+            // Bound to a name, then asked later in the same scope. Scope end is
+            // approximated by DEDENT rather than brace matching: a brace matcher
+            // that desyncs on one string literal swallows the rest of the file
+            // and reports nonsense, and a tripwire that cries wolf gets deleted.
+            let Some(name) = line
+                .split_once(" = ")
+                .and_then(|(lhs, _)| lhs.rsplit(|c: char| !(c.is_alphanumeric() || c == '_')).next())
+                .filter(|n| !n.is_empty())
+            else {
+                continue;
+            };
+            let indent = line.len() - line.trim_start().len();
+            for probe in lines.iter().skip(i + 1) {
+                let p = probe.trim_start();
+                if p.is_empty() || p.starts_with("//") {
+                    continue;
+                }
+                if probe.len() - p.len() < indent {
+                    break; // left the binding's scope
+                }
+                if let Some(rest) = probe.split_once(&format!("{}.", name)).map(|(_, r)| r) {
+                    if let Some(acc) = BAG_BACKED.iter().find(|a| rest.starts_with(**a)) {
+                        violations.push(format!(
+                            "{}: `{}.{}` — `{}` is bag-stripped; take `bag_present` \
+                             (or `whole_present`) if the bag is really needed",
+                            path.display(),
+                            name,
+                            acc,
+                            reader
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "bag-backed query on a narrow-axis view — it answers None instead of failing:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
 /// Slot detection asks the DRIVER which detector serves a language
 /// (`DriverCaps::cursor_context`), never the language's name. A name compare
 /// is a partial enumeration: it serves the languages someone remembered to
