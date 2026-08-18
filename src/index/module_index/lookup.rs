@@ -343,7 +343,7 @@ impl CrossFileLookup for ModuleIndex {
     }
 
     fn def_candidates(&self, name: &str) -> Vec<Arc<CachedModule>> {
-        match self.all_defs.get(name) {
+        match self.core.all_defs.get(name) {
             Some(cands) if !cands.is_empty() => {
                 // Path-ordered HERE, the one speller of candidate order —
                 // `all_defs` vecs are insertion-ordered (parallel indexing),

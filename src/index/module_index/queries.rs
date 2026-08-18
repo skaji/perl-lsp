@@ -11,7 +11,6 @@ impl ModuleIndex {
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
             open_doc_paths: Arc::new(DashMap::new()),
-            all_defs: Arc::new(DashMap::new()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),
@@ -142,7 +141,7 @@ impl ModuleIndex {
         visible: &std::collections::HashSet<String>,
     ) -> Option<Arc<CachedModule>> {
         if !visible.is_empty() {
-            if let Some(cands) = self.all_defs.get(module_name) {
+            if let Some(cands) = self.core.all_defs.get(module_name) {
                 let reachable: Vec<&Arc<CachedModule>> = cands
                     .iter()
                     .filter(|c| visible.contains(&c.path.to_string_lossy().into_owned()))
@@ -172,7 +171,7 @@ impl ModuleIndex {
             return Vec::new();
         }
         let mut out: Vec<(String, Arc<CachedModule>)> = Vec::new();
-        for entry in self.all_defs.iter() {
+        for entry in self.core.all_defs.iter() {
             if !entry.key().starts_with(prefix) {
                 continue;
             }
@@ -434,6 +433,12 @@ impl ModuleIndex {
     /// Direct access to the raw cache DashMap (for CLI warm_cache integration).
     pub fn cache_raw(&self) -> &DashMap<String, Option<Arc<CachedModule>>> {
         &self.core.cache
+    }
+
+    /// The candidate relation behind the name-slot winner — the warm lane
+    /// fills it alongside `cache_raw` so a warm start keeps every provider.
+    pub fn all_defs_raw(&self) -> &DashMap<String, Vec<Arc<CachedModule>>> {
+        &self.core.all_defs
     }
 
     /// Insert a module directly into the cache (for CLI and testing).

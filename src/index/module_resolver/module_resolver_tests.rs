@@ -80,7 +80,7 @@ sub new {
     let cached = Arc::new(CachedModule::new(PathBuf::from("/x/Demo/Has/Event.pm"), analysis));
 
     // Workspace-index style insert: a resolved module.
-    core.insert_resolved("Demo::Has::Event", Some(cached), false, false);
+    core.insert_resolved("Demo::Has::Event", Some(vec![cached]), false, false);
     assert!(core.cache.get("Demo::Has::Event").as_deref().unwrap().is_some());
 
     // On-demand resolver miss: `None`. Must NOT clobber the indexed copy.
@@ -95,7 +95,7 @@ sub new {
     let tree2 = parser.parse(source, None).unwrap();
     let analysis2 = std::sync::Arc::new(crate::build::builder::build(&tree2, source.as_bytes()));
     let cached2 = Arc::new(CachedModule::new(PathBuf::from("/y/Demo/Has/Event.pm"), analysis2));
-    core.insert_resolved("Demo::Has::Event", Some(cached2), false, false);
+    core.insert_resolved("Demo::Has::Event", Some(vec![cached2]), false, false);
     assert_eq!(
         core.cache.get("Demo::Has::Event").as_deref().unwrap().as_ref().unwrap().path,
         PathBuf::from("/y/Demo/Has/Event.pm"),
@@ -239,3 +239,134 @@ fn import_tier_strip_gates_on_persistence() {
     assert!(strip_import_copy(&None, true, true).is_none());
 }
 
+
+// ---- The @INC tier's candidate relation ----
+//
+// A module name maps to a SET of files, not to one file — XS/PP twins, a
+// project `lib/` shadowing an installed copy, `t/lib` vs `lib` per
+// entrypoint. `gold-corpus/KNOWN-GAPS.md`, "the @INC tier is still
+// single-provider".
+
+/// Two `@INC` roots, each providing `Twin`, with a sub only ONE of them
+/// defines. Returns (root_a, root_b).
+fn twin_roots(tag: &str) -> (PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!("perl-lsp-twin-{}-{}", tag, std::process::id()));
+    let (a, b) = (base.join("a"), base.join("b"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(
+        a.join("Twin.pm"),
+        "package Twin;\nsub only_in_a { 1 }\nsub shared { 1 }\n1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        b.join("Twin.pm"),
+        "package Twin;\nsub only_in_b { 1 }\nsub shared { 1 }\n1;\n",
+    )
+    .unwrap();
+    (a, b)
+}
+
+#[test]
+fn inc_resolution_enumerates_every_providing_root_in_inc_order() {
+    let (a, b) = twin_roots("paths");
+    let found = resolve_module_paths(&[a.clone(), b.clone()], "Twin");
+    assert_eq!(
+        found,
+        vec![a.join("Twin.pm"), b.join("Twin.pm")],
+        "both roots provide Twin; the relation must hold both, @INC order first",
+    );
+    // The winner is still exactly what `require` would load.
+    assert_eq!(
+        resolve_module_path(&[a.clone(), b.clone()], "Twin"),
+        Some(a.join("Twin.pm")),
+    );
+    // Reversing @INC reverses the winner, not the membership.
+    assert_eq!(
+        resolve_module_path(&[b.clone(), a.clone()], "Twin"),
+        Some(b.join("Twin.pm")),
+    );
+}
+
+#[test]
+fn a_name_keeps_every_provider_not_just_the_last_inserted() {
+    // Base behavior (single-provider tier): the second insert REPLACED the
+    // first in the one name-keyed slot and `def_candidates` fell back to
+    // that winner — one candidate, and the other provider's subs were
+    // unreachable. Both providers must survive as candidates.
+    use crate::model::file_analysis::CrossFileLookup;
+    let (a, b) = twin_roots("relation");
+    let mut parser = create_parser();
+    let mut memo: ParseMemo = HashMap::new();
+    let providers =
+        resolve_and_parse_with_memo(&[a.clone(), b.clone()], "Twin", &mut parser, &mut memo)
+            .expect("Twin resolves");
+    assert_eq!(providers.len(), 2, "both providers parse");
+
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    // One insert per provider — the single-copy front door, called twice,
+    // is exactly the shape that used to lose the first provider.
+    for m in &providers {
+        idx.insert_cache("Twin", Some(Arc::clone(m)));
+    }
+
+    let cands = idx.def_candidates("Twin");
+    assert_eq!(
+        cands.len(),
+        2,
+        "the relation dropped a provider: {:?}",
+        cands.iter().map(|c| c.path.clone()).collect::<Vec<_>>(),
+    );
+
+    // The payoff: a sub that lives ONLY in the shadowed provider still
+    // resolves to the file that defines it.
+    let owner = idx
+        .candidate_defining_sub("Twin", "only_in_b")
+        .expect("only_in_b is defined by the shadowed provider");
+    assert_eq!(owner.path, b.join("Twin.pm"));
+    let owner_a = idx
+        .candidate_defining_sub("Twin", "only_in_a")
+        .expect("only_in_a is defined by the winning provider");
+    assert_eq!(owner_a.path, a.join("Twin.pm"));
+}
+
+#[test]
+fn a_workspace_file_still_shadows_an_inc_provider_of_the_same_name() {
+    // The two tiers now SHARE `all_defs`, so the winner pick must stay
+    // tier-aware: project code shadows an installed copy, and the path
+    // tie-break has no opinion about which tier a candidate came from.
+    use crate::model::file_analysis::CrossFileLookup;
+    let base = std::env::temp_dir().join(format!("perl-lsp-shadow-{}", std::process::id()));
+    let (inc, ws) = (base.join("inc"), base.join("ws"));
+    std::fs::create_dir_all(&inc).unwrap();
+    std::fs::create_dir_all(&ws).unwrap();
+    // The @INC path sorts BEFORE the workspace path, so a tier-blind
+    // smallest-path tie-break would hand it the slot.
+    let inc_pm = inc.join("Shadowed.pm");
+    let ws_pm = ws.join("Shadowed.pm");
+    assert!(inc_pm < ws_pm, "fixture needs the @INC path to sort first");
+    let inc_src = "package Shadowed;\nsub from_inc { 1 }\n1;\n";
+    let ws_src = "package Shadowed;\nsub from_workspace { 1 }\n1;\n";
+    std::fs::write(&inc_pm, inc_src).unwrap();
+    std::fs::write(&ws_pm, ws_src).unwrap();
+
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let mut parser = create_parser();
+    let mut build = |src: &str| {
+        let tree = parser.parse(src, None).unwrap();
+        Arc::new(crate::build::builder::build(&tree, src.as_bytes()))
+    };
+    let inc_fa = build(inc_src);
+    let ws_fa = build(ws_src);
+
+    idx.insert_cache("Shadowed", Some(Arc::new(CachedModule::new(inc_pm.clone(), inc_fa))));
+    idx.register_workspace_module(ws_pm.clone(), ws_fa);
+
+    assert_eq!(
+        idx.get_cached("Shadowed").map(|c| c.path.clone()),
+        Some(std::fs::canonicalize(&ws_pm).unwrap_or(ws_pm.clone())),
+        "the workspace file must hold the name slot",
+    );
+    // Both remain candidates — shadowing decides the winner, not membership.
+    assert_eq!(idx.def_candidates("Shadowed").len(), 2);
+}

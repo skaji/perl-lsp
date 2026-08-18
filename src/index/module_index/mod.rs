@@ -145,6 +145,14 @@ mod lookup;
 mod queries;
 mod registration;
 
+/// Every file that provides one module name, in provider order. `[0]` is
+/// the winner — what `require` would load for an `@INC` set, the derived
+/// name-slot pick for a warm or workspace set — and the rest are the
+/// shadowed providers the candidate relation keeps, so a name maps to its
+/// SET of files rather than to whichever copy was parsed first.
+/// Never empty when present.
+pub type Providers = Vec<Arc<CachedModule>>;
+
 pub struct ModuleIndex {
     /// The shared organs (`IndexCore`): cache, edge indexes, resolve
     /// queue/notify, generation counters, loader shapes, bag-cache cell.
@@ -175,13 +183,6 @@ pub struct ModuleIndex {
     /// recorder yet, so guarding their background writes would freeze
     /// records staleward.
     open_doc_paths: Arc<DashMap<std::path::PathBuf, ()>>,
-    /// ALL cross-file candidates per name (not just the single winner in
-    /// `cache`) — pack languages only. C linkage is globally flat, so two
-    /// unrelated files can each define `class Box`; `cache` picks one
-    /// deterministic winner, but a query from file F wants the candidate F can
-    /// actually SEE (its `#include` closure). `get_cached_scoped` ranks these by
-    /// reachability. `docs/adr/macro-handling.md`, "the include-closure lie".
-    all_defs: Arc<DashMap<String, Vec<Arc<CachedModule>>>>,
     /// Every pack file registered, keyed by canonical path — including files
     /// that declare NOTHING registrable (a header-only `#include` shim). The
     /// name-keyed views can't reach those, but whole-project sweeps

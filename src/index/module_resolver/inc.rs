@@ -9,7 +9,7 @@ use super::*;
 /// top-level calls within a single resolver sweep so that parent-fallback
 /// recursion (e.g. 50 children all inheriting from `Exporter`) parses each
 /// parent exactly once.
-pub type ParseMemo = HashMap<String, Option<Arc<CachedModule>>>;
+pub type ParseMemo = HashMap<String, Option<Providers>>;
 
 /// Parse a module file directly in-process.
 /// tree-sitter-perl is stable — no subprocess isolation needed.
@@ -18,21 +18,41 @@ pub(super) fn parse_module(
     module_name: &str,
     parser: &mut Parser,
     memo: &mut ParseMemo,
-) -> Option<Arc<CachedModule>> {
+) -> Option<Providers> {
     resolve_and_parse_with_memo(inc_paths, module_name, parser, memo)
 }
 
 // ---- Resolution ----
 
-pub fn resolve_module_path(inc_paths: &[PathBuf], module_name: &str) -> Option<PathBuf> {
+/// EVERY `@INC` root that provides `module_name`, in `@INC` order — the
+/// `(name, inc-root)` relation's acquisition half. A name maps to a SET of
+/// files (XS/PP twins, a project `lib/` shadowing an installed copy,
+/// `t/lib` vs `lib` per entrypoint); stopping at the first hit is what made
+/// the tier answer from whichever root happened to win.
+pub fn resolve_module_paths(inc_paths: &[PathBuf], module_name: &str) -> Vec<PathBuf> {
     let rel_path = module_name.replace("::", "/") + ".pm";
+    let mut out: Vec<PathBuf> = Vec::new();
     for inc in inc_paths {
         let full = inc.join(&rel_path);
         if full.is_file() {
-            return Some(full);
+            // Distinct roots can name the same file (a symlinked `lib`, a
+            // duplicated @INC entry); the relation holds FILES, so dedup
+            // on the canonical path rather than trusting root identity.
+            let key = std::fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
+            if !out.iter().any(|p| {
+                std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == key
+            }) {
+                out.push(full);
+            }
         }
     }
-    None
+    out
+}
+
+/// The `@INC`-order winner among `resolve_module_paths` — what a `require`
+/// would load. The relation's other providers stay reachable as candidates.
+pub fn resolve_module_path(inc_paths: &[PathBuf], module_name: &str) -> Option<PathBuf> {
+    resolve_module_paths(inc_paths, module_name).into_iter().next()
 }
 
 #[allow(dead_code)]
@@ -41,6 +61,17 @@ pub fn resolve_and_parse(
     module_name: &str,
     parser: &mut Parser,
 ) -> Option<Arc<CachedModule>> {
+    resolve_and_parse_all(inc_paths, module_name, parser)
+        .and_then(|p| p.into_iter().next())
+}
+
+/// `resolve_and_parse` keeping the whole provider set.
+#[allow(dead_code)]
+pub fn resolve_and_parse_all(
+    inc_paths: &[PathBuf],
+    module_name: &str,
+    parser: &mut Parser,
+) -> Option<Providers> {
     let mut memo: ParseMemo = HashMap::new();
     resolve_and_parse_with_memo(inc_paths, module_name, parser, &mut memo)
 }
@@ -54,7 +85,7 @@ pub fn resolve_and_parse_with_memo(
     module_name: &str,
     parser: &mut Parser,
     memo: &mut ParseMemo,
-) -> Option<Arc<CachedModule>> {
+) -> Option<Providers> {
     let mut visiting: std::collections::HashSet<String> = std::collections::HashSet::new();
     resolve_and_parse_inner(inc_paths, module_name, parser, &mut visiting, memo)
 }
@@ -65,7 +96,7 @@ fn resolve_and_parse_inner(
     parser: &mut Parser,
     visiting: &mut std::collections::HashSet<String>,
     memo: &mut ParseMemo,
-) -> Option<Arc<CachedModule>> {
+) -> Option<Providers> {
     if let Some(cached) = memo.get(module_name) {
         return cached.clone();
     }
@@ -74,10 +105,37 @@ fn resolve_and_parse_inner(
         return None;
     }
 
+    // Every provider is parsed, not just the @INC winner: a shadowed twin
+    // carries its own subs and `@ISA`, and the candidate relation is only
+    // as honest as its acquisition.
+    let mut providers: Providers = Vec::new();
+    for path in resolve_module_paths(inc_paths, module_name) {
+        if let Some(cached) =
+            parse_one_provider(inc_paths, module_name, path, parser, visiting, memo)
+        {
+            providers.push(cached);
+        }
+    }
+    if providers.is_empty() {
+        return None;
+    }
+    memo.insert(module_name.to_string(), Some(providers.clone()));
+    Some(providers)
+}
+
+/// Read + parse ONE provider file into a `CachedModule`. Every provider runs
+/// this same body — the @INC winner has no privileged path (rule #10).
+fn parse_one_provider(
+    inc_paths: &[PathBuf],
+    module_name: &str,
+    path: PathBuf,
+    parser: &mut Parser,
+    visiting: &mut std::collections::HashSet<String>,
+    memo: &mut ParseMemo,
+) -> Option<Arc<CachedModule>> {
     let bench = std::env::var_os("PERL_LSP_BENCH").is_some();
     let bench_start = if bench { Some(std::time::Instant::now()) } else { None };
 
-    let path = resolve_module_path(inc_paths, module_name)?;
     let metadata = std::fs::metadata(&path).ok()?;
     if metadata.len() > 1_000_000 {
         if let Some(start) = bench_start {
@@ -104,9 +162,10 @@ fn resolve_and_parse_inner(
     if analysis.export.is_empty() && analysis.export_ok.is_empty() {
         let parents = crate::index::module_index::primary_package_parents(&analysis, module_name);
         for parent in &parents {
-            if let Some(parent_cached) =
+            let parent_primary =
                 resolve_and_parse_inner(inc_paths, parent, parser, visiting, memo)
-            {
+                    .and_then(|p| p.into_iter().next());
+            if let Some(parent_cached) = parent_primary {
                 if !parent_cached.analysis.export.is_empty()
                     || !parent_cached.analysis.export_ok.is_empty()
                 {
@@ -123,7 +182,6 @@ fn resolve_and_parse_inner(
     if let Some(start) = bench_start {
         eprintln!("bench\t{}\t{}\t{}\t{}", module_name, start.elapsed().as_micros(), symbols, bytes);
     }
-    memo.insert(module_name.to_string(), Some(result.clone()));
     Some(result)
 }
 
@@ -183,7 +241,11 @@ fn scan_dir_recursive(base: &std::path::Path, dir: &std::path::Path, available: 
                 let module_name = rel.to_string_lossy()
                     .trim_end_matches(".pm")
                     .replace(std::path::MAIN_SEPARATOR, "::");
-                available.insert(module_name, path.clone());
+                // Roots are walked in @INC order, so the FIRST one to claim a
+                // name is the one `require` would load. Overwriting here made
+                // the availability map name the LAST root — disagreeing with
+                // `resolve_module_paths` about which file a name means.
+                available.entry(module_name).or_insert_with(|| path.clone());
             }
         }
     }

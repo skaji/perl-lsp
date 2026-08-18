@@ -49,7 +49,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
         let strip_warm = server.is_some()
             && core.long_lived.load(std::sync::atomic::Ordering::Relaxed)
             && eviction_enabled();
-        let (n, stale_names) = module_cache::warm_cache(conn, &core.cache, strip_warm);
+        let (n, stale_names) = module_cache::warm_cache(conn, &core.cache, &core.all_defs, strip_warm);
         log::info!("Warmed module cache: {} entries loaded from disk, {} stale", n, stale_names.len());
         // Stamp generations for the warm-loaded @INC providers (they
         // landed in the cache without a registration front door).
@@ -156,14 +156,17 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
             crate::util::ghost_stats::count("resolver.module_resolved");
             let result = parse_module(&inc_paths, &module_name, &mut parser, &mut parse_memo);
             match &result {
-                Some(m) => log::info!(
-                    "Resolved '{}': {} export, {} export_ok",
+                Some(providers) => log::info!(
+                    "Resolved '{}': {} provider(s), {} export, {} export_ok",
                     module_name,
-                    m.analysis.export.len(),
-                    m.analysis.export_ok.len()
+                    providers.len(),
+                    providers[0].analysis.export.len(),
+                    providers[0].analysis.export_ok.len()
                 ),
                 None => log::info!("No exports found for '{}'", module_name),
             }
+            // Persistence is per FILE: each provider gets its own row, so a
+            // shadowed twin survives the warm start too.
             let persisted = db
                 .as_ref()
                 .map(|conn| save_module_generation(conn, &module_name, &result))
@@ -208,7 +211,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
             // skipped on its next turn. Server-only: a one-shot
             // session resolves exactly what its query asks for.
             if server.is_some() {
-                if let Some(ref m) = result {
+                if let Some(ref providers) = result {
                     let mut pending = core.queue.pending.lock().unwrap();
                     let enqueue = |pending: &mut Vec<String>, name: String| {
                         if name.is_empty() { return; }
@@ -218,6 +221,10 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
                             pending.push(name);
                         }
                     };
+                    // Every provider's deps, not just the winner's: a
+                    // shadowed twin has its own `use` list and `@ISA`, and a
+                    // class only it names must still resolve.
+                    for m in providers {
                     // Explicit imports — the module's own `use` statements.
                     for imp in &m.analysis.imports {
                         enqueue(&mut pending, imp.module_name.clone());
@@ -248,6 +255,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
                         {
                             enqueue(&mut pending, c);
                         }
+                    }
                     }
                     if !pending.is_empty() {
                         core.queue.condvar.notify_one();

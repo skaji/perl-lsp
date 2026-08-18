@@ -5,7 +5,7 @@
 
 use super::*;
 
-const SCHEMA_VERSION: &str = "9";
+const SCHEMA_VERSION: &str = "10";
 
 /// Bumped when the builder's analysis output changes shape in a way that
 /// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
@@ -25,14 +25,15 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             value TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS modules (
-            module_name      TEXT PRIMARY KEY,
+            module_name      TEXT NOT NULL,
             path             TEXT NOT NULL,
             mtime_secs       INTEGER NOT NULL,
             file_size        INTEGER NOT NULL,
             source           TEXT NOT NULL DEFAULT 'import',
             analysis         BLOB,
             extract_version  INTEGER NOT NULL DEFAULT 0,
-            deps_stamp       INTEGER NOT NULL DEFAULT 0
+            deps_stamp       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (module_name, path)
         );
         CREATE TABLE IF NOT EXISTS builtins (
             name TEXT PRIMARY KEY,
@@ -80,7 +81,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             path TEXT PRIMARY KEY,
             stub BLOB NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_modules_path ON modules(path);",
+        CREATE INDEX IF NOT EXISTS idx_modules_path ON modules(path);
+        CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(module_name);",
     )?;
     // Row-format generation for the derived tables (see REF_ROWS_VERSION).
     let rows_version: Option<String> = conn
@@ -184,15 +186,18 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             clear_derived_rows(conn)?;
             conn.execute_batch(
                 "CREATE TABLE modules (
-                    module_name      TEXT PRIMARY KEY,
+                    module_name      TEXT NOT NULL,
                     path             TEXT NOT NULL,
                     mtime_secs       INTEGER NOT NULL,
                     file_size        INTEGER NOT NULL,
                     source           TEXT NOT NULL DEFAULT 'import',
                     analysis         BLOB,
                     extract_version  INTEGER NOT NULL DEFAULT 0,
-                    deps_stamp       INTEGER NOT NULL DEFAULT 0
-                );",
+                    deps_stamp       INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (module_name, path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_modules_path ON modules(path);
+                CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(module_name);",
             )?;
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",

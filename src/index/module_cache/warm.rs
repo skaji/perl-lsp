@@ -245,9 +245,16 @@ fn insert_sentinel_guarded(
     }
 }
 
+/// The name-keyed (@INC) warm lane. `cache` takes the name-slot winner and
+/// `all_defs` the whole provider relation — the table holds one row per
+/// FILE, so a name with two providers warms as two rows and the winner is
+/// DERIVED (@INC order is unavailable here, so it is the smallest path —
+/// the same order-independent tie-break the workspace tier uses; the
+/// resolver's own insert corrects it to true @INC order once it runs).
 pub fn warm_cache(
     conn: &Connection,
     cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    all_defs: &DashMap<String, Vec<Arc<CachedModule>>>,
     strip: bool,
 ) -> (usize, Vec<String>) {
     // Name-keyed warm serves the @INC tier only; 'workspace' rows are
@@ -333,10 +340,8 @@ pub fn warm_cache(
                         if strip && !fa.degraded {
                             fa.evict_axes(true, false);
                         }
-                        cache.insert(
-                            module_name,
-                            Some(Arc::new(CachedModule::new(path, Arc::new(fa)))),
-                        );
+                        let cand = Arc::new(CachedModule::new(path, Arc::new(fa)));
+                        adopt_warm_provider(cache, all_defs, &module_name, cand);
                         count += 1;
                     }
                     None => {
@@ -360,4 +365,27 @@ pub fn warm_cache(
     }
 
     (count, stale_names)
+}
+
+/// Adopt one warmed row as a provider of `module_name`: replace-by-path in
+/// the relation (a re-warm must not stack), then re-derive the name-slot
+/// winner from the SET. Row order out of SQLite is not @INC order and is
+/// not stable, so the winner cannot be "whichever row arrived last" —
+/// smallest path makes repeat warms byte-identical.
+fn adopt_warm_provider(
+    cache: &DashMap<String, Option<Arc<CachedModule>>>,
+    all_defs: &DashMap<String, Vec<Arc<CachedModule>>>,
+    module_name: &str,
+    cand: Arc<CachedModule>,
+) {
+    let mut v = all_defs.entry(module_name.to_string()).or_default();
+    match v.iter().position(|c| c.path == cand.path) {
+        Some(i) => v[i] = cand.clone(),
+        None => v.push(cand.clone()),
+    }
+    let winner = v.iter().min_by(|a, b| a.path.cmp(&b.path)).cloned();
+    drop(v);
+    if let Some(w) = winner {
+        cache.insert(module_name.to_string(), Some(w));
+    }
 }
