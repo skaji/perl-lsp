@@ -20,7 +20,7 @@ Detail for each is in its section below.
 |---|---|---|
 | 1 | Post-cold-index availability hole | **PARTIAL** — "no answers" fixed `d9053e4f`; writer-drain diagnostics blackout still open, gate split adjudicated in PR #121 |
 | 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** — depth gate `fed8ac00`, then the recursion class itself removed (PR #123): descent is queued, cap 500 → 100,000, measured |
-| 3 | `references` terminal at scale | **OPEN — root-caused.** Never returns at 1500 s. A/B proves the fan-out is INHERENT, not cache thrash: with caches effectively unlimited (100% hit) it ran 6.6x MORE consult work and still gave no answer. Fix is a missing memo, not sizing |
+| 3 | `references` terminal at scale | **RETURNS** (`32a3bf4e`) — confirmed independently on the server path at 138k: 368 / 265 / 295 s, 2.8 GB peak, answer marked incomplete. Was: never, at 7+ GB. Slow, honest, and bounded — not yet fast |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
 | 5 | Every CLI verb hangs at 122x | **CLOSED** PR #125 — **confirmed at 138k: DNF → exit 0 in 350 s** with a real answer. Finite, not fast; the residual is a new row (#6) |
 | 6 | Pack indexing dominates startup on a Perl corpus | **ROOT-CAUSED** (C) — `LanguageScope`: a verb declares the families it can consult. Synthetic Perl query −52% CPU, pack phase 936 ms → 0.11 ms; unconfirmed at 138k |
@@ -299,6 +299,47 @@ it.
 ancestry are re-derived per consult — `query_rec`'s seen-set dedups within a
 single chase only — multiplied by the 5–12 declaring files a common package
 name has at this scale.
+
+**LANDED (`32a3bf4e`), and it took four things together — no single one sufficed:**
+the cross-consult memo (breadth), a wall-clock budget placed at the **cross-file
+fallback boundary** rather than per-hop (gating hops individually let the cheap
+ones through), an enrichment depth cap (depth), and a session around
+`enrich_open` so the heal thread is bounded too.
+
+Confirmed by the coordinator on the **server** path — the CLI never reproduces
+this pathology and returns in 356 s regardless:
+
+```
+  refs-1  367,741 ms   refs-2  264,558 ms   refs-3  294,685 ms   (207 B each)
+  ready 1,059 ms   peak RSS 2,832 MB
+```
+
+`refs-1` was reported as DNF at a 300 s cap; at 420 s it returns, so that
+residual is **slow, not stuck**. The 207-byte answer is not an early bail:
+with the budget DISABLED both requests DNF at 600 s, so the bound is
+load-bearing for termination. The answer is marked incomplete via
+`window/showMessage` (WARNING, once per session, every occurrence logged) —
+`references` returns `Location[]` and the protocol has no completeness field,
+so the only honest channel is the user.
+
+**Not fixed, contained.** `PERL_LSP_ENRICH_DEPTH` defaults to 4 — deliberate,
+not a tuned value. Koha's measured enrichment-depth tail is **12**, so 4 would
+under-enrich real Moo/DBIC chains; it declines 130 builds at Koha with a
+byte-identical answer, which is evidence it is safe *there*, not generally.
+The structural fix is level-indexed enrichment (below), after which the cap
+becomes a high backstop.
+
+**The real defect, still open.** `ENRICHING` is a thread-local set of paths on
+*this thread's stack*, so whether a dep comes back tainted depends on who asked
+first — the same file's enriched form differs by traversal order. That is why
+tainted builds are (correctly) never cached, which is why raising
+`ENRICHED_CAP` from 64 to 100,000 changed nothing: the cap governs retention
+and tainted results never reach it. Fix in flight: **level-indexed enrichment**
+— `enriched_0(F) = raw(F)`, `enriched_k(F)` built from `enriched_{k-1}` views
+of deps. Context-independent by construction, so every level is cacheable
+including cyclic members; terminates without cycle detection; subsumes both the
+taint rule and the depth cap. K sized over the measured union of Koha's tail
+(12) and a deep-framework fixture.
 
 **Fix routing.** Primary: memoize MethodOnClass/ancestry **answers** across
 consults. The epoch-memo pattern is already proven in this codebase on the same
