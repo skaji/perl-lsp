@@ -20,7 +20,7 @@ Detail for each is in its section below.
 |---|---|---|
 | 1 | Post-cold-index availability hole | **PARTIAL** — "no answers" fixed `d9053e4f`; writer-drain diagnostics blackout still open, gate split adjudicated in PR #121 |
 | 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** — depth gate `fed8ac00`, then the recursion class itself removed (PR #123): descent is queued, cap 500 → 100,000, measured |
-| 3 | `references` terminal at scale | **OPEN** — cpan5k still never returns after every fix; peak RSS 7.16 → 4.55 GB across three of them. Bottleneck now measured as enrichment fan-out, not the walk (66 candidate views) |
+| 3 | `references` terminal at scale | **OPEN — root-caused.** Never returns at 1500 s. A/B proves the fan-out is INHERENT, not cache thrash: with caches effectively unlimited (100% hit) it ran 6.6x MORE consult work and still gave no answer. Fix is a missing memo, not sizing |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
 | 5 | Every CLI verb hangs at 122x | **CLOSED** PR #125 — **confirmed at 138k: DNF → exit 0 in 350 s** with a real answer. Finite, not fast; the residual is a new row (#6) |
 | 6 | Pack indexing dominates startup on a Perl corpus | **OPEN** — new; `cli::index_pack` is 188 s of a 350 s Perl query |
@@ -269,7 +269,50 @@ upgrade costs one decode and never an answer.
 root cause at Koha, but at 122x the walk is already **181 ms** (91 candidates)
 and the 120 s DNF is not the walk.
 
-**MEASURED, and my prediction was wrong: the combination does NOT close it.**
+**ROOT-CAUSED (2026-08-18).** Three things settled it, all measured.
+
+**1. The handler is WORKING, not waiting — the standing hypothesis is refuted.**
+Full-depth stacks of the live server (`eu-stack` under an `LD_PRELOAD`
+`prctl(PR_SET_PTRACER_ANY)` shim, since `gdb -p` is blocked by
+`ptrace_scope=1`) put the request's `spawn_blocking` thread at ~100% CPU for
+its whole life, rooted in `references → refs_to → collect_from_analysis →
+method_call_invocant_class → ReducerRegistry::query → query_rec` — recursion
+regularly past 600 frames — `→ enriched_present → enriched_snapshot →
+stamp_method_call_targets → resolve_method_in_ancestors → rehydrate`. The
+phase log is the clean proof: `refs.resolve` 0.02 ms, `refs.aliases` 33 ms,
+**`refs.project` never prints.** Honest caveat: the request DOES first sit
+~95–100 s in the pre-projection awaits (reproducibly, just under the 120 s
+Complete cap) while the warm stream runs, and the open-doc heal really is
+stuck in the same cascade on another thread — so the old `await_open_full`
+theory pointed at a real fire, just not the one references is standing in.
+
+**2. The A/B: the fan-out is INHERENT. Cache sizing does not fix it.**
+With `BAG_CACHE_MB=6144`, `ENRICHED_CAP=100000`, `ENRICHED_MB=2048` the hub LRU
+ran at **~100% hit — 256.3 M lookups, 343 evictions** — i.e. thrash eliminated.
+`references` **still did not return in 900 s.** It executed **10.68 M
+`consult.moc_primary` in 15 min** against 1.62 M in the 25 thrashing minutes of
+the capped run: **6.6x the consult work and still no answer.** So one query's
+demand exceeds 10.7 M consults. Cache fixes move the wall; they do not remove
+it.
+
+**3. Why: the answers are never memoized across consults.** MethodOnClass and
+ancestry are re-derived per consult — `query_rec`'s seen-set dedups within a
+single chase only — multiplied by the 5–12 declaring files a common package
+name has at this scale.
+
+**Fix routing.** Primary: memoize MethodOnClass/ancestry **answers** across
+consults. The epoch-memo pattern is already proven in this codebase on the same
+shape — 9,358 key walks against 10.2 M memo hits — so this is applying an
+existing mechanism, not inventing one. And/or a fuel budget in CandidateSet
+construction so `collect` degrades honestly instead of running forever.
+Secondary: `purge_module` targeted removal, a per-connection blob loader,
+cap sizing against a project baseline.
+
+What is NOT the cost, measured: the refs walk (86 candidate views), overlay
+rebuilds (312), enrichment-key walks (291), and post-warm-stream epoch churn.
+
+**Superseded below.** The earlier prediction, kept because being wrong in
+public is the point of this document:
 With both `b6312ea2` and `d9053e4f` in, `references` on a hot name at warm
 cpan5k **still never returns.** The probe deliberately set a 150,000 ms client
 timeout — *above* the server's own 120,000 ms cap — so a cap expiry would be
