@@ -97,6 +97,11 @@ impl<'a> CandidateSet<'a> {
     /// sites) across the visible universe. Lexical/unowned cursors answer
     /// from the origin file's in-file union.
     pub fn references(&self) -> Vec<RefLocation> {
+        // The whole projection, not just the walk: target minting resolves
+        // invocants too, and it is the same cross-file lattice. One session
+        // spans both so the memo and the consult budget cover the verb
+        // (`docs/adr/resolution-session.md`).
+        let _session = crate::model::witnesses::ResolutionSession::enter(self.module_index);
         match self.resolution() {
             Some(ResolvedTarget::Target(t)) => {
                 let mask = self.target_visibility(t);

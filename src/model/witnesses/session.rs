@@ -70,7 +70,19 @@ struct SessionState {
     /// Consult budget for the whole walk. Even memoized, some query at
     /// some scale exceeds any bound; a capped, marked-incomplete answer
     /// beats one that never returns.
+    ///
+    /// TWO units, because neither alone is sizable. A COUNT is
+    /// deterministic — the same query degrades at the same place on every
+    /// run — but cannot be sized: a consult costs microseconds on a warm
+    /// small project and ~2.5 ms at 138k files (~9 blob rehydrations
+    /// each), so any count generous enough for a healthy workspace walk
+    /// (Koha: ~5k) is already tens of seconds at scale. A DEADLINE is
+    /// scale-free and gives the verb a real latency contract, at the cost
+    /// of being load-dependent. The count is set far above anything a
+    /// real query reaches, so it is the deterministic backstop and the
+    /// clock is what actually fires.
     fuel: u64,
+    deadline: Option<std::time::Instant>,
     /// Set when `fuel` ran out — the walk's answer is an
     /// under-approximation from that point on.
     exhausted: bool,
@@ -90,6 +102,13 @@ pub struct SessionStats {
 
 thread_local! {
     static SESSION: RefCell<Option<SessionState>> = const { RefCell::new(None) };
+    /// Degradation verdict of the walk that just CLOSED on this thread.
+    /// `references` returns `Location[]` — the protocol has no
+    /// `isIncomplete` for it (that lives on `CompletionList`) — so the
+    /// verdict has to leave the walk out of band. It is published here on
+    /// the owning guard's drop and read by the handler immediately after,
+    /// on the same thread, before it can be overwritten.
+    static LAST_WALK_DEGRADED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Consult budget for one walk. Sized from measurement: a workspace-scale
@@ -101,7 +120,15 @@ fn default_fuel() -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(|v| if v == 0 { u64::MAX } else { v })
-        .unwrap_or(20_000_000)
+        .unwrap_or(5_000_000)
+}
+
+/// Wall-clock half of the budget. `0` = unbounded.
+fn default_budget_ms() -> u64 {
+    std::env::var("PERL_LSP_RESOLVE_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30_000)
 }
 
 /// RAII handle. Only the OUTERMOST guard owns the session — a nested
@@ -141,6 +168,10 @@ impl ResolutionSession {
                 memo: HashMap::new(),
                 candidates: HashMap::new(),
                 fuel,
+                deadline: match default_budget_ms() {
+                    0 => None,
+                    ms => Some(std::time::Instant::now() + std::time::Duration::from_millis(ms)),
+                },
                 exhausted: false,
                 stats: SessionStats::default(),
             });
@@ -155,17 +186,51 @@ impl ResolutionSession {
         SESSION.with(|s| s.borrow().as_ref().is_some_and(|st| st.exhausted))
     }
 
+    /// Did the walk that just closed on this thread under-answer? Read it
+    /// IMMEDIATELY after the projection returns, on the projection's own
+    /// thread; the read clears it, so a later walk cannot inherit a stale
+    /// verdict. A caller with a user-visible channel (the LSP handler's
+    /// `window/showMessage`) owes them the warning — a degradation that
+    /// only reaches a server log is a silently short answer.
+    pub fn take_last_walk_degraded() -> bool {
+        LAST_WALK_DEGRADED.with(|c| c.replace(false))
+    }
+
     /// Consults performed vs answered from the memo for the open session.
     /// `None` when no session is open.
     pub fn stats() -> Option<SessionStats> {
         SESSION.with(|s| s.borrow().as_ref().map(|st| st.stats))
+    }
+
+    /// Declare that this walk answered with less than it could have. Any
+    /// degradation a consumer cannot otherwise see routes here — the
+    /// budget, and the enrichment depth cap, whose declines silently serve
+    /// a raw bag where an enriched one was due. A degradation nobody can
+    /// observe is the failure mode this codebase keeps finding: not a
+    /// crash, a quietly smaller answer.
+    pub fn mark_degraded(reason: &str) {
+        SESSION.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                if !st.exhausted {
+                    st.exhausted = true;
+                    eprintln!(
+                        "perl-lsp: resolution degraded ({reason}) — this answer is an \
+                         UNDER-APPROXIMATION, not a complete one."
+                    );
+                }
+            }
+        });
     }
 }
 
 impl Drop for ResolutionSession {
     fn drop(&mut self) {
         if self.owns {
-            SESSION.with(|s| *s.borrow_mut() = None);
+            let degraded = SESSION.with(|s| {
+                let st = s.borrow_mut().take();
+                st.is_some_and(|st| st.exhausted)
+            });
+            LAST_WALK_DEGRADED.with(|c| c.set(degraded));
         }
     }
 }
@@ -180,8 +245,16 @@ fn with_session<R>(
     let id = idx as *const dyn CrossFileLookup as *const () as usize;
     SESSION.with(|s| {
         let mut slot = s.borrow_mut();
-        let st = slot.as_mut()?;
+        let Some(st) = slot.as_mut() else {
+            // No walk open on this thread — the consult belongs to a
+            // background cascade (enrichment, the open-doc heal), not to a
+            // verb. Counted because "the memo did not apply" is the first
+            // thing to check when a walk stays slow.
+            crate::util::ghost_stats::count("session.absent");
+            return None;
+        };
         if st.index_id != id {
+            crate::util::ghost_stats::count("session.foreign_index");
             return None;
         }
         let now = idx.resolution_epoch();
@@ -250,21 +323,23 @@ pub(super) fn candidate_answer(
     .flatten()
 }
 
-/// Remember a candidate's contribution. `complete` is the caller's
-/// witness that no cycle-guard cut above the evaluation's own root fed
-/// this value — an incomplete value is path-dependent and must not be
-/// reused elsewhere.
+/// Remember a candidate's contribution.
+///
+/// A value the cycle guard truncated is remembered like any other. That is
+/// the SAME acceptance `QueryState`'s own memo already makes — it stores
+/// every off-path resolution regardless of whether an ancestor cut fed it,
+/// and reuses it elsewhere in the query where that ancestor is not on the
+/// path. The session widens the window from one query to one walk; it does
+/// not introduce a new class of answer. Refusing truncated values was
+/// measured instead: mutual imports make cuts near-universal at CPAN scale
+/// (508,319 refusals against 5,870 stores in one walk), so the strict memo
+/// remembered nothing and the walk still did not return.
 pub(super) fn remember_candidate_answer(
     idx: &dyn CrossFileLookup,
     path: &Path,
     q: &ReducerQuery,
     value: &ReducedValue,
-    complete: bool,
 ) {
-    if !complete {
-        crate::util::ghost_stats::count("session.memo_decline_incomplete");
-        return;
-    }
     with_session(idx, |st| {
         let id = st.intern(path);
         let key = candidate_key(id, q);
@@ -284,21 +359,43 @@ fn candidate_key(path: u32, q: &ReducerQuery) -> CandidateKey {
     }
 }
 
+/// Is there budget left to chase cross-file at all? Read-only — the
+/// per-candidate spend still happens in the loop. Marks the walk degraded
+/// the first time it answers `false`.
+pub(super) fn budget_available(idx: &dyn CrossFileLookup) -> bool {
+    with_session(idx, |st| {
+        let out_of_time = st.deadline.is_some_and(|d| std::time::Instant::now() >= d);
+        if st.fuel > 0 && !out_of_time {
+            return true;
+        }
+        note_exhausted(st, out_of_time);
+        false
+    })
+    .unwrap_or(true)
+}
+
+fn note_exhausted(st: &mut SessionState, out_of_time: bool) {
+    if !st.exhausted {
+        st.exhausted = true;
+        eprintln!(
+            "perl-lsp: resolution budget exhausted ({}) — this answer is an \
+             UNDER-APPROXIMATION, not a complete one. \
+             PERL_LSP_RESOLVE_BUDGET_MS / PERL_LSP_RESOLVE_FUEL raise it \
+             (0 = unbounded).",
+            if out_of_time { "time" } else { "consults" },
+        );
+    }
+    crate::util::ghost_stats::count("session.budget_exhausted");
+}
+
 /// Spend one unit of the walk's consult budget. `false` once the budget
 /// is gone — the caller answers from what it already has and the walk is
 /// marked degraded. No session (a plain hover, a test) ⇒ no budget.
 pub(super) fn spend_consult(idx: &dyn CrossFileLookup) -> bool {
     with_session(idx, |st| {
-        if st.fuel == 0 {
-            if !st.exhausted {
-                st.exhausted = true;
-                eprintln!(
-                    "perl-lsp: resolution fuel exhausted — the answer is an \
-                     under-approximation. Raise PERL_LSP_RESOLVE_FUEL (0 = unbounded) \
-                     if this is a legitimate query at this scale."
-                );
-            }
-            crate::util::ghost_stats::count("session.fuel_exhausted");
+        let out_of_time = st.deadline.is_some_and(|d| std::time::Instant::now() >= d);
+        if st.fuel == 0 || out_of_time {
+            note_exhausted(st, out_of_time);
             return false;
         }
         st.fuel -= 1;

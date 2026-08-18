@@ -922,7 +922,9 @@ impl LanguageServer for Backend {
         let point = symbols::position_to_point(pos);
         let uri = uri.clone();
         let scope = self.override_scope();
-        self.run_query(move |cx| {
+        let degraded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let degraded_flag = Arc::clone(&degraded);
+        let out = self.run_query(move |cx| {
             // Pack languages resolve + collect through their sub-index
             // (mirrors goto-def and the CLI) — the hub only knows Perl
             // modules, so a cpp query against it silently misses every
@@ -958,9 +960,43 @@ impl LanguageServer for Backend {
             let cs = crate::util::timings::phase("refs.resolve", || {
                 cx.set(base_idx, &analysis, &uri, point, scope)
             });
-            refs_to_locations(crate::util::timings::phase("refs.project", || cs.references()))
+            let locs =
+                refs_to_locations(crate::util::timings::phase("refs.project", || cs.references()));
+            // The walk's completeness verdict, read on the walk's own thread
+            // the moment it closes.
+            degraded_flag.store(
+                crate::model::witnesses::ResolutionSession::take_last_walk_degraded(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            locs
         })
-        .await
+        .await;
+        // `references` answers `Location[]`; the protocol gives it no
+        // completeness field, so a bounded answer says so the only way it
+        // can — to the user, not to a log. Crude, but visible beats
+        // correct-in-principle: a short list that looks complete is the
+        // failure mode the bound exists to avoid.
+        // Once per server session: someone hunting a large workspace runs
+        // this verb repeatedly, and a toast per query is how a signal gets
+        // trained into noise. The first one has to land; the tenth must not
+        // be as loud. Every occurrence still reaches the log.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if degraded.load(std::sync::atomic::Ordering::Relaxed)
+            && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.client
+                .show_message(
+                    MessageType::WARNING,
+                    concat!(
+                        "perl-lsp: this reference list is INCOMPLETE - the search hit its ",
+                        "resolution budget at this workspace size. Raise ",
+                        "PERL_LSP_RESOLVE_BUDGET_MS / PERL_LSP_ENRICH_DEPTH for a fuller ",
+                        "answer. (Reported once per session; the log records each.)",
+                    ),
+                )
+                .await;
+        }
+        out
     }
 
     async fn prepare_rename(

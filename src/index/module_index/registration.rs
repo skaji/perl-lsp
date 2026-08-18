@@ -424,6 +424,42 @@ impl ModuleIndex {
                 return hit;
             }
         }
+        // Enrichment RECURSES: enriching A runs type queries that ask for
+        // enriched(B), whose enrichment asks for enriched(C). The cycle
+        // guard above only stops a REPEAT of a path already on this
+        // thread's stack — a chain of DISTINCT files recurses as deep as
+        // the dependency graph is long, and each level deep-copies and
+        // enriches a whole analysis. Measured at 138k files: a single
+        // `references` consult descended 220+ frames of
+        // enrich → query → enrich and never came back.
+        //
+        // So cap the depth at which a NEW copy is built. A cached hit is
+        // served at any depth (it is free and already correct); past the
+        // cap a build declines exactly as a cycle declines — the caller
+        // falls back to the raw bag, honestly unenriched. `0` = unbounded.
+        static DEPTH_CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let depth_cap = *DEPTH_CAP.get_or_init(|| {
+            std::env::var("PERL_LSP_ENRICH_DEPTH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| if v == 0 { usize::MAX } else { v })
+                .unwrap_or(4)
+        });
+        // Depth distribution of the builds that DO run — the measurement
+        // that sizes the cap (and, later, level-indexed enrichment's K).
+        // Gated: `count` is inert without `PERL_LSP_GHOST_STATS`.
+        if crate::util::ghost_stats::enabled() {
+            crate::util::ghost_stats::count(&format!(
+                "enrich.depth.{:02}",
+                ENRICHING.with(|s| s.borrow().len())
+            ));
+        }
+        if ENRICHING.with(|s| s.borrow().len()) > depth_cap {
+            DECLINED.with(|c| c.set(c.get() + 1));
+            crate::util::ghost_stats::count("enriched_snapshot.depth_decline");
+            crate::model::witnesses::ResolutionSession::mark_degraded("enrichment depth");
+            return None;
+        }
         crate::util::ghost_stats::count("enriched_snapshot.build");
         if let Some(g) = &self.enriched_ghost {
             g.on_miss(&path.to_string_lossy());
