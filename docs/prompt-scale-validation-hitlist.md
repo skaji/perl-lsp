@@ -9,6 +9,63 @@ unmeasured — the longest prior measurement was 240 s), **Koha** (3.1×), and a
 **5,000-dist CPAN sample** (122× — genuinely the target rung). The
 **differential sweep** is the one track still owed.
 
+## Status board
+
+One line per item. `CLOSED` = fixed and verified, or closed as not-a-bug.
+`PARTIAL` = the half that mattered most is fixed, named residual still open.
+Detail for each is in its section below.
+
+### Tier 1
+| # | item | status |
+|---|---|---|
+| 1 | Post-cold-index availability hole | **PARTIAL** — "no answers" fixed `d9053e4f`; writer-drain diagnostics blackout still open, gate split adjudicated in PR #121 |
+| 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** `fed8ac00` — depth gate; iterative walk that removes the class is in flight (B) |
+| 3 | `references` terminal at scale | **OPEN** — Koha 5,493→3,362 ms `b6312ea2`, but cpan5k still never returns; measured, see below |
+| 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
+| 5 | Every CLI verb hangs at 122x | **OPEN** — new, found probing #3 |
+
+### Tier 2
+| item | status |
+|---|---|
+| `pod.rs` multibyte panic | **CLOSED** `f47c002b` |
+| Fold-64 non-convergence | **CLOSED** `fed8ac00` |
+| `query_rec` 512-depth cap | **OPEN** — seen again during the #3 probe |
+| hover empty on a module-name token | **OPEN** |
+| `epoch.gen_stamp_missing = 1074` | **CLOSED** — explained, never a bug |
+
+### Tier 3 / Tier 4
+| item | status |
+|---|---|
+| `@INC` single-provider tier | **IN FLIGHT** (C) — stages 1–2 done and base-verified |
+| ~10 bookkeeping `get_cached` sites | **OPEN** — deliberate |
+| `cursor_slot.rs:205` | **OPEN** — deferred, reducible |
+| Merge the two index families | **OPEN** |
+| Iterative builder walk | **IN FLIGHT** (B) — both walks agree over 1,454 tests |
+| Grammar-kind tripwire | **OPEN** |
+
+### Found en route (not original rows)
+| item | status |
+|---|---|
+| Qualified calls binding to same-named local subs | **CLOSED** `98bf42da` |
+| `RUST_LOG` / ghost stats never reached CLI verbs | **CLOSED** `336fc624` |
+| `resync_bytes` had no alarm | **CLOSED** `5cf44dfd`, corrected in PR #121 (fired on a designed state) |
+| `ResolveQueue` lost wakeup — resolver sleeps for the session | **FIX IN PR #121** |
+| `PackInvalidator::swap` strips against an unchecked persist | **OPEN** — blocked on a test-mode `open_cache_db`; serves stale silently |
+| Gold silently skips 22 rows on Debian/Ubuntu arch, still exits 0 | **OPEN** — check `PASS`==491 and grep `skip` |
+| 3 fold nondeterminism bugs (unstable cached blob) | **FIX IN B's PR** |
+
+### Validation
+| item | status |
+|---|---|
+| Narrow seam review | **DONE** — PR #121, nine findings |
+| Pack-language soak | **DONE** — 3h20m clean; caveat: ran pre-rows-lane |
+| T1 #1 + #3 combination | **DONE** — negative; the row does not close |
+| Cold cpan5k with every fix in | **OWED** |
+| Differential sweep (main vs branch) | **OWED** |
+| Profile the 150 s of refs CPU | **OWED** — the new #3 next step |
+| Re-soak `PackBagCache` on current tip | **OWED** |
+
+
 ## Corpora
 
 Durable, in `/home/veesh/perl-corpora/`:
@@ -172,7 +229,7 @@ walk removes the class but is a core-traversal rewrite and belongs in its own
 arc. A gold fixture of the two-copy dir is a free crash canary — `run.pl`
 already hard-fails aborts.
 
-### 3. `references` terminal at scale — **FIXED `b6312ea2`**, and the attribution was half wrong
+### 3. `references` terminal at scale — **OPEN.** Koha fixed (`b6312ea2`); cpan5k still DNF
 120 s DNF at 122×; 5.6 s at Koha. Root-caused by controlled A/B:
 `PERL_LSP_NO_EVICT=1` collapses the walk 5,613 → 1,357 ms (repeat
 3,647 → 842 ms). **~4× of the cost is blob decode of evicted candidates, not
