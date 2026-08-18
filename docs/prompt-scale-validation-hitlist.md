@@ -201,10 +201,31 @@ upgrade costs one decode and never an answer.
 
 **The cpan5k attribution above was wrong.** Decode-per-candidate was the real
 root cause at Koha, but at 122x the walk is already **181 ms** (91 candidates)
-and the 120 s DNF is *entirely* `references`' Complete wait on an open-doc
-heal that never lands — i.e. row #1's territory. Neither fix alone clears that
-number; **the two together are what should**, and that combination is
-unmeasured. See "Validation still owed".
+and the 120 s DNF is not the walk.
+
+**MEASURED, and my prediction was wrong: the combination does NOT close it.**
+With both `b6312ea2` and `d9053e4f` in, `references` on a hot name at warm
+cpan5k **still never returns.** The probe deliberately set a 150,000 ms client
+timeout — *above* the server's own 120,000 ms cap — so a cap expiry would be
+distinguishable from a true non-answer. Nothing came back, six times. So this
+was never only the wait policy expiring.
+
+It is not a deadlock either: ~294% CPU throughout, RSS climbing 97 MB → 3.4 GB
+and plateauing. Real work that never finishes. Repeats are not cheap — each of
+five repeats burned the full 150 s, the first three adding ~650 MB each, so the
+"memory grows and buys nothing" characterisation stands unchanged.
+
+**The Koha control is what makes this trustworthy**: same binary, driver,
+protocol and coordinates gave 3,328 ms and a **byte-exact 284,617-byte** answer
+against the prior 3,362 ms / 284,617 B. The rig is good; the cpan5k DNF is a
+property of cpan5k.
+
+So the residual is neither the refs axis nor the wait policy. It points at the
+same place row #1 handed off: the candidate explosion and enrichment fan-out at
+122x — the package→SET-of-files relation returning 5–12 declaring files for a
+common name, transitive overlay enrichment, and Perl's still-empty
+`ScopedLookup` slot (T3). **Row #3 stays open**, now with a well-posed next
+step: profile where those 150 s of CPU go, LSP path, warm, hot name.
 
 Related, same root: **repeat refs never cache-hit** — RSS plateaus
 (566→635 MB over 6 identical queries, bounded, not a leak) while latency stays
@@ -221,6 +242,22 @@ own sort key before the cut, so the in-scope and imported tiers survive and
 the auto-import firehose is what goes; `isIncomplete` makes the client
 re-query as the prefix grows. **7,289,367 B / 236 ms → 55,853 B / 4 ms.**
 Under the cap nothing changes at all — an ordinary file's list is untouched.
+
+### 5. `cli_full_startup` never reaches queryable state at 122x — NEW
+Found while probing row #3. Every CLI verb hangs at 138k files: `--references`,
+`--definition` and a rare-name query (8 occurrences) all DNF at exit 124, zero
+bytes, ~100% CPU on ONE thread, 1.5–2.0 GB. Verb-independent and
+candidate-count-independent, so it is stuck **before** the query runs — and the
+LSP server is ready in 793 ms off the *identical* `modules.db`, so the CLI is
+not taking the warm streaming path the server takes.
+
+That makes `--check` / `--heatmap` / `--workspace-symbol` / `--dump-package`
+unusable at workspace scale, and it means **the CLI is not a valid measurement
+fallback there** — a trap for anyone reaching for the cheap probe.
+
+(The probe's first write-up blamed a CPU grind in the refs walk; the rare-name
+and `--definition` controls refuted that and the retraction is in its log. The
+row #3 conclusion rests only on the LSP measurement.)
 
 # Tier 2 — cheap, and now debuggable
 
@@ -304,11 +341,13 @@ named inputs.
 
 # Validation still owed
 
-- **The T1 #1 + T1 #3 combination on cpan5k.** Neither fix alone clears the
-  120 s `references` DNF: the walk is 181 ms, and the rest was the availability
-  wait that `d9053e4f` addresses. They are now both in, and the combined number
-  has NOT been measured. This is the cheapest outstanding measurement and the
-  one most likely to close a headline row outright — do it first.
+- ~~**The T1 #1 + T1 #3 combination on cpan5k**~~ — **measured; it does not
+  close the row.** Details in row #3 above. What it bought was a sharper
+  question: the remaining cost is real CPU that never terminates, not a wait
+  expiring, so **the next measurement is a profile of that 150 s** — and it is
+  now well-posed (LSP path, warm, hot name, ~294% CPU, 97 MB → 3.4 GB).
+- **Cold cpan5k with every fix in.** Deliberately not started when it could not
+  fit the window; the walk alone is ~10 min plus ~9 min of writer drain.
 - **Differential sweep** — main vs branch over thousands of positions, turning
   "review 130k lines" into "adjudicate a divergence list".
 - ~~**Pack-language soak**~~ — **run, 3h20m on abseil (873 files), clean.**
