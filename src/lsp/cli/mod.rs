@@ -258,8 +258,9 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // @INC scan + SQLite warm.
     module_index.set_workspace_root(Some(root_uri.as_str()));
     let ws = file_store::FileStore::new();
-    let indexed =
-        module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None, None);
+    let indexed = timings::phase("cli::index_workspace", || {
+        module_resolver::index_workspace_with_index(&root_path, &ws, Some(&module_index), None, None)
+    });
     // Label the tier: a pack-only workspace printing a bare "Indexed 0 files"
     // reads as "indexing failed" when the pack line below says otherwise.
     if indexed > 0 {
@@ -267,13 +268,15 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     }
     // Pack languages (C++/Python/…) → per-language sub-indexes (separate
     // caches, no cross-language overlap), attached to the hub for routing.
-    let pack_indexed = module_resolver::index_pack_languages(
-        &root_path,
-        Some(&root_uri),
-        &module_index,
-        None,
-        crate::lsp::backend::max_cache_mb_default() as usize * 1024 * 1024,
-    );
+    let pack_indexed = timings::phase("cli::index_pack", || {
+        module_resolver::index_pack_languages(
+            &root_path,
+            Some(&root_uri),
+            &module_index,
+            None,
+            crate::lsp::backend::max_cache_mb_default() as usize * 1024 * 1024,
+        )
+    });
     if pack_indexed > 0 {
         // Name the languages actually served rather than the
         // generic "pack-language" — a pure-C++ workspace should read "C/C++",
@@ -286,7 +289,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
         eprintln!("Indexed {} {} files", pack_indexed, langs.join("/"));
     }
 
-    let mut inc_paths = module_resolver::discover_inc_paths();
+    let mut inc_paths = timings::phase("cli::discover_inc", module_resolver::discover_inc_paths);
     module_resolver::add_project_lib_paths(&mut inc_paths, &root_path);
 
     let db = module_cache::open_cache_db(Some(&root_uri), "perl");
@@ -297,12 +300,14 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             conn,
             &plugin::rhai_host::plugin_fingerprint(),
         );
-        let (warmed, stale) = module_cache::warm_cache(
-            conn,
-            module_index.cache_raw(),
-            module_index.all_defs_raw(),
-            module_index.is_long_lived() && module_resolver::eviction_enabled(),
-        );
+        let (warmed, stale) = timings::phase("cli::warm_inc_cache", || {
+            module_cache::warm_cache(
+                conn,
+                module_index.cache_raw(),
+                module_index.all_defs_raw(),
+                module_index.is_long_lived() && module_resolver::eviction_enabled(),
+            )
+        });
         // Stamp generations for the warm-loaded @INC providers (the warm
         // scan bypasses the registration front doors) so `enrichment_key`
         // reads a real token for every provider.
@@ -336,6 +341,7 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
     // the seen-set (`queued`); the cross-file surface walk handles cycles.
     let mut queue: std::collections::VecDeque<String> = needed.iter().cloned().collect();
     let mut queued: std::collections::HashSet<String> = needed.clone();
+    let _resolve_phase = timings::PhaseGuard::start("cli::resolve_imports");
     while let Some(name) = queue.pop_front() {
         let cached_arc = if module_index.cache_raw().contains_key(name.as_str())
             && !stale_set.contains(&name)
@@ -383,20 +389,25 @@ fn cli_full_startup(root: &str) -> (file_store::FileStore, module_index::ModuleI
             }
         }
     }
+    drop(_resolve_phase);
     eprintln!("Modules: {} cached, {} resolved, {} total", already_cached, resolved, queued.len());
 
     // `warm_cache` populated `cache_raw()` directly, bypassing the reverse
     // index, and `insert_cache` only indexes export/export_ok. Rebuild the
     // full `func → modules` index from the cache so `find_exporters` answers
     // identically on cold and warm runs (B6 export-attribution regression).
-    module_index.rebuild_reverse_index_from_cache();
+    timings::phase("cli::rebuild_reverse_index", || {
+        module_index.rebuild_reverse_index_from_cache()
+    });
 
     // Ancestry is now fully populated: materialize deferred cross-file
     // `ClassIsa` plugin emissions (DBIC column/relationship accessors reached
     // through a cross-file base) into the whole resident cached copies, so
     // cross-file goto-def / references see them via `whole_present`. See
     // `ModuleIndex::materialize_gated_emissions` / `GatedEmission`.
-    module_index.materialize_gated_emissions();
+    timings::phase("cli::materialize_gated", || {
+        module_index.materialize_gated_emissions()
+    });
 
     (ws, module_index)
 }

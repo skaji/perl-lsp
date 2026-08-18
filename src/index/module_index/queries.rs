@@ -344,10 +344,10 @@ impl ModuleIndex {
     /// picking which specific symbols matter to them.
     pub fn modules_with_symbol(&self, name: &str) -> Vec<String> {
         match self.core.edges.names.get(name) {
-            Some(modules) => {
-                let mut result = modules.clone();
+            Some(bucket) => {
+                // Unique by construction; sort only, for a stable order.
+                let mut result = bucket.as_slice().to_vec();
                 result.sort();
-                result.dedup();
                 result
             }
             None => Vec::new(),
