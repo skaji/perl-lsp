@@ -1487,6 +1487,18 @@ impl LanguageRegistry {
         LanguageRegistry { drivers }
     }
 
+    /// The id of the driver that serves files no other driver claims —
+    /// the reference language. A property, not a literal: a verb that is
+    /// intrinsically about this language (`--dump-package` dumps Perl type
+    /// inference) names it through here rather than spelling "perl".
+    pub fn reference_language(&self) -> &'static str {
+        self.drivers
+            .iter()
+            .find(|d| d.claims_unclaimed())
+            .map(|d| d.id())
+            .unwrap_or("perl")
+    }
+
     pub fn for_path(&self, path: &Path) -> Option<&dyn LanguageDriver> {
         // Exact filename first (CMakeLists.txt has no extension), then ext.
         if let Some(name) = path.file_name().and_then(|f| f.to_str()) {
@@ -1629,3 +1641,56 @@ impl LanguageRegistry {
 #[cfg(test)]
 #[path = "language_driver_tests.rs"]
 mod tests;
+
+
+/// Which language families a startup must index for an answer to be honest.
+///
+/// The VERB declares this; the indexer never asks what kind of query it is
+/// serving. A verb with a target file needs only what that file's language
+/// can consult — the same per-family rule the server's `didOpen` latch
+/// already applies (`ensure_workspace_indexed(language)` is latched per
+/// family, so opening a `.cc` never walks the Perl tree). A verb with no
+/// single origin sweeps every language's store and needs them all.
+///
+/// The asymmetry that makes this worth getting right: over-indexing is
+/// only wasted work, but UNDER-indexing is a wrong answer, and a quiet
+/// one. An unattached pack sub-index does not answer empty — `lookup_for`
+/// routes that language's queries to the Perl hub instead, so a C++
+/// goto-def would resolve against Perl and look plausible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageScope {
+    /// Every served language. A verb that sweeps the workspace
+    /// (`--check`, `--heatmap`, `--workspace-symbol`, `--batch` — whose
+    /// requests arrive after startup, so their languages are unknowable
+    /// here) reads every store.
+    All,
+    /// Only this language's family.
+    Only(&'static str),
+}
+
+impl LanguageScope {
+    /// The family serving `path`. An extension no driver claims falls to
+    /// the reference language, exactly as analysis routing does.
+    pub fn of_file(path: &Path) -> Self {
+        let reg = LanguageRegistry::with_enabled();
+        let id = reg
+            .for_path(path)
+            .map(|d| d.id())
+            .unwrap_or_else(|| reg.reference_language());
+        LanguageScope::Only(id)
+    }
+
+    /// The reference language alone — for a verb that is intrinsically
+    /// about it rather than about a file the caller named.
+    pub fn reference_only() -> Self {
+        LanguageScope::Only(LanguageRegistry::with_enabled().reference_language())
+    }
+
+    /// Must `lang`'s workspace index be built for this scope?
+    pub fn wants(&self, lang: &str) -> bool {
+        match self {
+            LanguageScope::All => true,
+            LanguageScope::Only(id) => *id == lang,
+        }
+    }
+}

@@ -26,6 +26,11 @@ pub fn index_pack_languages(
     // evicted file rehydrates its exact bag from SQLite into this cap. `0`
     // disables retention (rehydrate-and-drop). See `docs/adr/memory-slice-2-lru.md`.
     bag_cache_bytes: usize,
+    // Which language families this caller needs. A pack language the scope
+    // does not want is not walked at all — on a CPAN-shaped tree the XS/C
+    // files beside the `.pm`s are 7.8% of the files and 54% of the startup,
+    // and a Perl query cannot consult any of it.
+    scope: &crate::build::language_driver::LanguageScope,
 ) -> usize {
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
@@ -46,6 +51,9 @@ pub fn index_pack_languages(
     let mut lang_paths: Vec<(&'static str, Vec<PathBuf>)> = Vec::new();
     for driver in reg.pack_drivers() {
         let lang = driver.id();
+        if !scope.wants(lang) {
+            continue;
+        }
         let exts: Vec<&'static str> = driver.extensions().to_vec();
         if exts.is_empty() {
             continue;

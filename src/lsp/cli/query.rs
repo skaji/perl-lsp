@@ -22,7 +22,9 @@ pub(crate) fn cli_check(args: &[String]) {
     }
     timings::enable_from_env();
 
-    let (ws, module_index) = cli_full_startup(root);
+    // `--check` reports diagnostics for pack files too (the pack-index
+    // sweep below), so it needs every family.
+    let (ws, module_index) = cli_full_startup(root, language_driver::LanguageScope::All);
 
     // Dump the per-module breakdown before diagnostics output so the table
     // isn't buried under (and the early `exit(1)` below doesn't swallow it).
@@ -179,7 +181,10 @@ pub(crate) fn cli_cursor(q: &str, root: &str, rest: &[String]) {
         std::process::exit(2);
     });
     emit_pos_annotation(&target);
-    let (ws, idx) = cli_full_startup(root);
+    let (ws, idx) = cli_full_startup(
+        root,
+        language_driver::LanguageScope::of_file(std::path::Path::new(&target.file)),
+    );
     let req = BatchReq {
         id: String::new(),
         q: q.to_string(),
@@ -195,7 +200,8 @@ pub(crate) fn cli_cursor(q: &str, root: &str, rest: &[String]) {
 /// --document-link <root> <file> — the non-symbol clickable ranges (POD
 /// L<> links, comment URLs, string-path loads).
 pub(crate) fn cli_document_link(root: &str, file: &str) {
-    let (ws, idx) = cli_full_startup(root);
+    let (ws, idx) =
+        cli_full_startup(root, language_driver::LanguageScope::of_file(std::path::Path::new(file)));
     let req = BatchReq {
         id: String::new(),
         q: "document-link".into(),
@@ -210,7 +216,8 @@ pub(crate) fn cli_document_link(root: &str, file: &str) {
 
 /// --semantic-tokens <root> <file> — token classification for the file.
 pub(crate) fn cli_semantic_tokens(root: &str, file: &str) {
-    let (ws, idx) = cli_full_startup(root);
+    let (ws, idx) =
+        cli_full_startup(root, language_driver::LanguageScope::of_file(std::path::Path::new(file)));
     let req = BatchReq {
         id: String::new(),
         q: "semantic-tokens".into(),
@@ -1155,7 +1162,10 @@ fn batch_diagnostics(ws: &file_store::FileStore, idx: &module_index::ModuleIndex
 /// + @INC cost across every query instead of paying it per process.
 pub(crate) fn cli_batch(root: &str) {
     use std::io::{BufRead, Write};
-    let (ws, idx) = cli_full_startup(root);
+    // The requests arrive on stdin AFTER startup, so their languages are not
+    // knowable here — and a batch legitimately mixes them (the gold harness
+    // groups rows by ROOT, not by language).
+    let (ws, idx) = cli_full_startup(root, language_driver::LanguageScope::All);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -1207,7 +1217,10 @@ pub(crate) fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
     emit_pos_annotation(&target);
     // Full startup so workspace files are built with the same plugins, type
     // inference, and enrichment that the LSP backend would use.
-    let (ws, idx) = cli_full_startup(root);
+    let (ws, idx) = cli_full_startup(
+        root,
+        language_driver::LanguageScope::of_file(std::path::Path::new(&target.file)),
+    );
     match run_rename(&ws, &idx, &target.file, target.point, new_name, target.fmt) {
         Ok(s) => println!("{}", s),
         Err(e) => {
@@ -1228,7 +1241,9 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
     use std::sync::Arc;
     use file_analysis::{SymKind, SymbolDetail};
 
-    let (ws, module_index) = cli_full_startup(root);
+    // A package's type inference is a reference-language question; no pack
+    // store can hold one.
+    let (ws, module_index) = cli_full_startup(root, language_driver::LanguageScope::reference_only());
 
     // Find a FileAnalysis whose package matches. Workspace first; fall
     // back to cached @INC modules. No bespoke discovery — only what
@@ -1480,7 +1495,8 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
 pub(crate) fn cli_workspace_symbol(root: &str, query: &str) {
     // Full startup so workspace symbols reflect plugin-synthesized entities
     // (helpers, routes, accessors), built with `root`'s plugins not cwd's.
-    let (ws, idx) = cli_full_startup(root);
+    // `sym_row_search` fans across the hub AND every pack sub-index.
+    let (ws, idx) = cli_full_startup(root, language_driver::LanguageScope::All);
     let req = BatchReq {
         id: String::new(), q: "workspace-symbol".into(),
         file: String::new(), line: 0, col: 0,

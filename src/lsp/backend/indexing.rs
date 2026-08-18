@@ -205,6 +205,9 @@ impl Backend {
                     &module_index,
                     cb_ref,
                     bag_cache_bytes,
+                    // The server's latch is already per-FAMILY; inside the
+                    // pack family it indexes every pack language, as before.
+                    &crate::build::language_driver::LanguageScope::All,
                 )
             };
             // Drop the sender(s) so the emitter's channel closes, then drain it
