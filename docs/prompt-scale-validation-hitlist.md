@@ -19,10 +19,10 @@ Detail for each is in its section below.
 | # | item | status |
 |---|---|---|
 | 1 | Post-cold-index availability hole | **PARTIAL** — "no answers" fixed `d9053e4f`; writer-drain diagnostics blackout still open, gate split adjudicated in PR #121 |
-| 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** `fed8ac00` — depth gate; iterative walk that removes the class is in flight (B) |
+| 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** — depth gate `fed8ac00`, then the recursion class itself removed (PR #123): descent is queued, cap 500 → 100,000, measured |
 | 3 | `references` terminal at scale | **OPEN** — Koha 5,493→3,362 ms `b6312ea2`, but cpan5k still never returns; measured, see below |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
-| 5 | Every CLI verb hangs at 122x | **OPEN** — new, found probing #3 |
+| 5 | Every CLI verb hangs at 122x | **IN FLIGHT** (C) — root-cause: server is ready in 793 ms off the *same* db, so the CLI is not taking the warm path |
 
 ### Tier 2
 | item | status |
@@ -36,12 +36,12 @@ Detail for each is in its section below.
 ### Tier 3 / Tier 4
 | item | status |
 |---|---|
-| `@INC` single-provider tier | **IN FLIGHT** (C) — stages 1–2 done and base-verified |
+| `@INC` single-provider tier | **CLOSED** PR #122 — all four stages; a name is a set of files, resolved per asker |
 | ~10 bookkeeping `get_cached` sites | **OPEN** — deliberate |
 | `cursor_slot.rs:205` | **OPEN** — deferred, reducible |
 | Merge the two index families | **OPEN** |
-| Iterative builder walk | **IN FLIGHT** (B) — both walks agree over 1,454 tests |
-| Grammar-kind tripwire | **OPEN** |
+| Iterative builder walk | **CLOSED** PR #123 — both walks byte-agree over the whole suite |
+| Grammar-kind tripwire | **IN FLIGHT** (B) — must accept DECLARED future kinds or it eats the forward-compat arms |
 
 ### Found en route (not original rows)
 | item | status |
@@ -49,10 +49,11 @@ Detail for each is in its section below.
 | Qualified calls binding to same-named local subs | **CLOSED** `98bf42da` |
 | `RUST_LOG` / ghost stats never reached CLI verbs | **CLOSED** `336fc624` |
 | `resync_bytes` had no alarm | **CLOSED** `5cf44dfd`, corrected in PR #121 (fired on a designed state) |
-| `ResolveQueue` lost wakeup — resolver sleeps for the session | **FIX IN PR #121** |
-| `PackInvalidator::swap` strips against an unchecked persist | **OPEN** — blocked on a test-mode `open_cache_db`; serves stale silently |
-| Gold silently skips 22 rows on Debian/Ubuntu arch, still exits 0 | **OPEN** — check `PASS`==491 and grep `skip` |
-| 3 fold nondeterminism bugs (unstable cached blob) | **FIX IN B's PR** |
+| `ResolveQueue` lost wakeup — resolver sleeps for the session | **CLOSED** PR #121 — priority push had no ordering against the drain; an `EXTRACT_VERSION` bump triggered it |
+| `PackInvalidator::swap` strips against an unchecked persist | **IN FLIGHT** (A) — with its blocker, a test-mode `open_cache_db` |
+| Gold silently skips 22 rows on Debian/Ubuntu arch, still exits 0 | **IN FLIGHT** (B) — hit independently by two sessions |
+| 3 fold nondeterminism bugs (unstable cached blob) | **CLOSED** PR #123 — witnesses landed in `HashMap` order, so the same file built twice differed |
+| A stale cache hides a fix as readily as it hid the crash | **OPEN** — see below; cost one false gold FAIL during integration |
 
 ### Validation
 | item | status |
@@ -62,7 +63,7 @@ Detail for each is in its section below.
 | T1 #1 + #3 combination | **DONE** — negative; the row does not close |
 | Cold cpan5k with every fix in | **OWED** |
 | Differential sweep (main vs branch) | **OWED** |
-| Profile the 150 s of refs CPU | **OWED** — the new #3 next step |
+| Profile the 150 s of refs CPU | **IN PROGRESS** — running locally now |
 | Re-soak `PackBagCache` on current tip | **OWED** |
 
 
@@ -154,9 +155,16 @@ Two notes worth keeping:
   returning empty labels. Both clean on rerun, three consecutive times for
   the perl one. Harness timing under load, not a test failure, but it is the
   kind of thing that reads as a regression at 2am.
-- **The gold canary for the depth crash needs a cold cache.** A warm module
-  cache serves the blob and never re-walks the tree, so the crash hides and
-  the row passes for the wrong reason. Documented in `gold-corpus/README.md`.
+- **The gold canary for the depth crash needs a cold cache — and it cuts both
+  ways.** A warm module cache serves the stored blob and never re-walks the
+  tree, so the crash hides and the row passes for the wrong reason. The mirror
+  image bit during integration: after the cap moved 500 → 100,000, gold FAILED
+  with *two limits live at once* — one file's diagnostic said "the 100000
+  limit" and another's said "the 500 limit", while the source held only one
+  gate. The second was a cached diagnostic from before the change. Clearing
+  that root made it green. **Any diagnostics-shaped assertion is suspect until
+  you have run `perl-lsp --clear-cache <root>`**, whether you are trying to see
+  a bug or trying to see its fix.
 
 # Tier 1 — blocks the target market
 
