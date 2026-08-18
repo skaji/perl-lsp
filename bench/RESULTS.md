@@ -272,3 +272,25 @@ warm 266 → 158 MB rhyme with it).
 - dragonbox template knownweak: both probes now answer small non-null
   payloads (212/133 B) — the lazy template projection edge moved; probes
   left tagged until asserted meaningful.
+
+## Targeted A/B — enrichment copy: bincode round-trip → clone
+
+Not a full round; one scenario, run as the answer-identity net for the copy
+change (`docs/adr/enrichment-build-cost.md`). mojo (`lib`, server path via
+`lsp_bench.py`), five paired cold runs, `0b3e2fc0` vs branch.
+
+- **Answer identity: IDENTICAL across 5 pairs × 16 steps** (every step's
+  `result_size` byte-equal). That is the local stand-in for the Koha
+  `references`-on-`store` 284,617 net, which needs a corpus this box lacks.
+- Step total: before median 231 ms (145–236), after median 150 ms (109–254).
+  **The medians favour the branch and the ranges overlap, so this run does
+  not establish a wall-clock win** — mojo builds only 86 enriched copies
+  (99.1% overlay hit rate), so the per-build saving has almost nothing to
+  multiply. The measured win is per-build (27.8%) and shows up where builds
+  are numerous, which is the 138k case, not this one.
+- Ready: before median 1,484 ms, after 1,464 ms — unchanged, as expected;
+  enrichment is not on the startup path.
+
+Worth keeping as a caution: a scenario whose overlay hit rate is ~99% cannot
+measure a change to what a MISS costs. Reach for a corpus where the overlay
+thrashes, or count builds first and stop if the count is small.
