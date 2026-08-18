@@ -321,6 +321,19 @@ fn whole_copy_registration_sites_are_allowlisted() {
                 ("module_resolver", 2, "deferred writer halves — stripped arcs only"),
             ],
         ),
+        // `insert_cache` stores a WHOLE copy by construction (`persisted:
+        // false` — nothing was written, so the strip has no licence). Its one
+        // production reach is through `register_materialized_whole`, already
+        // bounded by that site's entry; a NEW caller would pin whole copies
+        // without tripping any other gate.
+        (
+            "insert_cache",
+            vec![(
+                "module_index",
+                1,
+                "register_materialized_whole’s cache-slot half",
+            )],
+        ),
         (
             "register_materialized_whole",
             vec![(
