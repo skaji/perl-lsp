@@ -329,6 +329,38 @@ byte-identical answer, which is evidence it is safe *there*, not generally.
 The structural fix is level-indexed enrichment (below), after which the cap
 becomes a high backstop.
 
+**Level-indexed enrichment: built, measured, REJECTED.** Branch
+`claude/level-indexed-enrichment` (`33c2a02f`), ADR kept at
+`docs/adr/level-indexed-enrichment.md`. It does everything the design promised
+— terminates in K steps with no cycle detection, `A_2 → B_1 → A_0` resolves a
+mutual pair, a file's form at (level, epoch) is independent of who asked first,
+and both the taint rule and the depth cap delete. Koha's answer is 284,617 and
+stable at every K. It is also **2.5–15x too slow**, against `32a3bf4e`'s
+3,331 / 2,264 ms:
+
+| K | refs-1 | refs-2 | builds | overlay hits |
+|---|---|---|---|---|
+| 4 | 6,803 | 5,732 | 1,267 | 38,064 |
+| 8 | 40,858 | 34,834 | 12,385 | 1,165,493 |
+| 16 | **timeout at 300 s** | — | 20,808 | 1,330,653 |
+
+Builds scale with K *by construction* — a file is built once per level rather
+than once — and every build is a whole-`FileAnalysis` bincode round-trip.
+Cacheability does not pay for the multiplication. And the correctness floor
+makes it worse, not better: Koha's depth tail of 12 puts the required K at 16,
+which is exactly the column that times out. **The prerequisite is making a
+build cheap** — incremental enrichment emitting a small overlay of derived
+facts instead of deep-copying an analysis. That is the next row, and it is
+bigger than this one.
+
+**A caveat on the shipped bound, found during that spike.** With the budget ON
+at K=8, two identical consecutive requests returned 279,645 and then 280,458
+bytes; with the budget off, both 284,617. **A wall-clock bound is deterministic
+only while it does not fire.** It does not fire at the containment branch's
+speeds on Koha, but it fires ~8,000 times at cpan5k, so answers there are
+reproducible only in practice, not by construction. Do not put a gold row
+anywhere near a configuration that trips the clock.
+
 **The real defect, still open.** `ENRICHING` is a thread-local set of paths on
 *this thread's stack*, so whether a dep comes back tainted depends on who asked
 first — the same file's enriched form differs by traversal order. That is why
