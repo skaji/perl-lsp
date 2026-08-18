@@ -1195,7 +1195,13 @@ impl<'a> Builder<'a> {
             ScopeId,
             Vec<(ArityBranch, Span)>,
         > = std::collections::HashMap::new();
-        let mut discriminated: std::collections::HashSet<ScopeId> =
+        // A `Vec` + membership set rather than a bare `HashSet`: the emission
+        // loop below walks this in order, and a `HashSet` would walk it in
+        // hash order — different between two builds of the same file, which
+        // makes the bag (and the cache blob minted from it) nondeterministic.
+        // Document order, since `return_infos` is already in walk order.
+        let mut discriminated: Vec<ScopeId> = Vec::new();
+        let mut discriminated_seen: std::collections::HashSet<ScopeId> =
             std::collections::HashSet::new();
         for ri in &self.return_infos {
             let Some(branch) = ri.arity_branch else { continue };
@@ -1206,7 +1212,9 @@ impl<'a> Builder<'a> {
                     | ArityBranch::AtMost(_)
                     | ArityBranch::AtLeast(_)
             ) {
-                discriminated.insert(ri.scope);
+                if discriminated_seen.insert(ri.scope) {
+                    discriminated.push(ri.scope);
+                }
             }
             if let Some(span) = ri.body_span {
                 by_scope.entry(ri.scope).or_default().push((branch, span));
@@ -1636,11 +1644,17 @@ impl<'a> Builder<'a> {
         // emission is enough: when child's `MethodOnClass(C, m)`
         // bag has no local witness, the inheritance Edge points at
         // `MethodOnClass(P, m)` and the registry follows it.
-        let parents_snapshot: Vec<(String, Vec<String>)> = self
+        // Sorted by child: `package_parents` is a `HashMap`, so iterating it
+        // raw lands these witnesses in hash order — which differs between two
+        // builds of the same file, making the bag (and the cache blob minted
+        // from it) nondeterministic. Parent order within a child is `@ISA`
+        // order and is left alone; that one IS semantic.
+        let mut parents_snapshot: Vec<(String, Vec<String>)> = self
             .package_parents
             .iter()
             .map(|(c, ps)| (c.clone(), ps.clone()))
             .collect();
+        parents_snapshot.sort_by(|a, b| a.0.cmp(&b.0));
         for (child, parents) in &parents_snapshot {
             // Per-child: track which methods already got an
             // inheritance edge, so the FIRST parent in `@ISA` order

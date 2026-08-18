@@ -1291,17 +1291,24 @@ impl<'a> Builder<'a> {
     pub(super) fn emit_array_push_witnesses(&mut self) {
         use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         self.bag.remove_by_source_tag("array_push");
-        // Group by (scope, arr_name) so successive pushes
-        // accumulate into one Sequence.
+        // Group by (scope, arr_name) so successive pushes accumulate into one
+        // Sequence, keeping first-appearance order. Iterating the grouping
+        // map directly would emit in hash order, which differs between two
+        // builds of the same file — the rest of the bag is in document order,
+        // and a nondeterministic bag means a nondeterministic cache blob.
+        let mut order: Vec<(ScopeId, String)> = Vec::new();
         let mut grouped: std::collections::HashMap<(ScopeId, String), Vec<Span>> =
             std::collections::HashMap::new();
         for (scope, name, spans) in &self.pending_array_pushes {
-            grouped
-                .entry((*scope, name.clone()))
-                .or_default()
-                .extend(spans.iter().copied());
+            let key = (*scope, name.clone());
+            if !grouped.contains_key(&key) {
+                order.push(key.clone());
+            }
+            grouped.entry(key).or_default().extend(spans.iter().copied());
         }
-        for ((scope, name), spans) in grouped {
+        for key in order {
+            let spans = grouped.remove(&key).expect("keyed on insert");
+            let (scope, name) = key;
             let resolved: Vec<InferredType> = spans
                 .iter()
                 .filter_map(|sp| self.bag_query_expr_span(*sp))
