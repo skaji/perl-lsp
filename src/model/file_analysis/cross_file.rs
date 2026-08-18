@@ -394,6 +394,17 @@ pub mod path_intern {
 }
 
 pub trait CrossFileLookup {
+    /// Monotone validity counter for everything a cross-file walk reads —
+    /// registrations, freshness records, cache-slot/loader-shape swaps.
+    /// The resolution session memoizes consult ANSWERS against it: any
+    /// index mutation moves the counter and the memo drops wholesale.
+    /// Default `0` (an index that never mutates, or one whose consumers
+    /// don't memoize) — a constant is sound because the memo only ever
+    /// widens invalidation, never narrows it, and an immutable index has
+    /// nothing to invalidate.
+    fn resolution_epoch(&self) -> u64 {
+        0
+    }
     fn get_cached(&self, module_name: &str) -> Option<std::sync::Arc<CachedModule>>;
     /// `get_cached` scoped to a querying file's VISIBILITY set (its own path +
     /// its `#include` closure) — see `ModuleIndex::get_cached_scoped`. Default:
@@ -858,6 +869,9 @@ impl<'a> ScopedLookup<'a> {
 }
 
 impl<'a> CrossFileLookup for ScopedLookup<'a> {
+    fn resolution_epoch(&self) -> u64 {
+        self.inner.resolution_epoch()
+    }
     fn get_cached(&self, module_name: &str) -> Option<std::sync::Arc<CachedModule>> {
         // A search-path origin's winner is PER-ASKER: the same name means
         // whichever provider this file's own @INC reaches first. Falling

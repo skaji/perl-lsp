@@ -23,7 +23,10 @@ use super::*;
 /// `q.receiver` constant within one `MethodOnClass` query) still hashes
 /// to one key, so memoization still kills the exponential re-chase.
 type VisitedKey = (usize, WitnessAttachment, Option<String>, Option<u32>);
-type VisitedSet = std::collections::HashSet<VisitedKey>;
+/// Key → the path depth it sits at, so a cycle cut names the frame it
+/// closed on (the session memo's completeness gate needs that; a plain
+/// set only says "somewhere on the path").
+type VisitedSet = std::collections::HashMap<VisitedKey, u32>;
 
 /// Per-top-level-`query` traversal state: the cycle guard plus a result
 /// memo. The bag forms a DAG of edges; without memoization a diamond
@@ -42,6 +45,16 @@ type VisitedSet = std::collections::HashSet<VisitedKey>;
 /// queries whose context (scopes / module_index / framework) differs.
 pub(super) struct QueryState {
     visited: VisitedSet,
+    /// Path length at the current frame — the depth a visited key sits
+    /// at, so a cycle cut can be attributed to the subtree it happened
+    /// in (see `blocked_above`).
+    depth: u32,
+    /// Shallowest path depth whose key a cycle/depth cut used to answer
+    /// `None` during the current evaluation. A value fed by a cut ABOVE
+    /// an evaluation's own root is path-dependent and must not outlive
+    /// the query (the session memo's completeness gate reads this); a cut
+    /// wholly inside the subtree is self-contained and reusable.
+    blocked_min_depth: u32,
     /// Enriched copies consulted during this query — pinned so memo
     /// entries keyed on their bag ADDRESSES stay valid even if the
     /// overlay's eviction drops its own reference mid-query.
@@ -57,9 +70,31 @@ pub(super) struct QueryState {
 impl QueryState {
     pub(super) fn new() -> Self {
         QueryState {
-            visited: std::collections::HashSet::new(),
+            visited: std::collections::HashMap::new(),
+            depth: 0,
+            blocked_min_depth: u32::MAX,
             pins: Vec::new(),
             memo: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Evaluate `f` as an isolated subtree and report whether its value is
+    /// COMPLETE — no cycle/depth cut above the subtree's own root fed it.
+    /// The outer scope keeps the shallowest cut of the two, so an inner
+    /// cut that IS above an enclosing root still disqualifies that one.
+    fn scoped<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> (R, bool) {
+        let root = self.depth;
+        let outer = std::mem::replace(&mut self.blocked_min_depth, u32::MAX);
+        let r = f(self);
+        let inner = self.blocked_min_depth;
+        self.blocked_min_depth = outer.min(inner);
+        (r, inner >= root)
+    }
+
+    /// Record that a cut at `depth` answered `None`.
+    fn note_blocked(&mut self, depth: u32) {
+        if depth < self.blocked_min_depth {
+            self.blocked_min_depth = depth;
         }
     }
 }
@@ -250,6 +285,9 @@ impl ReducerRegistry {
                 }
             });
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+            // A depth cut is path-length-dependent, never self-contained:
+            // disqualify every enclosing evaluation from being remembered.
+            state.note_blocked(0);
             return std::sync::Arc::new(ReducedValue::None);
         }
         let key: VisitedKey = (
@@ -267,11 +305,16 @@ impl ReducerRegistry {
         // `key` has two owners (the visited set, transiently; the memo,
         // for the rest of the query). Clone once for visited, then move
         // the original into the memo store below.
-        if !state.visited.insert(key.clone()) {
+        if let Some(at) = state.visited.get(&key).copied() {
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
+            state.note_blocked(at);
             return std::sync::Arc::new(ReducedValue::None);
         }
+        let here = state.depth;
+        state.visited.insert(key.clone(), here);
+        state.depth = here + 1;
         let result = std::sync::Arc::new(self.query_rec_body(bag, q, state));
+        state.depth = here;
         state.visited.remove(&key);
         // Cache the off-path resolution. The query depends only on
         // `(bag, attachment, receiver-class, arity)` (all in `key`) plus
@@ -328,7 +371,7 @@ impl ReducerRegistry {
                 // declaring `class` (a reopened package's method lives in
                 // whichever file defines it, not the name-slot winner).
                 if let Some(idx) = ctx.module_index {
-                    for cached in idx.visible_def_candidates(class) {
+                    for cached in super::session::visible_def_candidates(idx, class).iter() {
                         // Rehydrate the target file's bag if its resident copy
                         // was Slice-2-evicted; the cross-file chase reads its
                         // witnesses (`docs/adr/memory-slice-2-lru.md`).
@@ -353,8 +396,30 @@ impl ReducerRegistry {
                                 };
                                 (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
                             };
-                        let full = idx.bag_present(&cached);
-                        if !std::ptr::eq(bag, &full.witnesses) {
+                        // This candidate's contribution, remembered ACROSS
+                        // top-level queries. `attempt` is a pure function of
+                        // (candidate file, attachment, receiver, arity, point,
+                        // framework) — the whole key — so one walk derives it
+                        // once instead of once per call site.
+                        if let Some(hit) =
+                            super::session::candidate_answer(idx, &cached.path, q)
+                        {
+                            if *hit != ReducedValue::None {
+                                return (*hit).clone();
+                            }
+                            continue;
+                        }
+                        if !super::session::spend_consult(idx) {
+                            break;
+                        }
+                        let full = idx.bag_present(cached);
+                        if std::ptr::eq(bag, &full.witnesses) {
+                            // Self: the reducers above already tried this bag.
+                            // Not an answer about the candidate, so nothing to
+                            // remember either.
+                            continue;
+                        }
+                        let (v, complete) = state.scoped(|state| {
                             let v = attempt(&full, state);
                             if v != ReducedValue::None {
                                 return v;
@@ -364,16 +429,20 @@ impl ReducerRegistry {
                             // invisible to the raw bag, present in the
                             // enriched overlay.
                             crate::util::ghost_stats::count("consult.moc_primary");
-                            let enriched = idx.enriched_present(&cached);
+                            let enriched = idx.enriched_present(cached);
                             if !std::sync::Arc::ptr_eq(&enriched, &full)
                                 && !std::ptr::eq(bag, &enriched.witnesses)
                             {
                                 state.pins.push(std::sync::Arc::clone(&enriched));
-                                let v = attempt(&enriched, state);
-                                if v != ReducedValue::None {
-                                    return v;
-                                }
+                                return attempt(&enriched, state);
                             }
+                            ReducedValue::None
+                        });
+                        super::session::remember_candidate_answer(
+                            idx, &cached.path, q, &v, complete,
+                        );
+                        if v != ReducedValue::None {
+                            return v;
                         }
                     }
                 }

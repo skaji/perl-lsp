@@ -358,6 +358,12 @@ pub fn refs_to(
     target: &TargetRef,
     mask: RoleMask,
 ) -> Vec<RefLocation> {
+    // One backward walk issues a top-level type query per candidate call
+    // site, and each re-derives the same cross-file `MethodOnClass`
+    // lattice. The session is the memo that spans them (plus the consult
+    // budget that bounds the walk when even the memo isn't enough) —
+    // `docs/adr/resolution-session.md`.
+    let _session = crate::model::witnesses::ResolutionSession::enter(module_index);
     let mut out = Vec::new();
 
     // Names that reach the target through a macro delegation edge — the

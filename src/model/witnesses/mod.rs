@@ -28,6 +28,8 @@ mod registry;
 pub use registry::*;
 mod query;
 pub use query::*;
+mod session;
+pub use session::*;
 
 // ---- Witness bag ----
 

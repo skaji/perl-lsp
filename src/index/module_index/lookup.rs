@@ -220,6 +220,14 @@ impl ModuleIndex {
 /// recursion); the generic inherent iterators accept the `&mut dyn FnMut`
 /// trampolines directly.
 impl CrossFileLookup for ModuleIndex {
+    fn resolution_epoch(&self) -> u64 {
+        // The same additive counter the enrichment-key memo validates
+        // against — one home for "has anything a cross-file read depends
+        // on moved", so a new mutation path bumps one leg and every memo
+        // riding it invalidates together.
+        self.enrichment_epoch()
+    }
+
     fn get_cached(&self, module_name: &str) -> Option<Arc<CachedModule>> {
         self.get_cached(module_name)
     }
