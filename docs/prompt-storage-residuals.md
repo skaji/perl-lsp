@@ -89,6 +89,19 @@ Two unverified observations from the cpp adversarial review:
 - **`modules-{lang}.db` rows for deleted files are skipped on warm but
   never purged** — a suspected unbounded-growth residual on long-lived
   pack caches. Sibling of the watcher re-registration residual above.
+- **The `strings` interner is never garbage-collected.** `shred_derived_rows`
+  re-shreds a file by deleting and re-inserting its `refs` and `syms` rows
+  (`DELETE FROM refs/syms WHERE file_id = ?`), but never its strings; the
+  only `DELETE FROM strings` in the tree is in `clear_derived_rows`, the
+  hard clear. So within one cache generation the interner grows
+  monotonically with every edit and re-shred — a name that no surviving row
+  references still occupies its row. Measured at 556k rows / 31 MB, which is
+  why this is a residual and not a bug, but it is unbounded *by
+  construction*: nothing in the write path can ever shrink it. A collector
+  would be a `DELETE FROM strings WHERE id NOT IN (SELECT name_id FROM refs
+  UNION SELECT name_id FROM syms)` sweep, which is cheap to write and
+  expensive to run, so it wants a trigger (generation rollover, or a row
+  count threshold) rather than running per shred.
 - **`clean_body` truncates at `//` inside string literals** — a
   `#define URL "https://x"` body would be mangled, potentially flipping
   the whole-file validate gate to alias-only. Needs a string-literal-aware
