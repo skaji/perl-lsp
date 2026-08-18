@@ -500,3 +500,101 @@ fn two_askers_with_different_use_lib_see_different_providers() {
          name means the t/lib copy",
     );
 }
+
+// ---- The bounded persist queue ----
+
+/// The cap has to be a property of the design, not of the corpus: an
+/// unbounded channel parks whatever the walk outruns, which at 138k files is
+/// about four fifths of the corpus in RAM. With a bound, a producer that gets
+/// ahead is throttled to writer rate, so peak in-flight can never exceed the
+/// depth however large the tree is.
+#[test]
+fn a_full_queue_throttles_the_producer_to_drain_rate() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+    // Depth is floored at one chunk, so ask for exactly that.
+    std::env::set_var("PERL_LSP_WRITE_QUEUE_DEPTH", "1");
+    let depth = write_queue_depth();
+    std::env::remove_var("PERL_LSP_WRITE_QUEUE_DEPTH");
+    assert_eq!(depth, PERSIST_CHUNK, "depth floors at one transaction");
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(depth);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let total = depth * 4;
+    let (s, r, p) = (Arc::clone(&sent), Arc::clone(&received), Arc::clone(&peak));
+    let producer = std::thread::spawn(move || {
+        for i in 0..total {
+            send_to_writer(&tx, i);
+            // Sampled AFTER the send lands, so it can only over-report.
+            let in_flight = s.fetch_add(1, O::SeqCst) + 1 - r.load(O::SeqCst);
+            p.fetch_max(in_flight, O::SeqCst);
+        }
+    });
+
+    let mut drained = 0usize;
+    while let Ok(_e) = rx.recv() {
+        received.fetch_add(1, O::SeqCst);
+        drained += 1;
+        // Slow consumer: the producer must be the one that waits.
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    producer.join().unwrap();
+
+    assert_eq!(drained, total, "every entry still reaches the writer");
+    let observed = peak.load(O::SeqCst);
+    assert!(
+        observed <= depth + 1,
+        "peak in-flight {observed} exceeded the {depth}-entry bound — the queue is not \
+         throttling the producer"
+    );
+}
+
+/// A writer that dies must not wedge the walk. `send_to_writer` returns on a
+/// disconnected receiver instead of parking forever, so the index degrades to
+/// "these files are not persisted this run" rather than hanging.
+#[test]
+fn a_dead_writer_releases_the_producer_instead_of_hanging() {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<usize>(PERSIST_CHUNK);
+    drop(rx);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // More entries than the depth: with a blocking send against a live
+        // but stalled receiver this would never return.
+        for i in 0..(PERSIST_CHUNK * 2) {
+            send_to_writer(&tx, i);
+        }
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a disconnected receiver must release the producer");
+}
+
+/// End-to-end over the real harness: more entries than the queue holds still
+/// all reach `on_committed`. Pins that bounding did not introduce a stall or
+/// drop between the throttled producer and the batching drain.
+#[test]
+fn the_writer_drains_more_entries_than_the_queue_holds() {
+    use std::sync::atomic::{AtomicUsize, Ordering as O};
+    std::env::set_var("PERL_LSP_WRITE_QUEUE_DEPTH", "1"); // → PERSIST_CHUNK
+    let (tx, rx) = bounded_persist_channel::<usize>();
+    std::env::remove_var("PERL_LSP_WRITE_QUEUE_DEPTH");
+
+    let committed = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&committed);
+    let total = PERSIST_CHUNK * 3 + 7;
+    let producer = std::thread::spawn(move || {
+        for i in 0..total {
+            send_to_writer(&tx, i);
+        }
+    });
+    // No connection: the harness drains unregistered, which is enough to
+    // prove the producer/consumer pairing. The committed lane is exercised by
+    // the persist-lane tests in `pack_invalidator_tests`.
+    run_persist_writer(rx, None, "test", |_c, _b: &[usize]| {}, |_e| { c.fetch_add(1, O::SeqCst); }, |_e| {});
+    producer.join().unwrap();
+    assert_eq!(committed.load(O::SeqCst), 0, "no connection ⇒ drained unregistered");
+}

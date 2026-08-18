@@ -955,6 +955,75 @@ fn kind_comparisons_name_real_grammar_kinds() {
     );
 }
 
+/// Every producer that can PARK on the bounded persist queue is allowlisted,
+/// because parking is only safe while holding no lock the writer needs.
+///
+/// `run_persist_writer`'s committed and fallback lanes take `ModuleIndex`,
+/// `FileStore` and bag-cache guards. A producer that blocked on a full queue
+/// while holding one of those could never be woken — the writer cannot drain
+/// to free a slot. Today every site hands over fully-owned values
+/// (`prepare_*_parts` tokens, encoded blobs) with no guard live, which is the
+/// property that makes the bound safe. It is not self-evident from the call
+/// site, so a NEW one fails here until its author has answered the same
+/// question. This is the `filestore-guard-discipline` family, which has
+/// already produced two deadlocks in this codebase.
+#[test]
+fn persist_queue_producers_are_allowlisted() {
+    // file stem → (call sites, why parking there is safe)
+    // `source_files` reports the LAYER-directory stem, so both bulk
+    // indexers land under one key; the reasons are per file.
+    let allow: Vec<(&str, usize, &str)> = vec![(
+        "module_resolver",
+        4,
+        "index_perl's deferred + whole lanes (parts/blob owned; the FileStore write \
+         happens AFTER the send) and index_pack's two (register_symbols completes \
+         BEFORE the send)",
+    )];
+    let expected: HashMap<String, usize> =
+        allow.iter().map(|(f, n, _)| (f.to_string(), *n)).collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (path, _layer, stem) in source_files() {
+        let text = fs::read_to_string(&path).unwrap();
+        let n = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("send_to_writer(")
+            })
+            .count();
+        // The definition itself lives in `persist`; don't count it.
+        if n > 0 && !text.contains("pub(crate) fn send_to_writer") {
+            *seen.entry(stem.clone()).or_default() += n;
+        }
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    for (file, n) in &seen {
+        match expected.get(file) {
+            Some(exp) if exp == n => {}
+            Some(exp) => violations.push(format!(
+                "send_to_writer() call-site count changed in {file}: {n} (allowlisted {exp}) —                  state what guard, if any, is held at the new send"
+            )),
+            None => violations.push(format!(
+                "send_to_writer() called from {file} ({n} site(s)) — not allowlisted. A producer                  may park on a full queue, so it must hold NO index/store guard at the send"
+            )),
+        }
+    }
+    for (file, exp) in &expected {
+        if !seen.contains_key(file) {
+            violations.push(format!(
+                "send_to_writer() allowlisted in {file} ({exp}) but no call site found —                  update the allowlist"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "persist-queue producer drift:\n{}",
+        violations.join("\n")
+    );
+}
+
 /// A time-valued tunable must say its unit in its name.
 ///
 /// `BENCH_REQ_TIMEOUT` held seconds while `PERL_LSP_RESOLVE_BUDGET_MS` held

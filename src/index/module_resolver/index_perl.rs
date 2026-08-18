@@ -267,7 +267,7 @@ pub fn index_workspace_with_index(
         closure: crate::model::file_analysis::path_intern::ClosureList,
         stamp: (i64, i64),
     }
-    let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<WsFresh>();
+    let (fresh_tx, fresh_rx) = bounded_persist_channel::<WsFresh>();
     let timing = crate::util::timings::is_enabled();
 
     // Deliberate whole-copy accounting for the workspace-tier residency
@@ -426,8 +426,12 @@ pub fn index_workspace_with_index(
                         // "not yet indexed" — never wrong-empty.
                         let (arc, parts) = match module_index {
                             Some(idx) => {
-                                let parts =
+                                let mut parts =
                                     idx.prepare_workspace_parts(&canon, analysis, crate::model::file_analysis::Residency::Skeleton);
+                                // Takes the surface out rather than cloning it:
+                                // the writer's registration half discards it, so
+                                // it would otherwise ride the queue only to be
+                                // dropped.
                                 parts.record_surface(idx, &canon);
                                 (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
@@ -437,7 +441,7 @@ pub fn index_workspace_with_index(
                             }
                         };
                         let (blob, seeds, sym_seeds, closure) = payload.unwrap();
-                        let _ = fresh_tx.send(WsFresh {
+                        send_to_writer(&fresh_tx, WsFresh {
                             path: canon.clone(),
                             arc,
                             parts,
@@ -469,7 +473,7 @@ pub fn index_workspace_with_index(
                             None => std::sync::Arc::new(analysis),
                         };
                         if let Some((blob, seeds, sym_seeds, closure)) = payload {
-                            let _ = fresh_tx.send(WsFresh {
+                            send_to_writer(&fresh_tx, WsFresh {
                                 path: canon.clone(),
                                 arc: arc.clone(),
                                 parts: None,

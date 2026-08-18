@@ -186,7 +186,7 @@ pub fn index_pack_languages(
                             }
                             // The stub IS a persisted `prepare_pack_parts`
                             // output — rehydrate the token, register through it.
-                            let parts =
+                            let mut parts =
                                 crate::index::module_index::PackRegistrationParts::from_warm_stub(stub);
                             parts.record_surface(&pack_index, &path);
                             pack_index.register_symbols_inner(path.clone(), parts);
@@ -205,7 +205,7 @@ pub fn index_pack_languages(
                     // The ladder that used to be `strip_bag && rows_ok`.
                     let level = crate::model::file_analysis::Residency::for_strip(eviction_enabled(), rows_ok);
                     let fully_stripped = level == crate::model::file_analysis::Residency::Skeleton;
-                    let parts = crate::index::module_index::ModuleIndex::prepare_pack_parts(
+                    let mut parts = crate::index::module_index::ModuleIndex::prepare_pack_parts(
                         fa,
                         level,
                     );
@@ -298,7 +298,7 @@ pub fn index_pack_languages(
             sym_seeds: Vec<crate::model::file_analysis::SymRowSeed>,
             stamp: (i64, i64),
         }
-        let (fresh_tx, fresh_rx) = std::sync::mpsc::channel::<FreshEntry>();
+        let (fresh_tx, fresh_rx) = bounded_persist_channel::<FreshEntry>();
         let persist = conn.is_some();
         let strip = persist && eviction_enabled();
         // Every DELIBERATE whole-copy registration under strip increments
@@ -437,7 +437,7 @@ pub fn index_pack_languages(
                         // the writer — it registers after the chunk COMMITS,
                         // so an evicted copy is never reachable before its blob
                         // can rehydrate it.
-                        let parts = crate::index::module_index::ModuleIndex::prepare_pack_parts(
+                        let mut parts = crate::index::module_index::ModuleIndex::prepare_pack_parts(
                             analysis, crate::model::file_analysis::Residency::Skeleton,
                         );
                         let stub_blob = module_cache::encode_stub(
@@ -451,7 +451,7 @@ pub fn index_pack_languages(
                         parts.record_surface(&pack_index, &canon);
                         let (blob, seeds, sym_seeds) = payload.unwrap();
                         let arc = Arc::clone(parts.arc());
-                        let _ = fresh_tx.send(FreshEntry {
+                        send_to_writer(&fresh_tx, FreshEntry {
                             path: canon.clone(),
                             arc,
                             parts: Some(parts),
@@ -469,7 +469,7 @@ pub fn index_pack_languages(
                         let arc = Arc::new(analysis);
                         pack_index.register_symbols(path.clone(), arc.clone());
                         if let Some((blob, seeds, sym_seeds)) = payload {
-                            let _ = fresh_tx.send(FreshEntry {
+                            send_to_writer(&fresh_tx, FreshEntry {
                                 path: canon.clone(),
                                 arc,
                                 parts: None,
