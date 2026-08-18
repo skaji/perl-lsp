@@ -735,7 +735,7 @@ impl ModuleIndex {
         fa: FileAnalysis,
         level: crate::model::file_analysis::Residency,
     ) -> Arc<FileAnalysis> {
-        let parts = self.prepare_workspace_parts(&path, fa, level);
+        let mut parts = self.prepare_workspace_parts(&path, fa, level);
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_workspace_residency(path, parts);
@@ -1113,7 +1113,7 @@ impl ModuleIndex {
         // indexers that strip go through `register_symbols_stripping`.
         // `whole` mints the deliberate whole-copy token (feed + surface off
         // the unstripped arc) — the only door that pins a resident analysis.
-        let parts = PackRegistrationParts::whole(analysis);
+        let mut parts = PackRegistrationParts::whole(analysis);
         parts.record_surface(self, &path);
         self.register_symbols_inner(path, parts);
     }
@@ -1149,7 +1149,7 @@ impl ModuleIndex {
         let names = self.workspace_feed_prestrip(path, &fa);
         let surface = crate::model::surface::Surface::project(&fa);
         fa.evict_to(level);
-        WorkspaceRegistrationParts { arc: Arc::new(fa), names, surface }
+        WorkspaceRegistrationParts { arc: Arc::new(fa), names, surface: Some(surface) }
     }
 
     /// The ONE speller of the pack strip ordering: feed + specs + surface
@@ -1165,7 +1165,7 @@ impl ModuleIndex {
         let (feed, specs) = Self::prepare_pack_feed(&fa);
         let surface = crate::model::surface::Surface::project(&fa);
         fa.evict_to(level);
-        PackRegistrationParts { arc: Arc::new(fa), feed, specs, surface }
+        PackRegistrationParts { arc: Arc::new(fa), feed, specs, surface: Some(surface) }
     }
 
     pub fn register_symbols_stripping(
@@ -1174,7 +1174,7 @@ impl ModuleIndex {
         fa: FileAnalysis,
         level: crate::model::file_analysis::Residency,
     ) -> Arc<FileAnalysis> {
-        let parts = Self::prepare_pack_parts(fa, level);
+        let mut parts = Self::prepare_pack_parts(fa, level);
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_symbols_inner(path, parts);
