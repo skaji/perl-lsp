@@ -17,7 +17,12 @@ pub(super) fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'
         method_call_nodes: Vec::new(),
         chained_hash_elements: Vec::new(),
     };
-    fn walk<'t>(node: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
+    // Explicit stack, like every other tree pass here: a recursive descent
+    // costs one frame per CST level, and a stack overflow is a fatal abort
+    // no `catch_unwind` can net.
+    fn walk<'t>(root: Node<'t>, idx: &mut ChainTypingIndex<'t>) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
         match node.kind() {
             "assignment_expression" => {
                 idx.assignment_nodes.push(node);
@@ -51,10 +56,13 @@ pub(super) fn build_chain_typing_index<'a>(tree: &'a Tree) -> ChainTypingIndex<'
             }
             _ => {}
         }
-        for i in 0..node.named_child_count() {
+        // Reversed: popping from the end yields named child 0 first, so the
+        // ordered `Vec` fields keep document order.
+        for i in (0..node.named_child_count()).rev() {
             if let Some(c) = node.named_child(i) {
-                walk(c, idx);
+                stack.push(c);
             }
+        }
         }
     }
     walk(tree.root_node(), &mut idx);
@@ -65,18 +73,28 @@ pub fn build(tree: &Tree, source: &[u8]) -> FileAnalysis {
     build_with_plugins(tree, source, default_plugin_registry())
 }
 
-/// Hard ceiling on CST depth before the recursive walk is allowed to start.
+/// Sanity ceiling on CST depth, checked before the walk starts.
 ///
-/// The walk (`visit_node` → visitor → `visit_children`, a few frames per CST
-/// level) overflows a 2 MB rayon worker stack near ~2,200 levels (a 50 KB XML
-/// document shipped as `.pm`), and a stack overflow is a fatal abort that
-/// `catch_unwind` cannot catch — so the gate must run BEFORE the recursion,
-/// not around it. Measured 2026-08-17: Koha (3,553 files) tops out at depth
-/// 64; the deepest of 138,806 CPAN-5k files is 247 (generated encoding
-/// tables), plus one 5,336-level generated data table (`uts46data.pl`).
-/// 500 sits 2× above the deepest observed real Perl and ~4× under the
-/// observed overflow depth.
-pub(crate) const MAX_CST_DEPTH: usize = 500;
+/// This is no longer what keeps the process alive. The walk, the chain-typing
+/// index and the expression-shape typing are all bounded independently of CST
+/// depth (`walk.rs`, `build_chain_typing_index`, `MAX_EXPR_TYPE_DEPTH`), so a
+/// deep file is analyzed rather than refused. What remains is a bound on the
+/// absurd: past this point a file is not source anyone wrote, and analyzing it
+/// buys nothing while costing time and heap proportional to its depth.
+///
+/// The number follows from measurement, not inheritance. On a 2 MiB stack
+/// (the rayon worker size), release build, nested `[`:
+///
+/// | | deepest that yields a real analysis |
+/// |---|---|
+/// | recursive walk (before) | 1,803 — aborts by 2,503 |
+/// | iterative walk (now) | **1,000,003**, and that was the probe's ceiling, not the code's |
+///
+/// Against real input: the deepest of 138,806 CPAN files is 247 levels, and
+/// the deepest generated artifact seen is 5,336. 100,000 sits ~19× above
+/// anything observed and 10× below the verified survivable depth — the
+/// headroom is on the side where being wrong used to abort the server.
+pub(crate) const MAX_CST_DEPTH: usize = 100_000;
 
 /// Maximum node depth of the tree, measured iteratively (`TreeCursor`, no
 /// recursion — safe to run on exactly the trees the walk cannot handle).
@@ -202,8 +220,34 @@ pub(super) fn build_with_plugins_inner(
     plugins: Arc<PluginRegistry>,
     extra_re_fold: bool,
 ) -> FileAnalysis {
-    // Depth gate FIRST: past ~2,200 CST levels the recursive walk is a fatal
-    // stack overflow no unwind net can catch. See `MAX_CST_DEPTH`.
+    let fa = build_once(tree, source, plugins.clone(), extra_re_fold);
+    // `PERL_LSP_WALK_EQUIV=1 cargo test` re-builds every file the suite
+    // touches with the recursive descent and asserts the two agree. Running
+    // it over the whole suite — not a fixture list — is the point: it is the
+    // only corpus that covers every visitor arm.
+    #[cfg(test)]
+    if super::walk::equivalence_check_enabled()
+        && super::walk::recursive_walk_forced().is_none()
+        && cst_depth(tree) <= super::walk::MAX_COMPARABLE_DEPTH
+    {
+        super::walk::assert_walks_agree(&fa, || {
+            super::walk::with_walk_mode(true, || {
+                build_once(tree, source, plugins.clone(), extra_re_fold)
+            })
+        });
+    }
+    fa
+}
+
+fn build_once(
+    tree: &Tree,
+    source: &[u8],
+    plugins: Arc<PluginRegistry>,
+    extra_re_fold: bool,
+) -> FileAnalysis {
+    // Cheap structural bound, measured iteratively so it is safe on exactly
+    // the trees it screens. See `MAX_CST_DEPTH` for why the number is what
+    // it is and what it does — and no longer does.
     let depth = cst_depth(tree);
     if depth > MAX_CST_DEPTH {
         return too_deep_analysis(tree, depth);
@@ -300,6 +344,10 @@ pub(super) fn build_with_plugins_inner(
         arrow_deref_sites: Vec::new(),
         anon_sub_symbol_by_span: std::collections::HashMap::new(),
         modifier_invocant_pos: None,
+        expr_type_depth: 0,
+        walk_stack: Vec::new(),
+        recursive_walk: super::walk::recursive_walk_forced()
+            .unwrap_or_else(super::walk::recursive_walk_requested),
     };
     b.dispatch_manifest = b
         .plugins
@@ -360,7 +408,7 @@ pub(super) fn build_with_plugins_inner(
 
     // Create file-level scope and walk
     let file_scope = b.push_scope(ScopeKind::File, node_to_span(tree.root_node()), None);
-    bphase!("walk(visit_children)", b.visit_children(tree.root_node()));
+    bphase!("walk", b.drive_walk(tree.root_node()));
     // Still inside the file scope: synthesize Sub symbols for AutoLoader /
     // SelfLoader packages whose real definitions live in the `data_section`
     // after `__END__` (or `__DATA__`). Runs here so `package_uses` /

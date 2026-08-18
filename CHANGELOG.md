@@ -6,6 +6,49 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
+### The CST walk no longer grows the stack per level
+
+- **The builder walk is iterative.** `visit_node` dispatches a node and
+  *queues* what it wants walked next; one loop drains the queue. Depth costs
+  heap instead of native stack, so a deeply-nested file is analyzed rather
+  than aborting the process — a stack overflow is a fatal abort no
+  `catch_unwind` can net, which made one generated file able to take the whole
+  server down. Measured on a 2 MiB rayon worker stack, release: the recursive
+  descent gave a real analysis at 1,803 CST levels and aborted by 2,503; the
+  iterative walk reaches **1,000,003**, which was the probe's ceiling and not
+  the code's.
+- Two further depth-proportional recursions went with it, since removing only
+  the walk would have left the cliff standing: the chain-typing index walk is
+  now an explicit stack, and expression-shape typing — which is inherently
+  post-order and cannot be queued — is bounded by `MAX_EXPR_TYPE_DEPTH`,
+  degrading a pathologically-nested literal's type to plain `ArrayRef`/
+  `HashRef` exactly as it already did for an element it could not type. The
+  file still gets a full analysis; only that one type coarsens.
+- **`MAX_CST_DEPTH` is 100,000**, up from 500, and is now a bound on the
+  absurd rather than the thing keeping the process alive. The number follows
+  from the measurement above: ~19x above the deepest input ever observed
+  (5,336, a generated data table; the deepest real Perl in 138,806 files is
+  247) and 10x below the verified survivable depth. Files past it still
+  degrade honestly with a `cst-too-deep` diagnostic.
+- **Same analysis, proven.** Both walks are compared over every Perl file in
+  the repo on an ordinary `cargo test`, and over every file the whole suite
+  touches under `PERL_LSP_WALK_EQUIV=1`. The comparison is on the serde
+  projection rather than bincode bytes, because `HashMap` iteration order
+  differs between two builds in one thread and would report differences that
+  are not there.
+
+### Builds are deterministic again
+
+- Three fold-phase passes emitted witnesses in `HashMap`/`HashSet` iteration
+  order, so **the same file built twice produced a different `WitnessBag`** —
+  and therefore a different cached blob for an unchanged file, churning cache
+  writes and falsifying the "same input, same output" assumption the storage
+  layer's freshness and stamp comparisons rest on. Several reducers are
+  documented latest-wins, and the protection against that was accidental
+  ordering. Inheritance edges (`package_parents`), `push @arr` contributions
+  and arity-discriminated returns now emit in document order.
+
+
 ### Four new LSP verbs, all projections of existing machinery
 
 - **Go to type definition** — `$obj` jumps to the definition of its

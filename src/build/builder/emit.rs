@@ -387,7 +387,35 @@ impl<'a> Builder<'a> {
     /// + RHS-of-assignment) firing against the same node produce
     /// duplicate witnesses but don't change query answers, since the
     /// latest-wins reducers fold them all the same way.
+    /// How deep expression-shape typing will nest before it degrades.
+    ///
+    /// Typing a compound expression is inherently post-order — `[[1]]` cannot
+    /// name its `Sequence` until the inner literal has one — so this recursion
+    /// is not queueable the way the CST walk is. It is bounded instead. Past
+    /// the bound `expr_payload` declines, and the enclosing shape takes the
+    /// path it already takes for an element it cannot type: `Sequence`
+    /// degrades to plain `ArrayRef`/`HashRef`.
+    ///
+    /// The file still gets a REAL analysis — symbols, refs and scopes are the
+    /// walk's output and are unaffected; only the type attached to one
+    /// pathologically-nested literal coarsens. 64 is far above any nesting a
+    /// reader could follow (the deepest CST in 138,806 CPAN files is 247
+    /// levels *total*), and a `Sequence` nested deeper than this describes
+    /// nothing a consumer can use.
+    pub(super) const MAX_EXPR_TYPE_DEPTH: usize = 64;
+
     pub(super) fn emit_expr_witness(&mut self, node: Node<'a>) {
+        
+        if self.expr_type_depth >= Self::MAX_EXPR_TYPE_DEPTH {
+            return;
+        }
+        self.expr_type_depth += 1;
+        let out = self.emit_expr_witness_inner(node);
+        self.expr_type_depth -= 1;
+        out
+    }
+
+    fn emit_expr_witness_inner(&mut self, node: Node<'a>) {
         use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
         let span = node_to_span(node);
         if node.kind() == "conditional_expression" {

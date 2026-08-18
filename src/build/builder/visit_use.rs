@@ -704,7 +704,7 @@ impl<'a> Builder<'a> {
     pub(super) fn visit_require(&mut self, node: Node<'a>) {
         let Some(operand) = node.named_child(0) else { return };
         if operand.kind() != "bareword" {
-            self.visit_children(node);
+            self.queue_children(node);
             return;
         }
         let Ok(name) = operand.utf8_text(self.source) else { return };
@@ -1314,191 +1314,205 @@ impl<'a> Builder<'a> {
                 // substitution witnesses through the Symbol
                 // attachment without a per-shape dispatch in the
                 // chase site.
-                self.visit_node(right);
-                // Push the RHS's Expr(span) witness so the bag is
-                // canonical for this expression, then query for the
-                // resolved type. `emit_expr_witness` covers every
-                // shape via `expr_payload` — literals, anon-subs,
-                // constructor patterns, binary ops, scalars, calls,
-                // ternaries; Edge payloads resolve through the
-                // registry's materialization.
-                self.emit_expr_witness(right);
-                let mut inferred = self.bag_query_expr_span(node_to_span(right));
-                // `my %h = (k => v, …)` — the list IS a hash literal in
-                // this position, the hashref's second spelling. The
-                // list's own Expr witness can't carry that (its meaning
-                // depends on the LHS sigil), so type it from the LHS
-                // side through the same shape builder.
-                if inferred.is_none() && right.kind() == "list_expression" {
-                    if let Some(vt) = self.get_var_text_from_lhs(left) {
-                        if vt.starts_with('%') {
-                            inferred = Some(self.hash_literal_type(right));
-                        } else if vt.starts_with('@') {
-                            inferred = self.list_literal_type(right);
-                        }
-                    }
+                self.queue_node_then(right, move |b| b.assignment_after_rhs(node, left, right));
+            } else if left.kind() != "variable_declaration" {
+                // No RHS to read a type from, but the LHS still owes its refs.
+                self.queue_node(left);
+            }
+        } else {
+            // No left field — just visit children
+            self.queue_children(node);
+        }
+    }
+
+    /// The half of `visit_assignment` that can only run once the RHS subtree
+    /// is walked: read the rvalue's type, seed constraints and key writes
+    /// from it, then descend the LHS.
+    ///
+    /// Split out because the shape is descend → work → descend, which the
+    /// `queue_children_then` combinator deliberately cannot express. The type
+    /// read is only valid after the RHS walk has allocated its refs and
+    /// anon-sub symbols.
+    fn assignment_after_rhs(&mut self, node: Node<'a>, left: Node<'a>, right: Node<'a>) {
+        // Push the RHS's Expr(span) witness so the bag is
+        // canonical for this expression, then query for the
+        // resolved type. `emit_expr_witness` covers every
+        // shape via `expr_payload` — literals, anon-subs,
+        // constructor patterns, binary ops, scalars, calls,
+        // ternaries; Edge payloads resolve through the
+        // registry's materialization.
+        self.emit_expr_witness(right);
+        let mut inferred = self.bag_query_expr_span(node_to_span(right));
+        // `my %h = (k => v, …)` — the list IS a hash literal in
+        // this position, the hashref's second spelling. The
+        // list's own Expr witness can't carry that (its meaning
+        // depends on the LHS sigil), so type it from the LHS
+        // side through the same shape builder.
+        if inferred.is_none() && right.kind() == "list_expression" {
+            if let Some(vt) = self.get_var_text_from_lhs(left) {
+                if vt.starts_with('%') {
+                    inferred = Some(self.hash_literal_type(right));
+                } else if vt.starts_with('@') {
+                    inferred = self.list_literal_type(right);
                 }
-                if self.lhs_list_targets(left).is_some() {
-                    // List/destructuring assignment is minted + typed by the
-                    // declarative `@flow` query pass (`mint_flow_edges_via_query`),
-                    // which reuses the same `lhs_list_targets`/`list_element_nodes`
-                    // pairing. This guard just keeps the eager arm below from
-                    // mis-typing a list's first var (`get_var_text_from_lhs`
-                    // returns only `$a`) as the whole RHS.
-                } else if let Some(it) = inferred {
-                    if let Some(vt) = self.get_var_text_from_lhs(left) {
-                        // `my $self = bless {}, $class` — the eager TC below
-                        // bakes the RHS's MATERIALIZED type (the no-receiver
-                        // fallback, i.e. the enclosing class); the deferred
-                        // witness keeps the ctor receiver-polymorphic at
-                        // call sites (wins via reducer order).
-                        self.push_receiver_bless_witness(&vt, right);
-                        self.push_type_constraint(TypeConstraint {
-                            variable: vt,
-                            scope: self.current_scope(),
-                            constraint_span: node_to_span(node),
-                            inferred_type: it,
-                        });
-                    }
-                }
-                // The unresolved single-var case (a cross-file chain that
-                // didn't type at walk time) is now minted + lowered by the
-                // declarative `@flow` query pass (`mint_flow_edges_via_query`),
-                // as a fallback that doesn't override the eager TC above.
-                // Always record call/method-call bindings (independent
-                // of whether the bag resolved a type) — they're the
-                // source-sub linkage that hash-key ownership fixup
-                // walks. Pre-Step-4, the bag's call resolution wasn't
-                // available at walk time so `inferred` was None for
-                // function calls and the binding fell out of the
-                // `else if` branch; with the implicit-return edge
-                // routing through SymbolReturnArm chains, the type
-                // surfaces but the binding still has to fire.
-                if let Some(func_name) = self.extract_call_name(right) {
-                    if let Some(vt) = self.get_var_text_from_lhs(left) {
-                        self.call_bindings.push(CallBinding {
-                            variable: vt,
-                            func_name,
-                            scope: self.current_scope(),
-                            span: node_to_span(node),
-                        });
-                    }
-                } else if right.kind() == "method_call_expression" {
-                    // RHS is a method call — record binding for return-type post-pass
-                    if let Some(method_node) = right.child_by_field_name("method") {
-                        if let Some(invocant_node) = right.child_by_field_name("invocant") {
-                            if let (Ok(method), Ok(inv)) = (
-                                method_node.utf8_text(self.source),
-                                invocant_node.utf8_text(self.source),
-                            ) {
-                                // Skip constructors — already handled by extract_constructor_class
-                                if !crate::model::conventions::is_constructor_name(method) {
-                                    if let Some(vt) = self.get_var_text_from_lhs(left) {
-                                        // Resolve dynamic method names via constant folding
-                                        let method_names = if method.starts_with('$') {
-                                            self.resolve_constant_strings(method, 0)
-                                                .unwrap_or_else(|| vec![method.to_string()])
-                                        } else {
-                                            vec![method.to_string()]
-                                        };
-                                        for mname in method_names {
-                                            self.method_call_bindings.push(MethodCallBinding {
-                                                variable: vt.clone(),
-                                                invocant_var: inv.to_string(),
-                                                method_name: mname,
-                                                scope: self.current_scope(),
-                                                span: node_to_span(node),
-                                            });
-                                        }
-                                    }
+            }
+        }
+        if self.lhs_list_targets(left).is_some() {
+            // List/destructuring assignment is minted + typed by the
+            // declarative `@flow` query pass (`mint_flow_edges_via_query`),
+            // which reuses the same `lhs_list_targets`/`list_element_nodes`
+            // pairing. This guard just keeps the eager arm below from
+            // mis-typing a list's first var (`get_var_text_from_lhs`
+            // returns only `$a`) as the whole RHS.
+        } else if let Some(it) = inferred {
+            if let Some(vt) = self.get_var_text_from_lhs(left) {
+                // `my $self = bless {}, $class` — the eager TC below
+                // bakes the RHS's MATERIALIZED type (the no-receiver
+                // fallback, i.e. the enclosing class); the deferred
+                // witness keeps the ctor receiver-polymorphic at
+                // call sites (wins via reducer order).
+                self.push_receiver_bless_witness(&vt, right);
+                self.push_type_constraint(TypeConstraint {
+                    variable: vt,
+                    scope: self.current_scope(),
+                    constraint_span: node_to_span(node),
+                    inferred_type: it,
+                });
+            }
+        }
+        // The unresolved single-var case (a cross-file chain that
+        // didn't type at walk time) is now minted + lowered by the
+        // declarative `@flow` query pass (`mint_flow_edges_via_query`),
+        // as a fallback that doesn't override the eager TC above.
+        // Always record call/method-call bindings (independent
+        // of whether the bag resolved a type) — they're the
+        // source-sub linkage that hash-key ownership fixup
+        // walks. Pre-Step-4, the bag's call resolution wasn't
+        // available at walk time so `inferred` was None for
+        // function calls and the binding fell out of the
+        // `else if` branch; with the implicit-return edge
+        // routing through SymbolReturnArm chains, the type
+        // surfaces but the binding still has to fire.
+        if let Some(func_name) = self.extract_call_name(right) {
+            if let Some(vt) = self.get_var_text_from_lhs(left) {
+                self.call_bindings.push(CallBinding {
+                    variable: vt,
+                    func_name,
+                    scope: self.current_scope(),
+                    span: node_to_span(node),
+                });
+            }
+        } else if right.kind() == "method_call_expression" {
+            // RHS is a method call — record binding for return-type post-pass
+            if let Some(method_node) = right.child_by_field_name("method") {
+                if let Some(invocant_node) = right.child_by_field_name("invocant") {
+                    if let (Ok(method), Ok(inv)) = (
+                        method_node.utf8_text(self.source),
+                        invocant_node.utf8_text(self.source),
+                    ) {
+                        // Skip constructors — already handled by extract_constructor_class
+                        if !crate::model::conventions::is_constructor_name(method) {
+                            if let Some(vt) = self.get_var_text_from_lhs(left) {
+                                // Resolve dynamic method names via constant folding
+                                let method_names = if method.starts_with('$') {
+                                    self.resolve_constant_strings(method, 0)
+                                        .unwrap_or_else(|| vec![method.to_string()])
+                                } else {
+                                    vec![method.to_string()]
+                                };
+                                for mname in method_names {
+                                    self.method_call_bindings.push(MethodCallBinding {
+                                        variable: vt.clone(),
+                                        invocant_var: inv.to_string(),
+                                        method_name: mname,
+                                        scope: self.current_scope(),
+                                        span: node_to_span(node),
+                                    });
                                 }
                             }
                         }
                     }
                 }
-                // Branch-arm detection: if RHS is a ternary, emit
-                // per-arm `branch_arm`-source `Edge(Expr(arm_span))`
-                // witnesses on the LHS variable, plus the arms' own
-                // Expr(span) payloads. POST visit_node — needs the
-                // arms' refs to exist so `expr_payload` can resolve
-                // `Edge(Expression(refidx))` for method-call arms.
-                if right.kind() == "conditional_expression" {
-                    if let Some(vt) = self.get_var_text_from_lhs(left) {
-                        self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+            }
+        }
+        // Branch-arm detection: if RHS is a ternary, emit
+        // per-arm `branch_arm`-source `Edge(Expr(arm_span))`
+        // witnesses on the LHS variable, plus the arms' own
+        // Expr(span) payloads. POST visit_node — needs the
+        // arms' refs to exist so `expr_payload` can resolve
+        // `Edge(Expression(refidx))` for method-call arms.
+        if right.kind() == "conditional_expression" {
+            if let Some(vt) = self.get_var_text_from_lhs(left) {
+                self.emit_branch_arm_witnesses_for_ternary(&vt, right, node);
+            }
+        }
+        // `$obj->{k} = <rhs>` slot-type seed. Record key-span →
+        // rhs-span so `populate_witness_bag` can mint
+        // `SlotType{owner_class, k} → Edge(Expr(rhs_span))`
+        // keyed off the matching HashKeyAccess Write ref (whose
+        // span is this key node's span). `emit_expr_witness(right)`
+        // already published the RHS's `Expr(rhs_span)`.
+        if left.kind() == "hash_element_expression" {
+            if let Some(key_node) = left.child_by_field_name("key") {
+                self.slot_write_rhs_span
+                    .insert(node_to_span(key_node), node_to_span(right));
+            }
+        }
+        if matches!(
+            left.kind(),
+            "hash_element_expression" | "array_element_expression"
+        ) {
+            self.record_key_write(left, Some(right));
+        }
+        // Slice / keyval writes (`@h{qw(a b)} = …`, `%h{k} = …`,
+        // `@$h{…}`) land several keys at once — record an
+        // open-switching write (`key: None`) on the container so
+        // a closed shape can't claim the slice-written keys as
+        // misses.
+        if matches!(left.kind(), "slice_expression" | "keyval_expression") {
+            {
+                // Three container spellings: sigil (`@h{…}` →
+                // canonical `%h`), sigil-deref (`@$h{…}` — the
+                // varname wraps the scalar; canonical would mint
+                // a garbage `%$h`, so the inner scalar wins),
+                // and postfix deref (`$h->@{…}` / `$h->%{…}` —
+                // grammar field `hashref:`, a plain scalar).
+                let name = match left.child_by_field_name("hash") {
+                    Some(container) => {
+                        crate::cst::varname_inner_scalar_text(container, self.source)
+                            .or_else(|| {
+                                crate::cst::canonical_container_name(
+                                    container,
+                                    self.source,
+                                )
+                            })
                     }
-                }
-                // `$obj->{k} = <rhs>` slot-type seed. Record key-span →
-                // rhs-span so `populate_witness_bag` can mint
-                // `SlotType{owner_class, k} → Edge(Expr(rhs_span))`
-                // keyed off the matching HashKeyAccess Write ref (whose
-                // span is this key node's span). `emit_expr_witness(right)`
-                // already published the RHS's `Expr(rhs_span)`.
-                if left.kind() == "hash_element_expression" {
-                    if let Some(key_node) = left.child_by_field_name("key") {
-                        self.slot_write_rhs_span
-                            .insert(node_to_span(key_node), node_to_span(right));
-                    }
-                }
-                if matches!(
-                    left.kind(),
-                    "hash_element_expression" | "array_element_expression"
-                ) {
-                    self.record_key_write(left, Some(right));
-                }
-                // Slice / keyval writes (`@h{qw(a b)} = …`, `%h{k} = …`,
-                // `@$h{…}`) land several keys at once — record an
-                // open-switching write (`key: None`) on the container so
-                // a closed shape can't claim the slice-written keys as
-                // misses.
-                if matches!(left.kind(), "slice_expression" | "keyval_expression") {
-                    {
-                        // Three container spellings: sigil (`@h{…}` →
-                        // canonical `%h`), sigil-deref (`@$h{…}` — the
-                        // varname wraps the scalar; canonical would mint
-                        // a garbage `%$h`, so the inner scalar wins),
-                        // and postfix deref (`$h->@{…}` / `$h->%{…}` —
-                        // grammar field `hashref:`, a plain scalar).
-                        let name = match left.child_by_field_name("hash") {
-                            Some(container) => {
-                                crate::cst::varname_inner_scalar_text(container, self.source)
-                                    .or_else(|| {
-                                        crate::cst::canonical_container_name(
-                                            container,
-                                            self.source,
-                                        )
-                                    })
-                            }
-                            None => left
-                                .child_by_field_name("hashref")
-                                .filter(|c| c.kind() == "scalar")
-                                .and_then(|c| c.utf8_text(self.source).ok())
-                                .map(|s| s.to_string()),
-                        };
-                        if let Some(var_text) = name {
-                            let span = node_to_span(left);
-                            self.key_writes.push(crate::model::file_analysis::KeyWrite {
-                                var_text,
-                                key: crate::model::file_analysis::WriteKey::Unknown,
-                                scope: self
-                                    .scope_stack
-                                    .last()
-                                    .copied()
-                                    .unwrap_or(crate::model::file_analysis::ScopeId(0)),
-                                span,
-                                rhs_span: None,
-                                conditional: true,
-                            });
-                        }
-                    }
+                    None => left
+                        .child_by_field_name("hashref")
+                        .filter(|c| c.kind() == "scalar")
+                        .and_then(|c| c.utf8_text(self.source).ok())
+                        .map(|s| s.to_string()),
+                };
+                if let Some(var_text) = name {
+                    let span = node_to_span(left);
+                    self.key_writes.push(crate::model::file_analysis::KeyWrite {
+                        var_text,
+                        key: crate::model::file_analysis::WriteKey::Unknown,
+                        scope: self
+                            .scope_stack
+                            .last()
+                            .copied()
+                            .unwrap_or(crate::model::file_analysis::ScopeId(0)),
+                        span,
+                        rhs_span: None,
+                        conditional: true,
+                    });
                 }
             }
-            // Visit LHS children (except the variable_declaration we already handled)
-            if left.kind() != "variable_declaration" {
-                self.visit_node(left);
-            }
-        } else {
-            // No left field — just visit children
-            self.visit_children(node);
+        }
+        // Visit LHS children (except the variable_declaration we already handled)
+        if left.kind() != "variable_declaration" {
+            self.queue_node(left);
         }
     }
 

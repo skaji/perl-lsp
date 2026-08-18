@@ -47,13 +47,15 @@ macro_rules! bphase {
 }
 
 
-mod pipeline;
+pub(crate) mod pipeline;
 pub use pipeline::*;
 mod arity;
 use arity::*;
 mod infra;
 mod chain;
 mod plugin_emit;
+pub(crate) mod walk;
+use walk::WalkTask;
 mod visit_decl;
 mod visit_use;
 mod emit;
@@ -634,6 +636,18 @@ struct Builder<'a> {
     /// `visit_anonymous_sub` so it applies only to the immediately
     /// following anon sub, not to nested lambdas.
     modifier_invocant_pos: Option<usize>,
+
+    /// Current nesting of expression-shape typing — see
+    /// `MAX_EXPR_TYPE_DEPTH`. Post-order type construction cannot be
+    /// queued the way the walk is, so it is bounded instead.
+    expr_type_depth: usize,
+
+    /// Pending walk work. The CST descent lives here rather than on the
+    /// native stack — see `walk.rs`.
+    walk_stack: Vec<WalkTask<'a>>,
+    /// Restore the pre-worklist recursive descent (`PERL_LSP_RECURSIVE_WALK=1`).
+    /// Read once per build so the walk primitives branch on a bool, not on env.
+    recursive_walk: bool,
 }
 
 /// Owner-and-gating discriminator for `emit_call_arg_key_accesses`.

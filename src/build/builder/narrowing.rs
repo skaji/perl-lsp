@@ -159,7 +159,7 @@ fn func1op_subject_arg<'a>(node: Node<'a>) -> Option<Node<'a>> {
 /// (`||`/`or`) or unrecognized condition yields none. `builder` is
 /// threaded so recognizers can consult constant-fold state (a folded
 /// class name in `$x->isa($CLASS)`).
-fn recognize_guards(builder: &Builder, cond: Node, source: &[u8]) -> Vec<GuardFact> {
+fn recognize_guards<'a>(builder: &Builder<'a>, cond: Node<'a>, source: &[u8]) -> Vec<GuardFact> {
     // Peel transparent `(...)` / single-element list wrappers up front, so
     // `if (($x->isa('Foo')))` and nested grouping fall through to the real
     // condition — one shared primitive instead of a per-shape arm.
@@ -234,7 +234,7 @@ fn recognize_blessed_guard(call: Node, source: &[u8]) -> Option<GuardFact> {
 /// `$x->isa('Foo')` / `$x->DOES('Role')` → narrow `$x` to `ClassName`.
 /// The class argument is a string literal, or a scalar that the builder's
 /// constant fold pins to a single class (`my $C = 'Foo'; $x->isa($C)`).
-fn recognize_isa_guard(builder: &Builder, call: Node, source: &[u8]) -> Option<GuardFact> {
+fn recognize_isa_guard<'a>(builder: &Builder<'a>, call: Node<'a>, source: &[u8]) -> Option<GuardFact> {
     let mc = crate::cst::MethodCall::cast(call)?;
     let method = mc.method()?.utf8_text(source).ok()?;
     if method != "isa" && method != "DOES" {

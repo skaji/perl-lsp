@@ -14,14 +14,33 @@
       "expect": {
         "all": [
           "\"code\":\"cst-too-deep\"",
-          "\"file\":\"deep_a.pm\"",
-          "\"file\":\"deep_b.pm\"",
-          "analysis skipped: parse tree depth 12003 exceeds the 500 limit"
+          "\"file\":\"too_deep.pm\"",
+          "analysis skipped: parse tree depth 120003 exceeds the 100000 limit"
         ],
         "none": []
       },
       "status": "gold",
-      "note": "The depth gate's degradation contract: a file past MAX_CST_DEPTH gets no analysis and SAYS SO — one cst-too-deep warning per skipped file, while the rest of the workspace analyzes normally."
+      "note": "The depth gate's degradation contract, for input past the sanity bound: a file past MAX_CST_DEPTH gets no analysis and SAYS SO — one cst-too-deep warning per skipped file, while the rest of the workspace analyzes normally. too_deep.pm (120,003 levels) is the only file here past the bound; deep_a.pm/deep_b.pm sit under it and are now analyzed for real, which deepcst-walked-not-refused pins."
+    },
+    {
+      "id": "deepcst-walked-not-refused",
+      "difficulty": "simple",
+      "semantic_area": "robustness",
+      "root": "gold-corpus/deepcst-fixture",
+      "file": "",
+      "line": 0,
+      "col": 0,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [],
+        "none": [
+          "\"file\":\"deep_a.pm\"",
+          "\"file\":\"deep_b.pm\""
+        ]
+      },
+      "status": "gold",
+      "note": "The iterative walk's payoff, pinned end-to-end: deep_a.pm/deep_b.pm are 12,003-level CSTs — 6.6x past the depth at which the recursive walk aborted a 2 MB rayon worker — and they now carry NO cst-too-deep diagnostic, i.e. they are analyzed rather than refused. Under the recursive walk these two files could only ever be gated; walking them at all is the thing that changed."
     }
   ]
 }

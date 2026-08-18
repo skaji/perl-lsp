@@ -26,7 +26,7 @@ impl<'a> Builder<'a> {
                         for j in 0..child.child_count() {
                             if let Some(gc) = child.child(j) {
                                 if gc.kind() == "block" {
-                                    self.visit_children(gc);
+                                    self.queue_children(gc);
                                     return;
                                 }
                             }
@@ -46,7 +46,7 @@ impl<'a> Builder<'a> {
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "block" {
-                    self.visit_children(child);
+                    self.queue_children(child);
                     return;
                 }
             }
@@ -59,7 +59,7 @@ impl<'a> Builder<'a> {
         // and stop, since the outer node's own text (`%$x`) isn't a variable
         // name. Block-derefs (`%{...}`) are handled above.
         if let Some(inner) = self.sigil_deref_inner_scalar(node) {
-            self.visit_var_ref(inner);
+            self.queue_node(inner);
             return;
         }
 
@@ -238,7 +238,7 @@ impl<'a> Builder<'a> {
         // ref for it (otherwise every `print STDERR ...` flags STDERR as
         // unresolved). Visit the real payload args; skip the verb-as-func.
         if self.is_indirect_object_filehandle_call(node) {
-            self.visit_children(node);
+            self.queue_children(node);
             return;
         }
         // Symbolic-code-deref call: `&{ EXPR }(...)`. The `function` field is
@@ -252,7 +252,7 @@ impl<'a> Builder<'a> {
             .map(|f| f.kind() == "code_deref_expression" || code_deref_in(f).is_some())
             .unwrap_or(false)
         {
-            self.visit_children(node);
+            self.queue_children(node);
             return;
         }
         if let Some(func_node) = node.child_by_field_name("function") {
@@ -449,11 +449,10 @@ impl<'a> Builder<'a> {
         if lite_group {
             self.topic_group_spans.push(node_to_span(node));
         }
-        self.visit_children(node);
         // If `modifier_invocant_pos` wasn't consumed by a nested `visit_anonymous_sub`
         // (malformed or modifier-without-sub-body code), clear it so it doesn't leak
         // to the next anonymous sub in the file.
-        self.modifier_invocant_pos = None;
+        self.queue_children_then(node, |b| b.modifier_invocant_pos = None);
     }
 
     /// True when `node` is the bareword-filehandle argument of a

@@ -16,7 +16,7 @@ impl<'a> Builder<'a> {
                 self.push_var_type_constraint(arg, node, arg_type);
             }
         }
-        self.visit_children(node);
+        self.queue_children(node);
     }
 
     /// Handle `\&name` and `\&Pkg::name` refgen expressions.
@@ -48,7 +48,7 @@ impl<'a> Builder<'a> {
         }
         // Still descend: `\@array`, `\%hash`, `\$scalar` children may carry
         // variable refs that the walk needs to see.
-        self.visit_children(node);
+        self.queue_children(node);
     }
 
     /// Extract the first argument node from a function call.
@@ -367,7 +367,7 @@ impl<'a> Builder<'a> {
             self.record_plugin_loads(name, node, invocant_node);
         }
 
-        self.visit_children(node);
+        self.queue_children(node);
     }
 
     /// Class::Accessor::Grouped accessor synthesis. The `mk_group_*_accessors`
@@ -509,7 +509,7 @@ impl<'a> Builder<'a> {
         }
 
         // Visit children for the container variable ref
-        self.visit_children(node);
+        self.queue_children(node);
     }
 
     pub(super) fn visit_anon_hash(&mut self, node: Node<'a>) {
@@ -540,7 +540,7 @@ impl<'a> Builder<'a> {
             }
         }
 
-        self.visit_children(node);
+        self.queue_children(node);
     }
 
     /// Is this anon-hash node the operand of a `bless` call (within 5

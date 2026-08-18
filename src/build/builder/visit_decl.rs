@@ -40,33 +40,32 @@ impl<'a> Builder<'a> {
                 ) {
                     self.add_fold_range(node);
                     self.push_scope(ScopeKind::Block, node_to_span(node), None);
-                    self.walk_block_package_scoped(node);
-                    self.pop_scope();
+                    self.walk_block_package_scoped_then(node, |b| { b.pop_scope(); });
                     return;
                 }
                 self.add_fold_range(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // Foldable statements
             "if_statement" | "unless_statement" | "while_statement" | "until_statement" => {
                 self.add_fold_range(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // Flow-sensitive narrowing: a block guard refines the then-block;
             // a statement-level exit guard refines the rest of the block.
             "conditional_statement" => {
                 self.narrow_block_guard(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "postfix_conditional_expression" => {
                 self.narrow_postfix_exit(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "lowprec_logical_expression" => {
                 self.narrow_logical_exit(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // Variable references
@@ -106,7 +105,7 @@ impl<'a> Builder<'a> {
                 if crate::cst::element_arrow_deref(node, self.source) {
                     self.record_arrow_deref(node, crate::model::file_analysis::DerefForm::ArrayIndex);
                 }
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "coderef_call_expression" => {
                 // Walk-time: just narrow the operand to CodeRef.
@@ -122,7 +121,7 @@ impl<'a> Builder<'a> {
                 // no post-walk pass.
                 self.infer_deref_type(node, InferredType::CodeRef { return_edge: None });
                 self.record_arrow_deref(node, crate::model::file_analysis::DerefForm::Call);
-                self.visit_children(node);
+                self.queue_children(node);
             }
             // Symbolic code-deref: `&{ EXPR }` / `&{ EXPR }(...)`. The operand
             // (the EXPR inside the block) is a coderef. Narrow it, then visit
@@ -145,25 +144,25 @@ impl<'a> Builder<'a> {
                         );
                     }
                 }
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "array_deref_expression" => {
                 self.infer_deref_type(node, InferredType::ArrayRef);
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "hash_deref_expression" => {
                 self.infer_deref_type(node, InferredType::HashRef);
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // Binary operators → type constraints on variable operands
             "binary_expression" => {
                 self.infer_binary_op_type(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "equality_expression" | "relational_expression" => {
                 self.infer_comparison_type(node);
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // Unary operators
@@ -172,7 +171,7 @@ impl<'a> Builder<'a> {
                 if let Some(operand) = node.named_child(0) {
                     self.push_var_type_constraint(operand, node, InferredType::Numeric);
                 }
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // Return expressions → record structural facts pre-visit
@@ -201,10 +200,11 @@ impl<'a> Builder<'a> {
                         }
                     }
                 }
-                self.visit_children(node);
-                if let Some(scope) = scope {
-                    self.publish_return_arm_witnesses(node, scope);
-                }
+                self.queue_children_then(node, move |b| {
+                    if let Some(scope) = scope {
+                        b.publish_return_arm_witnesses(node, scope);
+                    }
+                });
             }
 
             // Expression statements inside sub bodies → track last
@@ -221,12 +221,12 @@ impl<'a> Builder<'a> {
             // branch_arm Edge → Expr(body) → Edge(call_target)`) handles
             // self-method tails for type inference; no separate map.
             "expression_statement" => {
-                self.visit_children(node);
-                if let Some(scope) = self.enclosing_sub_scope() {
+                self.queue_children_then(node, move |b| {
+                    let Some(scope) = b.enclosing_sub_scope() else { return };
                     let is_body_top_level = node
                         .parent()
                         .filter(|p| p.kind() == "block")
-                        .and_then(|b| b.parent())
+                        .and_then(|block| block.parent())
                         .map(|gp| {
                             matches!(
                                 gp.kind(),
@@ -236,18 +236,19 @@ impl<'a> Builder<'a> {
                             )
                         })
                         .unwrap_or(false);
-                    if is_body_top_level {
-                        if let Some(child) = node.named_child(0) {
-                            // Make sure the expression has Expr(span)
-                            // witnesses populated — `bag_query_expr_span`
-                            // resolves through them in the implicit-return
-                            // fallback. No-op for compound nodes whose
-                            // payload doesn't bake to a witness shape.
-                            self.emit_expr_witness(child);
-                            self.last_expr_span.insert(scope, node_to_span(child));
-                        }
+                    if !is_body_top_level {
+                        return;
                     }
-                }
+                    if let Some(child) = node.named_child(0) {
+                        // Make sure the expression has Expr(span)
+                        // witnesses populated — `bag_query_expr_span`
+                        // resolves through them in the implicit-return
+                        // fallback. No-op for compound nodes whose
+                        // payload doesn't bake to a witness shape.
+                        b.emit_expr_witness(child);
+                        b.last_expr_span.insert(scope, node_to_span(child));
+                    }
+                });
             }
 
             // Standalone bareword usage of a `use constant` name:
@@ -274,7 +275,7 @@ impl<'a> Builder<'a> {
             // refs. No semantic token is emitted for the literal itself — see
             // `FileAnalysis::semantic_tokens` (#63).
             "quoted_regexp" | "match_regexp" => {
-                self.visit_children(node);
+                self.queue_children(node);
             }
             "substitution_regexp" => {
                 // `s///e`: the replacement is Perl *code*, but the grammar
@@ -289,14 +290,14 @@ impl<'a> Builder<'a> {
                 if let Some(repl) = repl {
                     self.emit_refs_in_eval_replacement(repl);
                 }
-                self.visit_children(node);
+                self.queue_children(node);
             }
 
             // ERROR nodes: recover structural declarations (the file's skeleton)
             // but skip expressions/refs which are unreliable inside broken regions
             "ERROR" => self.recover_structural_from_error(node),
 
-            _ => self.visit_children(node),
+            _ => self.queue_children(node),
         }
     }
 
@@ -304,16 +305,28 @@ impl<'a> Builder<'a> {
     /// Only recovers the file's skeleton (packages, imports, subs, classes) —
     /// expressions and refs inside ERROR are unreliable and skipped.
     pub(super) fn recover_structural_from_error(&mut self, error_node: Node<'a>) {
+        // Queued, not called: a malformed file is exactly where nesting depth
+        // is least predictable, so ERROR recovery must not stay the one
+        // island that still grows the native stack per level.
+        let mut steps: Vec<Box<dyn FnOnce(&mut Builder<'a>) + 'a>> = Vec::new();
         for i in 0..error_node.child_count() {
             if let Some(child) = error_node.child(i) {
                 match child.kind() {
-                    "package_statement" => self.visit_package(child),
-                    "use_statement" => self.visit_use(child),
-                    "subroutine_declaration_statement" => self.visit_sub(child, false),
-                    "method_declaration_statement" => self.visit_sub(child, true),
-                    "class_statement" => self.visit_class(child),
-                    "ambiguous_function_call_expression" => self.visit_function_call(child),
-                    "ERROR" => self.recover_structural_from_error(child),
+                    "package_statement" => steps.push(Box::new(move |b: &mut Builder<'a>| b.visit_package(child))),
+                    "use_statement" => steps.push(Box::new(move |b: &mut Builder<'a>| b.visit_use(child))),
+                    "subroutine_declaration_statement" => {
+                        steps.push(Box::new(move |b: &mut Builder<'a>| b.visit_sub(child, false)))
+                    }
+                    "method_declaration_statement" => {
+                        steps.push(Box::new(move |b: &mut Builder<'a>| b.visit_sub(child, true)))
+                    }
+                    "class_statement" => steps.push(Box::new(move |b: &mut Builder<'a>| b.visit_class(child))),
+                    "ambiguous_function_call_expression" => {
+                        steps.push(Box::new(move |b: &mut Builder<'a>| b.visit_function_call(child)))
+                    }
+                    "ERROR" => steps.push(Box::new(move |b: &mut Builder<'a>| {
+                        b.recover_structural_from_error(child)
+                    })),
                     _ => {}
                 }
             }
@@ -330,7 +343,10 @@ impl<'a> Builder<'a> {
         // gated only on "we are inside a parse ERROR", never on any module.
         // See docs/parser-shortcomings.md (G7 — `"${@}"` bleed) and
         // docs/adr/error-recovery.md. KLUDGE: removable once upstream fixes G7.
-        self.recover_subs_from_error_text(error_node);
+        steps.push(Box::new(move |b: &mut Builder<'a>| {
+            b.recover_subs_from_error_text(error_node)
+        }));
+        self.queue_sequence(steps);
     }
 
     /// Source-text fallback for declarations a token-stream bleed destroyed.
@@ -437,14 +453,6 @@ impl<'a> Builder<'a> {
         }
     }
 
-    pub(super) fn visit_children(&mut self, node: Node<'a>) {
-        for i in 0..node.child_count() {
-            if let Some(child) = node.child(i) {
-                self.visit_node(child);
-            }
-        }
-    }
-
     /// Walk a `{ ... }` block's children, reverting package context at block
     /// close. `package Foo;` is file-scoped in Perl, but a `{ }` block is a
     /// hard boundary: `{ package Inner; }` must not leak Inner to the
@@ -452,29 +460,41 @@ impl<'a> Builder<'a> {
     /// statement-range cursor, restores both on exit, and repairs the
     /// `package_ranges` spans so `package_at` reverts past the block too.
     pub(super) fn walk_block_package_scoped(&mut self, node: Node<'a>) {
+        self.walk_block_package_scoped_then(node, |_| {});
+    }
+
+    /// `walk_block_package_scoped`, with `work` run after the package context
+    /// is restored — the block-scope arm closes its lexical scope there.
+    pub(super) fn walk_block_package_scoped_then(
+        &mut self,
+        node: Node<'a>,
+        work: impl FnOnce(&mut Builder<'a>) + 'a,
+    ) {
         let saved_pkg = self.current_package.clone();
         let saved_stmt_range = self.open_statement_package;
-        self.visit_children(node);
-        if self.open_statement_package != saved_stmt_range {
-            // A `package Inner;` inside the block opened a range to file-end;
-            // trim it to block close so it doesn't shadow the enclosing pkg.
-            if let Some(idx) = self.open_statement_package {
-                self.package_ranges[idx].span.end = node.end_position();
+        self.queue_children_then(node, move |b| {
+            if b.open_statement_package != saved_stmt_range {
+                // A `package Inner;` inside the block opened a range to file-end;
+                // trim it to block close so it doesn't shadow the enclosing pkg.
+                if let Some(idx) = b.open_statement_package {
+                    b.package_ranges[idx].span.end = node.end_position();
+                }
+                // The enclosing `package Outer;` range (if any) was truncated to
+                // Inner's start when Inner opened — resume it to file-end so
+                // Outer covers the post-block tail.
+                if let Some(idx) = saved_stmt_range {
+                    let file_end = b
+                        .scope_stack
+                        .first()
+                        .map(|id| b.scopes[id.0 as usize].span.end)
+                        .unwrap_or_else(|| node.end_position());
+                    b.package_ranges[idx].span.end = file_end;
+                }
+                b.open_statement_package = saved_stmt_range;
             }
-            // The enclosing `package Outer;` range (if any) was truncated to
-            // Inner's start when Inner opened — resume it to file-end so
-            // Outer covers the post-block tail.
-            if let Some(idx) = saved_stmt_range {
-                let file_end = self
-                    .scope_stack
-                    .first()
-                    .map(|id| self.scopes[id.0 as usize].span.end)
-                    .unwrap_or_else(|| node.end_position());
-                self.package_ranges[idx].span.end = file_end;
-            }
-            self.open_statement_package = saved_stmt_range;
-        }
-        self.current_package = saved_pkg;
+            b.current_package = saved_pkg;
+            work(b);
+        });
     }
 
     // ---- Node visitors ----
@@ -515,8 +535,7 @@ impl<'a> Builder<'a> {
             self.add_fold_range(node);
             self.push_block_package_range(name.clone(), node_to_span(node));
             self.current_package = Some(name);
-            self.visit_children(node);
-            self.current_package = prev_package;
+            self.queue_children_then(node, move |b| b.current_package = prev_package);
         } else {
             // `package Foo;` — package context flows to the next
             // sibling `package X;` / `class X;` or end of file.
@@ -607,9 +626,10 @@ impl<'a> Builder<'a> {
             self.push_block_package_range(name.clone(), node_to_span(node));
             self.current_package = Some(name.clone());
             self.push_scope(ScopeKind::Class { name: name.clone() }, node_to_span(node), Some(name));
-            self.visit_children(node);
-            self.pop_scope();
-            self.current_package = prev_package;
+            self.queue_children_then(node, move |b| {
+                b.pop_scope();
+                b.current_package = prev_package;
+            });
         } else {
             // Flat `class Foo;` — same semantics as non-block
             // `package Foo;`: package context flows in
@@ -679,11 +699,11 @@ impl<'a> Builder<'a> {
     pub(super) fn visit_sub(&mut self, node: Node<'a>, is_method: bool) {
         let name_node = match node.child_by_field_name("name") {
             Some(n) => n,
-            None => { self.visit_children(node); return; }
+            None => { self.queue_children(node); return; }
         };
         let name = match name_node.utf8_text(self.source) {
             Ok(s) => s.to_string(),
-            Err(_) => { self.visit_children(node); return; }
+            Err(_) => { self.queue_children(node); return; }
         };
 
         // A bodyless `sub NAME;` / `method NAME;` is a forward declaration, not
@@ -793,8 +813,7 @@ impl<'a> Builder<'a> {
         self.apply_param_type_manifest(&name, &params, node);
 
         // Visit children (body, etc.)
-        self.visit_children(node);
-        self.pop_scope();
+        self.queue_children_then(node, |b| { b.pop_scope(); });
     }
 
     /// Walk an `anonymous_subroutine_expression` (a `sub { ... }`
@@ -843,8 +862,7 @@ impl<'a> Builder<'a> {
         );
         self.record_signature_params(node, &params);
         self.detect_first_param_type(&params, node);
-        self.visit_children(node);
-        self.pop_scope();
+        self.queue_children_then(node, |b| { b.pop_scope(); });
     }
 
     /// Ensure an `(anon)` Symbol exists for the given anon-sub node
@@ -1535,14 +1553,13 @@ impl<'a> Builder<'a> {
                     }
                 }
 
-                self.visit_children(node);
-                self.pop_scope();
+                self.queue_children_then(node, |b| { b.pop_scope(); });
                 return;
             }
         }
 
         // No loop variable — just visit children normally
-        self.visit_children(node);
+        self.queue_children(node);
     }
 
     /// Statement-modifier loop: `EXPR for LIST` / `EXPR foreach LIST`.
@@ -1576,15 +1593,14 @@ impl<'a> Builder<'a> {
         if !topic_values.is_empty() {
             self.constant_strings.insert("$_".to_string(), topic_values);
         }
-        self.visit_children(node);
-        match saved {
+        self.queue_children_then(node, move |b| match saved {
             Some(v) => {
-                self.constant_strings.insert("$_".to_string(), v);
+                b.constant_strings.insert("$_".to_string(), v);
             }
             None => {
-                self.constant_strings.remove("$_");
+                b.constant_strings.remove("$_");
             }
-        }
+        });
     }
 
     /// Is `node` a `mk_classdata`/`mk_classaccessor` call whose single arg is the
