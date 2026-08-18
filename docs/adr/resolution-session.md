@@ -115,7 +115,7 @@ project and ~2.5 ms at 138k files (~9 blob rehydrations each), so any count
 generous enough for a healthy walk (Koha: ~5k consults) is already tens of
 seconds at scale. A DEADLINE is scale-free and gives the verb a real latency
 contract, at the cost of being load-dependent. `PERL_LSP_RESOLVE_FUEL`
-(5M, the deterministic backstop) and `PERL_LSP_RESOLVE_BUDGET_MS` (30s, what
+(5M, the deterministic backstop) and `PERL_LSP_RESOLVE_BUDGET_MILLISECONDS` (30s, what
 actually fires); `0` disables either.
 
 The gate sits at the entry to the cross-file fallback region, so a spent walk

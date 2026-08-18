@@ -812,3 +812,47 @@ fn kind_comparisons_name_real_grammar_kinds() {
         dead.join("\n")
     );
 }
+
+/// A time-valued tunable must say its unit in its name.
+///
+/// `BENCH_REQ_TIMEOUT` held seconds while `PERL_LSP_RESOLVE_BUDGET_MS` held
+/// milliseconds, and a brief that guessed wrong cost an agent a 50-minute run
+/// — the value looked plausible either way, so nothing failed, it just measured
+/// the wrong thing. A name that carries the unit cannot be misread. Counts
+/// (`_CAP`, `_DEPTH`, `_FUEL`, `_ITERS`) and sizes (`_MB`) are not time and are
+/// not covered here.
+#[test]
+fn time_valued_env_vars_name_their_unit() {
+    let mut offenders: Vec<String> = Vec::new();
+    let mut files: Vec<(PathBuf, Layer, String)> = Vec::new();
+    collect_rs(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"), Layer::Util, None, &mut files);
+
+    for (path, _, _) in &files {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        for raw in text.split("env::var(\"").skip(1) {
+            let Some(name) = raw.split('"').next() else { continue };
+            let upper = name.to_ascii_uppercase();
+            // Names that promise a duration but do not say in what unit.
+            let time_shaped = upper.ends_with("_MS")
+                || upper.ends_with("_SEC")
+                || upper.ends_with("_SECS")
+                || upper.contains("TIMEOUT")
+                || upper.contains("_WAIT")
+                || upper.contains("_DELAY")
+                || upper.contains("_INTERVAL");
+            let says_unit =
+                upper.ends_with("_SECONDS") || upper.ends_with("_MILLISECONDS");
+            if time_shaped && !says_unit {
+                offenders.push(format!("{} in {}", name, path.display()));
+            }
+        }
+    }
+    offenders.sort();
+    offenders.dedup();
+    assert!(
+        offenders.is_empty(),
+        "time-valued env vars must end in _SECONDS or _MILLISECONDS so the unit \
+         cannot be guessed wrong:\n{}",
+        offenders.join("\n")
+    );
+}

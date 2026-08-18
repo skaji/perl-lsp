@@ -990,7 +990,7 @@ impl LanguageServer for Backend {
                     concat!(
                         "perl-lsp: this reference list is INCOMPLETE - the search hit its ",
                         "resolution budget at this workspace size. Raise ",
-                        "PERL_LSP_RESOLVE_BUDGET_MS / PERL_LSP_ENRICH_DEPTH for a fuller ",
+                        "PERL_LSP_RESOLVE_BUDGET_MILLISECONDS / PERL_LSP_ENRICH_DEPTH for a fuller ",
                         "answer. (Reported once per session; the log records each.)",
                     ),
                 )

@@ -7,8 +7,8 @@
 -- in-window query resolves warm because the HANDLER waited for the imminent
 -- index, not because a later re-request raced it.
 --
---   PERL_LSP_COLD_WAIT_MS unset / large  → handler waits → full cross-file set.
---   PERL_LSP_COLD_WAIT_MS=0              → wait opts out → degraded (def only).
+--   PERL_LSP_COLD_WAIT_MILLISECONDS unset / large  → handler waits → full cross-file set.
+--   PERL_LSP_COLD_WAIT_MILLISECONDS=0              → wait opts out → degraded (def only).
 --
 -- After the in-window query, it waits for the index to fully settle then fires
 -- the SAME query again and measures its latency — the WARM case must pay ~zero

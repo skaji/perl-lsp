@@ -76,7 +76,7 @@ start_load() {
 stop_load() { for p in "${LOADPIDS[@]:-}"; do kill "$p" 2>/dev/null; done; LOADPIDS=(); }
 
 run() {  # $1 = coldWaitMs
-  export PERL_LSP_COLD_WAIT_MS="$1"
+  export PERL_LSP_COLD_WAIT_MILLISECONDS="$1"
   export XDG_CACHE_HOME="$(mktemp -d)"
   "$BIN" --clear-cache "$WS" >/dev/null 2>&1 || true
   start_load

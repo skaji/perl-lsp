@@ -124,12 +124,12 @@ return function(opts)
     cmd = { lsp_bin }
   end
 
-  -- initializationOptions. PERL_LSP_COLD_WAIT_MS overrides the cold-open
+  -- initializationOptions. PERL_LSP_COLD_WAIT_MILLISECONDS overrides the cold-open
   -- bounded-wait cap (0 opts the wait out) — the e2e cold-window repro toggles
   -- the fix on/off from the same binary through it.
   local init_options = nil
-  if vim.env.PERL_LSP_COLD_WAIT_MS then
-    init_options = { coldWaitMs = tonumber(vim.env.PERL_LSP_COLD_WAIT_MS) }
+  if vim.env.PERL_LSP_COLD_WAIT_MILLISECONDS then
+    init_options = { coldWaitMs = tonumber(vim.env.PERL_LSP_COLD_WAIT_MILLISECONDS) }
   end
 
   vim.lsp.config["perl-lsp"] = {

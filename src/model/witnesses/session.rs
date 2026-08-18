@@ -125,7 +125,7 @@ fn default_fuel() -> u64 {
 
 /// Wall-clock half of the budget. `0` = unbounded.
 fn default_budget_ms() -> u64 {
-    std::env::var("PERL_LSP_RESOLVE_BUDGET_MS")
+    std::env::var("PERL_LSP_RESOLVE_BUDGET_MILLISECONDS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(30_000)
@@ -380,7 +380,7 @@ fn note_exhausted(st: &mut SessionState, out_of_time: bool) {
         eprintln!(
             "perl-lsp: resolution budget exhausted ({}) — this answer is an \
              UNDER-APPROXIMATION, not a complete one. \
-             PERL_LSP_RESOLVE_BUDGET_MS / PERL_LSP_RESOLVE_FUEL raise it \
+             PERL_LSP_RESOLVE_BUDGET_MILLISECONDS / PERL_LSP_RESOLVE_FUEL raise it \
              (0 = unbounded).",
             if out_of_time { "time" } else { "consults" },
         );
