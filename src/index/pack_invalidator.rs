@@ -532,7 +532,7 @@ impl PackInvalidator {
         pack.invalidate_bag_cache(path);
         if landed && !arc.degraded && crate::index::module_resolver::eviction_enabled() {
             // Registration-owned strip (feeds read the whole copy).
-            let _ = pack.register_symbols_stripping(path.to_path_buf(), (**arc).clone(), true, true);
+            let _ = pack.register_symbols_stripping(path.to_path_buf(), (**arc).clone(), crate::model::file_analysis::Residency::Skeleton);
         } else {
             pack.register_symbols(path.to_path_buf(), Arc::clone(arc));
         }

@@ -192,19 +192,21 @@ pub fn index_workspace_with_index(
                 // WHOLE analysis, then the requested axes evict, then the
                 // stripped arc is stored (feeds must never see an emptied
                 // `symbols`).
-                let strip_bag = eviction_enabled();
-                let strip_rows = strip_bag && rows_ok;
+                // The ladder that used to be `strip_rows = strip_bag && rows_ok`.
+                let level = crate::model::file_analysis::Residency::for_strip(
+                    eviction_enabled(),
+                    rows_ok,
+                );
                 let arc = match module_index {
                     Some(idx) => idx.register_workspace_stripping(
                         path.clone(),
                         fa,
-                        strip_bag,
-                        strip_rows,
+                        level,
                     ),
                     None => {
                         // No index (CLI-less warm): no feeds to extract —
                         // strip and store.
-                        fa.evict_axes(strip_bag, strip_rows);
+                        fa.evict_to(level);
                         std::sync::Arc::new(fa)
                     }
                 };
@@ -425,12 +427,12 @@ pub fn index_workspace_with_index(
                         let (arc, parts) = match module_index {
                             Some(idx) => {
                                 let parts =
-                                    idx.prepare_workspace_parts(&canon, analysis, true, true);
+                                    idx.prepare_workspace_parts(&canon, analysis, crate::model::file_analysis::Residency::Skeleton);
                                 parts.record_surface(idx, &canon);
                                 (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
                             None => {
-                                analysis.evict_axes(true, true);
+                                analysis.evict_to(crate::model::file_analysis::Residency::Skeleton);
                                 (std::sync::Arc::new(analysis), None)
                             }
                         };
@@ -455,7 +457,7 @@ pub fn index_workspace_with_index(
                         let arc = match module_index {
                             Some(idx) => {
                                 let parts =
-                                    idx.prepare_workspace_parts(&canon, analysis, false, false);
+                                    idx.prepare_workspace_parts(&canon, analysis, crate::model::file_analysis::Residency::Whole);
                                 let arc = std::sync::Arc::clone(parts.arc());
                                 idx.register_workspace_residency(canon.clone(), parts);
                                 // Deliberate whole pin (unpersistable /

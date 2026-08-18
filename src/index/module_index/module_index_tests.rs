@@ -79,7 +79,7 @@ fn symbols_present_answers_resident_when_only_bag_evicted() {
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
 
     let mut bag_only = (*full.analysis).clone();
-    bag_only.evict_axes(true, false);
+    bag_only.evict_to(crate::model::file_analysis::Residency::RowsOnly);
     let bag_only_cached = Arc::new(CachedModule::new(path.clone(), Arc::new(bag_only)));
     let got = idx.symbols_present(&bag_only_cached);
     assert!(
@@ -108,7 +108,7 @@ fn symbols_present_rehydrates_evicted_symbols_never_absence_by_eviction() {
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
     let mut stripped = (*full.analysis).clone();
-    stripped.evict_axes(true, true);
+    stripped.evict_to(crate::model::file_analysis::Residency::Skeleton);
     assert!(stripped.symbols_are_evicted(), "fixture must model the workspace strip");
     let stripped_cached = Arc::new(CachedModule::new(full.path.clone(), Arc::new(stripped)));
     let got = idx.symbols_present(&stripped_cached);
@@ -133,7 +133,7 @@ fn refs_present_answers_resident_when_only_bag_evicted() {
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
     let mut bag_only = (*full.analysis).clone();
-    bag_only.evict_axes(true, false);
+    bag_only.evict_to(crate::model::file_analysis::Residency::RowsOnly);
     let cached = Arc::new(CachedModule::new(full.path.clone(), Arc::new(bag_only)));
     let got = idx.refs_present(&cached);
     assert!(Arc::ptr_eq(&got, &cached.analysis), "rows-resident copy answers resident");
@@ -158,7 +158,7 @@ fn refs_present_rehydrates_evicted_refs_never_absence_by_eviction() {
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
     let mut stripped = (*full.analysis).clone();
-    stripped.evict_axes(true, true);
+    stripped.evict_to(crate::model::file_analysis::Residency::Skeleton);
     assert!(stripped.refs_are_evicted(), "fixture must model the workspace strip");
     let cached = Arc::new(CachedModule::new(full.path.clone(), Arc::new(stripped)));
     let got = idx.refs_present(&cached);
@@ -614,7 +614,7 @@ fn register_symbols_stripping_feeds_before_evict() {
     let path = full.path.clone();
 
     let idx = ModuleIndex::new_for_cli();
-    let arc = idx.register_symbols_stripping((*path).to_path_buf(), (*full.analysis).clone(), true, true);
+    let arc = idx.register_symbols_stripping((*path).to_path_buf(), (*full.analysis).clone(), crate::model::file_analysis::Residency::Skeleton);
     assert!(arc.symbols_are_evicted() && arc.symbols().is_empty(), "stored copy is stripped");
     assert!(arc.refs_are_evicted());
 
@@ -1119,7 +1119,7 @@ fn rehydration_miss_is_counted_and_serves_resident() {
     let src = "package Ghost;\nsub boo { return 1 }\n1;\n";
     let tree = parser.parse(src, None).unwrap();
     let mut fa = crate::build::builder::build(&tree, src.as_bytes());
-    fa.evict_axes(true, true);
+    fa.evict_to(crate::model::file_analysis::Residency::Skeleton);
     let cm = Arc::new(CachedModule::new(
         PathBuf::from("/fake/Ghost.pm"),
         Arc::new(fa),
@@ -1159,7 +1159,7 @@ fn foreign_path_rehydrates_through_the_owning_sibling() {
     let whole = crate::build::builder::build(&tree, src.as_bytes());
     let whole_arc = Arc::new(whole);
     let mut stripped = (*whole_arc).clone();
-    stripped.evict_axes(true, true);
+    stripped.evict_to(crate::model::file_analysis::Residency::Skeleton);
     let path = PathBuf::from("/fake/hub/Ghost.pm");
 
     // Install the hub's rehydration cell with a loader that serves the
@@ -1554,7 +1554,7 @@ fn reregistering_one_file_keeps_evicted_sibling_edges() {
     let pb = PathBuf::from("/fake/pkgid/Beta.pm");
     // The sibling registers through the stripping door: its resident copy
     // has NO symbols, only the pre-strip name record.
-    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), true, true);
+    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), crate::model::file_analysis::Residency::Skeleton);
     let _ = idx.register_workspace_resident(pa.clone(), Arc::new(build_fa(src_a)));
     assert!(!idx.modules_with_symbol("from_beta").is_empty(), "sibling edges fed");
     // Re-register the whole file; the evicted sibling's names must replay.
@@ -1815,4 +1815,70 @@ fn an_exhausted_consult_budget_degrades_instead_of_running_forever() {
         ResolutionSession::degraded(),
         "and the walk must SAY it under-answered"
     );
+}
+
+/// The ladder, proved over EVERY inhabitant of the type.
+///
+/// The hazard this replaces was `evict_axes(strip_bag, strip_rows)`: four
+/// spellings for three states, and the fourth — rows dropped, bag kept —
+/// was prevented only by no production site passing it. It is not a crash
+/// if someone does. `bag_present` returns a copy whose symbols were
+/// evicted, and a consumer that reads both (cross-file import enrichment
+/// walks `symbols` off a bag view) reads absence-by-eviction as
+/// absence-in-fact: a silently smaller answer.
+///
+/// `Residency` has no spelling for it, so this asserts the property that
+/// makes the bag-then-symbols reads correct BY CONSTRUCTION rather than by
+/// audit: **dropping the rows always drops the bag**, i.e. bag present
+/// implies rows present.
+///
+/// A `trybuild` compile-fail case would show one bad line failing to
+/// compile; enumerating the variants proves the invariant for the whole
+/// domain, needs no extra dependency, and runs on every `cargo test`.
+#[test]
+fn residency_is_a_ladder_so_a_bag_view_always_carries_its_rows() {
+    use crate::model::file_analysis::Residency;
+    let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+
+    // EVERY level the type can express. A new variant added without a case
+    // here fails to compile on the match below, not silently at runtime.
+    for level in [Residency::Whole, Residency::RowsOnly, Residency::Skeleton] {
+        let mut fa = (*full.analysis).clone();
+        fa.evict_to(level);
+        let (bag_gone, refs_gone, syms_gone) =
+            (fa.bag_is_evicted(), fa.refs_are_evicted(), fa.symbols_are_evicted());
+
+        // THE invariant: no level keeps the bag while dropping the rows.
+        assert!(
+            !(refs_gone || syms_gone) || bag_gone,
+            "{level:?} drops a row axis while keeping the bag — the combination \
+             that makes `bag_present` hand out an evicted-symbols copy"
+        );
+        // The row axes move together: they persist as one generation.
+        assert_eq!(refs_gone, syms_gone, "{level:?} split the row axes");
+
+        // And each level strips exactly what it advertises.
+        let expected = match level {
+            Residency::Whole => (false, false),
+            Residency::RowsOnly => (true, false),
+            Residency::Skeleton => (true, true),
+        };
+        assert_eq!((bag_gone, refs_gone), expected, "{level:?} stripped the wrong axes");
+        assert_eq!(fa.is_fully_resident(), level == Residency::Whole);
+    }
+}
+
+/// `for_strip` is the one place the "rows only once the blob can rehydrate
+/// them" rule lives — it used to be `let strip_rows = strip_bag && rows_ok`
+/// written out at each tier. Eviction off means whole regardless of
+/// `rows_ok`; rows_ok false never yields a rows strip.
+#[test]
+fn for_strip_never_yields_rows_without_bag() {
+    use crate::model::file_analysis::Residency;
+    for rows_ok in [false, true] {
+        assert_eq!(Residency::for_strip(false, rows_ok), Residency::Whole);
+    }
+    assert_eq!(Residency::for_strip(true, false), Residency::RowsOnly);
+    assert_eq!(Residency::for_strip(true, true), Residency::Skeleton);
 }

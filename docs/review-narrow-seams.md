@@ -267,6 +267,18 @@ pairing unrepresentable (a closed `StripPlan` enum) or `debug_assert!(strip_bag
 || !strip_rows)` in `evict_axes`; the reader should take `whole_present`
 either way.
 
+**Resolved** — the pairing is now unrepresentable. `evict_axes(bool, bool)` is
+gone; `FileAnalysis::evict_to(Residency)` takes a ladder enum whose three
+variants are exactly the states that exist (`Whole` / `RowsOnly` /
+`Skeleton`). The invariant the callers were holding by hand —
+`strip_rows = strip_bag && rows_ok` — is now `Residency::for_strip`, so
+"bag present, rows evicted" has no spelling and `bag_present` carrying its
+symbols is a property of the type rather than of an audit. Proved over every
+inhabitant by `residency_is_a_ladder_so_a_bag_view_always_carries_its_rows`.
+The enrichment reader was left on `bag_present`: it is correct now for a
+structural reason, and moving it to `whole_present` would cost a whole-blob
+rehydrate per candidate on a path that only needs the bag.
+
 ### `whole_copy_registration_sites_are_allowlisted`
 
 The test greps source lines for `name(` call sites and compares counts. It

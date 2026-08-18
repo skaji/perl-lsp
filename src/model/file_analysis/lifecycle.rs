@@ -3,6 +3,53 @@
 
 use super::*;
 
+/// How much of a resident index copy survives the registration strip.
+///
+/// The evictable axes are a **ladder, not a set of independent switches**:
+/// every tier that drops the row axes drops the witness bag too. That was
+/// previously carried as `evict_axes(strip_bag, strip_rows)`, whose fourth
+/// combination — rows dropped, bag kept — no tier wants and nothing
+/// prevented. It is not a crash if someone writes it: `bag_present` hands
+/// back a copy whose symbols were evicted, and every consumer that reads
+/// both (cross-file import enrichment walks `symbols` off a bag view) reads
+/// absence-by-eviction as absence-in-fact. A silently smaller answer.
+///
+/// The ladder is not invented here — the callers already computed it by
+/// hand, as `let strip_rows = strip_bag && rows_ok`. This lifts that
+/// conjunction out of an expression and into the type, so the illegal
+/// pairing has no spelling.
+///
+/// Ordered widest-to-narrowest; a new axis extends the narrow end (and
+/// `is_fully_resident`), never adds a flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Residency {
+    /// Nothing evicted — open docs, degraded files, `PERL_LSP_NO_EVICT`.
+    Whole,
+    /// Witness bag dropped; refs and symbols kept. The @INC tier, whose
+    /// copies the MRO existence walks hammer for symbols.
+    RowsOnly,
+    /// Bag AND both row axes dropped. The workspace/pack tier once the blob
+    /// and its rows are persisted and can rehydrate.
+    Skeleton,
+}
+
+impl Residency {
+    /// The strip a persisting tier wants: nothing when eviction is off,
+    /// otherwise bag-only until the rows are safely on disk.
+    ///
+    /// This is the one place the "rows only once the blob can rehydrate
+    /// them" rule is written. `rows_ok` false with eviction on is exactly
+    /// `RowsOnly` — never the rows-without-bag combination, which the type
+    /// cannot express.
+    pub fn for_strip(eviction_enabled: bool, rows_ok: bool) -> Self {
+        match (eviction_enabled, rows_ok) {
+            (false, _) => Residency::Whole,
+            (true, false) => Residency::RowsOnly,
+            (true, true) => Residency::Skeleton,
+        }
+    }
+}
+
 impl FileAnalysis {
     /// Create a new FileAnalysis with indices built from the raw tables.
     /// `finalize_post_walk` runs on the builder path to seal baseline
@@ -161,19 +208,25 @@ impl FileAnalysis {
         !self.bag_evicted && !self.refs.is_evicted() && !self.symbols.is_evicted()
     }
 
-    /// The ONE speller of the registration strip: `strip_bag` drops the
-    /// witness bag; `strip_rows` drops the row-backed axes (refs AND
-    /// symbols — they persist as one generation and evict as one). Every
-    /// registration path routes here so a new eviction axis is added in
-    /// exactly one place; a site spelling `evict_*` calls directly is
-    /// re-stating this pairing by convention.
-    pub fn evict_axes(&mut self, strip_bag: bool, strip_rows: bool) {
-        if strip_bag {
-            self.evict_witness_bag();
-        }
-        if strip_rows {
-            self.evict_refs();
-            self.evict_symbols();
+    /// The ONE speller of the registration strip. Every registration path
+    /// routes here so a new eviction axis is added in exactly one place; a
+    /// site spelling `evict_*` calls directly is re-stating this by
+    /// convention.
+    ///
+    /// Takes a `Residency` rather than a pair of flags because the axes are
+    /// a LADDER, not independent switches — see that type. The pair could
+    /// spell "rows stripped, bag kept", which no tier wants and which would
+    /// turn every `bag_present` consumer that also reads symbols into
+    /// absence-by-eviction: a silently smaller answer, not a crash.
+    pub fn evict_to(&mut self, level: Residency) {
+        match level {
+            Residency::Whole => {}
+            Residency::RowsOnly => self.evict_witness_bag(),
+            Residency::Skeleton => {
+                self.evict_witness_bag();
+                self.evict_refs();
+                self.evict_symbols();
+            }
         }
     }
 

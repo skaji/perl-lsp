@@ -331,7 +331,7 @@ pub(crate) fn strip_import_copy_one(
 ) -> Arc<CachedModule> {
     if persisted && strip && !m.analysis.degraded {
         let mut fa = (*m.analysis).clone();
-        fa.evict_axes(true, false);
+        fa.evict_to(crate::model::file_analysis::Residency::RowsOnly);
         Arc::new(CachedModule::new(m.path.clone(), Arc::new(fa)))
     } else {
         m.clone()

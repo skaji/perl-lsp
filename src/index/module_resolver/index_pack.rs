@@ -202,12 +202,12 @@ pub fn index_pack_languages(
                             fa.sym_row_seeds(),
                         ));
                     }
-                    let strip_bag = eviction_enabled();
-                    let fully_stripped = strip_bag && rows_ok;
+                    // The ladder that used to be `strip_bag && rows_ok`.
+                    let level = crate::model::file_analysis::Residency::for_strip(eviction_enabled(), rows_ok);
+                    let fully_stripped = level == crate::model::file_analysis::Residency::Skeleton;
                     let parts = crate::index::module_index::ModuleIndex::prepare_pack_parts(
                         fa,
-                        strip_bag,
-                        fully_stripped,
+                        level,
                     );
                     if fully_stripped {
                         if let Some(blob) = module_cache::encode_stub(
@@ -438,7 +438,7 @@ pub fn index_pack_languages(
                         // so an evicted copy is never reachable before its blob
                         // can rehydrate it.
                         let parts = crate::index::module_index::ModuleIndex::prepare_pack_parts(
-                            analysis, true, true,
+                            analysis, crate::model::file_analysis::Residency::Skeleton,
                         );
                         let stub_blob = module_cache::encode_stub(
                             parts.feed(),

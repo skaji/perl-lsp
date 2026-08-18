@@ -733,10 +733,9 @@ impl ModuleIndex {
         &self,
         path: std::path::PathBuf,
         fa: FileAnalysis,
-        strip_bag: bool,
-        strip_rows: bool,
+        level: crate::model::file_analysis::Residency,
     ) -> Arc<FileAnalysis> {
-        let parts = self.prepare_workspace_parts(&path, fa, strip_bag, strip_rows);
+        let parts = self.prepare_workspace_parts(&path, fa, level);
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_workspace_residency(path, parts);
@@ -1143,12 +1142,11 @@ impl ModuleIndex {
         &self,
         path: &std::path::Path,
         mut fa: FileAnalysis,
-        strip_bag: bool,
-        strip_rows: bool,
+        level: crate::model::file_analysis::Residency,
     ) -> WorkspaceRegistrationParts {
         let names = self.workspace_feed_prestrip(path, &fa);
         let surface = crate::model::surface::Surface::project(&fa);
-        fa.evict_axes(strip_bag, strip_rows);
+        fa.evict_to(level);
         WorkspaceRegistrationParts { arc: Arc::new(fa), names, surface }
     }
 
@@ -1160,12 +1158,11 @@ impl ModuleIndex {
     /// and the stub encoder gets exactly the halves registration used.
     pub(crate) fn prepare_pack_parts(
         mut fa: FileAnalysis,
-        strip_bag: bool,
-        strip_rows: bool,
+        level: crate::model::file_analysis::Residency,
     ) -> PackRegistrationParts {
         let (feed, specs) = Self::prepare_pack_feed(&fa);
         let surface = crate::model::surface::Surface::project(&fa);
-        fa.evict_axes(strip_bag, strip_rows);
+        fa.evict_to(level);
         PackRegistrationParts { arc: Arc::new(fa), feed, specs, surface }
     }
 
@@ -1173,10 +1170,9 @@ impl ModuleIndex {
         &self,
         path: std::path::PathBuf,
         fa: FileAnalysis,
-        strip_bag: bool,
-        strip_rows: bool,
+        level: crate::model::file_analysis::Residency,
     ) -> Arc<FileAnalysis> {
-        let parts = Self::prepare_pack_parts(fa, strip_bag, strip_rows);
+        let parts = Self::prepare_pack_parts(fa, level);
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_symbols_inner(path, parts);
@@ -1280,7 +1276,7 @@ impl ModuleIndex {
         // resolves, and `direct_children_of` re-checks each candidate's CURRENT
         // `package_parents`, so a stale entry (an edit dropped a base)
         // self-heals at read. `package_parents` survives every strip
-        // (`evict_axes` leaves it) and rides the warm-stub skeleton, so the arc
+        // (`evict_to` leaves it) and rides the warm-stub skeleton, so the arc
         // carries it on the fresh, warm, and whole paths alike.
         for (child, parents) in analysis.package_parent_edges() {
             for parent in parents {

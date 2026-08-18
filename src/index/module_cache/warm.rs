@@ -338,7 +338,7 @@ pub fn warm_cache(
                         // touch a copy some OTHER path registered
                         // whole-for-a-reason (writer fallback, watcher).
                         if strip && !fa.degraded {
-                            fa.evict_axes(true, false);
+                            fa.evict_to(crate::model::file_analysis::Residency::RowsOnly);
                         }
                         let cand = Arc::new(CachedModule::new(path, Arc::new(fa)));
                         adopt_warm_provider(cache, all_defs, &module_name, cand);
