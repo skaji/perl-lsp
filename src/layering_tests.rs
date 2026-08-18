@@ -487,3 +487,328 @@ fn query_verbs_route_through_run_query() {
         violations.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Grammar-kind tripwire
+// ---------------------------------------------------------------------------
+
+/// Kinds a `kind()` comparison may name even though the grammar does not have
+/// them YET. Everything here is deliberate forward-compatibility, not debt.
+///
+/// `parenthesized_expression` is absent from ts-parser-perl on purpose and is
+/// coming in the next release — it is a breaking change, and nearly every
+/// tree-sitter grammar needs that wrapper or aliases and fields misbehave. The
+/// ~27 Perl-side arms that name it are inert today and become correct the day
+/// the parser lands. **Do not "clean them up"** (see CLAUDE.md's gotchas), and
+/// do not let this tripwire be the reason someone does.
+///
+/// The pack side is unaffected: `parenthesized_expression` is already a real
+/// tree-sitter-cpp kind, which is why this check is per-language rather than
+/// against the union — the union would silently excuse the Perl arms.
+///
+/// Adding a name here is a claim that a future grammar release will define it.
+/// Anything else belongs in the grammar or out of the code.
+const DECLARED_FUTURE_PERL_KINDS: &[&str] = &["parenthesized_expression"];
+
+/// Dead `kind()` arms that already existed when this tripwire landed.
+///
+/// These are BUGS, not exemptions. Each one names a kind the Perl grammar does
+/// not have, so the arm never fires — it is inert code sitting next to a
+/// working sibling, which is exactly what makes the class hard to see. They
+/// are quarantined rather than fixed here because a dead arm can be masking a
+/// real behavioural gap whose fix wants its own change and its own test; see
+/// the audit on issue #120.
+///
+/// **This list may only shrink.** Adding to it means shipping a new dead arm.
+/// Keyed by (path suffix, kind) rather than line so it survives edits.
+const KNOWN_DEAD_KIND_ARMS: &[(&str, &str)] = &[
+    // Real kind is `loopex_expression` for all three, so `last if $x;` and
+    // friends are not recognized as control-flow exits and do not narrow the
+    // rest of the block. The one finding here with visible behaviour behind it.
+    ("build/builder/narrowing.rs", "last_expression"),
+    ("build/builder/narrowing.rs", "next_expression"),
+    ("build/builder/narrowing.rs", "redo_expression"),
+    // A Perl qualified name (`Foo::Bar::baz`) is a `bareword`; there is no
+    // `scoped_identifier` in this grammar. Both sites pair it with `bareword`,
+    // which does match, so no behaviour is lost — it is the textbook shape of
+    // the hazard: a dead half that reads as handled.
+    ("build/builder/emit.rs", "scoped_identifier"),
+    // `do { }` is `do_expression` wrapping a `block`; the `block` arm already
+    // claims the body, so this half is inert.
+    ("build/builder/visit_decl.rs", "do_block"),
+    // `foreach` is `for_statement`, which is listed alongside it, so the
+    // parent-kind exclusion still works.
+    ("build/builder/visit_decl.rs", "foreach_statement"),
+    // `if`/`unless` are `conditional_statement`, `while`/`until` are
+    // `loop_statement`. The fold range these arms wanted is added by the
+    // `block` arm anyway, so folding is unaffected.
+    ("build/builder/visit_decl.rs", "if_statement"),
+    ("build/builder/visit_decl.rs", "unless_statement"),
+    ("build/builder/visit_decl.rs", "until_statement"),
+    ("build/builder/visit_decl.rs", "while_statement"),
+];
+
+/// Kinds tree-sitter defines for every grammar, so they never appear in a
+/// grammar's own node list.
+const TREE_SITTER_BUILTIN_KINDS: &[&str] = &["ERROR", "MISSING"];
+
+/// Every kind a grammar can produce, NAMED AND ANONYMOUS.
+///
+/// Anonymous keyword tokens count: `node.kind()` returns `"my"`, `"sub"`,
+/// `"and"` and friends for them, and the codebase legitimately compares
+/// against those. Filtering to named kinds only would flag correct code.
+fn grammar_kinds(lang: &tree_sitter::Language) -> std::collections::HashSet<String> {
+    (0..lang.node_kind_count())
+        .filter_map(|i| lang.node_kind_for_id(i as u16))
+        .filter(|k| lang.id_for_node_kind(k, true) != 0 || lang.id_for_node_kind(k, false) != 0)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Index just past the `close` matching the `open` at `start`.
+///
+/// Skips strings, char literals and comments. A brace inside any of those is
+/// not structure, and one desync makes a block swallow the rest of the file —
+/// which is exactly how an unrelated `match export_var_basename(..) { "EXPORT" => .. }`
+/// first looked like a kind comparison.
+fn balanced_from(src: &str, start: usize, open: u8, close: u8) -> usize {
+    let b = src.as_bytes();
+    let (mut i, mut depth) = (start, 0usize);
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            // `'x'` / `'\n'` is a char literal; `'a` alone is a lifetime and
+            // closes nothing, so only the quoted form is skipped.
+            b'\'' => {
+                let rest = &b[i..];
+                let lit = match rest {
+                    [_, b'\\', _, b'\'', ..] => Some(4),
+                    [_, c, b'\'', ..] if *c != b'\\' => Some(3),
+                    _ => None,
+                };
+                if let Some(n) = lit {
+                    i += n - 1;
+                }
+            }
+            b'/' if src[i..].starts_with("//") => {
+                i = src[i..].find('\n').map_or(b.len(), |n| i + n);
+            }
+            b'/' if src[i..].starts_with("/*") => {
+                i = src[i + 2..].find("*/").map_or(b.len(), |n| i + 2 + n + 1);
+            }
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// String literals in `s`, in order.
+fn string_literals(s: &str) -> Vec<String> {
+    let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+    while i < b.len() {
+        if b[i] == b'"' {
+            let start = i + 1;
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            if i <= b.len() {
+                out.push(s[start..i.min(b.len())].to_string());
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn is_kindish(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+}
+
+/// Every string this source compares against a tree-sitter `kind()`, with the
+/// line it sits on.
+///
+/// Deliberately high-precision rather than exhaustive: a false positive fails
+/// the build on correct code, which is far worse than missing an arm. Four
+/// shapes are recognized, covering how this codebase actually spells it —
+/// `k.kind() == "x"`, `matches!(k.kind(), "a" | "b")`, `match k.kind() { .. }`,
+/// and the same three through a local bound from `.kind()`.
+fn kind_comparison_literals(src: &str) -> Vec<(usize, String)> {
+    let line_of = |idx: usize| src[..idx].matches('\n').count() + 1;
+    let mut out: Vec<(usize, String)> = Vec::new();
+
+    // Locals bound straight from `.kind()`, e.g. `let parent_kind = p.kind();`
+    let mut bound: Vec<&str> = Vec::new();
+    for (i, _) in src.match_indices(".kind()") {
+        let head = &src[..i];
+        if let Some(l) = head.rfind("let ") {
+            let decl = &head[l + 4..];
+            if !decl.contains(';') && !decl.contains('{') {
+                let name = decl.trim().trim_start_matches("mut ").trim();
+                let name = name.split(['=', ':', ' ']).next().unwrap_or("").trim();
+                if !name.is_empty() && is_kindish(name) && src[i..].starts_with(".kind();") {
+                    bound.push(name);
+                }
+            }
+        }
+    }
+    let is_kind_expr = |head: &str| {
+        head.contains(".kind()") || bound.iter().any(|b| head.split_whitespace().any(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_') == *b))
+    };
+
+    // (1) `<kind expr> == "x"` / `!= "x"` / `== Some("x")`
+    for (i, _) in src.match_indices(".kind()") {
+        let rest = src[i + 7..].trim_start();
+        let rest = rest.strip_prefix(')').unwrap_or(rest).trim_start();
+        if let Some(r) = rest.strip_prefix("==").or_else(|| rest.strip_prefix("!=")) {
+            let r = r.trim_start();
+            let r = r.strip_prefix("Some(").unwrap_or(r).trim_start();
+            if r.starts_with('"') {
+                if let Some(lit) = string_literals(r).into_iter().next() {
+                    out.push((line_of(i), lit));
+                }
+            }
+        }
+    }
+    for name in &bound {
+        for (i, _) in src.match_indices(name.to_owned()) {
+            let rest = src[i + name.len()..].trim_start();
+            if let Some(r) = rest.strip_prefix("==").or_else(|| rest.strip_prefix("!=")) {
+                let r = r.trim_start();
+                if r.starts_with('"') {
+                    if let Some(lit) = string_literals(r).into_iter().next() {
+                        out.push((line_of(i), lit));
+                    }
+                }
+            }
+        }
+    }
+
+    // (2) `matches!(<kind expr>, "a" | "b" | ...)`
+    for (i, _) in src.match_indices("matches!(") {
+        let open = i + "matches!".len();
+        let end = balanced_from(src, open, b'(', b')');
+        let inner = &src[open + 1..end.saturating_sub(1)];
+        let Some(comma) = inner.find(',') else { continue };
+        if !is_kind_expr(&inner[..comma]) {
+            continue;
+        }
+        for lit in string_literals(&inner[comma..]) {
+            out.push((line_of(i), lit));
+        }
+    }
+
+    // (3) `match <kind expr> { "a" => .., "b" | "c" => .. }` — pattern position
+    //     only, so a string in an arm BODY is never mistaken for a kind.
+    for (i, _) in src.match_indices("match ") {
+        let after = &src[i + 6..];
+        let Some(brace_rel) = after.find('{') else { continue };
+        let head = &after[..brace_rel];
+        if head.contains(';') || head.contains(')') && !head.contains(".kind()") {
+            continue;
+        }
+        if !is_kind_expr(head) {
+            continue;
+        }
+        let open = i + 6 + brace_rel;
+        let end = balanced_from(src, open, b'{', b'}');
+        for (n, line) in src[open..end].split('\n').enumerate() {
+            let pat = match line.split_once("=>") {
+                Some((before, _)) => before.to_string(),
+                None => {
+                    let t = line.trim();
+                    // A continued pattern line is only literals, `|` and space.
+                    let only_pat = !t.is_empty()
+                        && t.chars().all(|c| c == '"' || c == '|' || c == '_' || c.is_whitespace() || c.is_alphanumeric());
+                    if only_pat && t.contains('"') { t.to_string() } else { String::new() }
+                }
+            };
+            for lit in string_literals(&pat) {
+                out.push((line_of(open) + n, lit));
+            }
+        }
+    }
+
+    out.retain(|(_, s)| is_kindish(s));
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A `kind()` compared against a string the grammar does not define is a
+/// SILENT no-op: the arm never fires, and it reads like handled behaviour
+/// sitting next to a working sibling. Two live bugs came from exactly that —
+/// a skip-list naming `require_statement` (the real kind is
+/// `require_expression`), and `"bareword" | "scoped_identifier"` arms where
+/// only the first half can ever match.
+///
+/// Per-language on purpose: see `DECLARED_FUTURE_PERL_KINDS`.
+#[test]
+fn kind_comparisons_name_real_grammar_kinds() {
+    let perl = grammar_kinds(&ts_parser_perl::LANGUAGE.into());
+    let pod = grammar_kinds(&ts_parser_pod::LANGUAGE.into());
+    let cpp = grammar_kinds(&tree_sitter_cpp::LANGUAGE.into());
+    assert!(perl.len() > 100 && cpp.len() > 100, "grammars failed to enumerate");
+
+    let builtin: std::collections::HashSet<&str> = TREE_SITTER_BUILTIN_KINDS.iter().copied().collect();
+    let future: std::collections::HashSet<&str> = DECLARED_FUTURE_PERL_KINDS.iter().copied().collect();
+
+    let mut dead: Vec<String> = Vec::new();
+    for (path, _, _) in source_files() {
+        let rel = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(&path).display().to_string();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        // Which grammar do this file's trees come from? Path-derived, because
+        // that is how the codebase separates them.
+        let (known, lang): (std::collections::HashSet<&str>, &str) =
+            if rel.ends_with("build/pod.rs") {
+                (pod.iter().map(String::as_str).collect(), "pod")
+            } else if rel.contains("query_extract") {
+                // The generic extraction driver serves every pack language.
+                (perl.iter().chain(pod.iter()).chain(cpp.iter()).map(String::as_str).collect(), "any")
+            } else if name.starts_with("cpp_") || rel.contains("cpp_reparse") {
+                (cpp.iter().map(String::as_str).collect(), "cpp")
+            } else {
+                (perl.iter().map(String::as_str).collect(), "perl")
+            };
+
+        let text = fs::read_to_string(&path).expect("read source");
+        for (line, lit) in kind_comparison_literals(&text) {
+            if known.contains(lit.as_str()) || builtin.contains(lit.as_str()) {
+                continue;
+            }
+            if lang == "perl" && future.contains(lit.as_str()) {
+                continue;
+            }
+            if KNOWN_DEAD_KIND_ARMS
+                .iter()
+                .any(|(f, k)| *k == lit && rel.replace('\\', "/").ends_with(f))
+            {
+                continue;
+            }
+            dead.push(format!("{rel}:{line}: `{lit}` is not a {lang} grammar kind"));
+        }
+    }
+
+    assert!(
+        dead.is_empty(),
+        "these `kind()` comparisons can never match — the arm is dead code that \
+         reads as handled behaviour.\nFix the spelling, or if the kind is coming \
+         in a future grammar release, add it to DECLARED_FUTURE_PERL_KINDS with \
+         a note saying so:\n{}",
+        dead.join("\n")
+    );
+}

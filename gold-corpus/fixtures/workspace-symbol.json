@@ -53,7 +53,7 @@
       "id": "ws-dt-mon",
       "difficulty": "tricky",
       "semantic_area": "codegen",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "query": "mon",
       "expect": {"all":["{\"col\":\"0\",\"file\":\"DateTime.pm\",\"kind\":\"Sub\",\"line\":\"797\",\"name\":\"mon\"}"],"none":[]},
       "status": "gold"
@@ -62,7 +62,7 @@
       "id": "ws-dt-fromepoch",
       "difficulty": "tricky",
       "semantic_area": "classic",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "query": "from_epoch",
       "expect": {"all":["{\"col\":\"8\",\"file\":\"DateTime.pm\",\"kind\":\"Sub\",\"line\":\"485\",\"name\":\"from_epoch\"}"],"none":[]},
       "status": "gold"

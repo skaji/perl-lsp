@@ -181,7 +181,7 @@
       "id": "sig-datetime-normalize-nanoseconds-indexarg",
       "difficulty": "simple",
       "semantic_area": "classic",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 226,
       "col": 8,
       "expect": {

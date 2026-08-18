@@ -5,7 +5,7 @@
       "id": "hover-dt-now",
       "difficulty": "simple",
       "semantic_area": "type-inference",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 542,
       "col": 4,
       "expect": {
@@ -22,7 +22,7 @@
       "id": "hover-dt-clone",
       "difficulty": "simple",
       "semantic_area": "type-inference",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 764,
       "col": 4,
       "expect": {
@@ -39,7 +39,7 @@
       "id": "hover-dt-duration-class-const",
       "difficulty": "simple",
       "semantic_area": "constants",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 87,
       "col": 4,
       "expect": {
@@ -56,7 +56,7 @@
       "id": "hover-dt-seconds-per-day-const",
       "difficulty": "simple",
       "semantic_area": "constants",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 85,
       "col": 4,
       "expect": {
@@ -73,7 +73,7 @@
       "id": "hover-dt-today-chain",
       "difficulty": "tricky",
       "semantic_area": "type-inference",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 568,
       "col": 4,
       "expect": {
@@ -90,7 +90,7 @@
       "id": "hover-dt-truncate-in-chain",
       "difficulty": "tricky",
       "semantic_area": "type-inference",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 568,
       "col": 28,
       "expect": {
@@ -385,7 +385,7 @@
       "id": "hover-datetime-clone-bless-ref",
       "difficulty": "tricky",
       "semantic_area": "bless",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 764,
       "col": 4,
       "expect": {
@@ -403,7 +403,7 @@
       "id": "hover-datetime-now-from-epoch",
       "difficulty": "tricky",
       "semantic_area": "chain",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 542,
       "col": 4,
       "expect": {
