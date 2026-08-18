@@ -195,7 +195,7 @@
       "id": "le-dt-p-hash-slices",
       "difficulty": "tricky",
       "semantic_area": "type-inference",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 190,
       "col": 7,
       "expect": {
@@ -212,7 +212,7 @@
       "id": "le-dt-class-new",
       "difficulty": "simple",
       "semantic_area": "classic",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 189,
       "col": 7,
       "expect": {
@@ -231,7 +231,7 @@
       "id": "le-dt-infinity-constant",
       "difficulty": "tricky",
       "semantic_area": "constants",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 81,
       "col": 4,
       "expect": {

@@ -117,7 +117,7 @@
       "id": "dh-datetime-normalize_seconds-sub",
       "difficulty": "simple",
       "semantic_area": "classic-sub-name",
-      "file": "x86_64-linux/DateTime.pm",
+      "file": "{arch}/DateTime.pm",
       "line": 394,
       "col": 8,
       "expect": {

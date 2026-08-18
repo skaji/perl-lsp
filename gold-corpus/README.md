@@ -84,9 +84,15 @@ canary — the abort kills the whole `--batch`, and the harness hard-fails a
 CRASH; the diagnostics row pins the degradation contract (`cst-too-deep`
 warning per skipped file, rest of the workspace unaffected). Two copies so
 at least one lands on a worker stack regardless of rayon scheduling.
-**Authoring trap:** a warm module cache masks the crash (cached blobs skip
-the walk entirely) — run `perl-lsp --clear-cache gold-corpus/deepcst-fixture`
-before trusting a base-failure check here.
+**Authoring trap, and it cuts both ways:** a warm module cache serves the
+stored blob and never re-walks the tree, so it masks whatever the walk would
+have done. Before the walk was iterative that hid the *crash*; after, it hid
+the *fix* — a stale blob replayed a `cst-too-deep` diagnostic naming the old
+`500` limit while a freshly-walked file in the same run named `100000`, two
+limits live at once from a source with only one gate. Either way the symptom
+is a result that does not match the code you are looking at. Run
+`perl-lsp --clear-cache gold-corpus/deepcst-fixture` before trusting any
+check here, base-failure or fix-verification.
 
 **Re-export fixture.** Three rows (`fixtures/reexport.json`, capability `definition` — folded under `definition` in `--list`) run against a small **committed, self-contained workspace** at `reexport-fixture/` instead of the snapshot substrate, via a per-row `root`. They flex the transitive export-surface feature: `goto-def` from a consumer of a re-exporter resolves to the *original* sub through both re-export forms — static splice (`our @EXPORT = (@RexBase::EXPORT)`) and loop-push (`push @EXPORT, @{"${m}::EXPORT"}`). The harness groups rows by `root` and runs one `--batch` per root.
 

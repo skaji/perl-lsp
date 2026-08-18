@@ -43,6 +43,7 @@ use strict;
 use warnings;
 use FindBin qw($RealBin);
 use File::Spec;
+use Config;
 use JSON::PP;
 use POSIX qw(WIFSIGNALED);
 use File::Temp qw(tempfile);
@@ -80,6 +81,18 @@ unless (-d $corpus) {
 # hermetic @INC: the pinned tree + its arch dir, ahead of anything inherited.
 my ($arch) = grep { -d } glob("$corpus/*/auto") ? map { s{/auto$}{}r } glob("$corpus/*/auto") : ();
 $ENV{PERL5LIB} = join(':', grep { defined && length } $corpus, $arch, $ENV{PERL5LIB});
+
+# The substrate's arch-specific subdirectory. It is NOT the same string on
+# every host: a Debian/Ubuntu threaded perl reports
+# `x86_64-linux-gnu-thread-multi` where CI's perl reports `x86_64-linux`.
+# Fixtures therefore spell it `{arch}` instead of one host's answer, and this
+# substitutes whatever is actually on disk (falling back to this perl's own
+# archname when the substrate has no arch dir at all). Hardcoding it cost two
+# sessions a full run each: the 22 rows under it simply did not resolve, and
+# the harness reported them as `skip` under an otherwise green summary.
+my $archname = defined $arch
+    ? (File::Spec->splitdir($arch))[-1]
+    : $Config{archname};
 
 # Strict residency: a server that would serve absence-as-answer (an evicted
 # copy whose blob can't rehydrate, an unaccounted whole-copy pin) PANICS —
@@ -173,7 +186,8 @@ sub batch_req {
     my %r = (id => $key, q => $cap);
     if ($spec->{check}) { return \%r; }
     if ($spec->{qarg})  { $r{query} = $row->{query} // ''; return \%r; }
-    $r{file} = "$root/$row->{file}";
+    (my $rel = $row->{file}) =~ s/\{arch\}/$archname/g;
+    $r{file} = "$root/$rel";
     $r{line} = $row->{line} // 0;
     $r{col}  = $row->{col}  // 0;
     $r{newname} = $row->{newname} // 'RENAMED' if $spec->{rename};
@@ -365,14 +379,23 @@ printf "  %-9s %d\n", 'xfail', $xfail;
 printf "  %-9s %d\n", 'FAIL',  scalar @fail;
 printf "  %-9s %d\n", 'XPASS', scalar @xpass;
 printf "  %-9s %d\n", 'CRASH', scalar @crash;
+# ALWAYS printed, even at zero, and counted as a failure below. A row whose
+# input did not resolve did not run, and a run that did not run a row has not
+# tested it — reporting that quietly under a green summary is the one thing
+# this harness must never do. Printing the zero makes "nothing was skipped" an
+# assertion a reader can see rather than an absence they have to notice.
+printf "  %-9s %d\n", 'skip',  scalar @skip;
 printf "  %-9s %d\n", 'prov?', scalar @prov if @prov;
-printf "  %-9s %d\n", 'skip',  scalar @skip if @skip;
-printf "  %-9s %d\n", 'lang-skip', scalar @lang_skip if @lang_skip;
+# lang-skip is NOT a failure: a default (perl-only) build legitimately cannot
+# serve the cpp rows, and CI builds exactly that. Still printed unconditionally
+# so the count is visible rather than inferred.
+printf "  %-9s %d\n", 'lang-skip', scalar @lang_skip;
 print "\n!! CRASH (process aborted):\n",                 map { "  - $_\n" } @crash if @crash;
 print "\n!! FAIL (gold assertion no longer holds):\n",   map { "  - $_\n" } @fail  if @fail;
 print "\n** XPASS (known gap fixed — update fixture):\n", map { "  - $_\n" } @xpass if @xpass;
 print "\nprovisional misses:\n",                         map { "  - $_\n" } @prov  if @prov;
-print "\nskipped:\n",                                    map { "  - $_\n" } @skip  if @skip;
+print "\n!! SKIP (row did not run — its input did not resolve):\n",
+                                                          map { "  - $_\n" } @skip  if @skip;
 print "\nlang-skipped (binary doesn't serve that language):\n", map { "  - $_\n" } @lang_skip if @lang_skip;
 print "\n";
 
@@ -429,4 +452,8 @@ print "\n";
 }
 sub _sum { my $t = 0; $t += $_ for @{ $_[0] }; $t }
 
-exit((@fail || @crash || @xpass) ? 1 : 0);
+# @skip fails the run. It is not a softer FAIL — it is worse, because a failing
+# row at least proves the harness reached it. @lang_skip is excluded on purpose:
+# it means the binary does not serve that language, which is a real supported
+# configuration (CI's perl-only build), not a missing input.
+exit((@fail || @crash || @xpass || @skip) ? 1 : 0);
