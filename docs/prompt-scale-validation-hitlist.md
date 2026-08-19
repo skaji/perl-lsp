@@ -841,3 +841,46 @@ named inputs.
 - **Narrow seam review** — the few hundred lines where a bug is silent and
   catastrophic (cache accounting, residency, invalidation, the enrichment
   writer, `IndexCore` shared state).
+
+## Koha A/B differential sweep — base does not complete the corpus
+
+The strongest single validation result of the pass, and the one that took
+three wrong readings to get to.
+
+**Result.** On Koha (23,446 positions), the branch-point binary **stops
+answering** — frozen at 1,691 answers, zero progress over a 45 s window,
+after 8 wedges. The tip completes all 23,446 with zero wedges.
+
+Every wedge is the same verb:
+
+| # | file:line | re-warm confirmed |
+|---|---|---|
+| 1 | `C4/ClassSortRoutine/Generic.pm:47` | yes (224 ms) |
+| 2 | `C4/InstallAuth.pm:32` | yes (173 ms) |
+| 3 | `C4/Reports/Guided.pm:52` | **no** |
+| 4 | `C4/Reports/Guided.pm:433` | yes (135 ms) |
+| 5 | `Koha.pm:0` | yes (166 ms) |
+| 6 | `Koha/Acquisition/Bookseller.pm:160` | yes (169 ms) |
+| 7 | `Koha/Acquisition/Bookseller/Issues.pm:23` | **no** |
+| 8 | `Koha/ArticleRequest/Status.pm:19` | **no** |
+
+`definition`, 8/8, all within the first 383 positions, three consecutive
+timeouts each. The failed re-warms cluster at the end: the degradation is
+cumulative, and shortly after the eighth the side stops answering entirely.
+
+**What this does NOT establish.** Which change removed the hang — the tip is
+the whole branch. And no divergence adjudication: the 1,691 overlapping
+positions are the *early* ones base survived to reach, not a random sample,
+so shape counts over them (`timeout-base 25`) are floors, not counts.
+
+**Methodology note, earned the hard way.** Three separate readings in one
+evening were wrong because a measurement read a file that was not yet what it
+would be: a floor diffed against noise runs from a *previous* invocation; this
+A/B diffed while its base side was still writing; build-phase counters read as
+zero when a warm cache meant nothing was built. **A partial answers file is
+indistinguishable from a complete one, to the harness and to the reader.**
+Until `sweep.py` writes `.partial` and renames on clean completion — or records
+an expected position count the differ can check — verify a side is quiescent
+*and* not merely stalled (sample the line count twice) before diffing. A side
+that aborted looks exactly like a side that legitimately answered less, which
+is the precise distinction the sweep exists to draw.
