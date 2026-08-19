@@ -386,7 +386,7 @@
       "id": "ti-classname-string",
       "difficulty": "hard",
       "semantic_area": "classic",
-      "file": "x86_64-linux-gnu-thread-multi/Moose.pm",
+      "file": "{arch}/Moose.pm",
       "line": 148,
       "col": 7,
       "query": "",
