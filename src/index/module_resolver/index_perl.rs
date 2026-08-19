@@ -528,13 +528,18 @@ pub fn index_workspace_with_index(
 
     // Workspace-tier residency tripwire, mirroring the pack indexer's:
     // gated off under NO_EVICT (everything is deliberately whole there).
+    // Timed alongside the drain: it sweeps every registered file, so it is a
+    // second O(corpus) term between the walk and the readiness gate, and the
+    // window is only the drain's if the other terms are measured too.
     if let Some(idx) = module_index {
         if eviction_enabled() {
-            residency_tripwire(
-                "workspace",
-                idx.count_fully_resident(),
-                expected_whole.load(Ordering::Relaxed),
-            );
+            crate::util::timings::phase("index.residency_tripwire", || {
+                residency_tripwire(
+                    "workspace",
+                    idx.count_fully_resident(),
+                    expected_whole.load(Ordering::Relaxed),
+                );
+            });
         }
     }
 

@@ -221,6 +221,12 @@ pub(crate) fn send_to_writer<E>(tx: &std::sync::mpsc::SyncSender<E>, entry: E) {
             }
             Err(TrySendError::Full(returned)) => entry = returned,
         }
+        // One per park INTERVAL, so `count * QUEUE_PARK` is roughly aggregate
+        // producer stall. Whether backpressure ever engaged is not inferable
+        // from wall time — a run where the walk never outran the writer looks
+        // identical to one where the depth did nothing — and a drain number
+        // from a run with zero parks says nothing about the depth.
+        crate::util::ghost_stats::count("persist_queue.producer_parked");
         std::thread::sleep(QUEUE_PARK);
         waited = waited.saturating_add(QUEUE_PARK);
         if !warned && waited >= QUEUE_STALL_WARN {

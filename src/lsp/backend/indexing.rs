@@ -210,6 +210,14 @@ impl Backend {
                     &crate::build::language_driver::LanguageScope::All,
                 )
             };
+            // Everything from here to `open_perl_gate_then_heal` is still
+            // inside the readiness gate, so it is part of the "100% walked,
+            // still not ready" window even though the walk and the writer are
+            // both done. Timed as one segment because the window's SIZE has
+            // been attributed to the writer drain, and an attribution is only
+            // worth anything if the other terms were measured rather than
+            // assumed.
+            let _to_gate = crate::util::timings::PhaseGuard::start("index.indexer_return_to_gate");
             // Drop the sender(s) so the emitter's channel closes, then drain it
             // — guarantees the final Report lands before End.
             drop(cb);
