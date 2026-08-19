@@ -18,7 +18,7 @@ Detail for each is in its section below.
 ### Tier 1
 | # | item | status |
 |---|---|---|
-| 1 | Post-cold-index availability hole | **PARTIAL** — "no answers" fixed `d9053e4f`; writer-drain diagnostics blackout still open, gate split adjudicated in PR #121 |
+| 1 | Post-cold-index availability hole | **CLOSED** — "no answers" fixed `d9053e4f`; the drain window closed itself once the queue was bounded (1.4 s at 138k, was ~7–9 min). Gate split retired unbuilt |
 | 2 | Fatal stack overflow on deep CSTs (P0) | **CLOSED** — depth gate `fed8ac00`, then the recursion class itself removed (PR #123): descent is queued, cap 500 → 100,000, measured |
 | 3 | `references` terminal at scale | **RETURNS** (`32a3bf4e`) — confirmed independently on the server path at 138k: 368 / 265 / 295 s, 2.8 GB peak, answer marked incomplete. Was: never, at 7+ GB. Slow, honest, and bounded — not yet fast |
 | 4 | Completion payload unbounded | **CLOSED** `b6312ea2` — 7.29 MB/236 ms → 55.9 KB/4 ms |
@@ -204,9 +204,29 @@ Measured, cpan5k cold: hover 120,000 ms TIMEOUT → 0.7 ms; def 44,498 ms →
 20 cores — only categorical results banked; the 691 s → 612 s gate-open delta
 is **not** claimed.
 
-**Still open — the writer-drain window.** Diagnostics stay deferred for the
-~7–9 min the single-threaded persist writer drains its unbounded backlog
-(~7 GB RSS), and Complete verbs still wait their 120 s cap in it. Now
+**The writer-drain window is CLOSED** (measured 2026-08-19, tip `8ede3571`).
+It was ~7–9 min because the persist channel was unbounded and accumulated
+~4/5 of the corpus. With the bound (PR #130) the drain is **1.4 s at 138k** —
+`index.writer_drain_after_walk` = 1,383 ms perl + 58 ms pack on a cold
+`--check`. The law that predicts it, derived on 2,265 files by throttling the
+writer into the bottleneck regime and varying the depth: **post-walk drain =
+queue depth × per-file writer cost, independent of corpus size.**
+
+That retires the `attached`/`durable` gate split before it was built — the
+split existed to let verbs answer *during* a long drain, and there is no long
+drain. Recorded as a design closed by measurement, not by implementation.
+
+**What remains of this row is a different problem**: `cli::index_workspace`
+(~233 s) and `cli::index_pack` (~220 s) at 138k — the walk itself, and `--check`
+paying pack indexing because it declares `LanguageScope::All`.
+
+**Measurement trap found doing this.** `PERL_LSP_PHASE_TIMING=1` emits a line
+per region *per file*; at 138k that is millions of lines (~4,800/s observed)
+and it dominates the run it is measuring. Use it for `cli::*`-level questions
+on small corpora; at corpus scale prefer the ghost-stats accumulators
+(`timed` / `add_ns`), which sum and dump once. Related: the periodic ghost
+re-emit covers cache reports only — the trigger counters flush at shutdown,
+so a killed run loses them. Now
 honestly announced ("Saving index to cache…") instead of a silent 100%.
 The gate cannot simply open at walk end: stripped fresh copies register only
 post-commit, so an evicted copy without a committed blob rehydrates to
