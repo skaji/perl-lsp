@@ -246,6 +246,9 @@ impl<'a> Builder<'a> {
         for round in 0..16 {
             debug_assert!(round < 15, "pattern dispatch failed to reach a fixed point");
             rounds_run += 1;
+            if round == 0 && combine_probe_enabled() {
+                self.probe_combined_query(root, &plugins);
+            }
             let mut progressed = false;
             for p in plugins.all() {
                 for spec in p.patterns() {
@@ -1004,5 +1007,149 @@ impl<'a> Builder<'a> {
             data.is_package_receiver = Some(is_pkg);
         }
         data
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Measurement probe: 14 whole-tree traversals vs 1.
+//
+// `dispatch_pattern_plugins` runs one `QueryCursor::matches` per pattern spec,
+// and each is a full traversal of the file's tree. Tree-sitter's intended
+// shape is the opposite — one `Query` holding many patterns, walked once, with
+// `pattern_index` routing each match back to its owner.
+//
+// The probe measures that A/B on the real corpus WITHOUT changing dispatch:
+// it runs the combined query first (so any cache warming biases AGAINST the
+// hypothesis), then the same specs separately, and records both times plus
+// both match counts. Equal counts are the evidence that the combined query
+// sees the same matches; unequal counts mean the concatenation is not
+// equivalent and the whole idea is dead before anyone writes the remap.
+//
+// Off unless `PERL_LSP_PD_COMBINE_PROBE=1`, and it only runs on round 0.
+// ---------------------------------------------------------------------------
+
+fn combine_probe_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PERL_LSP_PD_COMBINE_PROBE").as_deref() == Ok("1"))
+}
+
+/// Compile the concatenation of every Perl walk-phase pattern source, once.
+/// Keyed on the joined text, so it shares `cached_pattern_query`'s process-wide
+/// memo — the probe must not pay a compile per file or it measures the compile.
+fn combined_walk_query(sources: &[String]) -> Result<&'static Query, String> {
+    cached_pattern_query(&sources.join("\n"))
+}
+
+impl<'a> Builder<'a> {
+    /// One round of the A/B. Records, under `PERL_LSP_GHOST_STATS`:
+    ///   `pd.probe.combined` / `pd.probe.separate`   accumulated ns
+    ///   `pd.probe.combined_matches` / `..._separate_matches`  match totals
+    ///   `pd.probe.combined_exceeded`   cursor match-limit overruns (must be 0:
+    ///       exceeding the limit DROPS matches silently rather than erroring)
+    fn probe_combined_query(&self, root: Node<'a>, plugins: &crate::build::plugin::PluginRegistry) {
+        let sources: Vec<String> = plugins
+            .all()
+            .flat_map(|p| p.patterns())
+            .filter(|s| s.language == "perl" && s.phase == "walk")
+            .map(|s| s.query.clone())
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        crate::util::ghost_stats::count_by("pd.probe.specs", sources.len() as u64);
+
+        // Per-spec match sets, keyed by spec index. Comparing these rather
+        // than a total is the point: a combined query is only usable if each
+        // match still routes to the spec that owns it, and that routing —
+        // `pattern_index` offset by each source's `pattern_count` — is the
+        // highest-risk part of the real change. A total would agree even if
+        // every match were attributed to the wrong plugin.
+        let mut combined_by_spec: Vec<Vec<Span>> = vec![Vec::new(); sources.len()];
+        let mut separate_by_spec: Vec<Vec<Span>> = vec![Vec::new(); sources.len()];
+
+        // Combined FIRST: whatever warming the tree traversal gets accrues to
+        // the arm this probe is trying to beat, not to the one it favours.
+        let combined = match combined_walk_query(&sources) {
+            Ok(q) => q,
+            Err(e) => {
+                crate::util::ghost_stats::count("pd.probe.combined_compile_failed");
+                log::error!("combined pattern query failed to compile: {e}");
+                return;
+            }
+        };
+        // Cumulative pattern counts: combined pattern i belongs to the last
+        // spec whose offset is <= i. One source can contribute many patterns.
+        let mut offsets: Vec<usize> = Vec::with_capacity(sources.len());
+        {
+            let mut acc = 0usize;
+            for src in &sources {
+                offsets.push(acc);
+                acc += cached_pattern_query(src).map(|q| q.pattern_count()).unwrap_or(0);
+            }
+            if acc != combined.pattern_count() {
+                // The concatenation did not preserve pattern count — routing
+                // by offset would silently mis-attribute every match.
+                crate::util::ghost_stats::count("pd.probe.pattern_count_mismatch");
+                return;
+            }
+        }
+        let owner_of = |pattern_index: usize| -> usize {
+            match offsets.binary_search(&pattern_index) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            }
+        };
+
+        let mut exceeded = false;
+        crate::util::ghost_stats::timed("pd.probe.combined", || {
+            let mut cursor = QueryCursor::new();
+            let mut it = cursor.matches(combined, root, self.source);
+            while let Some(m) = it.next() {
+                let caps: Vec<(u32, Node<'a>)> =
+                    m.captures.iter().map(|c| (c.index, c.node)).collect();
+                if caps.is_empty() {
+                    continue;
+                }
+                combined_by_spec[owner_of(m.pattern_index)].push(union_span(&caps));
+            }
+            exceeded = cursor.did_exceed_match_limit();
+        });
+        if exceeded {
+            crate::util::ghost_stats::count("pd.probe.combined_exceeded");
+        }
+
+        crate::util::ghost_stats::timed("pd.probe.separate", || {
+            for (i, src) in sources.iter().enumerate() {
+                let Ok(q) = cached_pattern_query(src) else {
+                    continue;
+                };
+                let mut cursor = QueryCursor::new();
+                let mut it = cursor.matches(q, root, self.source);
+                while let Some(m) = it.next() {
+                    let caps: Vec<(u32, Node<'a>)> =
+                        m.captures.iter().map(|c| (c.index, c.node)).collect();
+                    if caps.is_empty() {
+                        continue;
+                    }
+                    separate_by_spec[i].push(union_span(&caps));
+                }
+            }
+        });
+
+        let mut total = 0u64;
+        let mut mismatched = 0u64;
+        for (a, b) in combined_by_spec.iter_mut().zip(separate_by_spec.iter_mut()) {
+            a.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
+            b.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
+            total += b.len() as u64;
+            if a != b {
+                mismatched += 1;
+            }
+        }
+        crate::util::ghost_stats::count_by("pd.probe.matches", total);
+        // MUST stay 0. A non-zero value is the finding: the combined query
+        // does not see what the separate ones see, and the 14-to-1 rewrite is
+        // dead before anyone writes the capture remap.
+        crate::util::ghost_stats::count_by("pd.probe.spec_mismatches", mismatched);
     }
 }
