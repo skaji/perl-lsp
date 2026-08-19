@@ -358,3 +358,40 @@ Pinned by `fixtures/type-at.json::ti-classname-string` (xfail). Found by
 `(anon)` fix, and adjudicating it showed 0.6.1 fails the same way — it just
 fell back to offering the ENCLOSING PACKAGE's own subs, which are not the
 receiver's methods at all.
+
+## Completion is not reproducible under the cap, and the order is load-bearing
+
+Four cold runs of the same binary over 1,458 positions (`bench/sweep`)
+disagree on **206 completion answers and nothing else** — definition, hover,
+references and documentSymbol are stable across all four. The 206 split
+cleanly by list size, and the split is the diagnosis:
+
+| | count | list size | cause |
+|---|---|---|---|
+| same candidate SET, different order | 173 | all **under** the cap | the list is never sorted |
+| candidate set actually moves | 33 | all **exactly at** the cap (200) | the pool is still filling |
+
+`cap_completion_items` returns early below `MAX_COMPLETION_ITEMS`, so an
+under-cap list goes out in whatever order the hash-backed tiers iterated. The
+33 are a different animal: all carry `isIncomplete`, and they occur **21, 12,
+0, 0** across quartiles of sweep order — confined to the first half of a run
+and absent from the second. That is the index still filling, which is what
+`isIncomplete` exists to say.
+
+**Sorting unconditionally is not the fix, and it was tried.** It removes the
+whole ordering component (the `reranked` floor falls from 158–168 to 0–1
+across six pairs) and fails
+`completion/completion-arg-position-type-match-ranks-first`, which is right
+to fail: `rank_candidates_by_expected_type` reorders candidates and nudges
+priorities, and dispatch items are explicitly prepended. Some of that intent
+lives in list POSITION rather than in `sort_text`, so a sort by `sort_text`
+discards it.
+
+Note the inconsistency that implies: the over-cap path already sorts by
+`sort_text`, so it already discards that same intent. Under the cap it is
+preserved. The two paths disagree about whether position carries meaning.
+
+The real fix is to encode every deliberate ordering into `sort_text` so
+sorting becomes order-preserving, at which point both paths can sort and
+completion becomes reproducible — and therefore gold-testable, which today it
+is not for any position in that 173.
