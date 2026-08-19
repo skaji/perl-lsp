@@ -29,6 +29,39 @@ const GHOST_CAP: usize = 8192;
 /// killed without a clean shutdown still leaves the trail on record.
 const EMIT_EVERY_MISSES: u64 = 2000;
 
+/// How often a long run re-emits the COUNTER block, for the same reason —
+/// `emit_all` only runs at a clean shutdown, so a run that is killed used to
+/// lose every counter, which is exactly what `EMIT_EVERY_MISSES` exists to
+/// prevent on the cache side. A 43-minute corpus run was lost to this.
+///
+/// Time-based rather than event-based, unlike the cache side: the failure
+/// being prevented is "a long run was killed", which is a property of elapsed
+/// time. A miss-count trigger emits nothing at all for a workload that never
+/// touches a cache — and the counters that say whether a MEASUREMENT was
+/// valid (`persist_queue.producer_parked`) come from exactly such a run.
+const ATTRIBUTION_REEMIT_MILLISECONDS: u64 = 60_000;
+
+/// `PERL_LSP_GHOST_REEMIT_MILLISECONDS` overrides the interval — a corpus run
+/// measured in tens of minutes may want its counters more often than once a
+/// minute, and a test wants them far sooner than that.
+fn attribution_reemit_interval() -> u64 {
+    static I: OnceLock<u64> = OnceLock::new();
+    *I.get_or_init(|| {
+        std::env::var("PERL_LSP_GHOST_REEMIT_MILLISECONDS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(ATTRIBUTION_REEMIT_MILLISECONDS)
+    })
+}
+
+/// Is a counter re-emit due? Split out so the interval rule is testable
+/// without the process-wide env gate. Saturating: a clock that appears to go
+/// backwards must not suppress emission forever.
+fn attribution_reemit_due(now_ms: u64, last_ms: u64, interval_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) >= interval_ms
+}
+
 enum Sink {
     Off,
     Stderr,
@@ -70,8 +103,55 @@ pub fn count(tag: &str) {
     if !enabled() {
         return;
     }
-    let mut c = counters().lock().unwrap_or_else(|e| e.into_inner());
-    *c.entry(tag.to_string()).or_insert(0) += 1;
+    {
+        let mut c = counters().lock().unwrap_or_else(|e| e.into_inner());
+        *c.entry(tag.to_string()).or_insert(0) += 1;
+    }
+    // AFTER the guard drops: the re-emit locks the same map, and this mutex
+    // is not reentrant.
+    maybe_reemit_attribution();
+}
+
+/// Process-start reference for the re-emit clock. An `Instant` cannot live in
+/// an atomic, so elapsed-millis-since-this is what the atomic holds.
+fn run_started() -> std::time::Instant {
+    static S: OnceLock<std::time::Instant> = OnceLock::new();
+    *S.get_or_init(std::time::Instant::now)
+}
+
+static LAST_ATTRIBUTION_EMIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Re-emit the counter block if the interval has elapsed. Called from the
+/// counter path rather than a timer thread, so an idle process stays idle;
+/// the CAS means exactly one thread emits per interval.
+fn maybe_reemit_attribution() {
+    let now = run_started().elapsed().as_millis() as u64;
+    let last = LAST_ATTRIBUTION_EMIT_MS.load(Ordering::Relaxed);
+    if !attribution_reemit_due(now, last, attribution_reemit_interval()) {
+        return;
+    }
+    if LAST_ATTRIBUTION_EMIT_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return; // another thread is emitting this interval
+    }
+    emit_attribution("periodic");
+}
+
+/// Add `n` to a named counter in one call. For a per-FILE quantity (fold
+/// iterations, POD bytes) a printed line per file is unreadable at corpus
+/// scale and unaggregable at any scale; a total plus a sample count gives
+/// both the sum and the average, and a single-file run still reads exactly.
+pub fn count_by(tag: &str, n: u64) {
+    if !enabled() || n == 0 {
+        return;
+    }
+    {
+        let mut c = counters().lock().unwrap_or_else(|e| e.into_inner());
+        *c.entry(tag.to_string()).or_insert(0) += n;
+    }
+    maybe_reemit_attribution();
 }
 
 /// tag -> (total nanos, call count). A per-call `[PHASE]` line is useless for
@@ -675,5 +755,28 @@ mod tests {
         assert!(inner.ring.len() <= GHOST_CAP);
         assert!(!inner.present.contains_key("/k0"), "oldest keys aged out");
         assert!(inner.present.contains_key(&format!("/k{}", GHOST_CAP + 99)[..]));
+    }
+}
+
+#[cfg(test)]
+mod reemit_tests {
+    use super::*;
+
+    /// The counter block used to reach the sink only via `emit_all`, which is
+    /// wired to a CLEAN shutdown. A long run that is killed therefore lost
+    /// every counter — including the ones that say whether a measurement was
+    /// valid at all. The interval rule is what makes the periodic re-emit
+    /// fire; the wiring is exercised by the counter path itself.
+    #[test]
+    fn a_reemit_is_due_only_after_the_interval() {
+        let iv = ATTRIBUTION_REEMIT_MILLISECONDS;
+        assert!(!attribution_reemit_due(0, 0, iv));
+        assert!(!attribution_reemit_due(iv - 1, 0, iv), "just inside the interval");
+        assert!(attribution_reemit_due(iv, 0, iv), "exactly at the interval");
+        assert!(attribution_reemit_due(iv * 10, iv * 9, iv));
+        // A clock that appears to move backwards must not suppress emission
+        // forever — saturating, not wrapping.
+        assert!(!attribution_reemit_due(5, 10_000, iv));
+        assert!(attribution_reemit_due(10_000 + iv, 10_000, iv));
     }
 }

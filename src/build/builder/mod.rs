@@ -37,12 +37,21 @@ mod narrowing;
 /// `--plugin-check` can run `verify_pattern_expects`.
 pub(crate) mod pattern_dispatch;
 
-/// Build a FileAnalysis from a parsed tree in a single walk.
-/// Time one build() pass — `bphase!("walk", expr)` prints `[PHASE] build::walk`
-/// when `PERL_LSP_PHASE_TIMING` is set. Call-site sugar over `timings::phase`.
+/// Time one build-pipeline phase into a running TOTAL, not a printed line.
+///
+/// These regions run once per FILE, and `build()` has ~19 of them: printing
+/// each one emits ~4,800 lines/s at corpus scale — 3.2M lines on a 138k walk,
+/// which turns the run being measured into a different, much slower run. A
+/// per-call line is also the wrong shape for a per-file region; what a hot
+/// phase needs is the sum and the call count, so a share and an average are
+/// derivable. A single-file debug run gets the same information with n=1.
+///
+/// Reported by `PERL_LSP_GHOST_STATS` under "accumulated time".
+/// `PERL_LSP_PHASE_TIMING` keeps its meaning for regions entered ONCE per run
+/// (`cli::*`, `index.*`), where a line per entry is exactly right.
 macro_rules! bphase {
     ($label:literal, $body:expr) => {
-        $crate::util::timings::phase(concat!("build::", $label), || $body)
+        $crate::util::ghost_stats::timed(concat!("build::", $label), || $body)
     };
 }
 

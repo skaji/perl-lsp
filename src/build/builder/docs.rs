@@ -60,16 +60,13 @@ impl<'a> Builder<'a> {
         if self.pod_texts.is_empty() {
             return;
         }
-        if crate::util::timings::phases_enabled() {
+        // Totals rather than a line per file — see `build.fold_iterations`.
+        if crate::util::ghost_stats::enabled() {
             let nsubs = self.symbols.iter().filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method)).count();
             let podbytes: usize = self.pod_texts.iter().map(|p| p.len()).sum();
-            eprintln!(
-                "[PHASE] {:<32} {} subs, {} pod_texts, {} pod_bytes",
-                "build::tail_pod_inputs",
-                nsubs,
-                self.pod_texts.len(),
-                podbytes
-            );
+            crate::util::ghost_stats::count_by("build.tail_pod_subs", nsubs as u64);
+            crate::util::ghost_stats::count_by("build.tail_pod_texts", self.pod_texts.len() as u64);
+            crate::util::ghost_stats::count_by("build.tail_pod_bytes", podbytes as u64);
         }
         // One name → doc map across every POD block. Within a block `=head2`
         // wins over `=item`; across blocks the earlier `pod_text` wins

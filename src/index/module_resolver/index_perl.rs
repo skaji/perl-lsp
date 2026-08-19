@@ -383,13 +383,19 @@ pub fn index_workspace_with_index(
             crate::util::timings::set_current_file(Some(&canon));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 analyze_stamped(path, || {
-                    let source = std::fs::read_to_string(path).ok()?;
+                    // Per-file segments accumulate rather than print: a
+                    // `[PHASE]` line per region per file is ~4,800 lines/s at
+                    // corpus scale and turns the run it is measuring into a
+                    // different run. Shares come from the totals.
+                    let source = crate::util::ghost_stats::timed("walk.read", || std::fs::read_to_string(path)).ok()?;
                     let mut parser = create_parser();
                     let t_parse = if timing { Some(std::time::Instant::now()) } else { None };
-                    let tree = parser.parse(&source, None)?;
+                    let tree = crate::util::ghost_stats::timed("walk.parse", || parser.parse(&source, None))?;
                     let parse_dur = t_parse.map(|s| s.elapsed()).unwrap_or_default();
                     let t_build = if timing { Some(std::time::Instant::now()) } else { None };
-                    let analysis = crate::build::builder::build(&tree, source.as_bytes());
+                    let analysis = crate::util::ghost_stats::timed("walk.build", || {
+                        crate::build::builder::build(&tree, source.as_bytes())
+                    });
                     let build_dur = t_build.map(|s| s.elapsed()).unwrap_or_default();
                     if timing {
                         crate::util::timings::record_built(
@@ -411,13 +417,19 @@ pub fn index_workspace_with_index(
                     // analysis; the persisted generation is encoded whole;
                     // only then is the resident copy stripped.
                     if let Some(idx) = module_index {
-                        idx.record_workspace_projections(&canon, &analysis);
+                        crate::util::ghost_stats::timed("walk.projections", || {
+                            idx.record_workspace_projections(&canon, &analysis)
+                        });
                     }
                     let payload = if persist && !analysis.degraded {
-                        module_cache::encode_analysis(&analysis).map(|blob| {
-                            let seeds: Vec<_> =
-                                analysis.ref_row_seeds();
-                            let sym_seeds = analysis.sym_row_seeds();
+                        crate::util::ghost_stats::timed("walk.encode", || module_cache::encode_analysis(&analysis)).map(|blob| {
+                            // One tag over both seed shreds so the sample
+                            // count stays one-per-file and the average reads
+                            // as "seed cost per file".
+                            let (seeds, sym_seeds) = crate::util::ghost_stats::timed(
+                                "walk.row_seeds",
+                                || (analysis.ref_row_seeds(), analysis.sym_row_seeds()),
+                            );
                             let closure = analysis.pack.include_closure.clone();
                             (blob, seeds, sym_seeds, closure)
                         })
@@ -431,13 +443,14 @@ pub fn index_workspace_with_index(
                         // "not yet indexed" — never wrong-empty.
                         let (arc, parts) = match module_index {
                             Some(idx) => {
-                                let mut parts =
-                                    idx.prepare_workspace_parts(&canon, analysis, crate::model::file_analysis::Residency::Skeleton);
+                                let mut parts = crate::util::ghost_stats::timed("walk.prepare_parts", || {
+                                    idx.prepare_workspace_parts(&canon, analysis, crate::model::file_analysis::Residency::Skeleton)
+                                });
                                 // Takes the surface out rather than cloning it:
                                 // the writer's registration half discards it, so
                                 // it would otherwise ride the queue only to be
                                 // dropped.
-                                parts.record_surface(idx, &canon);
+                                crate::util::ghost_stats::timed("walk.record_surface", || parts.record_surface(idx, &canon));
                                 (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
                             None => {

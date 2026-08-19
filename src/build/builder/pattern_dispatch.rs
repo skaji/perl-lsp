@@ -242,8 +242,10 @@ impl<'a> Builder<'a> {
         }
         let plugins = self.plugins.clone();
         let mut dispatched: HashSet<(String, String, Span)> = HashSet::new();
+        let mut rounds_run = 0u64;
         for round in 0..16 {
             debug_assert!(round < 15, "pattern dispatch failed to reach a fixed point");
+            rounds_run += 1;
             let mut progressed = false;
             for p in plugins.all() {
                 for spec in p.patterns() {
@@ -432,6 +434,11 @@ impl<'a> Builder<'a> {
                 break;
             }
         }
+        // Every round re-runs EVERY pattern query over the WHOLE tree — the
+        // fixed-point check is a full re-match, not an incremental one. So
+        // rounds-per-file is the multiplier on this phase's cost, and the
+        // last round is by definition the one that found nothing.
+        crate::util::ghost_stats::count_by("build.pattern_rounds", rounds_run);
     }
 
 
