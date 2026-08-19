@@ -237,6 +237,29 @@ def cmd_run(args):
                         rec["norm"] = None
                     else:
                         rec["norm"] = N.normalize(verb, msg.get("result"), root_uri)
+                    # An empty answer is asked TWICE. The @INC tier resolves
+                    # per-module, on demand, on a background thread, so the
+                    # first goto-def on `use Storable` can legitimately answer
+                    # empty and the second answer the file — the workspace
+                    # readiness gate cannot cover this, because the module was
+                    # never in the workspace. Verified by hand: the sweep
+                    # recorded head as empty on `use Storable` while the CLI,
+                    # which starts synchronously, resolves it.
+                    #
+                    # Without the retry that timing shows up as `only-base` and
+                    # reads as a lost resolution. The retry is in the RUNNER so
+                    # both sides get it by construction; a side-specific one
+                    # would be worse than none.
+                    if args.empty_retry_ms > 0 and not rec.get("timeout") \
+                            and not rec.get("err") \
+                            and N.is_empty(verb, rec["norm"]):
+                        time.sleep(args.empty_retry_ms / 1000.0)
+                        msg2, _ = lsp.request(method, params, timeout=args.timeout)
+                        if msg2 is not None and not _err(msg2):
+                            n2 = N.normalize(verb, msg2.get("result"), root_uri)
+                            if not N.is_empty(verb, n2):
+                                rec["norm"] = n2
+                                rec["filled_on_retry"] = True
                     fh.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
                     # A server that stops answering ENTIRELY is the failure
                     # mode that quietly ruins a long run: every remaining
@@ -453,6 +476,21 @@ SHAPE_ORDER = ["only-base", "subset", "timeout-head", "error-head", "disagree",
                "missing-head", "missing-base"]
 
 
+def _shape_counts(base_path, head_path, common):
+    """Shape histogram for one pair of answer files — used for the A/B run and,
+    with the SAME binary on both sides, for the noise floor."""
+    _, a = _load(base_path)
+    _, b = _load(head_path)
+    out = {}
+    for k in set(a) & set(b):
+        if k[3] not in common:
+            continue
+        sh = classify(k[3], a[k], b[k])
+        if sh != "same":
+            out[sh] = out.get(sh, 0) + 1
+    return out
+
+
 def cmd_diff(args):
     meta_a, base = _load(args.base)
     meta_b, head = _load(args.head)
@@ -492,6 +530,16 @@ def cmd_diff(args):
         kind = (b or a).get("kind", "?")
         counts[(shape, verb)] = counts.get((shape, verb), 0) + 1
         groups.setdefault((shape, verb, kind), []).append((k, a, b))
+
+    # The noise floor: the SAME binary against itself over the same
+    # positions. Measured here it is 3.1% of answers -- 162 `reranked` and 11
+    # `disagree`, and ZERO in every other shape. Without it a reader has no
+    # way to tell a 68-row `reranked` block from nothing at all, because
+    # completion ordering is not stable run to run. This is not a correction
+    # applied to the counts; it is the resolution limit printed beside them.
+    noise = {}
+    if args.noise_base and args.noise_head:
+        noise = _shape_counts(args.noise_base, args.noise_head, common)
 
     total = len(keys)
     diverged = sum(v for (s, _), v in counts.items() if s != "same")
@@ -539,15 +587,31 @@ def cmd_diff(args):
       f"agreement rate is not read as coverage.\n")
 
     W("## Divergences by shape\n")
-    W("| shape | n | meaning |")
-    W("|---|---|---|")
     by_shape = {}
     for (s, v), n in counts.items():
         if s != "same":
             by_shape[s] = by_shape.get(s, 0) + n
-    for s in SHAPE_ORDER:
-        if by_shape.get(s):
-            W(f"| `{s}` | {by_shape[s]} | {SHAPE_MEANING.get(s,'')} |")
+    if noise:
+        W("`noise` is the same shape's count when the SAME binary is run "
+          "twice over these positions. A block at or below its noise floor "
+          "carries no information — read the `signal` column, not `n`.\n")
+        W("| shape | n | noise | signal | meaning |")
+        W("|---|---|---|---|---|")
+        for s in SHAPE_ORDER:
+            if by_shape.get(s):
+                nf = noise.get(s, 0)
+                sig = "**below noise — unreadable**" if by_shape[s] <= nf \
+                      else f"{by_shape[s]-nf}"
+                W(f"| `{s}` | {by_shape[s]} | {nf} | {sig} | {SHAPE_MEANING.get(s,'')} |")
+    else:
+        W("*No noise floor supplied (`--noise-base` / `--noise-head`). Completion "
+          "ordering is not stable run to run, so `reranked` counts in particular "
+          "cannot be interpreted without one.*\n")
+        W("| shape | n | meaning |")
+        W("|---|---|---|")
+        for s in SHAPE_ORDER:
+            if by_shape.get(s):
+                W(f"| `{s}` | {by_shape[s]} | {SHAPE_MEANING.get(s,'')} |")
     W("")
 
     W("## Groups\n")
@@ -649,6 +713,10 @@ def main():
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--ready-timeout", type=float, default=600.0)
+    p.add_argument("--empty-retry-ms", type=float, default=400.0,
+                   help="re-ask once after this delay when an answer is empty; "
+                        "0 disables. Covers the on-demand @INC tier, which "
+                        "resolves per module after the first miss.")
     p.add_argument("--rewarm-timeout", type=float, default=60.0,
                    help="budget for re-reaching cross-file readiness after a restart")
     p.add_argument("--wedge-after", type=int, default=3,
@@ -661,6 +729,8 @@ def main():
     p.add_argument("--head", required=True)
     p.add_argument("--out")
     p.add_argument("--examples", type=int, default=8)
+    p.add_argument("--noise-base", help="answers from a repeat run of ONE binary")
+    p.add_argument("--noise-head", help="answers from a second run of that SAME binary")
     p.set_defaults(fn=cmd_diff)
 
     args = ap.parse_args()
