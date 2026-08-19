@@ -23,12 +23,23 @@ jobs:
 
       # `apt-get update` has wedged for 40-68 min on hosted runners (no output,
       # no failure) twice on this job, leaving Gold unverified while the build
-      # and harness steps never start. A short cap turns that silent hang into a
-      # fast, retryable failure — the packages take well under a minute when the
-      # mirrors are healthy.
+      # and harness steps never start. The cap turns that silent hang into a
+      # failure instead. It is deliberately well above the healthy time (under a
+      # minute) because a merely SLOW mirror is not the failure being caught: a
+      # 5-minute cap fired on a live PR and reported it as a gold regression,
+      # which is a worse outcome than the hang. Retry first, cap only the hang.
       - name: System libraries (XS build deps)
-        timeout-minutes: 5
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev libxml2-dev zlib1g-dev
+        timeout-minutes: 12
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get update -o Acquire::Retries=3 \
+              && sudo apt-get install -y -o Acquire::Retries=3 \
+                   libssl-dev libxml2-dev zlib1g-dev \
+              && exit 0
+            echo "apt attempt $attempt failed; retrying" >&2
+            sleep 5
+          done
+          exit 1
 
       - uses: shogo82148/actions-setup-perl@v1
         with:
