@@ -395,3 +395,21 @@ The real fix is to encode every deliberate ordering into `sort_text` so
 sorting becomes order-preserving, at which point both paths can sort and
 completion becomes reproducible — and therefore gold-testable, which today it
 is not for any position in that 173.
+
+**Two blockers found while attempting it, both concrete:**
+
+1. `rank_candidates_by_expected_type` nudges only non-matching **variables**
+   from `PRIORITY_LOCAL` to `PRIORITY_LOCAL + 1`. Same-tier candidates of
+   other kinds keep `PRIORITY_LOCAL`, so once sorted a non-matching local
+   falls *below* them and the locals stop being contiguous. Assembly order
+   hid this by keeping them together. Demoting every non-match at the local
+   tier is the one-line correction.
+
+2. Unexplained, and the reason the attempt was reverted rather than pushed
+   through: with the sort hoisted, the tiers predict `$total, $label, Foo,
+   apply` for `arg-rank-fixture/main.pl:8:6` — locals at 0 and 1,
+   same-file subs and packages at `PRIORITY_FILE_WIDE` (10) — and the CLI
+   prints exactly that **reversed**. Either a later stage reorders or the
+   printer does; until that is understood, a sorted list cannot be checked
+   against a fixture, because it is not clear what the fixture is asserting
+   about. Start here, not at the sort.
