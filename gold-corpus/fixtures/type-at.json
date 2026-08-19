@@ -153,7 +153,7 @@
         "none": []
       },
       "status": "gold",
-      "note": "SUPER::new types to the invocant class (Minion) via invocant_type_at_node's MethodOnClass receiver-relative fallback — resolves single-file now, no module index needed. Promoted from xfail (H7-8 typing work)."
+      "note": "SUPER::new types to the invocant class (Minion) via invocant_type_at_node's MethodOnClass receiver-relative fallback \u2014 resolves single-file now, no module index needed. Promoted from xfail (H7-8 typing work)."
     },
     {
       "id": "ti-13",
@@ -381,6 +381,24 @@
       },
       "status": "gold",
       "note": "auto cmp = x == y -> the C++ comparison expression is Bool."
+    },
+    {
+      "id": "ti-classname-string",
+      "difficulty": "hard",
+      "semantic_area": "classic",
+      "file": "x86_64-linux-gnu-thread-multi/Moose.pm",
+      "line": 148,
+      "col": 7,
+      "query": "",
+      "newname": "",
+      "expect": {
+        "all": [
+          "Moose::Meta::Class"
+        ],
+        "none": []
+      },
+      "status": "xfail",
+      "note": "`my $metaclass = $args{metaclass} || 'Moose::Meta::Class'` types as String, so the scalar never becomes a dispatch receiver and `$metaclass->initialize` completes to nothing. Not Moose-specific and not about `||`: `my $x = 'Widget'; $x->new()` has the same gap, on 0.6.1 as well as here. dispatch_class_of already does the right thing GIVEN InferredType::ClassName \u2014 the missing half is the literal's witness carrying it when the value names a known package, which is a property of the value rather than a branch in the completion consumer. Found by bench/sweep; the only only-base row in that run that was not the `(anon)` fix."
     }
   ]
 }
