@@ -67,7 +67,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # XS dists in the pinned substrate need system libraries to build.
+      # `apt-get update` has wedged for 40-68 min on hosted runners (no output,
+      # no failure) twice on this job, leaving Gold unverified while the build
+      # and harness steps never start. A short cap turns that silent hang into a
+      # fast, retryable failure — the packages take well under a minute when the
+      # mirrors are healthy.
       - name: System libraries (XS build deps)
+        timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y libssl-dev libxml2-dev zlib1g-dev
 
       - uses: shogo82148/actions-setup-perl@v1
