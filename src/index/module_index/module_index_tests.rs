@@ -1836,6 +1836,43 @@ fn an_exhausted_consult_budget_degrades_instead_of_running_forever() {
 /// compile; enumerating the variants proves the invariant for the whole
 /// domain, needs no extra dependency, and runs on every `cargo test`.
 #[test]
+fn an_evicted_copy_still_answers_its_export_surface() {
+    use crate::model::file_analysis::Residency;
+    // The enrichment provider chase skips a candidate that exports none of the
+    // names the consumer needs, and it asks the RESIDENT copy so the skip costs
+    // no rehydrate. That is only sound while the export surface survives the
+    // strip: if eviction ever took `export`/`export_ok`/`export_lookup` with it,
+    // every candidate would answer "exports nothing", the chase would skip
+    // providers it must visit, and imported return types would quietly stop
+    // resolving — no panic, no error, just types going missing.
+    let src = "package Widget;\nour @EXPORT = ('make');\nour @EXPORT_OK = ('helper');\n\
+               sub make { my $c = shift; return bless {}, $c; }\nsub helper { return 1 }\n1;\n";
+    let full = parse_source_to_cached(src, "Widget");
+    assert!(
+        full.analysis.exports_name("make") && full.analysis.exports_name("helper"),
+        "fixture must export both names before eviction"
+    );
+
+    for level in [Residency::Whole, Residency::RowsOnly, Residency::Skeleton] {
+        let mut fa = (*full.analysis).clone();
+        fa.evict_to(level);
+        assert!(
+            fa.exports_name("make"),
+            "@EXPORT name unreachable at {level:?} — the chase's resident gate \
+             would skip this provider and lose its imported types"
+        );
+        assert!(
+            fa.exports_name("helper"),
+            "@EXPORT_OK name unreachable at {level:?} — same silent loss"
+        );
+        assert!(
+            !fa.exports_name("never_exported"),
+            "the gate must stay an over-approximation, not answer true for everything"
+        );
+    }
+}
+
+#[test]
 fn residency_is_a_ladder_so_a_bag_view_always_carries_its_rows() {
     use crate::model::file_analysis::Residency;
     let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";

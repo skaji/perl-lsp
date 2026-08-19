@@ -903,11 +903,13 @@ impl ModuleIndex {
     ) -> Arc<FileAnalysis> {
         let mut stage = "no bag cache installed on this index".to_string();
         if let Some(bc) = self.bag_cache_ref() {
-            let got = if want_bag {
-                bc.bag_for_diag(&cached.path)
-            } else {
-                bc.rows_for_diag(&cached.path)
-            };
+            let got = crate::util::ghost_stats::timed("rehydrate.loader", || {
+                if want_bag {
+                    bc.bag_for_diag(&cached.path)
+                } else {
+                    bc.rows_for_diag(&cached.path)
+                }
+            });
             match got {
                 Ok(full) => return full,
                 // Discriminated cause (see `RehydrateMiss`) so the tripwire

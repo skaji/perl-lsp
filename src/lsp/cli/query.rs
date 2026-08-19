@@ -78,6 +78,11 @@ pub(crate) fn cli_check(args: &[String]) {
     }
 
     if !all_diagnostics.is_empty() {
+        // `exit` skips `EmitOnDrop`, and this verb is the one that walks and
+        // ENRICHES a whole workspace — the run whose counters are worth the
+        // most. Emitting here is the same explicit-before-hard-exit rule the
+        // server path already follows.
+        crate::util::ghost_stats::emit_all("check");
         std::process::exit(1);
     }
 }

@@ -74,6 +74,109 @@ pub fn count(tag: &str) {
     *c.entry(tag.to_string()).or_insert(0) += 1;
 }
 
+/// tag -> (total nanos, call count). A per-call `[PHASE]` line is useless for
+/// a region entered once per file across a corpus; what a hot region needs is
+/// the SUM and the call count, so an average and a share are derivable.
+fn accum() -> &'static Mutex<HashMap<String, (u128, u64)>> {
+    static A: OnceLock<Mutex<HashMap<String, (u128, u64)>>> = OnceLock::new();
+    A.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Add one timed region's elapsed nanos to `tag`'s running total.
+pub fn add_ns(tag: &str, nanos: u128) {
+    if !enabled() {
+        return;
+    }
+    let mut a = accum().lock().unwrap_or_else(|e| e.into_inner());
+    let e = a.entry(tag.to_string()).or_insert((0, 0));
+    e.0 += nanos;
+    e.1 += 1;
+}
+
+/// Time `body` into `tag`'s running total. Inert when the gate is off — not
+/// even an `Instant::now`, so an instrumented hot path costs nothing unmeasured.
+#[inline]
+pub fn timed<T>(tag: &str, body: impl FnOnce() -> T) -> T {
+    if !enabled() {
+        return body();
+    }
+    let t = std::time::Instant::now();
+    let out = body();
+    add_ns(tag, t.elapsed().as_nanos());
+    out
+}
+
+/// Accumulate a region's elapsed time on drop — the `timed` shape for a body
+/// that borrows its surroundings mutably and cannot be a closure.
+pub struct ScopedNs {
+    tag: &'static str,
+    started: Option<std::time::Instant>,
+}
+
+impl ScopedNs {
+    pub fn start(tag: &'static str) -> Self {
+        ScopedNs { tag, started: enabled().then(std::time::Instant::now) }
+    }
+}
+
+impl Drop for ScopedNs {
+    fn drop(&mut self) {
+        if let Some(t) = self.started {
+            add_ns(self.tag, t.elapsed().as_nanos());
+        }
+    }
+}
+
+/// tag -> set of distinct keys seen. Pairs with `count(tag)`: the ratio of
+/// total occurrences to distinct keys IS the repeat factor, which is the one
+/// number that says whether a memo would pay.
+fn distincts() -> &'static Mutex<HashMap<String, std::collections::HashSet<String>>> {
+    static D: OnceLock<Mutex<HashMap<String, std::collections::HashSet<String>>>> = OnceLock::new();
+    D.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record that `key` was seen under `tag`. No-op when the gate is off.
+pub fn count_distinct(tag: &str, key: &str) {
+    if !enabled() {
+        return;
+    }
+    let mut d = distincts().lock().unwrap_or_else(|e| e.into_inner());
+    d.entry(tag.to_string()).or_default().insert(key.to_string());
+}
+
+thread_local! {
+    /// Set while a region wants its downstream cache traffic attributed to it.
+    /// A hit rate is only actionable per CALLER: a 99% global rate hides a
+    /// caller that misses a third of the time, and that caller is the one to fix.
+    static ATTRIB: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Attribute downstream `count_attributed` events to `tag` for this scope.
+pub struct Attribute(Option<&'static str>);
+
+impl Attribute {
+    pub fn start(tag: &'static str) -> Self {
+        Attribute(ATTRIB.with(|a| a.replace(Some(tag))))
+    }
+}
+
+impl Drop for Attribute {
+    fn drop(&mut self) {
+        ATTRIB.with(|a| a.set(self.0));
+    }
+}
+
+/// Bump `<caller>.<event>` when inside an `Attribute` scope, else `<event>`.
+pub fn count_attributed(event: &str) {
+    if !enabled() {
+        return;
+    }
+    match ATTRIB.with(|a| a.get()) {
+        Some(t) => count(&format!("{t}.{event}")),
+        None => count(&format!("unattributed.{event}")),
+    }
+}
+
 fn trace_every() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     *N.get_or_init(|| {
@@ -159,6 +262,40 @@ pub fn emit_attribution(moment: &str) {
         out.push_str(&format!("[ghost-triggers {moment}] event counters:\n"));
         for (k, v) in rows {
             out.push_str(&format!("[ghost-triggers]   {v:>8}  {k}\n"));
+        }
+    }
+    {
+        let a = accum().lock().unwrap_or_else(|e| e.into_inner());
+        if !a.is_empty() {
+            let mut rows: Vec<(&String, &(u128, u64))> = a.iter().collect();
+            rows.sort_by(|x, y| y.1 .0.cmp(&x.1 .0).then_with(|| x.0.cmp(y.0)));
+            out.push_str(&format!("[ghost-triggers {moment}] accumulated time:\n"));
+            for (k, (ns, n)) in rows {
+                let ms = *ns as f64 / 1e6;
+                let avg_us = if *n > 0 { *ns as f64 / *n as f64 / 1e3 } else { 0.0 };
+                out.push_str(&format!(
+                    "[ghost-triggers]   {ms:>10.1} ms  n={n:<8} avg={avg_us:>9.1} us  {k}\n"
+                ));
+            }
+        }
+    }
+    {
+        let d = distincts().lock().unwrap_or_else(|e| e.into_inner());
+        if !d.is_empty() {
+            let c = counters().lock().unwrap_or_else(|e| e.into_inner());
+            let mut rows: Vec<(&String, usize)> =
+                d.iter().map(|(k, v)| (k, v.len())).collect();
+            rows.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(y.0)));
+            out.push_str(&format!(
+                "[ghost-triggers {moment}] distinct keys (total/distinct = repeat factor):\n"
+            ));
+            for (k, n) in rows {
+                let total = c.get(k).copied().unwrap_or(0);
+                let factor = if n > 0 { total as f64 / n as f64 } else { 0.0 };
+                out.push_str(&format!(
+                    "[ghost-triggers]   distinct={n:<8} total={total:<10} x{factor:<8.2} {k}\n"
+                ));
+            }
         }
     }
     {

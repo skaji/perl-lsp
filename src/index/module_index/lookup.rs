@@ -320,8 +320,10 @@ impl CrossFileLookup for ModuleIndex {
         // Never-evicted copy (open docs, degraded files kept whole): a cheap
         // Arc bump, no I/O.
         if !cached.analysis.bag_is_evicted() {
+            crate::util::ghost_stats::count("bagpresent.resident_whole");
             return cached.analysis.clone();
         }
+        crate::util::ghost_stats::count("bagpresent.rehydrate");
         self.rehydrate_or_resident(cached)
     }
 

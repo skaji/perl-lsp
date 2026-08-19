@@ -151,14 +151,24 @@ impl PackBagCache {
                 if let Some(g) = &self.ghost {
                     g.on_hit();
                 }
+                crate::util::ghost_stats::count("bagcache.hit");
+                crate::util::ghost_stats::count_attributed("bagcache_hit");
                 return Ok(arc);
             }
+            // Resident, but stripped — a rows-axes reader retained it and a
+            // bag request cannot be served from it.
+            crate::util::ghost_stats::count("bagcache.miss_stripped_resident");
+            crate::util::ghost_stats::count_attributed("bagcache_miss");
+        } else {
+            crate::util::ghost_stats::count("bagcache.miss_absent");
+            crate::util::ghost_stats::count_attributed("bagcache_miss");
         }
         if let Some(g) = &self.ghost {
             g.on_miss(&path.to_string_lossy());
         }
         let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
-        let mut loaded = (self.loader)(path)?;
+        let mut loaded = crate::util::ghost_stats::timed(
+            "bagcache.decode", || (self.loader)(path))?;
         if !want_bag {
             loaded.evict_witness_bag();
         }
@@ -185,7 +195,7 @@ impl PackBagCache {
             self.credit(old_sz);
         }
         self.recency.insert(path.to_path_buf(), self.tick());
-        self.evict_to_cap(path);
+        crate::util::ghost_stats::timed("bagcache.evict_to_cap", || self.evict_to_cap(path));
         if let Some(g) = &self.ghost {
             g.set_usage(
                 self.bytes.load(Ordering::Relaxed) as u64,

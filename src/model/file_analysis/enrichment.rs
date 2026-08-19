@@ -284,13 +284,40 @@ impl FileAnalysis {
             .collect();
         // A file with no call bindings needs no provider walk at all.
         if let Some(idx) = module_index.filter(|_| !needed_names.is_empty()) {
+            let _chase = crate::util::ghost_stats::ScopedNs::start("chase.total");
+            let _attrib = crate::util::ghost_stats::Attribute::start("chase");
+            crate::util::ghost_stats::count("chase.file");
             for import in &self.imports {
+                crate::util::ghost_stats::count("chase.import");
+                crate::util::ghost_stats::count_distinct(
+                    "chase.import", &import.module_name);
                 // A split exporter's subs live across its candidate files.
                 for cached in idx.visible_def_candidates(&import.module_name) {
+                    crate::util::ghost_stats::count("chase.candidate");
+                    crate::util::ghost_stats::count_distinct(
+                        "chase.candidate", &cached.path.display().to_string());
                 // Return-shape reads go through the bag — the resident index
                 // copy may be bag-evicted (workspace tier included), so take
                 // the bag-present view for the whole scan.
-                let whole = idx.bag_present(&cached);
+                // The scan below only does work for a symbol that is BOTH
+                // needed here and exported there, so a candidate exporting
+                // none of `needed_names` contributes nothing — and the
+                // expensive part of finding that out is fetching a view.
+                //
+                // `export_lookup` (@EXPORT u @EXPORT_OK) is not an evictable
+                // axis and is rebuilt by `build_indices` on every copy, so this
+                // reads the RESIDENT analysis: no rehydrate, no decode, no LRU
+                // traffic. Measured on the substrate: it drops the per-candidate
+                // bag fetch from 7,829 to 332 (95.8% of them were for providers
+                // that matched nothing). Do not "simplify" this to a
+                // symbols-axis probe — `symbols_present` rehydrates too, and
+                // doing that made the chase SLOWER, not faster.
+                if !needed_names.iter().any(|n| cached.analysis.exports_name(n)) {
+                    crate::util::ghost_stats::count("chase.candidate_skipped");
+                    continue;
+                }
+                let whole = crate::util::ghost_stats::timed(
+                    "chase.bag_present", || idx.bag_present(&cached));
                 // Fetched on the first return-type MISS (fallback-on-miss): the
                 // exporter's own return may chain through ITS imports (A→B→C),
                 // materialized only after the exporter is itself enriched — the
@@ -308,11 +335,22 @@ impl FileAnalysis {
                     if !whole.exports_name(&sym.name) {
                         continue;
                     }
+                    crate::util::ghost_stats::count("chase.sym_matched");
                     if matches!(sym.detail, SymbolDetail::Sub { .. }) {
-                        let mut ty = whole.symbol_return_type_via_bag(sym.id, None);
+                        crate::util::ghost_stats::count("chase.return_query");
+                        let mut ty = crate::util::ghost_stats::timed(
+                            "chase.symbol_return_type_via_bag",
+                            || whole.symbol_return_type_via_bag(sym.id, None),
+                        );
                         if ty.is_none() {
-                            let en = enriched
-                                .get_or_insert_with(|| idx.enriched_present(&cached));
+                            crate::util::ghost_stats::count("chase.return_miss");
+                            let en = enriched.get_or_insert_with(|| {
+                                crate::util::ghost_stats::count("chase.enriched_present");
+                                crate::util::ghost_stats::timed(
+                                    "chase.enriched_present",
+                                    || idx.enriched_present(&cached),
+                                )
+                            });
                             if !std::sync::Arc::ptr_eq(en, &whole) {
                                 ty = en.symbol_return_type_via_bag(sym.id, None);
                             }
