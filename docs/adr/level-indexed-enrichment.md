@@ -13,6 +13,12 @@
 > pays it once per level. Making levels affordable means memoizing that chase
 > across builds; an overlay would remove a further 3.8% and would not change
 > this verdict.
+>
+> The 61.6% has since come down 6.4x, and not by the route this ADR's
+> successor guessed at: the chase's cost was `bag_present` LRU misses, not
+> provider resolution, and a resident-copy export gate removed it. A build is
+> correspondingly cheaper, but K× of a cheaper build is still K×; nothing here
+> is reopened by it.
 
 # ADR: Level-indexed enrichment — correct, deterministic, and too slow as built
 

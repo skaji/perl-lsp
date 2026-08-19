@@ -53,10 +53,19 @@ ADR names does not, on these numbers, unblock it.
 
 The blocking term is the **cross-file provider chase** — 61.6% of a build,
 and it is re-done from scratch every time a file is built. A level-indexed
-design builds each file K times, so it pays that chase K times over. Making
-levels affordable means memoizing the chase across builds (the provider's
-resolved return types for a given epoch are the same answer every level asks
-for), not making the copy smaller.
+design builds each file K times, so it pays that chase K times over.
+
+**Where that led is not where this section pointed.** The guess above was
+"memoize the chase across builds"; per-caller attribution inside the chase
+said otherwise. Of 1,541 ms of chase, provider *resolution* was 0.4% and the
+overlay 0.02% — 93.5% was `bag_present`, because the chase is a breadth sweep
+that misses the bag LRU 45% of the time against 1.0% for every other caller,
+and each miss is a real decode. The loop took a bag view up front for a scan
+whose filters are all symbols-axis reads; gating on the export surface (an
+axis that survives the strip, so the skip costs no rehydrate) dropped the
+per-candidate fetch 7,829 → 502 and the chase 1,541 → 240 ms, work done
+unchanged. A memo would have cached the cheap half. Attribution inside a term
+is what turned a 61.6% share into a fix; the share alone named the wrong one.
 
 ## The consumer matrix
 
