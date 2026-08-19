@@ -337,3 +337,24 @@ repros; recorded here so a fix flips a real observation, not just narrative.
   already carries the roots and `IndexCore.inc_roots` already publishes the
   process set. Deferred because acquisition widening changes what gets
   parsed at startup, and that wants its own measurement.
+
+## A class-name string literal is not a dispatch receiver
+
+`my $x = 'Widget'; $x->new()` types `$x` as `String`, so the scalar never
+becomes a receiver and member completion on it answers nothing. Neither is
+this about `||`, despite the shape it was found in
+(`$args{metaclass} || 'Moose::Meta::Class'`), nor about Moose: the two-line
+form above reproduces it, and so does 0.6.1.
+
+`dispatch_class_of` already does the right thing given
+`InferredType::ClassName` — a bareword receiver (`Widget->new()`) completes
+correctly. The missing half is the literal's witness carrying `ClassName`
+when its value names a known package. That is a property of the value, so it
+belongs on the witness (rule #10), not as a branch in the completion
+consumer.
+
+Pinned by `fixtures/type-at.json::ti-classname-string` (xfail). Found by
+`bench/sweep`; it was the only `only-base` row in that run which was not the
+`(anon)` fix, and adjudicating it showed 0.6.1 fails the same way — it just
+fell back to offering the ENCLOSING PACKAGE's own subs, which are not the
+receiver's methods at all.
