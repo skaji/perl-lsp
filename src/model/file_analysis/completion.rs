@@ -167,7 +167,7 @@ impl FileAnalysis {
             .collect();
         vars.sort_by_key(|(_, sz)| *sz);
 
-        for (sym, scope_size) in vars {
+        for (sym, _scope_size) in vars {
             let (bare_name, decl_sigil) = match &sym.detail {
                 SymbolDetail::Variable { sigil: ds, .. } => {
                     (sym.name[1..].to_string(), *ds)
@@ -183,7 +183,20 @@ impl FileAnalysis {
             }
             seen.insert(key);
 
-            let priority = std::cmp::min(scope_size, 255) as u8;
+            // Tier, not magnitude: an in-scope lexical must outrank every
+            // cross-file tier (imports at 12/15, auto-import at 18/25,
+            // builtins at 30) or the rank-then-cut cap deletes the asker's
+            // own variables in favor of the workspace firehose. The old
+            // `min(scope_size, 255)` spelling saturated to 255 for any
+            // multi-line scope (span_size counts rows*10000), which parked
+            // every real lexical BELOW all of those tiers — invisible while
+            // completion was uncapped, candidate loss the day it wasn't.
+            // Innermost-shadow selection still rides the scope-size sort
+            // above; within a tier the client tie-breaks by label.
+            let priority = match &self.scopes[sym.scope.0 as usize].kind {
+                ScopeKind::File => PRIORITY_FILE_WIDE,
+                _ => PRIORITY_LOCAL,
+            };
             let detail = match &sym.detail {
                 SymbolDetail::Variable { decl_kind, .. } => {
                     Some(match decl_kind {

@@ -2661,3 +2661,35 @@ fn probe_copy_cost_and_delta_size() {
     );
     eprintln!("DELTA counts: symbols {ds:+}  refs {dr:+}  witnesses {dw:+}");
 }
+
+/// An in-scope lexical is a TIER above every cross-file completion tier —
+/// not a scope-size magnitude. The old `min(scope_size, 255)` spelling
+/// saturated to 255 for any multi-line scope, parking real lexicals below
+/// imports/auto-import/builtins; invisible while completion was uncapped,
+/// candidate loss (the sweep's 526-row sigil block) once rank-then-cut
+/// landed. Sub-scoped lexicals are PRIORITY_LOCAL, file-scoped ones
+/// PRIORITY_FILE_WIDE, and both outrank the explicit-import tier.
+#[test]
+fn lexical_completion_priority_is_the_local_tier() {
+    let fa = build_fa_from_source(
+        "our $wide = 1;\nsub f {\n    my $inner = 2;\n    my $x = $inner;\n}\n",
+    );
+    let cands = fa.complete_variables(Point::new(3, 12), '$');
+    let pri = |label: &str| {
+        cands
+            .iter()
+            .find(|c| c.label == label)
+            .unwrap_or_else(|| panic!("{label} offered"))
+            .sort_priority
+    };
+    assert_eq!(pri("$inner"), PRIORITY_LOCAL, "sub-scoped lexical is the local tier");
+    assert_eq!(pri("$wide"), PRIORITY_FILE_WIDE, "file-scoped our-var is the file tier");
+    for c in &cands {
+        assert!(
+            c.sort_priority < PRIORITY_EXPLICIT_IMPORT,
+            "{} at {} would lose to the import tiers under the cap",
+            c.label,
+            c.sort_priority
+        );
+    }
+}
