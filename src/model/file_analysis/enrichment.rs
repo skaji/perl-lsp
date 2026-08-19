@@ -405,8 +405,9 @@ impl FileAnalysis {
         // only ran for bindings where the func's return type was
         // known at build time. Cross-file return types come in here,
         // so the consumer-side `$cfg = Lib::get_config(); $cfg->{host}`
-        // access gets its owner set to Sub{None, "get_config"},
-        // matching the synthetic HashKeyDef we just injected.
+        // access gets its owner set to Sub{pkg, "get_config"} — matching
+        // the PRODUCER's own HashKeyDef, which is the single source (see
+        // the note above; no consumer-side stub is injected).
         let imported_keyed_subs: std::collections::HashSet<String> = imported_hash_keys
             .keys()
             .cloned()
