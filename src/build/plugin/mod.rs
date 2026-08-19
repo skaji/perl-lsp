@@ -1363,6 +1363,24 @@ pub enum CompletionKindHint {
 #[derive(Default)]
 pub struct PluginRegistry {
     plugins: Vec<Box<dyn FrameworkPlugin>>,
+    /// The registry's combined walk-phase query: the compiled query plus each
+    /// spec's start pattern index. A property of THIS plugin set, so it is
+    /// derived once per registry rather than per file.
+    ///
+    /// Filled on a BACKGROUND thread. Compiling it costs ~410 ms — comparable
+    /// to compiling all the individual specs, because the work is roughly
+    /// linear in total pattern source — and paying that synchronously puts it
+    /// on the critical path of the first build in the process: a one-shot CLI
+    /// verb on a small project went 686 ms to 1,101 ms, and under Rayon the
+    /// first file to arrive stalls the whole pool behind it. Since the
+    /// per-spec traversal is an always-correct fallback (and proven
+    /// equivalent), "not compiled yet" is simply another reason to take it.
+    combined_walk: std::sync::Arc<
+        std::sync::OnceLock<Option<(&'static tree_sitter::Query, Vec<usize>)>>,
+    >,
+    /// Whether the background compile has been kicked off. Separate from the
+    /// `OnceLock` because the lock is only *set* when the compile finishes.
+    combined_walk_started: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for PluginRegistry {
@@ -1372,6 +1390,22 @@ impl std::fmt::Debug for PluginRegistry {
             .field("ids", &self.plugins.iter().map(|p| p.id()).collect::<Vec<_>>())
             .finish()
     }
+}
+
+/// Compile the combined query on the calling thread instead of a background
+/// one. True under `cargo test` so the combined path and its equivalence nets
+/// are actually exercised rather than racing a thread that never wins on a
+/// one-file build, and under `PERL_LSP_PD_COMBINE_SYNC=1` for a measurement
+/// that needs the same path on every file.
+fn combined_walk_is_synchronous() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| {
+        std::env::var("PERL_LSP_PD_COMBINE_SYNC").as_deref() == Ok("1")
+            || std::env::var("PERL_LSP_PD_EQUIV").as_deref() == Ok("1")
+    })
 }
 
 impl PluginRegistry {
@@ -1393,6 +1427,48 @@ impl PluginRegistry {
     /// has been processed, so filtering would prevent the plugin
     /// from ever hooking the statement that introduces the trigger.
     /// Plugins that use `on_use` should filter on `ctx.module_name`.
+    /// The combined walk-phase query if it is ready, kicking off the
+    /// background compile the first time it is asked for.
+    ///
+    /// `None` means "take the per-spec path" — either the compile is still
+    /// running or it produced no usable query. The caller cannot tell the two
+    /// apart, and must not: both mean the same thing to it.
+    ///
+    /// `derive` runs on the spawned thread, so it takes no borrow of the
+    /// registry; the builder side closes over owned spec sources.
+    pub(crate) fn combined_walk(
+        &self,
+        derive: impl FnOnce() -> Option<(&'static tree_sitter::Query, Vec<usize>)> + Send + 'static,
+    ) -> Option<(&'static tree_sitter::Query, &[usize])> {
+        use std::sync::atomic::Ordering;
+        if let Some(v) = self.combined_walk.get() {
+            return v.as_ref().map(|(q, s)| (*q, s.as_slice()));
+        }
+        if combined_walk_is_synchronous() {
+            // `get_or_init`, not `set`: under Rayon several threads arrive
+            // together, and `set` would have each of them compile the query
+            // only for one to win the slot. Blocking the losers is the point
+            // of the synchronous mode anyway.
+            return self
+                .combined_walk
+                .get_or_init(derive)
+                .as_ref()
+                .map(|(q, s)| (*q, s.as_slice()));
+        }
+        if !self.combined_walk_started.swap(true, Ordering::Relaxed) {
+            let slot = std::sync::Arc::clone(&self.combined_walk);
+            // Detached: nothing waits on it, and a registry outliving the
+            // process is the only way the thread outlives the slot.
+            std::thread::Builder::new()
+                .name("pd-combine".into())
+                .spawn(move || {
+                    let _ = slot.set(derive());
+                })
+                .ok();
+        }
+        None
+    }
+
     pub fn all(&self) -> impl Iterator<Item = &dyn FrameworkPlugin> {
         self.plugins.iter().map(|p| p.as_ref())
     }

@@ -262,26 +262,32 @@ fn eligible_walk_specs<'p>(
 
 /// The combined query for a set of already-valid specs, plus the start
 /// pattern index of each spec within it.
-struct CombinedWalk {
+struct CombinedWalk<'r> {
     query: &'static Query,
     /// `starts[i]` = combined pattern index at which spec `i` begins. One
     /// source can contribute several patterns, so the owner of combined
     /// pattern `k` is the last `i` with `starts[i] <= k`.
+    starts: &'r [usize],
+}
+
+/// The owned form the registry stores; `CombinedWalk` is the borrowed view.
+struct OwnedCombinedWalk {
+    query: &'static Query,
     starts: Vec<usize>,
 }
 
-impl CombinedWalk {
+impl CombinedWalk<'_> {
     /// Combine only specs that already compile on their own, so one malformed
     /// `.rhai` can never take dispatch out for the other twelve — it is
     /// dropped by `eligible_walk_specs` before it reaches the concatenation.
     /// `None` means "use the per-spec path", which is always correct.
-    fn build(specs: &[(&dyn plugin::FrameworkPlugin, &PatternSpec, &'static Query)]) -> Option<Self> {
-        if specs.is_empty() {
+    fn build(parts: Vec<(String, usize)>) -> Option<OwnedCombinedWalk> {
+        if parts.is_empty() {
             return None;
         }
-        let joined = specs
+        let joined = parts
             .iter()
-            .map(|(_, s, _)| s.query.as_str())
+            .map(|(src, _)| src.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         let query = match cached_pattern_query(&joined) {
@@ -295,11 +301,11 @@ impl CombinedWalk {
                 return None;
             }
         };
-        let mut starts = Vec::with_capacity(specs.len());
+        let mut starts = Vec::with_capacity(parts.len());
         let mut acc = 0usize;
-        for (_, _, q) in specs {
+        for (_, count) in &parts {
             starts.push(acc);
-            acc += q.pattern_count();
+            acc += count;
         }
         if acc != query.pattern_count() {
             // Concatenation did not preserve pattern count, so routing by
@@ -314,7 +320,7 @@ impl CombinedWalk {
             crate::util::ghost_stats::count("pd.combine.pattern_count_mismatch");
             return None;
         }
-        Some(CombinedWalk { query, starts })
+        Some(OwnedCombinedWalk { query, starts })
     }
 
     fn owner_of(&self, pattern_index: usize) -> usize {
@@ -353,16 +359,35 @@ pub(crate) fn collection_equiv_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("PERL_LSP_PD_EQUIV").as_deref() == Ok("1"))
 }
 
-/// Compiled combined query per registry shape, memoized process-wide on the
-/// joined source (via `cached_pattern_query`), so a build never pays a
-/// compile. `None` = fall back.
-fn combined_walk(
+/// The registry's combined query, derived once and cached ON the registry.
+///
+/// Deriving it means joining every spec source and hashing the result to look
+/// up the compiled-query memo — a per-PROCESS cost that reads as per-file if
+/// it lives at the call site. Measured there first: 1,903 ms across 3,520
+/// files, 49% of the whole dispatch phase, eating half the win the combined
+/// query had just bought. The registry owns the slot because the answer is a
+/// function of the registry's plugins and nothing else.
+///
+/// `None` = use the per-spec path.
+fn combined_walk<'r>(
+    registry: &'r crate::build::plugin::PluginRegistry,
     specs: &[(&dyn plugin::FrameworkPlugin, &PatternSpec, &'static Query)],
-) -> Option<CombinedWalk> {
+) -> Option<CombinedWalk<'r>> {
     if !combine_forced().unwrap_or(!combine_disabled()) {
         return None;
     }
-    CombinedWalk::build(specs)
+    // Owned, so the derivation can run on another thread: the source text
+    // plus each spec's pattern count is everything the concatenation needs.
+    let parts: Vec<(String, usize)> = specs
+        .iter()
+        .map(|(_, spec, q)| (spec.query.clone(), q.pattern_count()))
+        .collect();
+    registry
+        .combined_walk(move || {
+            crate::util::ghost_stats::count("pd.combine.built");
+            CombinedWalk::build(parts).map(|c| (c.query, c.starts))
+        })
+        .map(|(query, starts)| CombinedWalk { query, starts })
 }
 
 /// Matches for one spec in one round: `(pattern_index, captures)` in the
@@ -556,11 +581,15 @@ impl<'a> Builder<'a> {
         // bucket. Dispatch still runs spec-by-spec in exactly this order even
         // though the combined traversal yields matches interleaved in tree
         // order — the bucketing is what keeps emission order unchanged.
+        let su = crate::util::ghost_stats::ScopedNs::start("pd.setup.eligible");
         let specs = eligible_walk_specs(&plugins);
+        drop(su);
         if specs.is_empty() {
             return;
         }
-        let combined = combined_walk(&specs);
+        let sc = crate::util::ghost_stats::ScopedNs::start("pd.setup.combine");
+        let combined = combined_walk(&plugins, &specs);
+        drop(sc);
         let mut dispatched: HashSet<(String, String, Span)> = HashSet::new();
         let mut rounds_run = 0u64;
         for round in 0..16 {
@@ -572,8 +601,11 @@ impl<'a> Builder<'a> {
             // by the query engine here, since `matches` gets the
             // source text; unknown predicate names pass through
             // unfiltered (the deferred-predicate reservation).
-            let rounds_matches = self.collect_walk_matches(root, &specs, combined.as_ref());
+            let rounds_matches = crate::util::ghost_stats::timed("pd.collect", || {
+                self.collect_walk_matches(root, &specs, combined.as_ref())
+            });
             let mut progressed = false;
+            let lr = crate::util::ghost_stats::ScopedNs::start("pd.loop");
             for (ordinal, (p, spec, _)) in specs.iter().enumerate() {
                 let (query, collected) = &rounds_matches[ordinal];
                 let (p, spec, query) = (*p, *spec, *query);
@@ -591,10 +623,18 @@ impl<'a> Builder<'a> {
                 for (pattern_index, caps) in collected {
                     let pattern_index = *pattern_index;
                     let mspan = union_span(caps);
+                    crate::util::ghost_stats::count("pd.match.seen");
                     let key = (p.id().to_string(), spec.name.clone(), mspan);
                     if dispatched.contains(&key) {
+                        crate::util::ghost_stats::count("pd.match.dedup_skip");
                         continue;
                     }
+                    // The gate runs for EVERY collected match, dispatched or
+                    // not, and it is per-match work with per-package inputs:
+                    // an O(package_ranges) scan, two owned clones, and an
+                    // ancestry walk. Timed as one region because that is the
+                    // unit a caller would skip.
+                    let g = crate::util::ghost_stats::ScopedNs::start("pd.gate");
                     let pkg = self.package_at_point(mspan.start);
                     let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
                     let parents = self.transitive_parents(&pkg);
@@ -603,6 +643,7 @@ impl<'a> Builder<'a> {
                         package_parents: &parents,
                     };
                     let fires = plugin::trigger_fires(p.triggers(), &tq);
+                    drop(g);
                     // Trigger didn't fire locally, but a `ClassIsa` gate may
                     // still hold CROSS-FILE (the package has ancestry the
                     // index-free builder can't resolve). Run `on_match` and
@@ -616,8 +657,14 @@ impl<'a> Builder<'a> {
                     };
                     let defer = !fires && !gate_prefixes.is_empty() && !parents.is_empty();
                     if !fires && !defer {
+                        crate::util::ghost_stats::count("pd.match.gated_out");
                         continue;
                     }
+                    crate::util::ghost_stats::count(if defer {
+                        "pd.match.deferred"
+                    } else {
+                        "pd.match.dispatched"
+                    });
                     dispatched.insert(key);
                     progressed = true;
                     crate::util::timings::record_pattern_dispatch(p.id(), &spec.name);
@@ -628,6 +675,7 @@ impl<'a> Builder<'a> {
                     let pkg_for_gate = pkg.clone();
                     let saved =
                         std::mem::replace(&mut self.current_package, Some(pkg.clone()));
+                    let c = crate::util::ghost_stats::ScopedNs::start("pd.context");
                     let mctx = self.build_match_context(
                         spec,
                         query,
@@ -639,7 +687,9 @@ impl<'a> Builder<'a> {
                         parents,
                         None,
                     );
-                    let actions = p.on_match(&spec.name, &mctx);
+                    drop(c);
+                    let actions =
+                        crate::util::ghost_stats::timed("pd.on_match", || p.on_match(&spec.name, &mctx));
                     if defer {
                         self.record_gated_pattern_emission(
                             p.id(),
@@ -673,6 +723,7 @@ impl<'a> Builder<'a> {
                     // (apply_emit_action stamps `current_package`
                     // onto symbols, so it must still be the match
                     // site's package here).
+                    let e = crate::util::ghost_stats::ScopedNs::start("pd.emit");
                     let match_scope = self.scope_at_point(mspan.start);
                     self.scope_stack.push(match_scope);
                     for a in actions {
@@ -722,9 +773,11 @@ impl<'a> Builder<'a> {
                         self.apply_emit_action(p.id().to_string(), a);
                     }
                     self.scope_stack.pop();
+                    drop(e);
                     self.current_package = saved;
                 }
             }
+            drop(lr);
             if !progressed {
                 break;
             }
