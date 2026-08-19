@@ -22,11 +22,18 @@ python3 "$HERE/selftest.py"
 python3 "$HERE/sweep.py" positions --root "$ROOT" --out "$OUT/positions.jsonl" \
   --per-file "$SWEEP_PER_FILE" --max-files "$SWEEP_MAX_FILES" --seed "$SWEEP_SEED"
 
+# Extra args come from the caller AFTER the four positionals; `shift 4` above
+# left them in "$@", so capture them before any function shadows it. `"$@:3"`
+# is not slicing syntax — it expands to the function's own args plus a literal
+# ":3", which made every invocation fail.
+EXTRA=("$@")
+
 run_side() {  # side, binary
-  python3 "$HERE/sweep.py" run --bin "$2" --root "$ROOT" \
-    --positions "$OUT/positions.jsonl" --out "$OUT/answers-$1.jsonl" --side "$1" \
-    --cache-dir "$OUT/cache-$1" --timeout "$SWEEP_TIMEOUT" \
-    --ready-timeout "$SWEEP_READY_TIMEOUT" "$@:3" 2>&1 | sed "s/^/[$1] /"
+  local side=$1 bin=$2
+  python3 "$HERE/sweep.py" run --bin "$bin" --root "$ROOT" \
+    --positions "$OUT/positions.jsonl" --out "$OUT/answers-$side.jsonl" --side "$side" \
+    --cache-dir "$OUT/cache-$side" --timeout "$SWEEP_TIMEOUT" \
+    --ready-timeout "$SWEEP_READY_TIMEOUT" "${EXTRA[@]}" 2>&1 | sed "s/^/[$side] /"
 }
 
 if [ "${SWEEP_SERIAL:-0}" = 1 ]; then
