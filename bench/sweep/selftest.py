@@ -138,7 +138,7 @@ check("an untruncated smaller list is still a subset",
 
 # The recheck pass must SUPERSEDE the cold answer, or the sweep measures
 # startup rather than the branch. Written as an appended row, applied on load.
-import io, json as _json, tempfile as _tf
+import json as _json, tempfile as _tf
 _p = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
 _p.write(_json.dumps({"_meta": {"side": "t"}}) + "\n")
 _p.write(_json.dumps({"file": "a.pm", "line": 1, "char": 2, "verb": "definition",
@@ -153,6 +153,36 @@ check("a warm recheck supersedes the cold empty answer",
       (_row["norm"], _row.get("filled_when_warm")),
       ([["lib/X.pm", [0, 0, 0, 1]]], True))
 os.unlink(_p.name)
+
+
+# The noise floor is a per-answer RATE, so it is only subtractable from a
+# count over the same answers. On Koha the base wedged and produced 1,184
+# comparable answers where the two noise runs produced ~21,790; a floor from
+# the larger population quoted beside the smaller count is not a correction,
+# it is a different measurement. `_shape_counts` must intersect.
+def _tmp_answers(rows):
+    f = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+    f.write(_json.dumps({"_meta": {"side": "t"}}) + "\n")
+    for r in rows:
+        f.write(_json.dumps(r) + "\n")
+    f.close()
+    return f.name
+
+def _row(line, norm, **kw):
+    return dict({"file": "a.pm", "line": line, "char": 0, "verb": "definition",
+                 "norm": norm, "ms": 1}, **kw)
+
+_D = [["lib/X.pm", [0, 0, 0, 1]]]
+# Two noise runs that disagree at line 1 AND at line 9. Only line 1 is in the
+# A/B's comparable set, so only line 1 may count toward the floor.
+_n1 = _tmp_answers([_row(1, _D), _row(9, _D)])
+_n2 = _tmp_answers([_row(1, []), _row(9, [])])
+_counts, _cov = S._shape_counts(_n1, _n2, {"definition"},
+                                {("a.pm", 1, 0, "definition")})
+check("the floor counts only answers the A/B actually compared",
+      (sum(_counts.values()), _cov), (1, 1))
+for _f in (_n1, _n2):
+    os.unlink(_f)
 
 
 # --- position selection -----------------------------------------------------

@@ -86,6 +86,22 @@ the workspace path, and their `EXTRACT_VERSION` and plugin fingerprints
 differ — sharing one makes each side hard-clear the other's cache on every
 startup.
 
+**The noise floor is measured over exactly the answers compared.** It is a
+per-answer rate, so it is only subtractable from a count taken over the same
+answers. Measured on Koha: the base wedged repeatedly and produced 1,184
+comparable answers where the two noise runs produced ~21,790. Quoting the
+larger population's floor beside the smaller count is not a correction, it is
+a different measurement — and a biased one, because the answers a stalling
+side reaches first are the cheap ones, which is exactly where two runs agree.
+The report says what fraction of the comparison the floor could cover.
+
+**A re-warmed server is not the same server.** Every row records the server
+generation that answered it. Answers from a generation that never
+re-confirmed cross-file readiness after a restart are HELD OUT of every count
+— on Koha 3 of 8 restarts never re-warmed, and an unconfirmed empty cannot be
+told apart from a lost resolution. Answers from a generation that did re-warm
+are counted but reported, because a rebuilt index is not the same index.
+
 ## Reading the report
 
 Shapes are ordered by what a reviewer must look at first. `only-base` and
@@ -96,6 +112,19 @@ candidates. `disagree` is the residual that always needs a human.
 `n` is positions; **`distinct` is claims** — the number of different (base
 answer, head answer) pairs behind them. One generated data file can
 contribute sixty positions that disagree identically. Adjudicate `distinct`.
+
+## Testing the harness
+
+`selftest.py` covers the rules that decide the report — normalisation,
+classification, the floor's intersection, the recheck supersede. `run.sh` is
+covered by `selftest-shell.sh` instead, which invokes it for real against a
+throwaway two-file corpus and asserts the same binary agrees with itself.
+
+That split is not tidiness. `run.sh` was once completely non-functional —
+`"$@:3"` is not slice syntax, so both sides died on `unrecognized arguments`
+— while the Python suite stayed green throughout, because it never invoked
+the entry point. A unit suite that passes says nothing about whether the
+thing runs.
 
 ## What it does not do
 

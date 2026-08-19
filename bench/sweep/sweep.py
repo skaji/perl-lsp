@@ -188,6 +188,12 @@ def cmd_run(args):
     # Lists, not ints: the loop rebinds `lsp` on restart and these have to
     # survive that without a nonlocal dance in a nested scope.
     wedge, restarts = [0], [0]
+    # A re-warmed server is not the same server. Rows carry the SERVER
+    # GENERATION they were answered by, and whether that generation ever
+    # confirmed cross-file readiness — on Koha 3 of 8 restarts never did, and
+    # a row from an unconfirmed generation is an answer from a server that
+    # was, as far as anyone can show, still cold.
+    epoch, epoch_warm = [0], [True]
     deferred = []
     t0 = time.monotonic()
     with open(args.out, "w") as fh:
@@ -213,7 +219,8 @@ def cmd_run(args):
                                   {"textDocument": {"uri": uri}}, timeout=args.timeout)
             fh.write(json.dumps({
                 "file": rel, "kind": "file", "verb": "documentSymbol",
-                "ms": round(ms, 1),
+                "ms": round(ms, 1), "epoch": epoch[0],
+                **({"warm_unconfirmed": True} if not epoch_warm[0] else {}),
                 "norm": N.normalize("documentSymbol", (msg or {}).get("result"), root_uri),
                 "err": _err(msg),
             }, sort_keys=True, default=str) + "\n")
@@ -232,7 +239,10 @@ def cmd_run(args):
                     msg, ms = lsp.request(method, params, timeout=args.timeout)
                     rec = {"file": rel, "line": p["line"], "char": ch,
                            "kind": p["kind"], "name": p["name"], "verb": verb,
-                           "ms": round(ms, 1), "err": _err(msg)}
+                           "ms": round(ms, 1), "err": _err(msg),
+                           "epoch": epoch[0]}
+                    if not epoch_warm[0]:
+                        rec["warm_unconfirmed"] = True
                     if msg is None:
                         rec["timeout"] = True
                         rec["norm"] = None
@@ -323,8 +333,10 @@ def cmd_run(args):
                             # the initial gate exists to close, and easier to
                             # miss here because the run is already underway.
                             _, _, warm_ms = await_cross_file(lsp, args.rewarm_timeout)
+                            epoch[0] += 1
+                            epoch_warm[0] = warm_ms is not None
                             fh.write(json.dumps({"_event": "restart-rewarm",
-                                "restart": restarts[0],
+                                "restart": restarts[0], "epoch": epoch[0],
                                 "cross_file_ready_ms": warm_ms and round(warm_ms),
                                 "confirmed": warm_ms is not None}) + "\n")
                             if warm_ms is None:
@@ -358,7 +370,8 @@ def cmd_run(args):
             fh.write(json.dumps({"_recheck": True, "file": rel, "line": ln,
                                  "char": ch, "verb": verb, "kind": kind,
                                  "name": name, "ms": round(ms, 1),
-                                 "norm": norm}, sort_keys=True, default=str) + "\n")
+                                 "epoch": epoch[0], "norm": norm},
+                                sort_keys=True, default=str) + "\n")
         fh.write(json.dumps({"_event": "recheck",
                              "empty_first_ask": len(deferred),
                              "filled_when_warm": filled}) + "\n")
@@ -534,19 +547,39 @@ SHAPE_ORDER = ["only-base", "subset", "timeout-head", "error-head", "disagree",
                "missing-head", "missing-base"]
 
 
-def _shape_counts(base_path, head_path, common):
-    """Shape histogram for one pair of answer files — used for the A/B run and,
-    with the SAME binary on both sides, for the noise floor."""
+def _shape_counts(base_path, head_path, common, only_keys):
+    """The noise floor, measured over EXACTLY the answers the A/B compared.
+
+    `only_keys` is not an optimisation, it is the whole correctness of the
+    number. The floor is a per-answer rate, so it is only subtractable from a
+    count taken over the same answers. Measured on Koha: the base wedged
+    repeatedly and produced 1,184 comparable answers where the two noise runs
+    (which never wedge, being the head binary) produced ~21,790 — quoting a
+    floor from 21,790 beside a count from 1,184 compares populations that
+    differ by a factor of eighteen and share an unknown fraction of their
+    members.
+
+    It is also biased, not merely scaled: the answers the base reached before
+    wedging are the CHEAP ones, and cheap positions are exactly where two
+    runs agree. A whole-corpus floor is therefore an over-estimate of the
+    floor on the surviving sample in some shapes and an under-estimate in
+    others, with no way to tell which from the number itself.
+
+    Returns the histogram plus how many of `only_keys` the noise runs could
+    actually answer — a floor measured over a fraction of the comparison is
+    still not comparable, and the caller has to be able to say so.
+    """
     _, a = _load(base_path)
     _, b = _load(head_path)
+    keys = (set(a) & set(b) & only_keys)
     out = {}
-    for k in set(a) & set(b):
+    for k in keys:
         if k[3] not in common:
             continue
         sh = classify(k[3], a[k], b[k])
         if sh != "same":
             out[sh] = out.get(sh, 0) + 1
-    return out
+    return out, len(keys)
 
 
 def cmd_diff(args):
@@ -567,9 +600,25 @@ def cmd_diff(args):
     # instead, which is the honest framing: this is what we compared, and
     # this is what we could not.
     all_keys = {k for k in (set(base) | set(head)) if k[3] in common}
-    keys = {k for k in all_keys if k in base and k in head}
+    comparable = {k for k in all_keys if k in base and k in head}
     only_base_keys = sum(1 for k in all_keys if k not in head)
     only_head_keys = sum(1 for k in all_keys if k not in base)
+
+    # An answer from a server generation that never re-confirmed cross-file
+    # readiness is an answer from a server that was, as far as anything here
+    # can show, still cold. It is held out rather than counted: an unconfirmed
+    # empty is indistinguishable from a lost resolution, which is the one
+    # confusion this whole harness exists to prevent.
+    unconfirmed = {k for k in comparable
+                   if base[k].get("warm_unconfirmed")
+                   or head[k].get("warm_unconfirmed")}
+    keys = comparable - unconfirmed
+    # Rows answered AFTER a restart by a generation that did re-warm are
+    # counted, but reported: they came from a different process with a
+    # rebuilt index, and a reader deciding how much to trust a thin block
+    # should know how much of it is post-restart.
+    post_restart = sum(1 for k in keys
+                       if base[k].get("epoch", 0) or head[k].get("epoch", 0))
 
     groups, counts, uninformative = {}, {}, 0
     for k in sorted(keys, key=lambda k: (k[0], k[3], k[1] is None, k[1] or 0, k[2] or 0)):
@@ -595,9 +644,10 @@ def cmd_diff(args):
     # way to tell a 68-row `reranked` block from nothing at all, because
     # completion ordering is not stable run to run. This is not a correction
     # applied to the counts; it is the resolution limit printed beside them.
-    noise = {}
+    noise, noise_n = {}, 0
     if args.noise_base and args.noise_head:
-        noise = _shape_counts(args.noise_base, args.noise_head, common)
+        noise, noise_n = _shape_counts(args.noise_base, args.noise_head,
+                                       common, keys)
 
     total = len(keys)
     diverged = sum(v for (s, _), v in counts.items() if s != "same")
@@ -635,11 +685,27 @@ def cmd_diff(args):
     W(f"**{total} (position, verb) answers compared — {same} identical "
       f"({same/max(total,1):.2%}), {diverged} divergent.**\n")
     if only_base_keys or only_head_keys:
+        reach = total / max(len(all_keys), 1)
         W(f"Coverage shortfall: {only_base_keys} answers exist only in the base "
           f"run and {only_head_keys} only in the head run — a side that aborted "
           f"or skipped never produced them. They are EXCLUDED from every count "
           f"above, because a position one side never reached is a gap in the "
           f"sweep, not a disagreement about an answer.\n")
+        if reach < 0.5:
+            W(f"> **Only {reach:.1%} of positions were answered by both sides.** "
+              f"The comparable set is not a random sample of the corpus — it is "
+              f"the positions the weaker side got through before it stopped, "
+              f"which are the cheap ones. Treat what follows as a statement "
+              f"about coverage, not a divergence list.\n")
+    if unconfirmed:
+        W(f"Held out: {len(unconfirmed)} answers came from a server generation "
+          f"that never re-confirmed cross-file readiness after a restart. They "
+          f"are excluded from every count — an unconfirmed empty cannot be "
+          f"told apart from a lost resolution.\n")
+    if post_restart:
+        W(f"Of the {total} compared, {post_restart} were answered after at "
+          f"least one side restarted (by a generation that did re-warm). A "
+          f"rebuilt index is not the same index.\n")
     W(f"Of the identical ones, {uninformative} were empty on both sides: positions "
       f"nobody would ask about, kept in the denominator but called out so the "
       f"agreement rate is not read as coverage.\n")
@@ -649,10 +715,20 @@ def cmd_diff(args):
     for (s, v), n in counts.items():
         if s != "same":
             by_shape[s] = by_shape.get(s, 0) + n
-    if noise:
+    if noise or noise_n:
         W("`noise` is the same shape's count when the SAME binary is run "
-          "twice over these positions. A block at or below its noise floor "
-          "carries no information — read the `signal` column, not `n`.\n")
+          "twice, measured over EXACTLY the answers compared here — a rate "
+          "taken over a different population is not subtractable from this "
+          "one. A block at or below its floor carries no information: read "
+          "`signal`, not `n`.\n")
+        cover = noise_n / max(total, 1)
+        if cover < 0.98:
+            W(f"> **The floor covers {noise_n} of {total} compared answers "
+              f"({cover:.1%}).** The rest could not be measured: the noise "
+              f"runs did not answer at those positions. Shapes below are "
+              f"scaled by that fraction only if the unmeasured answers behave "
+              f"like the measured ones, which is exactly what a run that "
+              f"stalled part-way does not guarantee.\n")
         W("| shape | n | noise | signal | meaning |")
         W("|---|---|---|---|---|")
         for s in SHAPE_ORDER:

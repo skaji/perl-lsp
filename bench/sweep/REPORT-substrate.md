@@ -19,19 +19,28 @@ identical, 945 were empty on both sides.
 
 ## The noise floor comes first
 
-The same binary, run twice over the same positions, disagrees with itself on
-**3.8%** of answers:
+> **The figures in this section were re-measured.** They were originally
+> taken over every answer the two noise runs produced, while the A/B counts
+> came from the smaller set the wedging base got through. Same defect
+> `[coordinator]` found at Koha scale, an order of magnitude smaller here,
+> and it moved real numbers: `disagree` 7 → **22**, `only-head` 0 → **11**,
+> `capped-head` 0 → **3**. The floor is now measured over exactly the
+> compared answers, and the report states what fraction of them it covers
+> (87.5% on this corpus — the noise runs reach positions the base never did).
+
+The same binary, run twice over the same positions, disagrees with itself:
 
 | shape | self-vs-self |
 |---|---|
-| `reranked` | 164 |
-| `disagree` | 7 |
+| `reranked` | 127 |
+| `disagree` | 22 |
+| `only-head` | 11 |
+| `capped-head` | 3 |
 | everything else | **0** |
 
-Completion ordering is not stable run to run. So the 70 `reranked` rows in
-the A/B carry **no information at all** — they are below the floor — while
-`only-*`, `subset`, `superset` and `content-differs` can be read at face
-value. Without this measurement a reader has no way to tell those cases
+Completion ordering is not stable run to run. So the `reranked` block carries
+**no information at all** — it sits below the floor — while `only-base`,
+`subset`, `superset` and `content-differs` can be read at face value. Without this measurement a reader has no way to tell those cases
 apart, and the third of the A/B's shapes that is pure noise looks exactly
 like the two thirds that are not.
 
