@@ -141,32 +141,38 @@ def cmd_run(args):
     # and one unlucky pick would stall the whole run at the timeout.
     probes = [p for p in pos if p["kind"] in ("use-module", "module-path")][:8] \
              or pos[:8]
-    first, ready, ready_ms = None, None, None
-    deadline = time.monotonic() + args.ready_timeout
-    while time.monotonic() < deadline and ready_ms is None:
-        for pr in probes:
-            uri = _open(lsp, root, pr["file"])
-            if uri is None:
-                continue
-            msg, _ = lsp.request("textDocument/definition", {
-                "textDocument": {"uri": uri},
-                "position": {"line": pr["line"], "character": pr["char_on"]}},
-                timeout=120)
-            locs = N.locations((msg or {}).get("result"), root_uri)
-            here = os.path.relpath(os.path.join(root, pr["file"]), root)
-            if any(u and u != here for (u, _) in locs):
-                first, ready = pr["file"], uri
-                ready_ms = (time.monotonic() - t_spawn) * 1000
-                break
-        if ready_ms is None:
+
+    def await_cross_file(client, budget):
+        """Block until a definition lands in a DIFFERENT file, or the budget
+        runs out. Returns (probe_file, uri, elapsed_ms | None)."""
+        t = time.monotonic()
+        end = t + budget
+        while time.monotonic() < end:
+            for pr in probes:
+                uri = _open(client, root, pr["file"])
+                if uri is None:
+                    continue
+                msg, _ = client.request("textDocument/definition", {
+                    "textDocument": {"uri": uri},
+                    "position": {"line": pr["line"], "character": pr["char_on"]}},
+                    timeout=120)
+                locs = N.locations((msg or {}).get("result"), root_uri)
+                here = os.path.relpath(os.path.join(root, pr["file"]), root)
+                if any(u and u != here for (u, _) in locs):
+                    return pr["file"], uri, (time.monotonic() - t) * 1000
             time.sleep(1.0)
-    if ready_ms is None:
+        return None, None, None
+
+    first, ready, ready_ms = await_cross_file(lsp, args.ready_timeout)
+    if ready_ms is not None:
+        ready_ms = (time.monotonic() - t_spawn) * 1000
+    else:
         first = pos[0]["file"]
         ready = _open(lsp, root, first)
         print(f"[{args.side}] WARNING: no cross-file definition resolved in "
               f"{args.ready_timeout}s — sweeping anyway, and the report will "
               f"say this side was never confirmed workspace-ready", flush=True)
-    else:
+    if ready_ms is not None:
         print(f"[{args.side}] cross-file ready after {round(ready_ms)}ms", flush=True)
 
     opened, done = {first: ready}, 0
@@ -265,6 +271,20 @@ def cmd_run(args):
                                 timeout=300)
                             lsp.notify("initialized", {})
                             opened.clear()
+                            # A respawned server is COLD. Sweeping on before
+                            # it re-warms records its unresolved cross-file
+                            # answers as lost resolutions -- the same trap
+                            # the initial gate exists to close, and easier to
+                            # miss here because the run is already underway.
+                            _, _, warm_ms = await_cross_file(lsp, args.ready_timeout)
+                            fh.write(json.dumps({"_event": "restart-rewarm",
+                                "restart": restarts[0],
+                                "cross_file_ready_ms": warm_ms and round(warm_ms),
+                                "confirmed": warm_ms is not None}) + "\n")
+                            if warm_ms is None:
+                                print(f"[{args.side}] WARNING: restart "
+                                      f"#{restarts[0]} never re-reached "
+                                      f"cross-file readiness", flush=True)
                             uri = _open(lsp, root, rel)
                             opened[rel] = uri
                             wedge[0] = 0
