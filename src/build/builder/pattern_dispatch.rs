@@ -382,12 +382,20 @@ fn combined_walk<'r>(
         .iter()
         .map(|(_, spec, q)| (spec.query.clone(), q.pattern_count()))
         .collect();
-    registry
-        .combined_walk(move || {
-            crate::util::ghost_stats::count("pd.combine.built");
-            CombinedWalk::build(parts).map(|c| (c.query, c.starts))
-        })
-        .map(|(query, starts)| CombinedWalk { query, starts })
+    let ready = registry.combined_walk(move || {
+        crate::util::ghost_stats::count("pd.combine.built");
+        CombinedWalk::build(parts).map(|c| (c.query, c.starts))
+    });
+    // How many files ran before the background compile landed. The deferred
+    // compile is a startup-ORDERING change, so "how long was the window" is
+    // the question a large corpus actually answers; without this you can only
+    // infer it from a phase total.
+    crate::util::ghost_stats::count(if ready.is_some() {
+        "pd.combine.ready"
+    } else {
+        "pd.combine.pending"
+    });
+    ready.map(|(query, starts)| CombinedWalk { query, starts })
 }
 
 /// Matches for one spec in one round: `(pattern_index, captures)` in the

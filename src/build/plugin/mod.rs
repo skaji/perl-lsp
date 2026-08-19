@@ -1459,12 +1459,20 @@ impl PluginRegistry {
             let slot = std::sync::Arc::clone(&self.combined_walk);
             // Detached: nothing waits on it, and a registry outliving the
             // process is the only way the thread outlives the slot.
-            std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("pd-combine".into())
                 .spawn(move || {
                     let _ = slot.set(derive());
                 })
-                .ok();
+                .is_ok();
+            if !spawned {
+                // Releasing the flag matters: the slot is only ever filled by
+                // the thread, so a swallowed spawn failure would leave every
+                // later call taking the per-spec path forever — correct, but
+                // silently and permanently slower. Let the next caller retry.
+                self.combined_walk_started.store(false, Ordering::Relaxed);
+                crate::util::ghost_stats::count("pd.combine.spawn_failed");
+            }
         }
         None
     }
