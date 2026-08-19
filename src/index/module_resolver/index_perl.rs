@@ -167,7 +167,7 @@ pub fn index_workspace_with_index(
             Vec<crate::model::file_analysis::SymRowSeed>,
         )> = Vec::new();
         let rows_present = module_cache::paths_with_ref_rows(conn);
-        let (_n, _stale) =
+        let (_n, _stale, gone) =
             module_cache::warm_cache_streaming(conn, "workspace", &mut |_name, path, mut fa| {
                 if !canon_members.contains(&path) {
                     dead_rows.push(path);
@@ -231,6 +231,11 @@ pub fn index_workspace_with_index(
                 }
             },
         );
+        // Rows whose FILE is gone. The membership check above never sees
+        // them — the scan skips a row it cannot stamp — so without this they
+        // are never collectable at all and the store keeps a dead generation
+        // per deleted file forever.
+        dead_rows.extend(gone);
         for path in dead_rows {
             module_cache::invalidate_generation_tier(
                 conn,

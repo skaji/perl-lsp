@@ -132,6 +132,10 @@ async fn main() {
             cli_dump_package(&args[2], &args[3]);
             return;
         }
+        Some("--gc-cache") if args.len() >= 3 => {
+            cli_gc_cache(&args[2]);
+            return;
+        }
         Some("--clear-cache") => {
             cli_clear_cache(args.get(2).map(|s| s.as_str()));
             return;
