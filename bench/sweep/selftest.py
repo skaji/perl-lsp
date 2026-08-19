@@ -123,6 +123,19 @@ check("a one-sided protocol error is its own shape",
       "error-base")
 
 
+# A truncated list is a strict subset of an untruncated one BY DESIGN. This
+# is the rule that turned 221 "regression candidates" into one intended
+# change on the first corpus run.
+cap_head = {"n": 1, "labels": [["x", 3]], "top": [["x", 3]], "incomplete": True}
+big_base = {"n": 2, "labels": [["x", 3], ["y", 3]], "top": [["x", 3]], "incomplete": False}
+check("a truncated head list is capped, not a lost candidate",
+      cls("completion", big_base, cap_head), "capped-head")
+# ...but a smaller list that does NOT claim truncation is still a real subset.
+uncapped_head = dict(cap_head, incomplete=False)
+check("an untruncated smaller list is still a subset",
+      cls("completion", big_base, uncapped_head), "subset")
+
+
 # --- position selection -----------------------------------------------------
 
 check("selection is deterministic across processes — hash() is salted, "

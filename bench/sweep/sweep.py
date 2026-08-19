@@ -403,6 +403,16 @@ def classify(verb, a, b):
         return "only-base"
     sa, sb = N.as_set(verb, na), N.as_set(verb, nb)
     if sa is not None and sb is not None and sa != sb:
+        # A truncated list is a strict subset of an untruncated one BY
+        # DESIGN. Ranking on one side and not the other would otherwise
+        # report every long completion as a lost-candidates regression --
+        # 221 rows in the first corpus run, all of them one intended change.
+        trunc = lambda n: verb == "completion" and isinstance(n, dict) \
+                          and n.get("incomplete")
+        if sb < sa and trunc(nb):
+            return "capped-head"
+        if sa < sb and trunc(na):
+            return "capped-base"
         if sa < sb:
             return "superset"
         if sb < sa:
@@ -421,6 +431,8 @@ SHAPE_MEANING = {
     "only-base":       "base answers, head empty  (LOST resolution -- regression candidate)",
     "superset":        "head found everything base did, plus more",
     "subset":          "head found strictly fewer  (regression candidate)",
+    "capped-head":     "head's list is a subset because head TRUNCATED it (isIncomplete) — by design, not a loss",
+    "capped-base":     "base's list is a subset because base truncated it — by design, not a loss",
     "disagree":        "both non-empty, neither contains the other",
     "reranked":        "same candidates, different order (completion ranking moved)",
     "content-differs": "same shape, different content (hover text, etc.)",
@@ -436,6 +448,7 @@ SHAPE_MEANING = {
 # Ordering of the report: the buckets a reviewer must adjudicate first.
 SHAPE_ORDER = ["only-base", "subset", "timeout-head", "error-head", "disagree",
                "content-differs", "reranked", "only-head", "superset",
+               "capped-head", "capped-base",
                "timeout-base", "error-base", "error-differs", "timeout-both",
                "missing-head", "missing-base"]
 

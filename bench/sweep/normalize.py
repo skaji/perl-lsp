@@ -96,11 +96,21 @@ COMPLETION_TOP_N = 10
 
 
 def completion(result):
+    """`isIncomplete` is kept because it is the ONLY thing that distinguishes
+    a lost candidate from a deliberately cut one.
+
+    A server that ranks and truncates (perl-lsp caps at
+    `MAX_COMPLETION_ITEMS`) returns a strict subset of an uncapped server's
+    list and sets `isIncomplete` to say so — that is the LSP contract, not a
+    defect. Dropping the flag made the first corpus run report 221 `subset`
+    rows as regression candidates when they were one intended change.
+    """
     if result is None:
-        return {"n": 0, "labels": [], "top": []}
+        return {"n": 0, "labels": [], "top": [], "incomplete": False}
+    inc = bool(result.get("isIncomplete")) if isinstance(result, dict) else False
     items = result.get("items", []) if isinstance(result, dict) else result
     if not isinstance(items, list):
-        return {"n": 0, "labels": [], "top": []}
+        return {"n": 0, "labels": [], "top": [], "incomplete": inc}
     # (label, kind): the same label at a different kind is a different
     # answer -- a sub becoming a field is a real change, and comparing bare
     # labels would hide it.
@@ -109,6 +119,7 @@ def completion(result):
         "n": len(pairs),
         "labels": sorted(set(pairs)),
         "top": pairs[:COMPLETION_TOP_N],
+        "incomplete": inc,
     }
 
 
