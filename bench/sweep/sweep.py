@@ -271,7 +271,22 @@ def cmd_run(args):
                     # right) and the remaining positions still get swept.
                     if rec.get("timeout"):
                         wedge[0] += 1
-                        if wedge[0] >= args.wedge_after:
+                        if wedge[0] >= args.wedge_after and _alive(lsp, uri, args):
+                            # The server still serves. Consecutive timeouts on
+                            # one VERB are a hang cluster, not a dead process,
+                            # and restarting would throw away a warm index to
+                            # cure something that is not wrong. Verified
+                            # independently of this driver: on the base binary
+                            # a `definition` that times out at 30 s is followed
+                            # by a `documentSymbol` on the same open file that
+                            # answers in milliseconds.
+                            fh.write(json.dumps({"_event": "hang-cluster",
+                                "after_position": done, "file": rel,
+                                "line": p["line"], "verb": verb,
+                                "consecutive_timeouts": wedge[0]}) + "\n")
+                            fh.flush()
+                            wedge[0] = 0
+                        elif wedge[0] >= args.wedge_after:
                             restarts[0] += 1
                             fh.write(json.dumps({"_event": "server-wedged",
                                 "after_position": done, "file": rel,
@@ -383,6 +398,20 @@ def _version(binp):
                               text=True, timeout=60).stdout.strip()
     except Exception as e:
         return f"<unavailable: {e}>"
+
+
+def _alive(client, uri, args):
+    """Is the server still serving, or is the process itself gone?
+
+    Asked with `documentSymbol` on an ALREADY-OPEN file: it needs no
+    cross-file resolution and no index, so an answer means the process reads
+    stdin and writes stdout. Anything more ambitious would confuse "slow to
+    resolve" with "dead", which is the distinction this call exists to make.
+    """
+    msg, _ = client.request("textDocument/documentSymbol",
+                            {"textDocument": {"uri": uri}},
+                            timeout=min(10.0, args.timeout))
+    return msg is not None
 
 
 def _err(msg):

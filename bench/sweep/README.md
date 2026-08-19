@@ -67,12 +67,19 @@ is subtracted into its own line.
 not a side that lost an answer, and conflating them is the most misleading
 thing this tool could report.
 
-**A wedged server is detected and respawned.** Observed on the base binary:
-`definition` in `Class/MOP/Overload.pm` hangs it permanently — client
-blocked, server at 0% CPU. Without detection every later request costs the
-full timeout and a two-hour sweep becomes twenty, arriving as a wall of
-timeouts that says nothing. The wedge is recorded as an event and the sweep
-continues.
+**A hang cluster is distinguished from a dead server.** The base binary has
+`definition` requests that never return — ten clusters over 1,458 positions.
+The first version of this called that a wedge and respawned the process,
+which was wrong: checked outside this driver, a `definition` that times out
+at 30 s is followed by a `documentSymbol` on the same open file answering in
+milliseconds. The server is alive; individual requests hang, and they
+cluster.
+
+So consecutive timeouts now trigger a liveness probe — `documentSymbol` on an
+already-open file, which needs no index and no cross-file work — and a server
+that answers it keeps its warm index. Only a process that fails the probe is
+respawned. Either way the event is recorded, because "this verb hangs here"
+is a finding whether or not it killed the server.
 
 **Each side gets its own `XDG_CACHE_HOME`.** Both key `~/.cache/perl-lsp` off
 the workspace path, and their `EXTRACT_VERSION` and plugin fingerprints
