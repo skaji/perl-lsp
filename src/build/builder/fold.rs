@@ -250,14 +250,12 @@ impl<'a> Builder<'a> {
             prev = cur;
         }
         self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
-        if crate::util::timings::phases_enabled() {
-            eprintln!(
-                "[PHASE] {:<32} {} iters, bag.len={}",
-                "build::fold_iterations",
-                iters,
-                self.bag.len()
-            );
-        }
+        // Totals, not a line per file: at corpus scale the per-file form is
+        // 138k unreadable lines, and the average is what says whether the
+        // lattice is settling. `build::fold_to_fixed_point`'s sample count is
+        // the divisor.
+        crate::util::ghost_stats::count_by("build.fold_iterations", iters as u64);
+        crate::util::ghost_stats::count_by("build.fold_bag_len", self.bag.len() as u64);
     }
 
     /// Snapshot of the answers the worklist driver tracks for fixed
