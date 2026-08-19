@@ -141,6 +141,98 @@ pub(super) fn analyze_stamped<T>(
 /// transient failure degrades gracefully, a permanent one can't OOM.
 pub(super) const FALLBACK_WHOLE_BYTE_CAP: usize = 128 * 1024 * 1024;
 
+/// Entries per persist transaction. The writer fills a batch with
+/// `try_recv` after its first blocking `recv`, so this is also the floor the
+/// bounded channel must clear for a chunk to be fillable without stalling.
+pub(crate) const PERSIST_CHUNK: usize = 128;
+
+/// Default depth of the bounded persist channel, in ENTRIES. A cold walk on
+/// 20 cores outruns SQLite's single writer roughly 4:1, so an unbounded
+/// channel parks about four fifths of the corpus in RAM — the cold-index
+/// spike. The cap is what makes peak in-flight a property of the design
+/// rather than of the corpus size: ~22 KB/entry at 138k Perl files puts this
+/// default near 44 MB.
+///
+/// It does NOT shorten time-to-ready. The writer is on the critical path for
+/// the whole run, so throttling the walk to writer rate finishes at about the
+/// same wall clock; what changes is the peak and the honesty of the progress
+/// bar. Only reducing the writer's WORK moves time-to-ready.
+const DEFAULT_WRITE_QUEUE_DEPTH: usize = 2048;
+
+/// `PERL_LSP_WRITE_QUEUE_DEPTH` overrides the default so the cap can be
+/// measured against a real corpus. Floored at one chunk: a channel shallower
+/// than a transaction would serialize the walk against every commit.
+pub(crate) fn write_queue_depth() -> usize {
+    std::env::var("PERL_LSP_WRITE_QUEUE_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_WRITE_QUEUE_DEPTH)
+        .max(PERSIST_CHUNK)
+}
+
+/// The bounded channel every bulk indexer hands to `run_persist_writer`.
+pub(crate) fn bounded_persist_channel<E>() -> (
+    std::sync::mpsc::SyncSender<E>,
+    std::sync::mpsc::Receiver<E>,
+) {
+    std::sync::mpsc::sync_channel(write_queue_depth())
+}
+
+/// How long a full-queue producer sleeps between attempts. Matched to the
+/// writer's drain rate (a slot frees every few ms at measured throughput), so
+/// the poll is cheap without adding meaningful latency to the walk.
+const QUEUE_PARK: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// A producer stalled this long has stopped being backpressure and started
+/// being a symptom; say so once rather than stalling mutely.
+const QUEUE_STALL_WARN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Hand one entry to the persist writer, parking while the queue is full.
+///
+/// `try_send` + park rather than a blocking `send` so a stall is observable
+/// instead of silent, and so the disconnected case is handled explicitly
+/// rather than by whatever `send` happens to do.
+///
+/// **The deadlock this must not have**: a producer parked here while holding
+/// a lock the writer's `on_committed` needs would never be woken, because
+/// the writer cannot drain to free a slot. Every bulk send site therefore
+/// holds NO index or store guard at its call to this function — the
+/// registration tokens (`prepare_*_parts`) and surfaces are fully owned
+/// values by then, and the writer's lanes touch only `ModuleIndex` /
+/// `FileStore` / bag-cache maps that no producer holds across a send. That
+/// property is what makes the bound safe; it is not incidental, and a new
+/// send site has to preserve it — `filestore-guard-discipline`, the family
+/// that has already produced two deadlocks here.
+pub(crate) fn send_to_writer<E>(tx: &std::sync::mpsc::SyncSender<E>, entry: E) {
+    use std::sync::mpsc::TrySendError;
+    let mut entry = entry;
+    let mut waited = std::time::Duration::ZERO;
+    let mut warned = false;
+    loop {
+        match tx.try_send(entry) {
+            Ok(()) => return,
+            // The writer drains until every sender drops, so it never
+            // disconnects while work remains — this is the writer-thread-died
+            // case. Parking would hang the walk; dropping leaves the file
+            // unindexed, which the next run repairs.
+            Err(TrySendError::Disconnected(_)) => {
+                log::error!("persist writer is gone; dropping a queued entry");
+                return;
+            }
+            Err(TrySendError::Full(returned)) => entry = returned,
+        }
+        std::thread::sleep(QUEUE_PARK);
+        waited = waited.saturating_add(QUEUE_PARK);
+        if !warned && waited >= QUEUE_STALL_WARN {
+            warned = true;
+            log::warn!(
+                "persist queue full for {}s — the walk is throttled to writer rate",
+                waited.as_secs()
+            );
+        }
+    }
+}
+
 /// The persist-writer harness every persist site shares: batches entries off
 /// the channel (≤128 per txn), owns BEGIN IMMEDIATE / COMMIT / ROLLBACK
 /// (IMMEDIATE — a deferred txn that reads before writing can hit an
@@ -206,7 +298,7 @@ pub(crate) fn run_persist_writer<E>(
     };
     while let Ok(entry) = rx.recv() {
         batch.push(entry);
-        while batch.len() < 128 {
+        while batch.len() < PERSIST_CHUNK {
             match rx.try_recv() {
                 Ok(e) => batch.push(e),
                 Err(_) => break,

@@ -332,7 +332,7 @@ pub(crate) struct PackRegistrationParts {
     pub(super) arc: Arc<FileAnalysis>,
     pub(super) feed: Vec<(String, bool)>,
     pub(super) specs: Vec<(String, String)>,
-    pub(super) surface: crate::model::surface::Surface,
+    pub(super) surface: Option<crate::model::surface::Surface>,
 }
 
 impl PackRegistrationParts {
@@ -347,8 +347,15 @@ impl PackRegistrationParts {
     pub(crate) fn specs(&self) -> &[(String, String)] {
         &self.specs
     }
+    /// The projected surface — valid only BEFORE `record_surface` takes it.
+    /// Panics after, rather than handing back an empty one: the caller that
+    /// reads this encodes a warm stub, and an empty surface baked into a
+    /// persisted stub is served as valid on every later warm start. A loud
+    /// ordering failure beats a stub that is quietly wrong across sessions.
     pub(crate) fn surface(&self) -> &crate::model::surface::Surface {
-        &self.surface
+        self.surface
+            .as_ref()
+            .expect("read the surface before record_surface takes it")
     }
 
     /// A whole-copy token minted from an already-`Arc`'d analysis: the feed
@@ -358,7 +365,7 @@ impl PackRegistrationParts {
     pub(crate) fn whole(arc: Arc<FileAnalysis>) -> Self {
         let (feed, specs) = ModuleIndex::prepare_pack_feed(&arc);
         let surface = crate::model::surface::Surface::project(&arc);
-        PackRegistrationParts { arc, feed, specs, surface }
+        PackRegistrationParts { arc, feed, specs, surface: Some(surface) }
     }
 
     /// Rehydrate a token from a warm stub — the persisted form of a prior
@@ -370,7 +377,7 @@ impl PackRegistrationParts {
             arc: Arc::new(stub.skeleton),
             feed: stub.feed,
             specs: stub.specs,
-            surface: stub.surface,
+            surface: Some(stub.surface),
         }
     }
 
@@ -378,12 +385,18 @@ impl PackRegistrationParts {
     /// Separate from registration so the deferred-writer path can record
     /// pre-COMMIT (session-local) while the residency half waits for the
     /// commit; the sync front doors record then register in sequence.
+    ///
+    /// TAKES the surface rather than cloning it. Registration discards it
+    /// (`surface: _`), so a token that rides the bounded persist queue would
+    /// otherwise carry a payload whose only remaining use is to be dropped.
+    /// Calling this twice records an empty surface the second time — the one
+    /// caller shape is record-then-hand-off, and every call site does that.
     pub(crate) fn record_surface(
-        &self,
+        &mut self,
         idx: &ModuleIndex,
         path: &std::path::Path,
     ) -> crate::model::surface::SurfaceVerdict {
-        idx.record_surface_value(path, self.surface.clone())
+        idx.record_surface_value(path, self.surface.take().unwrap_or_default())
     }
 }
 
@@ -396,7 +409,7 @@ pub(crate) struct WorkspaceRegistrationParts {
     /// pre-strip — Perl allows any number of packages per file, and each
     /// one must be reachable by name (`docs/adr/file-store-and-resolve.md`).
     pub(super) names: Vec<(String, bool)>,
-    pub(super) surface: crate::model::surface::Surface,
+    pub(super) surface: Option<crate::model::surface::Surface>,
 }
 
 impl WorkspaceRegistrationParts {
@@ -404,13 +417,13 @@ impl WorkspaceRegistrationParts {
         &self.arc
     }
 
-    /// See `PackRegistrationParts::record_surface`.
+    /// See `PackRegistrationParts::record_surface` — takes, does not clone.
     pub(crate) fn record_surface(
-        &self,
+        &mut self,
         idx: &ModuleIndex,
         path: &std::path::Path,
     ) -> crate::model::surface::SurfaceVerdict {
-        idx.record_surface_value(path, self.surface.clone())
+        idx.record_surface_value(path, self.surface.take().unwrap_or_default())
     }
 }
 

@@ -321,6 +321,19 @@ fn whole_copy_registration_sites_are_allowlisted() {
                 ("module_resolver", 2, "deferred writer halves — stripped arcs only"),
             ],
         ),
+        // `insert_cache` stores a WHOLE copy by construction (`persisted:
+        // false` — nothing was written, so the strip has no licence). Its one
+        // production reach is through `register_materialized_whole`, already
+        // bounded by that site's entry; a NEW caller would pin whole copies
+        // without tripping any other gate.
+        (
+            "insert_cache",
+            vec![(
+                "module_index",
+                1,
+                "register_materialized_whole’s cache-slot half",
+            )],
+        ),
         (
             "register_materialized_whole",
             vec![(
@@ -952,6 +965,190 @@ fn kind_comparisons_name_real_grammar_kinds() {
          in a future grammar release, add it to DECLARED_FUTURE_PERL_KINDS with \
          a note saying so:\n{}",
         dead.join("\n")
+    );
+}
+
+/// Every producer that can PARK on the bounded persist queue is allowlisted,
+/// because parking is only safe while holding no lock the writer needs.
+///
+/// `run_persist_writer`'s committed and fallback lanes take `ModuleIndex`,
+/// `FileStore` and bag-cache guards. A producer that blocked on a full queue
+/// while holding one of those could never be woken — the writer cannot drain
+/// to free a slot. Today every site hands over fully-owned values
+/// (`prepare_*_parts` tokens, encoded blobs) with no guard live, which is the
+/// property that makes the bound safe. It is not self-evident from the call
+/// site, so a NEW one fails here until its author has answered the same
+/// question. This is the `filestore-guard-discipline` family, which has
+/// already produced two deadlocks in this codebase.
+#[test]
+fn persist_queue_producers_are_allowlisted() {
+    // file stem → (call sites, why parking there is safe)
+    // `source_files` reports the LAYER-directory stem, so both bulk
+    // indexers land under one key; the reasons are per file.
+    let allow: Vec<(&str, usize, &str)> = vec![(
+        "module_resolver",
+        4,
+        "index_perl's deferred + whole lanes (parts/blob owned; the FileStore write \
+         happens AFTER the send) and index_pack's two (register_symbols completes \
+         BEFORE the send)",
+    )];
+    let expected: HashMap<String, usize> =
+        allow.iter().map(|(f, n, _)| (f.to_string(), *n)).collect();
+
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (path, _layer, stem) in source_files() {
+        let text = fs::read_to_string(&path).unwrap();
+        let n = text
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("send_to_writer(")
+            })
+            .count();
+        // The definition itself lives in `persist`; don't count it.
+        if n > 0 && !text.contains("pub(crate) fn send_to_writer") {
+            *seen.entry(stem.clone()).or_default() += n;
+        }
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    for (file, n) in &seen {
+        match expected.get(file) {
+            Some(exp) if exp == n => {}
+            Some(exp) => violations.push(format!(
+                "send_to_writer() call-site count changed in {file}: {n} (allowlisted {exp}) —                  state what guard, if any, is held at the new send"
+            )),
+            None => violations.push(format!(
+                "send_to_writer() called from {file} ({n} site(s)) — not allowlisted. A producer                  may park on a full queue, so it must hold NO index/store guard at the send"
+            )),
+        }
+    }
+    for (file, exp) in &expected {
+        if !seen.contains_key(file) {
+            violations.push(format!(
+                "send_to_writer() allowlisted in {file} ({exp}) but no call site found —                  update the allowlist"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "persist-queue producer drift:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Every verb's readiness policy is enumerated here, because a wrong one is
+/// SILENT.
+///
+/// `WaitPolicy` is data at the call site and redirecting a verb is a one-word
+/// change — which is the strength and the hazard. `ReadyGate` is a runtime
+/// latch, so a verb that waits `Interactive` on the index gate when its answer
+/// must not be partial does not fail, warn, or look different; it just
+/// under-reports during a cold window, which is this arc's signature failure.
+/// Nothing else in the tree records the intended mapping, so this table is it:
+/// a policy change is deliberate or it is a test failure.
+///
+/// The rule the table encodes: an ACT-ON-ABLE answer (rename edits, a
+/// references sweep, a hierarchy) waits `Complete`; a latency-critical
+/// interactive answer that heals via a refresh channel stays `Interactive`.
+#[test]
+fn verb_readiness_policies_are_enumerated() {
+    // (verb, gate, policy)
+    let expected: &[(&str, &str, &str)] = &[
+        // Act-on-able: silently partial is worse than slow.
+        ("document_symbol", "await_open_ready", "Complete"),
+        ("goto_implementation", "await_index_ready", "Complete"),
+        ("goto_implementation", "await_open_full", "Complete"),
+        ("goto_implementation", "await_open_ready", "Complete"),
+        ("prepare_call_hierarchy", "await_index_ready", "Complete"),
+        ("prepare_call_hierarchy", "await_open_ready", "Complete"),
+        ("prepare_type_hierarchy", "await_index_ready", "Complete"),
+        ("prepare_type_hierarchy", "await_open_ready", "Complete"),
+        ("references", "await_index_ready", "Complete"),
+        ("references", "await_open_full", "Complete"),
+        ("references", "await_open_ready", "Complete"),
+        ("rename", "await_index_ready", "Complete"),
+        ("rename", "await_open_full", "Complete"),
+        ("rename", "await_open_ready", "Complete"),
+        // Latency-critical: best-effort now, healed by a refresh channel.
+        ("code_action", "await_open_ready", "Interactive"),
+        ("completion", "await_open_ready", "Interactive"),
+        ("document_highlight", "await_open_ready", "Interactive"),
+        ("folding_range", "await_open_ready", "Interactive"),
+        ("goto_definition", "await_index_ready", "Interactive"),
+        ("goto_definition", "await_open_ready", "Interactive"),
+        ("goto_type_definition", "await_index_ready", "Interactive"),
+        ("goto_type_definition", "await_open_ready", "Interactive"),
+        ("hover", "await_index_ready", "Interactive"),
+        ("hover", "await_open_ready", "Interactive"),
+        ("inlay_hint", "await_open_ready", "Interactive"),
+        // `prepare_rename` only validates the token; `rename` does the edits.
+        ("prepare_rename", "await_open_ready", "Interactive"),
+        ("selection_range", "await_open_ready", "Interactive"),
+        ("semantic_tokens_full", "await_open_ready", "Interactive"),
+        ("signature_help", "await_open_ready", "Interactive"),
+    ];
+
+    let text = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lsp/backend/server.rs"),
+    )
+    .expect("read server.rs");
+
+    let mut found: Vec<(String, String, String)> = Vec::new();
+    let mut verb = String::new();
+    for line in text.lines() {
+        let t = line.trim_start();
+        // Method definitions sit at one indent level inside the impl.
+        if line.starts_with("    ") && !line.starts_with("     ") {
+            if let Some(rest) = t
+                .strip_prefix("pub async fn ")
+                .or_else(|| t.strip_prefix("async fn "))
+                .or_else(|| t.strip_prefix("pub fn "))
+                .or_else(|| t.strip_prefix("fn "))
+            {
+                verb = rest
+                    .split(|c: char| c == '(' || c == '<')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        if t.starts_with("//") {
+            continue;
+        }
+        for gate in ["await_index_ready", "await_open_ready", "await_open_full"] {
+            if !t.contains(&format!("{gate}(")) {
+                continue;
+            }
+            let policy = t
+                .split("WaitPolicy::")
+                .nth(1)
+                .map(|r| {
+                    r.chars()
+                        .take_while(|c| c.is_alphabetic())
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            found.push((verb.clone(), gate.to_string(), policy));
+        }
+    }
+    found.sort();
+    found.dedup();
+
+    let want: Vec<(String, String, String)> = expected
+        .iter()
+        .map(|(v, g, p)| (v.to_string(), g.to_string(), p.to_string()))
+        .collect();
+    let mut want_sorted = want.clone();
+    want_sorted.sort();
+
+    let missing: Vec<_> = want_sorted.iter().filter(|r| !found.contains(r)).collect();
+    let extra: Vec<_> = found.iter().filter(|r| !want_sorted.contains(r)).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "verb readiness policy drift.\n  no longer present: {missing:?}\n  \
+         not enumerated:   {extra:?}\nA policy change is fine — say so here. \
+         An unnoticed one under-reports silently during a cold window."
     );
 }
 
