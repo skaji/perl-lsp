@@ -709,10 +709,16 @@ def cmd_diff(args):
     short = []
     for label, m, rws in (("base", meta_a, base), ("head", meta_b, head)):
         got, want, done_marker = _completeness(m, rws)
-        if want and got < want:
+        if want is None:
+            # An unverifiable file is not a verified one. Silently accepting
+            # it would re-open the exact hole these checks close — every
+            # wrong number this evening came from a file that looked fine.
+            short.append(f"{label} predates completeness stamping, so it "
+                         f"cannot be shown to be a complete run")
+        elif got < want:
             short.append(f"{label} answered {got} of the {want} positions its "
                          f"own header declared ({got/want:.1%})")
-        elif want and not done_marker:
+        elif not done_marker:
             short.append(f"{label} reached its position count but never wrote "
                          f"a completion marker — it may have died in the "
                          f"recheck pass")
