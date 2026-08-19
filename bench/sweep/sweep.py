@@ -188,6 +188,7 @@ def cmd_run(args):
     # Lists, not ints: the loop rebinds `lsp` on restart and these have to
     # survive that without a nonlocal dance in a nested scope.
     wedge, restarts = [0], [0]
+    deferred = []
     t0 = time.monotonic()
     with open(args.out, "w") as fh:
         fh.write(json.dumps({"_meta": {
@@ -237,29 +238,27 @@ def cmd_run(args):
                         rec["norm"] = None
                     else:
                         rec["norm"] = N.normalize(verb, msg.get("result"), root_uri)
-                    # An empty answer is asked TWICE. The @INC tier resolves
-                    # per-module, on demand, on a background thread, so the
-                    # first goto-def on `use Storable` can legitimately answer
-                    # empty and the second answer the file — the workspace
-                    # readiness gate cannot cover this, because the module was
-                    # never in the workspace. Verified by hand: the sweep
-                    # recorded head as empty on `use Storable` while the CLI,
-                    # which starts synchronously, resolves it.
+                    # Every empty answer is re-asked, but at the END of the
+                    # run rather than here. The @INC tier resolves per module,
+                    # on demand, on a background thread, so the first goto-def
+                    # on `use App::Cmd::Command` can answer empty and a later
+                    # one answer the file — the workspace readiness gate
+                    # cannot cover that, because the module was never in the
+                    # workspace. Verified by hand twice: the sweep recorded
+                    # head empty on `use Storable` and on
+                    # `use App::Cmd::Command` where the CLI, which starts
+                    # synchronously, resolves both.
                     #
-                    # Without the retry that timing shows up as `only-base` and
-                    # reads as a lost resolution. The retry is in the RUNNER so
-                    # both sides get it by construction; a side-specific one
-                    # would be worse than none.
-                    if args.empty_retry_ms > 0 and not rec.get("timeout") \
-                            and not rec.get("err") \
+                    # An inline sleep-and-retry was the obvious fix and it was
+                    # the wrong one: at 400 ms it filled ZERO of head's empties
+                    # while taking the run from 51 s to 1,024 s. Too short to
+                    # help, and paid on every empty answer. Deferring costs one
+                    # extra request with no sleep, and asks it of the warmest
+                    # server the run ever has — strictly better evidence.
+                    if not rec.get("timeout") and not rec.get("err") \
                             and N.is_empty(verb, rec["norm"]):
-                        time.sleep(args.empty_retry_ms / 1000.0)
-                        msg2, _ = lsp.request(method, params, timeout=args.timeout)
-                        if msg2 is not None and not _err(msg2):
-                            n2 = N.normalize(verb, msg2.get("result"), root_uri)
-                            if not N.is_empty(verb, n2):
-                                rec["norm"] = n2
-                                rec["filled_on_retry"] = True
+                        deferred.append((rel, p["line"], ch, verb, method,
+                                         dict(params), p["kind"], p["name"]))
                     fh.write(json.dumps(rec, sort_keys=True, default=str) + "\n")
                     # A server that stops answering ENTIRELY is the failure
                     # mode that quietly ruins a long run: every remaining
@@ -328,6 +327,28 @@ def cmd_run(args):
                     el = time.monotonic() - t0
                     print(f"[{args.side}] {done}/{len(pos)} positions  {el:.0f}s "
                           f"({done/max(el,1e-9):.1f}/s)", flush=True)
+        # Second pass. Recheck rows are APPENDED, not rewritten in place, so
+        # the stream stays crash-resilient and both answers survive: the
+        # report can say a position was empty on first ask and resolved once
+        # warm, which is a fact about startup, not about the branch.
+        filled = 0
+        for (rel, ln, ch, verb, method, params, kind, name) in deferred:
+            msg, ms = lsp.request(method, params, timeout=args.timeout)
+            if msg is None or _err(msg):
+                continue
+            norm = N.normalize(verb, msg.get("result"), root_uri)
+            if N.is_empty(verb, norm):
+                continue
+            filled += 1
+            fh.write(json.dumps({"_recheck": True, "file": rel, "line": ln,
+                                 "char": ch, "verb": verb, "kind": kind,
+                                 "name": name, "ms": round(ms, 1),
+                                 "norm": norm}, sort_keys=True, default=str) + "\n")
+        fh.write(json.dumps({"_event": "recheck",
+                             "empty_first_ask": len(deferred),
+                             "filled_when_warm": filled}) + "\n")
+        print(f"[{args.side}] recheck: {filled} of {len(deferred)} empty answers "
+              f"resolved once warm", flush=True)
     lsp.shutdown()
     print(f"[{args.side}] done: {done} positions in "
           f"{time.monotonic()-t0:.0f}s -> {args.out}")
@@ -395,6 +416,14 @@ def _load(path):
             events.append(r)
             continue
         key = (r["file"], r.get("line"), r.get("char"), r["verb"])
+        if r.get("_recheck"):
+            # A warm answer supersedes a cold empty one. Both are in the file;
+            # this is the choice of which the comparison uses, and it must be
+            # the warm one on BOTH sides or the sweep measures startup.
+            if key in rows:
+                rows[key] = dict(rows[key], norm=r["norm"],
+                                 filled_when_warm=True)
+            continue
         rows[key] = r
     meta["events"] = events
     return meta, rows
@@ -713,10 +742,6 @@ def main():
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--ready-timeout", type=float, default=600.0)
-    p.add_argument("--empty-retry-ms", type=float, default=400.0,
-                   help="re-ask once after this delay when an answer is empty; "
-                        "0 disables. Covers the on-demand @INC tier, which "
-                        "resolves per module after the first miss.")
     p.add_argument("--rewarm-timeout", type=float, default=60.0,
                    help="budget for re-reaching cross-file readiness after a restart")
     p.add_argument("--wedge-after", type=int, default=3,

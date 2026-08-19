@@ -136,6 +136,25 @@ check("an untruncated smaller list is still a subset",
       cls("completion", big_base, uncapped_head), "subset")
 
 
+# The recheck pass must SUPERSEDE the cold answer, or the sweep measures
+# startup rather than the branch. Written as an appended row, applied on load.
+import io, json as _json, tempfile as _tf
+_p = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+_p.write(_json.dumps({"_meta": {"side": "t"}}) + "\n")
+_p.write(_json.dumps({"file": "a.pm", "line": 1, "char": 2, "verb": "definition",
+                      "norm": [], "ms": 1}) + "\n")
+_p.write(_json.dumps({"_recheck": True, "file": "a.pm", "line": 1, "char": 2,
+                      "verb": "definition", "norm": [["lib/X.pm", [0, 0, 0, 1]]],
+                      "ms": 1}) + "\n")
+_p.close()
+_meta, _rows = S._load(_p.name)
+_row = _rows[("a.pm", 1, 2, "definition")]
+check("a warm recheck supersedes the cold empty answer",
+      (_row["norm"], _row.get("filled_when_warm")),
+      ([["lib/X.pm", [0, 0, 0, 1]]], True))
+os.unlink(_p.name)
+
+
 # --- position selection -----------------------------------------------------
 
 check("selection is deterministic across processes — hash() is salted, "
