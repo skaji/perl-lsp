@@ -149,13 +149,22 @@ def cmd_run(args):
         end = t + budget
         while time.monotonic() < end:
             for pr in probes:
+                # The budget has to bind INSIDE the probe loop, not just
+                # between passes. Against a wedged server every probe costs
+                # its full timeout, so one pass over eight probes ran 16
+                # minutes while nominally honouring a 300-second budget --
+                # the run looked hung, and the budget was the thing that was
+                # supposed to prove it was not.
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
                 uri = _open(client, root, pr["file"])
                 if uri is None:
                     continue
                 msg, _ = client.request("textDocument/definition", {
                     "textDocument": {"uri": uri},
                     "position": {"line": pr["line"], "character": pr["char_on"]}},
-                    timeout=120)
+                    timeout=min(120, left))
                 locs = N.locations((msg or {}).get("result"), root_uri)
                 here = os.path.relpath(os.path.join(root, pr["file"]), root)
                 if any(u and u != here for (u, _) in locs):
@@ -276,7 +285,7 @@ def cmd_run(args):
                             # answers as lost resolutions -- the same trap
                             # the initial gate exists to close, and easier to
                             # miss here because the run is already underway.
-                            _, _, warm_ms = await_cross_file(lsp, args.ready_timeout)
+                            _, _, warm_ms = await_cross_file(lsp, args.rewarm_timeout)
                             fh.write(json.dumps({"_event": "restart-rewarm",
                                 "restart": restarts[0],
                                 "cross_file_ready_ms": warm_ms and round(warm_ms),
@@ -616,6 +625,8 @@ def main():
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--ready-timeout", type=float, default=600.0)
+    p.add_argument("--rewarm-timeout", type=float, default=60.0,
+                   help="budget for re-reaching cross-file readiness after a restart")
     p.add_argument("--wedge-after", type=int, default=3,
                    help="consecutive timeouts that mean the server is wedged")
     p.add_argument("--max-restarts", type=int, default=10)
