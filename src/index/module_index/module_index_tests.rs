@@ -1919,3 +1919,43 @@ fn for_strip_never_yields_rows_without_bag() {
     assert_eq!(Residency::for_strip(true, false), Residency::RowsOnly);
     assert_eq!(Residency::for_strip(true, true), Residency::Skeleton);
 }
+
+/// An enriched copy must carry the flags that describe the analysis it came
+/// from. `degraded`, `bag_evicted` and the ref/symbol eviction flags are
+/// `serde(skip)`, so the bincode round-trip this copy used to make reset them
+/// to false and `after_deserialize` never put them back: the enriched view of
+/// a DEGRADED analysis reported itself whole, and the consumers that gate on
+/// degradation could not see it.
+#[test]
+fn an_enriched_copy_keeps_the_degraded_marker() {
+    let idx = ModuleIndex::new_for_test();
+    let lib = parse_source_to_cached(
+        "package Lib;\nour @EXPORT_OK = ('make');\nsub make { my %h = (id => 1); return \\%h }\n1;\n",
+        "Lib",
+    );
+    let consumer = parse_source_to_cached(
+        "package App;\nuse Lib 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(lib.path.to_path_buf(), Arc::clone(&lib.analysis));
+
+    // Mark the consumer degraded, as a parse/extract shortfall would.
+    let mut fa = (*consumer.analysis).clone();
+    fa.degraded = true;
+    let degraded_consumer = Arc::new(CachedModule::new(
+        consumer.path.to_path_buf(),
+        Arc::new(fa),
+    ));
+    idx.register_workspace_module(
+        degraded_consumer.path.to_path_buf(),
+        Arc::clone(&degraded_consumer.analysis),
+    );
+
+    let snap = idx
+        .enriched_snapshot(&degraded_consumer)
+        .expect("a degraded analysis still enriches");
+    assert!(
+        snap.degraded,
+        "the enriched copy dropped the degraded marker, so it claims to be whole",
+    );
+}

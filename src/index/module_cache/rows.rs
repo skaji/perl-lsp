@@ -181,6 +181,49 @@ pub fn shred_derived_rows(
     Ok(())
 }
 
+/// Reclaim interned strings nothing references any more.
+///
+/// `strings` is append-only in normal operation: every deletion path
+/// (`delete_ref_rows`, the tier-scoped eraser, a file re-shredding under a
+/// changed name set) drops `refs`/`syms` rows and leaves their names behind.
+/// Measured over 300 substrate modules, deleting half the files orphans
+/// 34.6% of the table and deleting all of them orphans 100% — the table
+/// never shrinks, so a long-lived workspace accumulates every name it has
+/// ever seen.
+///
+/// Shaped as a set-difference, not a per-string existence test: `container_id`
+/// carries no index, so a `NOT EXISTS` per string would scan `syms` once per
+/// string. This builds the live set in one pass over each table instead.
+///
+/// Returns the number of strings reclaimed. Bumps `strings_generation` when
+/// it reclaims any, because the shredder memoizes `str_id`s for the writer's
+/// lifetime and a freed id must never be handed out again — that would write
+/// refs rows nothing joins to, the silent failure the generation guard
+/// exists for.
+///
+/// Callers must run this at a point where no shred is mid-flight. SQLite
+/// serialises writers, so a shred's intern-and-insert cannot interleave with
+/// the delete below; what the generation bump protects is the memo a writer
+/// built in an EARLIER transaction.
+pub fn gc_strings(conn: &Connection) -> usize {
+    let deleted = conn.execute(
+        "DELETE FROM strings WHERE str_id NOT IN (
+             SELECT name_id FROM refs
+             UNION SELECT name_id FROM syms
+             UNION SELECT key_id FROM syms
+             UNION SELECT container_id FROM syms WHERE container_id IS NOT NULL
+         )",
+        [],
+    );
+    match deleted {
+        Ok(n) if n > 0 => {
+            let _ = crate::index::module_cache::bump_strings_generation(conn);
+            n
+        }
+        _ => 0,
+    }
+}
+
 /// Drop one file's whole persisted generation — blob row AND derived ref
 /// rows, together (the eraser twin of the write invariant "blob + rows
 /// describe one generation"). Every invalidation seam calls this; nobody

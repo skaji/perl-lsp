@@ -470,12 +470,22 @@ impl ModuleIndex {
             }
         }
         let whole = crate::model::file_analysis::CrossFileLookup::whole_present(self, cached);
-        // Deep copy via serde — enrichment must never write through the
-        // shared Arc (the R4 rule the overlay exists to enforce).
-        let mut copy: FileAnalysis = bincode::serialize(&*whole)
-            .ok()
-            .and_then(|bin| bincode::deserialize(&bin).ok())?;
-        copy.after_deserialize();
+        // A private copy, because enrichment must never write through the
+        // shared Arc (the R4 rule this overlay exists to enforce). `clone`
+        // IS that private copy — the bincode round-trip this replaced
+        // encoded and decoded the whole analysis to reach the same place and
+        // then rebuilt from scratch every index the clone copies directly.
+        // Measured over 150 substrate modules: 834 ms round-trip vs 67 ms
+        // clone, 12.4x, and the round-trip is what made a build expensive
+        // enough to sink level-indexed enrichment
+        // (`docs/adr/level-indexed-enrichment.md`).
+        //
+        // It is also the more faithful copy. `bag_evicted`, `degraded` and
+        // the ref/symbol eviction flags are `serde(skip)`, so the round-trip
+        // silently reset them to false and `after_deserialize` never put
+        // them back — an enriched copy of a DEGRADED analysis claimed to be
+        // whole. Clone carries them.
+        let mut copy: FileAnalysis = (*whole).clone();
         copy.enrich_imported_types_with_keys(Some(self));
         let arc = Arc::new(copy);
         // Cycle-tainted: some dep declined mid-enrich (mutual imports), so

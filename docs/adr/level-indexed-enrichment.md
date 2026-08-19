@@ -3,11 +3,22 @@
 > implementation lives on branch `claude/level-indexed-enrichment` (`33c2a02f`)
 > and is deliberately not merged. Read the measurements before rebuilding it.
 >
-> **The blocker is not the design, it is what a "build" costs.** Enrichment
-> bincode round-trips a whole `FileAnalysis` to get a private copy, and this
-> design asks for one build *per level* instead of one. Make enrichment
-> incremental — a small overlay of derived facts rather than a whole-analysis
-> deep copy — and this becomes affordable. That is the prerequisite row.
+> **The blocker is not the design, it is what a "build" costs** — but the
+> expensive part of a build is NOT the copy. Measured in
+> `docs/adr/enrichment-build-cost.md`: the whole-analysis copy is 3.8% of a
+> build once it is a `clone` instead of a bincode round-trip (that swap alone
+> took 27.8% off every build), and the enrichment delta really is small
+> (4.13% of base). The dominant term is the **cross-file provider chase** at
+> 61.6%, re-done from scratch on every build — and a level-indexed design
+> pays it once per level. Making levels affordable means memoizing that chase
+> across builds; an overlay would remove a further 3.8% and would not change
+> this verdict.
+>
+> The 61.6% has since come down 6.4x, and not by the route this ADR's
+> successor guessed at: the chase's cost was `bag_present` LRU misses, not
+> provider resolution, and a resident-copy export gate removed it. A build is
+> correspondingly cheaper, but K× of a cheaper build is still K×; nothing here
+> is reopened by it.
 
 # ADR: Level-indexed enrichment — correct, deterministic, and too slow as built
 

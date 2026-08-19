@@ -11,17 +11,21 @@ use super::*;
 /// warm peak vs its 276 MB cold peak). Negative sentinels are skipped —
 /// the pack warm path has no consumer for them. Returns
 /// (valid_rows_seen, stale_names) like `warm_cache`.
+/// Returns `(valid_rows_seen, stale_names, missing_paths)`. `missing_paths`
+/// are rows whose FILE is gone from disk: only this scan can see them (the
+/// caller's membership check never runs for a row the scan skips), and
+/// nothing else will ever collect them, so the caller must.
 pub fn warm_cache_streaming(
     conn: &Connection,
     source: &str,
     each: &mut dyn FnMut(String, PathBuf, FileAnalysis),
-) -> (usize, Vec<String>) {
+) -> (usize, Vec<String>, Vec<PathBuf>) {
     let mut stmt = match conn.prepare(
         "SELECT module_name, path, mtime_secs, file_size, analysis, extract_version, deps_stamp \
          FROM modules WHERE source = ?1",
     ) {
         Ok(s) => s,
-        Err(_) => return (0, Vec::new()),
+        Err(_) => return (0, Vec::new(), Vec::new()),
     };
     let map_row = |row: &rusqlite::Row| {
         Ok((
@@ -36,11 +40,12 @@ pub fn warm_cache_streaming(
     };
     let rows = match stmt.query_map(params![source], map_row) {
         Ok(r) => r,
-        Err(_) => return (0, Vec::new()),
+        Err(_) => return (0, Vec::new(), Vec::new()),
     };
 
     let mut count = 0usize;
     let mut stale_names = Vec::new();
+    let mut missing: Vec<PathBuf> = Vec::new();
     let mut stat_memo: std::collections::HashMap<String, (i64, i64)> =
         std::collections::HashMap::new();
     for row in rows.map(|r| {
@@ -61,6 +66,10 @@ pub fn warm_cache_streaming(
                 stale_names.push(module_name);
                 continue; // stale rows re-analyze; don't register the old shape
             }
+            RowGeneration::Missing => {
+                missing.push(PathBuf::from(&path_str));
+                continue;
+            }
             RowGeneration::Sentinel | RowGeneration::StampStale => continue,
         };
         let Some(blob) = analysis_blob.filter(|b| !b.is_empty()) else {
@@ -76,7 +85,7 @@ pub fn warm_cache_streaming(
         count += 1;
         each(module_name, path, fa);
     }
-    (count, stale_names)
+    (count, stale_names, missing)
 }
 
 /// One persisted row's generation verdict — the shared first half of every
@@ -86,7 +95,15 @@ pub fn warm_cache_streaming(
 pub(crate) enum RowGeneration {
     /// Sentinel/negative row — no warm consumer.
     Sentinel,
-    /// The file changed or vanished on disk — skip silently.
+    /// The file is GONE from disk. Distinct from `StampStale` on purpose:
+    /// a changed file re-analyses and re-shreds, while a deleted one never
+    /// comes back on its own, so its rows are only collectable HERE. They
+    /// used to fall into `StampStale` and be skipped before the walk's
+    /// membership check could see them, which made them immortal — the
+    /// store grew a dead generation per deleted file forever, and the
+    /// dead-export view counted a deleted file as a live user.
+    Missing,
+    /// The file changed on disk — skip silently.
     StampStale,
     /// Blob shape predates EXTRACT_VERSION — the caller decides between
     /// skip (workspace tiers re-analyze from the walk) and queue-for-
@@ -107,7 +124,8 @@ pub(crate) fn classify_row_generation(
     let path = PathBuf::from(path_str);
     match file_stamp(&path) {
         Some((m, sz)) if m == cached_mtime && sz == cached_size => {}
-        _ => return RowGeneration::StampStale,
+        Some(_) => return RowGeneration::StampStale,
+        None => return RowGeneration::Missing,
     }
     if row_extract_version < EXTRACT_VERSION {
         return RowGeneration::VersionStale;
@@ -313,6 +331,12 @@ pub fn warm_cache(
                 continue;
             }
             RowGeneration::StampStale => continue,
+            // The provider file is gone. Its rows can only be seen here, so
+            // drop the generation rather than carry it forever.
+            RowGeneration::Missing => {
+                let _ = crate::index::module_cache::invalidate_generation(conn, &path_str);
+                continue;
+            }
             // @INC tier policy: stale entries still load, queued for
             // priority re-resolve.
             RowGeneration::VersionStale => {

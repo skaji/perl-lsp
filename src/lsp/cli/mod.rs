@@ -162,6 +162,9 @@ pub(crate) fn print_usage() {
     eprintln!("DEBUG:");
     eprintln!("  perl-lsp --dump-package <root> <package>               Dump every sub in <package>");
     eprintln!("                                                         with derived type info");
+    eprintln!("  perl-lsp --gc-cache <root>                             Reclaim unreferenced interned");
+    eprintln!("                                                          strings (run when nothing else");
+    eprintln!("                                                          is writing the cache)");
     eprintln!("  perl-lsp --clear-cache [<root>]                        Wipe the module cache for");
     eprintln!("                                                         <root>, or every project if");
     eprintln!("                                                         <root> is omitted");
@@ -440,6 +443,55 @@ fn severity_rank(s: &str) -> u8 {
         "hint" => 3,
         _ => 1,
     }
+}
+
+/// --gc-cache <root> — reclaim interned strings nothing references.
+///
+/// A MAINTENANCE verb, not an automatic sweep, and the distinction is the
+/// point. `strings` is append-only in normal operation: every deletion path
+/// drops `refs`/`syms` rows and leaves their names behind, so a long-lived
+/// workspace accumulates every name it has ever seen (measured: deleting
+/// half a 300-module set orphans 34.6% of the table, deleting all orphans
+/// 100%).
+///
+/// It is not wired into startup because `shred_derived_rows` has standalone
+/// autocommit callers — the watcher's invalidation path among them — whose
+/// intern and row-insert land in SEPARATE transactions. A sweep between the
+/// two would free a string the insert is about to reference, and the rows
+/// written after it would carry a `name_id` nothing joins to: retrieval
+/// answers EMPTY, not wrong, but silently. Making it automatic means giving
+/// the shred one transaction so intern-and-insert cannot be split; until
+/// then this runs when the caller knows nothing else is writing.
+pub(crate) fn cli_gc_cache(root: &str) {
+    let (_, root_uri) = canonical_root_and_uri(root);
+    let Some(conn) = module_cache::open_cache_db(Some(&root_uri), "perl") else {
+        eprintln!("No cache database for {root}");
+        std::process::exit(1);
+    };
+    let n = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    let before = n("SELECT COUNT(*) FROM strings");
+    // Report the whole derived store, not just the table being swept: a
+    // `strings` sweep that reclaims nothing because DEAD FILE rows are still
+    // holding their names looks identical to a store with no garbage in it,
+    // and those are very different situations.
+    eprintln!(
+        "before: files={} refs={} syms={} strings={} (of which {} orphaned)",
+        n("SELECT COUNT(*) FROM files"),
+        n("SELECT COUNT(*) FROM refs"),
+        n("SELECT COUNT(*) FROM syms"),
+        before,
+        n("SELECT COUNT(*) FROM strings s WHERE NOT EXISTS(SELECT 1 FROM refs r WHERE r.name_id=s.str_id) \
+             AND NOT EXISTS(SELECT 1 FROM syms y WHERE y.name_id=s.str_id OR y.key_id=s.str_id \
+                            OR y.container_id=s.str_id)"),
+    );
+    let missing = n(
+        "SELECT COUNT(*) FROM files f WHERE f.source='workspace'",
+    );
+    let reclaimed = module_cache::gc_strings(&conn);
+    eprintln!(
+        "Reclaimed {reclaimed} of {before} interned strings ({:.1}%); {missing} workspace file rows remain",
+        100.0 * reclaimed as f64 / before.max(1) as f64
+    );
 }
 
 /// --clear-cache [<root>] — Remove the SQLite module cache.

@@ -583,6 +583,29 @@ Hot-name retrieval measured 591 → 170 ms. **Do not add an occurrence `count`
 column**: a row count is a *candidate* count, not a reference count, and
 shipping one invites exactly the mistake that produced the ten dead columns.
 
+**The `strings` leak was a SYMPTOM; the rows leak was the disease.** A row
+can only be collected by the scan that reads it, and `warm_cache_streaming`
+skipped any row it could not stamp — which includes every row whose file has
+been DELETED (`file_stamp` returns `None`, the row classified `StampStale`,
+`continue`, and the walk's membership check that feeds `dead_rows` never saw
+it). So a deleted file's rows were immortal: the store grew a dead generation
+per deleted file forever, `ref_candidate_files` kept offering paths that no
+longer exist, and `unused_exported_syms` counted a deleted file as a live
+cross-file user — a wrong answer in the dead-export queue. `RowGeneration`
+now distinguishes `Missing` from `StampStale` and both lanes collect it.
+Measured on a 400-module workspace with 200 deleted: files 400 -> 200,
+refs 3,997 -> 1,997, syms 4,397 -> 2,197. Strings could not be reclaimed
+before because dead rows still referenced them.
+
+`gc_strings` + `--gc-cache <root>` reclaim what is genuinely unreferenced. It
+is deliberately NOT automatic: `shred_derived_rows` has standalone autocommit
+callers (the watcher's invalidation path among them) whose intern and
+row-insert land in separate transactions, and a sweep between the two frees a
+string the insert is about to reference — the rows written after it carry a
+`name_id` nothing joins to and retrieval answers EMPTY rather than wrong.
+Giving the shred a single transaction is what would make an automatic sweep
+safe.
+
 **The interner is the other half, and needs no version bump.**
 `shred_derived_rows` allocates its memo per FILE, so `$self`/`@_`/`new` are
 re-interned against the 556k-row unique index in all 124,689 files — ~5M

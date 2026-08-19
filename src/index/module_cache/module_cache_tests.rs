@@ -1296,3 +1296,193 @@ fn a_qualified_symbols_declaring_file_is_a_ref_candidate() {
         "the display name is not a retrieval key — that is what key_id is for",
     );
 }
+
+/// MEASUREMENT PROBE (not a net): how much of `strings` is orphaned after
+/// realistic churn. `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn probe_strings_orphan_rate() {
+    let conn = test_db();
+    let root = std::path::Path::new("gold-corpus/local/lib/perl5");
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>, cap: usize) {
+        if out.len() >= cap { return; }
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            if out.len() >= cap { return; }
+            let p = e.path();
+            if p.is_dir() { walk(&p, out, cap); }
+            else if p.extension().map(|x| x == "pm").unwrap_or(false) { out.push(p); }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files, 300);
+    if files.is_empty() { eprintln!("SKIP: no substrate"); return; }
+
+    let mut parser = crate::build::builder::create_parser();
+    let mut paths = Vec::new();
+    for f in &files {
+        let Ok(src) = std::fs::read_to_string(f) else { continue };
+        let Some(tree) = parser.parse(&src, None) else { continue };
+        let fa = crate::build::builder::build(&tree, src.as_bytes());
+        let ps = f.to_string_lossy().to_string();
+        shred_derived_rows(&conn, &ps, "workspace", &fa.ref_row_seeds(), &fa.sym_row_seeds()).unwrap();
+        paths.push(ps);
+    }
+    let count = |sql: &str| -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1)
+    };
+    let live = "SELECT COUNT(*) FROM strings s WHERE EXISTS(SELECT 1 FROM refs r WHERE r.name_id=s.str_id) \
+                OR EXISTS(SELECT 1 FROM syms y WHERE y.name_id=s.str_id OR y.key_id=s.str_id OR y.container_id=s.str_id)";
+    eprintln!("after shred: strings={} live={} files={}",
+        count("SELECT COUNT(*) FROM strings"), count(live), paths.len());
+
+    // Churn: delete half the files, as a workspace does over a session.
+    for p in paths.iter().step_by(2) { delete_ref_rows(&conn, p); }
+    let total = count("SELECT COUNT(*) FROM strings");
+    let alive = count(live);
+    eprintln!(
+        "after deleting half: strings={total} live={alive} ORPHANED={} ({:.1}%)",
+        total - alive, 100.0 * (total - alive) as f64 / total.max(1) as f64
+    );
+
+    // And a full wipe of every file, the extreme.
+    for p in &paths { delete_ref_rows(&conn, p); }
+    let total2 = count("SELECT COUNT(*) FROM strings");
+    let alive2 = count(live);
+    eprintln!(
+        "after deleting all:  strings={total2} live={alive2} ORPHANED={} ({:.1}%)",
+        total2 - alive2, 100.0 * (total2 - alive2) as f64 / total2.max(1) as f64
+    );
+}
+
+#[test]
+fn gc_reclaims_orphaned_strings_and_keeps_live_ones() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let mk = |name: &str, src: &str| -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, src).unwrap();
+        let ps = p.to_string_lossy().to_string();
+        let cached = parse_source_to_cached(src, &p);
+        shred_derived_rows(
+            &conn, &ps, "workspace",
+            &cached.analysis.ref_row_seeds(),
+            &cached.analysis.sym_row_seeds(),
+        ).unwrap();
+        ps
+    };
+    let keep = mk("gc_keep.pm", "package GcKeep;\nsub kept_name { 1 }\nsub go { kept_name() }\n1;\n");
+    let drop_ = mk("gc_drop.pm", "package GcDrop;\nsub doomed_name { 1 }\nsub go2 { doomed_name() }\n1;\n");
+
+    let has = |s: &str| -> bool {
+        conn.query_row("SELECT 1 FROM strings WHERE s = ?1", params![s], |_| Ok(())).is_ok()
+    };
+    assert!(has("kept_name") && has("doomed_name"));
+
+    // A GC with nothing orphaned must not touch anything.
+    assert_eq!(gc_strings(&conn), 0, "nothing is orphaned yet");
+    assert!(has("kept_name") && has("doomed_name"));
+
+    delete_ref_rows(&conn, &drop_);
+    assert!(has("doomed_name"), "deletion leaves the name behind — that is the leak");
+
+    let reclaimed = gc_strings(&conn);
+    assert!(reclaimed > 0, "gc reclaimed nothing after a file was deleted");
+    assert!(!has("doomed_name"), "orphan survived the gc");
+    assert!(has("kept_name"), "gc took a name that is still referenced");
+
+    // The surviving file is still fully retrievable — the gc must not have
+    // cut a string its rows join to.
+    assert_eq!(ref_candidate_files(&conn, &["kept_name".to_string()]), vec![keep]);
+}
+
+#[test]
+fn a_gc_invalidates_the_writer_intern_memo() {
+    // The shredder memoizes str_ids for the writer's lifetime. A gc frees
+    // ids, and SQLite reuses them — so a memo that survived a gc would stamp
+    // refs rows with an id belonging to a DIFFERENT string. Retrieval would
+    // then answer wrongly rather than emptily, which is worse. The
+    // generation bump is what prevents it; this test fails without it.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let mk = |name: &str, src: &str| -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, src).unwrap();
+        let ps = p.to_string_lossy().to_string();
+        let cached = parse_source_to_cached(src, &p);
+        shred_derived_rows(
+            &conn, &ps, "workspace",
+            &cached.analysis.ref_row_seeds(),
+            &cached.analysis.sym_row_seeds(),
+        ).unwrap();
+        ps
+    };
+    let a = mk("gc_memo_a.pm", "package GcMemoA;\nsub alpha_fn { 1 }\nsub go { alpha_fn() }\n1;\n");
+    delete_ref_rows(&conn, &a);
+    assert!(gc_strings(&conn) > 0);
+
+    // Re-shred the SAME file on the SAME thread, whose memo still holds the
+    // pre-gc ids.
+    let a2 = mk("gc_memo_a.pm", "package GcMemoA;\nsub alpha_fn { 1 }\nsub go { alpha_fn() }\n1;\n");
+    assert_eq!(
+        ref_candidate_files(&conn, &["alpha_fn".to_string()]),
+        vec![a2],
+        "post-gc rows carry a stale name_id — the memo outlived the strings it cached",
+    );
+}
+
+#[test]
+fn a_deleted_files_rows_are_collectable() {
+    // A row can only be collected by the scan that reads it, and the scan
+    // used to skip any row it could not stamp — which includes every row
+    // whose file has been DELETED. So those rows were immortal: the store
+    // grew a dead generation per deleted file forever, `ref_candidate_files`
+    // kept offering paths that no longer exist, and the dead-export view
+    // counted a deleted file as a live cross-file user. Their names could
+    // not be reclaimed either, because dead rows still referenced them.
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let p = dir.join("vanishing.pm");
+    let src = "package Vanishing;\nsub only_here { 1 }\nsub go { only_here() }\n1;\n";
+    std::fs::write(&p, src).unwrap();
+    let path_str = p.to_string_lossy().to_string();
+    let cached = parse_source_to_cached(src, &p);
+    shred_derived_rows(
+        &conn, &path_str, "workspace",
+        &cached.analysis.ref_row_seeds(),
+        &cached.analysis.sym_row_seeds(),
+    ).unwrap();
+    // Stamp the row to the file as it is on disk, so the scan would admit it.
+    let (mtime, size) = file_stamp(&p).expect("stamp");
+    conn.execute(
+        "INSERT OR REPLACE INTO modules
+           (module_name, path, mtime_secs, file_size, source, analysis, extract_version, deps_stamp)
+         VALUES (?1, ?1, ?2, ?3, 'workspace', ?4, ?5, 0)",
+        params![
+            path_str, mtime, size,
+            encode_analysis(&cached.analysis).expect("encode"),
+            EXTRACT_VERSION
+        ],
+    ).unwrap();
+
+    // Present: the scan admits it and reports nothing missing.
+    let (seen, _stale, gone) =
+        warm_cache_streaming(&conn, "workspace", &mut |_n, _p, _fa| {});
+    assert_eq!(seen, 1, "the live row is admitted");
+    assert!(gone.is_empty(), "nothing is missing yet");
+
+    // Now the file disappears, as a delete or a branch switch does.
+    std::fs::remove_file(&p).unwrap();
+    let (seen, _stale, gone) =
+        warm_cache_streaming(&conn, "workspace", &mut |_n, _p, _fa| {});
+    assert_eq!(seen, 0, "a vanished file is not admitted");
+    assert_eq!(
+        gone, vec![p.clone()],
+        "a vanished file's row must be REPORTED, or nothing can ever collect it",
+    );
+
+    // And collecting it lets its names be reclaimed.
+    invalidate_generation_tier(&conn, &path_str, "workspace");
+    assert!(gc_strings(&conn) > 0, "the dead file's names stayed pinned");
+    assert!(ref_candidate_files(&conn, &["only_here".to_string()]).is_empty());
+}

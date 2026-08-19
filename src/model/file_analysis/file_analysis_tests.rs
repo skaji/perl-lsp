@@ -2513,3 +2513,151 @@ fn binding_owner_restamp_drops_stale_symbol_link() {
     assert_eq!(r.method_target(), None);
     assert_eq!(r.resolved_package(), None);
 }
+
+// ---- MEASUREMENT PROBE (not a net) ----
+// What a whole-analysis copy costs, and how big the enrichment delta really
+// is. `--ignored --nocapture` so it never runs in the normal bar.
+
+#[test]
+#[ignore]
+fn probe_copy_cost_and_delta_size() {
+    use std::time::Instant;
+    let root = std::path::Path::new("gold-corpus/local/lib/perl5");
+    fn walk(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>, cap: usize) {
+        if out.len() >= cap {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            if out.len() >= cap {
+                return;
+            }
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out, cap);
+            } else if p.extension().map(|x| x == "pm").unwrap_or(false)
+                && std::fs::metadata(&p)
+                    .map(|m| m.len() > 4000 && m.len() < 400_000)
+                    .unwrap_or(false)
+            {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(root, &mut files, 150);
+    if files.is_empty() {
+        eprintln!("SKIP: no substrate at gold-corpus/local");
+        return;
+    }
+    let mut parser = crate::build::builder::create_parser();
+    let mut analyses: Vec<FileAnalysis> = Vec::new();
+    for f in &files {
+        let Ok(src) = std::fs::read_to_string(f) else { continue };
+        let Some(tree) = parser.parse(&src, None) else { continue };
+        analyses.push(crate::build::builder::build(&tree, src.as_bytes()));
+    }
+    eprintln!("== {} analyses ==", analyses.len());
+
+    let t = Instant::now();
+    let mut encoded = 0usize;
+    for a in &analyses {
+        let bin = bincode::serialize(a).unwrap();
+        encoded += bin.len();
+        let mut c: FileAnalysis = bincode::deserialize(&bin).unwrap();
+        c.after_deserialize();
+        std::hint::black_box(&c);
+    }
+    let serde_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = Instant::now();
+    for a in &analyses {
+        let c = a.clone();
+        std::hint::black_box(&c);
+    }
+    let clone_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    eprintln!(
+        "COPY  serde {:8.1} ms   clone {:8.1} ms   speedup {:5.1}x   (encoded {:.1} MB)",
+        serde_ms,
+        clone_ms,
+        serde_ms / clone_ms.max(0.001),
+        encoded as f64 / 1e6
+    );
+
+    // A REAL index, so enrichment actually resolves imports — with `None`
+    // the pass short-circuits and the delta measures nothing.
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    for (f, a) in files.iter().zip(analyses.iter()) {
+        idx.register_workspace_module(f.clone(), std::sync::Arc::new(a.clone()));
+    }
+    let (mut base_total, mut delta_total) = (0usize, 0usize);
+    let (mut ds, mut dr, mut dw) = (0i64, 0i64, 0i64);
+    let mut enriched_any = 0usize;
+    for a in &analyses {
+        let before = a.heap_estimate().total();
+        let mut c = a.clone();
+        let (s0, r0, w0) = (c.symbols().len(), c.refs().len(), c.witnesses.len());
+        c.enrich_imported_types_with_keys(Some(&idx));
+        base_total += before;
+        delta_total += c.heap_estimate().total().saturating_sub(before);
+        let (dsi, dri, dwi) = (
+            c.symbols().len() as i64 - s0 as i64,
+            c.refs().len() as i64 - r0 as i64,
+            c.witnesses.len() as i64 - w0 as i64,
+        );
+        if dsi != 0 || dri != 0 || dwi != 0 {
+            enriched_any += 1;
+        }
+        ds += dsi;
+        dr += dri;
+        dw += dwi;
+    }
+    eprintln!("DELTA {enriched_any}/{} files changed at all", analyses.len());
+
+    // The split that decides whether removing the COPY is still worth
+    // anything: if enrichment itself dominates once the copy is a clone,
+    // an overlay buys the smaller half.
+    let t = Instant::now();
+    let copies: Vec<FileAnalysis> = analyses.iter().map(|a| a.clone()).collect();
+    let copy_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let t = Instant::now();
+    for mut c in copies {
+        c.enrich_imported_types_with_keys(Some(&idx));
+        std::hint::black_box(&c);
+    }
+    let enrich_ms = t.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "BUILD copy {:7.1} ms ({:4.1}%)   enrich {:7.1} ms ({:4.1}%)   total {:7.1} ms",
+        copy_ms,
+        100.0 * copy_ms / (copy_ms + enrich_ms),
+        enrich_ms,
+        100.0 * enrich_ms / (copy_ms + enrich_ms),
+        copy_ms + enrich_ms
+    );
+
+    // Inside enrich: with NO index the import walk short-circuits, so the
+    // difference is the cross-file provider chase — the part an overlay
+    // cannot touch.
+    let t = Instant::now();
+    for a in &analyses {
+        let mut c = a.clone();
+        c.enrich_imported_types_with_keys(None);
+        std::hint::black_box(&c);
+    }
+    let noidx_ms = t.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "ENRICH  local-only {:7.1} ms   with-index {:7.1} ms   cross-file chase {:7.1} ms ({:4.1}% of build)",
+        noidx_ms,
+        enrich_ms,
+        enrich_ms - noidx_ms,
+        100.0 * (enrich_ms - noidx_ms) / (copy_ms + enrich_ms)
+    );
+    eprintln!(
+        "DELTA base {:.2} MB   delta {:.2} MB   = {:.3}% of base",
+        base_total as f64 / 1e6,
+        delta_total as f64 / 1e6,
+        100.0 * delta_total as f64 / base_total.max(1) as f64
+    );
+    eprintln!("DELTA counts: symbols {ds:+}  refs {dr:+}  witnesses {dw:+}");
+}
