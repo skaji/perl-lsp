@@ -11,6 +11,14 @@ set -euo pipefail
 
 BASE_BIN=${1:?base binary}; HEAD_BIN=${2:?head binary}
 ROOT=${3:?corpus root};     OUT=${4:?output dir}; shift 4
+# Captured HERE, at top level. Inside a function `$@` is that function's own
+# arguments, so reaching for the caller's extras from within `run_side` gets
+# the wrong list — and `"$@:3"` is not slice syntax at all (that is `${@:3}`),
+# so it expanded to the function's two args plus a literal `:3` and both
+# sides died on `unrecognized arguments`. The wrapper was completely
+# non-functional and the Python selftest could not see it, which is why
+# `selftest-shell.sh` now invokes this script for real.
+EXTRA=("$@")
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mkdir -p "$OUT"
 
@@ -30,10 +38,13 @@ EXTRA=("$@")
 
 run_side() {  # side, binary
   local side=$1 bin=$2
+  # `${EXTRA+...}` rather than a bare `"${EXTRA[@]}"`: under `set -u` an empty
+  # array is an unbound-variable error on bash before 4.4, and macOS still
+  # ships 3.2 as /bin/bash. Untested here (this box is 5.2), free to keep.
   python3 "$HERE/sweep.py" run --bin "$bin" --root "$ROOT" \
     --positions "$OUT/positions.jsonl" --out "$OUT/answers-$side.jsonl" --side "$side" \
     --cache-dir "$OUT/cache-$side" --timeout "$SWEEP_TIMEOUT" \
-    --ready-timeout "$SWEEP_READY_TIMEOUT" "${EXTRA[@]}" 2>&1 | sed "s/^/[$side] /"
+    --ready-timeout "$SWEEP_READY_TIMEOUT" ${EXTRA+"${EXTRA[@]}"} 2>&1 | sed "s/^/[$side] /"
 }
 
 if [ "${SWEEP_SERIAL:-0}" = 1 ]; then
