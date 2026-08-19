@@ -599,6 +599,46 @@ SHAPE_ORDER = ["only-base", "subset", "timeout-head", "error-head", "disagree",
                "missing-head", "missing-base"]
 
 
+def _floor_over_pairs(paths, common, only_keys):
+    """The floor from EVERY pair of same-binary runs, not one pair.
+
+    A two-run floor is a single draw from a distribution, and for some shapes
+    that distribution is wide: measured over four head runs on the substrate,
+    `disagree` came out 14, 15, 17, 19, 25, 25 across the six pairs — nearly
+    2x between the luckiest and unluckiest pair, on identical inputs. Quoting
+    whichever pair happened to run is how a shape gets called signal because
+    its floor was measured on a good day.
+
+    The reported floor is the MAX across pairs, because a shape earns
+    "signal" only by clearing the worst self-disagreement observed, and the
+    range comes back too so a reader can see how stable the estimate is.
+    `reranked` is tight here (158-168); `disagree` is not.
+    """
+    import itertools
+    loaded = [(p, _load(p)[1]) for p in paths]
+    per_pair = []
+    covered = 0
+    for (pa, a), (pb, b) in itertools.combinations(loaded, 2):
+        keys = set(a) & set(b) & only_keys
+        covered = max(covered, len(keys))
+        c = {}
+        for k in keys:
+            if k[3] not in common:
+                continue
+            sh = classify(k[3], a[k], b[k])
+            if sh != "same":
+                c[sh] = c.get(sh, 0) + 1
+                c[(sh, k[3])] = c.get((sh, k[3]), 0) + 1
+        per_pair.append(c)
+    if not per_pair:
+        return {}, {}, 0, 0
+    shapes = {k for c in per_pair for k in c}
+    floor = {k: max(c.get(k, 0) for c in per_pair) for k in shapes}
+    spread = {k: (min(c.get(k, 0) for c in per_pair),
+                  max(c.get(k, 0) for c in per_pair)) for k in shapes}
+    return floor, spread, covered, len(per_pair)
+
+
 def _shape_counts(base_path, head_path, common, only_keys):
     """The noise floor, measured over EXACTLY the answers the A/B compared.
 
@@ -641,7 +681,7 @@ def _shape_counts(base_path, head_path, common, only_keys):
     return out, len(keys)
 
 
-def _check_provenance(meta_a, meta_b, args):
+def _check_provenance(meta_a, meta_b, noise_paths):
     """Do all four inputs come from ONE sweep, asking ONE set of questions?
 
     Nothing downstream can tell that they do not. Four well-formed answer
@@ -656,10 +696,9 @@ def _check_provenance(meta_a, meta_b, args):
     -file case by definition.
     """
     metas = {}
-    for label, path in (("noise-base", args.noise_base),
-                        ("noise-head", args.noise_head)):
+    for path in noise_paths:
         m, _ = _load(path)
-        metas[label] = m
+        metas[os.path.basename(path)] = m
     want = meta_b.get("positions_sha") or meta_a.get("positions_sha")
     if want:
         for label, m in metas.items():
@@ -776,13 +815,17 @@ def cmd_diff(args):
     # completion ordering is not stable run to run. This is not a correction
     # applied to the counts; it is the resolution limit printed beside them.
     noise, noise_n, noise_reject = {}, 0, None
+    spread, npairs = {}, 0
+    noise_paths = list(args.noise or [])
     if args.noise_base and args.noise_head:
-        noise_reject = _check_provenance(meta_a, meta_b, args)
+        noise_paths = [args.noise_base, args.noise_head] + noise_paths
+    if len(noise_paths) >= 2:
+        noise_reject = _check_provenance(meta_a, meta_b, noise_paths)
         if noise_reject:
             print(f"WARNING: {noise_reject}", file=sys.stderr)
         if not (noise_reject and not args.force_noise):
-            noise, noise_n = _shape_counts(args.noise_base, args.noise_head,
-                                           common, keys)
+            noise, spread, noise_n, npairs = _floor_over_pairs(
+                noise_paths, common, keys)
 
     total = len(keys)
     diverged = sum(v for (s, _), v in counts.items() if s != "same")
@@ -864,11 +907,27 @@ def cmd_diff(args):
           f"> **Noise floor is SUSPECT — {noise_reject}.** Shown anyway "
           f"because `--force-noise` was passed.\n")
     if noise or noise_n:
-        W("`noise` is the same shape's count when the SAME binary is run "
-          "twice, measured over EXACTLY the answers compared here — a rate "
-          "taken over a different population is not subtractable from this "
-          "one. A block at or below its floor carries no information: read "
-          "`signal`, not `n`.\n")
+        W(f"`noise` is the WORST self-disagreement across all {npairs} pair"
+          f"{'s' if npairs != 1 else ''} of same-binary runs, measured over "
+          f"EXACTLY the answers compared here. A shape earns `signal` only by "
+          f"clearing the worst floor observed, not the luckiest.\n")
+        if npairs > 1:
+            # Keys are a mix of shape strings and (shape, verb) tuples, so
+            # sort on the shape name rather than the key itself.
+            wide = [(k, lo, hi) for k, (lo, hi) in spread.items()
+                    if isinstance(k, str) and hi and (hi - lo) > 0.25 * hi]
+            wide.sort(key=lambda t: t[0])
+            if wide:
+                W("> The floor is not one number. Across those pairs: "
+                  + "; ".join(f"`{k}` ranged {lo}–{hi}" for k, lo, hi in wide)
+                  + ". A single pair would have reported any one of those, so "
+                    "a block sitting between the low and high figures cannot "
+                    "be called signal from a two-run floor.\n")
+        elif npairs == 1:
+            W("> **Only one pair of noise runs was supplied, so the floor is a "
+              "single draw.** Measured on this corpus, `disagree` ranged 14–25 "
+              "across six pairs of identical runs — pass three or four runs to "
+              "`--noise` if a thin block's verdict depends on the floor.\n")
         cover = noise_n / max(total, 1)
         if cover < 0.98:
             W(f"> **The floor covers {noise_n} of {total} compared answers "
@@ -1019,6 +1078,11 @@ def main():
     p.add_argument("--examples", type=int, default=8)
     p.add_argument("--noise-base", help="answers from a repeat run of ONE binary")
     p.add_argument("--noise-head", help="answers from a second run of that SAME binary")
+    p.add_argument("--noise", nargs="+", metavar="ANSWERS",
+                   help="two or more runs of ONE binary. Every pair is "
+                        "measured and the floor is the worst of them — a "
+                        "single pair is one draw from a distribution that is "
+                        "wide for some shapes.")
     p.add_argument("--allow-short", action="store_true",
                    help="diff even when a side delivered fewer positions than "
                         "its header declared; the report is marked TRUNCATED")

@@ -108,6 +108,15 @@ like a floor from this one. It happened, and it published wrong numbers —
 a report generated the moment the head side finished, while the two noise
 runs the script had not yet started sat on disk from the previous invocation.
 
+**The floor is a distribution, not a number, so give `--noise` more than two
+runs.** Four head runs on the substrate yield six pairs, and on identical
+inputs `disagree` came out 14, 15, 17, 19, 25, 25 — nearly 2x between the
+luckiest and unluckiest pair. A two-run floor reports whichever one happened
+to run. The tool measures every pair and reports the WORST, because a shape
+earns "signal" by clearing the worst self-disagreement observed; the range is
+printed alongside so the estimate's stability is visible. `reranked` is tight
+(158-168); `disagree` is not.
+
 **The floor is sliced per verb as well as per shape.** An aggregate is the
 wrong baseline for a single-verb block, and it errs in both directions:
 measured here, every one of the `disagree` floor's occurrences is on
