@@ -193,6 +193,14 @@ def cmd_run(args):
     if ready_ms is not None:
         print(f"[{args.side}] cross-file ready after {round(ready_ms)}ms", flush=True)
 
+    # Written to `.partial` and renamed only on clean completion. A reader
+    # cannot tell a finished answer file from one still being appended to,
+    # and the failure is silent: three sessions in one evening published
+    # numbers taken from a file that was not yet what it would be — a floor
+    # from a run that had not started, and a coverage ratio read while the
+    # base side was still writing. The rename is the only signal that costs
+    # nothing to check and cannot be misread.
+    out_partial = args.out + ".partial"
     opened, done = {first: ready}, 0
     # Lists, not ints: the loop rebinds `lsp` on restart and these have to
     # survive that without a nonlocal dance in a nested scope.
@@ -205,7 +213,7 @@ def cmd_run(args):
     epoch, epoch_warm = [0], [True]
     deferred = []
     t0 = time.monotonic()
-    with open(args.out, "w") as fh:
+    with open(out_partial, "w") as fh:
         fh.write(json.dumps({"_meta": {
             # Identity of the QUESTIONS and of when they were asked. The diff
             # cross-checks these across all four inputs, because nothing else
@@ -223,6 +231,13 @@ def cmd_run(args):
             "cross_file_ready": ready_ms is not None, "verbs": served,
             "unserved": sorted(set(VERBS) - set(served)),
             "verb_rate": VERB_RATE, "positions": len(pos),
+            # What a COMPLETE run of this side would contain. A side that
+            # aborted looks exactly like a side that legitimately answered
+            # less, and that is precisely the distinction the sweep exists to
+            # draw — so the expectation is written down before the work
+            # starts, and the diff checks the delivery against it.
+            "expected_positions": len(pos),
+            "expected_files": len({p["file"] for p in pos}),
             "version": _version(args.bin),
         }}) + "\n")
         by_file = {}
@@ -331,7 +346,8 @@ def cmd_run(args):
                                     "reason": "restart budget exhausted",
                                     "swept": done, "of": len(pos)}) + "\n")
                                 print(f"[{args.side}] ABORTED after "
-                                      f"{restarts[0]} restarts", flush=True)
+                                      f"{restarts[0]} restarts — leaving "
+                                      f"{out_partial} unrenamed", flush=True)
                                 lsp.shutdown()
                                 return
                             try:
@@ -395,9 +411,12 @@ def cmd_run(args):
         fh.write(json.dumps({"_event": "recheck",
                              "empty_first_ask": len(deferred),
                              "filled_when_warm": filled}) + "\n")
+        fh.write(json.dumps({"_event": "complete",
+                             "positions_answered": done}) + "\n")
         print(f"[{args.side}] recheck: {filled} of {len(deferred)} empty answers "
               f"resolved once warm", flush=True)
     lsp.shutdown()
+    os.replace(out_partial, args.out)
     print(f"[{args.side}] done: {done} positions in "
           f"{time.monotonic()-t0:.0f}s -> {args.out}")
 
@@ -467,6 +486,18 @@ def _open(lsp, root, rel):
 
 # ---- diff ----
 
+def _completeness(meta, rows):
+    """Did this side deliver what its own header said it would?
+
+    Returns (answered, expected, complete_marker_present). A short side is
+    not a side that found less — it is a side that stopped, and conflating
+    the two is the exact error this whole harness exists to prevent.
+    """
+    positions = {(r["file"], r.get("line"), r.get("char"))
+                 for r in rows.values() if r.get("line") is not None}
+    return len(positions), meta.get("expected_positions"), meta.get("_complete")
+
+
 def _load(path):
     meta, rows, events = {}, {}, []
     for line in open(path):
@@ -488,6 +519,7 @@ def _load(path):
             continue
         rows[key] = r
     meta["events"] = events
+    meta["_complete"] = any(e.get("_event") == "complete" for e in events)
     return meta, rows
 
 
@@ -668,6 +700,30 @@ def cmd_diff(args):
     # branch and bury what does. The shortfall is reported as COVERAGE
     # instead, which is the honest framing: this is what we compared, and
     # this is what we could not.
+    # Completeness before anything else. A short side is a side that
+    # STOPPED, and every ratio computed over it is a ratio over the positions
+    # it got through — which are the cheap ones. This is checked first and
+    # loudly because the alternative is a plausible report built on a
+    # truncated file, which is how three sessions published wrong numbers in
+    # one evening.
+    short = []
+    for label, m, rws in (("base", meta_a, base), ("head", meta_b, head)):
+        got, want, done_marker = _completeness(m, rws)
+        if want and got < want:
+            short.append(f"{label} answered {got} of the {want} positions its "
+                         f"own header declared ({got/want:.1%})")
+        elif want and not done_marker:
+            short.append(f"{label} reached its position count but never wrote "
+                         f"a completion marker — it may have died in the "
+                         f"recheck pass")
+    if short and not args.allow_short:
+        for msg in short:
+            print(f"ERROR: {msg}", file=sys.stderr)
+        print("Refusing to diff a truncated run. Re-run the short side, or "
+              "pass --allow-short to compare anyway (the report will say so).",
+              file=sys.stderr)
+        sys.exit(3)
+
     all_keys = {k for k in (set(base) | set(head)) if k[3] in common}
     comparable = {k for k in all_keys if k in base and k in head}
     only_base_keys = sum(1 for k in all_keys if k not in head)
@@ -755,6 +811,13 @@ def cmd_diff(args):
             W(f"- **{side} {ev['_event']}**: " + ", ".join(
                 f"{k}={v}" for k, v in sorted(ev.items()) if k != "_event"))
     W("")
+    if short:
+        W("> **TRUNCATED RUN — every number below is over the positions the "
+          "short side got through, which are the ones it reached before it "
+          "stopped, not a sample of the corpus.**\n")
+        for msg in short:
+            W(f"> - {msg}")
+        W("")
     W(f"**{total} (position, verb) answers compared — {same} identical "
       f"({same/max(total,1):.2%}), {diverged} divergent.**\n")
     if only_base_keys or only_head_keys:
@@ -950,6 +1013,9 @@ def main():
     p.add_argument("--examples", type=int, default=8)
     p.add_argument("--noise-base", help="answers from a repeat run of ONE binary")
     p.add_argument("--noise-head", help="answers from a second run of that SAME binary")
+    p.add_argument("--allow-short", action="store_true",
+                   help="diff even when a side delivered fewer positions than "
+                        "its header declared; the report is marked TRUNCATED")
     p.add_argument("--force-noise", action="store_true",
                    help="use the noise pair even if it fails the provenance check")
     p.set_defaults(fn=cmd_diff)

@@ -191,6 +191,37 @@ for _f in (_n1, _n2):
     os.unlink(_f)
 
 
+# A short side is a side that STOPPED, not a side that found less. Every
+# ratio over it is a ratio over the positions it got through — the cheap ones.
+_short = _tmp_answers([_row(1, _D)])
+_L = open(_short).read().split("\n")
+_m = _json.loads(_L[0]); _m["_meta"]["expected_positions"] = 10
+_L[0] = _json.dumps(_m); open(_short, "w").write("\n".join(_L))
+_meta_s, _rows_s = S._load(_short)
+check("a truncated side is detected against its own declared count",
+      S._completeness(_meta_s, _rows_s)[:2], (1, 10))
+
+# ...and a side that answered everything but never wrote its completion
+# marker died somewhere after the main loop, which is equally not-finished.
+_nomark = _tmp_answers([_row(1, _D)])
+_L = open(_nomark).read().split("\n")
+_m = _json.loads(_L[0]); _m["_meta"]["expected_positions"] = 1
+_L[0] = _json.dumps(_m); open(_nomark, "w").write("\n".join(_L))
+_meta_n, _rows_n = S._load(_nomark)
+check("a run with no completion marker is not treated as complete",
+      S._completeness(_meta_n, _rows_n)[2], False)
+
+_full = _tmp_answers([_row(1, _D), {"_event": "complete", "positions_answered": 1}])
+_L = open(_full).read().split("\n")
+_m = _json.loads(_L[0]); _m["_meta"]["expected_positions"] = 1
+_L[0] = _json.dumps(_m); open(_full, "w").write("\n".join(_L))
+_meta_f, _rows_f = S._load(_full)
+check("a complete run reports complete",
+      S._completeness(_meta_f, _rows_f), (1, 1, True))
+for _f in (_short, _nomark, _full):
+    os.unlink(_f)
+
+
 # --- position selection -----------------------------------------------------
 
 check("selection is deterministic across processes — hash() is salted, "

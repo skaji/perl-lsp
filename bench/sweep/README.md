@@ -86,6 +86,19 @@ the workspace path, and their `EXTRACT_VERSION` and plugin fingerprints
 differ — sharing one makes each side hard-clear the other's cache on every
 startup.
 
+**A run's answers file does not exist until the run finishes.** Answers are
+written to `<out>.partial` and renamed only on clean completion, so an
+aborted or still-running side is never mistakable for a finished one. This is
+the fix for the root cause behind three separate wrong results in one
+evening: a measurement reading a file that is not yet what it will be.
+
+**A side that stopped is not a side that found less.** The header records how
+many positions a complete run would answer, and a completion marker is
+written at the very end; `diff` refuses (exit 3) when either check fails.
+`--allow-short` compares anyway and stamps the report TRUNCATED — because
+every ratio over a short side is a ratio over the positions it reached before
+stopping, which are the cheap ones.
+
 **All four inputs are cross-checked for provenance.** The diff verifies that
 the noise pair answered the same positions (by content hash) and did not run
 before the A/B, and refuses the floor otherwise. This is not defensive
