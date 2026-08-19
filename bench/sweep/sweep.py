@@ -451,17 +451,22 @@ def cmd_diff(args):
     va, vb = set(meta_a.get("verbs") or []), set(meta_b.get("verbs") or [])
     common = (va & vb) | {"documentSymbol"}
     cap_only = sorted((va | vb) - common)
-    keys = {k for k in (set(base) | set(head)) if k[3] in common}
+    # Only positions BOTH sides answered are comparable. A side that aborted
+    # early (the base wedges often enough here that it can) would otherwise
+    # contribute thousands of `missing-base` rows that say nothing about the
+    # branch and bury what does. The shortfall is reported as COVERAGE
+    # instead, which is the honest framing: this is what we compared, and
+    # this is what we could not.
+    all_keys = {k for k in (set(base) | set(head)) if k[3] in common}
+    keys = {k for k in all_keys if k in base and k in head}
+    only_base_keys = sum(1 for k in all_keys if k not in head)
+    only_head_keys = sum(1 for k in all_keys if k not in base)
 
     groups, counts, uninformative = {}, {}, 0
     for k in sorted(keys, key=lambda k: (k[0], k[3], k[1] is None, k[1] or 0, k[2] or 0)):
-        a, b = base.get(k), head.get(k)
+        a, b = base[k], head[k]
         verb = k[3]
-        if a is None or b is None:
-            shape = "missing-base" if a is None else "missing-head"
-            a = a or {}; b = b or {}
-        else:
-            shape = classify(verb, a, b)
+        shape = classify(verb, a, b)
         if shape == "same":
             # A position where both sides answered nothing on every verb is
             # the residue of an imperfect tokenizer (a name inside a string,
@@ -510,6 +515,12 @@ def cmd_diff(args):
     W("")
     W(f"**{total} (position, verb) answers compared — {same} identical "
       f"({same/max(total,1):.2%}), {diverged} divergent.**\n")
+    if only_base_keys or only_head_keys:
+        W(f"Coverage shortfall: {only_base_keys} answers exist only in the base "
+          f"run and {only_head_keys} only in the head run — a side that aborted "
+          f"or skipped never produced them. They are EXCLUDED from every count "
+          f"above, because a position one side never reached is a gap in the "
+          f"sweep, not a disagreement about an answer.\n")
     W(f"Of the identical ones, {uninformative} were empty on both sides: positions "
       f"nobody would ask about, kept in the denominator but called out so the "
       f"agreement rate is not read as coverage.\n")
