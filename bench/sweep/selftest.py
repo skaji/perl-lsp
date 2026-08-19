@@ -179,8 +179,14 @@ _n1 = _tmp_answers([_row(1, _D), _row(9, _D)])
 _n2 = _tmp_answers([_row(1, []), _row(9, [])])
 _counts, _cov = S._shape_counts(_n1, _n2, {"definition"},
                                 {("a.pm", 1, 0, "definition")})
+# Shape-level keys are plain strings; per-verb keys are (shape, verb) tuples.
+# Summing indiscriminately double-counts, which is why this asserts each.
+_shape_only = {k: v for k, v in _counts.items() if isinstance(k, str)}
 check("the floor counts only answers the A/B actually compared",
-      (sum(_counts.values()), _cov), (1, 1))
+      (sum(_shape_only.values()), _cov), (1, 1))
+check("the floor is also sliced per verb, the only baseline a single-verb "
+      "block can be read against",
+      _counts.get(("only-base", "definition")), 1)
 for _f in (_n1, _n2):
     os.unlink(_f)
 

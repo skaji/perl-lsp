@@ -19,24 +19,34 @@ identical, 945 were empty on both sides.
 
 ## The noise floor comes first
 
-> **The figures in this section were re-measured.** They were originally
-> taken over every answer the two noise runs produced, while the A/B counts
-> came from the smaller set the wedging base got through. Same defect
-> `[coordinator]` found at Koha scale, an order of magnitude smaller here,
-> and it moved real numbers: `disagree` 7 → **22**, `only-head` 0 → **11**,
-> `capped-head` 0 → **3**. The floor is now measured over exactly the
-> compared answers, and the report states what fraction of them it covers
-> (87.5% on this corpus — the noise runs reach positions the base never did).
+> **These figures were published wrong once, and the retraction is the
+> useful part.** An earlier amendment here claimed the intersected floor rose
+> sharply (`disagree` 7 → 22, `only-head` 0 → 11, `capped-head` 0 → 3). It did
+> not. That report was generated the moment the head side finished, while the
+> two noise runs the script had yet to start were still on disk from the
+> PREVIOUS invocation — so a fresh A/B was diffed against a stale floor. Four
+> well-formed files produce a well-formed report whether or not they belong
+> together, which is why `sweep.py diff` now cross-checks the positions hash
+> and start time of all four inputs and refuses a floor that fails either.
+>
+> Intersecting the floor is still right — a rate is only subtractable from a
+> count over the same answers — but on THIS corpus it barely moves anything,
+> because the base's stalls cost few answers. At Koha's 7.1% coverage it may
+> matter a great deal; that remains unmeasured by me.
 
 The same binary, run twice over the same positions, disagrees with itself:
 
-| shape | self-vs-self |
-|---|---|
-| `reranked` | 127 |
-| `disagree` | 22 |
-| `only-head` | 11 |
-| `capped-head` | 3 |
-| everything else | **0** |
+| shape | self-vs-self | of which |
+|---|---|---|
+| `reranked` | 152 | all completion |
+| `disagree` | 5 | all completion |
+| everything else | **0** | |
+
+Measured over 4,017 of 4,017 compared answers — full coverage, matched run.
+The per-verb slice matters: **all** of the `disagree` floor is completion, so
+a `definition` block read against the aggregate would be handed noise it does
+not have. The groups table now carries a per-verb floor column for this
+reason.
 
 Completion ordering is not stable run to run. So the `reranked` block carries
 **no information at all** — it sits below the floor — while `only-base`,

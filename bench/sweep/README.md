@@ -86,6 +86,21 @@ the workspace path, and their `EXTRACT_VERSION` and plugin fingerprints
 differ — sharing one makes each side hard-clear the other's cache on every
 startup.
 
+**All four inputs are cross-checked for provenance.** The diff verifies that
+the noise pair answered the same positions (by content hash) and did not run
+before the A/B, and refuses the floor otherwise. This is not defensive
+paranoia: four well-formed answer files produce a well-formed report whether
+or not they belong together, and a floor from a previous run reads exactly
+like a floor from this one. It happened, and it published wrong numbers —
+a report generated the moment the head side finished, while the two noise
+runs the script had not yet started sat on disk from the previous invocation.
+
+**The floor is sliced per verb as well as per shape.** An aggregate is the
+wrong baseline for a single-verb block, and it errs in both directions:
+measured here, every one of the `disagree` floor's occurrences is on
+completion, so a `definition` block read against the aggregate is handed
+noise it does not have.
+
 **The noise floor is measured over exactly the answers compared.** It is a
 per-answer rate, so it is only subtractable from a count taken over the same
 answers. Measured on Koha: the base wedged repeatedly and produced 1,184

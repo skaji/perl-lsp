@@ -25,7 +25,7 @@ Two traps this handles, both of which silently corrupt a comparison:
     look like it lost answers -- the single most misleading thing a
     differential sweep can report.
 """
-import argparse, json, os, pathlib, subprocess, sys, time
+import argparse, hashlib, json, os, pathlib, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -86,7 +86,16 @@ def cmd_positions(args):
           f"per_file={args.per_file})")
 
 
+def _sha_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
 def cmd_run(args):
+    _t0_wall = time.time()
     root = os.path.abspath(args.root)
     root_uri = pathlib.Path(root).as_uri()
     pos = [json.loads(l) for l in open(args.positions)]
@@ -198,6 +207,17 @@ def cmd_run(args):
     t0 = time.monotonic()
     with open(args.out, "w") as fh:
         fh.write(json.dumps({"_meta": {
+            # Identity of the QUESTIONS and of when they were asked. The diff
+            # cross-checks these across all four inputs, because nothing else
+            # can: four well-formed answer files from two different sweeps
+            # produce a report that is entirely plausible and entirely wrong.
+            # That happened — a report was generated the moment the head side
+            # finished, while the two noise runs the script had yet to start
+            # were still on disk from the previous invocation, and the floor
+            # it published came from a different sweep.
+            "positions_sha": _sha_file(args.positions),
+            "positions_path": os.path.abspath(args.positions),
+            "started_at": _t0_wall,
             "side": args.side, "bin": os.path.abspath(args.bin), "root": root,
             "root_uri": root_uri, "ready_ms": ready_ms and round(ready_ms),
             "cross_file_ready": ready_ms is not None, "verbs": served,
@@ -578,8 +598,57 @@ def _shape_counts(base_path, head_path, common, only_keys):
             continue
         sh = classify(k[3], a[k], b[k])
         if sh != "same":
+            # Keyed by (shape, verb) as well as shape. An aggregate floor is
+            # the wrong baseline for a single-verb block and the error is not
+            # conservative in either direction: measured here, `disagree` is
+            # 5 aggregate and ALL 5 of it is completion, so a `definition`
+            # sub-block read against the aggregate is handed noise it does
+            # not have, while on another corpus the reverse hides real signal.
             out[sh] = out.get(sh, 0) + 1
+            out[(sh, k[3])] = out.get((sh, k[3]), 0) + 1
     return out, len(keys)
+
+
+def _check_provenance(meta_a, meta_b, args):
+    """Do all four inputs come from ONE sweep, asking ONE set of questions?
+
+    Nothing downstream can tell that they do not. Four well-formed answer
+    files produce a well-formed report whether or not they belong together,
+    and the failure is silent and plausible — a floor from a previous run,
+    quoted beside fresh counts, reads exactly like a floor from this one.
+    It happened here, and it published wrong numbers.
+
+    Two checks. The positions hash must match, because a floor over different
+    QUESTIONS is not a floor at all. And the noise runs must not predate the
+    A/B: a noise pair older than the run it is quoted against is the stale
+    -file case by definition.
+    """
+    metas = {}
+    for label, path in (("noise-base", args.noise_base),
+                        ("noise-head", args.noise_head)):
+        m, _ = _load(path)
+        metas[label] = m
+    want = meta_b.get("positions_sha") or meta_a.get("positions_sha")
+    if want:
+        for label, m in metas.items():
+            got = m.get("positions_sha")
+            if got and got != want:
+                return (f"{label} answered a DIFFERENT position set "
+                        f"({got} vs {want}) — its floor is not a floor for "
+                        f"this comparison")
+            if not got:
+                return (f"{label} predates position-set stamping, so it "
+                        f"cannot be shown to answer the same questions")
+    ab_start = max(x for x in (meta_a.get("started_at"), meta_b.get("started_at"))
+                   if x) if (meta_a.get("started_at") or meta_b.get("started_at")) else None
+    if ab_start:
+        for label, m in metas.items():
+            st = m.get("started_at")
+            if st and st < ab_start:
+                return (f"{label} STARTED BEFORE the A/B run it is quoted "
+                        f"against — this is the stale-file case; re-run the "
+                        f"noise pair or pass --force-noise")
+    return None
 
 
 def cmd_diff(args):
@@ -644,10 +713,14 @@ def cmd_diff(args):
     # way to tell a 68-row `reranked` block from nothing at all, because
     # completion ordering is not stable run to run. This is not a correction
     # applied to the counts; it is the resolution limit printed beside them.
-    noise, noise_n = {}, 0
+    noise, noise_n, noise_reject = {}, 0, None
     if args.noise_base and args.noise_head:
-        noise, noise_n = _shape_counts(args.noise_base, args.noise_head,
-                                       common, keys)
+        noise_reject = _check_provenance(meta_a, meta_b, args)
+        if noise_reject:
+            print(f"WARNING: {noise_reject}", file=sys.stderr)
+        if not (noise_reject and not args.force_noise):
+            noise, noise_n = _shape_counts(args.noise_base, args.noise_head,
+                                           common, keys)
 
     total = len(keys)
     diverged = sum(v for (s, _), v in counts.items() if s != "same")
@@ -715,6 +788,12 @@ def cmd_diff(args):
     for (s, v), n in counts.items():
         if s != "same":
             by_shape[s] = by_shape.get(s, 0) + n
+    if noise_reject:
+        W(f"> **NOISE FLOOR REJECTED — {noise_reject}.** No floor is shown "
+          f"below. Counts are raw, and `reranked` in particular cannot be "
+          f"read without one.\n" if not args.force_noise else
+          f"> **Noise floor is SUSPECT — {noise_reject}.** Shown anyway "
+          f"because `--force-noise` was passed.\n")
     if noise or noise_n:
         W("`noise` is the same shape's count when the SAME binary is run "
           "twice, measured over EXACTLY the answers compared here — a rate "
@@ -756,13 +835,23 @@ def cmd_diff(args):
       "data file can contribute sixty positions that all disagree the same "
       "way; that is one thing to adjudicate, not sixty, and reading `n` as "
       "the workload is how a sweep gets abandoned as noise.\n")
-    W("| shape | verb | token kind | n | distinct |")
-    W("|---|---|---|---|---|")
+    if noise:
+        W("The `verb noise` column is the floor for that shape ON THAT VERB, "
+          "which is the only baseline a single-verb block can be read "
+          "against. It is summed over the verb's kinds, so a block covering "
+          "one kind sits well under it.\n")
+    W("| shape | verb | token kind | n | distinct |"
+      + (" verb noise |" if noise else ""))
+    W("|---|---|---|---|---|" + ("---|" if noise else ""))
     for (shape, verb, kind), items in sorted(
             groups.items(), key=lambda kv: (SHAPE_ORDER.index(kv[0][0])
                                             if kv[0][0] in SHAPE_ORDER else 99,
                                             -len(kv[1]))):
-        W(f"| `{shape}` | {verb} | {kind} | {len(items)} | {_distinct(verb, items)} |")
+        row = (f"| `{shape}` | {verb} | {kind} | {len(items)} | "
+               f"{_distinct(verb, items)} |")
+        if noise:
+            row += f" {noise.get((shape, verb), 0)} |"
+        W(row)
     W("")
 
     W("## Examples\n")
@@ -861,6 +950,8 @@ def main():
     p.add_argument("--examples", type=int, default=8)
     p.add_argument("--noise-base", help="answers from a repeat run of ONE binary")
     p.add_argument("--noise-head", help="answers from a second run of that SAME binary")
+    p.add_argument("--force-noise", action="store_true",
+                   help="use the noise pair even if it fails the provenance check")
     p.set_defaults(fn=cmd_diff)
 
     args = ap.parse_args()
