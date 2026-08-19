@@ -204,6 +204,172 @@ fn union_span(caps: &[(u32, Node<'_>)]) -> Span {
     })
 }
 
+
+// ---------------------------------------------------------------------------
+// One traversal instead of one per spec.
+//
+// Each `QueryCursor::matches(query, root, …)` is a full traversal of the
+// file's tree, so running the 13 Perl walk-phase patterns as 13 queries walks
+// every file 13 times. Tree-sitter's intended shape is one `Query` holding
+// many patterns, walked once, with `pattern_index` naming the owner.
+//
+// Measured on the gold substrate (3,520 files, cold): 17,874 ms of separate
+// traversals against 1,814 ms combined, with identical per-spec match sets.
+//
+// Nothing downstream needs remapping, which is why this is small: capture
+// indices are already read through `query.capture_names()` and quantifiers
+// through `query.capture_quantifiers(pattern_index)`, so handing
+// `build_match_context` the COMBINED query and the COMBINED pattern index is
+// the whole translation. `receiver_gate_for` reads
+// `general_predicates(pattern_index)` on the same pair.
+// ---------------------------------------------------------------------------
+
+/// `PERL_LSP_PD_NO_COMBINE=1` forces the per-spec traversals. The permanent
+/// escape hatch: if a future pattern turns out not to compose, this restores
+/// the old behaviour without a revert, and it is what the equivalence harness
+/// runs as its control arm.
+fn combine_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("PERL_LSP_PD_NO_COMBINE").as_deref() == Ok("1"))
+}
+
+/// Eligible walk-phase specs, in registry order, paired with their compiled
+/// query. A spec whose own query fails to compile is DROPPED here and logged —
+/// exactly what the per-spec loop did with it, so exclusion changes nothing.
+/// The ordinal of a spec in this vec is its bucket index for the round.
+fn eligible_walk_specs<'p>(
+    plugins: &'p crate::build::plugin::PluginRegistry,
+) -> Vec<(&'p dyn plugin::FrameworkPlugin, &'p PatternSpec, &'static Query)> {
+    let mut out = Vec::new();
+    for p in plugins.all() {
+        for spec in p.patterns() {
+            if spec.language != "perl" || spec.phase != "walk" {
+                continue;
+            }
+            match cached_pattern_query(&spec.query) {
+                Ok(q) => out.push((p, spec, q)),
+                Err(e) => log::error!(
+                    "plugin `{}` pattern `{}`: query compile failed: {}",
+                    p.id(),
+                    spec.name,
+                    e
+                ),
+            }
+        }
+    }
+    out
+}
+
+/// The combined query for a set of already-valid specs, plus the start
+/// pattern index of each spec within it.
+struct CombinedWalk {
+    query: &'static Query,
+    /// `starts[i]` = combined pattern index at which spec `i` begins. One
+    /// source can contribute several patterns, so the owner of combined
+    /// pattern `k` is the last `i` with `starts[i] <= k`.
+    starts: Vec<usize>,
+}
+
+impl CombinedWalk {
+    /// Combine only specs that already compile on their own, so one malformed
+    /// `.rhai` can never take dispatch out for the other twelve — it is
+    /// dropped by `eligible_walk_specs` before it reaches the concatenation.
+    /// `None` means "use the per-spec path", which is always correct.
+    fn build(specs: &[(&dyn plugin::FrameworkPlugin, &PatternSpec, &'static Query)]) -> Option<Self> {
+        if specs.is_empty() {
+            return None;
+        }
+        let joined = specs
+            .iter()
+            .map(|(_, s, _)| s.query.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let query = match cached_pattern_query(&joined) {
+            Ok(q) => q,
+            Err(e) => {
+                log::error!(
+                    "combined walk-pattern query failed to compile ({e}); \
+                     falling back to per-spec traversal"
+                );
+                crate::util::ghost_stats::count("pd.combine.compile_failed");
+                return None;
+            }
+        };
+        let mut starts = Vec::with_capacity(specs.len());
+        let mut acc = 0usize;
+        for (_, _, q) in specs {
+            starts.push(acc);
+            acc += q.pattern_count();
+        }
+        if acc != query.pattern_count() {
+            // Concatenation did not preserve pattern count, so routing by
+            // offset would mis-attribute matches — silently, to the wrong
+            // plugin. Refuse to use it.
+            log::error!(
+                "combined walk-pattern query has {} patterns, expected {}; \
+                 falling back to per-spec traversal",
+                query.pattern_count(),
+                acc
+            );
+            crate::util::ghost_stats::count("pd.combine.pattern_count_mismatch");
+            return None;
+        }
+        Some(CombinedWalk { query, starts })
+    }
+
+    fn owner_of(&self, pattern_index: usize) -> usize {
+        match self.starts.binary_search(&pattern_index) {
+            Ok(i) => i,
+            Err(i) => i - 1,
+        }
+    }
+}
+
+thread_local! {
+    /// Combine mode pinned for the current build, overriding the env gate.
+    /// Mirrors `walk::with_walk_mode` — it is what lets an equivalence check
+    /// build the same file both ways inside one process.
+    static COMBINE_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn combine_forced() -> Option<bool> {
+    COMBINE_FORCED.with(|c| c.get())
+}
+
+/// Run `f` with combine mode pinned. Restores the previous setting after.
+pub(crate) fn with_combine<R>(combined: bool, f: impl FnOnce() -> R) -> R {
+    let prev = COMBINE_FORCED.with(|c| c.replace(Some(combined)));
+    let out = f();
+    COMBINE_FORCED.with(|c| c.set(prev));
+    out
+}
+
+/// `PERL_LSP_PD_EQUIV=1` — check both collection paths agree on every round of
+/// every file. Unlike the whole-analysis net this one runs in release builds,
+/// because the bar is equivalence over the CORPUS and the corpus is only
+/// reachable from the CLI.
+pub(crate) fn collection_equiv_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PERL_LSP_PD_EQUIV").as_deref() == Ok("1"))
+}
+
+/// Compiled combined query per registry shape, memoized process-wide on the
+/// joined source (via `cached_pattern_query`), so a build never pays a
+/// compile. `None` = fall back.
+fn combined_walk(
+    specs: &[(&dyn plugin::FrameworkPlugin, &PatternSpec, &'static Query)],
+) -> Option<CombinedWalk> {
+    if !combine_forced().unwrap_or(!combine_disabled()) {
+        return None;
+    }
+    CombinedWalk::build(specs)
+}
+
+/// Matches for one spec in one round: `(pattern_index, captures)` in the
+/// order the cursor produced them, plus the query those indices are relative
+/// to (the combined one, or the spec's own under fallback).
+type SpecMatches<'t> = (&'static Query, Vec<(usize, Vec<(u32, Node<'t>)>)>);
+
 impl<'a> Builder<'a> {
     /// Innermost package at a point, from the walk's `package_ranges`
     /// (latest-starting containing range wins — same rule as
@@ -230,6 +396,151 @@ impl<'a> Builder<'a> {
             .unwrap_or_else(|| "main".to_string())
     }
 
+    /// Collect this round's matches for every eligible spec.
+    ///
+    /// One traversal with the combined query when it is available, bucketed
+    /// back to each spec by `pattern_index`; otherwise one traversal per spec.
+    /// Both arms return the same shape, so the dispatch loop below is written
+    /// once and cannot drift between them.
+    ///
+    /// A cursor that exceeds its match limit DROPS matches instead of
+    /// erroring, which would silently under-dispatch. The combined query
+    /// carries far more in-flight state than any single pattern, so the check
+    /// is wired here permanently and its overrun falls back to the per-spec
+    /// traversal for that round rather than trusting a truncated result.
+    fn collect_walk_matches(
+        &self,
+        root: Node<'a>,
+        specs: &[(&dyn plugin::FrameworkPlugin, &PatternSpec, &'static Query)],
+        combined: Option<&CombinedWalk>,
+    ) -> Vec<SpecMatches<'a>> {
+        if let Some(c) = combined {
+            let mut buckets: Vec<Vec<(usize, Vec<(u32, Node<'a>)>)>> =
+                vec![Vec::new(); specs.len()];
+            let mut cursor = QueryCursor::new();
+            {
+                let mut it = cursor.matches(c.query, root, self.source);
+                while let Some(m) = it.next() {
+                    let caps: Vec<(u32, Node<'a>)> =
+                        m.captures.iter().map(|cap| (cap.index, cap.node)).collect();
+                    if caps.is_empty() {
+                        continue;
+                    }
+                    buckets[c.owner_of(m.pattern_index)].push((m.pattern_index, caps));
+                }
+            }
+            if !cursor.did_exceed_match_limit() {
+                let out: Vec<SpecMatches<'a>> =
+                    buckets.into_iter().map(|b| (c.query, b)).collect();
+                if collection_equiv_enabled() {
+                    self.assert_collections_agree(root, specs, c, &out);
+                }
+                return out;
+            }
+            log::error!(
+                "combined walk-pattern cursor exceeded its match limit;                  falling back to per-spec traversal for this round"
+            );
+            crate::util::ghost_stats::count("pd.combine.exceeded_match_limit");
+        }
+        specs
+            .iter()
+            .map(|(_, _, q)| {
+                let mut out = Vec::new();
+                let mut cursor = QueryCursor::new();
+                {
+                    let mut it = cursor.matches(*q, root, self.source);
+                    while let Some(m) = it.next() {
+                        let caps: Vec<(u32, Node<'a>)> =
+                            m.captures.iter().map(|cap| (cap.index, cap.node)).collect();
+                        if !caps.is_empty() {
+                            out.push((m.pattern_index, caps));
+                        }
+                    }
+                }
+                if cursor.did_exceed_match_limit() {
+                    log::error!("walk-pattern cursor exceeded its match limit");
+                    crate::util::ghost_stats::count("pd.spec.exceeded_match_limit");
+                }
+                (*q, out)
+            })
+            .collect()
+    }
+
+    /// `PERL_LSP_PD_EQUIV=1` — assert the combined traversal reproduces the
+    /// per-spec traversals exactly, on every round of every file.
+    ///
+    /// Element-wise rather than set-wise, and this is the whole point: the
+    /// dispatch loop below is a pure function of (spec order, per-spec match
+    /// list, builder state). If the match lists agree element for element at
+    /// the start of every round, the dispatch is identical by construction —
+    /// same emissions, same order, same state evolution, inductively across
+    /// rounds. A set comparison would agree while the order differed, and
+    /// emission order is exactly what this change could break.
+    ///
+    /// Three things are checked per match, and they are the three that the
+    /// combined query renumbers:
+    ///   - the pattern index, RELATIVE to the spec's start offset,
+    ///   - each capture's NAME (indices are global to the combined query),
+    ///   - each capture's quantifier, which decides `Many` vs `One` in
+    ///     `build_match_context`.
+    fn assert_collections_agree(
+        &self,
+        root: Node<'a>,
+        specs: &[(&dyn plugin::FrameworkPlugin, &PatternSpec, &'static Query)],
+        combined: &CombinedWalk,
+        got: &[SpecMatches<'a>],
+    ) {
+        let want = self.collect_walk_matches(root, specs, None);
+        let names = combined.query.capture_names();
+        for (i, ((_, spec, q), ((_, a), (_, b)))) in
+            specs.iter().zip(got.iter().zip(want.iter())).enumerate()
+        {
+            let local_names = q.capture_names();
+            let bad = |what: &str| {
+                crate::util::ghost_stats::count("pd.equiv.mismatch");
+                panic!(
+                    "pattern-combine divergence in `{}`: {what}\n\
+                     combined: {:?}\n per-spec: {:?}",
+                    spec.name,
+                    a.iter().map(|(pi, c)| (*pi, c.len())).collect::<Vec<_>>(),
+                    b.iter().map(|(pi, c)| (*pi, c.len())).collect::<Vec<_>>(),
+                );
+            };
+            if a.len() != b.len() {
+                bad(&format!("{} matches vs {}", a.len(), b.len()));
+            }
+            for ((gpi, gcaps), (lpi, lcaps)) in a.iter().zip(b.iter()) {
+                if gpi - combined.starts[i] != *lpi {
+                    bad(&format!(
+                        "pattern index {gpi} - offset {} != {lpi}",
+                        combined.starts[i]
+                    ));
+                }
+                if gcaps.len() != lcaps.len() {
+                    bad(&format!("{} captures vs {}", gcaps.len(), lcaps.len()));
+                }
+                let gq = combined.query.capture_quantifiers(*gpi);
+                let lq = q.capture_quantifiers(*lpi);
+                for ((gix, gnode), (lix, lnode)) in gcaps.iter().zip(lcaps.iter()) {
+                    if gnode.id() != lnode.id() {
+                        bad("captured a different node");
+                    }
+                    if names.get(*gix as usize) != local_names.get(*lix as usize) {
+                        bad(&format!(
+                            "capture name {:?} vs {:?}",
+                            names.get(*gix as usize),
+                            local_names.get(*lix as usize)
+                        ));
+                    }
+                    if gq.get(*gix as usize) != lq.get(*lix as usize) {
+                        bad("capture quantifier differs");
+                    }
+                }
+            }
+        }
+        crate::util::ghost_stats::count("pd.equiv.file_round_ok");
+    }
+
     /// Run every plugin's declared patterns over the tree and dispatch
     /// matches. Fixed point over trigger gating: emissions can add
     /// package parents / uses that make more gates true, so rounds
@@ -241,206 +552,187 @@ impl<'a> Builder<'a> {
             return;
         }
         let plugins = self.plugins.clone();
+        // Registry order fixes each spec's ordinal, and the ordinal is its
+        // bucket. Dispatch still runs spec-by-spec in exactly this order even
+        // though the combined traversal yields matches interleaved in tree
+        // order — the bucketing is what keeps emission order unchanged.
+        let specs = eligible_walk_specs(&plugins);
+        if specs.is_empty() {
+            return;
+        }
+        let combined = combined_walk(&specs);
         let mut dispatched: HashSet<(String, String, Span)> = HashSet::new();
         let mut rounds_run = 0u64;
         for round in 0..16 {
             debug_assert!(round < 15, "pattern dispatch failed to reach a fixed point");
             rounds_run += 1;
-            if round == 0 && combine_probe_enabled() {
-                self.probe_combined_query(root, &plugins);
-            }
+            // Collect matches first: the cursor borrows the tree
+            // immutably, the projection pass needs `&mut self`.
+            // Text predicates (#eq?, #any-of?, …) are evaluated
+            // by the query engine here, since `matches` gets the
+            // source text; unknown predicate names pass through
+            // unfiltered (the deferred-predicate reservation).
+            let rounds_matches = self.collect_walk_matches(root, &specs, combined.as_ref());
             let mut progressed = false;
-            for p in plugins.all() {
-                for spec in p.patterns() {
-                    if spec.language != "perl" || spec.phase != "walk" {
+            for (ordinal, (p, spec, _)) in specs.iter().enumerate() {
+                let (query, collected) = &rounds_matches[ordinal];
+                let (p, spec, query) = (*p, *spec, *query);
+                // Raw counts recorded on the FIRST round only (later
+                // rounds re-run the same query over the same tree);
+                // zero-match runs record too so a never-matching
+                // pattern shows up at 0 in the stats report.
+                if round == 0 {
+                    crate::util::timings::record_pattern_matches(
+                        p.id(),
+                        &spec.name,
+                        collected.len(),
+                    );
+                }
+                for (pattern_index, caps) in collected {
+                    let pattern_index = *pattern_index;
+                    let mspan = union_span(caps);
+                    let key = (p.id().to_string(), spec.name.clone(), mspan);
+                    if dispatched.contains(&key) {
                         continue;
                     }
-                    let query = match cached_pattern_query(&spec.query) {
-                        Ok(q) => q,
-                        Err(e) => {
-                            log::error!(
-                                "plugin `{}` pattern `{}`: query compile failed: {}",
-                                p.id(),
-                                spec.name,
-                                e
-                            );
-                            continue;
-                        }
+                    let pkg = self.package_at_point(mspan.start);
+                    let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
+                    let parents = self.transitive_parents(&pkg);
+                    let tq = plugin::TriggerQuery {
+                        package_uses: &uses,
+                        package_parents: &parents,
                     };
-                    // Collect matches first: the cursor borrows the tree
-                    // immutably, the projection pass needs `&mut self`.
-                    // Text predicates (#eq?, #any-of?, …) are evaluated
-                    // by the query engine here, since `matches` gets the
-                    // source text; unknown predicate names pass through
-                    // unfiltered (the deferred-predicate reservation).
-                    let mut collected: Vec<(usize, Vec<(u32, Node<'a>)>)> = Vec::new();
-                    {
-                        let mut cursor = QueryCursor::new();
-                        let mut it = cursor.matches(query, root, self.source);
-                        while let Some(m) = it.next() {
-                            let caps: Vec<(u32, Node<'a>)> =
-                                m.captures.iter().map(|c| (c.index, c.node)).collect();
-                            if !caps.is_empty() {
-                                collected.push((m.pattern_index, caps));
-                            }
-                        }
+                    let fires = plugin::trigger_fires(p.triggers(), &tq);
+                    // Trigger didn't fire locally, but a `ClassIsa` gate may
+                    // still hold CROSS-FILE (the package has ancestry the
+                    // index-free builder can't resolve). Run `on_match` and
+                    // DEFER the emission — enrichment re-fires it once the
+                    // module index confirms the gate. No parents ⇒ no
+                    // cross-file ancestor possible, so nothing to defer.
+                    let gate_prefixes = if fires {
+                        Vec::new()
+                    } else {
+                        Self::cross_file_gate_prefixes(p.triggers())
+                    };
+                    let defer = !fires && !gate_prefixes.is_empty() && !parents.is_empty();
+                    if !fires && !defer {
+                        continue;
                     }
-                    // Raw counts recorded on the FIRST round only (later
-                    // rounds re-run the same query over the same tree);
-                    // zero-match runs record too so a never-matching
-                    // pattern shows up at 0 in the stats report.
-                    if round == 0 {
-                        crate::util::timings::record_pattern_matches(
+                    dispatched.insert(key);
+                    progressed = true;
+                    crate::util::timings::record_pattern_dispatch(p.id(), &spec.name);
+                    // Projections that consult package-relative walk
+                    // state (constant folds via the current package,
+                    // `__PACKAGE__` receivers) see the match site's
+                    // package, exactly as the walk would have.
+                    let pkg_for_gate = pkg.clone();
+                    let saved =
+                        std::mem::replace(&mut self.current_package, Some(pkg.clone()));
+                    let mctx = self.build_match_context(
+                        spec,
+                        query,
+                        pattern_index,
+                        caps,
+                        mspan,
+                        pkg,
+                        uses,
+                        parents,
+                        None,
+                    );
+                    let actions = p.on_match(&spec.name, &mctx);
+                    if defer {
+                        self.record_gated_pattern_emission(
                             p.id(),
-                            &spec.name,
-                            collected.len(),
+                            gate_prefixes,
+                            pkg_for_gate,
+                            mspan.start,
+                            actions,
                         );
-                    }
-                    for (pattern_index, caps) in collected {
-                        let mspan = union_span(&caps);
-                        let key = (p.id().to_string(), spec.name.clone(), mspan);
-                        if dispatched.contains(&key) {
-                            continue;
-                        }
-                        let pkg = self.package_at_point(mspan.start);
-                        let uses = self.package_uses.get(&pkg).cloned().unwrap_or_default();
-                        let parents = self.transitive_parents(&pkg);
-                        let tq = plugin::TriggerQuery {
-                            package_uses: &uses,
-                            package_parents: &parents,
-                        };
-                        let fires = plugin::trigger_fires(p.triggers(), &tq);
-                        // Trigger didn't fire locally, but a `ClassIsa` gate may
-                        // still hold CROSS-FILE (the package has ancestry the
-                        // index-free builder can't resolve). Run `on_match` and
-                        // DEFER the emission — enrichment re-fires it once the
-                        // module index confirms the gate. No parents ⇒ no
-                        // cross-file ancestor possible, so nothing to defer.
-                        let gate_prefixes = if fires {
-                            Vec::new()
-                        } else {
-                            Self::cross_file_gate_prefixes(p.triggers())
-                        };
-                        let defer = !fires && !gate_prefixes.is_empty() && !parents.is_empty();
-                        if !fires && !defer {
-                            continue;
-                        }
-                        dispatched.insert(key);
-                        progressed = true;
-                        crate::util::timings::record_pattern_dispatch(p.id(), &spec.name);
-                        // Projections that consult package-relative walk
-                        // state (constant folds via the current package,
-                        // `__PACKAGE__` receivers) see the match site's
-                        // package, exactly as the walk would have.
-                        let pkg_for_gate = pkg.clone();
-                        let saved =
-                            std::mem::replace(&mut self.current_package, Some(pkg.clone()));
-                        let mctx = self.build_match_context(
-                            spec,
-                            query,
-                            pattern_index,
-                            &caps,
-                            mspan,
-                            pkg,
-                            uses,
-                            parents,
-                            None,
-                        );
-                        let actions = p.on_match(&spec.name, &mctx);
-                        if defer {
-                            self.record_gated_pattern_emission(
-                                p.id(),
-                                gate_prefixes,
-                                pkg_for_gate,
-                                mspan.start,
-                                actions,
-                            );
-                            self.current_package = saved;
-                            continue;
-                        }
-                        // A #receiver-isa? gate defers DispatchCall
-                        // emissions to query time. The build-time
-                        // receiver type is a HINT on the candidate
-                        // (same role as record_provisional_dispatch's),
-                        // never the verdict.
-                        let gate = receiver_gate_for(query, pattern_index);
-                        let receiver_hint = gate.as_ref().and_then(|g| {
-                            let node = caps
-                                .iter()
-                                .find(|(ix, _)| *ix == g.capture_index)
-                                .map(|(_, n)| *n)?;
-                            match self.invocant_type_at_node(node) {
-                                Some(InferredType::ClassName(c)) => Some(c),
-                                _ => None,
-                            }
-                        });
-                        // Emissions attach to the scope AND package open
-                        // at the match site — the same context a
-                        // walk-time hook emission would have gotten
-                        // (apply_emit_action stamps `current_package`
-                        // onto symbols, so it must still be the match
-                        // site's package here).
-                        let match_scope = self.scope_at_point(mspan.start);
-                        self.scope_stack.push(match_scope);
-                        for a in actions {
-                            // A loader's config value must carry an Expr
-                            // witness at `config_span` so a cross-file
-                            // `expr_type_at_span` (the `$conf` join in
-                            // `record_loader_shapes`) resolves its shape.
-                            // The captured node lives in `caps`; emit for
-                            // it, mirroring the method-form recorder.
-                            if let plugin::EmitAction::PluginLoad {
-                                config_span: Some(cfg),
-                                ..
-                            } = &a
-                            {
-                                if let Some((_, node)) = caps
-                                    .iter()
-                                    .find(|(_, n)| node_to_span(*n) == *cfg)
-                                {
-                                    self.emit_expr_witness(*node);
-                                }
-                            }
-                            if let (
-                                Some(g),
-                                plugin::EmitAction::DispatchCall {
-                                    name,
-                                    dispatcher,
-                                    owner,
-                                    span,
-                                    ..
-                                },
-                            ) = (&gate, &a)
-                            {
-                                let HandlerOwner::Class(owner_class) = owner;
-                                self.provisional_dispatches.push(ReceiverGated::new(
-                                    g.target_class.clone(),
-                                    DispatchCandidate {
-                                        name: name.clone(),
-                                        span: *span,
-                                        dispatcher: dispatcher.clone(),
-                                        owner_class: owner_class.clone(),
-                                        receiver_class: receiver_hint.clone(),
-                                        call_span: mspan,
-                                    },
-                                ));
-                                continue;
-                            }
-                            self.apply_emit_action(p.id().to_string(), a);
-                        }
-                        self.scope_stack.pop();
                         self.current_package = saved;
+                        continue;
                     }
+                    // A #receiver-isa? gate defers DispatchCall
+                    // emissions to query time. The build-time
+                    // receiver type is a HINT on the candidate
+                    // (same role as record_provisional_dispatch's),
+                    // never the verdict.
+                    let gate = receiver_gate_for(query, pattern_index);
+                    let receiver_hint = gate.as_ref().and_then(|g| {
+                        let node = caps
+                            .iter()
+                            .find(|(ix, _)| *ix == g.capture_index)
+                            .map(|(_, n)| *n)?;
+                        match self.invocant_type_at_node(node) {
+                            Some(InferredType::ClassName(c)) => Some(c),
+                            _ => None,
+                        }
+                    });
+                    // Emissions attach to the scope AND package open
+                    // at the match site — the same context a
+                    // walk-time hook emission would have gotten
+                    // (apply_emit_action stamps `current_package`
+                    // onto symbols, so it must still be the match
+                    // site's package here).
+                    let match_scope = self.scope_at_point(mspan.start);
+                    self.scope_stack.push(match_scope);
+                    for a in actions {
+                        // A loader's config value must carry an Expr
+                        // witness at `config_span` so a cross-file
+                        // `expr_type_at_span` (the `$conf` join in
+                        // `record_loader_shapes`) resolves its shape.
+                        // The captured node lives in `caps`; emit for
+                        // it, mirroring the method-form recorder.
+                        if let plugin::EmitAction::PluginLoad {
+                            config_span: Some(cfg),
+                            ..
+                        } = &a
+                        {
+                            if let Some((_, node)) = caps
+                                .iter()
+                                .find(|(_, n)| node_to_span(*n) == *cfg)
+                            {
+                                self.emit_expr_witness(*node);
+                            }
+                        }
+                        if let (
+                            Some(g),
+                            plugin::EmitAction::DispatchCall {
+                                name,
+                                dispatcher,
+                                owner,
+                                span,
+                                ..
+                            },
+                        ) = (&gate, &a)
+                        {
+                            let HandlerOwner::Class(owner_class) = owner;
+                            self.provisional_dispatches.push(ReceiverGated::new(
+                                g.target_class.clone(),
+                                DispatchCandidate {
+                                    name: name.clone(),
+                                    span: *span,
+                                    dispatcher: dispatcher.clone(),
+                                    owner_class: owner_class.clone(),
+                                    receiver_class: receiver_hint.clone(),
+                                    call_span: mspan,
+                                },
+                            ));
+                            continue;
+                        }
+                        self.apply_emit_action(p.id().to_string(), a);
+                    }
+                    self.scope_stack.pop();
+                    self.current_package = saved;
                 }
             }
             if !progressed {
                 break;
             }
         }
-        // Every round re-runs EVERY pattern query over the WHOLE tree — the
-        // fixed-point check is a full re-match, not an incremental one. So
-        // rounds-per-file is the multiplier on this phase's cost, and the
-        // last round is by definition the one that found nothing.
+        // The fixed-point check re-runs the pattern set over the WHOLE tree —
+        // it is a full re-match, not an incremental one. So rounds-per-file is
+        // the multiplier on this phase's cost, and the last round is by
+        // definition the one that found nothing.
         crate::util::ghost_stats::count_by("build.pattern_rounds", rounds_run);
     }
 
@@ -1010,146 +1302,3 @@ impl<'a> Builder<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Measurement probe: 14 whole-tree traversals vs 1.
-//
-// `dispatch_pattern_plugins` runs one `QueryCursor::matches` per pattern spec,
-// and each is a full traversal of the file's tree. Tree-sitter's intended
-// shape is the opposite — one `Query` holding many patterns, walked once, with
-// `pattern_index` routing each match back to its owner.
-//
-// The probe measures that A/B on the real corpus WITHOUT changing dispatch:
-// it runs the combined query first (so any cache warming biases AGAINST the
-// hypothesis), then the same specs separately, and records both times plus
-// both match counts. Equal counts are the evidence that the combined query
-// sees the same matches; unequal counts mean the concatenation is not
-// equivalent and the whole idea is dead before anyone writes the remap.
-//
-// Off unless `PERL_LSP_PD_COMBINE_PROBE=1`, and it only runs on round 0.
-// ---------------------------------------------------------------------------
-
-fn combine_probe_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PERL_LSP_PD_COMBINE_PROBE").as_deref() == Ok("1"))
-}
-
-/// Compile the concatenation of every Perl walk-phase pattern source, once.
-/// Keyed on the joined text, so it shares `cached_pattern_query`'s process-wide
-/// memo — the probe must not pay a compile per file or it measures the compile.
-fn combined_walk_query(sources: &[String]) -> Result<&'static Query, String> {
-    cached_pattern_query(&sources.join("\n"))
-}
-
-impl<'a> Builder<'a> {
-    /// One round of the A/B. Records, under `PERL_LSP_GHOST_STATS`:
-    ///   `pd.probe.combined` / `pd.probe.separate`   accumulated ns
-    ///   `pd.probe.combined_matches` / `..._separate_matches`  match totals
-    ///   `pd.probe.combined_exceeded`   cursor match-limit overruns (must be 0:
-    ///       exceeding the limit DROPS matches silently rather than erroring)
-    fn probe_combined_query(&self, root: Node<'a>, plugins: &crate::build::plugin::PluginRegistry) {
-        let sources: Vec<String> = plugins
-            .all()
-            .flat_map(|p| p.patterns())
-            .filter(|s| s.language == "perl" && s.phase == "walk")
-            .map(|s| s.query.clone())
-            .collect();
-        if sources.is_empty() {
-            return;
-        }
-        crate::util::ghost_stats::count_by("pd.probe.specs", sources.len() as u64);
-
-        // Per-spec match sets, keyed by spec index. Comparing these rather
-        // than a total is the point: a combined query is only usable if each
-        // match still routes to the spec that owns it, and that routing —
-        // `pattern_index` offset by each source's `pattern_count` — is the
-        // highest-risk part of the real change. A total would agree even if
-        // every match were attributed to the wrong plugin.
-        let mut combined_by_spec: Vec<Vec<Span>> = vec![Vec::new(); sources.len()];
-        let mut separate_by_spec: Vec<Vec<Span>> = vec![Vec::new(); sources.len()];
-
-        // Combined FIRST: whatever warming the tree traversal gets accrues to
-        // the arm this probe is trying to beat, not to the one it favours.
-        let combined = match combined_walk_query(&sources) {
-            Ok(q) => q,
-            Err(e) => {
-                crate::util::ghost_stats::count("pd.probe.combined_compile_failed");
-                log::error!("combined pattern query failed to compile: {e}");
-                return;
-            }
-        };
-        // Cumulative pattern counts: combined pattern i belongs to the last
-        // spec whose offset is <= i. One source can contribute many patterns.
-        let mut offsets: Vec<usize> = Vec::with_capacity(sources.len());
-        {
-            let mut acc = 0usize;
-            for src in &sources {
-                offsets.push(acc);
-                acc += cached_pattern_query(src).map(|q| q.pattern_count()).unwrap_or(0);
-            }
-            if acc != combined.pattern_count() {
-                // The concatenation did not preserve pattern count — routing
-                // by offset would silently mis-attribute every match.
-                crate::util::ghost_stats::count("pd.probe.pattern_count_mismatch");
-                return;
-            }
-        }
-        let owner_of = |pattern_index: usize| -> usize {
-            match offsets.binary_search(&pattern_index) {
-                Ok(i) => i,
-                Err(i) => i - 1,
-            }
-        };
-
-        let mut exceeded = false;
-        crate::util::ghost_stats::timed("pd.probe.combined", || {
-            let mut cursor = QueryCursor::new();
-            let mut it = cursor.matches(combined, root, self.source);
-            while let Some(m) = it.next() {
-                let caps: Vec<(u32, Node<'a>)> =
-                    m.captures.iter().map(|c| (c.index, c.node)).collect();
-                if caps.is_empty() {
-                    continue;
-                }
-                combined_by_spec[owner_of(m.pattern_index)].push(union_span(&caps));
-            }
-            exceeded = cursor.did_exceed_match_limit();
-        });
-        if exceeded {
-            crate::util::ghost_stats::count("pd.probe.combined_exceeded");
-        }
-
-        crate::util::ghost_stats::timed("pd.probe.separate", || {
-            for (i, src) in sources.iter().enumerate() {
-                let Ok(q) = cached_pattern_query(src) else {
-                    continue;
-                };
-                let mut cursor = QueryCursor::new();
-                let mut it = cursor.matches(q, root, self.source);
-                while let Some(m) = it.next() {
-                    let caps: Vec<(u32, Node<'a>)> =
-                        m.captures.iter().map(|c| (c.index, c.node)).collect();
-                    if caps.is_empty() {
-                        continue;
-                    }
-                    separate_by_spec[i].push(union_span(&caps));
-                }
-            }
-        });
-
-        let mut total = 0u64;
-        let mut mismatched = 0u64;
-        for (a, b) in combined_by_spec.iter_mut().zip(separate_by_spec.iter_mut()) {
-            a.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
-            b.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
-            total += b.len() as u64;
-            if a != b {
-                mismatched += 1;
-            }
-        }
-        crate::util::ghost_stats::count_by("pd.probe.matches", total);
-        // MUST stay 0. A non-zero value is the finding: the combined query
-        // does not see what the separate ones see, and the 14-to-1 rewrite is
-        // dead before anyone writes the capture remap.
-        crate::util::ghost_stats::count_by("pd.probe.spec_mismatches", mismatched);
-    }
-}

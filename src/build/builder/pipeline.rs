@@ -236,6 +236,21 @@ pub(super) fn build_with_plugins_inner(
             })
         });
     }
+    // `PERL_LSP_PD_EQUIV=1 cargo test` additionally rebuilds with pattern
+    // dispatch's per-spec traversals and asserts the whole FileAnalysis
+    // matches — the byte-identical-dispatch-output bar, over every file the
+    // suite touches. The per-round collection check inside
+    // `collect_walk_matches` covers the corpus; this covers the model.
+    #[cfg(test)]
+    if super::pattern_dispatch::collection_equiv_enabled()
+        && super::pattern_dispatch::combine_forced().is_none()
+    {
+        super::walk::assert_analyses_agree("pattern-combine", &fa, || {
+            super::pattern_dispatch::with_combine(false, || {
+                build_once(tree, source, plugins.clone(), extra_re_fold)
+            })
+        });
+    }
     fa
 }
 

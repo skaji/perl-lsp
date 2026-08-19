@@ -214,6 +214,18 @@ pub(super) fn assert_walks_agree(
     iterative: &FileAnalysis,
     build_recursive: impl FnOnce() -> FileAnalysis,
 ) {
+    assert_analyses_agree("walk", iterative, build_recursive)
+}
+
+/// The generic form: `label` names which pair of paths is being compared, so
+/// a second equivalence net (pattern-dispatch combined vs per-spec) reuses
+/// this comparator instead of growing a parallel one that can drift from it.
+#[cfg(test)]
+pub(super) fn assert_analyses_agree(
+    label: &str,
+    iterative: &FileAnalysis,
+    build_recursive: impl FnOnce() -> FileAnalysis,
+) {
     let recursive = build_recursive();
     let mut a = serde_json::to_value(iterative).expect("FileAnalysis serializes");
     let mut b = serde_json::to_value(&recursive).expect("FileAnalysis serializes");
@@ -229,9 +241,9 @@ pub(super) fn assert_walks_agree(
     // carries the witness `source` tag that does.
     let elem = path.rfind(']').map(|i| &path[..=i]).unwrap_or(&path[..]).to_string();
     panic!(
-        "walk divergence: iterative and recursive walks disagree at `{}`\n\
-         iterative: {}\n recursive: {}\n\
-         enclosing `{}`\n  iterative: {}\n  recursive: {}",
+        "{label} divergence: the two paths disagree at `{}`\n\
+         first: {}\n second: {}\n\
+         enclosing `{}`\n  first: {}\n  second: {}",
         path,
         truncate(&at_path(&a, &path)),
         truncate(&at_path(&b, &path)),
