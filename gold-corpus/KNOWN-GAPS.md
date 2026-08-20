@@ -359,57 +359,37 @@ Pinned by `fixtures/type-at.json::ti-classname-string` (xfail). Found by
 fell back to offering the ENCLOSING PACKAGE's own subs, which are not the
 receiver's methods at all.
 
-## Completion is not reproducible under the cap, and the order is load-bearing
+## Completion's residual nondeterminism (17 of 4,302 answers)
 
-Four cold runs of the same binary over 1,458 positions (`bench/sweep`)
-disagree on **206 completion answers and nothing else** — definition, hover,
-references and documentSymbol are stable across all four. The 206 split
-cleanly by list size, and the split is the diagnosis:
+`cap_completion_items` now sorts whether or not it cuts, so the list no
+longer ships in hash-iteration order. Over four cold runs of 1,458 positions
+(`bench/sweep`) the unstable answers went **206 -> 17**:
 
-| | count | list size | cause |
-|---|---|---|---|
-| same candidate SET, different order | 173 | all **under** the cap | the list is never sorted |
-| candidate set actually moves | 33 | all **exactly at** the cap (200) | the pool is still filling |
+| | before | after |
+|---|---|---|
+| same set, different order | 173 | **2** |
+| candidate set moves | 33 | **15** |
+| `reranked` floor across 6 pairs | 158-168 | **0-1** |
+| `disagree` floor across 6 pairs | 14-25 | **5-12** |
 
-`cap_completion_items` returns early below `MAX_COMPLETION_ITEMS`, so an
-under-cap list goes out in whatever order the hash-backed tiers iterated. The
-33 are a different animal: all carry `isIncomplete`, and they occur **21, 12,
-0, 0** across quartiles of sweep order — confined to the first half of a run
-and absent from the second. That is the index still filling, which is what
-`isIncomplete` exists to say.
+Two residuals, both understood:
 
-**Sorting unconditionally is not the fix, and it was tried.** It removes the
-whole ordering component (the `reranked` floor falls from 158–168 to 0–1
-across six pairs) and fails
-`completion/completion-arg-position-type-match-ranks-first`, which is right
-to fail: `rank_candidates_by_expected_type` reorders candidates and nudges
-priorities, and dispatch items are explicitly prepended. Some of that intent
-lives in list POSITION rather than in `sort_text`, so a sort by `sort_text`
-discards it.
+**15 — the pool is still filling.** All at the cap, all carrying
+`isIncomplete`, and they decay across sweep order (21/12/0/0 by quartile
+before the hoist) — a query racing an incomplete index legitimately answers
+differently before and after resolution, which is what `isIncomplete` says.
+Not a defect. Two things follow for anyone reading per-position results:
+first-quartile positions are measuring a warming index rather than the
+server, so early positions carry systematically more noise than late ones;
+and `isIncomplete` gives the class a mechanical signature, so it can be
+separated from a real disagreement rather than adjudicated by hand.
 
-Note the inconsistency that implies: the over-cap path already sorts by
-`sort_text`, so it already discards that same intent. Under the cap it is
-preserved. The two paths disagree about whether position carries meaning.
+**2 — ties that agree on every sort key.** `sort_by` is stable, so two
+candidates matching on `sort_text`, label AND kind keep the order the
+producing map iterated in. Negligible in practice; if this number ever grows,
+this is where to look.
 
-The real fix is to encode every deliberate ordering into `sort_text` so
-sorting becomes order-preserving, at which point both paths can sort and
-completion becomes reproducible — and therefore gold-testable, which today it
-is not for any position in that 173.
-
-**Two blockers found while attempting it, both concrete:**
-
-1. `rank_candidates_by_expected_type` nudges only non-matching **variables**
-   from `PRIORITY_LOCAL` to `PRIORITY_LOCAL + 1`. Same-tier candidates of
-   other kinds keep `PRIORITY_LOCAL`, so once sorted a non-matching local
-   falls *below* them and the locals stop being contiguous. Assembly order
-   hid this by keeping them together. Demoting every non-match at the local
-   tier is the one-line correction.
-
-2. Unexplained, and the reason the attempt was reverted rather than pushed
-   through: with the sort hoisted, the tiers predict `$total, $label, Foo,
-   apply` for `arg-rank-fixture/main.pl:8:6` — locals at 0 and 1,
-   same-file subs and packages at `PRIORITY_FILE_WIDE` (10) — and the CLI
-   prints exactly that **reversed**. Either a later stage reorders or the
-   printer does; until that is understood, a sorted list cannot be checked
-   against a fixture, because it is not clear what the fixture is asserting
-   about. Start here, not at the sort.
+Worth recording that the hoist cut the SET-moving class too (33 -> 15), which
+the diagnosis did not predict: roughly half of what looked like pool
+variation was the cut boundary itself falling differently, because a
+non-total order made "the top 200" ambiguous even for an identical pool.
