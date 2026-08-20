@@ -3,15 +3,41 @@
   "rows": [
     {
       "id": "cpp-h73-member-references-decl-def-call",
-      "difficulty": "hard", "semantic_area": "cpp-multilang-crossfile",
-      "lang": "cpp", "root": "gold-corpus/cpp-fixture/oolmember",
-      "file": "table.h", "line": 3, "col": 7,
-      "comment": "References on a member method count the header decl, the out-of-line def (table.cc), AND the call site — the decl<->def link must hold across TUs.",
-      "expect": { "all": [
-        "\"col\":\"16\",\"file\":\"table.cc\",\"line\":\"2\"",
-        "\"file\":\"caller.cc\",\"line\":\"3\"",
-        "\"file\":\"table.h\",\"line\":\"4\""
-      ], "none": [] },
+      "difficulty": "hard",
+      "semantic_area": "cpp-multilang-crossfile",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture/oolmember",
+      "file": "table.h",
+      "line": 3,
+      "col": 7,
+      "comment": "References on a member method count the header decl, the out-of-line def (table.cc), AND the call site \u2014 the decl<->def link must hold across TUs.",
+      "expect": {
+        "all": [
+          "\"col\":\"16\",\"file\":\"table.cc\",\"line\":\"2\"",
+          "\"file\":\"caller.cc\",\"line\":\"3\"",
+          "\"file\":\"table.h\",\"line\":\"4\""
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-implicit-this-field-refs-from-use",
+      "difficulty": "medium",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "From the implicit-this read site, references answers decl + use \u2014 pre-bind it answered the decl only, missing its own site.",
+      "file": "autoret.cpp",
+      "line": 7,
+      "col": 29,
+      "expect": {
+        "all": [
+          "\"col\":\"11\",\"file\":\"autoret.cpp\",\"line\":\"7\"",
+          "\"col\":\"30\",\"file\":\"autoret.cpp\",\"line\":\"8\""
+        ],
+        "none": []
+      },
       "status": "gold"
     }
   ]

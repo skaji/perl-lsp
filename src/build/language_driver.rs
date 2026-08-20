@@ -1053,23 +1053,32 @@ fn emit_return_fuel(
     }
     let scope_package: HashMap<ScopeId, Option<String>> =
         fa.scopes.iter().map(|s| (s.id, s.package.clone())).collect();
-    let field_scope: HashMap<(String, String), ScopeId> = fa
+    let field_scope: HashMap<(String, String), (ScopeId, SymbolId)> = fa
         .symbols()
         .iter()
         .filter(|s| matches!(s.kind, SymKind::Field))
-        .filter_map(|s| s.package.clone().map(|p| ((p, s.name.clone()), s.scope)))
+        .filter_map(|s| s.package.clone().map(|p| ((p, s.name.clone()), (s.scope, s.id))))
         .collect();
-    let implicit_field_edges: Vec<(crate::model::file_analysis::Span, String, ScopeId)> = fa
+    let implicit_field_edges: Vec<(usize, crate::model::file_analysis::Span, String, ScopeId, SymbolId)> = fa
         .refs()
         .iter()
-        .filter(|r| matches!(r.kind, RefKind::Variable) && r.resolved_symbol().is_none())
-        .filter_map(|r| {
+        .enumerate()
+        .filter(|(_, r)| matches!(r.kind, RefKind::Variable) && r.resolved_symbol().is_none())
+        .filter_map(|(i, r)| {
             let class = scope_package.get(&r.scope)?.as_ref()?;
-            let fscope = *field_scope.get(&(class.clone(), r.target_name.clone()))?;
-            Some((r.span, r.target_name.clone(), fscope))
+            let (fscope, fsym) = *field_scope.get(&(class.clone(), r.target_name.clone()))?;
+            Some((i, r.span, r.target_name.clone(), fscope, fsym))
         })
         .collect();
-    for (span, name, fscope) in implicit_field_edges {
+    for (i, span, name, fscope, fsym) in implicit_field_edges {
+        // Bind the ref to the field it reads — the call half below pins its
+        // sibling calls for exactly this reason ("goto-def / references /
+        // rename all land on the sibling"); a field read left unbound feeds
+        // the TYPE system through the witness edge yet answers goto-def
+        // empty, while references still names the declaration through the
+        // symbols lane — the projection disagreement the consistency net
+        // flags as I4.
+        fa.refs_mut()[i].bind_symbol(fsym);
         fa.witnesses.push(Witness {
             attachment: WA::Expr(span),
             source: WitnessSource::Builder("cpp_implicit_field_read".into()),

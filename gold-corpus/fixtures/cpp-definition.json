@@ -217,7 +217,7 @@
       "difficulty": "hard",
       "semantic_area": "cpp-multilang-domain",
       "lang": "cpp",
-      "comment": "hitlist-6 Family B: gd on the domain-typed `b->kind` (basket) returns only the field decl (2:21); the inferred `enum fruit` (1:6) is no longer folded in. Still must NOT reach the crate `kind` decl (3:20) — the owner-separation invariant is intact.",
+      "comment": "hitlist-6 Family B: gd on the domain-typed `b->kind` (basket) returns only the field decl (2:21); the inferred `enum fruit` (1:6) is no longer folded in. Still must NOT reach the crate `kind` decl (3:20) \u2014 the owner-separation invariant is intact.",
       "root": "gold-corpus/cpp-fixture",
       "file": "domain_owner.c",
       "line": 3,
@@ -258,7 +258,7 @@
       "difficulty": "moderate",
       "semantic_area": "cpp-multilang-domain",
       "lang": "cpp",
-      "comment": "hitlist-6 Family B contrast: `op_next` has no domain (enum) inference, so gd returns exactly ONE target — the field decl in the BASEOP macro body (7:20). The Family B change (drop the enum fold) must not regress the already-single-target field.",
+      "comment": "hitlist-6 Family B contrast: `op_next` has no domain (enum) inference, so gd returns exactly ONE target \u2014 the field decl in the BASEOP macro body (7:20). The Family B change (drop the enum fold) must not regress the already-single-target field.",
       "root": "gold-corpus/cpp-fixture",
       "file": "baseop_ptr.c",
       "line": 9,
@@ -1045,7 +1045,7 @@
       "id": "cpp-sibling-call-ref-operator-def",
       "line": 33,
       "col": 36,
-      "comment": "bare enroll(k) inside a REFERENCE-returning operator[] DEFINITION (`int& operator[](...) { ... }`) is an implicit this->enroll — pins to the ENCLOSING class Slots, NOT the same-named Registry::enroll in a sibling class. Regression lock for hitlist-5 Family D: the inline ref-/ptr-returning operator def must mint its method symbol, or the sibling-pin's scope→symbol→enclosing-class join dead-ends and the bare call resolves nowhere (or, pre-json-reanchor, to a foreign same-named method).",
+      "comment": "bare enroll(k) inside a REFERENCE-returning operator[] DEFINITION (`int& operator[](...) { ... }`) is an implicit this->enroll \u2014 pins to the ENCLOSING class Slots, NOT the same-named Registry::enroll in a sibling class. Regression lock for hitlist-5 Family D: the inline ref-/ptr-returning operator def must mint its method symbol, or the sibling-pin's scope\u2192symbol\u2192enclosing-class join dead-ends and the bare call resolves nowhere (or, pre-json-reanchor, to a foreign same-named method).",
       "expect": {
         "all": [
           "sibling_call.cpp:33:10"
@@ -1083,7 +1083,7 @@
       "id": "cpp-ns-extern-global-scalar-goto-def",
       "line": 6,
       "col": 39,
-      "comment": "goto-def on a qualified read of a namespace-scope extern SCALAR global (`detail::kCounter`) lands on the decl — the scalar mint already existed, but the namespace-owner resolution gate did not admit it; hitlist-5 Finding E completes both.",
+      "comment": "goto-def on a qualified read of a namespace-scope extern SCALAR global (`detail::kCounter`) lands on the decl \u2014 the scalar mint already existed, but the namespace-owner resolution gate did not admit it; hitlist-5 Finding E completes both.",
       "expect": {
         "all": [
           "ns_extern_global.cpp:4:12"
@@ -1466,7 +1466,7 @@
       "semantic_area": "cpp-multilang-macros",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "hitlist-6 Family A: perl5 sv.h shape. `struct STRUCT_SV` STACKS two member-block macros — `_SV_HEAD(void*)` (plain fields) and `_SV_HEAD_UNION` (anonymous `union {..} sv_u`). The union-bearing member block must still attach its `(struct -> macro)` parent edge, so `sv->sv_flags` on an `SV *` receiver resolves the stacked base's field. The anonymous union in a stacked member-block body does NOT drop the edge (probe root-cause was a bounded-root/cache artifact).",
+      "comment": "hitlist-6 Family A: perl5 sv.h shape. `struct STRUCT_SV` STACKS two member-block macros \u2014 `_SV_HEAD(void*)` (plain fields) and `_SV_HEAD_UNION` (anonymous `union {..} sv_u`). The union-bearing member block must still attach its `(struct -> macro)` parent edge, so `sv->sv_flags` on an `SV *` receiver resolves the stacked base's field. The anonymous union in a stacked member-block body does NOT drop the edge (probe root-cause was a bounded-root/cache artifact).",
       "file": "svunion.c",
       "line": 21,
       "col": 15,
@@ -1484,7 +1484,7 @@
       "semantic_area": "cpp-multilang-macros",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture/svmacrotag",
-      "comment": "hitlist-6 Family A residual (DISTINCT from the member-block edge, which works): perl5's real `STRUCT_SV` tag is itself a macro (`#define STRUCT_SV sv`). The struct is DEFINED in svdef.h (no macro in scope → symbol named `STRUCT_SV`), but a using file that has the macro in scope expands the `struct STRUCT_SV *` receiver to `struct sv`, so the tag lookup misses. General cross-file macro-named-tag asymmetry (hits plain structs too); the `SV` typedef path is unaffected. XPASSes when tag-name canonicalization reconciles the two.",
+      "comment": "hitlist-6 Family A residual (DISTINCT from the member-block edge, which works): perl5's real `STRUCT_SV` tag is itself a macro (`#define STRUCT_SV sv`). The struct is DEFINED in svdef.h (no macro in scope \u2192 symbol named `STRUCT_SV`), but a using file that has the macro in scope expands the `struct STRUCT_SV *` receiver to `struct sv`, so the tag lookup misses. General cross-file macro-named-tag asymmetry (hits plain structs too); the `SV` typedef path is unaffected. XPASSes when tag-name canonicalization reconciles the two.",
       "file": "use.c",
       "line": 2,
       "col": 14,
@@ -1502,7 +1502,7 @@
       "semantic_area": "cpp-multilang-crossfile",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "The redis/curl C-tier defect: goto-def on a C free-function call (c_combine in capp.c) whose only visible declaration is a header PROTOTYPE (cjoin.h, reached via capp.c's include closure) must rank the bodied DEFINITION in the defining TU (cjoin.c) FIRST, prototype kept. capp.c never #includes cjoin.c textually — the def's TU includes the shared header the caller resolved to, so the decl→def hunt links them through that waypoint (docs/adr/resolution-candidate-set.md, 'decl→def ranking'). Before the fix the call stopped at the prototype (lookupKeyReadOrReply → server.h, addReplyBulk → server.h).",
+      "comment": "The redis/curl C-tier defect: goto-def on a C free-function call (c_combine in capp.c) whose only visible declaration is a header PROTOTYPE (cjoin.h, reached via capp.c's include closure) must rank the bodied DEFINITION in the defining TU (cjoin.c) FIRST, prototype kept. capp.c never #includes cjoin.c textually \u2014 the def's TU includes the shared header the caller resolved to, so the decl\u2192def hunt links them through that waypoint (docs/adr/resolution-candidate-set.md, 'decl\u2192def ranking'). Before the fix the call stopped at the prototype (lookupKeyReadOrReply \u2192 server.h, addReplyBulk \u2192 server.h).",
       "file": "cmultitu/capp.c",
       "line": 2,
       "col": 9,
@@ -1520,13 +1520,31 @@
       "semantic_area": "cpp-multilang-crossfile",
       "lang": "cpp",
       "root": "gold-corpus/cpp-fixture",
-      "comment": "The fmt-style C++ mirror of the C decl→def row: an unqualified free-function call (rpt::report_error from inside namespace rpt in reportcaller.cc) resolves to the bodied DEFINITION (report_inl.h) FIRST, header prototype (report.h) kept. The same mechanism as the C row — the fix is not language-gated (rule #10); C++ free-function decl→def rides the identical decl-connectivity clause and keeps landing on definitions.",
+      "comment": "The fmt-style C++ mirror of the C decl\u2192def row: an unqualified free-function call (rpt::report_error from inside namespace rpt in reportcaller.cc) resolves to the bodied DEFINITION (report_inl.h) FIRST, header prototype (report.h) kept. The same mechanism as the C row \u2014 the fix is not language-gated (rule #10); C++ free-function decl\u2192def rides the identical decl-connectivity clause and keeps landing on definitions.",
       "file": "cppmultitu/reportcaller.cc",
       "line": 3,
       "col": 2,
       "expect": {
         "all": [
           "report_inl.h:3:6\nreport.h:4:6"
+        ],
+        "none": []
+      },
+      "status": "gold"
+    },
+    {
+      "id": "cpp-implicit-this-field-goto-def",
+      "difficulty": "medium",
+      "semantic_area": "cpp-multilang",
+      "lang": "cpp",
+      "root": "gold-corpus/cpp-fixture",
+      "comment": "Implicit-this field read in an auto method body: `return inner_;` goto-defs to the field decl. The read edge fed typing but the ref was UNBOUND, so gd answered empty while references named the decl (the projection-consistency net's find #5).",
+      "file": "autoret.cpp",
+      "line": 7,
+      "col": 29,
+      "expect": {
+        "all": [
+          "autoret.cpp:7:11"
         ],
         "none": []
       },
