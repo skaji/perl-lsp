@@ -113,10 +113,42 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
 /// Public for the bulk writers' failure recovery: a failed chunk commit
 /// un-strips its resident copies by decoding the blobs it still holds.
 pub fn decode_analysis(blob: &[u8]) -> Option<FileAnalysis> {
-    let bin = zstd::decode_all(blob).ok()?;
-    let mut fa: FileAnalysis = bincode::deserialize(&bin).ok()?;
-    fa.after_deserialize();
+    // Split because "512 us per rehydrate" is a composite of three stages
+    // here plus the SQL fetch outside, and which one dominates decides the
+    // fix: a batched fetch only helps stage 1, a codec change only stage 2,
+    // and if `after_deserialize` dominates then none of them help — the fix
+    // is to stop asking for a fully-indexed analysis per lookup.
+    let t = std::time::Instant::now();
+    let bin = crate::util::ghost_stats::timed("decode.2_zstd", || zstd::decode_all(blob)).ok()?;
+    let mut fa: FileAnalysis = crate::util::ghost_stats::timed("decode.3_bincode", || {
+        bincode::deserialize(&bin)
+    })
+    .ok()?;
+    crate::util::ghost_stats::timed("decode.4_after_deser", || fa.after_deserialize());
+    // The mean describes two populations: a 512 us average against ~260 ms
+    // for the giant blobs the thrash chews on is a 500x spread, and a fix
+    // tuned to the mean can miss the tail entirely. Bucket both axes.
+    decode_bucket("decode.us", t.elapsed().as_micros() as u64);
+    decode_bucket("decode.blob_kb", (blob.len() / 1024) as u64);
     Some(fa)
+}
+
+/// Log-ish bucket counter — the distribution behind an average, at the cost
+/// of one counter increment.
+fn decode_bucket(tag: &str, v: u64) {
+    if !crate::util::ghost_stats::enabled() {
+        return;
+    }
+    let label = match v {
+        0..=9 => "0-9",
+        10..=99 => "10-99",
+        100..=999 => "100-999",
+        1_000..=9_999 => "1k-10k",
+        10_000..=99_999 => "10k-100k",
+        100_000..=999_999 => "100k-1M",
+        _ => "1M+",
+    };
+    crate::util::ghost_stats::count(&format!("{tag}.{label}"));
 }
 
 /// Keyed single-file decode — the Slice-2 rehydration primitive
@@ -146,17 +178,21 @@ pub fn load_one_diag(conn: &Connection, path: &str) -> Result<FileAnalysis, Rehy
              ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END",
         )
         .map_err(|_| RehydrateMiss::NoRow)?;
-    let rows: Vec<(Option<Vec<u8>>, i64, i64)> = stmt
-        .query_map(params![path], |row| {
-            Ok((
-                row.get::<_, Option<Vec<u8>>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
+    // Stage 1 of the rehydrate: the SQL roundtrip that fetches the bytes.
+    // Timed separately from the decode because batching the fetch is only
+    // worth doing if THIS is the dominant term.
+    let rows: Vec<(Option<Vec<u8>>, i64, i64)> =
+        crate::util::ghost_stats::timed("decode.1_sql_fetch", || {
+            stmt.query_map(params![path], |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map(|rows| rows.flatten().collect::<Vec<_>>())
         })
-        .map_err(|_| RehydrateMiss::NoRow)?
-        .flatten()
-        .collect();
+        .map_err(|_| RehydrateMiss::NoRow)?;
     if rows.is_empty() {
         return Err(RehydrateMiss::NoRow);
     }
