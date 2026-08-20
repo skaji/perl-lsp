@@ -29,6 +29,14 @@ const GHOST_CAP: usize = 8192;
 /// killed without a clean shutdown still leaves the trail on record.
 const EMIT_EVERY_MISSES: u64 = 2000;
 
+/// How much of a cache report to print. The aggregate lines are cheap and
+/// always useful; the per-key culprit lists are only worth their bulk once.
+#[derive(Clone, Copy)]
+pub enum Detail {
+    Summary,
+    Full,
+}
+
 /// How often a long run re-emits the COUNTER block, for the same reason —
 /// `emit_all` only runs at a clean shutdown, so a run that is killed used to
 /// lose every counter, which is exactly what `EMIT_EVERY_MISSES` exists to
@@ -530,7 +538,10 @@ impl GhostStats {
             }
         }
         if n % EMIT_EVERY_MISSES == 0 {
-            self.emit("periodic");
+            // Summary only — see `report_with`. This fires on a miss COUNT, so
+            // on a busy cache it is the highest-frequency emitter in the
+            // process; the culprit list belongs at a terminal moment.
+            self.emit_with("periodic", Detail::Summary);
         }
     }
 
@@ -582,6 +593,19 @@ impl GhostStats {
     /// The full report: hit rate, ghost hits, the refetch histogram, and the
     /// top refetched keys by name (the culprits).
     pub fn report(&self, moment: &str) -> String {
+        self.report_with(moment, Detail::Full)
+    }
+
+    /// `Summary` drops the per-key culprit lists and keeps the two aggregate
+    /// lines. The periodic re-emit uses it because it fires every
+    /// `EMIT_EVERY_MISSES` and the culprit list barely changes between fires:
+    /// on a 138k run that was ~580 repetitions of the same ~30 lines, 17.5k
+    /// of the last 20k stderr lines, for information the histogram beside it
+    /// already carries. The full list still prints at every terminal moment
+    /// (`emit_all` / drop), and a KILLED run keeps `distinct_refetched_keys`
+    /// plus the histogram — which is the "few keys many times vs many keys
+    /// once" question this module exists to answer.
+    pub fn report_with(&self, moment: &str, detail: Detail) -> String {
         let hits = self.live_hits.load(Ordering::Relaxed);
         let misses = self.misses.load(Ordering::Relaxed);
         let ghost_hits = self.ghost_hits.load(Ordering::Relaxed);
@@ -627,25 +651,31 @@ impl GhostStats {
             buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5], buckets[6],
             label = self.label,
         ));
-        for (k, c) in top.iter().take(20) {
-            out.push_str(&format!(
-                "[ghost-stats #{seq}] {label}: refetched {c}x  {k}\n",
-                label = self.label
-            ));
-        }
-        let mut itop: Vec<(&Arc<str>, &u64)> = g.inval_refetch.iter().collect();
-        itop.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-        for (k, c) in itop.iter().take(10) {
-            out.push_str(&format!(
-                "[ghost-stats #{seq}] {label}: inval-refetched {c}x  {k}\n",
-                label = self.label
-            ));
+        if matches!(detail, Detail::Full) {
+            for (k, c) in top.iter().take(20) {
+                out.push_str(&format!(
+                    "[ghost-stats #{seq}] {label}: refetched {c}x  {k}\n",
+                    label = self.label
+                ));
+            }
+            let mut itop: Vec<(&Arc<str>, &u64)> = g.inval_refetch.iter().collect();
+            itop.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            for (k, c) in itop.iter().take(10) {
+                out.push_str(&format!(
+                    "[ghost-stats #{seq}] {label}: inval-refetched {c}x  {k}\n",
+                    label = self.label
+                ));
+            }
         }
         out
     }
 
     pub fn emit(&self, moment: &str) {
-        let text = self.report(moment);
+        self.emit_with(moment, Detail::Full)
+    }
+
+    pub fn emit_with(&self, moment: &str, detail: Detail) {
+        let text = self.report_with(moment, detail);
         match sink() {
             Sink::Off => {}
             Sink::Stderr => eprint!("{text}"),
