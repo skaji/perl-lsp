@@ -589,10 +589,17 @@ it, so the corpus queues in an unbounded channel (the ~7 GB cold spike).
 >
 > But #144 removed `purge_module`'s sweep, which ran ON THE PERSIST-WRITER
 > THREAD, taking `index_workspace` 211,580 -> 119,435 ms. So the writer's own
-> load roughly halved and the ratio necessarily moved with it. Re-measure
-> before quoting any multiplier; state the busy/idle figures instead, since
-> those are what was actually instrumented. Batching already
-exists (≤128 files/txn); `synchronous` is measured as a no-op (~973 commits).
+> load roughly halved and the ratio necessarily moved with it.
+>
+> **Do not restate this as a multiplier at all.** A walk-vs-writer ratio is
+> derived over two independently moving parts, so it goes stale whenever
+> EITHER side changes — which it has now done twice, once quietly enough to
+> be cited downstream for weeks. Record the components (writer busy, walk
+> wall-equivalent, park count × park duration) and let a reader divide, on
+> figures that carry their own date.
+
+Batching already exists (≤128 files/txn); `synchronous` is measured as a
+no-op (~973 commits).
 
 **Ten of `refs`' twelve columns have no reader anywhere in the tree.**
 `kind`, all four span coordinates, `access`, `flags`, `qual_kind`, `qual_id`,
