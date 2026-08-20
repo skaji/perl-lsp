@@ -147,6 +147,24 @@ fn check_cursor_contracts(
         }
     }
 
+    // I7: every implementations() location is a Declaration-access site.
+    // Promoted from provisional after holding at ZERO violations over
+    // ~9,600 cursors (fixtures + substrate) — the ADR sentence this
+    // enforces was written AFTER the measurement, not before (measured-
+    // then-promised, the gold harness's provisional→gold rule). A future
+    // candidate invariant enters the same way: prefixed "P1", partitioned
+    // into the reported-never-failing lane below, promoted only once the
+    // corpora back it.
+    for l in cs.implementations() {
+        if l.access != AccessKind::Declaration {
+            violations.push(format!(
+                "I7 {}:{}:{} `{}` — implementations() location {:?} {:?} has access {:?}, not Declaration",
+                path.display(), r.span.start.row, r.span.start.column,
+                r.target_name, l.key, l.span, l.access,
+            ));
+        }
+    }
+
     // I4: gr names a declaration ⇒ gd answers.
     if refs_img.iter().any(|l| l.access == AccessKind::Declaration)
         && cs.definitions().is_empty()
@@ -192,6 +210,14 @@ fn projection_contracts_hold_at_every_corpus_cursor() {
         }
     }
 
+    let (provisional, violations): (Vec<String>, Vec<String>) =
+        violations.into_iter().partition(|v| v.starts_with("P1"));
+    for v in &provisional {
+        eprintln!("provisional: {v}");
+    }
+    if !provisional.is_empty() {
+        eprintln!("({} provisional reports — never failing)", provisional.len());
+    }
     assert!(
         violations.is_empty(),
         "{} projection-contract violations over {} cursors ({} capped out) — first 20:\n{}",
@@ -276,6 +302,14 @@ fn projection_contracts_hold_at_every_pack_cursor() {
         store.remove_workspace(path);
     }
 
+    let (provisional, violations): (Vec<String>, Vec<String>) =
+        violations.into_iter().partition(|v| v.starts_with("P1"));
+    for v in &provisional {
+        eprintln!("provisional: {v}");
+    }
+    if !provisional.is_empty() {
+        eprintln!("({} provisional reports — never failing)", provisional.len());
+    }
     assert!(
         violations.is_empty(),
         "{} pack projection-contract violations over {} cursors ({} capped out) — first 20:\n{}",
@@ -371,6 +405,14 @@ fn projection_contracts_broad_corpus() {
     // generously from the un-minted token while references is empty (the
     // harness shows the mirror image). The fix is a builder emission for
     // invocant-position calls; these entries promote out the day it lands.
+    let (provisional, violations): (Vec<String>, Vec<String>) =
+        violations.into_iter().partition(|v| v.starts_with("P1"));
+    for v in provisional.iter().take(40) {
+        eprintln!("provisional: {v}");
+    }
+    if !provisional.is_empty() {
+        eprintln!("({} provisional reports — never failing; first 40 shown)", provisional.len());
+    }
     const KNOWN: &[(&str, usize, usize)] = &[
         ("Mojo/Exception.pm", 69, 26),
         ("PPI/Structure/List.pm", 61, 8),
@@ -409,4 +451,121 @@ fn projection_contracts_broad_corpus() {
         "{} projection-contract violations on the broad corpus (see stderr)",
         violations.len(),
     );
+}
+
+/// I6 — the `requires` edge round-trip, RESTATED after [B]'s counterexample
+/// killed the symmetric draft (#120): `implementations()` answers DISPATCH
+/// REACHABILITY (which concrete def satisfies this contract) while
+/// `references()` answers RENAME CORRECTNESS (which tokens must change
+/// together), and the rename set is legitimately wider — Composer never
+/// composes SubRole, so SubRole's atom reaches Composer::fetch in
+/// references and must NOT in implementations. Demanding symmetry would
+/// force rename to emit an incomplete edit set to satisfy the net. The
+/// net was built to test the code; here the code tested the net.
+///
+///   leg 1 (strict):   for every L in implementations(atom): references
+///                     from L contains the atom — an implementation the
+///                     inverse forgets is exactly this net's bug class.
+///   leg 2 (weakened): for every fulfilling method M: at least one atom
+///                     in references(M) has M in its implementations —
+///                     catches an inverse naming unrelated atoms without
+///                     asserting a symmetry the two verbs do not have.
+///
+/// The inverse direction IS `references()` — no new API, no new
+/// vocabulary; the round-trip is two existing projections disagreeing
+/// or not.
+#[test]
+fn requires_round_trip_holds_on_the_contract_fixtures() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_files/lib/Contract");
+    let store = FileStore::new();
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let mut by_path: Vec<(PathBuf, std::sync::Arc<FileAnalysis>, String)> = Vec::new();
+    for name in ["Role.pm", "SubRole.pm", "Composer.pm", "Deep.pm", "Broken.pm"] {
+        let p = root.join(name);
+        let src = std::fs::read_to_string(&p).unwrap();
+        let fa = std::sync::Arc::new(parse(&src));
+        store.insert_workspace_arc(p.clone(), fa.clone());
+        idx.register_workspace_module(p.clone(), fa.clone());
+        by_path.push((p, fa, src));
+    }
+    let find = |file: &str, needle: &str, token: &str| -> (PathBuf, tree_sitter::Point) {
+        let (p, _fa, src) = by_path.iter().find(|(p, ..)| p.ends_with(file)).unwrap();
+        let (row, line) = src
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(needle))
+            .unwrap_or_else(|| panic!("{file} lost its `{needle}` line"));
+        let col = line.find(token).unwrap();
+        (p.clone(), tree_sitter::Point { row, column: col })
+    };
+    let cs_at = |p: &PathBuf, pt: tree_sitter::Point| {
+        let fa = &by_path.iter().find(|(q, ..)| q == p).unwrap().1;
+        resolve(
+            &store,
+            fa,
+            FileKey::Path(p.clone()),
+            pt,
+            Some(&idx),
+            OverrideScope::default(),
+        )
+    };
+    let covers = |locs: &[RefLocation], p: &PathBuf, pt: tree_sitter::Point| {
+        locs.iter().any(|l| {
+            matches!(&l.key, FileKey::Path(q) if q == p)
+                && l.span.start.row == pt.row
+                && l.span.start.column <= pt.column
+                && pt.column < l.span.end.column
+        })
+    };
+
+    // Leg 1, from each requires atom.
+    for (atom_file, needle) in [("Role.pm", "requires 'fetch'"), ("SubRole.pm", "requires")] {
+        let (ap, apt) = find(atom_file, needle, "fetch");
+        let atom = cs_at(&ap, apt);
+        let impls = atom.implementations();
+        assert!(
+            !impls.is_empty(),
+            "implementations() from {atom_file}'s requires atom is empty — the forward walk lost the edge",
+        );
+        for l in &impls {
+            let FileKey::Path(lp) = &l.key else { continue };
+            let back = cs_at(lp, l.span.start).references();
+            assert!(
+                covers(&back, &ap, apt),
+                "leg 1: implementations({atom_file}) reached {}:{}:{} but references from \
+                 there does not name the atom — an implementation the inverse forgot",
+                lp.display(), l.span.start.row, l.span.start.column,
+            );
+        }
+    }
+
+    // Leg 2 (weakened), from each fulfilling method.
+    for m_file in ["Composer.pm", "Deep.pm"] {
+        let (mp, mpt) = find(m_file, "sub fetch", "fetch");
+        let m = cs_at(&mp, mpt);
+        let named_atoms: Vec<(PathBuf, tree_sitter::Point)> = m
+            .references()
+            .iter()
+            .filter_map(|l| match &l.key {
+                FileKey::Path(p)
+                    if p.ends_with("Role.pm") || p.ends_with("SubRole.pm") =>
+                {
+                    Some((p.clone(), l.span.start))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !named_atoms.is_empty(),
+            "references({m_file}::fetch) names no requires atom at all",
+        );
+        let some_atom_implements_back = named_atoms.iter().any(|(ap, apt)| {
+            let impls = cs_at(ap, *apt).implementations();
+            covers(&impls, &mp, mpt)
+        });
+        assert!(
+            some_atom_implements_back,
+            "leg 2: no atom named by references({m_file}::fetch) has it in implementations()",
+        );
+    }
 }
