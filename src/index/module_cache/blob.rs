@@ -423,3 +423,129 @@ pub fn save_to_db(
     }
     ok
 }
+
+#[cfg(test)]
+mod bag_share_probe {
+    //! What share of a stored FileAnalysis is the witness bag?
+    //!
+    //! `rows_for_diag` decodes the whole blob and then strips the bag, so a
+    //! rows-axis reader pays zstd + bincode for a lane it discards. That is
+    //! only worth acting on if the bag is a large share of the BYTES, and
+    //! only in the population whose decodes actually cost — so this reports
+    //! the DISTRIBUTION by blob size, never a corpus mean. A mean would
+    //! average a few giant analyses into thousands of tiny ones and say the
+    //! opposite of what the giants do.
+    //!
+    //! `cargo test --release bag_share -- --ignored --nocapture`
+    use crate::model::file_analysis::FileAnalysis;
+
+    #[test]
+    #[ignore]
+    fn probe_bag_share_of_stored_bytes() {
+        let root = std::path::Path::new("gold-corpus/local/lib/perl5");
+        if !root.is_dir() {
+            eprintln!("substrate absent — skipping");
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_pm(root, &mut files, 0);
+        files.sort();
+        // The single-point grammar accessor — `layering_tests` forbids
+        // naming the grammar outside the builder, and it is right to.
+        let mut parser = crate::build::builder::create_parser();
+
+        // (zstd bytes whole, zstd bytes bagless, bincode whole, bincode bagless)
+        let mut rows: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for path in files.iter() {
+            let Ok(src) = std::fs::read_to_string(path) else { continue };
+            if src.len() > 1_000_000 {
+                continue;
+            }
+            let Some(tree) = parser.parse(&src, None) else { continue };
+            let fa = crate::build::builder::build(&tree, src.as_bytes());
+            let mut bagless = fa.clone();
+            bagless.witnesses = Default::default();
+            let (Some(w), Some(b)) = (
+                super::encode_analysis(&fa),
+                super::encode_analysis(&bagless),
+            ) else {
+                continue;
+            };
+            let bw = bincode::serialize(&fa).map(|v| v.len()).unwrap_or(0);
+            let bb = bincode::serialize(&bagless).map(|v| v.len()).unwrap_or(0);
+            rows.push((w.len(), b.len(), bw, bb));
+        }
+        assert!(!rows.is_empty(), "no analyses built");
+
+        // Bucketed by STORED size, because the decode cost that matters
+        // tracks blob size and the two populations behave differently.
+        let buckets: [(&str, usize, usize); 5] = [
+            ("   <4 KB", 0, 4 * 1024),
+            (" 4-16 KB", 4 * 1024, 16 * 1024),
+            ("16-64 KB", 16 * 1024, 64 * 1024),
+            ("64-256KB", 64 * 1024, 256 * 1024),
+            ("  >256KB", 256 * 1024, usize::MAX),
+        ];
+        println!("\n{} analyses, sizes are the STORED (zstd) blob\n", rows.len());
+        println!("{:<9} {:>6} {:>12} {:>10} {:>10}", "bucket", "n", "zstd bytes", "bag% zstd", "bag% bin");
+        let mut tot_w = 0usize;
+        let mut tot_b = 0usize;
+        for (label, lo, hi) in buckets {
+            let sel: Vec<_> = rows.iter().filter(|r| r.0 >= lo && r.0 < hi).collect();
+            if sel.is_empty() {
+                continue;
+            }
+            let zw: usize = sel.iter().map(|r| r.0).sum();
+            let zb: usize = sel.iter().map(|r| r.1).sum();
+            let bw: usize = sel.iter().map(|r| r.2).sum();
+            let bb: usize = sel.iter().map(|r| r.3).sum();
+            tot_w += zw;
+            tot_b += zb;
+            println!(
+                "{:<9} {:>6} {:>12} {:>9.1}% {:>9.1}%",
+                label, sel.len(), zw,
+                100.0 * (zw - zb) as f64 / zw as f64,
+                100.0 * (bw - bb) as f64 / bw as f64,
+            );
+        }
+        let tot_bw: usize = rows.iter().map(|r| r.2).sum();
+        let tot_bb: usize = rows.iter().map(|r| r.3).sum();
+        println!(
+            "\nwhole corpus: {} zstd bytes, bag is {:.1}% of them",
+            tot_w, 100.0 * (tot_w - tot_b) as f64 / tot_w as f64
+        );
+        // The stage that costs most is bincode deserialize, and it works on
+        // the UNCOMPRESSED bytes — so this, not the zstd share, is the bag's
+        // share of the expensive half.
+        println!(
+            "              {} bincode bytes, bag is {:.1}% of them",
+            tot_bw, 100.0 * (tot_bw - tot_bb) as f64 / tot_bw as f64
+        );
+        // Where the BYTES live, which is where the decode seconds live.
+        let mut by_size: Vec<_> = rows.clone();
+        by_size.sort_by_key(|r| std::cmp::Reverse(r.0));
+        let top: usize = (rows.len() / 100).max(1);
+        let top_w: usize = by_size[..top].iter().map(|r| r.0).sum();
+        let top_b: usize = by_size[..top].iter().map(|r| r.1).sum();
+        println!(
+            "largest 1% ({} files): {:.1}% of all stored bytes, bag is {:.1}% of them",
+            top, 100.0 * top_w as f64 / tot_w as f64,
+            100.0 * (top_w - top_b) as f64 / top_w as f64
+        );
+    }
+
+    fn collect_pm(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u32) {
+        if depth > 12 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() {
+                collect_pm(&p, out, depth + 1);
+            } else if p.extension().map(|x| x == "pm").unwrap_or(false) {
+                out.push(p);
+            }
+        }
+    }
+}

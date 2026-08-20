@@ -166,6 +166,17 @@ impl PackBagCache {
         if let Some(g) = &self.ghost {
             g.on_miss(&path.to_string_lossy());
         }
+        // The axis of an actual DECODE. Deliberately here and NOT at
+        // `rehydrate_axes_or_resident`, which is where the `want_bag`
+        // parameter lives and where it is tempting to count: at a 99.2% hit
+        // rate that denominator is 1.66M lookups against 14.8k decodes, and
+        // it answers 84% rows-axis where the decodes say 69%. Only a decode
+        // can waste anything, so only decodes are counted.
+        crate::util::ghost_stats::count(if want_bag {
+            "decode.want_bag"
+        } else {
+            "decode.rows_only"
+        });
         let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
         let mut loaded = crate::util::ghost_stats::timed(
             "bagcache.decode", || (self.loader)(path))?;
