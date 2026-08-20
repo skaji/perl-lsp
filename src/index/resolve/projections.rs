@@ -107,7 +107,7 @@ impl<'a> CandidateSet<'a> {
                 let mask = self.target_visibility(t);
                 refs_to(self.files, self.module_index, t, mask)
             }
-            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => group_refs(
+            Some(ResolvedTarget::Group { local_spans, pinned_spans, members, .. }) => group_refs(
                 self.files,
                 self.module_index,
                 &self.origin_key,
@@ -199,7 +199,7 @@ impl<'a> CandidateSet<'a> {
                 .map(|loc| (loc, true))
                 .collect()
             }
-            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
+            Some(ResolvedTarget::Group { local_spans, pinned_spans, members, .. }) => {
                 let origin_path = key_for_sort(&self.origin_key);
                 let mut out: Vec<(RefLocation, bool)> = local_spans
                     .iter()
@@ -335,7 +335,7 @@ impl<'a> CandidateSet<'a> {
                     .map(|loc| (loc, new_name.to_string()))
                     .collect()
             }
-            Some(ResolvedTarget::Group { local_spans, pinned_spans, members }) => {
+            Some(ResolvedTarget::Group { local_spans, pinned_spans, members, .. }) => {
                 // Group spellings are bare name tokens; a sigil on the typed
                 // name applies only to variable-shaped members' own rules.
                 let bare_new = self.bare_new_name(new_name);

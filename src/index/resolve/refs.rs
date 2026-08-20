@@ -101,6 +101,7 @@ pub(super) fn group_from_projections(
         None => ResolvedTarget::Group {
             local_spans: p.variable_spans,
             pinned_spans: Vec::new(),
+            decl_spans: p.decl_spans.into_iter().map(|s| (None, s)).collect(),
             members,
         },
         Some(path) => ResolvedTarget::Group {
@@ -109,6 +110,11 @@ pub(super) fn group_from_projections(
                 .variable_spans
                 .into_iter()
                 .map(|s| (path.clone(), s))
+                .collect(),
+            decl_spans: p
+                .decl_spans
+                .into_iter()
+                .map(|s| (Some(path.clone()), s))
                 .collect(),
             members,
         },
