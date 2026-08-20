@@ -430,6 +430,26 @@ pub fn index_workspace_with_index(
                                 "walk.row_seeds",
                                 || (analysis.ref_row_seeds(), analysis.sym_row_seeds()),
                             );
+                            // MEASUREMENT-ONLY (PERL_LSP_QUAL_DUMP=<path>): the
+                            // shred-time (key, kind, qual) distribution per file,
+                            // for costing a class axis on the ref rows. Formatted
+                            // HERE because `RefRowSeed` is a Model type and the
+                            // util tier may not see it. Remove once that question
+                            // is answered.
+                            if crate::util::qual_dump::enabled() {
+                                let p = canon.to_string_lossy();
+                                let mut buf = String::with_capacity(seeds.len() * 48);
+                                for sd in &seeds {
+                                    buf.push_str(&format!(
+                                        "{p}\t{}\t{}\t{}\t{}\n",
+                                        sd.kind,
+                                        sd.qual_kind,
+                                        sd.qual.as_deref().unwrap_or("?"),
+                                        sd.key
+                                    ));
+                                }
+                                crate::util::qual_dump::append(&buf);
+                            }
                             let closure = analysis.pack.include_closure.clone();
                             (blob, seeds, sym_seeds, closure)
                         })
