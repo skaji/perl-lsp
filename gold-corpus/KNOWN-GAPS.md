@@ -399,10 +399,30 @@ doc comment names the consequence: a client caches a complete response and
 never asks again. It was invisible before the hoist, buried in 173 rows of
 ordering noise.
 
-Not fixed here. The honest options are to answer `isIncomplete: true` while a
-member-access receiver is still unresolved, or to make the member path wait
-on resolution; both are member-completion design decisions rather than a
-capping one.
+Not fixed, and three candidate gates were measured and rejected. The rate is
+**8 of 156 member positions (5.1%) during warm-up, 0% once the index
+settles** — three passes in one session, cold / after / after-that, with the
+second and third byte-identical. So flagging is free IF the gate only fires
+while the answer can still change. What that gate is, is the whole problem:
+
+| gate | warm cost | catches the 6-8 | verdict |
+|---|---|---|---|
+| receiver has no resolved type | **32.7%** | all | a third of member completions permanently non-cacheable — trades a correctness bug for a latency one |
+| resolver queue non-empty | 0% | **none** | `@INC` resolution is on demand; the query answers without ever enqueuing, so the queue is empty exactly when it matters |
+| any of this file's imports not cached | 1.9% | **none** | the import IS cached; that is not what is missing |
+
+The third measurement is the useful one, because it says where the real
+signal lives. `Mojo/UserAgent/CookieJar.pm` does `use Mojo::File qw(path)`
+and then `my $tmp = path(...)`, so the receiver's type comes from the
+IMPORTED SUB'S RETURN TYPE. `Mojo::File` is cached at cold-query time —
+what has not happened yet is `enrich_imported_types_with_keys` propagating
+`path()`'s return into this document's bag.
+
+So the condition is not "is the index warm" but **"has this document been
+enriched against its providers yet"**, which is per-document state
+(`FileStore::enrich_open`, the `enriched_snapshot` overlay) rather than
+anything the index queue or the module cache exposes. A fourth gate should
+start there; the first three are recorded so nobody re-measures them.
 
 **2 — ties that agree on every sort key.** `sort_by` is stable, so two
 candidates matching on `sort_text`, label AND kind keep the order the
