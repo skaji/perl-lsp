@@ -284,6 +284,16 @@ cargo test                                    # 900+ unit tests
 cargo build --release && ./e2e/run.sh         # 10 nvim-driven e2e suites (requires nvim)
 ```
 
+The e2e harness needs **nvim 0.10+** (it calls `vim.lsp.get_clients`); CI pins
+v0.11.0. Distro packages are often older — Ubuntu 24.04 ships 0.9.5, which fails
+at harness startup rather than as a test failure. Prefer the release tarball:
+
+```bash
+curl -sSL -o nvim.tar.gz \
+  https://github.com/neovim/neovim/releases/download/v0.11.0/nvim-linux-x86_64.tar.gz
+tar xzf nvim.tar.gz && export PATH="$PWD/nvim-linux-x86_64/bin:$PATH"
+```
+
 ## License
 
 [MIT](LICENSE)
