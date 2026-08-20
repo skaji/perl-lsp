@@ -224,17 +224,51 @@ fn run_probe(
 /// non-zero yet we still want the (empty) capture handled by the
 /// caller's parse; what matters is whether `execvp` found the binary.
 fn capture(driver: &str, args: &[String]) -> Option<(String, String)> {
-    let out = Command::new(driver)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+    let out = output_with_transient_retry(|| {
+        Command::new(driver)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    })?;
     Some((
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     ))
+}
+
+/// Spawn with retry on the TRANSIENT failure class (EAGAIN/ENOMEM under
+/// load); `NotFound` stays permanent — a machine may have no compiler,
+/// and that answer is probed once and cached. The stakes are bigger than
+/// one degraded session: `toolchain_fingerprint` folds "probe failed"
+/// into the identity that `validate_input_fingerprint` stamps on the
+/// pack modules DB, so a single failed spawn hard-clears a HEALTHY
+/// cached generation, restamps the degraded identity, and guarantees a
+/// second full wipe when the toolchain answers again — plus a clobber
+/// window for any concurrently-serving process whose warm-registered
+/// skeletons just lost their blobs (strict residency scores that as a
+/// crash). Same rationale as the pd-combine spawn retry.
+fn output_with_transient_retry(
+    mut spawn: impl FnMut() -> std::io::Result<std::process::Output>,
+) -> Option<std::process::Output> {
+    let mut delay = std::time::Duration::from_millis(20);
+    for attempt in 0..3 {
+        match spawn() {
+            Ok(out) => return Some(out),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) if attempt < 2 => {
+                crate::util::ghost_stats::count("toolchain.probe.spawn_retried");
+                std::thread::sleep(delay);
+                delay *= 5;
+            }
+            Err(_) => {
+                crate::util::ghost_stats::count("toolchain.probe.spawn_failed");
+                return None;
+            }
+        }
+    }
+    None
 }
 
 fn first_line(s: &str) -> String {

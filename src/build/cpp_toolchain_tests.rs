@@ -155,3 +155,47 @@ fn integration_probe_real_compiler_when_present() {
 fn probe_absent_compiler_is_none() {
     assert_eq!(probe("definitely-not-a-real-compiler-xyz", None), None);
 }
+
+/// A transiently-failing spawn (EAGAIN/ENOMEM class) retries and succeeds —
+/// the probe must not conclude "no toolchain" from one loaded-box hiccup,
+/// because that identity flip hard-clears a healthy pack modules DB.
+#[test]
+fn transient_spawn_failure_retries_to_success() {
+    let mut calls = 0;
+    let out = super::output_with_transient_retry(|| {
+        calls += 1;
+        if calls < 3 {
+            Err(std::io::Error::other("resource temporarily unavailable"))
+        } else {
+            std::process::Command::new("true").output()
+        }
+    });
+    assert_eq!(calls, 3);
+    assert!(out.is_some(), "third attempt succeeded — capture must return it");
+}
+
+/// `NotFound` is the PERMANENT class (a machine may have no compiler):
+/// answered immediately, no retry burned on it.
+#[test]
+fn missing_compiler_is_not_retried() {
+    let mut calls = 0;
+    let out = super::output_with_transient_retry(|| {
+        calls += 1;
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+    });
+    assert_eq!(calls, 1);
+    assert!(out.is_none());
+}
+
+/// A persistent transient failure gives up after the bounded attempts —
+/// the retry is a hiccup net, not an availability loop.
+#[test]
+fn persistent_spawn_failure_gives_up_bounded() {
+    let mut calls = 0;
+    let out = super::output_with_transient_retry(|| {
+        calls += 1;
+        Err(std::io::Error::other("still failing"))
+    });
+    assert_eq!(calls, 3);
+    assert!(out.is_none());
+}
