@@ -14,24 +14,43 @@ adjudication below can be re-checked rather than believed.
   is a capability difference, not a divergence.
 - Raw report: `report-substrate-raw.md`.
 
-**2,836 of 4,302 answers identical (65.9%); 1,466 divergent.** Of the
-identical, 945 were empty on both sides.
+**2,747 of 4,302 answers identical (63.9%); 1,555 divergent.** Of the
+identical, 895 were empty on both sides.
 
 ## The noise floor comes first
 
-The same binary, run twice over the same positions, disagrees with itself on
-**3.8%** of answers:
+> **Re-measured end to end with the guarded harness.** Every figure below
+> comes from one verified set: five runs (base + four head) on one position
+> set, each renamed from `.partial` only on clean completion, each carrying
+> its position-set hash and a completion marker, and cross-checked by
+> `diff` before use. The earlier figures in this section were published
+> twice and wrong twice — first from a floor measured over a different
+> population, then from noise files belonging to the *previous* invocation.
+> Neither error was visible in the output.
 
-| shape | self-vs-self |
-|---|---|
-| `reranked` | 164 |
-| `disagree` | 7 |
-| everything else | **0** |
+The same binary, run twice, disagrees with itself — but **the floor is not a
+number, it is a distribution.** Four head runs give six pairs, and on
+identical inputs they disagree by nearly 2× in one shape:
 
-Completion ordering is not stable run to run. So the 70 `reranked` rows in
-the A/B carry **no information at all** — they are below the floor — while
-`only-*`, `subset`, `superset` and `content-differs` can be read at face
-value. Without this measurement a reader has no way to tell those cases
+| shape | across 6 pairs | reported floor (worst) |
+|---|---|---|
+| `reranked` | 158, 163, 164, 164, 167, 168 | **168** |
+| `disagree` | 14, 15, 17, 19, 25, 25 | **25** |
+| everything else | all zero | **0** |
+
+A two-run floor is one draw from that. Whichever pair happened to run would
+have been quoted as "the floor", and for `disagree` that is anywhere from 14
+to 25 — so a block sitting in that band cannot be called signal on a two-run
+measurement. The reported floor is the **worst** pair, because a shape earns
+"signal" by clearing the worst self-disagreement observed, not the luckiest.
+`--noise` takes as many runs as you give it.
+
+All of the `disagree` floor is on completion; `definition` contributes zero
+in all six pairs. The groups table carries a per-verb floor for that reason.
+
+Completion ordering is not stable run to run. So the `reranked` block carries
+**no information at all** — it sits below the floor — while `only-base`,
+`subset`, `superset` and `content-differs` can be read at face value. Without this measurement a reader has no way to tell those cases
 apart, and the third of the A/B's shapes that is pure noise looks exactly
 like the two thirds that are not.
 
@@ -39,13 +58,13 @@ like the two thirds that are not.
 
 | claim | rows | verdict |
 |---|---|---|
-| head no longer offers `(anon)` as a completion candidate | 87 `subset` + 1 `only-base` | **fix** — an anonymous sub is not a name anyone can type. 88 of 88 lose `(anon)` and *nothing else*, on two independent runs |
-| head resolves goto-def to the declaration line where base returned `0:0` | 110 `disagree` | **fix** — every same-file definition disagreement is this |
+| head no longer offers `(anon)` as a completion candidate | 52 `subset` + 1 `only-base` | **fix** — an anonymous sub is not a name anyone can type. 53 of 53 lose `(anon)` and *nothing else*, and this has now reproduced on four independent runs |
+| head resolves goto-def to the declaration line where base returned `0:0` | 56 `disagree` | **fix** — every same-file definition disagreement is this, in every run |
 | head returns *every* `@INC` provider of a name where base returned one | ~117 `disagree` | **intended** — this is the `(name, inc-root)` candidate relation. `use strict` now answers both `perl/5.38.2/strict.pm` and `perl-base/strict.pm`. Flagged because it is my own change: the sweep is confirming it, not discovering it |
-| head answers where base was empty | 263 `only-head` | improvement (99 definition, 87 completion, 77 hover) |
-| head answers a superset | 182 `superset` | improvement (155 completion, 27 references) |
-| head truncates long completion lists | 27 `capped-head` | **by design** — `MAX_COMPLETION_ITEMS`, with `isIncomplete` set |
-| completion ranking moved | 70 `reranked` | **unreadable** — below the noise floor |
+| head answers where base was empty | 417 `only-head` | improvement |
+| head answers a superset | 254 `superset` | improvement |
+| head truncates long completion lists | 16 `capped-head` | **by design** — `MAX_COMPLETION_ITEMS`, with `isIncomplete` set |
+| completion ranking moved | 41 `reranked` | **unreadable** — floor is 168 |
 
 ## Needs a ruling
 
@@ -61,9 +80,10 @@ like the two thirds that are not.
   candidates. It is the only `only-base` row in the sweep that is not the
   `(anon)` fix.
 
-**526 completion `disagree` rows** where head both gains and loses real
-names. Perl builtins explain only 2%; **63% lose sigil'd (lexical or
-package) names**. Whether that is scope correctness or lost candidates is
+**531 completion `disagree` rows** where head both gains and loses real
+names (of 560 completion disagreements). Perl builtins explain only ~2% of
+what head gains; **341 — 64% — lose sigil'd (lexical or package) names**,
+against a `disagree`/completion floor of 25. Whether that is scope correctness or lost candidates is
 the one bucket this sweep cannot rule on.
 
 ## Two things about `main` itself

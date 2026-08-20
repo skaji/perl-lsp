@@ -39,9 +39,21 @@ fn rank_candidates_by_expected_type(
     };
     let mut tagged: Vec<(bool, CompletionCandidate)> =
         candidates.drain(..).map(|c| (is_match(&c), c)).collect();
+    // Demote every non-match by one from ITS OWN tier, rather than only
+    // variables sitting exactly on `PRIORITY_LOCAL`. The old guard never
+    // fired on the path this function actually serves: an in-scope `my` in
+    // `complete_general` carries `PRIORITY_FILE_WIDE`, so `$total` and
+    // `$label` both shipped as `010…` and the type-match ranking existed
+    // ONLY as the position this reorder gave them — invisible while the
+    // under-cap list went out unsorted, and lost the moment it is sorted
+    // (`010$label` sorts before `010$total`).
+    //
+    // One step is enough and cannot cross a tier: the priority constants are
+    // at least two apart, so a demoted candidate stays between its own tier
+    // and the next.
     for (m, c) in tagged.iter_mut() {
-        if !*m && matches!(c.kind, FaSymKind::Variable) && c.sort_priority == PRIORITY_LOCAL {
-            c.sort_priority = PRIORITY_LOCAL + 1;
+        if !*m {
+            c.sort_priority = c.sort_priority.saturating_add(1);
         }
     }
     tagged.sort_by_key(|(m, _)| !*m); // stable: matches (key false) lead
@@ -82,7 +94,19 @@ pub const MAX_COMPLETION_ITEMS: usize = 200;
 /// the workspace firehose by construction. Under the cap nothing changes:
 /// the full list returns as a complete (client-cacheable) response.
 pub(crate) fn cap_completion_items(items: &mut Vec<CompletionItem>, typed_prefix: &str) -> bool {
+    // Sorted whether or not anything is cut. The tiers assemble from
+    // hash-backed stores, so an unsorted list ships in iteration order and
+    // differs between two runs of the same binary on the same file — 173 of
+    // 1,458 positions over four cold runs (`bench/sweep`), every one of them
+    // under the cap. It also means the priority tiers and the type-match
+    // ranking were computed and then DISCARDED below 200 items, which is
+    // where most lists live.
+    //
+    // This does not claim users saw scrambled lists: a conforming client
+    // re-sorts by `sort_text`. It makes our own output reproducible, and it
+    // is what puts the ranking work into effect at all.
     if items.len() <= MAX_COMPLETION_ITEMS {
+        sort_completion_items(items);
         return false;
     }
     if !typed_prefix.is_empty() {
@@ -94,14 +118,24 @@ pub(crate) fn cap_completion_items(items: &mut Vec<CompletionItem>, typed_prefix
         });
     }
     if items.len() > MAX_COMPLETION_ITEMS {
-        items.sort_by(|a, b| {
-            let ka = a.sort_text.as_deref().unwrap_or(&a.label);
-            let kb = b.sort_text.as_deref().unwrap_or(&b.label);
-            ka.cmp(kb).then_with(|| a.label.cmp(&b.label))
-        });
+        sort_completion_items(items);
         items.truncate(MAX_COMPLETION_ITEMS);
     }
     true
+}
+
+/// The order the client sorts on (`sort_text`, label fallback), with label
+/// then kind as tie-breaks so the comparator is TOTAL. `sort_by` is stable,
+/// so two candidates agreeing on every key would otherwise keep the order
+/// the producing map iterated in — the nondeterminism this exists to remove.
+fn sort_completion_items(items: &mut [CompletionItem]) {
+    items.sort_by(|a, b| {
+        let ka = a.sort_text.as_deref().unwrap_or(&a.label);
+        let kb = b.sort_text.as_deref().unwrap_or(&b.label);
+        ka.cmp(kb)
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| format!("{:?}", a.kind).cmp(&format!("{:?}", b.kind)))
+    });
 }
 
 pub(crate) fn candidate_to_completion_item(c: CompletionCandidate) -> CompletionItem {

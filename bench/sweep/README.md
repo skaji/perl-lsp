@@ -86,6 +86,59 @@ the workspace path, and their `EXTRACT_VERSION` and plugin fingerprints
 differ — sharing one makes each side hard-clear the other's cache on every
 startup.
 
+**A run's answers file does not exist until the run finishes.** Answers are
+written to `<out>.partial` and renamed only on clean completion, so an
+aborted or still-running side is never mistakable for a finished one. This is
+the fix for the root cause behind three separate wrong results in one
+evening: a measurement reading a file that is not yet what it will be.
+
+**A side that stopped is not a side that found less.** The header records how
+many positions a complete run would answer, and a completion marker is
+written at the very end; `diff` refuses (exit 3) when either check fails.
+`--allow-short` compares anyway and stamps the report TRUNCATED — because
+every ratio over a short side is a ratio over the positions it reached before
+stopping, which are the cheap ones.
+
+**All four inputs are cross-checked for provenance.** The diff verifies that
+the noise pair answered the same positions (by content hash) and did not run
+before the A/B, and refuses the floor otherwise. This is not defensive
+paranoia: four well-formed answer files produce a well-formed report whether
+or not they belong together, and a floor from a previous run reads exactly
+like a floor from this one. It happened, and it published wrong numbers —
+a report generated the moment the head side finished, while the two noise
+runs the script had not yet started sat on disk from the previous invocation.
+
+**The floor is a distribution, not a number, so give `--noise` more than two
+runs.** Four head runs on the substrate yield six pairs, and on identical
+inputs `disagree` came out 14, 15, 17, 19, 25, 25 — nearly 2x between the
+luckiest and unluckiest pair. A two-run floor reports whichever one happened
+to run. The tool measures every pair and reports the WORST, because a shape
+earns "signal" by clearing the worst self-disagreement observed; the range is
+printed alongside so the estimate's stability is visible. `reranked` is tight
+(158-168); `disagree` is not.
+
+**The floor is sliced per verb as well as per shape.** An aggregate is the
+wrong baseline for a single-verb block, and it errs in both directions:
+measured here, every one of the `disagree` floor's occurrences is on
+completion, so a `definition` block read against the aggregate is handed
+noise it does not have.
+
+**The noise floor is measured over exactly the answers compared.** It is a
+per-answer rate, so it is only subtractable from a count taken over the same
+answers. Measured on Koha: the base wedged repeatedly and produced 1,184
+comparable answers where the two noise runs produced ~21,790. Quoting the
+larger population's floor beside the smaller count is not a correction, it is
+a different measurement — and a biased one, because the answers a stalling
+side reaches first are the cheap ones, which is exactly where two runs agree.
+The report says what fraction of the comparison the floor could cover.
+
+**A re-warmed server is not the same server.** Every row records the server
+generation that answered it. Answers from a generation that never
+re-confirmed cross-file readiness after a restart are HELD OUT of every count
+— on Koha 3 of 8 restarts never re-warmed, and an unconfirmed empty cannot be
+told apart from a lost resolution. Answers from a generation that did re-warm
+are counted but reported, because a rebuilt index is not the same index.
+
 ## Reading the report
 
 Shapes are ordered by what a reviewer must look at first. `only-base` and
@@ -96,6 +149,19 @@ candidates. `disagree` is the residual that always needs a human.
 `n` is positions; **`distinct` is claims** — the number of different (base
 answer, head answer) pairs behind them. One generated data file can
 contribute sixty positions that disagree identically. Adjudicate `distinct`.
+
+## Testing the harness
+
+`selftest.py` covers the rules that decide the report — normalisation,
+classification, the floor's intersection, the recheck supersede. `run.sh` is
+covered by `selftest-shell.sh` instead, which invokes it for real against a
+throwaway two-file corpus and asserts the same binary agrees with itself.
+
+That split is not tidiness. `run.sh` was once completely non-functional —
+`"$@:3"` is not slice syntax, so both sides died on `unrecognized arguments`
+— while the Python suite stayed green throughout, because it never invoked
+the entry point. A unit suite that passes says nothing about whether the
+thing runs.
 
 ## What it does not do
 

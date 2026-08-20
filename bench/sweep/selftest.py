@@ -138,7 +138,7 @@ check("an untruncated smaller list is still a subset",
 
 # The recheck pass must SUPERSEDE the cold answer, or the sweep measures
 # startup rather than the branch. Written as an appended row, applied on load.
-import io, json as _json, tempfile as _tf
+import json as _json, tempfile as _tf
 _p = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
 _p.write(_json.dumps({"_meta": {"side": "t"}}) + "\n")
 _p.write(_json.dumps({"file": "a.pm", "line": 1, "char": 2, "verb": "definition",
@@ -153,6 +153,73 @@ check("a warm recheck supersedes the cold empty answer",
       (_row["norm"], _row.get("filled_when_warm")),
       ([["lib/X.pm", [0, 0, 0, 1]]], True))
 os.unlink(_p.name)
+
+
+# The noise floor is a per-answer RATE, so it is only subtractable from a
+# count over the same answers. On Koha the base wedged and produced 1,184
+# comparable answers where the two noise runs produced ~21,790; a floor from
+# the larger population quoted beside the smaller count is not a correction,
+# it is a different measurement. `_shape_counts` must intersect.
+def _tmp_answers(rows):
+    f = _tf.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+    f.write(_json.dumps({"_meta": {"side": "t"}}) + "\n")
+    for r in rows:
+        f.write(_json.dumps(r) + "\n")
+    f.close()
+    return f.name
+
+def _row(line, norm, **kw):
+    return dict({"file": "a.pm", "line": line, "char": 0, "verb": "definition",
+                 "norm": norm, "ms": 1}, **kw)
+
+_D = [["lib/X.pm", [0, 0, 0, 1]]]
+# Two noise runs that disagree at line 1 AND at line 9. Only line 1 is in the
+# A/B's comparable set, so only line 1 may count toward the floor.
+_n1 = _tmp_answers([_row(1, _D), _row(9, _D)])
+_n2 = _tmp_answers([_row(1, []), _row(9, [])])
+_counts, _cov = S._shape_counts(_n1, _n2, {"definition"},
+                                {("a.pm", 1, 0, "definition")})
+# Shape-level keys are plain strings; per-verb keys are (shape, verb) tuples.
+# Summing indiscriminately double-counts, which is why this asserts each.
+_shape_only = {k: v for k, v in _counts.items() if isinstance(k, str)}
+check("the floor counts only answers the A/B actually compared",
+      (sum(_shape_only.values()), _cov), (1, 1))
+check("the floor is also sliced per verb, the only baseline a single-verb "
+      "block can be read against",
+      _counts.get(("only-base", "definition")), 1)
+for _f in (_n1, _n2):
+    os.unlink(_f)
+
+
+# A short side is a side that STOPPED, not a side that found less. Every
+# ratio over it is a ratio over the positions it got through — the cheap ones.
+_short = _tmp_answers([_row(1, _D)])
+_L = open(_short).read().split("\n")
+_m = _json.loads(_L[0]); _m["_meta"]["expected_positions"] = 10
+_L[0] = _json.dumps(_m); open(_short, "w").write("\n".join(_L))
+_meta_s, _rows_s = S._load(_short)
+check("a truncated side is detected against its own declared count",
+      S._completeness(_meta_s, _rows_s)[:2], (1, 10))
+
+# ...and a side that answered everything but never wrote its completion
+# marker died somewhere after the main loop, which is equally not-finished.
+_nomark = _tmp_answers([_row(1, _D)])
+_L = open(_nomark).read().split("\n")
+_m = _json.loads(_L[0]); _m["_meta"]["expected_positions"] = 1
+_L[0] = _json.dumps(_m); open(_nomark, "w").write("\n".join(_L))
+_meta_n, _rows_n = S._load(_nomark)
+check("a run with no completion marker is not treated as complete",
+      S._completeness(_meta_n, _rows_n)[2], False)
+
+_full = _tmp_answers([_row(1, _D), {"_event": "complete", "positions_answered": 1}])
+_L = open(_full).read().split("\n")
+_m = _json.loads(_L[0]); _m["_meta"]["expected_positions"] = 1
+_L[0] = _json.dumps(_m); open(_full, "w").write("\n".join(_L))
+_meta_f, _rows_f = S._load(_full)
+check("a complete run reports complete",
+      S._completeness(_meta_f, _rows_f), (1, 1, True))
+for _f in (_short, _nomark, _full):
+    os.unlink(_f)
 
 
 # --- position selection -----------------------------------------------------

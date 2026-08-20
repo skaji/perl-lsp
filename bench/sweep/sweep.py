@@ -25,7 +25,7 @@ Two traps this handles, both of which silently corrupt a comparison:
     look like it lost answers -- the single most misleading thing a
     differential sweep can report.
 """
-import argparse, json, os, pathlib, subprocess, sys, time
+import argparse, hashlib, json, os, pathlib, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -86,7 +86,16 @@ def cmd_positions(args):
           f"per_file={args.per_file})")
 
 
+def _sha_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
 def cmd_run(args):
+    _t0_wall = time.time()
     root = os.path.abspath(args.root)
     root_uri = pathlib.Path(root).as_uri()
     pos = [json.loads(l) for l in open(args.positions)]
@@ -184,19 +193,51 @@ def cmd_run(args):
     if ready_ms is not None:
         print(f"[{args.side}] cross-file ready after {round(ready_ms)}ms", flush=True)
 
+    # Written to `.partial` and renamed only on clean completion. A reader
+    # cannot tell a finished answer file from one still being appended to,
+    # and the failure is silent: three sessions in one evening published
+    # numbers taken from a file that was not yet what it would be — a floor
+    # from a run that had not started, and a coverage ratio read while the
+    # base side was still writing. The rename is the only signal that costs
+    # nothing to check and cannot be misread.
+    out_partial = args.out + ".partial"
     opened, done = {first: ready}, 0
     # Lists, not ints: the loop rebinds `lsp` on restart and these have to
     # survive that without a nonlocal dance in a nested scope.
     wedge, restarts = [0], [0]
+    # A re-warmed server is not the same server. Rows carry the SERVER
+    # GENERATION they were answered by, and whether that generation ever
+    # confirmed cross-file readiness — on Koha 3 of 8 restarts never did, and
+    # a row from an unconfirmed generation is an answer from a server that
+    # was, as far as anyone can show, still cold.
+    epoch, epoch_warm = [0], [True]
     deferred = []
     t0 = time.monotonic()
-    with open(args.out, "w") as fh:
+    with open(out_partial, "w") as fh:
         fh.write(json.dumps({"_meta": {
+            # Identity of the QUESTIONS and of when they were asked. The diff
+            # cross-checks these across all four inputs, because nothing else
+            # can: four well-formed answer files from two different sweeps
+            # produce a report that is entirely plausible and entirely wrong.
+            # That happened — a report was generated the moment the head side
+            # finished, while the two noise runs the script had yet to start
+            # were still on disk from the previous invocation, and the floor
+            # it published came from a different sweep.
+            "positions_sha": _sha_file(args.positions),
+            "positions_path": os.path.abspath(args.positions),
+            "started_at": _t0_wall,
             "side": args.side, "bin": os.path.abspath(args.bin), "root": root,
             "root_uri": root_uri, "ready_ms": ready_ms and round(ready_ms),
             "cross_file_ready": ready_ms is not None, "verbs": served,
             "unserved": sorted(set(VERBS) - set(served)),
             "verb_rate": VERB_RATE, "positions": len(pos),
+            # What a COMPLETE run of this side would contain. A side that
+            # aborted looks exactly like a side that legitimately answered
+            # less, and that is precisely the distinction the sweep exists to
+            # draw — so the expectation is written down before the work
+            # starts, and the diff checks the delivery against it.
+            "expected_positions": len(pos),
+            "expected_files": len({p["file"] for p in pos}),
             "version": _version(args.bin),
         }}) + "\n")
         by_file = {}
@@ -213,7 +254,8 @@ def cmd_run(args):
                                   {"textDocument": {"uri": uri}}, timeout=args.timeout)
             fh.write(json.dumps({
                 "file": rel, "kind": "file", "verb": "documentSymbol",
-                "ms": round(ms, 1),
+                "ms": round(ms, 1), "epoch": epoch[0],
+                **({"warm_unconfirmed": True} if not epoch_warm[0] else {}),
                 "norm": N.normalize("documentSymbol", (msg or {}).get("result"), root_uri),
                 "err": _err(msg),
             }, sort_keys=True, default=str) + "\n")
@@ -232,7 +274,10 @@ def cmd_run(args):
                     msg, ms = lsp.request(method, params, timeout=args.timeout)
                     rec = {"file": rel, "line": p["line"], "char": ch,
                            "kind": p["kind"], "name": p["name"], "verb": verb,
-                           "ms": round(ms, 1), "err": _err(msg)}
+                           "ms": round(ms, 1), "err": _err(msg),
+                           "epoch": epoch[0]}
+                    if not epoch_warm[0]:
+                        rec["warm_unconfirmed"] = True
                     if msg is None:
                         rec["timeout"] = True
                         rec["norm"] = None
@@ -301,7 +346,8 @@ def cmd_run(args):
                                     "reason": "restart budget exhausted",
                                     "swept": done, "of": len(pos)}) + "\n")
                                 print(f"[{args.side}] ABORTED after "
-                                      f"{restarts[0]} restarts", flush=True)
+                                      f"{restarts[0]} restarts — leaving "
+                                      f"{out_partial} unrenamed", flush=True)
                                 lsp.shutdown()
                                 return
                             try:
@@ -323,8 +369,10 @@ def cmd_run(args):
                             # the initial gate exists to close, and easier to
                             # miss here because the run is already underway.
                             _, _, warm_ms = await_cross_file(lsp, args.rewarm_timeout)
+                            epoch[0] += 1
+                            epoch_warm[0] = warm_ms is not None
                             fh.write(json.dumps({"_event": "restart-rewarm",
-                                "restart": restarts[0],
+                                "restart": restarts[0], "epoch": epoch[0],
                                 "cross_file_ready_ms": warm_ms and round(warm_ms),
                                 "confirmed": warm_ms is not None}) + "\n")
                             if warm_ms is None:
@@ -358,13 +406,17 @@ def cmd_run(args):
             fh.write(json.dumps({"_recheck": True, "file": rel, "line": ln,
                                  "char": ch, "verb": verb, "kind": kind,
                                  "name": name, "ms": round(ms, 1),
-                                 "norm": norm}, sort_keys=True, default=str) + "\n")
+                                 "epoch": epoch[0], "norm": norm},
+                                sort_keys=True, default=str) + "\n")
         fh.write(json.dumps({"_event": "recheck",
                              "empty_first_ask": len(deferred),
                              "filled_when_warm": filled}) + "\n")
+        fh.write(json.dumps({"_event": "complete",
+                             "positions_answered": done}) + "\n")
         print(f"[{args.side}] recheck: {filled} of {len(deferred)} empty answers "
               f"resolved once warm", flush=True)
     lsp.shutdown()
+    os.replace(out_partial, args.out)
     print(f"[{args.side}] done: {done} positions in "
           f"{time.monotonic()-t0:.0f}s -> {args.out}")
 
@@ -434,6 +486,18 @@ def _open(lsp, root, rel):
 
 # ---- diff ----
 
+def _completeness(meta, rows):
+    """Did this side deliver what its own header said it would?
+
+    Returns (answered, expected, complete_marker_present). A short side is
+    not a side that found less — it is a side that stopped, and conflating
+    the two is the exact error this whole harness exists to prevent.
+    """
+    positions = {(r["file"], r.get("line"), r.get("char"))
+                 for r in rows.values() if r.get("line") is not None}
+    return len(positions), meta.get("expected_positions"), meta.get("_complete")
+
+
 def _load(path):
     meta, rows, events = {}, {}, []
     for line in open(path):
@@ -455,6 +519,7 @@ def _load(path):
             continue
         rows[key] = r
     meta["events"] = events
+    meta["_complete"] = any(e.get("_event") == "complete" for e in events)
     return meta, rows
 
 
@@ -534,19 +599,127 @@ SHAPE_ORDER = ["only-base", "subset", "timeout-head", "error-head", "disagree",
                "missing-head", "missing-base"]
 
 
-def _shape_counts(base_path, head_path, common):
-    """Shape histogram for one pair of answer files — used for the A/B run and,
-    with the SAME binary on both sides, for the noise floor."""
+def _floor_over_pairs(paths, common, only_keys):
+    """The floor from EVERY pair of same-binary runs, not one pair.
+
+    A two-run floor is a single draw from a distribution, and for some shapes
+    that distribution is wide: measured over four head runs on the substrate,
+    `disagree` came out 14, 15, 17, 19, 25, 25 across the six pairs — nearly
+    2x between the luckiest and unluckiest pair, on identical inputs. Quoting
+    whichever pair happened to run is how a shape gets called signal because
+    its floor was measured on a good day.
+
+    The reported floor is the MAX across pairs, because a shape earns
+    "signal" only by clearing the worst self-disagreement observed, and the
+    range comes back too so a reader can see how stable the estimate is.
+    `reranked` is tight here (158-168); `disagree` is not.
+    """
+    import itertools
+    loaded = [(p, _load(p)[1]) for p in paths]
+    per_pair = []
+    covered = 0
+    for (pa, a), (pb, b) in itertools.combinations(loaded, 2):
+        keys = set(a) & set(b) & only_keys
+        covered = max(covered, len(keys))
+        c = {}
+        for k in keys:
+            if k[3] not in common:
+                continue
+            sh = classify(k[3], a[k], b[k])
+            if sh != "same":
+                c[sh] = c.get(sh, 0) + 1
+                c[(sh, k[3])] = c.get((sh, k[3]), 0) + 1
+        per_pair.append(c)
+    if not per_pair:
+        return {}, {}, 0, 0
+    shapes = {k for c in per_pair for k in c}
+    floor = {k: max(c.get(k, 0) for c in per_pair) for k in shapes}
+    spread = {k: (min(c.get(k, 0) for c in per_pair),
+                  max(c.get(k, 0) for c in per_pair)) for k in shapes}
+    return floor, spread, covered, len(per_pair)
+
+
+def _shape_counts(base_path, head_path, common, only_keys):
+    """The noise floor, measured over EXACTLY the answers the A/B compared.
+
+    `only_keys` is not an optimisation, it is the whole correctness of the
+    number. The floor is a per-answer rate, so it is only subtractable from a
+    count taken over the same answers. Measured on Koha: the base wedged
+    repeatedly and produced 1,184 comparable answers where the two noise runs
+    (which never wedge, being the head binary) produced ~21,790 — quoting a
+    floor from 21,790 beside a count from 1,184 compares populations that
+    differ by a factor of eighteen and share an unknown fraction of their
+    members.
+
+    It is also biased, not merely scaled: the answers the base reached before
+    wedging are the CHEAP ones, and cheap positions are exactly where two
+    runs agree. A whole-corpus floor is therefore an over-estimate of the
+    floor on the surviving sample in some shapes and an under-estimate in
+    others, with no way to tell which from the number itself.
+
+    Returns the histogram plus how many of `only_keys` the noise runs could
+    actually answer — a floor measured over a fraction of the comparison is
+    still not comparable, and the caller has to be able to say so.
+    """
     _, a = _load(base_path)
     _, b = _load(head_path)
+    keys = (set(a) & set(b) & only_keys)
     out = {}
-    for k in set(a) & set(b):
+    for k in keys:
         if k[3] not in common:
             continue
         sh = classify(k[3], a[k], b[k])
         if sh != "same":
+            # Keyed by (shape, verb) as well as shape. An aggregate floor is
+            # the wrong baseline for a single-verb block and the error is not
+            # conservative in either direction: measured here, `disagree` is
+            # 5 aggregate and ALL 5 of it is completion, so a `definition`
+            # sub-block read against the aggregate is handed noise it does
+            # not have, while on another corpus the reverse hides real signal.
             out[sh] = out.get(sh, 0) + 1
-    return out
+            out[(sh, k[3])] = out.get((sh, k[3]), 0) + 1
+    return out, len(keys)
+
+
+def _check_provenance(meta_a, meta_b, noise_paths):
+    """Do all four inputs come from ONE sweep, asking ONE set of questions?
+
+    Nothing downstream can tell that they do not. Four well-formed answer
+    files produce a well-formed report whether or not they belong together,
+    and the failure is silent and plausible — a floor from a previous run,
+    quoted beside fresh counts, reads exactly like a floor from this one.
+    It happened here, and it published wrong numbers.
+
+    Two checks. The positions hash must match, because a floor over different
+    QUESTIONS is not a floor at all. And the noise runs must not predate the
+    A/B: a noise pair older than the run it is quoted against is the stale
+    -file case by definition.
+    """
+    metas = {}
+    for path in noise_paths:
+        m, _ = _load(path)
+        metas[os.path.basename(path)] = m
+    want = meta_b.get("positions_sha") or meta_a.get("positions_sha")
+    if want:
+        for label, m in metas.items():
+            got = m.get("positions_sha")
+            if got and got != want:
+                return (f"{label} answered a DIFFERENT position set "
+                        f"({got} vs {want}) — its floor is not a floor for "
+                        f"this comparison")
+            if not got:
+                return (f"{label} predates position-set stamping, so it "
+                        f"cannot be shown to answer the same questions")
+    ab_start = max(x for x in (meta_a.get("started_at"), meta_b.get("started_at"))
+                   if x) if (meta_a.get("started_at") or meta_b.get("started_at")) else None
+    if ab_start:
+        for label, m in metas.items():
+            st = m.get("started_at")
+            if st and st < ab_start:
+                return (f"{label} STARTED BEFORE the A/B run it is quoted "
+                        f"against — this is the stale-file case; re-run the "
+                        f"noise pair or pass --force-noise")
+    return None
 
 
 def cmd_diff(args):
@@ -566,10 +739,56 @@ def cmd_diff(args):
     # branch and bury what does. The shortfall is reported as COVERAGE
     # instead, which is the honest framing: this is what we compared, and
     # this is what we could not.
+    # Completeness before anything else. A short side is a side that
+    # STOPPED, and every ratio computed over it is a ratio over the positions
+    # it got through — which are the cheap ones. This is checked first and
+    # loudly because the alternative is a plausible report built on a
+    # truncated file, which is how three sessions published wrong numbers in
+    # one evening.
+    short = []
+    for label, m, rws in (("base", meta_a, base), ("head", meta_b, head)):
+        got, want, done_marker = _completeness(m, rws)
+        if want is None:
+            # An unverifiable file is not a verified one. Silently accepting
+            # it would re-open the exact hole these checks close — every
+            # wrong number this evening came from a file that looked fine.
+            short.append(f"{label} predates completeness stamping, so it "
+                         f"cannot be shown to be a complete run")
+        elif got < want:
+            short.append(f"{label} answered {got} of the {want} positions its "
+                         f"own header declared ({got/want:.1%})")
+        elif not done_marker:
+            short.append(f"{label} reached its position count but never wrote "
+                         f"a completion marker — it may have died in the "
+                         f"recheck pass")
+    if short and not args.allow_short:
+        for msg in short:
+            print(f"ERROR: {msg}", file=sys.stderr)
+        print("Refusing to diff a truncated run. Re-run the short side, or "
+              "pass --allow-short to compare anyway (the report will say so).",
+              file=sys.stderr)
+        sys.exit(3)
+
     all_keys = {k for k in (set(base) | set(head)) if k[3] in common}
-    keys = {k for k in all_keys if k in base and k in head}
+    comparable = {k for k in all_keys if k in base and k in head}
     only_base_keys = sum(1 for k in all_keys if k not in head)
     only_head_keys = sum(1 for k in all_keys if k not in base)
+
+    # An answer from a server generation that never re-confirmed cross-file
+    # readiness is an answer from a server that was, as far as anything here
+    # can show, still cold. It is held out rather than counted: an unconfirmed
+    # empty is indistinguishable from a lost resolution, which is the one
+    # confusion this whole harness exists to prevent.
+    unconfirmed = {k for k in comparable
+                   if base[k].get("warm_unconfirmed")
+                   or head[k].get("warm_unconfirmed")}
+    keys = comparable - unconfirmed
+    # Rows answered AFTER a restart by a generation that did re-warm are
+    # counted, but reported: they came from a different process with a
+    # rebuilt index, and a reader deciding how much to trust a thin block
+    # should know how much of it is post-restart.
+    post_restart = sum(1 for k in keys
+                       if base[k].get("epoch", 0) or head[k].get("epoch", 0))
 
     groups, counts, uninformative = {}, {}, 0
     for k in sorted(keys, key=lambda k: (k[0], k[3], k[1] is None, k[1] or 0, k[2] or 0)):
@@ -595,9 +814,18 @@ def cmd_diff(args):
     # way to tell a 68-row `reranked` block from nothing at all, because
     # completion ordering is not stable run to run. This is not a correction
     # applied to the counts; it is the resolution limit printed beside them.
-    noise = {}
+    noise, noise_n, noise_reject = {}, 0, None
+    spread, npairs = {}, 0
+    noise_paths = list(args.noise or [])
     if args.noise_base and args.noise_head:
-        noise = _shape_counts(args.noise_base, args.noise_head, common)
+        noise_paths = [args.noise_base, args.noise_head] + noise_paths
+    if len(noise_paths) >= 2:
+        noise_reject = _check_provenance(meta_a, meta_b, noise_paths)
+        if noise_reject:
+            print(f"WARNING: {noise_reject}", file=sys.stderr)
+        if not (noise_reject and not args.force_noise):
+            noise, spread, noise_n, npairs = _floor_over_pairs(
+                noise_paths, common, keys)
 
     total = len(keys)
     diverged = sum(v for (s, _), v in counts.items() if s != "same")
@@ -632,14 +860,37 @@ def cmd_diff(args):
             W(f"- **{side} {ev['_event']}**: " + ", ".join(
                 f"{k}={v}" for k, v in sorted(ev.items()) if k != "_event"))
     W("")
+    if short:
+        W("> **TRUNCATED RUN — every number below is over the positions the "
+          "short side got through, which are the ones it reached before it "
+          "stopped, not a sample of the corpus.**\n")
+        for msg in short:
+            W(f"> - {msg}")
+        W("")
     W(f"**{total} (position, verb) answers compared — {same} identical "
       f"({same/max(total,1):.2%}), {diverged} divergent.**\n")
     if only_base_keys or only_head_keys:
+        reach = total / max(len(all_keys), 1)
         W(f"Coverage shortfall: {only_base_keys} answers exist only in the base "
           f"run and {only_head_keys} only in the head run — a side that aborted "
           f"or skipped never produced them. They are EXCLUDED from every count "
           f"above, because a position one side never reached is a gap in the "
           f"sweep, not a disagreement about an answer.\n")
+        if reach < 0.5:
+            W(f"> **Only {reach:.1%} of positions were answered by both sides.** "
+              f"The comparable set is not a random sample of the corpus — it is "
+              f"the positions the weaker side got through before it stopped, "
+              f"which are the cheap ones. Treat what follows as a statement "
+              f"about coverage, not a divergence list.\n")
+    if unconfirmed:
+        W(f"Held out: {len(unconfirmed)} answers came from a server generation "
+          f"that never re-confirmed cross-file readiness after a restart. They "
+          f"are excluded from every count — an unconfirmed empty cannot be "
+          f"told apart from a lost resolution.\n")
+    if post_restart:
+        W(f"Of the {total} compared, {post_restart} were answered after at "
+          f"least one side restarted (by a generation that did re-warm). A "
+          f"rebuilt index is not the same index.\n")
     W(f"Of the identical ones, {uninformative} were empty on both sides: positions "
       f"nobody would ask about, kept in the denominator but called out so the "
       f"agreement rate is not read as coverage.\n")
@@ -649,10 +900,42 @@ def cmd_diff(args):
     for (s, v), n in counts.items():
         if s != "same":
             by_shape[s] = by_shape.get(s, 0) + n
-    if noise:
-        W("`noise` is the same shape's count when the SAME binary is run "
-          "twice over these positions. A block at or below its noise floor "
-          "carries no information — read the `signal` column, not `n`.\n")
+    if noise_reject:
+        W(f"> **NOISE FLOOR REJECTED — {noise_reject}.** No floor is shown "
+          f"below. Counts are raw, and `reranked` in particular cannot be "
+          f"read without one.\n" if not args.force_noise else
+          f"> **Noise floor is SUSPECT — {noise_reject}.** Shown anyway "
+          f"because `--force-noise` was passed.\n")
+    if noise or noise_n:
+        W(f"`noise` is the WORST self-disagreement across all {npairs} pair"
+          f"{'s' if npairs != 1 else ''} of same-binary runs, measured over "
+          f"EXACTLY the answers compared here. A shape earns `signal` only by "
+          f"clearing the worst floor observed, not the luckiest.\n")
+        if npairs > 1:
+            # Keys are a mix of shape strings and (shape, verb) tuples, so
+            # sort on the shape name rather than the key itself.
+            wide = [(k, lo, hi) for k, (lo, hi) in spread.items()
+                    if isinstance(k, str) and hi and (hi - lo) > 0.25 * hi]
+            wide.sort(key=lambda t: t[0])
+            if wide:
+                W("> The floor is not one number. Across those pairs: "
+                  + "; ".join(f"`{k}` ranged {lo}–{hi}" for k, lo, hi in wide)
+                  + ". A single pair would have reported any one of those, so "
+                    "a block sitting between the low and high figures cannot "
+                    "be called signal from a two-run floor.\n")
+        elif npairs == 1:
+            W("> **Only one pair of noise runs was supplied, so the floor is a "
+              "single draw.** Measured on this corpus, `disagree` ranged 14–25 "
+              "across six pairs of identical runs — pass three or four runs to "
+              "`--noise` if a thin block's verdict depends on the floor.\n")
+        cover = noise_n / max(total, 1)
+        if cover < 0.98:
+            W(f"> **The floor covers {noise_n} of {total} compared answers "
+              f"({cover:.1%}).** The rest could not be measured: the noise "
+              f"runs did not answer at those positions. Shapes below are "
+              f"scaled by that fraction only if the unmeasured answers behave "
+              f"like the measured ones, which is exactly what a run that "
+              f"stalled part-way does not guarantee.\n")
         W("| shape | n | noise | signal | meaning |")
         W("|---|---|---|---|---|")
         for s in SHAPE_ORDER:
@@ -680,13 +963,23 @@ def cmd_diff(args):
       "data file can contribute sixty positions that all disagree the same "
       "way; that is one thing to adjudicate, not sixty, and reading `n` as "
       "the workload is how a sweep gets abandoned as noise.\n")
-    W("| shape | verb | token kind | n | distinct |")
-    W("|---|---|---|---|---|")
+    if noise:
+        W("The `verb noise` column is the floor for that shape ON THAT VERB, "
+          "which is the only baseline a single-verb block can be read "
+          "against. It is summed over the verb's kinds, so a block covering "
+          "one kind sits well under it.\n")
+    W("| shape | verb | token kind | n | distinct |"
+      + (" verb noise |" if noise else ""))
+    W("|---|---|---|---|---|" + ("---|" if noise else ""))
     for (shape, verb, kind), items in sorted(
             groups.items(), key=lambda kv: (SHAPE_ORDER.index(kv[0][0])
                                             if kv[0][0] in SHAPE_ORDER else 99,
                                             -len(kv[1]))):
-        W(f"| `{shape}` | {verb} | {kind} | {len(items)} | {_distinct(verb, items)} |")
+        row = (f"| `{shape}` | {verb} | {kind} | {len(items)} | "
+               f"{_distinct(verb, items)} |")
+        if noise:
+            row += f" {noise.get((shape, verb), 0)} |"
+        W(row)
     W("")
 
     W("## Examples\n")
@@ -785,6 +1078,16 @@ def main():
     p.add_argument("--examples", type=int, default=8)
     p.add_argument("--noise-base", help="answers from a repeat run of ONE binary")
     p.add_argument("--noise-head", help="answers from a second run of that SAME binary")
+    p.add_argument("--noise", nargs="+", metavar="ANSWERS",
+                   help="two or more runs of ONE binary. Every pair is "
+                        "measured and the floor is the worst of them — a "
+                        "single pair is one draw from a distribution that is "
+                        "wide for some shapes.")
+    p.add_argument("--allow-short", action="store_true",
+                   help="diff even when a side delivered fewer positions than "
+                        "its header declared; the report is marked TRUNCATED")
+    p.add_argument("--force-noise", action="store_true",
+                   help="use the noise pair even if it fails the provenance check")
     p.set_defaults(fn=cmd_diff)
 
     args = ap.parse_args()
