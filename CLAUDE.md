@@ -39,7 +39,20 @@ cd gold-corpus && /tmp/cpm install -L local --mirror https://www.cpan.org/ --res
 
 (Outside a restricted sandbox, plain `cpm install -L local --resolver
 snapshot` or `carton install --deployment` from `gold-corpus/` works.)
-`e2e/run.sh` needs `nvim`, absent in some sandboxes — let CI cover e2e then.
+**`e2e/run.sh` needs `nvim` 0.10+** (the harness calls `vim.lsp.get_clients`).
+Ubuntu ships 0.9.5, which fails. Do NOT fall back to "let CI cover it" — the
+release tarball is a 10 MB download, needs no sudo and no package manager:
+
+```
+curl -sSL -o /tmp/nvim.tar.gz \
+  https://github.com/neovim/neovim/releases/download/v0.11.0/nvim-linux-x86_64.tar.gz
+tar xzf /tmp/nvim.tar.gz -C /tmp
+export PATH=/tmp/nvim-linux-x86_64/bin:$PATH   # nvim --version -> NVIM v0.11.0
+```
+
+v0.11.0 is the version CI pins (`rhysd/action-setup-vim`), so a local pass
+means the same thing a CI pass does. Run e2e yourself before calling a change
+verified.
 
 ## Architecture
 
