@@ -45,7 +45,7 @@ use FindBin qw($RealBin);
 use File::Spec;
 use Config;
 use JSON::PP;
-use POSIX qw(WIFSIGNALED);
+use POSIX qw(WIFSIGNALED WTERMSIG WIFEXITED WEXITSTATUS);
 use File::Temp qw(tempfile);
 use Time::HiRes qw(time);
 binmode STDOUT, ':utf8';    # responses may carry non-ASCII once decoded
@@ -208,13 +208,18 @@ sub run_batch {
     # request delivery non-blocking, so we only ever read on the parent side.
     my ($tfh, $tpath) = tempfile('corpus-batch-XXXXXX', TMPDIR => 1, UNLINK => 1);
     print $tfh $jsonl; close $tfh;
+    # Child stderr goes to a file, not /dev/null: when the batch aborts, the
+    # panic/abort message is the only evidence of WHY, and every unanswered
+    # row scores CRASH with no cause attached. Kept only on abnormal exit.
+    my ($efh, $epath) = tempfile('corpus-batch-err-XXXXXX', TMPDIR => 1, UNLINK => 1);
+    close $efh;
     my @cpu0 = times();           # children utime/stime baseline (slots 2,3)
     my $t0 = time();
     my $pid = open(my $out, '-|');
     die "fork: $!" unless defined $pid;
     if ($pid == 0) {
         open(STDIN, '<', $tpath) or exit 127;
-        open(STDERR, '>', '/dev/null');
+        open(STDERR, '>', $epath);
         $ENV{PERL5LIB} = $p5lib if defined $p5lib;
         if ($rename_scope) { $ENV{PERL_LSP_RENAME_SCOPE} = $rename_scope; }
         else { delete $ENV{PERL_LSP_RENAME_SCOPE}; }
@@ -253,10 +258,21 @@ sub run_batch {
         }
     }
     close($out);
+    my $st = $?;
     my @cpu1 = times();
     $met->{wall_s}     = time() - $t0;
     $met->{cpu_user_s} = $cpu1[2] - $cpu0[2];
     $met->{cpu_sys_s}  = $cpu1[3] - $cpu0[3];
+    if ($st != 0) {
+        $met->{abort} = WIFSIGNALED($st) ? "signal " . WTERMSIG($st)
+                      : WIFEXITED($st)   ? "exit "   . WEXITSTATUS($st)
+                      :                    "status $st";
+        if (open(my $ef, '<', $epath)) {
+            my @tail; while (my $l = <$ef>) { push @tail, $l; shift @tail if @tail > 25; }
+            close($ef);
+            $met->{stderr_tail} = join('', @tail);
+        }
+    }
     return wantarray ? (\%by_id, $met) : \%by_id;
 }
 
@@ -391,6 +407,17 @@ printf "  %-9s %d\n", 'prov?', scalar @prov if @prov;
 # so the count is visible rather than inferred.
 printf "  %-9s %d\n", 'lang-skip', scalar @lang_skip;
 print "\n!! CRASH (process aborted):\n",                 map { "  - $_\n" } @crash if @crash;
+# Attribute each aborted batch: which root, how it died, and the stderr it
+# left behind — without this a CRASH block names the victims but not the cause.
+for my $m (grep { $_->{abort} } @batch_metrics) {
+    print "\n!! batch abort: root=$m->{root} ($m->{abort})\n";
+    if (defined $m->{stderr_tail} && $m->{stderr_tail} =~ /\S/) {
+        print "   stderr tail:\n";
+        print "   | $_\n" for split /\n/, $m->{stderr_tail};
+    } else {
+        print "   (stderr empty)\n";
+    }
+}
 print "\n!! FAIL (gold assertion no longer holds):\n",   map { "  - $_\n" } @fail  if @fail;
 print "\n** XPASS (known gap fixed — update fixture):\n", map { "  - $_\n" } @xpass if @xpass;
 print "\nprovisional misses:\n",                         map { "  - $_\n" } @prov  if @prov;
