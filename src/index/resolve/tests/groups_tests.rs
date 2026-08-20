@@ -120,7 +120,7 @@ my $val = $p->x;
     // Cursor on `$x` in the field decl (row 2, col 11 = bare name).
     let resolved = resolve_symbol(&origin_fa, tree_sitter::Point { row: 2, column: 11 }, None)
         .expect("field decl resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected Group, got {:?}", resolved);
     };
     assert!(pinned_spans.is_empty(), "local mint has no pinned spans");
@@ -183,7 +183,7 @@ class Point {
     // From the ctor key `x` (row 1, col 19).
     let resolved = resolve_symbol(&consumer, tree_sitter::Point { row: 1, column: 19 }, Some(&idx))
         .expect("consumer key resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected Group from consumer key, got {:?}", resolved);
     };
     assert!(local_spans.is_empty(), "remote mint: no origin spans");
@@ -232,7 +232,7 @@ fn test_group_rename_rederives_mapped_members_cross_file() {
     // Cursor on the attr decl token `size` (row 2, col 4).
     let resolved = resolve_symbol(&class_fa, tree_sitter::Point { row: 2, column: 4 }, None)
         .expect("attr decl resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected Group, got {:?}", resolved);
     };
     let edits = group_rename_edits(
@@ -279,7 +279,7 @@ fn moo_explicit_string_accessor_renames_its_defining_string() {
     // Cursor on the `has size` attr token (row 2, col 4).
     let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 2, column: 4 }, None)
         .expect("attr decl resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected Group, got {:?}", resolved);
     };
     let edits = group_rename_edits(
@@ -450,7 +450,7 @@ fn package_var_main_global_does_not_cross_scripts() {
     store.insert_workspace(b.clone(), parse("our $config = 2;\nprint $config;\n"));
 
     let a_fa = store.workspace_raw().get(&a).unwrap().value().clone();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&a_fa, tree_sitter::Point { row: 0, column: 5 }, None).unwrap()
     else {
         panic!("main global should be a file-local Group")
@@ -601,7 +601,7 @@ fn dbic_column_rename_reaches_single_arg_call_keys() {
     store.insert_workspace(path.clone(), parse(src));
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     let col = src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -633,7 +633,7 @@ fn dbic_column_rename_multiarg_search_excludes_attrs_hash() {
     store.insert_workspace(path.clone(), parse(src));
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     let col = src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -669,7 +669,7 @@ fn dbic_column_rename_reaches_fluent_resultset_chain() {
     store.insert_workspace(path.clone(), parse(src));
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     let col = src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -712,7 +712,7 @@ sub go {\n\
     store.insert_workspace(path.clone(), parse(src));
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     let col = src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -756,7 +756,7 @@ fn moo_attr_group_includes_cross_file_constructor_key() {
     store.insert_workspace(app.clone(), parse(app_src));
     let lib_fa = store.workspace_raw().get(&lib).unwrap().value().clone();
     let col = lib_src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&lib_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx)).expect("attr resolves")
     else {
         panic!("expected a Moo attr Group")
@@ -811,7 +811,7 @@ fn inherited_attr_rename_reaches_subclass_constructor_key() {
     store.insert_workspace(app.clone(), parse(app_src));
     let animal_fa = store.workspace_raw().get(&animal).unwrap().value().clone();
     let col = animal_src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&animal_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx)).expect("attr resolves")
     else {
         panic!("expected a Moo attr Group")
@@ -848,7 +848,7 @@ fn corinna_field_subclass_does_not_bleed_to_ancestor() {
     let col = deriv_src.lines().nth(1).unwrap().find("size").unwrap();
     let resolved = resolve_symbol(&deriv_fa, tree_sitter::Point { row: 1, column: col }, Some(&idx))
         .expect("field resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected a field Group, got {resolved:?}")
     };
     let edits = group_rename_edits(
@@ -884,7 +884,7 @@ fn overridden_attr_renames_whole_family_symmetrically() {
         let fa = store.workspace_raw().get(path).unwrap().value().clone();
         let col = src.lines().nth(row).unwrap().find("name").unwrap();
         let r = resolve_symbol(&fa, tree_sitter::Point { row, column: col }, Some(&idx)).unwrap();
-        let ResolvedTarget::Group { local_spans, pinned_spans, members } = r else {
+        let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = r else {
             panic!("expected Group, got {r:?}")
         };
         let mut got: Vec<String> = group_rename_edits(
@@ -925,7 +925,7 @@ fn dbic_multi_key_hashref_links_all_columns() {
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     // Rename the MIDDLE column `beta` — it must reach the search arg key (row 3).
     let col = src.lines().nth(2).unwrap().find("beta").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -1020,7 +1020,7 @@ fn dbic_custom_sub_shadowing_verb_is_not_column_keyed() {
     store.insert_workspace(path.clone(), parse(src));
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     let col = src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -1048,7 +1048,7 @@ fn dbic_scalar_cond_does_not_column_key_attrs_hash() {
     store.insert_workspace(path.clone(), parse(src));
     let fa = store.workspace_raw().get(&path).unwrap().value().clone();
     let col = src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&fa, tree_sitter::Point { row: 2, column: col }, None).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -1082,7 +1082,7 @@ fn dbic_column_rename_reaches_cross_file_consumer_arg_key() {
     store.insert_workspace(app.clone(), parse(app_src));
     let lib_fa = store.workspace_raw().get(&lib).unwrap().value().clone();
     let col = lib_src.lines().nth(2).unwrap().find("name").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&lib_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx)).expect("column resolves")
     else {
         panic!("expected a column attr Group")
@@ -1134,7 +1134,7 @@ fn dbic_column_rename_owner_gated_excludes_framework_and_siblings() {
 
     let widget_fa = store.workspace_raw().get(&widget).unwrap().value().clone();
     let col = widget_src.lines().nth(2).unwrap().find("id").unwrap();
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } =
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } =
         resolve_symbol(&widget_fa, tree_sitter::Point { row: 2, column: col }, Some(&idx))
             .expect("column resolves to a group")
     else {
@@ -1329,7 +1329,7 @@ fn test_internal_slot_pokes_join_group_cross_file() {
     let class_fa = store.workspace_raw().get(&class_path).unwrap().value().clone();
     let resolved = resolve_symbol(&class_fa, tree_sitter::Point { row: 2, column: 4 }, None)
         .expect("attr decl resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected Group, got {:?}", resolved);
     };
     assert!(
@@ -1378,7 +1378,7 @@ fn rename_from_bless_key_reaches_self_slot_accesses() {
     let key_col = src.lines().nth(1).unwrap().find("history").unwrap();
     let resolved = resolve_symbol(&fa, tree_sitter::Point { row: 1, column: key_col }, None)
         .expect("bless key resolves");
-    let ResolvedTarget::Group { local_spans, pinned_spans, members } = resolved else {
+    let ResolvedTarget::Group { local_spans, pinned_spans, members, .. } = resolved else {
         panic!("expected Group, got {:?}", resolved);
     };
     assert!(

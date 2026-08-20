@@ -60,6 +60,10 @@ here." The CandidateSet owns, computed once at the set level:
   group members with per-member rename rules, and the descendants walk
   (`implementations_of` over `GraphView`); each projection declares which
   edges it follows,
+- **declaration** — a projection group carries `decl_spans` (the `has` /
+  column token, the `field` decl) beside its spellings, each tagged with
+  the file it was minted from; goto-def projects it rather than re-deriving
+  where an inherited attr was declared,
 - **per-site policy** — `RefLocation.rewritable`, `MemberRename` texts:
   policy rides the candidates, handlers never re-derive it.
 
@@ -71,7 +75,7 @@ Every feature is a **projection** of the same CandidateSet:
 | rename | `rename_edits(new)` — references + rewritability policy; an edit outside the references image is unrepresentable |
 | prepareRename | `renameable()` — mirrors `rename_edits`' arms |
 | implementations | `implementations()` — the family/descendants walk |
-| goto-def | `definitions()` — forward-best projection |
+| goto-def | `definitions()` — forward-best projection, backstopped by the identity's declaration axis: when every forward lane misses and the cursor resolved to a group, the group's `decl_spans` answer, so goto-def cannot come up empty where `references()` names a declaration |
 | completion gathering | `complete(prefix, import_slot)` — prefix-enumeration of the visible identifier universe (Perl: in-scope + explicit imports on OPEN, export surfaces + auto-import firehose on DEPENDENCY; pack: the origin's include-closure universe); `complete_modules(prefix)` — the loadable-module half (DEPENDENCY). `import_slot` is the slot's import affordance: `false` = the slot offers no import-sourced names (an import candidate without a place for its edit completes to broken code); candidates carry `ImportFact`, the adapter composes the edit |
 | hover | the set resolves for BOTH languages; each keeps its presenter. Pack: `hover_candidate()` — the top-ranked `definitions()` candidate, presented. Perl: the model hover primitives render local identity, and the cross-file call lanes present `function_binding()` — the same import-classification / FQ-package lanes `definitions()` jumps through — so hover and goto-def cannot disagree at a position |
 | documentHighlight | `highlights()` — the origin-file-narrowed image of `references()` (same identity, same matcher via `refs_to_in_file`, walk never leaves the cursor's document), carrying `RefLocation.access` for highlight kinds |

@@ -1012,8 +1012,22 @@ impl FileAnalysis {
                     .collect()
             })
             .unwrap_or_default();
+        // A `has`/column group's decl token IS its only spelling here; a
+        // field-backed group's decl is the field symbol's own token (the
+        // rest of `variable_spans` are body uses), sigil-skipped like them.
+        let mut decl_spans: Vec<Span> = g
+            .field_sym
+            .map(|fs| {
+                let sel = self.symbol(fs).selection_span;
+                vec![Span {
+                    start: Point::new(sel.start.row, sel.start.column + 1),
+                    end: sel.end,
+                }]
+            })
+            .unwrap_or_default();
         if let Some(decl) = g.decl_span {
             variable_spans.push(decl);
+            decl_spans.push(decl);
         }
         let mapped = self
             .attr_projections
@@ -1054,6 +1068,7 @@ impl FileAnalysis {
             has_class_key,
             field_backed: g.field_sym.is_some(),
             variable_spans,
+            decl_spans,
             mapped,
         }
     }

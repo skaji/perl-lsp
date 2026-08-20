@@ -193,6 +193,9 @@ pub fn resolve_symbol_scoped(
             return Some(ResolvedTarget::Group {
                 local_spans: spans,
                 pinned_spans: Vec::new(),
+                // The `our` decl is in the origin file, where goto-def's
+                // local path already lands — no group-level decl to add.
+                decl_spans: Vec::new(),
                 members: Vec::new(),
             });
         }

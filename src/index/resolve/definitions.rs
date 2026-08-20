@@ -1050,6 +1050,31 @@ impl<'a> CandidateSet<'a> {
             }
         }
 
+        // Identity backstop: the cursor's resolution is a projection GROUP,
+        // so its declaration axis IS the answer. The forward lanes above
+        // resolve through the owner the REF carries, which for an inherited
+        // attr is the subclass (`$self->{size}` in `Gadget` where `Widget`
+        // declares `has size`) — they miss, and `references()` would still
+        // name the base's decl, because identity already climbed the
+        // ancestry to mint the group. Reading the group here is what keeps
+        // the two projections from disagreeing; no second ancestry walk.
+        if let Some(ResolvedTarget::Group { decl_spans, .. }) = self.resolution() {
+            let out: Vec<RefLocation> = decl_spans
+                .iter()
+                .filter(|(path, _)| path.as_ref().is_none_or(|p| Url::from_file_path(p).is_ok()))
+                .map(|(path, span)| RefLocation {
+                    key: path.clone().map_or_else(|| self.origin_key.clone(), FileKey::Path),
+                    span: *span,
+                    access: AccessKind::Declaration,
+                    rewritable: true,
+                    label: None,
+                })
+                .collect();
+            if !out.is_empty() {
+                return out;
+            }
+        }
+
         // Last resort (pack): a token no query captures — a namespace middle
         // segment (`StatusCode` in `absl::StatusCode::kNotFound` is a
         // namespace_identifier, ref-less) — resolves by word to a named

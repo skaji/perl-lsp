@@ -98,8 +98,9 @@ pub struct CandidateSet<'a> {
     source: Option<&'a str>,
     scope: OverrideScope,
     /// Identity, minted once via `resolve_symbol_scoped` — lazily, so a
-    /// projection that never consults it (goto-def's forward path) doesn't
-    /// pay the override-family walk. `None` = nothing cross-file-resolvable
+    /// projection answering off its own forward path (goto-def, until every
+    /// lane misses) doesn't pay the override-family walk. `None` = nothing
+    /// cross-file-resolvable
     /// at the cursor; local projections still answer from `origin`.
     resolution: std::sync::OnceLock<Option<ResolvedTarget>>,
     /// Visibility for a `Target` resolution, memoized — computed by

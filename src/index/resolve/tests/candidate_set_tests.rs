@@ -380,3 +380,55 @@ fn collect_from_analysis_still_finds_sub_refs_after_scope_hardening() {
         "expected call-site read, got {results:?}"
     );
 }
+
+/// goto-def and references are two projections of ONE CandidateSet, so they
+/// cannot disagree about whether a declaration exists. An INHERITED Moo slot
+/// poke is the shape that split them: `$self->{size}` in `Gadget` carries a
+/// `Class(Gadget)` owner, so goto-def's owner-keyed hash-key lookup asked the
+/// SUBCLASS for a key only the base declares and found nothing, while
+/// references reached `Widget`'s `has size` through the group the identity
+/// already climbs to. Both must land on the base's decl token.
+#[test]
+fn goto_def_agrees_with_references_on_inherited_slot() {
+    use crate::index::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let widget = PathBuf::from("/tmp/cs_inh_widget.pm");
+    let gadget = PathBuf::from("/tmp/cs_inh_gadget.pm");
+    let widget_src = "package Widget;\nuse Moo;\nhas size => (is => 'ro');\nhas color => (is => 'ro');\n1;\n";
+    let gadget_src = "package Gadget;\nuse Moo;\nextends 'Widget';\nsub area { my $self = shift; return $self->{size}; }\n1;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(widget.clone(), Arc::new(parse(widget_src)));
+    idx.register_workspace_module(gadget.clone(), Arc::new(parse(gadget_src)));
+    store.insert_workspace(widget.clone(), parse(widget_src));
+    store.insert_workspace(gadget.clone(), parse(gadget_src));
+
+    let gadget_fa = store.workspace_raw().get(&gadget).unwrap().value().clone();
+    let col = gadget_src.lines().nth(3).unwrap().find("{size}").unwrap() + 1;
+    let cs = resolve(
+        &store,
+        &gadget_fa,
+        FileKey::Path(gadget.clone()),
+        tree_sitter::Point { row: 3, column: col },
+        Some(&idx),
+        OverrideScope::default(),
+    );
+
+    let decl_col = widget_src.lines().nth(2).unwrap().find("size").unwrap();
+    let refs = cs.references();
+    assert!(
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &widget)
+            && r.span.start.row == 2
+            && r.span.start.column == decl_col),
+        "references reaches the base decl: {refs:?}",
+    );
+
+    let defs = cs.definitions();
+    assert!(
+        defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p == &widget)
+            && d.span.start.row == 2
+            && d.span.start.column == decl_col),
+        "goto-def must land on the same base decl references already names: {defs:?}",
+    );
+}

@@ -617,6 +617,10 @@ pub struct FieldProjections {
     pub field_backed: bool,
     /// Origin-file variable spellings (decl + body uses), bare-adjusted.
     pub variable_spans: Vec<Span>,
+    /// The DECLARATION subset of `variable_spans` — the `has`/column token,
+    /// or the `field $x` decl. Goto-def is the projection that wants just
+    /// this; references/rename take every spelling.
+    pub decl_spans: Vec<Span>,
     /// Plugin-declared, name-mapped members (`predicate => has_size`).
     /// `affix` = `(prefix, suffix)` when the method name embeds the attr —
     /// rename re-derives the name; `None` = references-only member.
