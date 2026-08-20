@@ -194,6 +194,12 @@ const QUERY_REC_DEPTH_CAP: u32 = 512;
 const QUERY_REC_DEPTH_CAP: u32 = 256;
 
 thread_local! {
+    /// Set when an edge chase reads an `Expr(span)` attachment — the marker
+    /// for "this answer needed the raw derivation, not just a conclusion".
+    static TOUCHED_EXPR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
     static QUERY_REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// One-shot so we don't flood stderr while a deep walk unwinds.
     static QUERY_REC_DEPTH_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -266,9 +272,27 @@ impl ReducerRegistry {
     /// mutual-inheritance loops that span files.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
         let mut state = QueryState::new();
+        // Is the CONCLUSION LAYER CLOSED for the shape that dominates
+        // cross-file traffic? A `MethodOnClass` answer that never reads an
+        // `Expr(span)` witness could be served from stored conclusions; one
+        // that does needs the raw derivation, so the bag has to come along.
+        // Measured at the top-level query only — inner hops are the thing
+        // being counted, not separate questions.
+        let top_moc = matches!(q.attachment, WitnessAttachment::MethodOnClass { .. });
+        if top_moc {
+            TOUCHED_EXPR.with(|c| c.set(false));
+        }
         // Sole boundary where an owned `ReducedValue` is required; the
         // internal recursion threads `Arc` to avoid deep clones per hop.
-        (*self.query_rec(bag, q, &mut state)).clone()
+        let out = (*self.query_rec(bag, q, &mut state)).clone();
+        if top_moc {
+            crate::util::ghost_stats::count(if TOUCHED_EXPR.with(|c| c.get()) {
+                "moc.touched_expr"
+            } else {
+                "moc.conclusions_only"
+            });
+        }
+        out
     }
 
     /// Returns an `Arc` so the memo, the cycle-guard early-outs, and the
@@ -281,6 +305,12 @@ impl ReducerRegistry {
         q: &ReducerQuery,
         state: &mut QueryState,
     ) -> std::sync::Arc<ReducedValue> {
+        // The chase has landed on a raw-derivation attachment. Whatever the
+        // top-level question was, its answer now depends on the bag's
+        // observations rather than on any conclusion we could have stored.
+        if matches!(q.attachment, WitnessAttachment::Expr(_)) {
+            TOUCHED_EXPR.with(|c| c.set(true));
+        }
         let depth = QUERY_REC_DEPTH.with(|c| {
             let d = c.get();
             c.set(d + 1);

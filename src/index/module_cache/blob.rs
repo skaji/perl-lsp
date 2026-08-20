@@ -534,7 +534,82 @@ mod bag_share_probe {
         );
     }
 
-    fn collect_pm(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u32) {
+
+    /// How big is the CONCLUSION layer next to the derivation it would
+    /// replace?
+    ///
+    /// The conclusion measured here is the POST-FOLD one — the resolved
+    /// return per sub, taken through the same registry path a query uses —
+    /// not `MethodSurface::ret`, which is projected with no module index and
+    /// is therefore the pre-enrichment answer. Two providers with different
+    /// enriched returns project byte-identical surfaces, so persisting that
+    /// one would store a value the query does not agree with.
+    ///
+    /// This is a floor on the layer's size, not the whole design: it does not
+    /// carry the `ReturnExpr` SHAPES (`Receiver`, `ReceiverPolymorphic`),
+    /// where the conclusion is "returns its invocant" rather than a value —
+    /// a handful of bytes each, but they must be represented, so the real
+    /// layer is somewhat larger than this.
+    #[test]
+    #[ignore]
+    fn probe_conclusion_layer_size() {
+        use crate::model::file_analysis::SymKind;
+        let root = std::path::Path::new("gold-corpus/local/lib/perl5");
+        if !root.is_dir() {
+            eprintln!("substrate absent — skipping");
+            return;
+        }
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        super::bag_share_probe::collect_pm(root, &mut files, 0);
+        files.sort();
+        let mut parser = crate::build::builder::create_parser();
+        let (mut bag_z, mut concl_z, mut bag_b, mut concl_b) = (0usize, 0usize, 0usize, 0usize);
+        let (mut subs, mut typed) = (0usize, 0usize);
+        for path in files.iter() {
+            let Ok(src) = std::fs::read_to_string(path) else { continue };
+            if src.len() > 1_000_000 {
+                continue;
+            }
+            let Some(tree) = parser.parse(&src, None) else { continue };
+            let fa = crate::build::builder::build(&tree, src.as_bytes());
+            let concl: Vec<(String, Option<crate::model::file_analysis::InferredType>)> = fa
+                .symbols()
+                .iter()
+                .filter(|s| matches!(s.kind, SymKind::Sub | SymKind::Method))
+                .map(|s| {
+                    let t = fa.sub_return_type_at_arity(&s.name, None);
+                    (s.name.clone(), t)
+                })
+                .collect();
+            subs += concl.len();
+            typed += concl.iter().filter(|(_, t)| t.is_some()).count();
+            let (Ok(cb), Ok(bb)) = (
+                bincode::serialize(&concl),
+                bincode::serialize(&fa.witnesses),
+            ) else {
+                continue;
+            };
+            let (Some(cz), Some(bz)) = (
+                zstd::encode_all(cb.as_slice(), super::ZSTD_LEVEL).ok(),
+                zstd::encode_all(bb.as_slice(), super::ZSTD_LEVEL).ok(),
+            ) else {
+                continue;
+            };
+            concl_b += cb.len();
+            bag_b += bb.len();
+            concl_z += cz.len();
+            bag_z += bz.len();
+        }
+        println!("\nsubs: {subs}, of which the fold gives a return type: {typed} ({:.1}%)",
+                 100.0 * typed as f64 / subs.max(1) as f64);
+        println!("bag        : {bag_b:>10} bincode  {bag_z:>9} zstd");
+        println!("conclusions: {concl_b:>10} bincode  {concl_z:>9} zstd");
+        println!("conclusions are {:.1}% of the bag by bincode, {:.1}% by zstd",
+                 100.0 * concl_b as f64 / bag_b.max(1) as f64,
+                 100.0 * concl_z as f64 / bag_z.max(1) as f64);
+    }
+
+    pub(super) fn collect_pm(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: u32) {
         if depth > 12 {
             return;
         }
