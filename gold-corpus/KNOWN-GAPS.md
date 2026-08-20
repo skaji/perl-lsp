@@ -374,7 +374,7 @@ longer ships in hash-iteration order. Over four cold runs of 1,458 positions
 
 Two residuals, both understood:
 
-**15 — the pool is still filling.** All at the cap, all carrying
+**14 of the 15 — the pool is still filling.** All at the cap, all carrying
 `isIncomplete`, and they decay across sweep order (21/12/0/0 by quartile
 before the hoist) — a query racing an incomplete index legitimately answers
 differently before and after resolution, which is what `isIncomplete` says.
@@ -383,6 +383,26 @@ first-quartile positions are measuring a warming index rather than the
 server, so early positions carry systematically more noise than late ones;
 and `isIncomplete` gives the class a mechanical signature, so it can be
 separated from a real disagreement rather than adjudicated by hand.
+
+**1 of the 15 — a receiver-resolution race that does NOT announce itself.**
+`Mojo/UserAgent/CookieJar.pm:145:12` (`$tmp->spew(...)`, receiver
+`Mojo::File`) answered **14, 14, 35, 14** items across four runs, under the
+cap, with `isIncomplete: false` every time. The 21 extra items in the odd run
+are `Mojo::File`'s methods — `spew`, `_path`, `basename`, `child`, `chmod` —
+so three runs answered before the receiver's class resolved and one answered
+after.
+
+This is a different cause from the capped 14 and a worse-behaved one. Those
+are truncated and say so; this returns a list that claims to be COMPLETE
+while missing the receiver's whole method set. `cap_completion_items`' own
+doc comment names the consequence: a client caches a complete response and
+never asks again. It was invisible before the hoist, buried in 173 rows of
+ordering noise.
+
+Not fixed here. The honest options are to answer `isIncomplete: true` while a
+member-access receiver is still unresolved, or to make the member path wait
+on resolution; both are member-completion design decisions rather than a
+capping one.
 
 **2 — ties that agree on every sort key.** `sort_by` is stable, so two
 candidates matching on `sort_text`, label AND kind keep the order the
