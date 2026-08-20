@@ -2693,3 +2693,40 @@ fn lexical_completion_priority_is_the_local_tier() {
         );
     }
 }
+
+/// The tier ladder's implicit invariant: the one-step demotions
+/// (`priority.saturating_add(1)` on the `$#arr` cross-sigil form,
+/// `PRIORITY_LOCAL + 1` in `rank_candidates_by_expected_type`) assume a
+/// nudged value cannot cross into the next tier. That holds only while
+/// adjacent named tiers sit at least two apart — today FILE_WIDE(10) →
+/// EXPLICIT_IMPORT(12) is exactly the minimum. Pin the headroom so a
+/// future tier inserted one above an existing one fails HERE instead of
+/// silently reordering nudged candidates into the wrong tier.
+#[test]
+fn completion_tier_ladder_keeps_one_step_headroom() {
+    use crate::model::file_analysis::{
+        PRIORITY_AUTO_ADD_QW, PRIORITY_BARE_IMPORT, PRIORITY_BUILTIN, PRIORITY_CLOSURE,
+        PRIORITY_DYNAMIC, PRIORITY_EXPLICIT_IMPORT, PRIORITY_FILE_WIDE, PRIORITY_LESS_RELEVANT,
+        PRIORITY_LOCAL, PRIORITY_UNIMPORTED,
+    };
+    let ladder = [
+        PRIORITY_LOCAL,
+        PRIORITY_FILE_WIDE,
+        PRIORITY_EXPLICIT_IMPORT,
+        PRIORITY_BARE_IMPORT,
+        PRIORITY_AUTO_ADD_QW,
+        PRIORITY_LESS_RELEVANT,
+        PRIORITY_UNIMPORTED,
+        PRIORITY_BUILTIN,
+        PRIORITY_DYNAMIC,
+        PRIORITY_CLOSURE,
+    ];
+    for w in ladder.windows(2) {
+        assert!(
+            w[1] >= w[0] + 2,
+            "adjacent tiers {} and {} leave no headroom for the one-step demotions",
+            w[0],
+            w[1]
+        );
+    }
+}

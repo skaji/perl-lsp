@@ -512,9 +512,21 @@ impl FileAnalysis {
     pub fn complete_general(&self, point: Point) -> Vec<CompletionCandidate> {
         let mut candidates = Vec::new();
 
-        // Variables (all sigils)
+        // Variables (all sigils). The sigil-lane contract is "the client's
+        // buffer already holds the typed sigil", so every variable
+        // insert_text omits it (the client word-replaces the part after the
+        // sigil). This is the BARE-cursor lane — no sigil exists in the
+        // buffer, so inserting that text verbatim writes sigil-less code
+        // (`emit('connect', self)`). Restore the requested sigil onto the
+        // insert; the label already carries it.
         for sigil in ['$', '@', '%'] {
-            candidates.extend(self.complete_variables(point, sigil));
+            candidates.extend(self.complete_variables(point, sigil).into_iter().map(|mut c| {
+                c.insert_text = Some(match c.insert_text.take() {
+                    Some(t) => format!("{sigil}{t}"),
+                    None => c.label.clone(),
+                });
+                c
+            }));
         }
 
         // Subs

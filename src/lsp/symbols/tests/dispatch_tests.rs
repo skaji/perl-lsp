@@ -1120,3 +1120,74 @@ sub fire {
         "no handler_params → no string-dispatch sig; also no local ->emit def"
     );
 }
+
+/// The past-arg-0 twin of the suppression test above: the firehose goes
+/// quiet AND what remains is the variables in scope — the candidates
+/// you'd pass as the next argument — with insert text that carries the
+/// sigil. The suppression half held from day one and was pinned; the
+/// insert half was not: variable candidates mint `insert_text` for the
+/// sigil-typed lane (bare name — the client's buffer already holds the
+/// `$` and word-replaces after it), and the bare-cursor lane consumed
+/// them verbatim, so accepting `$self` here inserted sigil-less `self`.
+/// Invisible in the menu (label and filter_text carry the sigil), wrong
+/// only at the moment of insertion.
+#[test]
+fn completion_after_comma_in_dispatch_call_offers_scope_variables() {
+    let src = r#"
+package My::Emitter;
+use parent 'Mojo::EventEmitter';
+
+sub wire {
+    my $self = shift;
+    $self->on('connect', sub { my ($s, $sock) = @_; });
+}
+
+sub fire {
+    my $self = shift;
+    my $payload = { id => 1 };
+    $self->emit('connect', );
+}
+"#;
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&ts_parser_perl::LANGUAGE.into())
+        .unwrap();
+    let tree = parser.parse(src, None).unwrap();
+    let analysis = crate::build::builder::build(&tree, src.as_bytes());
+    let idx = ModuleIndex::new_for_test();
+
+    let (line_idx, line) = src
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("->emit('connect',"))
+        .unwrap();
+    let col = line.find(", )").unwrap() + 2;
+    let pos = Position {
+        line: line_idx as u32,
+        character: col as u32,
+    };
+
+    let items = completion_items_for_test(&analysis, &tree, src, pos, &idx, None);
+    let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"$self") && labels.contains(&"$payload"),
+        "scope variables should be offered past arg-0 in a dispatch call: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"wire"),
+        "firehose stays suppressed while variables are offered: {:?}",
+        labels
+    );
+    // The insertion half — what the buffer receives at a BARE cursor
+    // must carry the sigil (no typed sigil exists for the client to keep).
+    for want in ["$self", "$payload"] {
+        let it = items.iter().find(|i| i.label == want).unwrap();
+        assert_eq!(
+            it.insert_text.as_deref().unwrap_or(&it.label),
+            want,
+            "bare-cursor insert for {want} must include the sigil"
+        );
+    }
+}
