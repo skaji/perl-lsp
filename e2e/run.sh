@@ -8,6 +8,31 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 export PERL5LIB="${PERL5LIB:-$PWD/test_files/lib}"
 
+# Fail on an old nvim with the reason, not a traceback. The harness calls
+# `vim.lsp.get_clients` (0.10+); on 0.9.x that surfaces as
+# "attempt to call field 'get_clients' (a nil value)" inside lua/test/lsp.lua,
+# which reads as a broken harness rather than a stale editor — an hour lost to
+# it here, and Ubuntu 24.04 still ships 0.9.5.
+if ! command -v nvim >/dev/null 2>&1; then
+  echo "e2e: nvim not found. The harness needs nvim 0.10+ (CI pins v0.11.0)." >&2
+  exit 1
+fi
+nvim_ver=$(nvim --version | head -1 | sed -E 's/^NVIM v?//')
+nvim_major=${nvim_ver%%.*}
+nvim_minor=${nvim_ver#*.}; nvim_minor=${nvim_minor%%.*}
+if (( nvim_major == 0 && nvim_minor < 10 )); then
+  cat >&2 <<EOF
+e2e: nvim $nvim_ver is too old — the harness needs 0.10+ (it calls
+     vim.lsp.get_clients). CI pins v0.11.0. Distro packages lag: Ubuntu
+     24.04 ships 0.9.5. Use the release tarball:
+
+  curl -sSL -o nvim.tar.gz \\
+    https://github.com/neovim/neovim/releases/download/v0.11.0/nvim-linux-x86_64.tar.gz
+  tar xzf nvim.tar.gz && export PATH="\$PWD/nvim-linux-x86_64/bin:\$PATH"
+EOF
+  exit 1
+fi
+
 bin="${PERL_LSP_BIN:-./target/release/perl-lsp}"
 
 # Reap our own servers. nvim spawns perl-lsp and cleanly shuts it down when nvim
