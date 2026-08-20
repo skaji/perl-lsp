@@ -569,9 +569,29 @@ row #3 conclusion rests only on the LSP measurement.)
 
 ### 7. Cold-index write pressure — dedup + interner LANDED, backpressure open
 
-~17M rows into 1.73 GB through SQLite's single writer; the 20-core walk
-outpaces it ~4x, so ~4/5 of the corpus sits in an unbounded channel (the ~7 GB
-cold spike) and the drain holds the readiness gate ~9 min. Batching already
+~17M rows into 1.73 GB through SQLite's single writer, and the walk outruns
+it, so the corpus queues in an unbounded channel (the ~7 GB cold spike).
+
+> **Two figures in this paragraph were stale and are corrected here.** The
+> "~4x" ratio and the "~9 min drain" both predate measurements that moved
+> them.
+>
+> **The drain is 1.4 s, not 7-9 min** — measured when the `attached`/`durable`
+> gate split was costed, which is why that design was retired. The 9-minute
+> figure should not be cited.
+>
+> **The ratio is unmeasured on current main.** Last direct measurement, taken
+> BEFORE #144: writer thread busy 207.6 s of 209.3 s wall (99.2%), the Rayon
+> walk needing ~65 s wall-equivalent (1,306 thread-s / 20 cores), and
+> `persist_queue.producer_parked` at 549,346 parks x 5.09 ms = 2,797
+> thread-seconds — about two thirds of parse capacity idle. That is ~3.2x, not
+> ~4x.
+>
+> But #144 removed `purge_module`'s sweep, which ran ON THE PERSIST-WRITER
+> THREAD, taking `index_workspace` 211,580 -> 119,435 ms. So the writer's own
+> load roughly halved and the ratio necessarily moved with it. Re-measure
+> before quoting any multiplier; state the busy/idle figures instead, since
+> those are what was actually instrumented. Batching already
 exists (≤128 files/txn); `synchronous` is measured as a no-op (~973 commits).
 
 **Ten of `refs`' twelve columns have no reader anywhere in the tree.**
