@@ -130,6 +130,23 @@ fn check_cursor_contracts(
         }
     }
 
+    // I5: hover presents the top-ranked definitions() candidate — the
+    // ADR's words. Two implementations of "the best definition" that
+    // drift is exactly the sibling-pair class this net exists for.
+    if let Some(h) = cs.hover_candidate() {
+        if !cs
+            .definitions()
+            .iter()
+            .any(|d| file_key_eq(&d.key, &h.key) && d.span == h.span)
+        {
+            violations.push(format!(
+                "I5 {}:{}:{} `{}` — hover_candidate {:?} {:?} not in definitions()",
+                path.display(), r.span.start.row, r.span.start.column,
+                r.target_name, h.key, h.span,
+            ));
+        }
+    }
+
     // I4: gr names a declaration ⇒ gd answers.
     if refs_img.iter().any(|l| l.access == AccessKind::Declaration)
         && cs.definitions().is_empty()
@@ -275,7 +292,12 @@ fn projection_contracts_hold_at_every_pack_cursor() {
 
 /// The REACH instance: the same contracts over a big real corpus — the
 /// snapshot-pinned CPAN substrate (`gold-corpus/local`, ~3.5k files of
-/// real CPAN code), or any root named by `PERL_LSP_CONSISTENCY_CORPUS`.
+/// real CPAN code) by default. `PERL_LSP_CONSISTENCY_CORPUS=<root>` points
+/// the net at ANY tree — this is the highest-leverage knob here: the net
+/// travels to whatever corpus is worrying us this week (Koha, crm, a bug
+/// reporter's repo) instead of staying pinned to the fixtures it was born
+/// with. Nothing else changes: same contracts, same known-list, same
+/// verdict.
 /// Answers whether the fixture-tree run's near-cleanliness means the set
 /// is clean or the corpora are tame. `#[ignore]` because it runs minutes,
 /// not seconds — opt in with `cargo test -- --ignored` or by name.
