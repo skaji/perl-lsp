@@ -396,15 +396,19 @@ fn projection_contracts_broad_corpus() {
 
     // Gold-harness xfail discipline: adjudication-pending residuals are
     // KNOWN — reported, never silently failing — and a known that stops
-    // firing is flagged for promotion, exactly like an XPASS. Current
-    // entries: invocant-position cursors inside SUPER calls. ADJUDICATED
-    // (#120) as a RULE-7 BUILDER GAP: the builtin invocant (`shift` in
-    // `shift->SUPER::new`) gets NO token ref of its own — the MethodCall
-    // ref's span merely starts there and its `invocant_span` is metadata —
-    // so there is nothing for the cursor to resolve TO. gd answers
-    // generously from the un-minted token while references is empty (the
-    // harness shows the mirror image). The fix is a builder emission for
-    // invocant-position calls; these entries promote out the day it lands.
+    // firing is flagged for promotion, exactly like an XPASS. (The
+    // original pair — invocant-position cursors inside SUPER calls —
+    // promoted out when the rule-7 builtin-keyword emission landed:
+    // builtin calls now mint CORE-bound refs, so the cursor resolves the
+    // builtin instead of the enclosing MethodCall.)
+    //
+    // Current entry: HARNESS-REACH, not a code bug — production gd AND
+    // references both answer correctly at this cursor (`$self->plugin(
+    // 'Koha::…::Objects')` → the plugin module's `register`). The
+    // in-process net lacks the resolver thread that serves name-keyed
+    // module resolution at query time, so ITS gd comes up empty while its
+    // references finds the decl by walking files directly. This maps the
+    // net's reach boundary; wiring a test resolver lane would promote it.
     let (provisional, violations): (Vec<String>, Vec<String>) =
         violations.into_iter().partition(|v| v.starts_with("P1"));
     for v in provisional.iter().take(40) {
@@ -414,8 +418,7 @@ fn projection_contracts_broad_corpus() {
         eprintln!("({} provisional reports — never failing; first 40 shown)", provisional.len());
     }
     const KNOWN: &[(&str, usize, usize)] = &[
-        ("Mojo/Exception.pm", 69, 26),
-        ("PPI/Structure/List.pm", 61, 8),
+        ("Koha/REST/V1.pm", 223, 19),
     ];
     let is_known = |v: &str| {
         KNOWN.iter().any(|(f, row, col)| v.contains(&format!("{f}:{row}:{col} ")))

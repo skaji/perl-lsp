@@ -10,6 +10,26 @@ impl<'a> Builder<'a> {
         let name = node.child(0)
             .and_then(|c| c.utf8_text(self.source).ok())
             .unwrap_or("");
+        // Rule 7: the keyword is a meaningful token and gets its own ref.
+        // Without one, `ref_at` at an invocant-position builtin
+        // (`shift->SUPER::new`) fell through to the ENCLOSING MethodCall —
+        // goto-def answered the method from a token nobody minted while
+        // references answered nothing (the consistency net's KNOWN pair).
+        // Bound to CORE — the namespace Perl itself gives builtins — so the
+        // identity can never cross-link to a user sub of the same name;
+        // `rename_kind_at` declines CORE (a builtin is not renameable) and
+        // the in-file occurrence union serves highlights/references.
+        if !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase()) {
+            if let Some(kw) = node.child(0) {
+                self.add_bound_ref(
+                    RefKind::FunctionCall,
+                    node_to_span(kw),
+                    name.to_string(),
+                    AccessKind::Read,
+                    Some(RefBinding::Function { package: "CORE".to_string() }),
+                );
+            }
+        }
         // Push type constraint on the argument
         if let Some(arg_type) = crate::model::builtins::builtin_first_arg_type(name) {
             if let Some(arg) = node.named_child(0) {

@@ -305,7 +305,23 @@
         "none": []
       },
       "status": "gold",
-      "note": "goto &Role::Tiny::import resolves to Role/Tiny.pm sub import — the `&` code-ref sigil is stripped so the FQ name resolves."
+      "note": "goto &Role::Tiny::import resolves to Role/Tiny.pm sub import \u2014 the `&` code-ref sigil is stripped so the FQ name resolves."
+    },
+    {
+      "id": "builtin-invocant-cursor-claims-the-builtin",
+      "difficulty": "medium",
+      "semantic_area": "builtins",
+      "comment": "Cursor on the builtin invocant of `shift->SUPER::new`. Pre-fix the builtin keyword had NO ref, so ref_at fell to the enclosing MethodCall and gd answered the parent's method from a token nobody minted. Now the CORE-bound builtin ref wins narrowest-span and gd answers nothing here (the builtin has no definition to jump to); the method-token cursor one column right still jumps.",
+      "file": "Mojo/Exception.pm",
+      "line": 69,
+      "col": 26,
+      "expect": {
+        "all": [],
+        "none": [
+          "Base.pm"
+        ]
+      },
+      "status": "gold"
     }
   ]
 }

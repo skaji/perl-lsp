@@ -1086,6 +1086,15 @@ impl FileAnalysis {
             match &r.kind {
                 RefKind::Variable | RefKind::ContainerAccess => return Some(RenameKind::Variable),
                 RefKind::FunctionCall => {
+                    // A CORE-bound ref is a builtin call keyword (`shift`,
+                    // `keys`, ...). It has an identity — the in-file
+                    // occurrence union serves highlights/references — but no
+                    // rename: the language owns the name, and a Function
+                    // target here would fan a rewrite over every builtin
+                    // call site.
+                    if r.resolved_package() == Some("CORE") {
+                        return None;
+                    }
                     // A qualified call (`Foo::baz()`) carries the whole path
                     // in `target_name`; the renamable identifier is the bare
                     // tail, scoped by the `Function` binding (the qualifier). When

@@ -1105,3 +1105,45 @@ fn collect_perl_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, 
         }
     }
 }
+
+// ---- builtin call keyword refs (rule 7) ----
+
+/// A builtin call's keyword gets its own ref, bound to CORE. Without it,
+/// `ref_at` at an invocant-position builtin (`shift->SUPER::new`) fell
+/// through to the ENCLOSING MethodCall: goto-def answered the method from
+/// a token nobody minted while references answered nothing — the
+/// projection disagreement the consistency net carried as its KNOWN pair.
+/// CORE (the namespace Perl itself gives builtins) keeps the identity from
+/// ever cross-linking to a user sub of the same name, and rename declines
+/// it: the language owns the name.
+#[test]
+fn builtin_call_keyword_gets_a_core_bound_ref() {
+    let src = "my @x = (1);\nmy $a = shift @x;\nshift(@x)->foo;\nmy $u = uc($a);\nmy $t = time;\n";
+    let fa = build_fa(src);
+    let core_refs: Vec<_> = fa
+        .refs()
+        .iter()
+        .filter(|r| {
+            matches!(r.kind, RefKind::FunctionCall) && r.resolved_package() == Some("CORE")
+        })
+        .map(|r| (r.target_name.as_str(), r.span.start.row, r.span.start.column))
+        .collect();
+    for want in [("shift", 1, 8), ("shift", 2, 0), ("uc", 3, 8), ("time", 4, 8)] {
+        assert!(
+            core_refs.contains(&want),
+            "missing CORE-bound builtin ref {want:?}; got {core_refs:?}",
+        );
+    }
+
+    // Narrowest-span (rule 7's tiebreaker): the invocant-position cursor
+    // now resolves the BUILTIN, not the enclosing method call.
+    let r = fa.ref_at(Point { row: 2, column: 2 }).expect("ref at invocant");
+    assert_eq!(r.target_name, "shift", "invocant cursor claims the builtin: {:?}", r.kind);
+
+    // And a builtin is not renameable — prepareRename must refuse rather
+    // than offer to rewrite the language's own vocabulary.
+    assert!(
+        fa.rename_kind_at(Point { row: 2, column: 2 }, None).is_none(),
+        "a CORE-bound builtin call must not mint a rename kind",
+    );
+}
