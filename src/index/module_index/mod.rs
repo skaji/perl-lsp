@@ -161,6 +161,7 @@ pub(crate) use index_core::strip_import_copy_one;
 mod lookup;
 mod queries;
 mod registration;
+pub use registration::SweepMemoGuard;
 
 /// Every file that provides one module name, in provider order. `[0]` is
 /// the winner — what `require` would load for an `@INC` set, the derived
