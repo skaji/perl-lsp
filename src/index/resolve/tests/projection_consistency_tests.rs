@@ -52,6 +52,96 @@ fn corpus_files() -> Vec<PathBuf> {
 /// pass-line, never silently.
 const CURSORS_PER_FILE: usize = 250;
 
+/// The four contracts at one cursor — ONE speller, shared by every corpus
+/// instance (a drifted copy of the drift-detector would be the joke that
+/// writes itself). Returns the violations found at this cursor.
+fn check_cursor_contracts(
+    store: &FileStore,
+    fa: &std::sync::Arc<FileAnalysis>,
+    path: &std::path::Path,
+    r: &crate::model::file_analysis::Ref,
+    idx: &crate::index::module_index::ModuleIndex,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    let key = FileKey::Path(path.to_path_buf());
+    let cs = resolve(
+        store,
+        fa,
+        key.clone(),
+        r.span.start,
+        Some(idx),
+        OverrideScope::default(),
+    );
+
+    let refs_img = cs.references();
+    let highlights = cs.highlights();
+
+    // I1: highlights == references ∩ origin, as span SETS.
+    let mut gr_origin: Vec<Span> = refs_img
+        .iter()
+        .filter(|l| file_key_eq(&l.key, &key))
+        .map(|l| l.span)
+        .collect();
+    let mut hl: Vec<Span> = highlights.iter().map(|l| l.span).collect();
+    gr_origin.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
+    gr_origin.dedup();
+    hl.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
+    hl.dedup();
+    if gr_origin != hl {
+        violations.push(format!(
+            "I1 {}:{}:{} `{}` — highlights ({}) != references∩origin ({}): hl={:?} gr={:?}",
+            path.display(), r.span.start.row, r.span.start.column, r.target_name,
+            hl.len(), gr_origin.len(), hl, gr_origin,
+        ));
+    }
+
+    // I2: linked editing spans ⊆ highlight spans.
+    for s in cs.linked_editing_spans() {
+        if !hl.contains(&s) {
+            violations.push(format!(
+                "I2 {}:{}:{} `{}` — linked-editing span {:?} not in highlights",
+                path.display(), r.span.start.row, r.span.start.column, r.target_name, s,
+            ));
+        }
+    }
+
+    // I3: rename edits ⊆ references image. CONTAINMENT, not span equality:
+    // a variable rename edits the bare name inside the sigil'd reference
+    // span, so the edit is a sub-span of its reference site — outside ANY
+    // reference span is the violation.
+    if cs.renameable() {
+        if let Ok(edits) = cs.rename_edits("zzz_consistency_probe") {
+            for (loc, _text) in &edits {
+                let in_refs = refs_img.iter().any(|l| {
+                    file_key_eq(&l.key, &loc.key)
+                        && (l.span.start.row, l.span.start.column)
+                            <= (loc.span.start.row, loc.span.start.column)
+                        && (loc.span.end.row, loc.span.end.column)
+                            <= (l.span.end.row, l.span.end.column)
+                });
+                if !in_refs {
+                    violations.push(format!(
+                        "I3 {}:{}:{} `{}` — rename edit at {:?} {:?} outside references",
+                        path.display(), r.span.start.row, r.span.start.column,
+                        r.target_name, loc.key, loc.span,
+                    ));
+                }
+            }
+        }
+    }
+
+    // I4: gr names a declaration ⇒ gd answers.
+    if refs_img.iter().any(|l| l.access == AccessKind::Declaration)
+        && cs.definitions().is_empty()
+    {
+        violations.push(format!(
+            "I4 {}:{}:{} `{}` — references name a Declaration but definitions() is empty",
+            path.display(), r.span.start.row, r.span.start.column, r.target_name,
+        ));
+    }
+    violations
+}
+
 #[test]
 fn projection_contracts_hold_at_every_corpus_cursor() {
     let files = corpus_files();
@@ -75,90 +165,13 @@ fn projection_contracts_hold_at_every_corpus_cursor() {
     let mut violations: Vec<String> = Vec::new();
     let mut cursors = 0usize;
     let mut dropped = 0usize;
-
     for (path, fa) in &analyses {
         let refs = fa.refs();
         let stride = refs.len().div_ceil(CURSORS_PER_FILE).max(1);
         dropped += refs.len() - refs.len().div_ceil(stride);
         for r in refs.iter().step_by(stride) {
             cursors += 1;
-            let key = FileKey::Path(path.clone());
-            let cs = resolve(
-                &store,
-                fa,
-                key.clone(),
-                r.span.start,
-                Some(&idx),
-                OverrideScope::default(),
-            );
-
-            let refs_img = cs.references();
-            let highlights = cs.highlights();
-
-            // I1: highlights == references ∩ origin, as span SETS.
-            let mut gr_origin: Vec<Span> = refs_img
-                .iter()
-                .filter(|l| file_key_eq(&l.key, &key))
-                .map(|l| l.span)
-                .collect();
-            let mut hl: Vec<Span> = highlights.iter().map(|l| l.span).collect();
-            gr_origin.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
-            gr_origin.dedup();
-            hl.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
-            hl.dedup();
-            if gr_origin != hl {
-                violations.push(format!(
-                    "I1 {}:{}:{} `{}` — highlights ({}) != references∩origin ({}): hl={:?} gr={:?}",
-                    path.display(), r.span.start.row, r.span.start.column, r.target_name,
-                    hl.len(), gr_origin.len(), hl, gr_origin,
-                ));
-            }
-
-            // I2: linked editing spans ⊆ highlight spans.
-            for s in cs.linked_editing_spans() {
-                if !hl.contains(&s) {
-                    violations.push(format!(
-                        "I2 {}:{}:{} `{}` — linked-editing span {:?} not in highlights",
-                        path.display(), r.span.start.row, r.span.start.column,
-                        r.target_name, s,
-                    ));
-                }
-            }
-
-            // I3: rename edits ⊆ references image. CONTAINMENT, not span
-            // equality: a variable rename edits the bare name inside the
-            // sigil'd reference span, so the edit is a sub-span of its
-            // reference site — outside ANY reference span is the violation.
-            if cs.renameable() {
-                if let Ok(edits) = cs.rename_edits("zzz_consistency_probe") {
-                    for (loc, _text) in &edits {
-                        let in_refs = refs_img.iter().any(|l| {
-                            file_key_eq(&l.key, &loc.key)
-                                && (l.span.start.row, l.span.start.column)
-                                    <= (loc.span.start.row, loc.span.start.column)
-                                && (loc.span.end.row, loc.span.end.column)
-                                    <= (l.span.end.row, l.span.end.column)
-                        });
-                        if !in_refs {
-                            violations.push(format!(
-                                "I3 {}:{}:{} `{}` — rename edit at {:?} {:?} outside references",
-                                path.display(), r.span.start.row, r.span.start.column,
-                                r.target_name, loc.key, loc.span,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // I4: gr names a declaration ⇒ gd answers.
-            if refs_img.iter().any(|l| l.access == AccessKind::Declaration)
-                && cs.definitions().is_empty()
-            {
-                violations.push(format!(
-                    "I4 {}:{}:{} `{}` — references name a Declaration but definitions() is empty",
-                    path.display(), r.span.start.row, r.span.start.column, r.target_name,
-                ));
-            }
+            violations.extend(check_cursor_contracts(&store, fa, path, r, &idx));
         }
     }
 
@@ -182,7 +195,11 @@ fn projection_contracts_hold_at_every_corpus_cursor() {
 /// include closures gather from disk; analyses register into a cpp
 /// sub-index attached to a hub, the production topology (`lookup_for`
 /// routes pack asks to the sub-index — pack symbols never live in the
-/// Perl FileStore workspace map).
+/// Perl FileStore workspace map). The queried origin is staged in the
+/// workspace store for its cursors, exactly as the CLI's
+/// `ScopedWorkspaceEntry` / the LSP's open doc does — without it the
+/// backward walk cannot see the queried file and every cursor flags a
+/// false I1.
 #[cfg(feature = "cpp")]
 #[test]
 fn projection_contracts_hold_at_every_pack_cursor() {
@@ -230,87 +247,14 @@ fn projection_contracts_hold_at_every_pack_cursor() {
     let mut violations: Vec<String> = Vec::new();
     let mut cursors = 0usize;
     let mut dropped = 0usize;
-
     for (path, fa) in &analyses {
-        // Stage the origin the way every production query does
-        // (`ScopedWorkspaceEntry` in the CLI, the open doc in the LSP):
-        // the backward walk reads the queried file from the store.
         store.insert_workspace_arc(path.clone(), fa.clone());
         let refs = fa.refs();
         let stride = refs.len().div_ceil(CURSORS_PER_FILE).max(1);
         dropped += refs.len() - refs.len().div_ceil(stride);
         for r in refs.iter().step_by(stride) {
             cursors += 1;
-            let key = FileKey::Path(path.clone());
-            let cs = resolve(
-                &store,
-                fa,
-                key.clone(),
-                r.span.start,
-                Some(&hub),
-                OverrideScope::default(),
-            );
-
-            let refs_img = cs.references();
-            let highlights = cs.highlights();
-
-            let mut gr_origin: Vec<Span> = refs_img
-                .iter()
-                .filter(|l| file_key_eq(&l.key, &key))
-                .map(|l| l.span)
-                .collect();
-            let mut hl: Vec<Span> = highlights.iter().map(|l| l.span).collect();
-            gr_origin.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
-            gr_origin.dedup();
-            hl.sort_by_key(|s| (s.start.row, s.start.column, s.end.row, s.end.column));
-            hl.dedup();
-            if gr_origin != hl {
-                violations.push(format!(
-                    "I1 {}:{}:{} `{}` — highlights ({}) != references∩origin ({}): hl={:?} gr={:?}",
-                    path.display(), r.span.start.row, r.span.start.column, r.target_name,
-                    hl.len(), gr_origin.len(), hl, gr_origin,
-                ));
-            }
-
-            for s in cs.linked_editing_spans() {
-                if !hl.contains(&s) {
-                    violations.push(format!(
-                        "I2 {}:{}:{} `{}` — linked-editing span {:?} not in highlights",
-                        path.display(), r.span.start.row, r.span.start.column,
-                        r.target_name, s,
-                    ));
-                }
-            }
-
-            if cs.renameable() {
-                if let Ok(edits) = cs.rename_edits("zzz_consistency_probe") {
-                    for (loc, _text) in &edits {
-                        let in_refs = refs_img.iter().any(|l| {
-                            file_key_eq(&l.key, &loc.key)
-                                && (l.span.start.row, l.span.start.column)
-                                    <= (loc.span.start.row, loc.span.start.column)
-                                && (loc.span.end.row, loc.span.end.column)
-                                    <= (l.span.end.row, l.span.end.column)
-                        });
-                        if !in_refs {
-                            violations.push(format!(
-                                "I3 {}:{}:{} `{}` — rename edit at {:?} {:?} outside references",
-                                path.display(), r.span.start.row, r.span.start.column,
-                                r.target_name, loc.key, loc.span,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if refs_img.iter().any(|l| l.access == AccessKind::Declaration)
-                && cs.definitions().is_empty()
-            {
-                violations.push(format!(
-                    "I4 {}:{}:{} `{}` — references name a Declaration but definitions() is empty",
-                    path.display(), r.span.start.row, r.span.start.column, r.target_name,
-                ));
-            }
+            violations.extend(check_cursor_contracts(&store, fa, path, r, &hub));
         }
         store.remove_workspace(path);
     }
@@ -326,5 +270,119 @@ fn projection_contracts_hold_at_every_pack_cursor() {
     eprintln!(
         "pack projection contracts held at {cursors} cursors across {} files ({dropped} capped out)",
         analyses.len(),
+    );
+}
+
+/// The REACH instance: the same contracts over a big real corpus — the
+/// snapshot-pinned CPAN substrate (`gold-corpus/local`, ~3.5k files of
+/// real CPAN code), or any root named by `PERL_LSP_CONSISTENCY_CORPUS`.
+/// Answers whether the fixture-tree run's near-cleanliness means the set
+/// is clean or the corpora are tame. `#[ignore]` because it runs minutes,
+/// not seconds — opt in with `cargo test -- --ignored` or by name.
+/// Both caps are LOUD in the pass line; a cap is a coverage decision.
+#[test]
+#[ignore = "broad-corpus reach run (minutes) — run by name or --ignored"]
+fn projection_contracts_broad_corpus() {
+    const FILE_CAP: usize = 700;
+    const BROAD_CURSORS_PER_FILE: usize = 25;
+
+    let root = std::env::var("PERL_LSP_CONSISTENCY_CORPUS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gold-corpus/local/lib/perl5")
+        });
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "pm" || x == "pl") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    assert!(!files.is_empty(), "no corpus at {} — set PERL_LSP_CONSISTENCY_CORPUS", root.display());
+    let total_files = files.len();
+    let fstride = total_files.div_ceil(FILE_CAP).max(1);
+    let files: Vec<PathBuf> = files.into_iter().step_by(fstride).collect();
+
+    let store = FileStore::new();
+    let idx = crate::index::module_index::ModuleIndex::new_for_test();
+    let mut analyses: Vec<(PathBuf, std::sync::Arc<FileAnalysis>)> = Vec::new();
+    for p in &files {
+        let Ok(src) = std::fs::read_to_string(p) else { continue };
+        if src.len() > 1_000_000 {
+            continue; // the walk's own 1MB cap
+        }
+        let fa = std::sync::Arc::new(parse(&src));
+        store.insert_workspace_arc(p.clone(), fa.clone());
+        idx.register_workspace_module(p.clone(), fa.clone());
+        analyses.push((p.clone(), fa));
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut cursors = 0usize;
+    let mut dropped = 0usize;
+    let t0 = std::time::Instant::now();
+    for (path, fa) in &analyses {
+        let refs = fa.refs();
+        let stride = refs.len().div_ceil(BROAD_CURSORS_PER_FILE).max(1);
+        dropped += refs.len() - refs.len().div_ceil(stride);
+        for r in refs.iter().step_by(stride) {
+            cursors += 1;
+            violations.extend(check_cursor_contracts(&store, fa, path, r, &idx));
+        }
+    }
+
+    // Gold-harness xfail discipline: adjudication-pending residuals are
+    // KNOWN — reported, never silently failing — and a known that stops
+    // firing is flagged for promotion, exactly like an XPASS. Current
+    // entries: invocant-position cursors inside SUPER calls (the
+    // MethodCall ref's span STARTS at the invocant, so `ref_at` claims
+    // the cursor for the call while identity minting declines it —
+    // production gd answers generously there while references is empty,
+    // the harness shows the mirror image; whether an invocant cursor
+    // should resolve the call AT ALL is an open adjudication, #120).
+    const KNOWN: &[(&str, usize, usize)] = &[
+        ("Mojo/Exception.pm", 69, 26),
+        ("PPI/Structure/List.pm", 61, 8),
+    ];
+    let is_known = |v: &str| {
+        KNOWN.iter().any(|(f, row, col)| v.contains(&format!("{f}:{row}:{col} ")))
+    };
+    let (known, violations): (Vec<String>, Vec<String>) =
+        violations.into_iter().partition(|v| is_known(&v[..]));
+    for v in &known {
+        eprintln!("KNOWN (adjudication pending): {v}");
+    }
+    if known.len() < KNOWN.len() {
+        eprintln!(
+            "NOTE: only {} of {} KNOWN residuals fired — a fixed one should be \
+             promoted out of the list (the xfail→XPASS rule)",
+            known.len(),
+            KNOWN.len(),
+        );
+    }
+    // Report-first: on a broad corpus the FINDINGS are the product; print
+    // every distinct violation before the verdict so a red run carries its
+    // own triage list.
+    for v in &violations {
+        eprintln!("{v}");
+    }
+    eprintln!(
+        "broad corpus: {} violations over {cursors} cursors, {} of {total_files} files \
+         (file stride {fstride}; {dropped} cursors capped out) in {:.1}s",
+        violations.len(),
+        analyses.len(),
+        t0.elapsed().as_secs_f32(),
+    );
+    assert!(
+        violations.is_empty(),
+        "{} projection-contract violations on the broad corpus (see stderr)",
+        violations.len(),
     );
 }
