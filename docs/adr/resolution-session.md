@@ -4,8 +4,9 @@
 reference walk issues one such query per candidate call site, and each
 re-derives the same `MethodOnClass{class, method}` lattice from scratch.
 At 138k files that re-derivation is combinatorial — 5–12 files declare a
-common package name, mutual imports are the norm, and the chase recurses
-through both — and the verb does not return. Measured: one `references`
+common package name, the chase is keyed by that name rather than by an
+import edge, and it recurses through every provider — and the verb does
+not return. Measured: one `references`
 request performed **10.7M cross-file consults in 15 minutes** and never
 reached the projection, with the blob caches sized so large that
 rehydration hit ~100% and the query still did not finish. Cache sizing
@@ -52,8 +53,8 @@ this memo exists.
 **Truncated values are remembered like any other — measured, not assumed.**
 The first design refused to store a value the cycle guard fed by cutting a
 key above the evaluation's own root, on the theory that such a value is
-path-dependent. At CPAN scale mutual imports make those cuts near-universal:
-**508,319 refusals against 5,870 stores** in one walk, so the memo
+path-dependent. At CPAN scale the split-package fan-out makes those cuts
+near-universal: **508,319 refusals against 5,870 stores** in one walk, so the memo
 remembered nothing and the walk still did not return. It is also a gate the
 codebase does not otherwise apply — `QueryState`'s own memo stores every
 off-path resolution regardless of ancestor cuts and reuses it elsewhere in

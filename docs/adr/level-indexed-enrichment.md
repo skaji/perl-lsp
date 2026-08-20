@@ -39,8 +39,8 @@ thread's stack. Two consequences, and the second is the expensive one:
 2. **The result is context-dependent, so it can never be cached.** Whether
    B comes back enriched or raw depends on who asked first. The code says
    so and refuses to retain a cycle-tainted build — correctly, given that
-   design. Where mutual imports are the norm, "never retained" means every
-   consult rebuilds a whole analysis. Raising `PERL_LSP_ENRICHED_CAP` to
+   design. Where the name-keyed chase revisits constantly, "never
+   retained" means every consult rebuilds a whole analysis. Raising `PERL_LSP_ENRICHED_CAP` to
    100,000 cannot help: the cap governs retention, and tainted results
    never reach it.
 
