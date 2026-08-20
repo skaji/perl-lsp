@@ -363,12 +363,14 @@ fn projection_contracts_broad_corpus() {
     // Gold-harness xfail discipline: adjudication-pending residuals are
     // KNOWN — reported, never silently failing — and a known that stops
     // firing is flagged for promotion, exactly like an XPASS. Current
-    // entries: invocant-position cursors inside SUPER calls (the
-    // MethodCall ref's span STARTS at the invocant, so `ref_at` claims
-    // the cursor for the call while identity minting declines it —
-    // production gd answers generously there while references is empty,
-    // the harness shows the mirror image; whether an invocant cursor
-    // should resolve the call AT ALL is an open adjudication, #120).
+    // entries: invocant-position cursors inside SUPER calls. ADJUDICATED
+    // (#120) as a RULE-7 BUILDER GAP: the builtin invocant (`shift` in
+    // `shift->SUPER::new`) gets NO token ref of its own — the MethodCall
+    // ref's span merely starts there and its `invocant_span` is metadata —
+    // so there is nothing for the cursor to resolve TO. gd answers
+    // generously from the un-minted token while references is empty (the
+    // harness shows the mirror image). The fix is a builder emission for
+    // invocant-position calls; these entries promote out the day it lands.
     const KNOWN: &[(&str, usize, usize)] = &[
         ("Mojo/Exception.pm", 69, 26),
         ("PPI/Structure/List.pm", 61, 8),
