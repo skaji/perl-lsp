@@ -221,8 +221,20 @@ function M.open_and_attach(path)
     local clients = vim.lsp.get_clients({ bufnr = buf })
     if #clients > 0 then
       io.write("lsp:  " .. clients[1].name .. "\n\n")
-      vim.wait(500)  -- let server finish initial parse
-      return buf
+      -- Readiness is an ANSWER, not a delay: the server bounds its own
+      -- cold-open wait (`coldWaitMs`, 400 ms) and then answers pull verbs
+      -- degraded (null) until the initial build lands, so a fixed sleep
+      -- encodes a box-speed assumption — 500 ms passed on the box that
+      -- wrote it and lost 6-10/10 on a slower one, failing every suite's
+      -- FIRST assertion. Poll a same-file verb until it answers content;
+      -- the suite then starts when the server is actually serving.
+      for _ = 1, 100 do
+        local syms = M.symbol_names(buf)
+        if #syms > 0 then return buf end
+        vim.wait(100)
+      end
+      io.write("\27[31mERROR: server never answered documentSymbol with content within 10s\27[0m\n")
+      vim.cmd("cquit! 1")
     end
     vim.wait(100)
   end
