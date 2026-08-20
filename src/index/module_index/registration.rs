@@ -923,6 +923,10 @@ impl ModuleIndex {
     ) -> Arc<FileAnalysis> {
         let mut stage = "no bag cache installed on this index".to_string();
         if let Some(bc) = self.bag_cache_ref() {
+            // Attribute this lookup to the file whose sweep asked for it, so
+            // the repeat rate a per-sweep memo could actually serve is
+            // measurable before one is written.
+            crate::util::ghost_stats::SweepScope::note(&cached.path.to_string_lossy());
             let got = crate::util::ghost_stats::timed("rehydrate.loader", || {
                 if want_bag {
                     bc.bag_for_diag(&cached.path)

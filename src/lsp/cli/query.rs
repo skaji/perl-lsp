@@ -1117,6 +1117,7 @@ fn enriched_tree_diagnostics(
             entry.key().clone(),
             std::sync::Arc::clone(entry.value()),
         ));
+        let _sweep = crate::util::ghost_stats::SweepScope::start();
         let diags = match idx.enriched_snapshot(&cached) {
             Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
             None => {

@@ -224,6 +224,57 @@ fn distincts() -> &'static Mutex<HashMap<String, std::collections::HashSet<Strin
 }
 
 /// Record that `key` was seen under `tag`. No-op when the gate is off.
+thread_local! {
+    /// Keys looked up during the CURRENT per-file sweep, when one is open.
+    /// Repeats are counted per sweep rather than globally on purpose: a memo
+    /// scoped to one file's diagnostics can only return an answer it was
+    /// already asked for INSIDE that sweep, so a global distinct count would
+    /// credit it with cross-file repeats it can never serve.
+    static SWEEP: std::cell::RefCell<Option<std::collections::HashSet<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Open a per-file sweep. Drop closes it and records the totals.
+pub struct SweepScope {
+    total: u64,
+}
+
+impl SweepScope {
+    pub fn start() -> Self {
+        if enabled() {
+            SWEEP.with(|c| *c.borrow_mut() = Some(std::collections::HashSet::new()));
+        }
+        SweepScope { total: 0 }
+    }
+
+    /// Note one lookup of `key` inside the open sweep.
+    pub fn note(key: &str) {
+        if !enabled() {
+            return;
+        }
+        SWEEP.with(|c| {
+            if let Some(set) = c.borrow_mut().as_mut() {
+                if !set.contains(key) {
+                    set.insert(key.to_string());
+                }
+            }
+        });
+        count("sweep.lookup");
+    }
+}
+
+impl Drop for SweepScope {
+    fn drop(&mut self) {
+        if !enabled() {
+            return;
+        }
+        let _ = self.total;
+        let distinct = SWEEP.with(|c| c.borrow_mut().take().map(|s| s.len()).unwrap_or(0));
+        count_by("sweep.distinct", distinct as u64);
+        count("sweep.files");
+    }
+}
+
 pub fn count_distinct(tag: &str, key: &str) {
     if !enabled() {
         return;
