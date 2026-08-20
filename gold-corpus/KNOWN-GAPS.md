@@ -384,59 +384,29 @@ server, so early positions carry systematically more noise than late ones;
 and `isIncomplete` gives the class a mechanical signature, so it can be
 separated from a real disagreement rather than adjudicated by hand.
 
-**1 of the 15 — a receiver-resolution race that does NOT announce itself.**
-`Mojo/UserAgent/CookieJar.pm:145:12` (`$tmp->spew(...)`, receiver
-`Mojo::File`) answered **14, 14, 35, 14** items across four runs, under the
-cap, with `isIncomplete: false` every time. The 21 extra items in the odd run
-are `Mojo::File`'s methods — `spew`, `_path`, `basename`, `child`, `chmod` —
-so three runs answered before the receiver's class resolved and one answered
-after.
+**1 of the 15 — a receiver-resolution race. FIXED at the response layer.**
+`Mojo/UserAgent/CookieJar.pm:145:12` answered 14/14/35/14 across four runs
+with `isIncomplete: false` every time. Four gates were built against that
+shape — untyped receiver (32.7% warm cost), resolver queue, imports cached,
+receiver bound to an imported call — and none of them worked, because
+counting showed the shape was the MINORITY. Across three cold sessions, 19
+member answers changed cold-to-warm, all 19 claimed complete, and **12 (63%)
+went from ZERO items to a real list** rather than from short to long.
 
-This is a different cause from the capped 14 and a worse-behaved one. Those
-are truncated and say so; this returns a list that claims to be COMPLETE
-while missing the receiver's whole method set. `cap_completion_items`' own
-doc comment names the consequence: a client caches a complete response and
-never asks again. It was invisible before the hoist, buried in 173 rows of
-ordering noise.
+The zero case had a different cause and a different home:
+`Backend::completion` returned `Ok(None)` for an empty Perl list. A null
+response carries no `isIncomplete` field at all, so it is the MOST cacheable
+answer the server can give — the client is told there is nothing here and
+never asks again. The pack path one branch above already preserved an
+incomplete-empty response; the Perl path dropped it unconditionally. Empty
+now answers `isIncomplete: true`, taking cold-empty member asks carrying a
+signal from 0 of 39 to 35 of 39 (the remaining 4 are the `get_open`
+short-circuit, a different and legitimate null).
 
-Not fixed, and three candidate gates were measured and rejected. The rate is
-**8 of 156 member positions (5.1%) during warm-up, 0% once the index
-settles** — three passes in one session, cold / after / after-that, with the
-second and third byte-identical. So flagging is free IF the gate only fires
-while the answer can still change. What that gate is, is the whole problem:
-
-| gate | warm cost | catches the 6-8 | verdict |
-|---|---|---|---|
-| receiver has no resolved type | **32.7%** | all | a third of member completions permanently non-cacheable — trades a correctness bug for a latency one |
-| resolver queue non-empty | 0% | **none** | `@INC` resolution is on demand; the query answers without ever enqueuing, so the queue is empty exactly when it matters |
-| any of this file's imports not cached | 1.9% | **none** | the import IS cached; that is not what is missing |
-| receiver bound to an imported call with unknown return | 0% | **none** | the precise version of the CookieJar shape, and it still misses — because that shape is the minority |
-
-**The causal model behind all four gates was wrong, and that is the finding.**
-They were built by generalising from CookieJar — receiver untyped, therefore
-short list. Counting what actually changes says otherwise. Across three
-independent cold sessions, 19 member answers differed between the cold ask
-and a warm re-ask:
-
-| | count |
-|---|---|
-| claimed `isIncomplete: false` | **19 of 19** |
-| went from ZERO items to a real list | **12 (63%)** |
-| went from a short list to a longer one (the CookieJar shape) | 7 (37%) |
-
-So the dominant class is not a mistyped receiver at all — it is the slot
-answering **nothing** and later answering properly, which no receiver-typing
-gate can see. CookieJar was the example to hand and it is the minority case.
-
-What survives: the defect is real and universal in this population — every
-answer that changes claims to be complete while it is not. What does not
-survive is the diagnosis, so the fix should be designed against the 0-to-N
-class first. An obvious candidate is "an empty list never claims
-completeness" (an empty result has nothing to filter client-side, so the flag
-only asks for a re-query the client would make on the next keystroke anyway),
-but it was NOT confirmed here: setting it in `complete_general` did not change
-the observed flag, so the empty answers are leaving by some other path and
-that needs tracing before anyone builds on it.
+The short-to-long residual is NOT fixed: a receiver that types late still
+returns a shorter list claiming completeness, and no cheap gate found so far
+separates "not yet" from "not ever". The four measured attempts are recorded
+above so the next one starts from data.
 
 **2 — ties that agree on every sort key.** `sort_by` is stable, so two
 candidates matching on `sort_text`, label AND kind keep the order the

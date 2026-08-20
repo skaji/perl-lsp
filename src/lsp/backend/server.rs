@@ -1258,14 +1258,30 @@ impl LanguageServer for Backend {
                 )
             })
             .await?;
-        if items.is_empty() {
-            Ok(None)
-        } else {
-            // Incomplete when the payload cap fired (re-query narrows
-            // server-side as the prefix grows) or any item is a loading
-            // placeholder (re-request after the module resolves).
-            let is_incomplete =
-                capped || items.iter().any(|i| i.insert_text.as_deref() == Some(""));
+        // Incomplete when the payload cap fired (re-query narrows
+        // server-side as the prefix grows), when any item is a loading
+        // placeholder (re-request after the module resolves), or when the
+        // list is EMPTY.
+        //
+        // The empty arm is the load-bearing one. This used to return
+        // `Ok(None)` — a null result, which carries no `isIncomplete` field
+        // at all and is therefore the most cacheable answer we can give: the
+        // client is told there is nothing here and never asks again.
+        // Measured over three cold sessions of 156 member positions, 2.8% of
+        // member asks answer EMPTY and then answer properly once warm, so a
+        // cached null leaves that slot dead for the rest of the session with
+        // nothing to tell the user it is wrong. The pack path above already
+        // preserves an incomplete-empty response (`items.is_empty() &&
+        // !is_incomplete`); this one dropped it unconditionally.
+        //
+        // The cost lands only where an empty answer is genuinely permanent
+        // (5.8% of member asks), and it is close to notional: an empty list
+        // has nothing to filter client-side, so `isIncomplete` only asks for
+        // a re-query the client already makes when the prefix changes.
+        let is_incomplete = capped
+            || items.is_empty()
+            || items.iter().any(|i| i.insert_text.as_deref() == Some(""));
+        {
             if is_incomplete {
                 // Trigger resolution for the module being loaded
                 for i in &items {
