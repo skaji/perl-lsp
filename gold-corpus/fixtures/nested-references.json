@@ -1,6 +1,6 @@
 {
   "capability": "references",
-  "comment": "Tier 1 references: a $row->{name} deref on a DBIC row is NOT a column reference (a column isn't a hash slot), so it never joins the column's cross-file reference set — references from the deref must not reach the column file.",
+  "comment": "Tier 1 references: a $row->{name} deref on a DBIC row is NOT a column reference (a column isn't a hash slot), so it never joins the column's cross-file reference set \u2014 references from the deref must not reach the column file.",
   "rows": [
     {
       "id": "nested-row-key-deref-not-in-column-refs",
@@ -9,7 +9,11 @@
       "line": 22,
       "col": 17,
       "status": "gold",
-      "expect": { "none": ["\"file\":\"NestedRow.pm\""] }
+      "expect": {
+        "none": [
+          "\"file\":\"NestedRow.pm\""
+        ]
+      }
     },
     {
       "id": "dbic-2hop-has-many-refs-crossfile",
@@ -19,7 +23,30 @@
       "line": 15,
       "col": 23,
       "status": "gold",
-      "expect": { "all": ["\"file\":\"deep.pl\""], "none": [] }
+      "expect": {
+        "all": [
+          "\"file\":\"deep.pl\""
+        ],
+        "none": []
+      }
+    },
+    {
+      "id": "super-qualifier-segment-references",
+      "difficulty": "medium",
+      "semantic_area": "inheritance",
+      "comment": "Cursor on the QUALIFIER segment of `shift->SUPER::new` (the `SUPER::` half). method_name_span covers only the bare tail, so this cursor minted no identity: goto-def (span-generous) answered while references/rename/highlights came back empty. The identity gate now accepts the whole qualified token.",
+      "file": "Mojo/Exception.pm",
+      "line": 69,
+      "col": 33,
+      "expect": {
+        "all": [
+          "\"col\":\"5\",\"file\":\"Pg.pm\",\"line\":\"174\"",
+          "\"col\":\"5\",\"file\":\"Minion.pm\",\"line\":\"108\"",
+          "\"col\":\"49\",\"file\":\"Minion.pm\",\"line\":\"17\""
+        ],
+        "none": []
+      },
+      "status": "gold"
     }
   ]
 }

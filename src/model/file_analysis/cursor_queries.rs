@@ -1107,8 +1107,22 @@ impl FileAnalysis {
                     // in the call — its span covers the args. But only the
                     // method-name token renames the method: a hash key in the
                     // args (`$rs->search({ order_by => 1 })`) that didn't resolve
-                    // to a column must NOT hijack `search`. Gate on the name span.
-                    if contains_point(method_name_span, point) {
+                    // to a column must NOT hijack `search`. Gate on the name span
+                    // — widened to the QUALIFIED token: `method_name_span`
+                    // covers the bare tail only, so a cursor on the qualifier
+                    // segment (`SUPER::|new`, `Foo::Bar::|m`) minted no identity
+                    // — goto-def (span-generous) answered while references /
+                    // rename / highlights came back empty. The renamable
+                    // identifier stays the bare tail; only cursor ACCEPTANCE
+                    // covers the token the user sees as one word.
+                    let token_span = {
+                        let mut s = *method_name_span;
+                        let qual =
+                            r.target_name.len().saturating_sub(r.unqualified_target_name().len());
+                        s.start.column = s.start.column.saturating_sub(qual);
+                        s
+                    };
+                    if contains_point(&token_span, point) {
                         if let Some(class) = self.method_call_invocant_class(r, module_index) {
                             // FQ `$o->Foo::Bar::m` renames the bare `m` tail; the
                             // qualifier scopes the class (same as Function above).
