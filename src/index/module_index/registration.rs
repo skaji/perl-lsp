@@ -878,7 +878,7 @@ impl ModuleIndex {
     /// GENERIC (keys on `SymKind::Class`), so every pack language gets
     /// cross-file from one indexer + its own per-language ModuleIndex.
     /// `get_cached("Box")` finds the file defining `Box`, and the same
-    /// MethodOnClass / member-completion machinery resolves across files.
+    /// PackageSymbol / member-completion machinery resolves across files.
     /// Attach a per-language sub-index (`"cpp"`, `"python"`, …).
     pub fn attach_pack_index(&self, lang: &str, idx: Arc<ModuleIndex>) {
         // Share the hub's rehydration CELL (not its current contents — the
@@ -980,7 +980,7 @@ impl ModuleIndex {
             crate::util::ghost_stats::SweepScope::note(&cached.path.to_string_lossy());
             // `PERL_LSP_REHYDRATE_TRACE=N`: dump the first N call stacks that
             // reach here. Three candidate callers were eliminated by counter
-            // (diagnostics, the enrichment chase, the MethodOnClass walk) and
+            // (diagnostics, the enrichment chase, the PackageSymbol walk) and
             // none of them accounted for a 207k-call term, so stop guessing
             // and let the call name itself.
             {
