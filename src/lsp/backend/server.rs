@@ -27,6 +27,17 @@ impl LanguageServer for Backend {
         // Same root drives repo-local `.perl-lsp/` plugin discovery, so the
         // plugin set and the per-project cache key can't disagree.
         crate::build::plugin::rhai_host::set_workspace_root(root);
+        // The registry's one-time cost (rhai-compiling the bundled plugins,
+        // warming every pattern query + the flow query) is ~1 s of CPU.
+        // Paid lazily it lands inside the FIRST didOpen's build — the exact
+        // window the cold-open bounded wait (400 ms) cannot cover, so a
+        // session's first pull verb answers null on any box where that
+        // second runs long. Warm it here instead, off the handler, where it
+        // overlaps the client's own startup; the first build then finds the
+        // registry ready (`OnceLock` — a racing build blocks on this warm
+        // rather than duplicating it). AFTER set_workspace_root, so the
+        // repo-local plugin set is the one being warmed.
+        tokio::task::spawn_blocking(crate::build::plugin::default_plugin_registry);
 
         // LSP spec: `initialize` carries the client `processId`; "if the parent
         // process is not alive then the server should exit." Poll it on an
@@ -59,6 +70,22 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         self.type_hierarchy_dynamic
             .store(th_dyn, std::sync::atomic::Ordering::Relaxed);
+
+        // Every column this server speaks is a tree-sitter BYTE offset —
+        // Span/Point math, the CLI coordinates, every emitted Range. LSP's
+        // default encoding is UTF-16 code units, so on a line with a
+        // non-ASCII character before the cursor the two lanes disagree and
+        // every position verb misaligns there. Negotiate honesty where the
+        // client permits it (LSP 3.17): offer utf-8 and the client converts
+        // for us (nvim 0.10+ does). A client without utf-8 stays on the
+        // default — mismatched as before, but as a known gap rather than an
+        // unspoken byte==code-unit identity assumption.
+        let utf8_positions = params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref())
+            .is_some_and(|encs| encs.iter().any(|e| *e == PositionEncodingKind::UTF8));
 
         // Opt-in diagnostics from `initializationOptions.diagnostics`.
         // The `diagnostics` sub-object deserializes straight into
@@ -119,6 +146,7 @@ impl LanguageServer for Backend {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
             capabilities: ServerCapabilities {
+                position_encoding: utf8_positions.then_some(PositionEncodingKind::UTF8),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -1739,4 +1767,50 @@ async fn run_perltidy(input: String) -> std::io::Result<std::process::Output> {
     let output = child.wait_with_output().await;
     let _ = writer.await;
     output
+}
+
+#[cfg(test)]
+mod position_encoding_tests {
+    use super::*;
+    use tower_lsp::LspService;
+
+    async fn init_with(encodings: Option<Vec<PositionEncodingKind>>) -> InitializeResult {
+        let (service, _socket) = LspService::new(Backend::new);
+        let params = InitializeParams {
+            capabilities: ClientCapabilities {
+                general: Some(GeneralClientCapabilities {
+                    position_encodings: encodings,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        service.inner().initialize(params).await.expect("initialize")
+    }
+
+    /// A client that can speak byte positions is told the truth: every
+    /// column this server emits IS a byte offset, so advertising utf-8
+    /// makes the client convert instead of misreading them as UTF-16
+    /// code units on non-ASCII lines.
+    #[tokio::test]
+    async fn utf8_offer_is_accepted() {
+        let r = init_with(Some(vec![
+            PositionEncodingKind::UTF16,
+            PositionEncodingKind::UTF8,
+        ]))
+        .await;
+        assert_eq!(r.capabilities.position_encoding, Some(PositionEncodingKind::UTF8));
+    }
+
+    /// No utf-8 offer → stay silent (the spec default, utf-16, applies).
+    /// The mismatch on non-ASCII lines remains for such clients — a known
+    /// gap, not a silently claimed capability.
+    #[tokio::test]
+    async fn no_offer_stays_on_the_default() {
+        let r = init_with(None).await;
+        assert_eq!(r.capabilities.position_encoding, None);
+        let r = init_with(Some(vec![PositionEncodingKind::UTF16])).await;
+        assert_eq!(r.capabilities.position_encoding, None);
+    }
 }

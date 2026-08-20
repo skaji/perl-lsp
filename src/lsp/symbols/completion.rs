@@ -30,7 +30,6 @@ fn rank_candidates_by_expected_type(
     analysis: &FileAnalysis,
     point: Point,
 ) {
-    use crate::model::file_analysis::PRIORITY_LOCAL;
     let is_match = |c: &CompletionCandidate| -> bool {
         matches!(c.kind, FaSymKind::Variable)
             && analysis
