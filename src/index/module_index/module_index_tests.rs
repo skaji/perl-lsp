@@ -2014,3 +2014,82 @@ fn unregistering_a_workspace_file_retracts_its_loader_shapes() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The reverse record must retract EXACTLY what the whole-map sweep did.
+///
+/// `purge_module` no longer scans every bucket; it walks the keys the module
+/// was fed under. That is a pure performance change whose failure mode is a
+/// stale edge surviving a purge — silent, and only visible later as a
+/// phantom module in a lookup. So this compares the two implementations
+/// directly on the same state rather than asserting a hand-written expected
+/// shape, and it does it on the case that motivated the change: SEVERAL
+/// FILES feeding under ONE module name, which is what an installed @INC tree
+/// is full of and what `rebuild_name_registration` replays after each purge.
+#[test]
+fn the_record_driven_purge_matches_the_whole_map_sweep() {
+    use crate::index::module_index::ModuleEdgeIndexes;
+
+    // Overlapping symbol names across modules is what makes shared buckets;
+    // two files under `Dup::Mod` is the duplicate-name shape.
+    let srcs: Vec<(&str, &str)> = vec![
+        ("Dup::Mod", "package Dup::Mod; use parent 'Base::One'; sub new {} sub run {}"),
+        ("Dup::Mod", "package Dup::Mod; use parent 'Base::Two'; sub new {} sub helper {}"),
+        ("Other::Mod", "package Other::Mod; use parent 'Base::One'; sub new {} sub run {}"),
+        ("Third::Mod", "package Third::Mod; sub new {} sub only_here {}"),
+    ];
+
+    let build = || {
+        let edges = ModuleEdgeIndexes::new();
+        for (i, (name, src)) in srcs.iter().enumerate() {
+            let fa = build_fa(src);
+            edges.feed(name, &PathBuf::from(format!("/fake/f{i}.pm")), &fa);
+        }
+        edges.publish_spec("Primary::T", "Dup::Mod");
+        edges.publish_child("Base::One", "Dup::Mod");
+        edges
+    };
+
+    // Every module in play, including one never fed.
+    for target in ["Dup::Mod", "Other::Mod", "Third::Mod", "Never::Fed"] {
+        let by_record = build();
+        let by_sweep = build();
+        assert_eq!(
+            by_record.snapshot(),
+            by_sweep.snapshot(),
+            "the two indexes did not start identical for {target}"
+        );
+        by_record.purge_module(target);
+        by_sweep.purge_module_by_sweep(target);
+        assert_eq!(
+            by_record.snapshot(),
+            by_sweep.snapshot(),
+            "record-driven purge of {target} diverged from the whole-map sweep"
+        );
+    }
+}
+
+/// A purge must retract a sibling's contribution too, not just the last
+/// feed's. Both files under `Dup::Mod` publish `new`; if the record replaced
+/// instead of unioning, the first file's keys would go unrecorded and its
+/// edge would outlive the purge.
+#[test]
+fn a_purge_retracts_every_sibling_feed_under_one_name() {
+    use crate::index::module_index::ModuleEdgeIndexes;
+    let edges = ModuleEdgeIndexes::new();
+    for (i, src) in [
+        "package Dup::Mod; sub only_in_first {}",
+        "package Dup::Mod; sub only_in_second {}",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let fa = build_fa(src);
+        edges.feed("Dup::Mod", &PathBuf::from(format!("/fake/s{i}.pm")), &fa);
+    }
+    edges.purge_module("Dup::Mod");
+    assert!(
+        edges.snapshot().is_empty(),
+        "a sibling feed's edges survived the purge: {:?}",
+        edges.snapshot()
+    );
+}

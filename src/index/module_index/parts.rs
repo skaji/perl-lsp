@@ -122,15 +122,51 @@ pub struct ModuleEdgeIndexes {
     /// (re-feeds are exactly when it's needed); `remove_path_record` drops
     /// it when the file itself goes.
     name_records: DashMap<std::path::PathBuf, Vec<String>>,
-    /// Every module name `feed` has published edges under. `purge_module`
-    /// removes one module from every bucket of every map — an O(all
-    /// buckets) sweep — and a bulk index calls it once per registered
-    /// package name, which is the second quadratic term in workspace
-    /// registration. A name that was never fed has nothing to remove, and
-    /// during a cold bulk index that is every name: the sweep only earns
-    /// its cost on RE-registration (a watcher edit, a reopened package's
-    /// second file), which is not the hot path.
-    fed_modules: DashMap<String, ()>,
+    /// Every module name `feed` has published edges under, and — the point
+    /// — WHICH bucket keys it was published under in each map, so
+    /// `purge_module` touches only its own edges.
+    ///
+    /// The guard alone is not enough. Its old comment claimed a cold bulk
+    /// index never re-feeds a name; that is false on any corpus with
+    /// duplicate package names, and being false silently is what hid this.
+    /// An installed `@INC` tree is full of them — bundled `inc/Module/Install`
+    /// alone appears in hundreds of distributions — and each duplicate pays a
+    /// sweep over EVERY bucket of all four maps. Applications with unique
+    /// module names skip every sweep, which is why the term is invisible on
+    /// Koha and only bites on a CPAN-shaped tree.
+    fed_modules: DashMap<String, FedKeys>,
+}
+
+/// The bucket keys one module was fed under, per map — the reverse record
+/// that makes retraction O(own edges) instead of O(all buckets).
+///
+/// `ModuleBucket` reused rather than a fresh set type: it is exactly a
+/// deduplicated string collection that scans while small and promotes to a
+/// hash when it is not, and one name's key list has the same shape as one
+/// bucket's member list. A second implementation of that threshold would be
+/// a thing to keep in sync for no gain.
+#[derive(Default, Clone)]
+struct FedKeys {
+    names: ModuleBucket,
+    bridges: ModuleBucket,
+    children: ModuleBucket,
+    specs: ModuleBucket,
+}
+
+impl FedKeys {
+    /// Union `other`'s keys into this record.
+    fn merge(&mut self, other: &FedKeys) {
+        for (dst, src) in [
+            (&mut self.names, &other.names),
+            (&mut self.bridges, &other.bridges),
+            (&mut self.children, &other.children),
+            (&mut self.specs, &other.specs),
+        ] {
+            for k in src.as_slice() {
+                dst.insert(k);
+            }
+        }
+    }
 }
 
 impl ModuleEdgeIndexes {
@@ -167,22 +203,33 @@ impl ModuleEdgeIndexes {
             self.name_records.insert(path.to_path_buf(), names.clone());
             names
         };
-        self.fed_modules.insert(module_name.to_string(), ());
-        let push_unique = |map: &DashMap<String, ModuleBucket>, key: String| {
-            map.entry(key).or_default().insert(module_name);
-        };
+        // Built locally and merged once: holding a `fed_modules` entry across
+        // the edge-map writes would nest two DashMap locks on the bulk path
+        // for no reason.
+        let mut fed = FedKeys::default();
+        let push_unique =
+            |map: &DashMap<String, ModuleBucket>, key: String, seen: &mut ModuleBucket| {
+                seen.insert(&key);
+                map.entry(key).or_default().insert(module_name);
+            };
         for name in names {
-            push_unique(&self.names, name);
+            push_unique(&self.names, name, &mut fed.names);
         }
         for class in Self::bridge_classes(analysis) {
-            push_unique(&self.bridges, class);
+            push_unique(&self.bridges, class, &mut fed.bridges);
         }
         for parent in Self::parent_classes(analysis) {
-            push_unique(&self.children, parent);
+            push_unique(&self.children, parent, &mut fed.children);
         }
         for primary in Self::spec_primaries(analysis) {
-            push_unique(&self.specs, primary);
+            push_unique(&self.specs, primary, &mut fed.specs);
         }
+        // UNION, not replace: several files can feed under one package name
+        // (Perl reopens packages anywhere), and `rebuild_name_registration`
+        // feeds every candidate after one purge. Replacing would leave the
+        // earlier siblings' keys unrecorded and their edges unpurgeable.
+        let mut rec = self.fed_modules.entry(module_name.to_string()).or_default();
+        rec.merge(&fed);
     }
 
     /// Publish ONE specialization edge (primary → spec). The pack path
@@ -190,15 +237,62 @@ impl ModuleEdgeIndexes {
     /// member fed or `purge_module`'s guard will skip a module that does
     /// have edges.
     pub fn publish_spec(&self, primary: &str, spec: &str) {
-        self.fed_modules.insert(spec.to_string(), ());
+        self.fed_modules
+            .entry(spec.to_string())
+            .or_default()
+            .specs
+            .insert(primary);
         self.specs.entry(primary.to_string()).or_default().insert(spec);
     }
 
     /// Publish ONE inverse-inheritance edge (parent → child). Same
     /// marking contract as `publish_spec`.
     pub fn publish_child(&self, parent: &str, child: &str) {
-        self.fed_modules.insert(child.to_string(), ());
+        self.fed_modules
+            .entry(child.to_string())
+            .or_default()
+            .children
+            .insert(parent);
         self.children.entry(parent.to_string()).or_default().insert(child);
+    }
+
+    /// Test-only REFERENCE implementation: the whole-map sweep the reverse
+    /// record replaced. Kept so the record-driven purge can be checked
+    /// against it directly rather than against hand-written expectations —
+    /// the failure mode is a stale edge that survives, which no
+    /// spot-assertion reliably catches.
+    #[cfg(test)]
+    pub fn purge_module_by_sweep(&self, module_name: &str) {
+        if self.fed_modules.remove(module_name).is_none() {
+            return;
+        }
+        for map in [&self.names, &self.bridges, &self.children, &self.specs] {
+            map.retain(|_key, bucket| {
+                bucket.remove(module_name);
+                !bucket.is_empty()
+            });
+        }
+    }
+
+    /// Test-only: the whole edge state, canonically ordered, for comparing
+    /// two purge implementations.
+    #[cfg(test)]
+    pub fn snapshot(&self) -> Vec<(&'static str, String, Vec<String>)> {
+        let mut out = Vec::new();
+        for (label, map) in [
+            ("names", &self.names),
+            ("bridges", &self.bridges),
+            ("children", &self.children),
+            ("specs", &self.specs),
+        ] {
+            for e in map.iter() {
+                let mut members = e.value().as_slice().to_vec();
+                members.sort();
+                out.push((label, e.key().clone(), members));
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Test-only bucket readers: the maps are `pub(super)`, and these
@@ -228,17 +322,33 @@ impl ModuleEdgeIndexes {
     /// KEEPS `name_records` — they are per-PATH, and a same-name sibling
     /// file's replay source must survive this file's re-registration.
     pub fn purge_module(&self, module_name: &str) {
-        // Never fed ⇒ no bucket can hold it. The sweep below is O(every
-        // bucket of every map); a cold bulk index would otherwise pay it
-        // once per registered name for nothing.
-        if self.fed_modules.remove(module_name).is_none() {
+        // Never fed ⇒ no bucket can hold it.
+        let Some((_, fed)) = self.fed_modules.remove(module_name) else {
+            crate::util::ghost_stats::count("edges.purge_skipped_never_fed");
             return;
-        }
-        for map in [&self.names, &self.bridges, &self.children, &self.specs] {
-            map.retain(|_key, bucket| {
-                bucket.remove(module_name);
-                !bucket.is_empty()
-            });
+        };
+        crate::util::ghost_stats::count("edges.purge_by_record");
+        for (map, keys) in [
+            (&self.names, &fed.names),
+            (&self.bridges, &fed.bridges),
+            (&self.children, &fed.children),
+            (&self.specs, &fed.specs),
+        ] {
+            for key in keys.as_slice() {
+                let now_empty = match map.get_mut(key) {
+                    Some(mut bucket) => {
+                        bucket.remove(module_name);
+                        bucket.is_empty()
+                    }
+                    None => false,
+                };
+                if now_empty {
+                    // Keep "emptied" indistinguishable from "never fed", so no
+                    // reader needs an empty-bucket arm — the shape the whole-map
+                    // `retain` produced by dropping the entry.
+                    map.remove_if(key, |_, b| b.is_empty());
+                }
+            }
         }
     }
 
