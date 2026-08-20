@@ -1075,6 +1075,31 @@ impl<'a> CandidateSet<'a> {
             }
         }
 
+        // The same identity backstop for a CALLABLE target. A method
+        // resolves to `Target`, never `Group`, so it never reached the arm
+        // above — and the cross-file lane that would have answered it is
+        // `resolve_method_in_ancestors`, which climbs UPWARD only. A
+        // template method (`$self->step_one()` in a base, declared only in
+        // the subclass) lives below, so every forward lane misses while
+        // `references()` names the child's decl through the override family
+        // identity already computed.
+        //
+        // This projects that same family rather than walking it again: the
+        // declaration axis of `references()` IS the answer, and the whole
+        // defect is two projections each growing their own mechanism. It is
+        // a LAST RESORT — every forward lane has already missed — so the
+        // walk it costs is one nobody paid on the answered path.
+        if matches!(self.resolution(), Some(ResolvedTarget::Target(_))) {
+            let decls: Vec<RefLocation> = self
+                .references()
+                .into_iter()
+                .filter(|r| r.access == AccessKind::Declaration)
+                .collect();
+            if !decls.is_empty() {
+                return decls;
+            }
+        }
+
         // Last resort (pack): a token no query captures — a namespace middle
         // segment (`StatusCode` in `absl::StatusCode::kNotFound` is a
         // namespace_identifier, ref-less) — resolves by word to a named

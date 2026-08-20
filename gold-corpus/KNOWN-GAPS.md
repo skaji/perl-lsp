@@ -399,10 +399,44 @@ doc comment names the consequence: a client caches a complete response and
 never asks again. It was invisible before the hoist, buried in 173 rows of
 ordering noise.
 
-Not fixed here. The honest options are to answer `isIncomplete: true` while a
-member-access receiver is still unresolved, or to make the member path wait
-on resolution; both are member-completion design decisions rather than a
-capping one.
+Not fixed, and three candidate gates were measured and rejected. The rate is
+**8 of 156 member positions (5.1%) during warm-up, 0% once the index
+settles** — three passes in one session, cold / after / after-that, with the
+second and third byte-identical. So flagging is free IF the gate only fires
+while the answer can still change. What that gate is, is the whole problem:
+
+| gate | warm cost | catches the 6-8 | verdict |
+|---|---|---|---|
+| receiver has no resolved type | **32.7%** | all | a third of member completions permanently non-cacheable — trades a correctness bug for a latency one |
+| resolver queue non-empty | 0% | **none** | `@INC` resolution is on demand; the query answers without ever enqueuing, so the queue is empty exactly when it matters |
+| any of this file's imports not cached | 1.9% | **none** | the import IS cached; that is not what is missing |
+| receiver bound to an imported call with unknown return | 0% | **none** | the precise version of the CookieJar shape, and it still misses — because that shape is the minority |
+
+**The causal model behind all four gates was wrong, and that is the finding.**
+They were built by generalising from CookieJar — receiver untyped, therefore
+short list. Counting what actually changes says otherwise. Across three
+independent cold sessions, 19 member answers differed between the cold ask
+and a warm re-ask:
+
+| | count |
+|---|---|
+| claimed `isIncomplete: false` | **19 of 19** |
+| went from ZERO items to a real list | **12 (63%)** |
+| went from a short list to a longer one (the CookieJar shape) | 7 (37%) |
+
+So the dominant class is not a mistyped receiver at all — it is the slot
+answering **nothing** and later answering properly, which no receiver-typing
+gate can see. CookieJar was the example to hand and it is the minority case.
+
+What survives: the defect is real and universal in this population — every
+answer that changes claims to be complete while it is not. What does not
+survive is the diagnosis, so the fix should be designed against the 0-to-N
+class first. An obvious candidate is "an empty list never claims
+completeness" (an empty result has nothing to filter client-side, so the flag
+only asks for a re-query the client would make on the next keystroke anyway),
+but it was NOT confirmed here: setting it in `complete_general` did not change
+the observed flag, so the empty answers are leaving by some other path and
+that needs tracing before anyone builds on it.
 
 **2 — ties that agree on every sort key.** `sort_by` is stable, so two
 candidates matching on `sort_text`, label AND kind keep the order the

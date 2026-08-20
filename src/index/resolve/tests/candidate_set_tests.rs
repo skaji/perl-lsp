@@ -432,3 +432,57 @@ fn goto_def_agrees_with_references_on_inherited_slot() {
         "goto-def must land on the same base decl references already names: {defs:?}",
     );
 }
+
+/// The same projection disagreement on the TEMPLATE-METHOD shape, which is
+/// plain inheritance with no roles and no plugins: a base calls
+/// `$self->step_one()` and only the subclass declares it. references reaches
+/// the child's decl through the override family identity already computed,
+/// and goto-def's forward lane is `resolve_method_in_ancestors` — UPWARD
+/// only, so it climbs past a method that lives BELOW and answers nothing.
+///
+/// The `Group` identity backstop does not cover it: a method resolves to
+/// `ResolvedTarget::Target`, never `Group`, so it never reaches that arm.
+#[test]
+fn goto_def_agrees_with_references_on_template_method() {
+    use crate::index::module_index::ModuleIndex;
+    use std::sync::Arc;
+
+    let store = FileStore::new();
+    let base = PathBuf::from("/tmp/cs_tmpl_base.pm");
+    let child = PathBuf::from("/tmp/cs_tmpl_child.pm");
+    let base_src = "package Base;\nsub run {\n    my $self = shift;\n    return $self->step_one() + 1;\n}\n1;\n";
+    let child_src = "package Child;\nuse parent 'Base';\nsub step_one { return 41 }\n1;\n";
+    let idx = ModuleIndex::new_for_test();
+    idx.register_workspace_module(base.clone(), Arc::new(parse(base_src)));
+    idx.register_workspace_module(child.clone(), Arc::new(parse(child_src)));
+    store.insert_workspace(base.clone(), parse(base_src));
+    store.insert_workspace(child.clone(), parse(child_src));
+
+    let base_fa = store.workspace_raw().get(&base).unwrap().value().clone();
+    let col = base_src.lines().nth(3).unwrap().find("step_one").unwrap();
+    let cs = resolve(
+        &store,
+        &base_fa,
+        FileKey::Path(base.clone()),
+        tree_sitter::Point { row: 3, column: col },
+        Some(&idx),
+        OverrideScope::default(),
+    );
+
+    let decl_col = child_src.lines().nth(2).unwrap().find("step_one").unwrap();
+    let refs = cs.references();
+    assert!(
+        refs.iter().any(|r| matches!(&r.key, FileKey::Path(p) if p == &child)
+            && r.span.start.row == 2
+            && r.span.start.column == decl_col),
+        "references reaches the child decl: {refs:?}",
+    );
+
+    let defs = cs.definitions();
+    assert!(
+        defs.iter().any(|d| matches!(&d.key, FileKey::Path(p) if p == &child)
+            && d.span.start.row == 2
+            && d.span.start.column == decl_col),
+        "goto-def must land on the same child decl references already names: {defs:?}",
+    );
+}
