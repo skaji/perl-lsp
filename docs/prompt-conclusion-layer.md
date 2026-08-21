@@ -43,6 +43,29 @@ live at `Variable` attachments, where `FrameworkAwareTypeFold` gates them
 temporally (`reducers.rs:166-181`, `:832`) — so a variable's conclusion is
 `λ point. InferredType`, a step function with a breakpoint per witness span.
 
+**Timelines cannot cross a file boundary, and the code enforces it.** Every
+cross-file entry builds a FRESH query with `point: None` against a context
+rebuilt from the provider's own `scopes`/`packages` (all five sites in
+`witnesses/query.rs`), entering at a point-free `Symbol(sid)`. The asker's
+point is never threaded across the boundary. The single `point: Some(..)`
+construction (`registry.rs:1034`) is the scope-chain walk INSIDE one bag, and
+the `point: q.point` threading is likewise intra-walk.
+
+So an intra-file edge does reference a timeline — that is where the 1.3M
+observation reads are — but no INBOUND edge from another file can name one.
+The portable key set is point-free by design and the reset makes it point-free
+by enforcement, independently. The apparent counterexample is not one:
+enrichment's MCB bridge pushes `Variable → Edge(MethodOnClass)`, a
+consumer-local variable pointing OUTWARD at a foreign symbol. Nothing outside
+ever names that variable.
+
+That is a stronger property than the composition argument below, and it is the
+one that matters for thrash: the only consumer of an UNAPPLIED timeline is
+`inferred_type_via_bag(var, point)` — hover / inlay / completion on a file the
+user has open, where the bag is resident anyway. Leaving timelines to the full
+bag decode therefore costs nothing, because the on-demand decode never fires
+for timeline reasons on a closed provider.
+
 **And the binder is always applied at bake.** Every hop that enters a
 `Variable` fixes the point AT the hop, from bake-time constants —
 `registry.rs:799-801` uses `Expr(span).start` for edges chased from
