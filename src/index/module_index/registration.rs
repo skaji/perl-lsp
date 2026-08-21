@@ -978,6 +978,28 @@ impl ModuleIndex {
             // the repeat rate a per-sweep memo could actually serve is
             // measurable before one is written.
             crate::util::ghost_stats::SweepScope::note(&cached.path.to_string_lossy());
+            // `PERL_LSP_REHYDRATE_TRACE=N`: dump the first N call stacks that
+            // reach here. Three candidate callers were eliminated by counter
+            // (diagnostics, the enrichment chase, the MethodOnClass walk) and
+            // none of them accounted for a 207k-call term, so stop guessing
+            // and let the call name itself.
+            {
+                static TRACED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let want: u64 = std::env::var("PERL_LSP_REHYDRATE_TRACE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if want > 0
+                    && TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < want
+                {
+                    eprintln!(
+                        "[rehydrate-trace] {:?}\n{}",
+                        cached.path,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
             // Memo hit: the same path, at the same index shape, already
             // rehydrated inside this sweep.
             let stamp = self

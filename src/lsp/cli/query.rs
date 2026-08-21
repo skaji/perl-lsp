@@ -1119,6 +1119,12 @@ fn enriched_tree_diagnostics(
         ));
         let _sweep = crate::util::ghost_stats::SweepScope::start();
         let _memo = module_index::SweepMemoGuard::open();
+        // The region the four `diag.*` tags did NOT cover, and the one that
+        // holds the volume: enriching a file pulls its providers' analyses,
+        // and that happens BEFORE `collect_diagnostics` is entered. Bounding
+        // the callee from the inside is worth nothing if the caller is
+        // outside every region.
+        let _g_enrich = crate::util::ghost_stats::ScopedNs::start("diag.0_enriched_snapshot");
         let diags = match idx.enriched_snapshot(&cached) {
             Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
             None => {
