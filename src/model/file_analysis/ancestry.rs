@@ -461,6 +461,11 @@ impl FileAnalysis {
                 // Symbols-axis read only (existence, kind, package, class-
                 // content — never the bag/refs), so the import tier answers
                 // from its resident copy instead of decoding the whole blob.
+                // Fetched-vs-matched for this walk. The comment above says the
+                // symbols-axis read answers from the resident copy; that holds
+                // only while the copy still HAS symbols, and the workspace tier
+                // strips them, so at scale this is a decode per candidate.
+                crate::util::ghost_stats::count("mroc.candidate_fetched");
                 let whole = idx.symbols_present(&cached);
                 let has_member = whole.symbols.iter().any(|s| {
                     s.name == method_name
@@ -475,6 +480,11 @@ impl FileAnalysis {
                                 // `symbols_named`, which the evicted copy
                                 // answers empty.
                             ) && whole.symbol_is_class_content(s)))
+                });
+                crate::util::ghost_stats::count(if has_member {
+                    "mroc.candidate_matched"
+                } else {
+                    "mroc.candidate_wasted"
                 });
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
