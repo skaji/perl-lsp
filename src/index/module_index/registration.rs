@@ -990,8 +990,16 @@ impl ModuleIndex {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
-                if want > 0
-                    && TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < want
+                // `_EVERY=N` samples every Nth call instead of the first N.
+                // The first-N form is biased toward whatever runs early, which
+                // is exactly wrong for attributing a remainder: the dominant
+                // caller can saturate the sample before a second one starts.
+                let every: u64 = std::env::var("PERL_LSP_REHYDRATE_TRACE_EVERY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let n = TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if (every > 0 && n % every == 0) || (want > 0 && every == 0 && n < want)
                 {
                     eprintln!(
                         "[rehydrate-trace] {:?}\n{}",

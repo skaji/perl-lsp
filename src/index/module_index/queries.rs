@@ -367,16 +367,32 @@ impl ModuleIndex {
         class: &str,
     ) -> Option<String> {
         use crate::model::file_analysis::CrossFileLookup;
-        self.modules_with_symbol(name)
+        // Runs as the ancestor walk's LAST resort, i.e. on exactly the misses.
+        // `modules_with_symbol` is every module declaring a sub of this name —
+        // for a name like `new` that is most of the corpus — and each one's
+        // candidates are FETCHED to test the class. The reverse index narrows
+        // by NAME but not by CLASS, so the class test can only be answered
+        // after a rehydrate.
+        crate::util::ghost_stats::count("mdmp.call");
+        let mods = self.modules_with_symbol(name);
+        crate::util::ghost_stats::count_by("mdmp.modules_scanned", mods.len() as u64);
+        let found = mods
             .into_iter()
             .find(|mod_name| {
                 // EVERY file registered under this module name — the definer
                 // may be a losing candidate of its own name slot. Symbols-axis
                 // existence scan — no bag/refs read.
-                self.def_candidates(mod_name)
-                    .iter()
-                    .any(|c| self.symbols_present(c).has_sub_in_package(name, class))
-            })
+                self.def_candidates(mod_name).iter().any(|c| {
+                    crate::util::ghost_stats::count("mdmp.candidate_fetched");
+                    self.symbols_present(c).has_sub_in_package(name, class)
+                })
+            });
+        crate::util::ghost_stats::count(if found.is_some() {
+            "mdmp.found"
+        } else {
+            "mdmp.not_found"
+        });
+        found
     }
 
     /// Create a ModuleIndex for CLI mode: a real (headless) resolver
