@@ -1030,6 +1030,9 @@ impl ModuleIndex {
                 return hit;
             }
             crate::util::ghost_stats::count("sweep.memo_miss");
+            if crate::util::ghost_stats::inside_ancestor_walk() {
+                crate::util::ghost_stats::count("sweep.memo_miss.from_mroc");
+            }
             let got = crate::util::ghost_stats::timed("rehydrate.loader", || {
                 if want_bag {
                     bc.bag_for_diag(&cached.path)

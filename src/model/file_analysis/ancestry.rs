@@ -466,7 +466,9 @@ impl FileAnalysis {
                 // only while the copy still HAS symbols, and the workspace tier
                 // strips them, so at scale this is a decode per candidate.
                 crate::util::ghost_stats::count("mroc.candidate_fetched");
-                let whole = idx.symbols_present(&cached);
+                let whole = crate::util::ghost_stats::in_ancestor_walk(|| {
+                    idx.symbols_present(&cached)
+                });
                 let has_member = whole.symbols.iter().any(|s| {
                     s.name == method_name
                         && s.package.as_deref() == Some(cls)

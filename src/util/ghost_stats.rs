@@ -861,3 +861,29 @@ mod reemit_tests {
         assert!(attribution_reemit_due(10_000 + iv, 10_000, iv));
     }
 }
+
+thread_local! {
+    /// Set while the ancestor walk's candidate loop is fetching. The loop is
+    /// in the Model layer and the rehydrate site is in Index, so the marker
+    /// lives HERE — `util` is the neutral leaf every layer may import, and
+    /// routing it through `index` made Model import Index, which
+    /// `layering_tests::imports_flow_down_only` correctly rejected.
+    ///
+    /// It exists because the loop's own fetch count and the rehydrate site's
+    /// miss count have different denominators: most fetches are absorbed by
+    /// the sweep memo and never pay a rehydrate. Only the miss site can say
+    /// which misses the loop owns.
+    static ANCESTOR_WALK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f` marked as the ancestor walk's candidate fetch.
+pub fn in_ancestor_walk<R>(f: impl FnOnce() -> R) -> R {
+    ANCESTOR_WALK.with(|c| c.set(c.get() + 1));
+    let out = f();
+    ANCESTOR_WALK.with(|c| c.set(c.get() - 1));
+    out
+}
+
+pub fn inside_ancestor_walk() -> bool {
+    ANCESTOR_WALK.with(|c| c.get()) > 0
+}
