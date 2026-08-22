@@ -88,7 +88,7 @@ pub fn index_pack_languages(
         // decodes the one requested file's full bag.
         let bag_cache = {
             let cache_key_owned = cache_key.map(|s| s.to_string());
-            let loader = move |path: &std::path::Path| {
+            let loader = move |path: &std::path::Path, want_bag: bool| {
                 // The blob is persisted under the CANONICAL path (both feed
                 // paths write `canon`), while the resident copy may be
                 // registered under the walk's raw path — canonicalize so the
@@ -101,7 +101,12 @@ pub fn index_pack_languages(
                 if raw != spellings[0] {
                     spellings.push(raw);
                 }
-                module_cache::open_and_load_diag(cache_key_owned.as_deref(), lang, &spellings)
+                module_cache::open_and_load_diag(
+                    cache_key_owned.as_deref(),
+                    lang,
+                    &spellings,
+                    want_bag,
+                )
             };
             Arc::new(crate::index::pack_bag_cache::PackBagCache::new_labeled(
                 bag_cache_bytes,
@@ -289,7 +294,7 @@ pub fn index_pack_languages(
             // copies). `None` → the worker already registered a whole copy
             // (NO_EVICT/degraded); the writer only persists.
             parts: Option<crate::index::module_index::PackRegistrationParts>,
-            blob: Vec<u8>,
+            blob: crate::index::module_cache::EncodedAnalysis,
             // Warm stub (deferred/stripped entries only) — persisted in the
             // same chunk txn as the blob so the next warm start registers
             // from it without decoding `blob`.
@@ -360,7 +365,7 @@ pub fn index_pack_languages(
                     },
                     |e: FreshEntry| {
                         pack_index_writer.invalidate_bag_cache(&e.path);
-                        if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                        if let Some(fa) = e.blob.decode_whole() {
                             let bytes = fa.heap_estimate().total();
                             if fallback_bytes.saturating_add(bytes) <= FALLBACK_WHOLE_BYTE_CAP {
                                 fallback_bytes += bytes;

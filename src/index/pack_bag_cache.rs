@@ -29,7 +29,7 @@ use dashmap::DashMap;
 use crate::model::file_analysis::FileAnalysis;
 use crate::index::module_cache::RehydrateMiss;
 
-type Loader = Box<dyn Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync>;
+type Loader = Box<dyn Fn(&Path, bool) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync>;
 
 pub struct PackBagCache {
     /// Rehydrated, bag-present analyses keyed by canonical path, each paired
@@ -73,7 +73,7 @@ impl PackBagCache {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(
         cap_bytes: usize,
-        loader: impl Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
+        loader: impl Fn(&Path, bool) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
     ) -> Self {
         Self::new_labeled(cap_bytes, "pack-bag", loader)
     }
@@ -83,7 +83,7 @@ impl PackBagCache {
     pub fn new_labeled(
         cap_bytes: usize,
         label: &str,
-        loader: impl Fn(&Path) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
+        loader: impl Fn(&Path, bool) -> Result<FileAnalysis, RehydrateMiss> + Send + Sync + 'static,
     ) -> Self {
         PackBagCache {
             entries: DashMap::new(),
@@ -178,8 +178,19 @@ impl PackBagCache {
             "decode.rows_only"
         });
         let gen_before = self.generation.get(path).map(|g| *g).unwrap_or(0);
+        // The axis goes DOWN to the loader rather than being applied to what
+        // it returns. Decoding the bag and then dropping it was 52.9% of the
+        // bincode bytes on a path where 94.9% of decodes never wanted it.
         let mut loaded = crate::util::ghost_stats::timed(
-            "bagcache.decode", || (self.loader)(path))?;
+            "bagcache.decode", || (self.loader)(path, want_bag))?;
+        // The strip STAYS, even though the loader was asked for the narrow
+        // axis. It is not where the saving lives — that is in the bytes SQL
+        // never fetched and bincode never walked — and dropping it would make
+        // "a rows-lane entry retains without the bag" depend on every loader
+        // remembering to honour the flag. A loader that returns a superset is
+        // within its contract; the cache still owes callers the marker, since
+        // `get_or_load`'s stripped-resident check reads it to decide whether a
+        // later bag request may be served from this entry.
         if !want_bag {
             loaded.evict_witness_bag();
         }
@@ -307,7 +318,7 @@ mod tests {
     fn cap_zero_never_retains() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let cache = PackBagCache::new(0, move |_p| {
+        let cache = PackBagCache::new(0, move |_p, _want_bag: bool| {
             c.fetch_add(1, Ordering::Relaxed);
             Ok(empty_fa())
         });
@@ -323,7 +334,7 @@ mod tests {
     fn hit_avoids_reload() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| {
+        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p, _want_bag: bool| {
             c.fetch_add(1, Ordering::Relaxed);
             Ok(empty_fa())
         });
@@ -339,7 +350,7 @@ mod tests {
         // only one so inserting a second evicts the first.
         let one = empty_fa().heap_estimate().total();
         assert!(one > 0);
-        let cache = PackBagCache::new(one, move |_p| Ok(empty_fa()));
+        let cache = PackBagCache::new(one, move |_p, _want_bag: bool| Ok(empty_fa()));
         let a = PathBuf::from("/x/a.h");
         let b = PathBuf::from("/x/b.h");
         cache.bag_for(&a);
@@ -358,7 +369,7 @@ mod tests {
         let c2 = cache.clone();
         let p = PathBuf::from("/x/racy.h");
         let p2 = p.clone();
-        let built = PackBagCache::new(128 * 1024 * 1024, move |_p| {
+        let built = PackBagCache::new(128 * 1024 * 1024, move |_p, _want_bag: bool| {
             if let Some(c) = c2.get() {
                 c.invalidate(&p2);
             }
@@ -381,7 +392,7 @@ mod tests {
     #[test]
     fn charge_total_tracks_the_map_and_cannot_ratchet() {
         let one = empty_fa().heap_estimate().total();
-        let cache = PackBagCache::new(one * 8, move |_p| Ok(empty_fa()));
+        let cache = PackBagCache::new(one * 8, move |_p, _want_bag: bool| Ok(empty_fa()));
         let paths: Vec<PathBuf> =
             (0..24).map(|i| PathBuf::from(format!("/x/{i}.h"))).collect();
         for p in &paths {
@@ -412,7 +423,7 @@ mod tests {
     /// the total past cap for good.
     #[test]
     fn concurrent_decodes_of_one_path_charge_once() {
-        let cache = Arc::new(PackBagCache::new(128 * 1024 * 1024, move |_p| {
+        let cache = Arc::new(PackBagCache::new(128 * 1024 * 1024, move |_p, _want_bag: bool| {
             // Wide enough for the misses to overlap on the insert.
             std::thread::sleep(std::time::Duration::from_millis(20));
             Ok(empty_fa())
@@ -447,7 +458,7 @@ mod tests {
     fn rows_lane_strips_and_bag_request_upgrades() {
         let calls = Arc::new(AtomicUsize::new(0));
         let c = calls.clone();
-        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| {
+        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p, _want_bag: bool| {
             c.fetch_add(1, Ordering::Relaxed);
             Ok(empty_fa())
         });
@@ -480,7 +491,7 @@ mod tests {
         let one = empty_fa().heap_estimate().total();
         assert!(one > 1);
         // Cap below a single entry: the first insert is permanently over.
-        let cache = PackBagCache::new(one - 1, move |_p| Ok(empty_fa()));
+        let cache = PackBagCache::new(one - 1, move |_p, _want_bag: bool| Ok(empty_fa()));
         let a = PathBuf::from("/x/a.h");
         cache.bag_for(&a);
         assert!(
@@ -504,7 +515,7 @@ mod tests {
     #[test]
     fn a_drifted_counter_is_reported() {
         let one = empty_fa().heap_estimate().total();
-        let cache = PackBagCache::new(one * 8, move |_p| Ok(empty_fa()));
+        let cache = PackBagCache::new(one * 8, move |_p, _want_bag: bool| Ok(empty_fa()));
         let paths: Vec<PathBuf> =
             (0..4).map(|i| PathBuf::from(format!("/x/{i}.h"))).collect();
         for p in &paths {
@@ -523,7 +534,7 @@ mod tests {
 
     #[test]
     fn invalidate_drops_entry() {
-        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p| Ok(empty_fa()));
+        let cache = PackBagCache::new(128 * 1024 * 1024, move |_p, _want_bag: bool| Ok(empty_fa()));
         let p = PathBuf::from("/x/a.h");
         cache.bag_for(&p);
         assert!(cache.entries.contains_key(&p));

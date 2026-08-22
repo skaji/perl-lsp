@@ -266,7 +266,7 @@ pub fn index_workspace_with_index(
         /// Register + mirror in the writer after COMMIT. `false` = the
         /// worker already registered a WHOLE copy (NO_EVICT); persist only.
         deferred: bool,
-        blob: Vec<u8>,
+        blob: crate::index::module_cache::EncodedAnalysis,
         seeds: Vec<crate::model::file_analysis::RefRowSeed>,
         sym_seeds: Vec<crate::model::file_analysis::SymRowSeed>,
         closure: crate::model::file_analysis::path_intern::ClosureList,
@@ -332,7 +332,7 @@ pub fn index_workspace_with_index(
                     if let Some(idx) = module_index {
                         idx.invalidate_bag_cache(&e.path);
                     }
-                    if let Some(fa) = module_cache::decode_analysis(&e.blob) {
+                    if let Some(fa) = e.blob.decode_whole() {
                         let bytes = fa.heap_estimate().total();
                         if fallback_bytes.saturating_add(bytes) > FALLBACK_WHOLE_BYTE_CAP {
                             // Over budget: DROP (the chunk didn't commit, so a
