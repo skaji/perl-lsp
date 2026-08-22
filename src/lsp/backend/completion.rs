@@ -106,8 +106,9 @@ pub fn pack_completion(
                 let closure_live = closure_symbol_completion(
                     files, analysis, source, point, language, path, module_index, &mut items);
                 rank_domain_members(&mut items, &members, &enum_name);
-                let capped = symbols::cap_completion_items(&mut items, "");
-                return (items, capped || macros_live || closure_live);
+                return symbols::finish_completion(
+                    items, &slot, false, macros_live || closure_live,
+                );
             }
         }
     }
@@ -115,14 +116,9 @@ pub fn pack_completion(
     let macros_live = macro_completion(source, point, language, path, &mut items);
     let closure_live = closure_symbol_completion(
         files, analysis, source, point, language, path, module_index, &mut items);
-    // Same payload cap as the Perl path — the include-closure tier is the
-    // pack side's workspace-scaled source.
-    let typed_prefix = match &slot {
-        crate::lsp::cursor_slot::Slot::Identifier { prefix } => prefix.as_str(),
-        _ => "",
-    };
-    let capped = symbols::cap_completion_items(&mut items, typed_prefix);
-    (items, capped || macros_live || closure_live)
+    // The shared finisher — the same cap, prefix rule, and flag
+    // composition the Perl assembly exits through.
+    symbols::finish_completion(items, &slot, false, macros_live || closure_live)
 }
 
 /// Move a domain's enum members to the front of the completion list with a

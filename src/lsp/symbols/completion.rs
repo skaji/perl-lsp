@@ -123,6 +123,32 @@ pub(crate) fn cap_completion_items(items: &mut Vec<CompletionItem>, typed_prefix
     true
 }
 
+/// The ONE finishing step of every completion assembly, Perl and pack
+/// (`docs/adr/sibling-forks.md` — the two-bug fork's shared skeleton):
+/// the slot's typed prefix narrows the over-cap cut, the cap
+/// ranks-then-cuts, and `isIncomplete` composes as "the cut happened OR a
+/// prefix-gated source is live". A list complete for THIS prefix but not
+/// for the next keystroke must say so whichever lane assembled it — the
+/// flag half of exactly the divergence where one lane answered null while
+/// its sibling branch preserved an incomplete-empty response.
+/// `sigil_active` is the Perl lane's one asymmetry, stated here once: a
+/// sigil-triggered list's labels carry the sigil the typed prefix lacks,
+/// so prefix-narrowing would empty the list; the pack lane has no sigil
+/// trigger and passes false.
+pub(crate) fn finish_completion(
+    mut items: Vec<CompletionItem>,
+    slot: &crate::lsp::cursor_slot::Slot,
+    sigil_active: bool,
+    live_prefix_gated_sources: bool,
+) -> (Vec<CompletionItem>, bool) {
+    let typed_prefix = match slot {
+        crate::lsp::cursor_slot::Slot::Identifier { prefix } if !sigil_active => prefix.as_str(),
+        _ => "",
+    };
+    let capped = cap_completion_items(&mut items, typed_prefix);
+    (items, capped || live_prefix_gated_sources)
+}
+
 /// The order the client sorts on (`sort_text`, label fallback), with label
 /// then kind as tie-breaks so the comparator is TOTAL. `sort_by` is stable,
 /// so two candidates agreeing on every key would otherwise keep the order
@@ -533,8 +559,7 @@ fn completion_items_native(
                 candidates.into_iter().map(candidate_to_completion_item).collect();
             // The candidate sources already narrowed by the qualifier
             // prefix, so the cap's own prefix pass has nothing to add.
-            let is_incomplete = cap_completion_items(&mut items, "");
-            return (items, is_incomplete);
+            return finish_completion(items, &slot, false, false);
         }
         Slot::Identifier { .. } if sigil_trigger.is_some() => {
             analysis.complete_variables(point, sigil_trigger.expect("checked by guard"))
@@ -631,15 +656,9 @@ fn completion_items_native(
     }
 
     // Payload cap over the assembled universe (the identifier slot's
-    // auto-import firehose is the workspace-scaled tier). The typed
-    // prefix narrows server-side only when the cap fires — under it,
-    // clients keep their complete list and filter locally.
-    let typed_prefix = match &slot {
-        Slot::Identifier { prefix } if sigil_trigger.is_none() => prefix.as_str(),
-        _ => "",
-    };
-    let is_incomplete = cap_completion_items(&mut items, typed_prefix);
-    (items, is_incomplete)
+    // auto-import firehose is the workspace-scaled tier); the shared
+    // finisher owns the prefix rule and the flag composition.
+    finish_completion(items, &slot, sigil_trigger.is_some(), false)
 }
 
 /// The `use Module qw(|)` "still indexing" affordance — shown while the
@@ -800,6 +819,37 @@ mod cap_tests {
             filter_text: Some(label.to_string()),
             ..Default::default()
         }
+    }
+
+    /// The finisher's flag composition — the #143 class: an EMPTY list
+    /// with a live prefix-gated source is an incomplete-empty response
+    /// (`isIncomplete: true`), never a complete null the client caches.
+    /// Both lanes exit through this one speller now; the divergence where
+    /// one lane dropped the flag its sibling branch preserved is
+    /// unrepresentable.
+    #[test]
+    fn empty_with_live_prefix_gated_source_is_incomplete() {
+        let slot = crate::lsp::cursor_slot::Slot::Identifier { prefix: "xy".into() };
+        let (items, incomplete) = finish_completion(Vec::new(), &slot, false, true);
+        assert!(items.is_empty());
+        assert!(incomplete, "a live prefix-gated source keeps the client re-asking");
+        let (_, complete) = finish_completion(Vec::new(), &slot, false, false);
+        assert!(!complete, "no cut, no live source: the empty list is genuinely complete");
+    }
+
+    /// The Perl lane's one finisher asymmetry: a sigil-triggered list's
+    /// labels carry the sigil the typed prefix lacks, so prefix-narrowing
+    /// must not run (it would empty the list at the cut).
+    #[test]
+    fn sigil_active_suppresses_prefix_narrowing() {
+        let slot = crate::lsp::cursor_slot::Slot::Identifier { prefix: "se".into() };
+        let over: Vec<CompletionItem> =
+            (0..250).map(|i| item(&format!("$var{i:03}"), 0)).collect();
+        let (kept, incomplete) = finish_completion(over.clone(), &slot, true, false);
+        assert!(incomplete);
+        assert_eq!(kept.len(), MAX_COMPLETION_ITEMS, "cut, but never prefix-emptied");
+        let (narrowed, _) = finish_completion(over, &slot, false, false);
+        assert!(narrowed.is_empty(), "without the sigil gate the prefix filter applies");
     }
 
     /// Under the cap the list is untouched and reported complete — ordinary
