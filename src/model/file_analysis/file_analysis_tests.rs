@@ -2730,3 +2730,28 @@ fn completion_tier_ladder_keeps_one_step_headroom() {
         );
     }
 }
+
+/// The isa walkers terminate in BOUNDED time, not merely cycle-free —
+/// `walk_ancestry`'s budget (200 visited classes, set well above any real
+/// MRO) cuts off a pathological chain instead of walking it to the end.
+/// Pinned because the build-time face (`Builder::package_isa_local`) now
+/// delegates here after retiring the one isa walk that had no bound at
+/// all (a seen-set alone guarantees "no cycle", which is weaker than
+/// "terminates in bounded time" on a deep or wide legitimate graph).
+#[test]
+fn isa_walk_budget_bounds_a_pathological_chain() {
+    use std::collections::HashMap;
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for i in 0..300 {
+        parents.insert(format!("C{i}"), vec![format!("C{}", i + 1)]);
+    }
+    // Within budget: a normal chain resolves.
+    assert!(crate::model::file_analysis::class_isa("C0", "C10", &parents, None));
+    // Past budget: the walk gives up instead of visiting 300 classes.
+    assert!(
+        !crate::model::file_analysis::class_isa("C0", "C299", &parents, None),
+        "the visit budget must cut off a chain no real MRO produces"
+    );
+    // Self is always isa self, budget untouched.
+    assert!(crate::model::file_analysis::class_isa("C0", "C0", &parents, None));
+}

@@ -138,28 +138,14 @@ impl<'a> Builder<'a> {
     }
 
     /// Local-only isa: does `child` reach `ancestor` through this
-    /// file's `package_parents`? (No index at build — `parents_of`'s
-    /// cross-file arm needs one.)
+    /// file's `package_parents`? THE isa seam's build-time face:
+    /// `class_isa` over the builder's still-accumulating parent map (a
+    /// `LocalParents` impl), no index at build. Same walker, same
+    /// budget as every other isa question — this was the one isa walk
+    /// with no bound at all (seen-set only), and "no cycle" is a weaker
+    /// guarantee than "terminates in bounded time".
     pub(super) fn package_isa_local(&self, child: &str, ancestor: &str) -> bool {
-        if child == ancestor {
-            return true;
-        }
-        let mut stack = vec![child.to_string()];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(c) = stack.pop() {
-            if !seen.insert(c.clone()) {
-                continue;
-            }
-            if let Some(ps) = self.package_parents.get(&c) {
-                for p in ps {
-                    if p == ancestor {
-                        return true;
-                    }
-                    stack.push(p.clone());
-                }
-            }
-        }
-        false
+        crate::model::file_analysis::class_isa(child, ancestor, &self.package_parents, None)
     }
 
     /// Convert a plugin-produced `EmitAction` into real builder state. All
