@@ -54,13 +54,23 @@ only when one bites; most carry their sanction in a comment or ADR.
 
 Collapsed (the templates): `refs_to`/`refs_to_in_file` → `walk_refs`;
 `rehydrate_or_resident`/`rehydrate_rows_or_resident` → one body;
-`package_isa_local` → `class_isa` over the `LocalParents` seam.
+`package_isa_local` → `class_isa` over the `LocalParents` seam;
+`walk_ancestry`/`GraphView::walk` → one engine (`graph::bounded_dfs`).
+The ancestry collapse is the worked example of the bound rule below:
+the two walkers guaranteed different things (visit budget vs depth
+cap), so `WalkBound` carries BOTH axes as a type, each family's preset
+preserves its pre-collapse guarantee exactly (`GRAPH`: depth 21,
+visits unbounded; `ISA`: visits 200, depth unbounded), and the
+divergent cases were pinned BEFORE the engines merged — after a
+collapse nothing can detect a silently changed guarantee, because the
+net compares siblings and there are no siblings left. Tightening a
+preset is a deliberate, corpus-measured change to a constant, never a
+side effect of routing.
 
 Open, in execution order:
 
 | pair | class | seam / note |
 |---|---|---|
-| `walk_ancestry` vs `GraphView::walk` | 2 | self-declared target (`docs/adr/graph-walking.md`). The risk IS the bound reconciliation: `walk_ancestry` budgets total visited classes, `GraphView` caps depth — pick one out loud and pin the divergent case BEFORE collapsing, or it is a behavior change disguised as a refactor the net cannot catch (both drivers become the same driver) |
 | `completion_items` vs `pack_completion` | 3 | assembly skeleton only (two-half gather, cap, `is_incomplete` composition); entity-content gathering stays out per the CandidateSet ADR's honest boundary. Ranked above its size: two of the six net-era bugs lived in this fork |
 | `prepare_pack_parts` vs `prepare_workspace_parts` | 2/3 | tier-policy parameter; take it only if it falls out of the completion collapse |
 | `index_perl` vs `index_pack` | 3 | **parked as a program, not a slice**: H9 bulk-defer coordination lives in the unshared halves, which is exactly where a mistake stays invisible until a corpus is large; no demonstrated bug yield. The persist harness, chunk writer, and residency tripwire are already shared |
@@ -83,3 +93,19 @@ the full query composes), `resolve_symbol`/`resolve_symbol_scoped`
 `hover_info`/`pack_hover` (presenters over one shared resolution —
 sanctioned; flag only if a presenter starts making resolution
 decisions).
+
+## Related, distinct: stale agreement
+
+The boundary case of the family, not a code fork: two verdicts that
+agree by construction on a question neither is being asked. The worked
+instance is a PR stack showing MERGEABLE with all checks GREEN —
+MERGEABLE is a statement about text, GREEN is a statement about a base
+that has since moved, and neither is a statement about the tree the
+merge would produce (a rename sweeping 69 files merges cleanly against
+new code referencing the old name; the result names a type that does
+not exist). The cure is operational, not structural: a verdict is only
+trusted about the tree it was computed on, so re-verify at the
+integration tip before merging anything that predates it. Listed here
+because a reader hunting fork-shaped hazards should find the edge of
+the territory: sibling forks are two answers to one live question;
+stale agreement is two answers to a question that expired.
