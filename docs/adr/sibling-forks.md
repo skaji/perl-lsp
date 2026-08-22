@@ -37,6 +37,17 @@ paired invariant SHRINKS to the residual claim the scope split leaves
 deleted, because that residue is exactly what a scope split can
 silently break.
 
+The collapse-shape rule: **subsuming forks merge; nested ones
+narrow.** Two enumerations of ONE relation merge into a driver. Two
+enumerations of two OVERLAPPING relations, one nested inside the
+other, narrow instead — the outer keeps only what the inner cannot
+answer. The mroc/mdmp pair is the worked case: 98.6% path overlap on
+the substrate, but the residual 1.4% is a strict-superset lane and
+the only part that ever produces an answer — deleting the "redundant"
+fallback would have been sound-looking and wrong. Measure overlap on a
+real corpus before choosing the shape: the in-regime synthetic corpus
+showed 100% overlap and would have made deletion look safe.
+
 **3. Language-lane forks — fold the decision into a seam.** A Perl arm
 and a pack arm making one decision. The cure is the value-carries-its-
 rule pattern already in service: `Slot`, `VisibilityAxis`,
