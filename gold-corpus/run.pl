@@ -21,7 +21,19 @@
 #     xfail       — known gap: assertion must currently NOT hold; if it starts
 #                   holding → XPASS (gap fixed → promote to gold). Soft failure.
 #     provisional — run + report, never fails the suite
+#   warm:
+#     "xfail"     — this row is KNOWN to pass cold and fail warm. Reported as
+#                   warm-xfail; drop the key when the bug is fixed (the run then
+#                   reports warm-XPASS until you do).
 #   a process abort (exit 134 / signal) is always a hard FAIL (the scanner-overflow class).
+#
+# The suite runs TWICE against a private, throwaway cache dir: once cold (nothing
+# written yet) and once warm (against what the cold pass wrote). A row that
+# passes cold and fails warm is warm-FAIL — a fact that survives the first
+# analysis but not rehydration, which is invisible to any cold-only run and is
+# the state every user is in from their second session onward. `--no-warm` skips
+# the second pass for fast iteration; the summary then says so rather than
+# printing zeros it did not earn.
 #
 # Output is normalized before matching: absolute paths reduced to basenames; JSON
 # outputs (references/workspace-symbol/outline/rename/diagnostics) decoded and
@@ -31,7 +43,8 @@
 # construction.
 #
 # Usage:
-#   gold-corpus/run.pl [capability ...]                       # run the suite
+#   gold-corpus/run.pl [capability ...]                       # run the suite (cold + warm)
+#   gold-corpus/run.pl --no-warm [capability ...]             # cold pass only
 #   gold-corpus/run.pl --list
 #   gold-corpus/run.pl --emit <cap> <file> <line> <col> [newname]
 #   gold-corpus/run.pl --emit workspace-symbol <query>
@@ -351,24 +364,43 @@ for my $r (@rows) {
     $gctx{$gkey} //= { root => $root, scope => $scope, inc => $inc };
     push @{ $groups{$gkey} }, batch_req($r->{capability}, $spec, $r, $key, $root);
 }
-my $resp = {};
-my @batch_metrics;
-for my $gkey (sort keys %groups) {
-    my ($root, $scope, $inc) = @{ $gctx{$gkey} }{qw(root scope inc)};
-    my ($by, $met) = run_batch($groups{$gkey}, $root, p5lib_for($root, $inc), $scope);
-    %$resp = (%$resp, %$by);
-    push @batch_metrics, $met;
+
+# Both passes run under a cache dir this process owns and throws away, so the
+# cold pass is cold because nothing has written to it yet — not because the
+# developer happened to clear theirs. The alternative, `--clear-cache`, wipes
+# ~/.cache/perl-lsp for every project on the box as a side effect of running
+# the suite; this touches nothing outside the tempdir.
+# Clearing the real cache instead would be wrong in both directions: bare
+# `--clear-cache` wipes every project's cache on the box, and clearing only the
+# roots you remembered is worse than clearing none — an uncleared root makes the
+# cold pass silently warm, and nothing in the output says which roots were
+# reused. A cache dir that did not exist a moment ago cannot be partially cold.
+my $cachedir = File::Temp::tempdir('corpus-cache-XXXXXX', TMPDIR => 1, CLEANUP => 1);
+$ENV{XDG_CACHE_HOME} = $cachedir;
+my %distinct_roots = map { $gctx{$_}{root} => 1 } keys %gctx;
+my $n_roots = scalar keys %distinct_roots;
+
+sub run_all_batches {
+    my %by; my @mets;
+    for my $gkey (sort keys %groups) {
+        my ($root, $scope, $inc) = @{ $gctx{$gkey} }{qw(root scope inc)};
+        my ($b, $met) = run_batch($groups{$gkey}, $root, p5lib_for($root, $inc), $scope);
+        %by = (%by, %$b);
+        push @mets, $met;
+    }
+    return (\%by, \@mets);
 }
 
-my (@fail, @xpass, @crash, @skip, @prov); my ($pass, $xfail) = (0, 0);
-for my $key (@order) {
-    my ($r, $spec) = @{ $meta{$key} };
-    my $status = $r->{status} // 'gold';
-    my $rr = $resp->{$key};
-    if (!$rr) { push @crash, "$key (no response — batch aborted at/before this row)"; next; }
+# Score one row's response: (ok?, normalized text, skip reason). Shared by both
+# passes so a warm verdict is the SAME assertion as the cold one — a second
+# copy of this logic is how the two lanes would silently drift apart.
+sub score_row {
+    my ($r, $rr) = @_;
+    return (0, '', 'no response — batch aborted at/before this row') unless $rr;
     # ok:false is a graceful "no result" (e.g. file-not-found, no def); treat as empty output
     my $norm = $rr->{ok} ? normalize($r->{capability}, $rr->{out}) : '';
-    if (!$rr->{ok} && $rr->{err} && $rr->{err} =~ /^file not found/) { push @skip, "$key ($rr->{err})"; next; }
+    return (0, '', $rr->{err})
+        if !$rr->{ok} && $rr->{err} && $rr->{err} =~ /^file not found/;
     my $ok = 1;
     for my $s (@{ $r->{expect}{all}  || [] }) { $ok = 0, last if index($norm, $s) < 0; }
     if ($ok) { for my $s (@{ $r->{expect}{none} || [] }) { $ok = 0, last if index($norm, $s) >= 0; } }
@@ -381,6 +413,23 @@ for my $key (@order) {
         my @got = grep { length } map { my $l = (split /\t/, $_)[0] // ''; $l =~ s/^\s+|\s+$//g; $l } split /\n/, $norm;
         $ok = 0 if @got > $r->{expect}{max_items};
     }
+    return ($ok, $norm, undef);
+}
+
+my ($resp, $bm) = run_all_batches();
+my @batch_metrics = @$bm;
+
+my (@fail, @xpass, @crash, @skip, @prov); my ($pass, $xfail) = (0, 0);
+my %cold_ok;
+for my $key (@order) {
+    my ($r, $spec) = @{ $meta{$key} };
+    my $status = $r->{status} // 'gold';
+    my ($ok, $norm, $err) = score_row($r, $resp->{$key});
+    if (defined $err) {
+        if ($err =~ /^no response/) { push @crash, "$key ($err)" } else { push @skip, "$key ($err)" }
+        next;
+    }
+    $cold_ok{$key} = $ok;
     if ($status eq 'gold') {
         if ($ok) { $pass++ } else { push @fail, "$key\n      expect: " . encode_json($r->{expect}) . "\n      got: " . substr($norm, 0, 200) }
     } elsif ($status eq 'xfail') {
@@ -389,7 +438,45 @@ for my $key (@order) {
         push @prov, $key unless $ok;
     }
 }
-printf "\nGold-corpus harness\n  binary: %s\n  corpus: %s\n\n", $bin, $corpus;
+
+# ---- warm pass: the same suite again, against the cache the cold pass wrote ----
+# Cold is the first time a user opens a project; warm is every time after. A
+# fact that is derived at registration and not rebuilt from a cache blob answers
+# correctly once and silently stops answering — no error, no crash, just a
+# capability that quietly went missing on day two. Cold-only runs cannot see
+# that class at all, which is why this is a lane and not an assertion folded
+# into the first pass: `warm-FAIL` names the state transition, not the row.
+#
+# Deliberately NOT solved by having the harness clear the cache and run once.
+# That makes the suite deterministic by deleting the only evidence the bug
+# exists — the green run would be honest about the cold path and silent about
+# the one users actually spend their time on.
+my (@warm_fail, @warm_xpass); my $warm_xfail = 0; my $warm_wall = 0;
+my $do_warm = !grep { $_ eq '--no-warm' } @ARGV;
+if ($do_warm) {
+    my ($wresp, $wmets) = run_all_batches();
+    $warm_wall += $_->{wall_s} for @$wmets;
+    for my $key (@order) {
+        my ($r) = @{ $meta{$key} };
+        # Gold rows that passed cold are the only ones with a warm claim to
+        # make. A row already FAILing cold has nothing to regress from, and
+        # xfail/provisional rows assert nothing the second pass could break.
+        next unless ($r->{status} // 'gold') eq 'gold' && $cold_ok{$key};
+        my ($ok) = score_row($r, $wresp->{$key});
+        my $known = ($r->{warm} // '') eq 'xfail';
+        if ($ok) {
+            push @warm_xpass, "$key (warm-XPASS — drop \"warm\": \"xfail\" from the row)" if $known;
+        } elsif ($known) {
+            $warm_xfail++;
+        } else {
+            push @warm_fail, "$key (passes cold, fails warm)";
+        }
+    }
+}
+printf "\nGold-corpus harness\n  binary: %s\n  corpus: %s\n", $bin, $corpus;
+# Naming the cache and the root count makes "every root started cold" something
+# the reader can check, rather than a property they have to trust.
+printf "  cache:  %s (private, empty at start; %d roots)\n\n", $cachedir, $n_roots;
 printf "  %-9s %d\n", 'PASS',  $pass;
 printf "  %-9s %d\n", 'xfail', $xfail;
 printf "  %-9s %d\n", 'FAIL',  scalar @fail;
@@ -406,6 +493,17 @@ printf "  %-9s %d\n", 'prov?', scalar @prov if @prov;
 # serve the cpp rows, and CI builds exactly that. Still printed unconditionally
 # so the count is visible rather than inferred.
 printf "  %-9s %d\n", 'lang-skip', scalar @lang_skip;
+# Printed unconditionally when the warm pass ran, zeros included: "no row
+# regressed on rehydration" is a result worth seeing asserted. When the pass is
+# skipped the line says so, so a green summary can never be mistaken for one
+# that checked the warm path.
+if ($do_warm) {
+    printf "  %-9s %d\n", 'warm-FAIL',  scalar @warm_fail;
+    printf "  %-9s %d\n", 'warm-XPASS', scalar @warm_xpass;
+    printf "  %-9s %d\n", 'warm-xfail', $warm_xfail;
+} else {
+    printf "  %-9s %s\n", 'warm', '(skipped: --no-warm)';
+}
 print "\n!! CRASH (process aborted):\n",                 map { "  - $_\n" } @crash if @crash;
 # Attribute each aborted batch: which root, how it died, and the stderr it
 # left behind — without this a CRASH block names the victims but not the cause.
@@ -420,6 +518,10 @@ for my $m (grep { $_->{abort} } @batch_metrics) {
 }
 print "\n!! FAIL (gold assertion no longer holds):\n",   map { "  - $_\n" } @fail  if @fail;
 print "\n** XPASS (known gap fixed — update fixture):\n", map { "  - $_\n" } @xpass if @xpass;
+print "\n!! warm-FAIL (passes on a cold cache, fails on a warm one):\n",
+                                                          map { "  - $_\n" } @warm_fail  if @warm_fail;
+print "\n** warm-XPASS (warm gap fixed — update fixture):\n",
+                                                          map { "  - $_\n" } @warm_xpass if @warm_xpass;
 print "\nprovisional misses:\n",                         map { "  - $_\n" } @prov  if @prov;
 print "\n!! SKIP (row did not run — its input did not resolve):\n",
                                                           map { "  - $_\n" } @skip  if @skip;
@@ -460,8 +562,13 @@ print "\n";
         printf "  startup %-46s %8.1f ms\n",
             _bn($met->{root}), ($met->{first_s} // 0) * 1000;
     }
-    printf "  wall %.2fs   cpu user %.2fs sys %.2fs   peak rss %.1f MB\n\n",
+    printf "  wall %.2fs   cpu user %.2fs sys %.2fs   peak rss %.1f MB\n",
         $wall, $cpu_u, $cpu_s, $hwm / 1024;
+    # The cost report measures the COLD pass; the warm wall is printed beside it
+    # because "what does a warm start actually save" is the number this second
+    # pass yields for free, and it is the one a caching change has to move.
+    printf "  warm wall %.2fs\n", $warm_wall if $do_warm;
+    print "\n";
     if (my $mo = $ENV{METRICS_OUT}) {
         my %caps = map {
             my @d = @{ $by_cap{$_} };
@@ -483,4 +590,4 @@ sub _sum { my $t = 0; $t += $_ for @{ $_[0] }; $t }
 # row at least proves the harness reached it. @lang_skip is excluded on purpose:
 # it means the binary does not serve that language, which is a real supported
 # configuration (CI's perl-only build), not a missing input.
-exit((@fail || @crash || @xpass || @skip) ? 1 : 0);
+exit((@fail || @crash || @xpass || @skip || @warm_fail || @warm_xpass) ? 1 : 0);
