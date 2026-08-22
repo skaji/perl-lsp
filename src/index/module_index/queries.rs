@@ -67,7 +67,7 @@ impl ModuleIndex {
         // evicted once persisted; queries that need the whole analysis
         // rehydrate through this, same as the pack sub-indexes. Fixed
         // 128 MiB cap (Perl analyses are 10-100x smaller than cpp ones).
-        let loader = move |path: &std::path::Path| {
+        let loader = move |path: &std::path::Path, want_bag: bool| {
             // Raw walk path first (preserves the pre-diag behavior), canonical
             // as a fallback spelling; the discriminated helper survives the
             // readonly-open CANTOPEN/WAL race behind both.
@@ -82,7 +82,12 @@ impl ModuleIndex {
                     spellings.push(c);
                 }
             }
-            crate::index::module_cache::open_and_load_diag(key.as_deref(), "perl", &spellings)
+            crate::index::module_cache::open_and_load_diag(
+                key.as_deref(),
+                "perl",
+                &spellings,
+                want_bag,
+            )
         };
         // Measurement-only override for ghost-stats cap experiments
         // (`PERL_LSP_BAG_CACHE_MB`); unset ⇒ the stock 128 MiB.

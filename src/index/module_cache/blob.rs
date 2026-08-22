@@ -103,10 +103,115 @@ pub(super) fn closure_stamp(
     acc as i64
 }
 
-/// Serialize FileAnalysis via bincode then compress with zstd.
-pub fn encode_analysis(fa: &FileAnalysis) -> Option<Vec<u8>> {
-    let bin = bincode::serialize(fa).ok()?;
-    zstd::encode_all(bin.as_slice(), ZSTD_LEVEL).ok()
+/// A stored analysis, split into the lane every reader needs and the lane
+/// most readers throw away.
+///
+/// The two halves travel together so a writer cannot persist one without the
+/// other: a row whose `analysis` is post-split but whose `bag` never landed
+/// would answer every type query with an empty bag — absence read as an
+/// answer, which is the failure this whole storage layer is arranged to
+/// prevent.
+pub struct EncodedAnalysis {
+    /// The analysis with its witness bag taken out.
+    pub analysis: Vec<u8>,
+    /// The witness bag alone. NEVER empty for a row this code writes — the
+    /// `bag IS NULL` test is how a reader tells a pre-split row (bag inline
+    /// in `analysis`) from a post-split one, so an empty encoding here would
+    /// silently make a new row look old. `zstd` always emits a frame header,
+    /// and `encoded_bag_is_never_empty` pins it.
+    pub bag: Vec<u8>,
+}
+
+impl EncodedAnalysis {
+    /// Total stored size, for the writers' byte accounting.
+    pub fn len(&self) -> usize {
+        self.analysis.len() + self.bag.len()
+    }
+
+    /// Re-decode both halves into the analysis they came from.
+    ///
+    /// For the bulk writers' failure recovery: a chunk that failed to commit
+    /// leaves its resident copies stripped with no committed blob to
+    /// rehydrate from, so the in-hand encoding is the only remaining source
+    /// and it must come back WHOLE — a bag-less recovery would pin a copy
+    /// that answers every type query with silence.
+    pub fn decode_whole(&self) -> Option<FileAnalysis> {
+        decode_analysis_parts(&self.analysis, Some(&self.bag), true)
+    }
+}
+
+/// Serialize FileAnalysis via bincode then compress with zstd, splitting the
+/// witness bag into its own blob.
+///
+/// The split is why: a refs/symbols reader decodes `analysis` alone, and the
+/// bag is 52.9% of the uncompressed bytes bincode would otherwise walk. On
+/// the backward-walk workloads that own this path (references, rename,
+/// documentHighlight, callHierarchy incoming, heatmap fan-in) 94.9% of
+/// decodes want no bag at all.
+pub fn encode_analysis(fa: &FileAnalysis) -> Option<EncodedAnalysis> {
+    // Split off the bag by value: `bincode` has no field-skipping hook, so
+    // the alternative is serializing a clone of the whole analysis. The bag
+    // goes back before this returns, so `fa` is observably unchanged.
+    let mut owned;
+    let (bagless, bag) = {
+        owned = fa.clone();
+        let bag = std::mem::take(&mut owned.witnesses);
+        (&owned, bag)
+    };
+    let bin = bincode::serialize(bagless).ok()?;
+    let analysis = zstd::encode_all(bin.as_slice(), ZSTD_LEVEL).ok()?;
+    let bag_bin = bincode::serialize(&bag).ok()?;
+    let bag = zstd::encode_all(bag_bin.as_slice(), ZSTD_LEVEL).ok()?;
+    debug_assert!(!bag.is_empty(), "an empty bag blob would read as a pre-split row");
+    Some(EncodedAnalysis { analysis, bag })
+}
+
+/// Decompress + deserialize an analysis blob, installing `bag` when the
+/// caller wants the witness lane.
+///
+/// Row format is NOT inferred here. Pre-split rows carry their bag inside
+/// `analysis` and would be indistinguishable from a post-split row whose bag
+/// column went missing — both arrive as a `None` bag over an analysis with no
+/// witnesses, one benign and one an invariant break. `EXTRACT_VERSION` is
+/// bumped for the split and every reader filters on it, so a row reaching
+/// this function is always post-split and the ambiguity does not exist.
+///
+/// A `None` bag therefore means exactly one of two things:
+///
+///   * `want_bag` false — the caller never fetched the column. Mark the
+///     analysis bag-EVICTED so a later type query rehydrates rather than
+///     reading an empty bag as "no type facts".
+///   * `want_bag` true — the column was NULL on a row that must have one.
+///     Same marker, because degrading honestly is what the rest of this
+///     layer does with a broken invariant, plus a counter so it is visible
+///     instead of silent.
+pub fn decode_analysis_parts(
+    blob: &[u8],
+    bag: Option<&[u8]>,
+    want_bag: bool,
+) -> Option<FileAnalysis> {
+    let mut fa = decode_analysis(blob)?;
+    match bag {
+        Some(b) => {
+            let bin = crate::util::ghost_stats::timed("decode.2_zstd_bag", || zstd::decode_all(b))
+                .ok()?;
+            fa.witnesses = crate::util::ghost_stats::timed("decode.3_bincode_bag", || {
+                bincode::deserialize(&bin)
+            })
+            .ok()?;
+        }
+        None => {
+            if want_bag {
+                crate::util::ghost_stats::count("decode.bag_column_missing");
+                log::warn!(
+                    "post-split row had no bag column; serving bag-evicted \
+                     (types for this file are incomplete until it is rewritten)"
+                );
+            }
+            fa.evict_witness_bag();
+        }
+    }
+    Some(fa)
 }
 
 /// Decompress + deserialize an analysis blob.
@@ -159,12 +264,21 @@ fn decode_bucket(tag: &str, v: u64) {
 /// No mtime/closure validation: the caller (`PackBagCache`) invalidates its
 /// entry on file change, and the row's shape is EXTRACT_VERSION-pinned.
 pub fn load_one(conn: &Connection, path: &str) -> Option<FileAnalysis> {
-    load_one_diag(conn, path).ok()
+    load_one_diag(conn, path, true).ok()
 }
 
 /// `load_one` that discriminates the failure (see `RehydrateMiss`) instead
 /// of collapsing to `None`, so the rehydration tripwire can name the cause.
-pub fn load_one_diag(conn: &Connection, path: &str) -> Result<FileAnalysis, RehydrateMiss> {
+///
+/// `want_bag` false selects a narrower row: the `bag` column is not named in
+/// the SELECT, so SQLite never reads its overflow pages and the decode never
+/// walks its bytes. That is the whole point of the split — on backward-walk
+/// traffic 94.9% of decodes take this path.
+pub fn load_one_diag(
+    conn: &Connection,
+    path: &str,
+    want_bag: bool,
+) -> Result<FileAnalysis, RehydrateMiss> {
     // A dual-homed project-lib file has TWO rows for one path (name-keyed
     // import + path-keyed workspace). Prefer a row whose stamp matches the
     // disk (one tier's persist may have failed or lagged, leaving a stale
@@ -172,22 +286,33 @@ pub fn load_one_diag(conn: &Connection, path: &str) -> Result<FileAnalysis, Rehy
     // deliberately skip stamp validation — the registered generation may
     // legitimately predate an unsaved edit, and the caller invalidates the
     // LRU on file change.
+    //
+    // The `extract_version` filter is what lets `decode_analysis_parts` skip
+    // format inference: a pre-split row carries its bag inside `analysis` and
+    // would decode as a post-split row whose bag column vanished. Filtering
+    // makes such a row invisible here rather than plausible.
     let mut stmt = conn
-        .prepare(
-            "SELECT analysis, mtime_secs, file_size FROM modules WHERE path = ?1 \
-             ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END",
-        )
+        .prepare(if want_bag {
+            "SELECT analysis, mtime_secs, file_size, bag FROM modules \
+             WHERE path = ?1 AND extract_version = ?2 \
+             ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END"
+        } else {
+            "SELECT analysis, mtime_secs, file_size, NULL FROM modules \
+             WHERE path = ?1 AND extract_version = ?2 \
+             ORDER BY CASE source WHEN 'workspace' THEN 0 ELSE 1 END"
+        })
         .map_err(|_| RehydrateMiss::NoRow)?;
     // Stage 1 of the rehydrate: the SQL roundtrip that fetches the bytes.
     // Timed separately from the decode because batching the fetch is only
     // worth doing if THIS is the dominant term.
-    let rows: Vec<(Option<Vec<u8>>, i64, i64)> =
+    let rows: Vec<(Option<Vec<u8>>, i64, i64, Option<Vec<u8>>)> =
         crate::util::ghost_stats::timed("decode.1_sql_fetch", || {
-            stmt.query_map(params![path], |row| {
+            stmt.query_map(params![path, EXTRACT_VERSION], |row| {
                 Ok((
                     row.get::<_, Option<Vec<u8>>>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             })
             .map(|rows| rows.flatten().collect::<Vec<_>>())
@@ -196,19 +321,22 @@ pub fn load_one_diag(conn: &Connection, path: &str) -> Result<FileAnalysis, Rehy
     if rows.is_empty() {
         return Err(RehydrateMiss::NoRow);
     }
-    let pick = |require_stamp: bool| -> Option<&Vec<u8>> {
-        rows.iter().find_map(|(blob, m, sz)| {
+    // The bag rides with the blob it was split from: picking them separately
+    // could pair a workspace row's analysis with an import row's bag.
+    let pick = |require_stamp: bool| -> Option<(&Vec<u8>, Option<&Vec<u8>>)> {
+        rows.iter().find_map(|(blob, m, sz, bag)| {
             let blob = blob.as_ref().filter(|b| !b.is_empty())?;
             if require_stamp && file_stamp(std::path::Path::new(path)) != Some((*m, *sz)) {
                 return None;
             }
-            Some(blob)
+            Some((blob, bag.as_ref().filter(|b| !b.is_empty())))
         })
     };
-    let blob = pick(rows.len() > 1)
+    let (blob, bag) = pick(rows.len() > 1)
         .or_else(|| pick(false))
         .ok_or(RehydrateMiss::EmptyBlob)?;
-    decode_analysis(blob).ok_or(RehydrateMiss::DecodeFailed)
+    decode_analysis_parts(blob, bag.map(|b| b.as_slice()), want_bag)
+        .ok_or(RehydrateMiss::DecodeFailed)
 }
 
 /// The bag-cache rehydration loader body, shared by every per-lang loader
@@ -222,10 +350,11 @@ pub fn open_and_load_diag(
     cache_key: Option<&str>,
     lang: &str,
     paths: &[String],
+    want_bag: bool,
 ) -> Result<FileAnalysis, RehydrateMiss> {
     let dir = cache_dir_for_workspace(cache_key)
         .ok_or_else(|| RehydrateMiss::OpenerFailed("no cache dir for workspace".into()))?;
-    load_with_wal_fallback(&db_path_for(&dir, lang), paths)
+    load_with_wal_fallback(&db_path_for(&dir, lang), paths, want_bag)
 }
 
 #[cfg(test)]
@@ -233,6 +362,7 @@ pub fn open_and_load_diag(
     _cache_key: Option<&str>,
     _lang: &str,
     _paths: &[String],
+    _want_bag: bool,
 ) -> Result<FileAnalysis, RehydrateMiss> {
     Err(RehydrateMiss::NoRow)
 }
@@ -254,6 +384,7 @@ pub fn open_and_load_diag(
 pub fn load_with_wal_fallback(
     db_path: &std::path::Path,
     paths: &[String],
+    want_bag: bool,
 ) -> Result<FileAnalysis, RehydrateMiss> {
     // `open_reader_retrying` waits out the transient CANTOPEN window; the
     // rw_open closure below then handles the (rarer) opened-but-row-invisible
@@ -262,6 +393,7 @@ pub fn load_with_wal_fallback(
         open_reader_retrying(db_path),
         || open_rw_shared_at(db_path),
         paths,
+        want_bag,
     )
 }
 
@@ -274,12 +406,13 @@ pub(super) fn rehydrate_from_opens(
     ro: Result<Connection, String>,
     rw_open: impl FnOnce() -> Option<Connection>,
     paths: &[String],
+    want_bag: bool,
 ) -> Result<FileAnalysis, RehydrateMiss> {
     let ro_err = ro.as_ref().err().cloned();
     let mut last = RehydrateMiss::NoRow;
     if let Ok(conn) = &ro {
         for p in paths {
-            match load_one_diag(conn, p) {
+            match load_one_diag(conn, p, want_bag) {
                 Ok(fa) => return Ok(fa),
                 Err(RehydrateMiss::NoRow) => {}
                 Err(other) => last = other,
@@ -292,7 +425,7 @@ pub(super) fn rehydrate_from_opens(
     if ro_err.is_some() || matches!(last, RehydrateMiss::NoRow) {
         if let Some(rw) = rw_open() {
             for p in paths {
-                if let Ok(fa) = load_one_diag(&rw, p) {
+                if let Ok(fa) = load_one_diag(&rw, p, want_bag) {
                     let _ = rw.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
                     return Ok(fa);
                 }
@@ -317,22 +450,23 @@ pub fn save_blob_to_db_stamped(
     module_name: &str,
     path: &std::path::Path,
     include_closure: &crate::model::file_analysis::path_intern::ClosureList,
-    blob: &[u8],
+    blob: &EncodedAnalysis,
     source: &str,
     stamp: (i64, i64),
 ) {
     let (mtime, size) = stamp;
     let deps = closure_stamp(include_closure, &mut std::collections::HashMap::new());
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, extract_version, deps_stamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, bag, extract_version, deps_stamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             module_name,
             path.to_string_lossy(),
             mtime,
             size,
             source,
-            Some(blob),
+            Some(&blob.analysis),
+            Some(&blob.bag),
             EXTRACT_VERSION,
             deps
         ],
@@ -403,9 +537,19 @@ pub fn save_to_db(
     };
 
     let r = conn.execute(
-        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, extract_version, deps_stamp)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![module_name, path_str, mtime, size, source, analysis_blob, EXTRACT_VERSION, deps_stamp],
+        "INSERT OR REPLACE INTO modules (module_name, path, mtime_secs, file_size, source, analysis, bag, extract_version, deps_stamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            module_name,
+            path_str,
+            mtime,
+            size,
+            source,
+            analysis_blob.as_ref().map(|b| &b.analysis),
+            analysis_blob.as_ref().map(|b| &b.bag),
+            EXTRACT_VERSION,
+            deps_stamp
+        ],
     );
     let ok = match r {
         // A row whose blob failed to ENCODE landed as NULL — not a

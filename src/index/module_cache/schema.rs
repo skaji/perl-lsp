@@ -10,7 +10,7 @@ const SCHEMA_VERSION: &str = "10";
 /// Bumped when the builder's analysis output changes shape in a way that
 /// invalidates cached blobs. Unlike `SCHEMA_VERSION`, this does not drop
 /// the table — stale entries are re-resolved lazily with priority.
-pub const EXTRACT_VERSION: i64 = 183;
+pub const EXTRACT_VERSION: i64 = 184;
 
 /// Bumped when the ROW format of the relational ref index changes shape.
 /// Unlike `EXTRACT_VERSION` (which governs the blobs), a mismatch only wipes
@@ -31,6 +31,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             file_size        INTEGER NOT NULL,
             source           TEXT NOT NULL DEFAULT 'import',
             analysis         BLOB,
+            bag              BLOB,
             extract_version  INTEGER NOT NULL DEFAULT 0,
             deps_stamp       INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (module_name, path)
@@ -159,6 +160,12 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     let _ = conn.execute_batch(
         "ALTER TABLE modules ADD COLUMN deps_stamp INTEGER NOT NULL DEFAULT 0;",
     );
+    // Same in-place treatment for the split-out witness bag. Pre-existing
+    // rows keep their bag inside `analysis` and get a NULL here; they are
+    // never READ as post-split rows, because the split bumped
+    // `EXTRACT_VERSION` and every reader filters on it. So they age out by
+    // re-resolution rather than needing a migration or a format probe.
+    let _ = conn.execute_batch("ALTER TABLE modules ADD COLUMN bag BLOB;");
     // Stub generation gate — stamped here so every fresh DB is writable by
     // the persist writers (their per-chunk `stub_version_current` check
     // would otherwise fail-closed until the first warm scan stamped it).
@@ -185,6 +192,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
                     file_size        INTEGER NOT NULL,
                     source           TEXT NOT NULL DEFAULT 'import',
                     analysis         BLOB,
+                    bag              BLOB,
                     extract_version  INTEGER NOT NULL DEFAULT 0,
                     deps_stamp       INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (module_name, path)

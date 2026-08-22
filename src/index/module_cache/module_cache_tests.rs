@@ -1054,6 +1054,7 @@ fn readonly_open_failure_recovers_through_read_write() {
         Err("simulated SQLITE_CANTOPEN".to_string()),
         || open_rw_shared_at(&db),
         std::slice::from_ref(&pm_str),
+        true,
     )
     .expect("RW fallback must recover the row a failed read-only open couldn't reach");
     assert!(!recovered.bag_is_evicted());
@@ -1066,6 +1067,7 @@ fn readonly_open_failure_recovers_through_read_write() {
         Err("simulated SQLITE_CANTOPEN".to_string()),
         || None,
         std::slice::from_ref(&pm_str),
+        true,
     )
     .unwrap_err();
     assert!(matches!(miss, RehydrateMiss::OpenerFailed(_)), "got {miss}");
@@ -1087,10 +1089,10 @@ fn rehydrate_absent_row_is_honest_miss() {
         init_schema(&w).unwrap();
     }
     // Row truly absent (present DB, no matching row) → NoRow, via both opens.
-    let miss = load_with_wal_fallback(&db, &["/no/such.pm".to_string()]).unwrap_err();
+    let miss = load_with_wal_fallback(&db, &["/no/such.pm".to_string()], true).unwrap_err();
     assert!(matches!(miss, RehydrateMiss::NoRow), "got {miss}");
     // No DB file at all → OpenerFailed (neither read-only nor read-write open).
-    let none = load_with_wal_fallback(&dir.join("nope.db"), &["/x.pm".to_string()]).unwrap_err();
+    let none = load_with_wal_fallback(&dir.join("nope.db"), &["/x.pm".to_string()], true).unwrap_err();
     assert!(matches!(none, RehydrateMiss::OpenerFailed(_)), "got {none}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1106,9 +1108,9 @@ fn load_one_diag_discriminates_failures() {
     let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
     let pm_str = pm.to_string_lossy().into_owned();
     save_to_db(&conn, &pm_str, &Some(cached), "workspace");
-    assert!(load_one_diag(&conn, &pm_str).is_ok());
+    assert!(load_one_diag(&conn, &pm_str, true).is_ok());
     assert!(matches!(
-        load_one_diag(&conn, "/absent.pm").unwrap_err(),
+        load_one_diag(&conn, "/absent.pm", true).unwrap_err(),
         RehydrateMiss::NoRow
     ));
     conn.execute(
@@ -1118,7 +1120,7 @@ fn load_one_diag_discriminates_failures() {
     )
     .unwrap();
     assert!(matches!(
-        load_one_diag(&conn, "/empty.pm").unwrap_err(),
+        load_one_diag(&conn, "/empty.pm", true).unwrap_err(),
         RehydrateMiss::EmptyBlob
     ));
     conn.execute(
@@ -1128,7 +1130,7 @@ fn load_one_diag_discriminates_failures() {
     )
     .unwrap();
     assert!(matches!(
-        load_one_diag(&conn, "/garbage.pm").unwrap_err(),
+        load_one_diag(&conn, "/garbage.pm", true).unwrap_err(),
         RehydrateMiss::DecodeFailed
     ));
     let _ = std::fs::remove_file(&pm);
@@ -1454,13 +1456,14 @@ fn a_deleted_files_rows_are_collectable() {
     ).unwrap();
     // Stamp the row to the file as it is on disk, so the scan would admit it.
     let (mtime, size) = file_stamp(&p).expect("stamp");
+    let enc = encode_analysis(&cached.analysis).expect("encode");
     conn.execute(
         "INSERT OR REPLACE INTO modules
-           (module_name, path, mtime_secs, file_size, source, analysis, extract_version, deps_stamp)
-         VALUES (?1, ?1, ?2, ?3, 'workspace', ?4, ?5, 0)",
+           (module_name, path, mtime_secs, file_size, source, analysis, bag, extract_version, deps_stamp)
+         VALUES (?1, ?1, ?2, ?3, 'workspace', ?4, ?5, ?6, 0)",
         params![
             path_str, mtime, size,
-            encode_analysis(&cached.analysis).expect("encode"),
+            enc.analysis, enc.bag,
             EXTRACT_VERSION
         ],
     ).unwrap();
@@ -1485,4 +1488,112 @@ fn a_deleted_files_rows_are_collectable() {
     invalidate_generation_tier(&conn, &path_str, "workspace");
     assert!(gc_strings(&conn) > 0, "the dead file's names stayed pinned");
     assert!(ref_candidate_files(&conn, &["only_here".to_string()]).is_empty());
+}
+
+/// The `bag IS NULL` discriminator is only sound if a row this code writes
+/// never has an empty bag blob — an empty one would read as a pre-split row.
+///
+/// Nothing in the writer enforces that directly; it holds because `zstd`
+/// always emits a frame header, which is a property of a dependency rather
+/// than of this codebase. So it is pinned here: the case that would break it
+/// is an analysis whose witness bag is genuinely empty, which is exactly the
+/// input a reader could not otherwise tell apart from an old row.
+#[test]
+fn encoded_bag_is_never_empty() {
+    let src = "1;\n";
+    let mut parser = crate::build::builder::create_parser();
+    let tree = parser.parse(src, None).expect("parse");
+    let mut fa = crate::build::builder::build(&tree, src.as_bytes());
+    fa.witnesses = Default::default();
+    assert!(
+        fa.witnesses.is_empty(),
+        "this test is vacuous unless the bag really is empty"
+    );
+    let enc = encode_analysis(&fa).expect("encode");
+    assert!(
+        !enc.bag.is_empty(),
+        "an empty bag blob is indistinguishable from a pre-split row's NULL, \
+         so every such row would silently decode as though its bag lived \
+         inside the analysis blob"
+    );
+}
+
+/// A rows-only read must not report "this file has no type facts".
+///
+/// The split makes that failure newly reachable: the bag genuinely is not in
+/// the bytes any more, so an analysis that forgot to mark itself evicted
+/// would answer type queries with a confident, empty, wrong answer instead of
+/// rehydrating. The marker is the only thing standing between the two.
+#[test]
+fn rows_only_read_is_marked_evicted_not_empty() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("stage1_axis.pm");
+    std::fs::write(&pm, "package A;\nsub f { return 'x' }\n1;\n").unwrap();
+    let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
+    assert!(
+        !cached.analysis.witnesses.is_empty(),
+        "fixture must carry witnesses or neither assertion below means anything"
+    );
+    let n = cached.analysis.witnesses.len();
+    let pm_str = pm.to_string_lossy().into_owned();
+    save_to_db(&conn, &pm_str, &Some(cached), "workspace");
+
+    let rows = load_one_diag(&conn, &pm_str, false).expect("rows-only read");
+    assert!(
+        rows.bag_is_evicted(),
+        "a rows-only read left the bag absent WITHOUT the evicted marker — a \
+         type query would read the empty bag as 'no facts' and never rehydrate"
+    );
+
+    let whole = load_one_diag(&conn, &pm_str, true).expect("bag read");
+    assert!(!whole.bag_is_evicted());
+    assert_eq!(
+        whole.witnesses.len(),
+        n,
+        "the split must round-trip the bag exactly, not approximately"
+    );
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// A pre-split row must never be served as a post-split one.
+///
+/// Such a row carries its bag inside `analysis` and a NULL `bag` column,
+/// which is byte-for-byte what a post-split row with a lost bag looks like.
+/// `decode_analysis_parts` deliberately does not try to tell them apart; the
+/// `extract_version` filter is what makes the ambiguous row unreachable, and
+/// this is the test that fails if that filter is ever dropped.
+#[test]
+fn pre_split_rows_are_filtered_not_guessed() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("stage1_presplit.pm");
+    std::fs::write(&pm, "package B;\nsub g { return 1 }\n1;\n").unwrap();
+    let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
+    let pm_str = pm.to_string_lossy().into_owned();
+
+    // A row in the OLD shape: whole analysis (bag inline) in `analysis`,
+    // NULL `bag`, and the extract_version that shipped before the split.
+    let whole_blob = {
+        let bin = bincode::serialize(&*cached.analysis).expect("bincode");
+        zstd::encode_all(bin.as_slice(), 3).expect("zstd")
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO modules
+           (module_name, path, mtime_secs, file_size, source, analysis, bag, extract_version, deps_stamp)
+         VALUES (?1, ?1, 0, 0, 'workspace', ?2, NULL, ?3, 0)",
+        params![pm_str, whole_blob, EXTRACT_VERSION - 1],
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            load_one_diag(&conn, &pm_str, true).unwrap_err(),
+            RehydrateMiss::NoRow
+        ),
+        "a pre-split row was served as post-split; its inline bag would be \
+         mistaken for a missing bag column (or vice versa) and one of those \
+         two readings is silently wrong"
+    );
+    let _ = std::fs::remove_file(&pm);
 }

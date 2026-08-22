@@ -38,7 +38,7 @@ fn bag_present_rehydrates_evicted_at_both_caps() {
     for cap in [8 * 1024 * 1024usize, 0] {
         // Loader hands back the FULL analysis (as SQLite would after decode).
         let full_for_loader = full.analysis.clone();
-        let cache = Arc::new(PackBagCache::new(cap, move |_p| {
+        let cache = Arc::new(PackBagCache::new(cap, move |_p, _want_bag: bool| {
             Ok((*full_for_loader).clone())
         }));
         let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
@@ -73,7 +73,7 @@ fn symbols_present_answers_resident_when_only_bag_evicted() {
     let path = full.path.clone();
 
     // Loader that PANICS: proof the bag-only-evicted path never rehydrates.
-    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, |_p: &std::path::Path| {
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, |_p: &std::path::Path, _want_bag: bool| {
         panic!("symbols_present must not rehydrate a symbols-resident copy")
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
@@ -103,7 +103,7 @@ fn symbols_present_rehydrates_evicted_symbols_never_absence_by_eviction() {
     let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\n1;\n";
     let full = parse_source_to_cached(src, "Widget");
     let full_for_loader = full.analysis.clone();
-    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, move |_p: &std::path::Path| {
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, move |_p: &std::path::Path, _want_bag: bool| {
         Ok((*full_for_loader).clone())
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
@@ -128,7 +128,7 @@ fn refs_present_answers_resident_when_only_bag_evicted() {
     use crate::model::file_analysis::CrossFileLookup;
     let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\nWidget::make('Widget');\n1;\n";
     let full = parse_source_to_cached(src, "Widget");
-    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, |_p: &std::path::Path| {
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, |_p: &std::path::Path, _want_bag: bool| {
         panic!("refs_present must not rehydrate a rows-resident copy")
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
@@ -153,7 +153,7 @@ fn refs_present_rehydrates_evicted_refs_never_absence_by_eviction() {
     let src = "package Widget;\nsub make { my $c = shift; return bless {}, $c; }\nWidget::make('Widget');\n1;\n";
     let full = parse_source_to_cached(src, "Widget");
     let full_for_loader = full.analysis.clone();
-    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, move |_p: &std::path::Path| {
+    let cache = Arc::new(PackBagCache::new(8 * 1024 * 1024, move |_p: &std::path::Path, _want_bag: bool| {
         Ok((*full_for_loader).clone())
     }));
     let idx = ModuleIndex::new_for_cli().with_bag_cache(cache);
@@ -627,7 +627,7 @@ fn register_symbols_stripping_feeds_before_evict() {
 
     // whole_present rehydrates symbols through the LRU.
     let full_for_loader = full.analysis.clone();
-    let cache = std::sync::Arc::new(PackBagCache::new(1024 * 1024, move |_p| {
+    let cache = std::sync::Arc::new(PackBagCache::new(1024 * 1024, move |_p, _want_bag: bool| {
         Ok((*full_for_loader).clone())
     }));
     let idx2 = ModuleIndex::new_for_cli().with_bag_cache(cache);
@@ -1167,7 +1167,7 @@ fn foreign_path_rehydrates_through_the_owning_sibling() {
     let served = Arc::clone(&whole_arc);
     hub.set_bag_cache(Arc::new(crate::index::pack_bag_cache::PackBagCache::new(
         128 * 1024 * 1024,
-        move |p: &std::path::Path| {
+        move |p: &std::path::Path, _want_bag: bool| {
             if p == std::path::Path::new("/fake/hub/Ghost.pm") {
                 Ok((*served).clone())
             } else {
