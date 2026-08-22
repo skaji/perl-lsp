@@ -1113,6 +1113,12 @@ fn enriched_tree_diagnostics(
     let mut all = Vec::new();
     for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
+        // Names the file on stderr if this one unit runs long. The sweep is
+        // where a single pathological file can grind for minutes while the
+        // run looks merely slow — and a run that never finishes never
+        // reaches an after-the-fact report, so the warning has to come from
+        // a watchdog while the unit is still held.
+        crate::util::timings::set_current_file(Some(entry.key()));
         let cached = std::sync::Arc::new(file_analysis::CachedModule::new(
             entry.key().clone(),
             std::sync::Arc::clone(entry.value()),
@@ -1139,6 +1145,7 @@ fn enriched_tree_diagnostics(
         for d in diags {
             all.push((file.clone(), d));
         }
+        crate::util::timings::set_current_file(None);
     }
     // Pack-language files (C++/…) live in the per-language sub-indexes, not the
     // Perl-only `FileStore` above. Mirror the backend's language dispatch: they
