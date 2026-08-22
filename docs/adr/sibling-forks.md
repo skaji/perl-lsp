@@ -48,6 +48,69 @@ fallback would have been sound-looking and wrong. Measure overlap on a
 real corpus before choosing the shape: the in-regime synthetic corpus
 showed 100% overlap and would have made deletion look safe.
 
+**And the mroc/mdmp narrowing was then built, measured, and rejected.**
+The shape above is right; the reason to pay for it was not. The
+narrowing is implementable and answer-preserving — the ancestor walk
+records, per candidate whose symbols it already holds, the answer to
+the FALLBACK's question (not its own: the walk sees through re-exports
+and admits class-content, so donating `has_member` loses answers), and
+the fallback honours it. It removed the fetches it targeted and nothing
+else:
+
+| counter | before | after |
+|---|---|---|
+| `mdmp.candidate_fetched`, substrate | 39,491 | 882 |
+| `mdmp.candidate_fetched`, in-regime | 1,689,378 | 0 |
+| `mdmp.found` | 80 | 80 |
+| `mroc.*`, `mdmp.call`/`modules_scanned`/`not_found` | — | identical |
+
+It bought no wall time in any regime measured — substrate cold
+(20.79 → 20.59 s median), the in-regime duplicated-package corpus
+(76.00 → 74.20 s), and substrate with the sweep memo disabled
+(21.06 → 21.02 s), all inside run-to-run spread on three interleaved
+cold repeats each.
+
+The third arm is the one that explains the other two. Disabling the
+sweep memo was meant to make these fetches expensive; instead, removing
+36,712 rehydrations left `rehydrate.loader` TOTAL flat (3,531 → 3,579
+ms, up by noise) while its AVERAGE rose (10.2 → 11.5 µs). That
+signature is self-consistent and it is the finding: pull the cheapest
+entries out of a denominator and the mean rises while the total does
+not move. **The fetches the narrowing removes are the cheapest
+rehydrations in the system.**
+
+So the overlap number was **true about count and false about cost** —
+and a 98.6% overlap invites exactly that inference, which is why this
+is written down. A rehydrate COUNT is a poor proxy for rehydrate COST.
+
+The structural argument does not rescue it either. The sibling-fork
+rule exists to stop two implementations of one question from diverging
+in their ANSWERS; the path-level data says the fallback's set is a
+strict superset (the 563 paths it alone answers), so this is two
+questions with overlapping work, not two answers to one question.
+Duplicated work with no measured cost does not earn new machinery.
+"Nested ones narrow" stands as taxonomy; it does not oblige paying for
+the narrowing here.
+
+What landed instead is the pair of fixtures that pin the fallback's
+semantics (`typeglob_fallback_still_answers_from_a_candidate_the_
+ancestor_walk_rejected`, `typeglob_fallback_keeps_its_provider_
+ordering_across_the_overlap`) — previously unpinned, and the thing any
+future attempt must not break. The rejected implementation is PR #151,
+commit `0f41907e`.
+
+**Bound-first is not enough on its own — ablate the bound.** The first
+fixture written for this narrowing, committed before the change per the
+bound-first discipline, PASSED under both wrong designs: an installer
+sorting before the class short-circuited the fallback's `find()` before
+the memo was ever consulted, so it asserted a true thing about a path
+the change does not touch. It was caught by ablating it, not by reading
+it. **An un-ablated fixture is an assertion, not a net.** The cheap
+check is to break the change deliberately, in each way it could
+plausibly be got wrong, and confirm the fixture fails each time — the
+pair above was verified that way (donate `has_member` → the first
+fails; answer out of the walk loop → the second fails).
+
 > A worked one, because the fork was invisible until the two walks were
 > read side by side: `implementations_of` gathered descendants PLUS the
 > co-ancestors those descendants reach going back up their own MRO,

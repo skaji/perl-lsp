@@ -513,6 +513,7 @@ impl FileAnalysis {
             // same-named class must not hijack the walk — while Perl gets
             // the whole relation. The goto-def consumer re-picks the
             // defining candidate with the same test.
+            crate::util::ghost_stats::mroc_begin();
             for cached in idx.visible_def_candidates(cls) {
                 // Class-scoped, not file-scoped: a pack file holds MANY
                 // classes, so "some sub of this name exists in cls's file"
@@ -527,6 +528,7 @@ impl FileAnalysis {
                 // only while the copy still HAS symbols, and the workspace tier
                 // strips them, so at scale this is a decode per candidate.
                 crate::util::ghost_stats::count("mroc.candidate_fetched");
+                crate::util::ghost_stats::mroc_note(&cached.path);
                 let whole = crate::util::ghost_stats::in_ancestor_walk(|| {
                     idx.symbols_present(&cached)
                 });

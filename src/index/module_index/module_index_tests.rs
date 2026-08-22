@@ -2157,6 +2157,118 @@ fn typeglob_install_is_found_through_the_class_keyed_provider_index() {
     );
 }
 
+/// The ancestor walk and the typeglob fallback ask DIFFERENT questions
+/// over overlapping candidate sets, and this is the difference. The walk
+/// sees through a re-export and admits class-content variables; the
+/// fallback does neither. So a file the walk REJECTED can still be the
+/// fallback's answer.
+///
+/// Pinned because the two enumerations overlap almost entirely (98.6% of
+/// the fallback's fetches on the substrate, 100% in a duplicated-package
+/// corpus, are files the walk just decoded), which makes "have the walk
+/// answer for both" a standing temptation. It is only sound while the two
+/// verdicts stay separate. The rejected file is the ONLY match here, so a
+/// version that reused the walk's own verdict answers `None` rather than
+/// passing by luck on an earlier provider.
+///
+/// `docs/adr/sibling-forks.md` has the measurement that says collapsing
+/// the overlap buys nothing.
+#[test]
+fn typeglob_fallback_still_answers_from_a_candidate_the_ancestor_walk_rejected() {
+    use crate::model::file_analysis::{CrossFileLookup, MethodResolution, SymKind};
+    let idx = ModuleIndex::new_for_test();
+
+    let reg = |name: &str, fa: crate::model::file_analysis::FileAnalysis| {
+        let path = PathBuf::from(format!("/fake/overlap/{}.pm", name.replace("::", "_")));
+        let _ = idx.register_workspace_resident(path, Arc::new(fa));
+    };
+
+    // `Widget` declares `paint` itself, but only as a RE-EXPORT — the
+    // ancestor walk sees through it (`is_reexport`) and finds no member.
+    let mut widget = build_fa("package Widget;\nsub paint { 1 }\n1;\n");
+    for sym in widget.symbols_mut() {
+        if sym.name == "paint" && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            sym.attributes.push("reexport".to_string());
+        }
+    }
+    reg("Widget", widget);
+    // A second provider of `Widget`, sorting FIRST, that installs a
+    // different method — so the fallback's scan must run past it and reach
+    // the file the walk already decoded.
+    reg(
+        "Aaa::Painter",
+        build_fa("package Aaa::Painter;\n*{ 'Widget::draw' } = sub { 2 };\n1;\n"),
+    );
+
+    assert_eq!(
+        idx.modules_providing_package("Widget"),
+        vec!["Aaa::Painter".to_string(), "Widget".to_string()],
+        "fixture must give the class two providers, the non-answer sorting first"
+    );
+    assert_eq!(
+        idx.visible_def_candidates("Widget").len(),
+        1,
+        "fixture must put `Widget`'s own file in the walk's path — the overlap"
+    );
+
+    assert_eq!(
+        idx.module_declaring_method_in_package("paint", "Widget")
+            .as_deref(),
+        Some("Widget"),
+        "the fallback does not see through the re-export the walk sees through"
+    );
+    let caller = build_fa("package Caller;\nsub go { return Widget->paint(); }\n1;\n");
+    match caller.resolve_method_in_ancestors("Widget", "paint", Some(&idx)) {
+        Some(MethodResolution::CrossFile { class, def_module }) => {
+            assert_eq!(class, "Widget");
+            assert_eq!(def_module.as_deref(), Some("Widget"));
+        }
+        other => panic!("the walk-rejected candidate must still answer, got {other:?}"),
+    }
+}
+
+/// The companion to the verdict rule: WHICH module wins when several
+/// provide the class. The fallback scans providers in SORTED order, so an
+/// installer sorting before `cls` answers even though the walk decoded
+/// `cls`'s own file first. Anything that answered straight out of the walk
+/// loop would return `cls` here instead.
+#[test]
+fn typeglob_fallback_keeps_its_provider_ordering_across_the_overlap() {
+    use crate::model::file_analysis::{CrossFileLookup, MethodResolution, SymKind};
+    let idx = ModuleIndex::new_for_test();
+
+    let reg = |name: &str, fa: crate::model::file_analysis::FileAnalysis| {
+        let path = PathBuf::from(format!("/fake/order/{}.pm", name.replace("::", "_")));
+        let _ = idx.register_workspace_resident(path, Arc::new(fa));
+    };
+
+    let mut widget = build_fa("package Widget;\nsub paint { 1 }\n1;\n");
+    for sym in widget.symbols_mut() {
+        if sym.name == "paint" && matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+            sym.attributes.push("reexport".to_string());
+        }
+    }
+    reg("Widget", widget);
+    // Sorts first AND matches — so both providers are answers and only the
+    // order decides.
+    reg(
+        "Aaa::Painter",
+        build_fa("package Aaa::Painter;\n*{ 'Widget::paint' } = sub { 2 };\n1;\n"),
+    );
+
+    let caller = build_fa("package Caller;\nsub go { return Widget->paint(); }\n1;\n");
+    match caller.resolve_method_in_ancestors("Widget", "paint", Some(&idx)) {
+        Some(MethodResolution::CrossFile { def_module, .. }) => {
+            assert_eq!(
+                def_module.as_deref(),
+                Some("Aaa::Painter"),
+                "the sorted provider scan decides, not the walk's fetch order"
+            );
+        }
+        other => panic!("expected the fallback's provider-ordered home, got {other:?}"),
+    }
+}
+
 /// The provider edge is symbol-derived, so a symbol-EVICTED resident copy
 /// must replay it from the per-path record like the name edges do. Without
 /// the replay the installer silently stops providing its target package

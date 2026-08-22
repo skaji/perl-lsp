@@ -940,3 +940,31 @@ pub fn in_ancestor_walk<R>(f: impl FnOnce() -> R) -> R {
 pub fn inside_ancestor_walk() -> bool {
     ANCESTOR_WALK.with(|c| c.get()) > 0
 }
+
+thread_local! {
+    /// Paths the ancestor walk's candidate loop fetched for the CURRENT
+    /// (class, method) resolution. Lives here for the same layering reason as
+    /// `ANCESTOR_WALK`: the loop is Model, the second enumeration is Index.
+    ///
+    /// It exists to test one claim empirically — that the typeglob fallback
+    /// re-fetches the very files the loop just rejected. Two totals being
+    /// exactly equal is suggestive; per-path overlap is decisive.
+    static MROC_PATHS: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn mroc_begin() {
+    if enabled() {
+        MROC_PATHS.with(|c| c.borrow_mut().clear());
+    }
+}
+
+pub fn mroc_note(path: &std::path::Path) {
+    if enabled() {
+        MROC_PATHS.with(|c| c.borrow_mut().push(path.to_path_buf()));
+    }
+}
+
+pub fn mroc_saw(path: &std::path::Path) -> bool {
+    enabled() && MROC_PATHS.with(|c| c.borrow().iter().any(|p| p == path))
+}
