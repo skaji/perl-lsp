@@ -412,7 +412,7 @@ fn walk_refs(
     scope: WalkScope<'_>,
 ) -> Vec<RefLocation> {
     // One backward walk issues a top-level type query per candidate call
-    // site, and each re-derives the same cross-file `MethodOnClass`
+    // site, and each re-derives the same cross-file `PackageSymbol`
     // lattice. The session is the memo that spans them (plus the consult
     // budget that bounds the walk when even the memo isn't enough) —
     // `docs/adr/resolution-session.md`. Entered for BOTH scopes: a

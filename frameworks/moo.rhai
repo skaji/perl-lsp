@@ -241,14 +241,14 @@ fn on_match(pattern, m) {
 
             if kw == "handles" {
                 // One method per delegated name. With a class-typed isa, edge
-                // the method's return through MethodOnClass{class, remote} so
+                // the method's return through PackageSymbol{package, remote} so
                 // `$self->log(...)` chains to the remote method's return.
                 for pair in handles_pairs(val) {
                     let local = pair[0];
                     let remote = pair[1];
                     let edge = ();
                     if cls != () {
-                        edge = #{ MethodOnClass: #{ class: cls, name: remote } };
+                        edge = #{ PackageSymbol: #{ "package": cls, name: remote } };
                     }
                     out += #{
                         Method: #{
