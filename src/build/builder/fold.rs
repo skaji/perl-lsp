@@ -294,7 +294,7 @@ impl<'a> Builder<'a> {
                 };
                 let resolved = match reg.query(&self.bag, &q) {
                     ReducedValue::Type(t) => Some(t),
-                    _ => None,
+                    ReducedValue::FactMap(_) | ReducedValue::None => None,
                 };
                 // A brand is a route VALUE identity, never a sub
                 // return contract. Project it to its base class for
@@ -1067,7 +1067,7 @@ impl<'a> Builder<'a> {
         };
         match reg.query(&self.bag, &q) {
             ReducedValue::Type(t) => Some(t),
-            _ => None,
+            ReducedValue::FactMap(_) | ReducedValue::None => None,
         }
     }
 
@@ -1157,7 +1157,7 @@ impl<'a> Builder<'a> {
                 Some(InferredType::ClassName(package))
             }
             ReducedValue::Type(t) => Some(t),
-            _ => None,
+            ReducedValue::FactMap(_) | ReducedValue::None => None,
         }
     }
 
@@ -1436,10 +1436,9 @@ impl<'a> Builder<'a> {
                     args: Vec::new(),
                     context: Some(&ctx),
                 };
-                if let ReducedValue::Type(t) = reg.query(&self.bag, &q) {
-                    Some(t)
-                } else {
-                    None
+                match reg.query(&self.bag, &q) {
+                    ReducedValue::Type(t) => Some(t),
+                    ReducedValue::FactMap(_) | ReducedValue::None => None,
                 }
             });
 
@@ -2051,6 +2050,40 @@ impl<'a> Builder<'a> {
                             break;
                         }
                         scope = self.scopes[sid.0 as usize].parent;
+                    }
+                }
+
+                // MEASUREMENT: a ref that reaches here with no owner is the
+                // "unowned" class — 17.4% of hash-key refs on CPAN, 54.7% on
+                // Koha. Classify WHY, to separate a genuine gap (the fact was
+                // available and the scope/point test missed it) from a design
+                // (nothing in this file could have attributed it).
+                if crate::util::ghost_stats::enabled() && r.hash_key_owner().is_none() {
+                    let known_tc = type_map.contains_key(&vt) || type_map.contains_key(&lookup_name);
+                    let known_def = var_defs.contains_key(&vt) || var_defs.contains_key(&lookup_name);
+                    crate::util::ghost_stats::count("unowned.total");
+                    if crate::model::conventions::is_conventional_invocant_name(&vt) {
+                        crate::util::ghost_stats::count("unowned.self_like");
+                    }
+                    if !vt.starts_with(['$', '@', '%']) {
+                        crate::util::ghost_stats::count("unowned.not_a_variable");
+                        if vt.is_empty() {
+                            crate::util::ghost_stats::count("unowned.notvar_empty");
+                        } else {
+                            crate::util::ghost_stats::count_distinct("unowned.notvar_shape", &vt);
+                            crate::util::ghost_stats::count("unowned.notvar_shape");
+                        }
+                    }
+                    match (known_tc, known_def) {
+                        // The name IS known here; only the scope-chain / point
+                        // test rejected it. That is the gap-shaped bucket.
+                        (true, _) => crate::util::ghost_stats::count("unowned.tc_known_scope_missed"),
+                        (false, true) => {
+                            crate::util::ghost_stats::count("unowned.def_known_scope_missed")
+                        }
+                        // Nothing in this file mentions the name as a typed
+                        // value or a declaration — genuinely unattributable.
+                        (false, false) => crate::util::ghost_stats::count("unowned.name_unknown"),
                     }
                 }
             }

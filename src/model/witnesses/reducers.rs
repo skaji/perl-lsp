@@ -60,6 +60,26 @@ pub struct BagContext<'a> {
     pub app_surface_consumers: &'a [String],
 }
 
+/// A reducer's answer.
+///
+/// **Adding a variant here is not additive** — so every `match` on it names
+/// its variants explicitly, no `_` catch-all, the way
+/// `FileAnalysis::surface_feed` destructures with no `..`. A new variant is
+/// then a compile error at each site that must decide what it means, instead
+/// of compiling everywhere and silently answering `None` — which is how type
+/// inference would go dark with nothing to say so. Keep it that way: a
+/// catch-all re-introduced here buys one line and costs the enforcement.
+///
+/// `if let ReducedValue::Type(t) = …` is the same hole wearing a different
+/// hat — it falls through silently and no exhaustiveness check reaches it —
+/// so those sites are spelled as matches too, even where the extra arm is
+/// empty. The payoff is that a variant carrying richer payload (the resolved
+/// owner alongside the type — see `docs/adr/skipping-cross-file-work.md`)
+/// arrives as a list of compile errors naming every site that must decide.
+///
+/// `FactMap` is the reserved payload-bearing shape and is deliberately
+/// unproduced and unread; reaching for it does not avoid the above, because a
+/// reducer that starts returning it stops returning `Type` for those callers.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)] // FactMap reserved for payload-bearing reducers
 pub enum ReducedValue {

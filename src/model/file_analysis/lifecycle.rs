@@ -146,13 +146,23 @@ impl FileAnalysis {
     /// end of the worklist (single emission point for "this sub's
     /// return type is known"). Cross-file imports do not get a local
     /// mirror; they resolve lazily through `query_sub_return_type`.
-    /// Drop the witness bag (the build-time type-inference scaffold) from
-    /// this resident analysis after the fold baked its conclusions into pinned
-    /// fields. The full bag rides the on-disk blob, so this is lossless — a
-    /// type query needing it rehydrates the exact persisted bag on demand
-    /// (`docs/adr/memory-slice-2-lru.md`). Clears both the `Vec<Witness>` and
-    /// its rebuilt index; touches no pinned field (refs, symbols, return_types,
-    /// ref bindings all survive). Idempotent.
+    /// Drop the witness bag (the build-time type-inference scaffold) from this
+    /// resident analysis. The full bag rides the on-disk blob, so this is
+    /// lossless — a type query needing it rehydrates the exact persisted bag on
+    /// demand (`docs/adr/memory-slice-2-lru.md`). Clears both the
+    /// `Vec<Witness>` and its rebuilt index; refs, symbols and ref bindings all
+    /// survive. Idempotent.
+    ///
+    /// What does NOT survive, and is easy to assume otherwise: a sub's RETURN
+    /// TYPE. The fold's conclusion is published by
+    /// `write_back_sub_return_types` as a `MethodOnClass{..} -> Edge(Symbol(id))`
+    /// witness — in the bag, by the "edges, not values" invariant, since
+    /// materialising it into a field would be the parallel store the worklist
+    /// rules forbid. There is no `return_types` field to fall back on. So
+    /// evicting here means every cross-file "what does this sub return" costs a
+    /// rehydrate, which is the whole reason enrichment's provider chase is
+    /// dominated by `bag_present` (measured: ~400 witnesses moved per return-type
+    /// query answered).
     pub fn evict_witness_bag(&mut self) {
         self.witnesses = crate::model::witnesses::WitnessBag::default();
         self.bag_evicted = true;
@@ -258,10 +268,81 @@ impl FileAnalysis {
     ///
     /// Contract: if the invocant class does not infer, store `None` (honest
     /// miss). No name-only fallback — that re-introduces the `->new` flood.
+    /// MEASUREMENT-ONLY: is `class`'s ancestry wholly LOCAL to this file?
+    ///
+    /// The proposed soundness argument for skipping an enrichment re-stamp is
+    /// that the index can only move the answer when the invocant's class has
+    /// cross-file ancestry — if the whole parent chain is declared here,
+    /// `resolve_method_in_ancestors` walks identical edges with or without an
+    /// index. This computes that property so it can be cross-tabulated against
+    /// what the re-stamp ACTUALLY changed. Per class, not per ref, which is the
+    /// granularity the argument turns on.
+    ///
+    /// Conservative in the direction that matters: anything it cannot verify
+    /// as local (class not declared here, dynamic parents, a parent the index
+    /// knows and we do not) answers false, so a `true` is the strong claim.
+    fn ancestry_is_wholly_local(
+        &self,
+        class: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+        memo: &mut std::collections::HashMap<String, bool>,
+    ) -> bool {
+        if let Some(hit) = memo.get(class) {
+            return *hit;
+        }
+        memo.insert(class.to_string(), false); // cycle guard: assume not-local
+        let mut verdict = true;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack = vec![class.to_string()];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            if !self.packages.contains_key(&c) || self.has_dynamic_parents(&c) {
+                verdict = false;
+                break;
+            }
+            // A SPLIT package defeats the argument: the class is declared here,
+            // its parents may match, and yet the METHOD can live in another
+            // file's copy of the same package — so the index would resolve
+            // CrossFile where the local walk resolved Local. Require the class
+            // to be declared nowhere else before trusting the local chain.
+            if let Some(idx) = module_index {
+                if idx.visible_def_candidates(&c).len() > 1 {
+                    verdict = false;
+                    break;
+                }
+            }
+            let local: Vec<String> = self.declared_parents(&c).to_vec();
+            if let Some(idx) = module_index {
+                if idx.parents_cached(&c).iter().any(|p| !local.contains(p)) {
+                    verdict = false;
+                    break;
+                }
+            }
+            stack.extend(local);
+        }
+        memo.insert(class.to_string(), verdict);
+        verdict
+    }
+
     pub(crate) fn stamp_method_call_targets(&mut self, module_index: Option<&dyn CrossFileLookup>) {
         // Collect resolutions first; `method_call_invocant_class` /
         // `resolve_method_in_ancestors` borrow `&self`, so we can't hold a
         // `&mut self.refs[i]` while calling them.
+        // MEASUREMENT: this pass is the dominant driver of cross-file bag
+        // rehydration (51% of sampled decode misses). Attribute its cache
+        // traffic to itself, and count how much of the ENRICHMENT re-stamp
+        // actually changes an answer the build already froze.
+        let _stamp = crate::util::ghost_stats::ScopedNs::start("stamp.total");
+        let _attrib = crate::util::ghost_stats::Attribute::start("stamp");
+        crate::util::ghost_stats::count(if module_index.is_some() {
+            "stamp.pass_enrichment"
+        } else {
+            "stamp.pass_build"
+        });
+        let mut local_memo: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         let mut stamped: Vec<(usize, Option<MethodTarget>)> = Vec::new();
         for (i, r) in self.refs.iter().enumerate() {
             // A plugin-bridged invocant must NEVER freeze as a class:
@@ -274,7 +355,13 @@ impl FileAnalysis {
             {
                 continue;
             }
-            let target = self
+            crate::util::ghost_stats::count("stamp.methodcall_considered");
+            // Time the resolve and bucket it BY OUTCOME. A failed ancestor walk
+            // may cost more than a successful one (it exhausts the chain rather
+            // than stopping at a hit), so apportioning the pass's cost by ref
+            // COUNT would misattribute it in an unknown direction.
+            let _t0 = std::time::Instant::now();
+            let target = (|| self
                 .method_call_invocant_class(r, module_index)
                 .map(|cn| {
                     match self.resolve_method_in_ancestors(&cn, r.unqualified_target_name(), module_index) {
@@ -293,7 +380,267 @@ impl FileAnalysis {
                         // method-not-found arm returns None honestly.
                         _ => MethodTarget::CrossFile { invocant_class: cn },
                     }
-                });
+                }))();
+            if crate::util::ghost_stats::enabled() {
+                let ns = _t0.elapsed().as_nanos();
+                crate::util::ghost_stats::add_ns(
+                    if target.is_some() { "stamp.resolve_hit" } else { "stamp.resolve_miss" },
+                    ns,
+                );
+            }
+            // The question: does the enrichment re-stamp change what the build
+            // already froze? Same answer = the walk that produced it was work
+            // nobody needed.
+            if module_index.is_some() && crate::util::ghost_stats::enabled() {
+                // The decisive check: does ANY ref whose class is wholly local
+                // get a different answer from the index? A single one falsifies
+                // the soundness argument.
+                let _p0 = std::time::Instant::now();
+                let wholly_local = r
+                    .method_target()
+                    .map(|t| t.invocant_class().to_string())
+                    .map(|cn| self.ancestry_is_wholly_local(&cn, module_index, &mut local_memo))
+                    .unwrap_or(false);
+                crate::util::ghost_stats::add_ns("pred.cost", _p0.elapsed().as_nanos());
+                let changed_now = match (r.method_target(), target.as_ref()) {
+                    (Some(old), Some(new)) => old != new,
+                    (Some(_), None) | (None, Some(_)) => true,
+                    (None, None) => false,
+                };
+                match (wholly_local, changed_now) {
+                    (true, false) => {
+                        crate::util::ghost_stats::count("pred.local_and_stable")
+                    }
+                    (true, true) => {
+                        crate::util::ghost_stats::count("pred.LOCAL_BUT_CHANGED")
+                    }
+                    (false, false) => {
+                        crate::util::ghost_stats::count("pred.crossfile_and_stable")
+                    }
+                    (false, true) => {
+                        crate::util::ghost_stats::count("pred.crossfile_and_changed")
+                    }
+                }
+            }
+            // Hover asks one question twice. `resolve_method_in_ancestors`
+            // climbs to the DEFINING class; `find_method_return_type` then
+            // asks `MethodOnClass{access_class, name}`, whose reducer climbs
+            // the same ancestry again inside the registry. Two walkers, one
+            // question — and the second is handed the access class even
+            // though the first already named the owner.
+            //
+            // The proposed fix is to route the second query at the owner
+            // (`method_return_type_on` already separates the dispatch class
+            // from the receiver VALUE, so `ReturnExpr::Receiver` still
+            // substitutes the access class). That is only a fix if the two
+            // walkers agree today; if they don't, it changes answers and the
+            // disagreement is the finding. Measured, not assumed.
+            // Option A's blast radius, edge-filtered. "43 names have a
+            // same-named sub somewhere" is a NAME match; the family only
+            // widens if an INHERITS_INV edge actually connects the demander
+            // to the definer. That edge filter is the number nobody measured,
+            // and it is the difference between a Surface field and a code
+            // action that offers to write `requires`.
+            if crate::util::ghost_stats::probe("demands") {
+                if let Some(idx) = module_index {
+                    if let Some(cn) = self.method_call_invocant_class(r, module_index) {
+                        let name = r.unqualified_target_name();
+                        // Demanded here and provided by NOBODY up-chain — the
+                        // degenerate-singleton case pass 2 would fire on.
+                        if self
+                            .resolve_method_in_ancestors(&cn, name, module_index)
+                            .is_none()
+                        {
+                            crate::util::ghost_stats::count("demand.unresolved");
+                            crate::util::ghost_stats::count_distinct(
+                                "demand.shapes", &format!("{cn}|{name}"));
+                            let mut widens = false;
+                            let mut reachable = false;
+                            let graph = crate::model::graph::GraphView::new(self, Some(idx));
+                            graph.walk(
+                                crate::model::graph::Node::Class(cn.clone()),
+                                crate::model::graph::EdgeKindMask::INHERITS_INV,
+                                &mut |n| {
+                                    if let crate::model::graph::Node::Class(d) = n {
+                                        let defines = matches!(
+                                            self.resolve_method_in_ancestors(
+                                                d, name, module_index),
+                                            Some(MethodResolution::Local { class: ref c, .. })
+                                            | Some(MethodResolution::CrossFile {
+                                                class: ref c, .. })
+                                            if c == d
+                                        );
+                                        if defines {
+                                            widens = true;
+                                            return crate::model::graph::WalkControl::Stop;
+                                        }
+                                        // The motivating shape is NOT a
+                                        // descendant defining M: role R is
+                                        // demanded by consumer K, and a
+                                        // SIBLING role S composed into K
+                                        // provides it. S is not a descendant
+                                        // of R — it is reachable only THROUGH
+                                        // K. So also count "some descendant
+                                        // can SEE M", which covers it.
+                                        if !reachable
+                                            && self
+                                                .resolve_method_in_ancestors(
+                                                    d, name, module_index)
+                                                .is_some()
+                                        {
+                                            reachable = true;
+                                        }
+                                    }
+                                    crate::model::graph::WalkControl::Continue
+                                },
+                            );
+                            if widens {
+                                crate::util::ghost_stats::count("demand.WIDENS");
+                                crate::util::ghost_stats::count_distinct(
+                                    "demand.widen_shapes", &format!("{cn}|{name}"));
+                            } else {
+                                crate::util::ghost_stats::count("demand.no_descendant_defines");
+                            }
+                            if !widens && reachable {
+                                crate::util::ghost_stats::count("demand.SIBLING_REACHABLE");
+                                crate::util::ghost_stats::count_distinct(
+                                    "demand.sibling_shapes", &format!("{cn}|{name}"));
+                            }
+                        }
+                    }
+                }
+            }
+            if module_index.is_some() && crate::util::ghost_stats::probe("owner") {
+                if let Some(cn) = self.method_call_invocant_class(r, module_index) {
+                    let name = r.unqualified_target_name();
+                    let arity = r.arg_count.map(|c| c as usize);
+                    let owner = match self.resolve_method_in_ancestors(&cn, name, module_index) {
+                        Some(MethodResolution::Local { class, .. })
+                        | Some(MethodResolution::CrossFile { class, .. }) => Some(class),
+                        None => None,
+                    };
+                    if let Some(owner) = owner {
+                        crate::util::ghost_stats::count("owner.probe_total");
+                        crate::util::ghost_stats::count(if owner == cn {
+                            "owner.declared_on_access_class"
+                        } else {
+                            "owner.inherited"
+                        });
+                        // Denominators for the disagreement rate. Occurrences
+                        // are not shapes: 43 refs can be one method asked 43
+                        // times, and "0.3% of refs" would then be a claim
+                        // about the corpus rather than about the design.
+                        let shape = format!("{cn}|{owner}|{name}");
+                        crate::util::ghost_stats::count_distinct("owner.all.shapes", &shape);
+                        if owner != cn {
+                            crate::util::ghost_stats::count_distinct(
+                                "owner.inherited.shapes", &shape);
+                        }
+                        let _a0 = std::time::Instant::now();
+                        let a = self.find_method_return_type(&cn, name, module_index, arity);
+                        crate::util::ghost_stats::add_ns(
+                            "owner.ask_access_class", _a0.elapsed().as_nanos());
+                        let recv = InferredType::ClassName(cn.clone());
+                        let _b0 = std::time::Instant::now();
+                        let b =
+                            self.method_return_type_on(&owner, &recv, name, module_index, arity);
+                        crate::util::ghost_stats::add_ns(
+                            "owner.ask_owner_class", _b0.elapsed().as_nanos());
+                        crate::util::ghost_stats::count(match (&a, &b) {
+                            (Some(x), Some(y)) if x == y => "owner.agree_same_type",
+                            (None, None) => "owner.agree_no_type",
+                            (Some(_), Some(_)) => "owner.DISAGREE_type",
+                            (Some(_), None) => "owner.DISAGREE_owner_lost_it",
+                            (None, Some(_)) => "owner.owner_found_it",
+                        });
+                        // Why would anchoring at the owner LOSE an answer the
+                        // access class had? Two candidates, and they imply
+                        // different fixes: the framework fact is read off the
+                        // dispatch class (so anchoring moves it), or the chase
+                        // needs the child-anchored edges (so anchoring skips
+                        // them and no amount of context repair helps).
+                        if a.is_some() && b.is_none() {
+                            // 43 occurrences is a CANDIDATE count. How many
+                            // distinct (access, owner, method) shapes is the
+                            // number that says whether this generalises.
+                            crate::util::ghost_stats::count_distinct(
+                                "owner.lost.shapes",
+                                &format!("{cn}|{owner}|{name}"),
+                            );
+                            // The mechanism to separate: does the access class
+                            // carry its OWN witness for this method, which the
+                            // owner anchor then discards?
+                            let local_att =
+                                crate::model::witnesses::WitnessAttachment::MethodOnClass {
+                                    class: cn.clone(),
+                                    name: name.to_string(),
+                                };
+                            crate::util::ghost_stats::count(
+                                if self.witnesses.for_attachment(&local_att).is_empty() {
+                                    "owner.lost.no_local_witness_on_access"
+                                } else {
+                                    "owner.lost.local_witness_on_access"
+                                },
+                            );
+                            let fw_access = self.package_framework(&cn);
+                            let fw_owner = self.package_framework(&owner);
+                            crate::util::ghost_stats::count(if fw_access == fw_owner {
+                                "owner.lost.framework_same"
+                            } else {
+                                "owner.lost.framework_differs"
+                            });
+                            crate::util::ghost_stats::count(
+                                if self.packages.contains_key(owner.as_str()) {
+                                    "owner.lost.owner_declared_here"
+                                } else {
+                                    "owner.lost.owner_is_cross_file"
+                                },
+                            );
+                            // Owner anchor + the ACCESS class's framework: does
+                            // restoring that one fact recover the answer?
+                            let att = crate::model::witnesses::WitnessAttachment::MethodOnClass {
+                                class: owner.clone(),
+                                name: name.to_string(),
+                            };
+                            let ctx = self.bag_context(module_index);
+                            let q = crate::model::witnesses::ReducerQuery {
+                                attachment: &att,
+                                point: None,
+                                framework: fw_access.unwrap_or(
+                                    crate::model::witnesses::FrameworkFact::Plain,
+                                ),
+                                arity_hint: arity.map(|n| n as u32),
+                                receiver: Some(recv.clone()),
+                                args: Vec::new(),
+                                context: Some(&ctx),
+                            };
+                            let reg = crate::model::witnesses::ReducerRegistry::with_defaults();
+                            crate::util::ghost_stats::count(
+                                match reg.query(&self.witnesses, &q) {
+                                    crate::model::witnesses::ReducedValue::Type(_) => {
+                                        "owner.lost.recovered_by_framework"
+                                    }
+                                    crate::model::witnesses::ReducedValue::FactMap(_)
+                                    | crate::model::witnesses::ReducedValue::None => {
+                                        "owner.lost.still_lost"
+                                    }
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            if module_index.is_some() {
+                match (r.method_target(), target.as_ref()) {
+                    (Some(old), Some(new)) if old == new => {
+                        crate::util::ghost_stats::count("stamp.unchanged")
+                    }
+                    (Some(_), Some(_)) => crate::util::ghost_stats::count("stamp.changed"),
+                    (None, Some(_)) => crate::util::ghost_stats::count("stamp.newly_resolved"),
+                    (Some(_), None) => crate::util::ghost_stats::count("stamp.would_erase"),
+                    (None, None) => crate::util::ghost_stats::count("stamp.still_unresolved"),
+                }
+            }
             stamped.push((i, target));
         }
         for (i, target) in stamped {

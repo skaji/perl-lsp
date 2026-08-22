@@ -283,6 +283,54 @@ impl FileAnalysis {
             })
             .collect();
         // A file with no call bindings needs no provider walk at all.
+        // Does an IMPORT ever collide with an ancestor's method of the
+        // same name? That is the one case where folding imports into the
+        // package-symbol chase would be actively WRONG rather than merely
+        // generous: Perl resolves a name in the package's OWN stash — which
+        // is where `import` aliased it — before consulting @ISA, for plain
+        // calls and method calls alike. A chase that reaches the ancestor
+        // first returns the wrong sub for code that runs correctly.
+        if crate::util::ghost_stats::probe("shadow") {
+            crate::util::ghost_stats::count("shadow.file");
+            crate::util::ghost_stats::add_n(
+                "shadow.imports_len", self.imports.len() as u64);
+            for import in &self.imports {
+                crate::util::ghost_stats::count("shadow.import_seen");
+                // `package_ranges`, not `enclosing_package_of`: the latter
+                // wants a Package SYMBOL whose span contains the point, which
+                // is a brace-delimited pack namespace. Perl's `package Foo;`
+                // symbol spans one statement and contains nothing, so it
+                // attributes 10,435 of 10,436 imports to nobody.
+                let Some(pkg) = self.package_at(import.span.start).map(str::to_string) else {
+                    crate::util::ghost_stats::count("shadow.no_enclosing_package");
+                    continue;
+                };
+                if import.imported_symbols.is_empty() {
+                    // Bare `use M;` — the names live in M's @EXPORT, so the
+                    // collision set is not enumerable from this file alone.
+                    crate::util::ghost_stats::count("shadow.bare_use_unknowable");
+                    continue;
+                }
+                for sym in &import.imported_symbols {
+                    crate::util::ghost_stats::count("shadow.imported_name");
+                    match self.resolve_method_in_ancestors(
+                        &pkg, &sym.local_name, module_index)
+                    {
+                        Some(MethodResolution::Local { class, .. })
+                        | Some(MethodResolution::CrossFile { class, .. })
+                            if class != pkg =>
+                        {
+                            crate::util::ghost_stats::count("shadow.COLLIDES");
+                            crate::util::ghost_stats::count_distinct(
+                                "shadow.collision_shapes",
+                                &format!("{pkg}|{}|{class}", sym.local_name),
+                            );
+                        }
+                        _ => crate::util::ghost_stats::count("shadow.clear"),
+                    }
+                }
+            }
+        }
         if let Some(idx) = module_index.filter(|_| !needed_names.is_empty()) {
             let _chase = crate::util::ghost_stats::ScopedNs::start("chase.total");
             let _attrib = crate::util::ghost_stats::Attribute::start("chase");
@@ -316,8 +364,15 @@ impl FileAnalysis {
                     crate::util::ghost_stats::count("chase.candidate_skipped");
                     continue;
                 }
+                crate::util::ghost_stats::count_distinct(
+                    "chase.fetched", &cached.path.display().to_string());
                 let whole = crate::util::ghost_stats::timed(
                     "chase.bag_present", || idx.bag_present(&cached));
+                crate::util::ghost_stats::count("chase.fetched");
+                crate::util::ghost_stats::add_n(
+                    "chase.witnesses_rehydrated", whole.witnesses.len() as u64);
+                crate::util::ghost_stats::add_n(
+                    "chase.symbols_rehydrated", whole.symbols.len() as u64);
                 // Fetched on the first return-type MISS (fallback-on-miss): the
                 // exporter's own return may chain through ITS imports (A→B→C),
                 // materialized only after the exporter is itself enriched — the
@@ -422,6 +477,20 @@ impl FileAnalysis {
                 }
             })
             .collect();
+        // MEASUREMENT (Q6): how many HashKeyAccess refs owe their BAKED owner
+        // to this cross-file fixup, versus already having one from the build?
+        for r in self.refs.iter() {
+            if matches!(r.kind, RefKind::HashKeyAccess { .. }) {
+                crate::util::ghost_stats::count("hka.total");
+                match r.hash_key_owner() {
+                    Some(o) if !matches!(o, HashKeyOwner::Variable { .. }) => {
+                        crate::util::ghost_stats::count("hka.baked_before_fixup")
+                    }
+                    Some(_) => crate::util::ghost_stats::count("hka.variable_owned"),
+                    None => crate::util::ghost_stats::count("hka.unowned"),
+                }
+            }
+        }
         if !binding_by_var.is_empty() {
             for r in &mut self.refs {
                 if let RefKind::HashKeyAccess { ref var_text } = r.kind {
@@ -436,6 +505,7 @@ impl FileAnalysis {
                                 // Re-stamping the owner drops the stale
                                 // HashKeyDef link; the enrichment re-index
                                 // re-links against the new owner.
+                                crate::util::ghost_stats::count("hka.baked_by_fixup");
                                 r.bind_hash_key_owner(HashKeyOwner::Sub {
                                     package: pkg.clone(),
                                     name: func_name.clone(),
