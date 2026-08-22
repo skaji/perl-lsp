@@ -89,6 +89,31 @@ impl FileAnalysis {
         })
     }
 
+    /// Every package this file attributes a sub/method to — exactly the
+    /// key `has_sub_in_package` tests against. Normally the file's own
+    /// declared packages; a cross-package typeglob install
+    /// (`*{'DateTime::x'} = …` inside `package DateTime::PP`) also
+    /// attributes the synthesized sub to the TARGET package, which no
+    /// `package` statement in this file names. The cross-file provider
+    /// index is fed from this, so "which module declares `m` for class
+    /// `C`" is a bucket read keyed by C instead of a scan over every
+    /// module declaring a sub named `m`.
+    pub fn provided_packages(&self) -> Vec<String> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out = Vec::new();
+        for s in self.symbols() {
+            if !matches!(s.kind, SymKind::Sub | SymKind::Method) {
+                continue;
+            }
+            if let Some(pkg) = s.package.as_deref() {
+                if seen.insert(pkg) {
+                    out.push(pkg.to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Completion candidates for `use Module qw(|)` — this module's export
     /// surface, `@EXPORT` first (sort tier 10) then `@EXPORT_OK` (tier 20),
     /// deduped. Detail carries the resolved return type when known. The

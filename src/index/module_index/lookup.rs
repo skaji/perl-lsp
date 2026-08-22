@@ -34,6 +34,20 @@ impl ModuleIndex {
         self.workspace_modules.contains_key(module)
     }
 
+    /// Modules with a sub/method ATTRIBUTED to `package` — the class-keyed
+    /// provider bucket (`ModuleEdgeIndexes::providers`). Sorted, so the
+    /// caller's first match is stable across runs.
+    pub fn modules_providing_package(&self, package: &str) -> Vec<String> {
+        match self.core.edges.providers.get(package) {
+            Some(bucket) => {
+                let mut result = bucket.as_slice().to_vec();
+                result.sort();
+                result
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn modules_bridging_to(&self, class_name: &str) -> Vec<String> {
         match self.core.edges.bridges.get(class_name) {
             Some(bucket) => {

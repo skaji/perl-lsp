@@ -357,24 +357,26 @@ impl ModuleIndex {
     /// Find the module that declares method `name` *attributed to class*
     /// `class` in a file whose own module name differs (cross-package
     /// typeglob install). Returns the registration key for a follow-up
-    /// `get_cached`. The reverse index (keyed by symbol name) scopes the
-    /// scan; the per-module `has_sub_in_package` filter pins the package.
-    /// `None` when no such cross-package symbol exists — callers fall
-    /// back to the class's own module / bridges.
+    /// `get_cached`. `None` when no such cross-package symbol exists —
+    /// callers fall back to the class's own module / bridges.
+    ///
+    /// The candidate set is the CLASS-keyed provider bucket, not the
+    /// name-keyed one: this runs as the ancestor walk's last resort, i.e.
+    /// on exactly the misses, and a name-keyed narrowing leaves the class
+    /// test answerable only after a rehydrate — for `new`, once per module
+    /// in the corpus, to conclude nothing. Both buckets are supersets of
+    /// the answer set (a module matching the `has_sub_in_package` filter
+    /// necessarily attributes a sub to `class`), so the filtered result is
+    /// the same module; the provider bucket just makes the miss a bucket
+    /// read.
     pub fn module_declaring_method_in_package(
         &self,
         name: &str,
         class: &str,
     ) -> Option<String> {
         use crate::model::file_analysis::CrossFileLookup;
-        // Runs as the ancestor walk's LAST resort, i.e. on exactly the misses.
-        // `modules_with_symbol` is every module declaring a sub of this name —
-        // for a name like `new` that is most of the corpus — and each one's
-        // candidates are FETCHED to test the class. The reverse index narrows
-        // by NAME but not by CLASS, so the class test can only be answered
-        // after a rehydrate.
         crate::util::ghost_stats::count("mdmp.call");
-        let mods = self.modules_with_symbol(name);
+        let mods = self.modules_providing_package(class);
         crate::util::ghost_stats::count_by("mdmp.modules_scanned", mods.len() as u64);
         let found = mods
             .into_iter()
