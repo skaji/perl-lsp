@@ -2755,3 +2755,24 @@ fn isa_walk_budget_bounds_a_pathological_chain() {
     // Self is always isa self, budget untouched.
     assert!(crate::model::file_analysis::class_isa("C0", "C0", &parents, None));
 }
+
+/// DIVERGENT-CASE PIN, written BEFORE the walk engines collapse (the
+/// fan-out half lives in `graph_tests`): the isa family's guarantee is a
+/// VISIT budget (200), not a depth cap — a legitimate-if-extreme chain
+/// deeper than GraphView's 21 still resolves. A collapse that silently
+/// adopted the depth cap for isa questions would flip this to false with
+/// nothing left to notice: after the merge both walkers are the same
+/// walker, so the guarantee must be established in advance, not verified
+/// after.
+#[test]
+fn deep_isa_chain_within_visit_budget_still_resolves() {
+    use std::collections::HashMap;
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for i in 0..150 {
+        parents.insert(format!("C{i}"), vec![format!("C{}", i + 1)]);
+    }
+    assert!(
+        crate::model::file_analysis::class_isa("C0", "C149", &parents, None),
+        "depth 149 > the graph walker's 21, visits 150 < the isa budget 200: must hold"
+    );
+}

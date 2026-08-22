@@ -254,3 +254,30 @@ fn walk_depth_cap_bounds_pathological_chains() {
     });
     assert_eq!(visited, 21, "the MAX_DEPTH backstop bounds a pathological chain");
 }
+
+/// DIVERGENT-CASE PIN, written BEFORE the walk engines collapse: the two
+/// walkers bound differently — `walk_ancestry` budgets total visits (200),
+/// `GraphView::walk` caps depth (21) — and a wide shallow fan-out passes
+/// one while a deep chain passes the other. After the collapse both ride
+/// one engine and nothing can DETECT a silently changed guarantee (the
+/// consistency net compares siblings; there will be no siblings), so each
+/// walker's guarantee is pinned in advance. This is the fan-out half: a
+/// 300-child hierarchy enumerates COMPLETELY — implementations over a
+/// wide schema must never be truncated by a small visit budget.
+#[test]
+fn wide_fanout_enumerates_completely_despite_any_visit_budget() {
+    let mut src = String::from("package Base;\n1;\n");
+    for i in 0..300 {
+        src.push_str(&format!(
+            "package Kid{i};\nuse parent -norequire, 'Base';\n1;\n"
+        ));
+    }
+    let fa = parse(&src);
+    let g = GraphView::new(&fa, None);
+    let mut visited = 0usize;
+    g.walk(Node::Class("Base".into()), EdgeKindMask::INHERITS_INV, &mut |_| {
+        visited += 1;
+        WalkControl::Continue
+    });
+    assert_eq!(visited, 300, "every child of a wide hierarchy is reached (depth 1, no budget bite)");
+}
