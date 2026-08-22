@@ -435,6 +435,7 @@ impl ReducerRegistry {
                         if !super::session::spend_consult(idx) {
                             break;
                         }
+                        crate::util::ghost_stats::count("moc.provider_fetched");
                         let full = idx.bag_present(cached);
                         if std::ptr::eq(bag, &full.witnesses) {
                             // Self: the reducers above already tried this bag.
@@ -444,6 +445,11 @@ impl ReducerRegistry {
                         }
                         let v = {
                             let v = attempt(&full, state);
+                            crate::util::ghost_stats::count(if v == ReducedValue::None {
+                                "moc.provider_no_answer"
+                            } else {
+                                "moc.provider_answered"
+                            });
                             if v != ReducedValue::None {
                                 v
                             } else {
@@ -523,6 +529,7 @@ impl ReducerRegistry {
                         }
                         // Bridged Method's return lives in the bridging file's
                         // bag — rehydrate it if evicted before querying.
+                        crate::util::ghost_stats::count("moc.provider_fetched");
                         let full = idx.bag_present(cached);
                         if let Some(t) = full.symbol_return_type_via_bag(sym.id, None) {
                             found = Some(t);
@@ -583,9 +590,15 @@ impl ReducerRegistry {
                                 };
                                 (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
                             };
+                        crate::util::ghost_stats::count("moc.provider_fetched");
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
                             let v = attempt(&full, state);
+                            crate::util::ghost_stats::count(if v == ReducedValue::None {
+                                "moc.provider_no_answer"
+                            } else {
+                                "moc.provider_answered"
+                            });
                             if v != ReducedValue::None {
                                 return v;
                             }
@@ -652,6 +665,7 @@ impl ReducerRegistry {
             if let Some(ctx) = q.context {
                 if let Some(idx) = ctx.module_index {
                     for cached in idx.visible_def_candidates(name) {
+                        crate::util::ghost_stats::count("moc.provider_fetched");
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {

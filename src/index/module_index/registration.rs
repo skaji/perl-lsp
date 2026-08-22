@@ -3,6 +3,57 @@
 
 use super::*;
 
+thread_local! {
+    /// Per-sweep rehydration memo. One file's diagnostics re-ask the same
+    /// rehydration 10.5x on average (1.66M lookups against 158k distinct over
+    /// 3,520 files), and every repeat pays the cache lookup again.
+    ///
+    /// Validity is asked of the index, not reasoned about here: the memo
+    /// carries the `shape_bumps` value it was built at, and ANY index-shape
+    /// mutation clears it. That is the same epoch `enrichment_key` already
+    /// hashes, and it is what closes the hazard that makes this unsafe
+    /// naively — `--check` resolves `@INC` lazily, so a provider can land
+    /// mid-sweep, and a memo that reasoned "a rehydrate cannot change"
+    /// would serve a pre-resolution answer to the next file. Silently, and
+    /// order-dependently, into the diagnostics noise floor.
+    ///
+    /// Over-invalidation is the safe direction and it is nearly free: a bump
+    /// costs one cleared map, and bumps do not happen 1.66M times.
+    static SWEEP_MEMO: std::cell::RefCell<Option<SweepMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct SweepMemo {
+    stamp: u64,
+    map: std::collections::HashMap<std::path::PathBuf, Arc<FileAnalysis>>,
+}
+
+/// Opens a rehydration memo for one file's sweep; closes it on drop.
+pub struct SweepMemoGuard(());
+
+impl SweepMemoGuard {
+    pub fn open() -> Self {
+        // `PERL_LSP_NO_SWEEP_MEMO=1` leaves the memo closed: the A/B control,
+        // and the escape hatch if a sweep ever turns out not to be a
+        // consistent world.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| {
+            std::env::var("PERL_LSP_NO_SWEEP_MEMO").as_deref() == Ok("1")
+        });
+        if !off {
+            SWEEP_MEMO.with(|c| *c.borrow_mut() = Some(SweepMemo::default()));
+        }
+        SweepMemoGuard(())
+    }
+}
+
+impl Drop for SweepMemoGuard {
+    fn drop(&mut self) {
+        SWEEP_MEMO.with(|c| *c.borrow_mut() = None);
+    }
+}
+
 impl ModuleIndex {
     /// Re-register a WHOLE (non-stripped) cached copy carrying materialized
     /// gated emissions. The cache slot routes through `insert_cache` — the
@@ -923,6 +974,65 @@ impl ModuleIndex {
     ) -> Arc<FileAnalysis> {
         let mut stage = "no bag cache installed on this index".to_string();
         if let Some(bc) = self.bag_cache_ref() {
+            // Attribute this lookup to the file whose sweep asked for it, so
+            // the repeat rate a per-sweep memo could actually serve is
+            // measurable before one is written.
+            crate::util::ghost_stats::SweepScope::note(&cached.path.to_string_lossy());
+            // `PERL_LSP_REHYDRATE_TRACE=N`: dump the first N call stacks that
+            // reach here. Three candidate callers were eliminated by counter
+            // (diagnostics, the enrichment chase, the MethodOnClass walk) and
+            // none of them accounted for a 207k-call term, so stop guessing
+            // and let the call name itself.
+            {
+                static TRACED: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let want: u64 = std::env::var("PERL_LSP_REHYDRATE_TRACE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                // `_EVERY=N` samples every Nth call instead of the first N.
+                // The first-N form is biased toward whatever runs early, which
+                // is exactly wrong for attributing a remainder: the dominant
+                // caller can saturate the sample before a second one starts.
+                let every: u64 = std::env::var("PERL_LSP_REHYDRATE_TRACE_EVERY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let n = TRACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if (every > 0 && n % every == 0) || (want > 0 && every == 0 && n < want)
+                {
+                    eprintln!(
+                        "[rehydrate-trace] {:?}\n{}",
+                        cached.path,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+            // Memo hit: the same path, at the same index shape, already
+            // rehydrated inside this sweep.
+            let stamp = self
+                .core
+                .shape_bumps
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let memoed = SWEEP_MEMO.with(|c| {
+                let mut slot = c.borrow_mut();
+                let memo = slot.as_mut()?;
+                if memo.stamp != stamp {
+                    memo.map.clear();
+                    memo.stamp = stamp;
+                    crate::util::ghost_stats::count("sweep.memo_invalidated");
+                    return None;
+                }
+                memo.map.get(&cached.path).cloned()
+            });
+            if let Some(hit) = memoed {
+                crate::util::ghost_stats::count("sweep.memo_hit");
+                return hit;
+            }
+            crate::util::ghost_stats::count("sweep.memo_miss");
+            if crate::util::ghost_stats::inside_ancestor_walk() {
+                crate::util::ghost_stats::count("sweep.memo_miss.from_mroc");
+            }
             let got = crate::util::ghost_stats::timed("rehydrate.loader", || {
                 if want_bag {
                     bc.bag_for_diag(&cached.path)
@@ -931,7 +1041,16 @@ impl ModuleIndex {
                 }
             });
             match got {
-                Ok(full) => return full,
+                Ok(full) => {
+                    SWEEP_MEMO.with(|c| {
+                        if let Some(memo) = c.borrow_mut().as_mut() {
+                            if memo.stamp == stamp {
+                                memo.map.insert(cached.path.clone(), Arc::clone(&full));
+                            }
+                        }
+                    });
+                    return full;
+                }
                 // Discriminated cause (see `RehydrateMiss`) so the tripwire
                 // below names the mechanism instead of shrugging.
                 Err(miss) => stage = format!("loader miss: {miss}"),

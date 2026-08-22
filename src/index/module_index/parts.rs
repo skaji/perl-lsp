@@ -110,6 +110,15 @@ pub struct ModuleEdgeIndexes {
     /// `FileAnalysis.pack.specializes`). The `Specializes` family edge's
     /// cross-file half; member resolution never reads it.
     pub(super) specs: DashMap<String, ModuleBucket>,
+    /// package → modules with a sub/method ATTRIBUTED to it
+    /// (`FileAnalysis::provided_packages`). Distinct from `names`, which is
+    /// keyed by the member's own name: the class-keyed question ("who
+    /// declares a method for class C") has no answer in a name-keyed index,
+    /// which is why `module_declaring_method_in_package` used to fetch every
+    /// module declaring a sub of that name — for `new`, most of a corpus.
+    /// Cross-package typeglob installs are the reason the key can differ
+    /// from the module's registration name.
+    pub(super) providers: DashMap<String, ModuleBucket>,
     /// The indexable-name list each FILE last fed — the symbols-derived
     /// half of `feed`, recorded from the WHOLE analysis so a re-feed over
     /// symbol-EVICTED cache copies (`rebuild_reverse_index*` after the
@@ -121,7 +130,7 @@ pub struct ModuleEdgeIndexes {
     /// file's names for its siblings. `clear()` and `purge_module` keep it
     /// (re-feeds are exactly when it's needed); `remove_path_record` drops
     /// it when the file itself goes.
-    name_records: DashMap<std::path::PathBuf, Vec<String>>,
+    name_records: DashMap<std::path::PathBuf, FedNames>,
     /// Every module name `feed` has published edges under, and — the point
     /// — WHICH bucket keys it was published under in each map, so
     /// `purge_module` touches only its own edges.
@@ -151,6 +160,17 @@ struct FedKeys {
     bridges: ModuleBucket,
     children: ModuleBucket,
     specs: ModuleBucket,
+    providers: ModuleBucket,
+}
+
+/// The symbols-derived halves of one FILE's feed, recorded together so a
+/// replay over a symbol-evicted copy can never carry one and miss the
+/// other. Both are read from `analysis.symbols()`, the only evictable axis
+/// `feed` touches.
+#[derive(Default, Clone)]
+struct FedNames {
+    names: Vec<String>,
+    providers: Vec<String>,
 }
 
 impl FedKeys {
@@ -161,6 +181,7 @@ impl FedKeys {
             (&mut self.bridges, &other.bridges),
             (&mut self.children, &other.children),
             (&mut self.specs, &other.specs),
+            (&mut self.providers, &other.providers),
         ] {
             for k in src.as_slice() {
                 dst.insert(k);
@@ -176,6 +197,7 @@ impl ModuleEdgeIndexes {
             bridges: DashMap::new(),
             children: DashMap::new(),
             specs: DashMap::new(),
+            providers: DashMap::new(),
             name_records: DashMap::new(),
             fed_modules: DashMap::new(),
         }
@@ -190,18 +212,18 @@ impl ModuleEdgeIndexes {
     /// candidate-set rebuilds (purge + one feed per candidate) and the
     /// warm rebuild can overlap without accumulation.
     pub fn feed(&self, module_name: &str, path: &std::path::Path, analysis: &FileAnalysis) {
-        let names: Vec<String> = if analysis.symbols_are_evicted() {
+        let FedNames { names, providers } = if analysis.symbols_are_evicted() {
             match self.name_records.get(path) {
                 Some(rec) => rec.clone(),
                 // No record (a stripped copy fed without ever being fed
                 // whole — shouldn't happen, but degrade to the pinned
                 // export names rather than nothing).
-                None => Self::indexable_names(analysis),
+                None => Self::symbol_derived_names(analysis),
             }
         } else {
-            let names = Self::indexable_names(analysis);
-            self.name_records.insert(path.to_path_buf(), names.clone());
-            names
+            let rec = Self::symbol_derived_names(analysis);
+            self.name_records.insert(path.to_path_buf(), rec.clone());
+            rec
         };
         // Built locally and merged once: holding a `fed_modules` entry across
         // the edge-map writes would nest two DashMap locks on the bulk path
@@ -223,6 +245,9 @@ impl ModuleEdgeIndexes {
         }
         for primary in Self::spec_primaries(analysis) {
             push_unique(&self.specs, primary, &mut fed.specs);
+        }
+        for pkg in providers {
+            push_unique(&self.providers, pkg, &mut fed.providers);
         }
         // UNION, not replace: several files can feed under one package name
         // (Perl reopens packages anywhere), and `rebuild_name_registration`
@@ -266,7 +291,7 @@ impl ModuleEdgeIndexes {
         if self.fed_modules.remove(module_name).is_none() {
             return;
         }
-        for map in [&self.names, &self.bridges, &self.children, &self.specs] {
+        for map in [&self.names, &self.bridges, &self.children, &self.specs, &self.providers] {
             map.retain(|_key, bucket| {
                 bucket.remove(module_name);
                 !bucket.is_empty()
@@ -284,6 +309,7 @@ impl ModuleEdgeIndexes {
             ("bridges", &self.bridges),
             ("children", &self.children),
             ("specs", &self.specs),
+            ("providers", &self.providers),
         ] {
             for e in map.iter() {
                 let mut members = e.value().as_slice().to_vec();
@@ -305,6 +331,10 @@ impl ModuleEdgeIndexes {
     pub fn children_of(&self, parent: &str) -> Vec<String> {
         self.children.get(parent).map(|b| b.as_slice().to_vec()).unwrap_or_default()
     }
+    #[cfg(test)]
+    pub fn providers_of(&self, pkg: &str) -> Vec<String> {
+        self.providers.get(pkg).map(|b| b.as_slice().to_vec()).unwrap_or_default()
+    }
 
     /// Record `path`'s indexable-name list from a WHOLE analysis so a later
     /// `feed` of its stripped copy replays it — the pre-strip half of the
@@ -313,7 +343,7 @@ impl ModuleEdgeIndexes {
     pub fn record_names(&self, path: &std::path::Path, analysis: &FileAnalysis) {
         debug_assert!(!analysis.symbols_are_evicted());
         self.name_records
-            .insert(path.to_path_buf(), Self::indexable_names(analysis));
+            .insert(path.to_path_buf(), Self::symbol_derived_names(analysis));
     }
 
     /// Remove `module_name` from every bucket of every map. Runs
@@ -333,6 +363,7 @@ impl ModuleEdgeIndexes {
             (&self.bridges, &fed.bridges),
             (&self.children, &fed.children),
             (&self.specs, &fed.specs),
+            (&self.providers, &fed.providers),
         ] {
             for key in keys.as_slice() {
                 let now_empty = match map.get_mut(key) {
@@ -365,10 +396,20 @@ impl ModuleEdgeIndexes {
         self.bridges.clear();
         self.children.clear();
         self.specs.clear();
+        self.providers.clear();
         // The marks describe the maps just emptied; keeping them would let
         // a later purge take the sweep for a module with no edges left,
         // and — worse — a re-feed would find its mark already set.
         self.fed_modules.clear();
+    }
+
+    /// One walk of `symbols()` for both symbol-derived feed halves — the
+    /// record they land in is what a stripped copy replays.
+    fn symbol_derived_names(analysis: &FileAnalysis) -> FedNames {
+        FedNames {
+            names: Self::indexable_names(analysis),
+            providers: analysis.provided_packages(),
+        }
     }
 
     /// Every name `find_exporters` might need to locate a module by:

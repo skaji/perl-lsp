@@ -2093,3 +2093,87 @@ fn a_purge_retracts_every_sibling_feed_under_one_name() {
         edges.snapshot()
     );
 }
+
+/// A cross-package typeglob install (`*{'DateTime::_ymd2rd'} = sub {…}`
+/// inside `package DateTime::PP`) attributes the synthesized sub to the
+/// TARGET package at build time. Nothing in the file DECLARES `DateTime`,
+/// so the class-keyed method lookup can only find the installing module
+/// through the provider index — and that index is what this pins, together
+/// with the resolution it serves.
+///
+/// The narrowing is the point: the name-keyed reverse index is keyed by
+/// `new`/`_ymd2rd`, not by `DateTime`, so answering "who declares this
+/// method for this class" from it means fetching every module declaring a
+/// sub of that name. Here the noise modules all declare `_ymd2rd` in their
+/// own packages and must NOT enter the candidate set.
+#[test]
+fn typeglob_install_is_found_through_the_class_keyed_provider_index() {
+    use crate::model::file_analysis::{CrossFileLookup, MethodResolution};
+    let idx = ModuleIndex::new_for_test();
+
+    let reg = |name: &str, src: &str| {
+        let path = PathBuf::from(format!("/fake/glob/{}.pm", name.replace("::", "_")));
+        let _ = idx.register_workspace_resident(path, Arc::new(build_fa(src)));
+    };
+    reg("DateTime", "package DateTime;\nsub new { bless {}, shift }\n1;\n");
+    reg(
+        "DateTime::PP",
+        "package DateTime::PP;\n*{ 'DateTime::_ymd2rd' } = sub { 42 };\n1;\n",
+    );
+    // Same METHOD NAME, unrelated packages — the name bucket's noise.
+    for i in 0..8 {
+        reg(
+            &format!("Noise::N{i}"),
+            &format!("package Noise::N{i};\nsub _ymd2rd {{ {i} }}\n1;\n"),
+        );
+    }
+
+    assert!(
+        idx.modules_with_symbol("_ymd2rd").len() >= 9,
+        "fixture must make the name bucket wide"
+    );
+
+    // End-to-end: a caller's `DateTime->_ymd2rd` resolves to the installer.
+    let caller = build_fa("package Caller;\nsub go { return DateTime->_ymd2rd(1); }\n1;\n");
+    match caller.resolve_method_in_ancestors("DateTime", "_ymd2rd", Some(&idx)) {
+        Some(MethodResolution::CrossFile { class, def_module }) => {
+            assert_eq!(class, "DateTime");
+            assert_eq!(def_module.as_deref(), Some("DateTime::PP"));
+        }
+        other => panic!("expected the installing module as the def home, got {other:?}"),
+    }
+    assert_eq!(
+        idx.module_declaring_method_in_package("_ymd2rd", "DateTime")
+            .as_deref(),
+        Some("DateTime::PP"),
+        "the installing module is the home of DateTime::_ymd2rd"
+    );
+    // The candidate set stays CLASS-keyed: the eight same-named noise
+    // modules are in the name bucket and must not be in this one.
+    assert_eq!(
+        idx.modules_providing_package("DateTime"),
+        vec!["DateTime".to_string(), "DateTime::PP".to_string()],
+        "only the declaring module and the typeglob installer provide DateTime"
+    );
+}
+
+/// The provider edge is symbol-derived, so a symbol-EVICTED resident copy
+/// must replay it from the per-path record like the name edges do. Without
+/// the replay the installer silently stops providing its target package
+/// the first time a same-named sibling re-registers — a wrong-empty answer,
+/// not a crash.
+#[test]
+fn provider_edges_replay_for_a_symbol_evicted_copy() {
+    let idx = ModuleIndex::new_for_test();
+    let pp = PathBuf::from("/fake/globstrip/PP.pm");
+    let _ = idx.register_workspace_stripping(
+        pp,
+        build_fa("package DateTime::PP;\n*{ 'DateTime::_ymd2rd' } = sub { 42 };\n1;\n"),
+        crate::model::file_analysis::Residency::Skeleton,
+    );
+    assert_eq!(
+        idx.modules_providing_package("DateTime"),
+        vec!["DateTime::PP".to_string()],
+        "the stripped copy's provider edge must come from the pre-strip record"
+    );
+}

@@ -119,6 +119,12 @@ pub fn collect_diagnostics(
         /// Names on the producer's export surface; `None` when not yet cached.
         exported: Option<std::collections::HashSet<String>>,
     }
+    // The tail is ~87% unattributed after decode and hit-path overhead. These
+    // four regions are the whole body of `collect_diagnostics` below the plugin
+    // render, so their sum bounds the per-file cost from the inside rather than
+    // by subtraction — which is the step that produced two wrong per-item costs
+    // today.
+    let _g_imports = crate::util::ghost_stats::ScopedNs::start("diag.1_import_bindings");
     let import_bindings: Vec<ImportBinding> = analysis
         .imports
         .iter()
@@ -153,6 +159,7 @@ pub fn collect_diagnostics(
     // Best resolution of a call name across all imports: `Brought` dominates
     // `ExportedNotBrought`. Mirrors `resolve_imported_function_classified` over
     // the precomputed snapshot.
+    drop(_g_imports);
     let resolve_name = |name: &str| -> Option<(&crate::model::file_analysis::Import, ImportResolution)> {
         let mut best: Option<(&crate::model::file_analysis::Import, ImportResolution)> = None;
         for b in &import_bindings {
@@ -171,6 +178,7 @@ pub fn collect_diagnostics(
         best
     };
 
+    let _g_fn = crate::util::ghost_stats::ScopedNs::start("diag.2_unresolved_fn_loop");
     for r in analysis.refs() {
         if !matches!(r.kind, RefKind::FunctionCall { .. }) {
             continue;
@@ -290,6 +298,7 @@ pub fn collect_diagnostics(
         }
     }
 
+    drop(_g_fn);
     // 5e: Unresolved method diagnostics for locally-defined classes.
     // Rule-#10 debt: the framework entries below (DBIC/Moose) belong to the
     // frameworks, not core diagnostics — they move out when plugins can
@@ -307,6 +316,7 @@ pub fn collect_diagnostics(
         // Moose/Moo meta-methods
         "meta",
     ];
+    let _g_meth = crate::util::ghost_stats::ScopedNs::start("diag.3_unresolved_method_loop");
     for r in analysis.refs() {
         let (invocant, _invocant_span) = match &r.kind {
             // A plugin-bridged token is plugin-resolved, not a receiver we
@@ -553,6 +563,8 @@ pub fn collect_diagnostics(
         });
     }
 
+    drop(_g_meth);
+
     // 5h: helper-not-loaded — the entrypoint-scan lint
     // (docs/prompt-helper-consumption.md phase 2). A method call whose
     // ONLY resolution is a plugin bridge from a WORKSPACE module that
@@ -563,6 +575,7 @@ pub fn collect_diagnostics(
     {
         use crate::model::conventions::{InvocantText, MethodToken};
         let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+        let _g_narrow = crate::util::ghost_stats::ScopedNs::start("diag.4_helper_not_loaded");
         for r in analysis.refs() {
             let RefKind::MethodCall { invocant, .. } = &r.kind else { continue };
             // Plugin-bridged tokens are resolved by their owning plugin,

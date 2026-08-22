@@ -385,9 +385,12 @@ for my $m (Some::Other::tags()) {
 #[test]
 fn glob_loop_can_rhs_synthesizes_under_current_pkg() {
     // DateTime::PP shape. `__PACKAGE__->can($sub)` is recognized as a
-    // sub-producing RHS; the qualified target name is synthesized as the
-    // unqualified tail under the current package (cross-package attribution
-    // deferred — see synthesize_glob_assigned_sub).
+    // sub-producing RHS, and the symbol is minted under the unqualified TAIL
+    // — never the fully-qualified string, which is what call sites and nav
+    // look up. Which PACKAGE the tail is attributed to is a separate axis and
+    // is pinned by `cross_package_glob_synthesizes_under_target_package`;
+    // this test deliberately declares no package, so there is no target to
+    // attribute to and only the tail is in question.
     let src = "\
 for my $sub (qw/foo bar/) {
   *{ 'DateTime::' . $sub } = __PACKAGE__->can($sub);
