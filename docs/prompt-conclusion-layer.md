@@ -495,6 +495,53 @@ guessed answer.
   `witnesses/query.rs` are lines 39, 68, 109, 199, 309. All verified
   2026-08-22.
 
+## Invalidation must be structural, not remembered
+
+A baked conclusion introduces a staleness class the bag does not have: a
+reducer edit changes what the right answer IS while the stored bytes stay
+well-formed. Nothing catches that except someone remembering to bump a
+version, and a plausible-but-wrong answer maintained by discipline is the
+failure shape this codebase keeps paying for.
+
+**Prerequisite, measured: the fold is deterministic.** A fingerprint is
+worthless if the baked answer can differ from the live answer on identical
+code. `--dump-package` over the substrate, five packages, three warm runs
+each plus a cold run against a fresh cache dir: byte-identical every time,
+cold matching warm, across ~330 KB of dumped conclusions including Catalyst
+(145 KB) and Type::Tiny (109 KB), which are the heaviest cross-file candidate
+iterations available. Nothing in the fold depends on map iteration order —
+unlike completion's ranking, which did.
+
+**The fingerprint.** Conclusions get their own version, derived rather than
+maintained: a `build.rs` hashes the derivation sources into a compile-time
+constant, and the cache checks it exactly as it already checks the plugin
+fingerprint over `.rhai` files. There is no `build.rs` today; this is what it
+would be for.
+
+Do not try to enumerate "the files that can change a fold's outcome". The
+core is `model/witnesses/**`, but the fold calls into `InferredType`'s
+methods, `conventions.rs`, and the framework tables, and that boundary is
+fuzzy — a fuzzy boundary is the same discipline problem one level down. Hash
+the whole source tree. Over-invalidation is the safe direction, and it is
+nearly free here for a reason worth stating: **the conclusion version is
+independent of `EXTRACT_VERSION`.** A source change drops the conclusion
+column and KEEPS the blobs, so the next run re-bakes by decoding blobs it
+already has — one decode per file, once, which is precisely the cost stage 1
+reduces. The two stages compose.
+
+## Absence must not mean an answer
+
+The three-way lookup — a form, `OpenNone`, or absent — makes "absent" a
+definite `None`, which is sound only while key enumeration is complete. That
+is another correctness precondition maintained by discipline.
+
+Make absent mean DECODE THE BAG. A definite negative is then only ever an
+explicitly stored one, and an unenumerated key costs a decode instead of
+returning a wrong answer. When the enumeration is right this costs nothing;
+when it is wrong the layer is slow instead of incorrect, which is the trade
+to take. It also removes the burden entirely from anyone adding a key shape
+later.
+
 ## Verdict
 
 **Stage 1 — a separate bag blob column — is worth building now.** One schema
