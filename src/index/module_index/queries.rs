@@ -391,6 +391,11 @@ impl ModuleIndex {
                 // existence scan — no bag/refs read.
                 self.def_candidates(mod_name).iter().any(|c| {
                     crate::util::ghost_stats::count("mdmp.candidate_fetched");
+                    crate::util::ghost_stats::count(if crate::util::ghost_stats::mroc_saw(&c.path) {
+                        "mdmp.candidate_seen_by_mroc"
+                    } else {
+                        "mdmp.candidate_new"
+                    });
                     self.symbols_present(c).has_sub_in_package(name, class)
                 })
             });
