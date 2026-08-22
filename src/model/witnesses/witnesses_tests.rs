@@ -1056,3 +1056,106 @@ fn isa_chain(n: usize) -> String {
     src.push_str(&format!("package C{}; sub target {{ return \"hi\" }}\n", n - 1));
     src
 }
+
+/// The fold must not depend on map iteration order — a gate, not a note.
+///
+/// Today nothing relies on this. Once conclusions are baked into the cache
+/// (`docs/prompt-conclusion-layer.md`) it becomes a correctness precondition:
+/// a fold that varies by iteration order produces a stale answer that
+/// MATCHES ITS OWN FINGERPRINT, which is a perfect mechanism protecting a
+/// broken premise. So it fails a build here instead.
+///
+/// The lever is that `RandomState` seeds per instance, so two independently
+/// built analyses of the same source carry maps with different iteration
+/// orders. That makes this probabilistic per source and reliable across the
+/// set — which is why the vacuity guard below matters more than it looks:
+/// if seeding ever stops varying, this test would pass by construction while
+/// checking nothing, and it says so instead.
+///
+/// Scope honestly: this observes no order dependence on the fold paths
+/// exercised below. It is not a proof over all Perl.
+#[test]
+fn the_fold_does_not_depend_on_map_iteration_order() {
+    use std::collections::HashMap;
+
+    // Vacuity guard. Two same-content maps must disagree about iteration
+    // order, or the comparison below proves nothing.
+    let order_of = || {
+        let m: HashMap<u32, u32> = (0..64u32).map(|i| (i, i)).collect();
+        m.keys().copied().collect::<Vec<_>>()
+    };
+    let mut seeds_vary = false;
+    for _ in 0..8 {
+        if order_of() != order_of() {
+            seeds_vary = true;
+            break;
+        }
+    }
+    assert!(
+        seeds_vary,
+        "two independently built HashMaps iterated identically 8 times — \
+         map seeding no longer varies per instance, so this test cannot \
+         detect order dependence and must be rewritten rather than trusted"
+    );
+
+    // One source per fold path that could plausibly read a map: framework
+    // accessor synthesis, branch-arm agreement, arity discrimination,
+    // inheritance, and a structural projection.
+    let sources: &[(&str, &str)] = &[
+        ("moo accessors", "package W;\nuse Moo;\nhas name => (is => 'ro', isa => sub {});\n\
+                           has size => (is => 'rw');\nsub go { my $s = shift; return $s->name }\n1;\n"),
+        ("branch arms", "package B;\nsub pick { my $c = shift;\n  if ($c) { return 'x' } else { return 'y' }\n}\n\
+                         sub num { return 1 + 1 }\n1;\n"),
+        ("arity union", "package A;\nsub acc { my $s = shift; if (@_) { return $s } return $s->{v} }\n\
+                         sub go { my $s = shift; return $s->acc(1) }\n1;\n"),
+        ("inheritance", "package P;\nsub make { my $c = shift; return bless {}, $c }\n\
+                         package C;\nour @ISA = ('P');\nsub run { my $s = shift; return $s->make }\n1;\n"),
+        ("projection", "package H;\nsub cfg { return { host => 'h', port => 1 } }\n\
+                        sub go { my $s = shift; my $c = $s->cfg; return $c->{host} }\n1;\n"),
+    ];
+
+    // Every sub's resolved return, sorted by name so the COMPARISON is over
+    // values rather than over output ordering — output ordering is not the
+    // property under test.
+    let conclusions = |src: &str| -> Vec<(String, String)> {
+        let mut parser = crate::build::builder::create_parser();
+        let tree = parser.parse(src, None).expect("parse");
+        let fa = crate::build::builder::build(&tree, src.as_bytes());
+        let mut out: Vec<(String, String)> = fa
+            .symbols()
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.kind,
+                    crate::model::file_analysis::SymKind::Sub
+                        | crate::model::file_analysis::SymKind::Method
+                )
+            })
+            .map(|s| {
+                let t = fa.sub_return_type_at_arity(&s.name, None);
+                (s.name.clone(), format!("{t:?}"))
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    for (label, src) in sources {
+        let first = conclusions(src);
+        assert!(
+            !first.is_empty(),
+            "{label}: no subs resolved, so this source exercises nothing"
+        );
+        // Several rounds: each build re-seeds, so a dependence that only
+        // shows on some orderings still surfaces.
+        for round in 0..6 {
+            let again = conclusions(src);
+            assert_eq!(
+                first, again,
+                "{label}: the fold gave a different answer on round {round} \
+                 with identical input — an iteration-order dependence, which \
+                 makes a baked conclusion unsound"
+            );
+        }
+    }
+}

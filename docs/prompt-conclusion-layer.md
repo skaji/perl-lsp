@@ -503,14 +503,32 @@ well-formed. Nothing catches that except someone remembering to bump a
 version, and a plausible-but-wrong answer maintained by discipline is the
 failure shape this codebase keeps paying for.
 
-**Prerequisite, measured: the fold is deterministic.** A fingerprint is
-worthless if the baked answer can differ from the live answer on identical
-code. `--dump-package` over the substrate, five packages, three warm runs
-each plus a cold run against a fresh cache dir: byte-identical every time,
-cold matching warm, across ~330 KB of dumped conclusions including Catalyst
-(145 KB) and Type::Tiny (109 KB), which are the heaviest cross-file candidate
-iterations available. Nothing in the fold depends on map iteration order —
-unlike completion's ranking, which did.
+**Prerequisite: no iteration-order dependence observed where measured.** A
+fingerprint is worthless if the baked answer can differ from the live answer
+on identical code. `--dump-package` over the substrate, five packages, three
+warm runs each plus a cold run against a fresh cache dir: byte-identical
+every time, cold matching warm, across ~330 KB of dumped conclusions
+including Catalyst (145 KB) and Type::Tiny (109 KB), the heaviest cross-file
+candidate iterations available. (`DBIx::Class::ResultSet` returned zero
+bytes — absent from the substrate, so not a data point rather than a pass.)
+
+Stated that way deliberately. Five packages of one substrate is a sample, not
+a proof, and the stronger sentence — "the fold is deterministic" — is the one
+a later reader stops checking behind.
+
+**And it is now load-bearing, so it is a gate rather than a paragraph.**
+Today nothing depends on the fold being stable; after this layer it is a
+correctness precondition of the cache, because an order-dependent fold
+produces a stale answer that MATCHES ITS OWN FINGERPRINT — a perfect
+mechanism protecting a broken premise.
+`witnesses_tests::the_fold_does_not_depend_on_map_iteration_order` fails a
+build instead. It leans on `RandomState` seeding per instance, so two
+independently built analyses of one source carry differently ordered maps;
+that makes it probabilistic per source and reliable across the set, and it
+carries a vacuity guard that fails loudly if seeding ever stops varying
+rather than passing while checking nothing. Both assertions are
+mutation-verified: making the fold order-dependent, and making seeding
+invariant, each fail it by name.
 
 **The fingerprint.** Conclusions get their own version, derived rather than
 maintained: a `build.rs` hashes the derivation sources into a compile-time
