@@ -194,6 +194,12 @@ const QUERY_REC_DEPTH_CAP: u32 = 512;
 const QUERY_REC_DEPTH_CAP: u32 = 256;
 
 thread_local! {
+    /// Set when an edge chase reads an `Expr(span)` attachment — the marker
+    /// for "this answer needed the raw derivation, not just a conclusion".
+    static TOUCHED_EXPR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
     static QUERY_REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// One-shot so we don't flood stderr while a deep walk unwinds.
     static QUERY_REC_DEPTH_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -266,9 +272,27 @@ impl ReducerRegistry {
     /// mutual-inheritance loops that span files.
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
         let mut state = QueryState::new();
+        // Is the CONCLUSION LAYER CLOSED for the shape that dominates
+        // cross-file traffic? A `MethodOnClass` answer that never reads an
+        // `Expr(span)` witness could be served from stored conclusions; one
+        // that does needs the raw derivation, so the bag has to come along.
+        // Measured at the top-level query only — inner hops are the thing
+        // being counted, not separate questions.
+        let top_moc = matches!(q.attachment, WitnessAttachment::MethodOnClass { .. });
+        if top_moc {
+            TOUCHED_EXPR.with(|c| c.set(false));
+        }
         // Sole boundary where an owned `ReducedValue` is required; the
         // internal recursion threads `Arc` to avoid deep clones per hop.
-        (*self.query_rec(bag, q, &mut state)).clone()
+        let out = (*self.query_rec(bag, q, &mut state)).clone();
+        if top_moc {
+            crate::util::ghost_stats::count(if TOUCHED_EXPR.with(|c| c.get()) {
+                "moc.touched_expr"
+            } else {
+                "moc.conclusions_only"
+            });
+        }
+        out
     }
 
     /// Returns an `Arc` so the memo, the cycle-guard early-outs, and the
@@ -281,6 +305,53 @@ impl ReducerRegistry {
         q: &ReducerQuery,
         state: &mut QueryState,
     ) -> std::sync::Arc<ReducedValue> {
+        // The chase has landed on a raw-derivation attachment. Whatever the
+        // top-level question was, its answer now depends on the bag's
+        // observations rather than on any conclusion we could have stored.
+        // Closure test proper: what does the chase read at EVERY attachment
+        // it enters, not just the `Expr` ones. An `Edge` is only expressible
+        // as a conclusion if what it points at is too, transitively — so an
+        // `Observation` anywhere in the walk is what would make the layer
+        // genuinely open.
+        for w in bag.for_attachment(&q.attachment) {
+            crate::util::ghost_stats::count(match &w.payload {
+                WitnessPayload::Observation(_) => "hop.OBSERVATION",
+                WitnessPayload::InferredType(_) => "hop.inferred_type",
+                WitnessPayload::Edge(_) => "hop.edge",
+                WitnessPayload::CallReturn { .. } => "hop.call_return",
+                WitnessPayload::QualifiedCallReturn { .. } => "hop.qualified_call",
+                WitnessPayload::ReturnExpr(_) => "hop.return_expr",
+                WitnessPayload::Fact { .. } => "hop.fact",
+                WitnessPayload::Derivation => "hop.derivation",
+                WitnessPayload::Custom { .. } => "hop.custom",
+                WitnessPayload::Projected { .. } => "hop.projected",
+                _ => "hop.other",
+            });
+        }
+        if matches!(q.attachment, WitnessAttachment::Expr(_)) {
+            TOUCHED_EXPR.with(|c| c.set(true));
+            // WHY the chase needs the raw derivation here. If these land in a
+            // few recurring payload shapes, each is a candidate for a
+            // PARAMETERISED conclusion (`ReturnExpr::Receiver` already is
+            // one — "returns its invocant", a function of the query rather
+            // than a value). If they are spread across everything, the
+            // derivation is genuinely open and no conclusion layer closes it.
+            for w in bag.for_attachment(&q.attachment) {
+                crate::util::ghost_stats::count(match &w.payload {
+                    WitnessPayload::InferredType(_) => "expr_hop.inferred_type",
+                    WitnessPayload::Observation(_) => "expr_hop.observation",
+                    WitnessPayload::Edge(_) => "expr_hop.edge",
+                    WitnessPayload::CallReturn { .. } => "expr_hop.call_return",
+                    WitnessPayload::QualifiedCallReturn { .. } => "expr_hop.qualified_call",
+                    WitnessPayload::ReturnExpr(_) => "expr_hop.return_expr",
+                    WitnessPayload::Fact { .. } => "expr_hop.fact",
+                    WitnessPayload::Derivation => "expr_hop.derivation",
+                    WitnessPayload::Custom { .. } => "expr_hop.custom",
+                    WitnessPayload::Projected { .. } => "expr_hop.projected",
+                    _ => "expr_hop.other",
+                });
+            }
+        }
         let depth = QUERY_REC_DEPTH.with(|c| {
             let d = c.get();
             c.set(d + 1);
@@ -436,7 +507,19 @@ impl ReducerRegistry {
                             break;
                         }
                         crate::util::ghost_stats::count("moc.provider_fetched");
-                        let full = idx.bag_present(cached);
+                        // The three costs of one cross-file consult, split
+                        // because a conclusion layer would remove the first
+                        // two and CANNOT remove the third (enrichment is bag
+                        // surgery). Sizing stage 2 means knowing which is
+                        // which, not the total.
+                        //
+                        // These NEST over the `decode.*` stage split rather
+                        // than restating it: a miss here descends through
+                        // `bagcache.decode` into `decode.2_zstd`/`3_bincode`.
+                        // Summing a `consult.*` against a `decode.*` term
+                        // double-counts the same microseconds.
+                        let full = crate::util::ghost_stats::timed(
+                            "consult.bag_present", || idx.bag_present(cached));
                         if std::ptr::eq(bag, &full.witnesses) {
                             // Self: the reducers above already tried this bag.
                             // Not an answer about the candidate, so nothing to
@@ -444,7 +527,8 @@ impl ReducerRegistry {
                             continue;
                         }
                         let v = {
-                            let v = attempt(&full, state);
+                            let v = crate::util::ghost_stats::timed(
+                                "consult.attempt", || attempt(&full, state));
                             crate::util::ghost_stats::count(if v == ReducedValue::None {
                                 "moc.provider_no_answer"
                             } else {
@@ -458,7 +542,8 @@ impl ReducerRegistry {
                             // invisible to the raw bag, present in the
                             // enriched overlay.
                             crate::util::ghost_stats::count("consult.moc_primary");
-                            let enriched = idx.enriched_present(cached);
+                            let enriched = crate::util::ghost_stats::timed(
+                                "consult.enriched", || idx.enriched_present(cached));
                             if !std::sync::Arc::ptr_eq(&enriched, &full)
                                 && !std::ptr::eq(bag, &enriched.witnesses)
                             {
