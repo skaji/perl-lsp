@@ -169,14 +169,32 @@ pub fn group_refs(
     out
 }
 
-/// `refs_to` narrowed to ONE file: the same delegation aliases and the same
-/// matcher (`collect_from_analysis`), run against a single analysis. The
-/// highlights / linked-editing projections use it with the ORIGIN document,
-/// so their image is the in-file slice of `references()` by construction
-/// without paying the workspace walk per cursor move. No closure gate: the
-/// origin minted the target at its own cursor, so it sees it by definition
-/// (and a fragment origin — seen only by textual inclusion — must still
-/// answer its own highlights).
+/// Which files the backward walk visits. Everything else is shared by
+/// construction inside `walk_refs` — the session memo, the delegation
+/// aliases, the matcher (`collect_from_analysis`), and the sort+dedup —
+/// so "highlights is the origin-file slice of references" is ONE code
+/// path with a smaller enumeration, not a sibling implementation kept in
+/// agreement by a test. A new cross-cutting axis (a session concern, an
+/// alias kind, a mask behavior) lands in `walk_refs` above the scope
+/// split and both projections inherit it; it cannot be added to
+/// references and forgotten in highlights.
+pub(super) enum WalkScope<'a> {
+    /// Every file the mask + closure gate admit: open docs, relational
+    /// row candidates, the workspace sweep, the dependency sweep.
+    Workspace,
+    /// The origin document only — the highlights / linked-editing
+    /// enumeration. Two deliberate asymmetries, stated here once: no
+    /// closure gate (the origin minted the target at its own cursor, so
+    /// it sees it by definition — and a fragment origin, seen only by
+    /// textual inclusion, must still answer its own highlights); and the
+    /// analysis is the origin's own copy handed to `resolve()` — already
+    /// whole and enriched, so it takes no `matcher_view` routing.
+    Origin { key: &'a FileKey, analysis: &'a FileAnalysis },
+}
+
+/// `refs_to` narrowed to ONE file — the origin scope of the same driver,
+/// so the highlights image is the in-file slice of `references()` without
+/// paying the workspace walk per cursor move.
 pub(super) fn refs_to_in_file(
     files: &FileStore,
     module_index: Option<&dyn CrossFileLookup>,
@@ -185,13 +203,7 @@ pub(super) fn refs_to_in_file(
     analysis: &FileAnalysis,
     mask: RoleMask,
 ) -> Vec<RefLocation> {
-    let aliases = delegation_aliases(files, module_index, target, mask);
-    let file_str = canonical_file_str(key);
-    let mut out = Vec::new();
-    collect_from_analysis(key, analysis, target, &aliases, module_index, &file_str, &mut out);
-    out.sort_by_key(|l| (l.span.start.row, l.span.start.column));
-    out.dedup_by(|a, b| a.span == b.span);
-    out
+    walk_refs(files, module_index, target, mask, WalkScope::Origin { key, analysis })
 }
 
 /// Reject a `newName` that would corrupt rather than rename: empty,
@@ -364,11 +376,28 @@ pub fn refs_to(
     target: &TargetRef,
     mask: RoleMask,
 ) -> Vec<RefLocation> {
+    walk_refs(files, module_index, target, mask, WalkScope::Workspace)
+}
+
+/// THE backward walk. Both reference-shaped projections are this one
+/// driver — `references()` at `WalkScope::Workspace`, highlights /
+/// linked-editing at `WalkScope::Origin` — differing ONLY in which files
+/// the scope enumerates (see `WalkScope` for the origin scope's two
+/// stated asymmetries).
+fn walk_refs(
+    files: &FileStore,
+    module_index: Option<&dyn CrossFileLookup>,
+    target: &TargetRef,
+    mask: RoleMask,
+    scope: WalkScope<'_>,
+) -> Vec<RefLocation> {
     // One backward walk issues a top-level type query per candidate call
     // site, and each re-derives the same cross-file `MethodOnClass`
     // lattice. The session is the memo that spans them (plus the consult
     // budget that bounds the walk when even the memo isn't enough) —
-    // `docs/adr/resolution-session.md`.
+    // `docs/adr/resolution-session.md`. Entered for BOTH scopes: a
+    // cursor-move storm of highlight queries re-derives the same lattice
+    // a workspace walk would.
     let _session = crate::model::witnesses::ResolutionSession::enter(module_index);
     let mut out = Vec::new();
 
@@ -379,6 +408,12 @@ pub fn refs_to(
     let aliases = crate::util::timings::phase("refs.aliases", || {
         delegation_aliases(files, module_index, target, mask)
     });
+
+    if let WalkScope::Origin { key, analysis } = scope {
+        let file_str = canonical_file_str(key);
+        collect_from_analysis(key, analysis, target, &aliases, module_index, &file_str, &mut out);
+        return sorted_deduped(out);
+    }
 
     // Textual-inclusion extension of the closure gate: a file whose own
     // closure reaches no def path still sees the target when a DIRECT seer
@@ -614,7 +649,13 @@ pub fn refs_to(
         }
     }
 
-    // Sort for stable output, dedupe by (path, span).
+    sorted_deduped(out)
+}
+
+/// Stable output order + (path, span) dedup — the one spelling both walk
+/// scopes exit through. (The origin scope's single file makes the key
+/// component a constant; identical result, one implementation.)
+fn sorted_deduped(mut out: Vec<RefLocation>) -> Vec<RefLocation> {
     out.sort_by(|a, b| {
         key_for_sort(&a.key)
             .cmp(&key_for_sort(&b.key))

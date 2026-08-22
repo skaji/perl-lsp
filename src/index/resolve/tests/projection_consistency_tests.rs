@@ -10,9 +10,13 @@
 //! schedule instead of by accident.
 //!
 //! Checked per cursor:
-//!   I1  highlights() == references() ∩ origin file (span sets — the two
-//!       sides ride DIFFERENT walk entries, `refs_to_in_file` vs `refs_to`,
-//!       exactly the sibling-pair shape)
+//!   I1  highlights() == references() ∩ origin file (span sets). Both
+//!       sides are now ONE driver (`walk_refs`, scope-parameterized), so
+//!       this no longer polices a sibling implementation — it tests the
+//!       residual claim the scope split leaves: that the origin scope's
+//!       smaller enumeration (and its two stated asymmetries — no closure
+//!       gate, no matcher_view routing) commutes with filtering the
+//!       workspace walk to the origin file
 //!   I2  linked_editing_spans() ⊆ highlights() spans (the co-edit subset)
 //!   I3  rename_edits() ⊆ references() image (edits outside it are
 //!       "unrepresentable" — hold the word to it), when renameable()
@@ -76,7 +80,9 @@ fn check_cursor_contracts(
     let refs_img = cs.references();
     let highlights = cs.highlights();
 
-    // I1: highlights == references ∩ origin, as span SETS.
+    // I1: highlights == references ∩ origin, as span SETS. Post-collapse
+    // (one `walk_refs` driver) this tests only the scope-enumeration
+    // commutation — see the module header.
     let mut gr_origin: Vec<Span> = refs_img
         .iter()
         .filter(|l| file_key_eq(&l.key, &key))
