@@ -123,50 +123,102 @@ pub struct GraphView<'a> {
     idx: Option<&'a dyn CrossFileLookup>,
 }
 
+/// Both bound axes of a graph walk, carried by the TYPE so a walk's
+/// guarantee is declared at its call site instead of implied by which
+/// walker it happened to ride. `max_depth` bounds how FAR from the origin
+/// (edges); `max_visits` bounds total WORK (unique nodes visited). A deep
+/// chain exhausts one axis, a wide fan-out the other, and neither alone
+/// is "terminates in bounded time" for both shapes. The presets preserve
+/// each walk family's pre-collapse guarantee EXACTLY — tightening either
+/// is a deliberate, corpus-measured change to a preset constant, never a
+/// side effect of routing (the divergent cases are pinned:
+/// `deep_isa_chain_within_visit_budget_still_resolves`,
+/// `wide_fanout_enumerates_completely_despite_any_visit_budget`).
+#[derive(Clone, Copy)]
+pub struct WalkBound {
+    pub max_depth: usize,
+    pub max_visits: usize,
+}
+
+impl WalkBound {
+    /// The graph-verb guarantee: ancestry depth capped at 21 (the Perl
+    /// MRO backstop), visits bounded only by the seen-set — a wide
+    /// fan-out (implementations over a 300-child schema) enumerates
+    /// completely.
+    pub const GRAPH: WalkBound = WalkBound { max_depth: 21, max_visits: usize::MAX };
+    /// The isa-family guarantee: 200 visited classes (set well above any
+    /// real MRO), depth unbounded — a deep legitimate chain within the
+    /// budget still resolves.
+    pub const ISA: WalkBound = WalkBound { max_depth: usize::MAX, max_visits: 200 };
+}
+
+/// THE bounded DFS — the one loop under both `GraphView::walk` and
+/// `walk_ancestry` (`docs/adr/sibling-forks.md`: the engines were the
+/// duplicated half; edge derivation was already single-sourced per
+/// family). Seen-set cycle-safety; visit-at-pop so a left parent's whole
+/// ancestry precedes the right parent (the @ISA contract — edge sources
+/// are reverse-pushed to preserve their order under LIFO); the origin is
+/// never visited (depth 0 is the caller's hand). A node AT `max_depth`
+/// is visited but not expanded; a visit past `max_visits` stops the walk.
+pub(crate) fn bounded_dfs<N: std::hash::Hash + Eq + Clone>(
+    origin: N,
+    bound: WalkBound,
+    mut edges: impl FnMut(&N, &mut Vec<N>),
+    visit: &mut dyn FnMut(&N) -> WalkControl,
+) {
+    let mut seen: std::collections::HashSet<N> = std::collections::HashSet::new();
+    seen.insert(origin.clone());
+    let mut stack: Vec<(N, usize)> = vec![(origin, 0)];
+    let mut visits = 0usize;
+    let mut next: Vec<N> = Vec::new();
+    while let Some((node, depth)) = stack.pop() {
+        if depth > 0 {
+            if visits >= bound.max_visits {
+                return;
+            }
+            visits += 1;
+            match visit(&node) {
+                WalkControl::Continue => {}
+                WalkControl::PruneChildren => continue,
+                WalkControl::Stop => return,
+            }
+        }
+        if depth >= bound.max_depth {
+            continue;
+        }
+        next.clear();
+        edges(&node, &mut next);
+        for n in next.drain(..).rev() {
+            if seen.insert(n.clone()) {
+                stack.push((n, depth + 1));
+            }
+        }
+    }
+}
+
 impl<'a> GraphView<'a> {
     pub fn new(fa: &'a FileAnalysis, idx: Option<&'a dyn CrossFileLookup>) -> Self {
         GraphView { fa, idx }
     }
 
-    /// THE walker. DFS from `origin` over edges in `mask`, depth-capped
-    /// and cycle-safe; `visit` sees every reached node (origin
-    /// excluded) in traversal order and answers with a [`WalkControl`]
-    /// verdict — continue, prune the node's own expansion, or stop the
-    /// walk. On INHERITS the order is Perl's left-to-right DFS MRO, so
-    /// method resolution sees ancestors in the order dispatch demands.
+    /// THE graph walker's public face. DFS from `origin` over edges in
+    /// `mask` at [`WalkBound::GRAPH`]; `visit` sees every reached node
+    /// (origin excluded) in traversal order and answers with a
+    /// [`WalkControl`] verdict. On INHERITS the order is Perl's
+    /// left-to-right DFS MRO, so method resolution sees ancestors in the
+    /// order dispatch demands.
     pub fn walk(
         &self,
         origin: Node,
         mask: EdgeKindMask,
         visit: &mut dyn FnMut(&Node) -> WalkControl,
     ) {
-        let mut seen: std::collections::HashSet<Node> = std::collections::HashSet::new();
-        seen.insert(origin.clone());
-        let mut stack: Vec<(Node, usize)> = vec![(origin, 0)];
-        const MAX_DEPTH: usize = 21; // ancestry-depth backstop (seen-set already breaks cycles)
-        while let Some((node, depth)) = stack.pop() {
-            // visit at POP — depth-first order, so a left parent's whole
-            // ancestry precedes the right parent (the @ISA contract).
-            // depth 0 is the origin, which callers already hold.
-            if depth > 0 {
-                match visit(&node) {
-                    WalkControl::Continue => {}
-                    WalkControl::PruneChildren => continue,
-                    WalkControl::Stop => return,
-                }
-            }
-            if depth >= MAX_DEPTH {
-                continue;
-            }
-            let mut next: Vec<Node> = Vec::new();
-            self.edges_from(&node, mask, &mut next);
-            // reverse-push so LIFO pops preserve edge order
-            for n in next.into_iter().rev() {
-                if seen.insert(n.clone()) {
-                    stack.push((n, depth + 1));
-                }
-            }
-        }
+        bounded_dfs(
+            origin,
+            WalkBound::GRAPH,
+            |node, out| self.edges_from(node, mask, out),
+            visit,
+        )
     }
 
     /// Edge derivation — the ONE place graph structure comes from. The

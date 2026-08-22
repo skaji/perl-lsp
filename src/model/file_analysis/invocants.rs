@@ -524,7 +524,7 @@ impl FileAnalysis {
 
     /// Is `class` a DBIC result class — transitively `isa DBIx::Class`
     /// (through the cross-file parent graph) but NOT itself a schema or
-    /// resultset base? Depth-capped like the MRO walk. Used to gate
+    /// resultset base? Visit-budgeted tighter than the isa walkers. Used to gate
     /// source-moniker resolution so a stray same-basename non-DBIC class
     /// can't be mistaken for a row source.
     fn class_is_dbic_result(class: &str, mi: &dyn CrossFileLookup) -> bool {
@@ -534,12 +534,15 @@ impl FileAnalysis {
         // ::Schema/::ResultSet ancestor must still be able to disqualify;
         // `Reject` short-circuits that negative, and `rejected` distinguishes
         // it from plain exhaustion. Deliberately cross-file-only (no local
-        // `package_parents` seam), depth-capped tighter than the isa walkers.
+        // `package_parents` seam), visit-budgeted tighter than the isa walkers.
         let mut isa_dbic = false;
         let mut rejected = false;
         walk_ancestry(
             class,
-            40,
+            crate::model::graph::WalkBound {
+                max_visits: 40,
+                ..crate::model::graph::WalkBound::ISA
+            },
             |c| mi.parents_cached(c),
             |c| {
                 if c == "DBIx::Class::Core" || c == "DBIx::Class::Row" {

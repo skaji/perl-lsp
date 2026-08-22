@@ -71,44 +71,48 @@ pub(super) enum WalkVerdict {
     Reject,
 }
 
-/// The single bounded ancestry DFS — `class_isa`, `class_isa_prefix`, and
-/// `class_is_dbic_result` all route here, so the inheritance graph is
-/// enumerated in exactly one place. `parents_of` supplies the per-node
-/// parent seam (local `PackageFacts::parents` ∪ cross-file `parents_cached`, or
-/// cross-file-only for the DBIC gate); `predicate` classifies each visited
-/// class; `budget` caps TOTAL classes visited (not ancestry depth) — a
-/// per-call-site backstop against a pathological graph, set well above any
-/// real MRO. Returns `true` iff a `Hit` verdict terminated the walk; a
-/// `Reject` or exhaustion returns `false`. Cycle-guarded by `seen`.
-/// Long-term collapse target: GraphView's lazy `walk` over the inheritance
-/// edges (docs/adr/graph-walking.md).
+/// The isa family's face of THE bounded DFS (`graph::bounded_dfs` — one
+/// engine under this and `GraphView::walk`, `docs/adr/sibling-forks.md`).
+/// `parents_of` supplies the per-node parent seam (local
+/// `PackageFacts::parents` ∪ cross-file `parents_cached`, or
+/// cross-file-only for the DBIC gate); `predicate` classifies each
+/// visited class; `bound` is the call site's declared guarantee
+/// (`WalkBound::ISA` — 200 visited classes, depth unbounded — unless the
+/// site narrows it). Returns `true` iff a `Hit` verdict terminated the
+/// walk; a `Reject` or exhaustion returns `false`. Ancestors are visited
+/// in MRO order (left parent's line first), which existence-style
+/// predicates cannot observe; the DBIC gate's Hit/Reject flags are
+/// order-independent by construction (`rejected` forces false whichever
+/// side is seen first).
 pub(super) fn walk_ancestry(
     origin: &str,
-    budget: usize,
+    bound: crate::model::graph::WalkBound,
     mut parents_of: impl FnMut(&str) -> Vec<String>,
     mut predicate: impl FnMut(&str) -> WalkVerdict,
 ) -> bool {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = vec![origin.to_string()];
-    let mut visited = 0;
-    while let Some(cur) = stack.pop() {
-        if visited > budget {
-            break;
-        }
-        visited += 1;
-        if !seen.insert(cur.clone()) {
-            continue;
-        }
-        match predicate(&cur) {
-            WalkVerdict::Hit => return true,
-            WalkVerdict::Reject => return false,
-            WalkVerdict::Miss => {}
-        }
-        for p in parents_of(&cur) {
-            stack.push(p);
-        }
+    use crate::model::graph::WalkControl;
+    // The isa questions include self (`C0 isa C0`); the engine never
+    // visits the origin, so it is classified here.
+    match predicate(origin) {
+        WalkVerdict::Hit => return true,
+        WalkVerdict::Reject => return false,
+        WalkVerdict::Miss => {}
     }
-    false
+    let mut hit = false;
+    crate::model::graph::bounded_dfs(
+        origin.to_string(),
+        bound,
+        |cur, out| out.extend(parents_of(cur)),
+        &mut |cur| match predicate(cur) {
+            WalkVerdict::Hit => {
+                hit = true;
+                WalkControl::Stop
+            }
+            WalkVerdict::Reject => WalkControl::Stop,
+            WalkVerdict::Miss => WalkControl::Continue,
+        },
+    );
+    hit
 }
 
 /// The local+cross-file parent seam for the isa walkers: the file's own
@@ -139,7 +143,7 @@ pub fn class_isa(
 ) -> bool {
     walk_ancestry(
         class,
-        200,
+        crate::model::graph::WalkBound::ISA,
         |cur| isa_parents(cur, local, module_index),
         |c| {
             if c == target {
@@ -172,7 +176,7 @@ pub fn class_isa_prefix(
     let ns = format!("{prefix}::");
     walk_ancestry(
         class,
-        200,
+        crate::model::graph::WalkBound::ISA,
         |cur| isa_parents(cur, local, module_index),
         |c| {
             if c == prefix || c.starts_with(&ns) {
