@@ -507,7 +507,19 @@ impl ReducerRegistry {
                             break;
                         }
                         crate::util::ghost_stats::count("moc.provider_fetched");
-                        let full = idx.bag_present(cached);
+                        // The three costs of one cross-file consult, split
+                        // because a conclusion layer would remove the first
+                        // two and CANNOT remove the third (enrichment is bag
+                        // surgery). Sizing stage 2 means knowing which is
+                        // which, not the total.
+                        //
+                        // These NEST over the `decode.*` stage split rather
+                        // than restating it: a miss here descends through
+                        // `bagcache.decode` into `decode.2_zstd`/`3_bincode`.
+                        // Summing a `consult.*` against a `decode.*` term
+                        // double-counts the same microseconds.
+                        let full = crate::util::ghost_stats::timed(
+                            "consult.bag_present", || idx.bag_present(cached));
                         if std::ptr::eq(bag, &full.witnesses) {
                             // Self: the reducers above already tried this bag.
                             // Not an answer about the candidate, so nothing to
@@ -515,7 +527,8 @@ impl ReducerRegistry {
                             continue;
                         }
                         let v = {
-                            let v = attempt(&full, state);
+                            let v = crate::util::ghost_stats::timed(
+                                "consult.attempt", || attempt(&full, state));
                             crate::util::ghost_stats::count(if v == ReducedValue::None {
                                 "moc.provider_no_answer"
                             } else {
@@ -529,7 +542,8 @@ impl ReducerRegistry {
                             // invisible to the raw bag, present in the
                             // enriched overlay.
                             crate::util::ghost_stats::count("consult.moc_primary");
-                            let enriched = idx.enriched_present(cached);
+                            let enriched = crate::util::ghost_stats::timed(
+                                "consult.enriched", || idx.enriched_present(cached));
                             if !std::sync::Arc::ptr_eq(&enriched, &full)
                                 && !std::ptr::eq(bag, &enriched.witnesses)
                             {
