@@ -48,6 +48,23 @@ fallback would have been sound-looking and wrong. Measure overlap on a
 real corpus before choosing the shape: the in-regime synthetic corpus
 showed 100% overlap and would have made deletion look safe.
 
+> A worked one, because the fork was invisible until the two walks were
+> read side by side: `implementations_of` gathered descendants PLUS the
+> co-ancestors those descendants reach going back up their own MRO,
+> while `method_override_family` gathered descendants only. Nothing
+> declared them siblings — they were written for different verbs. But a
+> role that CALLS `$self->m` and the sibling role that DEFINES it are
+> joined only through their shared composer, down one edge and back up
+> another, so the narrower gather returned nothing and `collect`'s
+> membership test turned that into an empty `references` answer from a
+> cursor where `--implementations` answered fine.
+>
+> Collapsed to `dispatch_participants`: one gather, `implementations_of`
+> subtracts its own contract line, `method_override_family` unions the
+> root. The residual claim is that the two verbs differ only by those
+> post-filters — which is the shape the leg-2 weakening in class 1 makes
+> explicit from the other side.
+
 **3. Language-lane forks — fold the decision into a seam.** A Perl arm
 and a pack arm making one decision. The cure is the value-carries-its-
 rule pattern already in service: `Slot`, `VisibilityAxis`,
@@ -55,6 +72,19 @@ rule pattern already in service: `Slot`, `VisibilityAxis`,
 genuinely differs per language and the *decision* is already seamed
 (presenters over a shared resolution; `cursor_context` vs
 `cursor_sentinel` under the `Slot` vocabulary).
+
+> And a consequence worth recording where the next person will find it,
+> because the measurement points the other way. The sibling-role gold
+> fixture carries **no `requires`**: once the gather is shared, the
+> projection alone answers, so the shape that motivated a `demands` lane
+> — a Surface field, an `EXTRACT_VERSION` bump, per-package consumer
+> churn — needs no recorded obligation at all. The 107-shape figure in
+> `skipping-cross-file-work.md` is the population a `demands` lane
+> *could* convert; it is not an argument that one is needed for the
+> template-method case, which is closed. What remains is the
+> abstract-base shape, pinned as an xfail row in
+> `fixtures/call-hierarchy.json`, which will XPASS the day someone
+> closes it.
 
 **4. Eager/lazy twins — a ledger, not a backlog.** An eager writer and
 a lazy reader of one rule is a deliberate purchase of speed with a
