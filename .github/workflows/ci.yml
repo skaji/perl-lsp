@@ -7,7 +7,20 @@ on:
   # another feature branch is covered (the reason the default `[main]`
   # filter was dropped). Runs on PRs; doesn't *require* a green check —
   # that's branch protection, separate from this file.
+  #
+  # `edited` is added to the DEFAULT set (opened, synchronize, reopened)
+  # because retargeting a PR's base fires `edited` and nothing else. That is
+  # not an edge case for a stacked PR: squash-merging the bottom of a stack
+  # orphans the rest, and the restack that follows ends in a retarget — so
+  # without this the workflow is blind precisely where stacks live, and the
+  # PR sits with zero checks rather than pending ones. Observed on #145.
+  #
+  # `edited` also fires on title/body edits, which cannot change what the code
+  # does, so each job carries the guard `action != 'edited' || changes.base` —
+  # run on a retarget, skip on a description tweak. On push and synchronize
+  # `action` is not 'edited', so the first clause already passes.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 # Cancel superseded runs when a PR branch is re-pushed.
 concurrency:
@@ -20,6 +33,7 @@ env:
 jobs:
   rust-tests:
     name: Rust tests
+    if: github.event.action != 'edited' || github.event.changes.base   # see `on:`
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -36,6 +50,7 @@ jobs:
 
   e2e-tests:
     name: E2E tests (headless nvim)
+    if: github.event.action != 'edited' || github.event.changes.base   # see `on:`
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -58,6 +73,7 @@ jobs:
 
   gold-corpus:
     name: Gold corpus
+    if: github.event.action != 'edited' || github.event.changes.base   # see `on:`
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
