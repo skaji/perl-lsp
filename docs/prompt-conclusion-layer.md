@@ -1,7 +1,7 @@
 # Specification: the conclusion layer
 
-**Status: specified, closes, staged; stage 2 gated on a post-stage-1
-re-measurement (verdict at the end).**
+**Status: specified, closes, staged. Stage 1 landed; stage 2 is approved on
+the structural-invalidation condition (verdict at the end).**
 
 A **conclusion** is the registry chase partially evaluated over what one file's
 bag knows, with the three query binders (`ReducerQuery.point` / `.receiver` /
@@ -41,9 +41,9 @@ pub enum ReceiverRule {
     Dispatch(String),
 }
 
-/// Per-file, persisted with the blob, invalidated with it (same stamp),
-/// versioned by CONCLUSION_VERSION in the EXTRACT_VERSION gate family
-/// (`schema.rs:13`).
+/// Per-file, persisted with the blob, invalidated with it (same stamp), and
+/// gated on a DERIVED fingerprint over the derivation sources rather than a
+/// hand-maintained version (Constraint 3).
 pub struct ConclusionMap(HashMap<ConclusionKey, Conclusion>);
 ```
 
@@ -468,11 +468,18 @@ guessed answer.
 2. **Hops cheaper, never fewer.** `Link` preserves every hop; the map never
    holds a materialized cross-file value. An answer still moves when a
    provider resolves.
-3. **Reducer changes now change semantics without changing shape.** Any edit
-   to a reducer, to `eval_return_expr`, or to registration order
-   (`registry.rs:218-257`) must bump `EXTRACT_VERSION` (`schema.rs:13`) or a
-   sibling `CONCLUSION_VERSION` in the same gate family (as `REF_ROWS_VERSION`
-   `schema.rs:19` and `STUB_VERSION` `stubs.rs:22` already are).
+3. **Reducer changes change semantics without changing shape**, so the gate
+   is DERIVED, not remembered. Any edit to a reducer, to `eval_return_expr`,
+   or to registration order (`registry.rs:218-257`) invalidates every baked
+   conclusion while the stored bytes stay well-formed. A `build.rs` hash over
+   the derivation sources is what catches it — see "Invalidation must be
+   structural" below for the mechanism and its boundaries. A hand-bumped
+   `CONCLUSION_VERSION` is explicitly NOT the rule here: the one failure this
+   layer adds is an answer that is wrong in a way nothing can see, and a
+   discipline is the wrong instrument for it. The sibling gates
+   (`REF_ROWS_VERSION` `schema.rs:19`, `STUB_VERSION` `stubs.rs:22`) stay
+   hand-bumped because a shape change breaks decode loudly; this one does
+   not.
 4. **Never bake through a degradation** — `QUERY_REC_DEPTH_CAP`, a `degraded`
    analysis, a truncated chase: `OpenNone` or nothing.
 5. **Unserved residue, permanent:** rename transport and `--dump-package`
@@ -562,17 +569,30 @@ later.
 
 ## Verdict
 
-**Stage 1 — a separate bag blob column — is worth building now.** One schema
-bump, zero new semantics: the bag (56,932,990 bincode / 6,697,721 zstd —
-41.5% of stored bytes, 52.9% of bincode payload) moves to its own column,
-decoded on demand; `--dump-package` and rename's full read become an explicit
-second fetch. It captures the decode-side share by itself and creates the
-measurement seam stage 2 needs.
+**Stage 1 — a separate bag blob column — landed.** The bag (41.5% of stored
+bytes, 52.9% of bincode payload) has its own column, fetched only when the
+caller asks for the witness axis. On the backward walk that is 95.8% of
+decodes taking the narrow path, and average decode cost falls 603.1 -> 430.4
+us (-28.6%). On a diagnostics sweep it changes nothing, because that workload
+barely touches the axis — both endpoints belong together, and neither
+describes the other.
 
-**Stage 2 — this layer — only on post-stage-1 evidence.** The map lands
-between the flat one-return-per-sub table (534,938 / 276,551 — which does not
-close: 22.7% of `MethodOnClass` queries enter an `Expr`) and the bag;
-estimate low-single-digit MB, verify before committing a schema. The target
-is the compute half — `consult.attempt`'s 2,262 ms is 78% of the removable
-cost and identical cold vs warm — so re-measure that counter once stage 1 and
-the session memo have taken their share, and let the number decide.
+**Stage 2 — this layer — is no longer gated on that re-measurement, because
+the re-measurement is in and it answers the question the gate was asking.**
+The gate said: re-measure `consult.attempt` once stage 1 has taken its share.
+Stage 1 took NO share of it. Across the split, on the same workload,
+`consult.attempt` moved 16.8 -> 16.5 us/call against 108,269 -> 108,459 calls
+— noise, and exactly what the compute/decode split predicts: stage 1 removes
+bytes from a fetch, and this counter measures the chase that happens after
+the fetch. The two costs are disjoint, so no amount of decode-side work can
+inform the compute-side decision.
+
+That is the whole of the earlier gate's content, and it is spent. What
+remains is the sizing question, unchanged and still worth answering before a
+schema commits: the map lands between the flat one-return-per-sub table
+(534,938 / 276,551 — which does not close, since 22.7% of `MethodOnClass`
+queries enter an `Expr`) and the bag, estimated low-single-digit MB.
+
+The condition that DOES bind is structural invalidation (Constraint 3): this
+layer may be built on a derived fingerprint, and may not be built on a
+remembered version bump.
