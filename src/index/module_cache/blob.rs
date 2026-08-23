@@ -211,6 +211,23 @@ pub fn bake_conclusions_blob(
     fa: &FileAnalysis,
     bag: &crate::model::witnesses::WitnessBag,
 ) -> Vec<u8> {
+    let map = bake_conclusion_map(fa, bag);
+    bincode::serialize(&map)
+        .ok()
+        .and_then(|b| zstd::encode_all(b.as_slice(), ZSTD_LEVEL).ok())
+        .unwrap_or_default()
+}
+
+/// The bake itself, before encoding.
+///
+/// The flush driver wants the map, not the bytes: it evaluates the fresh map
+/// against the rest of the store to decide whether the file's answers moved,
+/// and only the files that moved get encoded. Going through the blob would
+/// serialize-and-decode every candidate to throw most of them away.
+pub fn bake_conclusion_map(
+    fa: &FileAnalysis,
+    bag: &crate::model::witnesses::WitnessBag,
+) -> crate::model::witnesses::ConclusionMap {
     crate::util::ghost_stats::timed("persist.bake", || {
         // Every declared sub/method becomes a key, not just those the bag
         // indexed — see `bake_with_symbols`. Without this, a method resolved
@@ -253,10 +270,7 @@ pub fn bake_conclusions_blob(
             &parents,
             Some(&local_ctx),
         );
-        bincode::serialize(&map)
-            .ok()
-            .and_then(|b| zstd::encode_all(b.as_slice(), ZSTD_LEVEL).ok())
-            .unwrap_or_default()
+        map
     })
 }
 
