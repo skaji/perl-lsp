@@ -222,7 +222,7 @@ fn a_link_chain_resolves_to_the_answer_at_its_end() {
     let a = m(vec![(
         moc("A", "f"),
         Conclusion::Link {
-            target: moc("B", "f"),
+            targets: vec![moc("B", "f")],
             arity: None,
             receiver: ReceiverRule::Thread,
         },
@@ -236,7 +236,7 @@ fn a_link_chain_resolves_to_the_answer_at_its_end() {
         "B" => vec![("/b.pm".to_string(), Some(b.clone()))],
         _ => vec![],
     };
-    let got = crate::model::witnesses::registry::follow_link_with(&resolve, &moc("A", "f"), &None, None, &[]);
+    let got = crate::model::witnesses::registry::follow_link_with(&resolve, &[moc("A", "f")], &None, None, &[]);
     assert_eq!(
         got,
         Some(crate::model::file_analysis::InferredType::HashRef),
@@ -250,7 +250,7 @@ fn a_cyclic_link_chain_terminates() {
     let a = m(vec![(
         moc("A", "f"),
         Conclusion::Link {
-            target: moc("B", "f"),
+            targets: vec![moc("B", "f")],
             arity: None,
             receiver: ReceiverRule::Thread,
         },
@@ -258,7 +258,7 @@ fn a_cyclic_link_chain_terminates() {
     let b = m(vec![(
         moc("B", "f"),
         Conclusion::Link {
-            target: moc("A", "f"),
+            targets: vec![moc("A", "f")],
             arity: None,
             receiver: ReceiverRule::Thread,
         },
@@ -268,7 +268,7 @@ fn a_cyclic_link_chain_terminates() {
         "B" => vec![("/b.pm".to_string(), Some(b.clone()))],
         _ => vec![],
     };
-    let got = crate::model::witnesses::registry::follow_link_with(&resolve, &moc("A", "f"), &None, None, &[]);
+    let got = crate::model::witnesses::registry::follow_link_with(&resolve, &[moc("A", "f")], &None, None, &[]);
     assert_eq!(
         got, None,
         "a cyclic chain produced an answer; it must degrade to the decode instead"
@@ -285,7 +285,7 @@ fn an_open_none_on_the_chain_degrades_to_a_decode() {
     let a = m(vec![(
         moc("A", "f"),
         Conclusion::Link {
-            target: moc("B", "f"),
+            targets: vec![moc("B", "f")],
             arity: None,
             receiver: ReceiverRule::Thread,
         },
@@ -297,7 +297,7 @@ fn an_open_none_on_the_chain_degrades_to_a_decode() {
         _ => vec![],
     };
     assert_eq!(
-        crate::model::witnesses::registry::follow_link_with(&resolve, &moc("A", "f"), &None, None, &[]),
+        crate::model::witnesses::registry::follow_link_with(&resolve, &[moc("A", "f")], &None, None, &[]),
         None,
         "the walk answered past an OpenNone it cannot resolve"
     );
@@ -330,7 +330,7 @@ fn a_none_candidate_does_not_stop_the_ladder() {
         _ => vec![],
     };
     assert_eq!(
-        crate::model::witnesses::registry::follow_link_with(&resolve, &moc("B", "f"), &None, None, &[]),
+        crate::model::witnesses::registry::follow_link_with(&resolve, &[moc("B", "f")], &None, None, &[]),
         Some(crate::model::file_analysis::InferredType::ArrayRef),
         "the first candidate's None ended the walk instead of falling through"
     );

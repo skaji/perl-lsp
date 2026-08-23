@@ -87,8 +87,15 @@ pub enum Conclusion {
     /// live path uses.
     ReturnOf(ReturnExpr),
     /// The answer is in another file. Never a value — see "Edges, not values".
+    ///
+    /// `targets` is ORDERED and first-answer-wins, because Perl's DFS-MRO is an
+    /// ordered ladder and that is precisely what this form encodes: "whichever
+    /// of these rungs answers first". A chase that COMBINED frames — an arm
+    /// fold, a splice into a populated witness list — has an answer this cannot
+    /// express, and is poisoned to `OpenNone` rather than squeezed into a
+    /// vector that would silently mean something else.
     Link {
-        target: ConclusionKey,
+        targets: Vec<ConclusionKey>,
         arity: Option<u32>,
         receiver: ReceiverRule,
     },
@@ -178,11 +185,11 @@ impl ConclusionMap {
                 }
             }
             Conclusion::Link {
-                target,
+                targets,
                 arity: link_arity,
                 receiver: rule,
             } => Outcome::Follow {
-                target: target.clone(),
+                targets: targets.clone(),
                 arity: link_arity.or(arity),
                 receiver: match rule {
                     ReceiverRule::Thread => receiver.cloned(),
@@ -203,9 +210,10 @@ pub enum Outcome {
     None,
     /// Unbakeable here. Decode the blob and run the real chase for this key.
     Decode,
-    /// The answer is in another file; follow with these binders.
+    /// The answer is in another file; follow with these binders. Ordered,
+    /// first-answer-wins.
     Follow {
-        target: ConclusionKey,
+        targets: Vec<ConclusionKey>,
         arity: Option<u32>,
         receiver: Option<InferredType>,
     },
@@ -267,6 +275,15 @@ pub fn trust_absent_conclusions() -> bool {
 pub fn verify_absent_conclusions() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("PERL_LSP_CONCL_EQUIV").is_ok())
+}
+
+/// Mint `Link`s from a chase's recorded residuals.
+///
+/// OFF until the ladder-frame rule's poisoning half lands — see the comment at
+/// the mint site for the measured error rate.
+pub fn mint_links_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PERL_LSP_MINT_LINKS").is_ok())
 }
 
 /// How many map-to-map hops a `Follow` may take before giving up.
@@ -511,7 +528,7 @@ fn bake_one(
     if let Some(target) = sole_foreign_edge(bag, att, local_packages) {
         crate::util::ghost_stats::count("bake.link");
         return Conclusion::Link {
-            target,
+            targets: vec![target],
             arity: None,
             // An inheritance hop keeps the original object as receiver — the
             // call is still on it, the method just lives up the chain.
@@ -553,7 +570,43 @@ fn bake_one(
     crate::util::ghost_stats::count("bake.attempted");
     let ReducedValue::Type(t) = bare else {
         crate::util::ghost_stats::count("bake.no_bare_answer");
-        // No answer without binders, and `OpenNone` (decode) rather than
+        // No answer without binders. Before settling for `OpenNone`, ask
+        // whether the chase told us WHERE it would have gone: an un-poisoned
+        // chase whose residuals are all ladder rungs is exactly a `Link`.
+        // MINTING IS OFF BY DEFAULT, because it is measurably unsound.
+        //
+        // Recording residuals and minting them wholesale converts almost the
+        // whole `OpenNone` population — 10,314 -> 293, with `Link` going
+        // 44 -> 10,065. It also produces WRONG ANSWERS: 44 follow breaks
+        // against 65 correct follows under `PERL_LSP_CONCL_EQUIV`, a 40%
+        // error rate on the links it mints.
+        //
+        // The recording half is right; the missing half is the ladder-frame
+        // rule's other side. A chase that COMBINES frames — an arm fold, a
+        // `materialize` splice into a populated witness list — has an answer
+        // that is not "whichever rung answers first", and nothing here poisons
+        // those yet, so they mint a `Link` that means something else. The
+        // observed breaks are consistent with that and NOT with the receiver
+        // rule (the live parent hop threads the receiver unchanged, which is
+        // what `Thread` already does).
+        //
+        // Kept behind a flag rather than deleted: the machinery, the counters
+        // and the 44-break population are exactly what the fix needs to work
+        // against.
+        if mint_links_enabled() {
+            if let Some(targets) = registry.residuals_of_last_query() {
+                crate::util::ghost_stats::count("bake.link_from_residual");
+                return Conclusion::Link {
+                    targets,
+                    arity: None,
+                    // The live candidate/parent hops thread the receiver
+                    // unchanged; the call is still on the original object.
+                    receiver: ReceiverRule::Thread,
+                };
+            }
+        }
+
+        // No answer, and no nameable exit — `OpenNone` (decode) rather than
         // absent (a proven None) — measured, not assumed.
         //
         // Treating these as absent looks free: the bake got None, so the live

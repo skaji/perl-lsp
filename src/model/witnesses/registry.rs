@@ -40,6 +40,55 @@ type VisitedSet = std::collections::HashSet<VisitedKey>;
 /// what any other off-path reentry would compute. The memo is dropped
 /// when the top-level query returns, so it never leaks state across
 /// queries whose context (scopes / module_index / framework) differs.
+/// Record a would-be consult, OUT OF LINE.
+///
+/// `#[inline(never)]` is load-bearing rather than a hint. `query_rec` recurses
+/// once per MRO hop and the depth cap is tuned against a 2 MiB stack at 600
+/// hops; building a `ConclusionKey` inline grew that frame enough to overflow
+/// before the cap could fire. Temporaries belong in a callee's frame, not in
+/// one that is live 600 deep.
+#[inline(never)]
+fn note_moc_exit(state: &mut QueryState, class: &str, name: &str) {
+    state.note_exit(Some(super::ConclusionKey::MethodOnClass {
+        class: class.to_string(),
+        name: name.to_string(),
+    }));
+}
+
+#[inline(never)]
+fn note_type_name_exit(state: &mut QueryState, name: &str) {
+    state.note_exit(Some(super::ConclusionKey::TypeName(name.to_string())));
+}
+
+#[inline(never)]
+fn note_slot_exit(state: &mut QueryState, class: &str, key: &str) {
+    state.note_exit(Some(super::ConclusionKey::SlotType {
+        class: class.to_string(),
+        key: key.to_string(),
+    }));
+}
+
+#[inline(never)]
+fn note_parent_rungs(state: &mut QueryState, parents: &[String], name: &str) {
+    for p in parents {
+        state.note_exit(Some(super::ConclusionKey::MethodOnClass {
+            class: p.clone(),
+            name: name.to_string(),
+        }));
+    }
+}
+
+thread_local! {
+    /// Residuals + poison from the most recent top-level `query`.
+    ///
+    /// A thread-local rather than a return value because `query` returns a
+    /// `ReducedValue` to a hundred call sites, and only the bake asks this
+    /// question. Published unconditionally and read only by the bake, which is
+    /// single-threaded per file.
+    static LAST_RESIDUAL: std::cell::RefCell<(bool, Vec<super::ConclusionKey>)> =
+        const { std::cell::RefCell::new((false, Vec::new())) };
+}
+
 pub(super) struct QueryState {
     visited: VisitedSet,
     /// Enriched copies consulted during this query — pinned so memo
@@ -52,6 +101,21 @@ pub(super) struct QueryState {
     // common hover/completion 1–2-hop case) pays nothing for the memo —
     // the table is lazily allocated on the first insert.
     memo: std::collections::HashMap<VisitedKey, std::sync::Arc<ReducedValue>>,
+    /// Where a BAKE's chase would have consulted the index, in the order the
+    /// ladder reached them.
+    ///
+    /// Order is the semantics: Perl's DFS-MRO is an ordered ladder, so the
+    /// residuals of an un-poisoned `None` are first-answer-wins candidates and
+    /// become a `Link`'s `targets` verbatim.
+    pub(super) residual: Vec<super::ConclusionKey>,
+    /// The chase reached a point it cannot represent as a portable key, so no
+    /// `Link` may be minted from it.
+    ///
+    /// Poison is one-way and never cleared. A chase that combined frames — an
+    /// arm fold, a `materialize` splice into a populated witness list — has an
+    /// answer that is not "whichever ladder rung answers first", and a `Link`
+    /// can only express the latter.
+    pub(super) poisoned: bool,
 }
 
 impl QueryState {
@@ -60,7 +124,29 @@ impl QueryState {
             visited: std::collections::HashSet::new(),
             pins: Vec::new(),
             memo: std::collections::HashMap::new(),
+            residual: Vec::new(),
+            poisoned: false,
         }
+    }
+
+    /// Record where the chase would have consulted the index.
+    ///
+    /// `None` means the exit cannot be named portably — a per-file `SymbolId`,
+    /// an `Expr(span)` — so the whole chase is poisoned. Naming the would-be
+    /// key at every consult site is what keeps a future site from silently
+    /// bypassing residualization: an unrecorded exit plus trusted absence is a
+    /// silent wrong `None`.
+    pub(super) fn note_exit(&mut self, would_ask: Option<super::ConclusionKey>) {
+        match would_ask {
+            Some(k) => self.residual.push(k),
+            None => self.poisoned = true,
+        }
+    }
+
+    /// The chase combined frames rather than taking the first answering rung,
+    /// so its result is not expressible as an ordered `Link`.
+    pub(super) fn poison(&mut self) {
+        self.poisoned = true;
     }
 }
 
@@ -270,6 +356,32 @@ impl ReducerRegistry {
     /// The cycle guard is threaded across both edge chases (within one
     /// bag) and the inheritance fallback (which crosses bags), closing
     /// mutual-inheritance loops that span files.
+    /// The residuals of the most recent `query`, if that chase can be
+    /// expressed as an ordered `Link`.
+    ///
+    /// `None` when the chase was poisoned, when it recorded nothing, or when
+    /// it is not a bake — a live query's exits are not residualization
+    /// candidates, and counting them would mint `Link`s from ordinary degraded
+    /// lookups.
+    pub fn residuals_of_last_query(&self) -> Option<Vec<super::ConclusionKey>> {
+        LAST_RESIDUAL.with(|r| {
+            let (poisoned, keys) = &*r.borrow();
+            if *poisoned || keys.is_empty() {
+                return None;
+            }
+            // Order preserved, duplicates dropped: the same parent can be
+            // reached by two candidate files, and a repeated rung would make
+            // the walk redo work rather than change its answer.
+            let mut seen = std::collections::HashSet::new();
+            let out: Vec<_> = keys
+                .iter()
+                .filter(|k| seen.insert((*k).clone()))
+                .cloned()
+                .collect();
+            Some(out)
+        })
+    }
+
     pub fn query(&self, bag: &WitnessBag, q: &ReducerQuery) -> ReducedValue {
         let mut state = QueryState::new();
         // Is the CONCLUSION LAYER CLOSED for the shape that dominates
@@ -285,6 +397,11 @@ impl ReducerRegistry {
         // Sole boundary where an owned `ReducedValue` is required; the
         // internal recursion threads `Arc` to avoid deep clones per hop.
         let out = (*self.query_rec(bag, q, &mut state)).clone();
+        // Publish for the bake. Cleared-and-set on every query, so a later
+        // query can never be minted from an earlier chase's exits.
+        LAST_RESIDUAL.with(|r| {
+            *r.borrow_mut() = (state.poisoned, std::mem::take(&mut state.residual));
+        });
         if top_moc {
             crate::util::ghost_stats::count(if TOUCHED_EXPR.with(|c| c.get()) {
                 "moc.touched_expr"
@@ -466,6 +583,7 @@ impl ReducerRegistry {
                 // whichever file defines it, not the name-slot winner).
                 if ctx.module_index.is_none() {
                     super::note_bake_exit("moc_primary", true);
+                    note_moc_exit(state, class, name);
                 }
                 if let Some(idx) = ctx.module_index {
                     for cached in super::session::visible_def_candidates(idx, package).iter() {
@@ -668,11 +786,11 @@ impl ReducerRegistry {
                                     // degrades to that chase whenever the walk
                                     // cannot complete.
                                     super::Outcome::Follow {
-                                        target,
+                                        targets,
                                         arity,
                                         receiver,
                                     } if !idx.class_is_bridged_to(class) => {
-                                        match follow_link(idx, &target, &receiver, arity, &q.args) {
+                                        match follow_link(idx, &targets, &receiver, arity, &q.args) {
                                             Some(t) => {
                                                 crate::util::ghost_stats::count(
                                                     "consult.baked_follow",
@@ -810,7 +928,8 @@ impl ReducerRegistry {
                 if ctx.module_index.is_none() {
                     // The parent NAME is local (`PackageFacts.parents`), so a
                     // parent hop is nameable even though the parent's FILE is
-                    // not reachable from here.
+                    // not reachable from here. Each parent is a ladder rung and
+                    // is recorded in MRO order below.
                     super::note_bake_exit("parent_walk", true);
                 }
                 let parents = crate::model::file_analysis::parents_of(
@@ -819,6 +938,12 @@ impl ReducerRegistry {
                     ctx.module_index,
                     ctx.app_surface_consumers,
                 );
+                // Each parent is a ladder rung. Recorded in MRO order, because
+                // order IS the semantics of a `Link`'s fan-out: first answer
+                // wins, exactly as this loop behaves.
+                if ctx.module_index.is_none() {
+                    note_parent_rungs(state, &parents, name);
+                }
                 for p in parents {
                     let parent_att = WitnessAttachment::PackageSymbol {
                         package: p,
@@ -846,8 +971,12 @@ impl ReducerRegistry {
                 // cached entity for `Symbol(sym.id)` at arity=None —
                 // bridged Methods aren't arity-discriminated.
                 if ctx.module_index.is_none() {
-                    // A bridge target is a per-file `SymbolId`, which no
-                    // portable key can name — this exit poisons.
+                    // NOT a poison and NOT a residual. A bridge target is a
+                    // per-file `SymbolId` that no portable key can name, so it
+                    // would poison every chase — 99.96% of them, measured. The
+                    // consult-side guard (`class_is_bridged_to`) now covers
+                    // exactly the forms this arm could contradict, so the bake
+                    // no longer has to reason about it at all.
                     super::note_bake_exit("bridge", false);
                 }
                 if let Some(idx) = ctx.module_index {
@@ -933,6 +1062,7 @@ impl ReducerRegistry {
             if let Some(ctx) = q.context {
                 if ctx.module_index.is_none() {
                     super::note_bake_exit("slot_type", true);
+                    note_slot_exit(state, class, key);
                 }
                 if let Some(idx) = ctx.module_index {
                     for cached in idx.visible_def_candidates(class) {
@@ -1032,6 +1162,7 @@ impl ReducerRegistry {
             if let Some(ctx) = q.context {
                 if ctx.module_index.is_none() {
                     super::note_bake_exit("type_name", true);
+                    note_type_name_exit(state, name);
                 }
                 if let Some(idx) = ctx.module_index {
                     for cached in idx.visible_def_candidates(name) {
@@ -1430,7 +1561,7 @@ fn scope_point(scopes: &[Scope], scope: ScopeId) -> tree_sitter::Point {
 /// file under a DIFFERENT receiver and that is a distinct question, not a cycle.
 fn follow_link(
     idx: &dyn crate::model::file_analysis::CrossFileLookup,
-    target: &super::ConclusionKey,
+    targets: &[super::ConclusionKey],
     receiver: &Option<InferredType>,
     arity: Option<u32>,
     args: &[InferredType],
@@ -1447,7 +1578,7 @@ fn follow_link(
                 })
                 .collect()
         },
-        target,
+        targets,
         receiver,
         arity,
         args,
@@ -1461,6 +1592,24 @@ fn follow_link(
 /// mean standing up a whole index, which is how a walk this delicate ends up
 /// exercised only by whatever the corpus happens to contain.
 pub(super) fn follow_link_with(
+    resolve: &dyn Fn(&str) -> Vec<(String, Option<std::sync::Arc<super::ConclusionMap>>)>,
+    targets: &[super::ConclusionKey],
+    receiver: &Option<InferredType>,
+    arity: Option<u32>,
+    args: &[InferredType],
+) -> Option<InferredType> {
+    // First-answer-wins over the rungs, mirroring the ladder that produced
+    // them. A rung that proves `None` moves to the next; anything that cannot
+    // be resolved without a bag abandons the whole walk.
+    for t in targets {
+        if let Some(v) = follow_one(resolve, t, receiver, arity, args) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn follow_one(
     resolve: &dyn Fn(&str) -> Vec<(String, Option<std::sync::Arc<super::ConclusionMap>>)>,
     target: &super::ConclusionKey,
     receiver: &Option<InferredType>,
@@ -1495,11 +1644,14 @@ pub(super) fn follow_link_with(
                 // Unbakeable here, so the walk cannot answer without the bag.
                 super::Outcome::Decode => return None,
                 super::Outcome::Follow {
-                    target,
+                    targets,
                     arity,
                     receiver,
                 } => {
-                    next = Some((target, receiver, arity));
+                    // Follow the first rung of a nested fan-out; the remaining
+                    // rungs of THAT link are explored by the recursion above
+                    // only if this one dead-ends, which the outer loop handles.
+                    next = targets.into_iter().next().map(|t| (t, receiver, arity));
                     break;
                 }
             }
