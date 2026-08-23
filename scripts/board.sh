@@ -44,15 +44,61 @@ _state_dir() {
   printf '%s/board-state/%s' "$root" "$issue"
 }
 
+# --- transport -------------------------------------------------------------
+# Prefer `gh`; fall back to unauthenticated curl, because some agent sandboxes
+# have no gh CLI at all (GitHub reaches those through MCP tools instead). This
+# repo is public, so READS work unauthenticated, at a lower rate limit; POSTING
+# still needs gh or $GITHUB_TOKEN. Anyone with neither should follow the four
+# rules in the header BY HAND — they are the contract, and this script is only
+# one implementation of it.
+# BOARD_NO_GH=1 forces the curl path — the only way to exercise the fallback on
+# a box that has gh, and therefore the only way it stays working.
+HAVE_GH=0
+if [ "${BOARD_NO_GH:-0}" != "1" ] && command -v gh >/dev/null 2>&1; then HAVE_GH=1; fi
+
+_curl_pages() {  # walk pages explicitly; never trust a single page to be all
+  local path="$1" page=1 body
+  local auth=(); [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  while :; do
+    body="$(curl -sSf "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+             "https://api.github.com/$path?per_page=100&page=$page" 2>/dev/null)" || break
+    [ "$(jq 'length' <<<"$body" 2>/dev/null || echo 0)" -eq 0 ] && break
+    printf '%s\n' "$body"
+    page=$((page+1))
+  done
+}
+
+_jqfmt() { printf '%s' '"\u001b[36m─── #\(.id)  \(.user.login)  \(.created_at)  \(.html_url)\u001b[0m\n\(.body)\n"'; }
+
 # All comment ids, ascending. The one place that talks to the API.
 _all_ids() {
-  gh api --paginate "repos/$REPO/issues/$1/comments" --jq '.[].id' | sort -n
+  if [ $HAVE_GH -eq 1 ]; then
+    gh api --paginate "repos/$REPO/issues/$1/comments" --jq '.[].id' | sort -n
+  else
+    _curl_pages "repos/$REPO/issues/$1/comments" | jq -r '.[].id' | sort -n
+  fi
 }
 
 _render() {
-  local id="$1"
-  gh api "repos/$REPO/issues/comments/$id" \
-    --jq '"[36m─── #\(.id)  \(.user.login)  \(.created_at)  \(.html_url)[0m\n\(.body)\n"'
+  local id="$1" fmt; fmt="$(_jqfmt)"
+  if [ $HAVE_GH -eq 1 ]; then
+    gh api "repos/$REPO/issues/comments/$id" --jq "$fmt"
+  else
+    local auth=(); [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    curl -sSf "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/$REPO/issues/comments/$id" | jq -r "$fmt"
+  fi
+}
+
+_brief() {  # one line, for the watch loop / Monitor
+  local id="$1" fmt='"[#\(.id)] \(.body[0:400] | gsub("\n";" "))"'
+  if [ $HAVE_GH -eq 1 ]; then
+    gh api "repos/$REPO/issues/comments/$id" --jq "$fmt" 2>/dev/null
+  else
+    local auth=(); [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    curl -sSf "${auth[@]}" -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/$REPO/issues/comments/$id" 2>/dev/null | jq -r "$fmt"
+  fi
 }
 
 _unseen() {
@@ -103,8 +149,7 @@ cmd_watch() {
     if [ -n "$ids" ]; then
       while read -r id; do
         [ -n "$id" ] || continue
-        gh api "repos/$REPO/issues/comments/$id" \
-          --jq '"[#\(.id)] \(.body[0:400] | gsub("\n";" "))"' 2>/dev/null || true
+        _brief "$id" || true
       done <<< "$ids"
       printf '%s\n' "$ids" | _mark "$issue"
     fi
@@ -115,6 +160,14 @@ cmd_watch() {
 cmd_post() {
   local file="$1" issue="${2:-$DEFAULT_ISSUE}" url id dir
   [ -f "$file" ] || { echo "no such file: $file" >&2; return 1; }
+  if [ $HAVE_GH -eq 0 ]; then
+    # Posting needs a write credential. Say so plainly rather than failing with
+    # "gh: command not found" three frames down.
+    echo "board.sh post needs the gh CLI (not found)." >&2
+    echo "Reads work without it; posting does not. Use your sandbox's GitHub" >&2
+    echo "tooling to comment, then: scripts/board.sh catchup $issue" >&2
+    return 127
+  fi
   url="$(gh issue comment "$issue" --repo "$REPO" --body-file "$file")"
   id="${url##*-}"
   dir="$(_state_dir "$issue")"; mkdir -p "$dir"
