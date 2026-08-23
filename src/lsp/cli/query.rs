@@ -1193,6 +1193,7 @@ fn for_each_enriched_diagnostic(
     // Snapshot before working: values are `Arc`s, so this is a pointer copy
     // per file, and it releases the DashMap shard guards an `iter()` would
     // otherwise hold closed to writers for the whole sweep.
+    let _g_snap = crate::util::timings::PhaseGuard::start("cli::diag_snapshot");
     let entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
         .workspace_raw()
         .iter()
@@ -1203,6 +1204,11 @@ fn for_each_enriched_diagnostic(
     // THROUGHOUT the run rather than buffering it into a final print a
     // timeout discards whole (`docs/adr/instrument-blindness.md`). `emit` is
     // `&mut` and stays on this thread — only the diagnostics cross.
+    drop(_g_snap);
+    // The sweep is the run's dominant phase and had no name — the startup
+    // phases account for ~11s of an 80s run, so an unattributed remainder
+    // reads as "startup is the cost" when it is not.
+    let _g_sweep = crate::util::timings::PhaseGuard::start("cli::diag_sweep");
     let (tx, rx) =
         std::sync::mpsc::channel::<(String, tower_lsp::lsp_types::Diagnostic)>();
     std::thread::scope(|scope| {
