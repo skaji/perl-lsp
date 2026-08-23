@@ -1656,6 +1656,34 @@ fn the_conclusion_fingerprint_is_not_stale() {
         fnv(&mut acc, &bytes);
         fnv(&mut acc, b"\0");
     }
+    // A tree edited AFTER this binary was built is a tree this test cannot
+    // conclude anything about: the fingerprint compiled in describes the
+    // sources as they were at build time, and comparing it to the sources as
+    // they are now measures the edit, not the guard. That is an ordinary
+    // developer workflow — a test run racing an editor — and failing on it
+    // reports a stale-fingerprint bug that does not exist. Say "I could not
+    // look" instead of "nothing there"; the same rule the instruments in this
+    // arc keep having to learn.
+    let built_at = std::env::current_exe()
+        .and_then(|p| p.metadata())
+        .and_then(|m| m.modified())
+        .ok();
+    if let Some(built_at) = built_at {
+        let edited_after = files.iter().any(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .map(|t| t > built_at)
+                .unwrap_or(false)
+        });
+        if edited_after {
+            eprintln!(
+                "the_conclusion_fingerprint_is_not_stale: SKIPPED — a hashed \
+                 source file is newer than this test binary, so the tree moved \
+                 after the build and the comparison would measure the edit"
+            );
+            return;
+        }
+    }
     assert_eq!(
         format!("{acc:016x}"),
         conclusion_fingerprint(),
