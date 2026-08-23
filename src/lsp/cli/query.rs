@@ -31,22 +31,30 @@ pub(crate) fn cli_check(args: &[String]) {
     timings::report();
     timings::report_pattern_stats();
 
-    let mut all_diagnostics = Vec::new();
-
-    for (file, d) in enriched_tree_diagnostics(&ws, &module_index, options) {
-        {
-            let sev = match d.severity {
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
-                Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
-                _ => "warning",
-            };
-            // Filter by minimum severity
-            if severity_rank(sev) > min_rank {
-                continue;
-            }
-            all_diagnostics.push(serde_json::json!({
+    // STREAMED, never buffered: a corpus-scale run emits as each file's
+    // diagnostics land, flushed per element, so a tail shows live progress
+    // and a timeout still leaves every finding computed so far — hours of
+    // work must never ride on one final print. JSON stays one valid array
+    // (elements streamed one per line inside `[`/`]`).
+    let mut total = 0usize;
+    let mut first = true;
+    if json_mode {
+        println!("[");
+    }
+    for_each_enriched_diagnostic(&ws, &module_index, options, &mut |file, d| {
+        let sev = match d.severity {
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::ERROR => "error",
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::WARNING => "warning",
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION => "info",
+            Some(s) if s == tower_lsp::lsp_types::DiagnosticSeverity::HINT => "hint",
+            _ => "warning",
+        };
+        if severity_rank(sev) > min_rank {
+            return;
+        }
+        total += 1;
+        if json_mode {
+            let obj = serde_json::json!({
                 "file": file,
                 "line": d.range.start.line,
                 "col": d.range.start.character,
@@ -56,28 +64,36 @@ pub(crate) fn cli_check(args: &[String]) {
                     tower_lsp::lsp_types::NumberOrString::Number(n) => n.to_string(),
                 }).unwrap_or_default(),
                 "message": d.message,
-            }));
+            });
+            if first {
+                first = false;
+            } else {
+                println!(",");
+            }
+            print!("{obj}");
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+        } else {
+            let line = d.range.start.line as u64 + 1;
+            let col = d.range.start.character as u64 + 1;
+            let code = match d.code {
+                Some(tower_lsp::lsp_types::NumberOrString::String(s)) => s,
+                Some(tower_lsp::lsp_types::NumberOrString::Number(n)) => n.to_string(),
+                None => String::new(),
+            };
+            eprintln!("{}:{}:{}: {}[{}] {}", file, line, col, sev, code, d.message);
         }
-    }
-
+    });
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&all_diagnostics).unwrap());
-    } else {
-        for d in &all_diagnostics {
-            let severity = d["severity"].as_str().unwrap_or("warning");
-            let file = d["file"].as_str().unwrap_or("");
-            let line = d["line"].as_u64().unwrap_or(0) + 1;
-            let col = d["col"].as_u64().unwrap_or(0) + 1;
-            let code = d["code"].as_str().unwrap_or("");
-            let msg = d["message"].as_str().unwrap_or("");
-            eprintln!("{}:{}:{}: {}[{}] {}", file, line, col, severity, code, msg);
+        if !first {
+            println!();
         }
-        let total = all_diagnostics.len();
-        let files = ws.workspace_len();
-        eprintln!("{} diagnostics in {} files", total, files);
+        println!("]");
+    } else {
+        eprintln!("{} diagnostics in {} files", total, ws.workspace_len());
     }
 
-    if !all_diagnostics.is_empty() {
+    if total > 0 {
         // `exit` skips `EmitOnDrop`, and this verb is the one that walks and
         // ENRICHES a whole workspace — the run whose counters are worth the
         // most. Emitting here is the same explicit-before-hard-exit rule the
@@ -1105,12 +1121,32 @@ fn run_rename(
 /// runs on open docs), so cross-file-typed shapes hint here too. A file
 /// whose snapshot fails degrades to its unenriched whole view rather
 /// than vanishing.
+/// Collected form for callers that need the whole set at once (`--batch`
+/// diagnostics answers one JSON payload per request by protocol).
 fn enriched_tree_diagnostics(
     ws: &file_store::FileStore,
     idx: &module_index::ModuleIndex,
     options: symbols::DiagnosticOptions,
 ) -> Vec<(String, tower_lsp::lsp_types::Diagnostic)> {
     let mut all = Vec::new();
+    for_each_enriched_diagnostic(ws, idx, options, &mut |file, d| {
+        all.push((file.to_string(), d));
+    });
+    all
+}
+
+/// The per-file diagnostics sweep, streamed: `emit` runs as each file's
+/// diagnostics are computed, so `--check` produces output THROUGHOUT a
+/// corpus-scale run instead of buffering hours of work into one final
+/// print a timeout can discard whole (`docs/adr/instrument-blindness.md`
+/// — a 0-byte output file at hour two answers "has anything been
+/// PRINTED", not "has anything been found").
+fn for_each_enriched_diagnostic(
+    ws: &file_store::FileStore,
+    idx: &module_index::ModuleIndex,
+    options: symbols::DiagnosticOptions,
+    emit: &mut dyn FnMut(&str, tower_lsp::lsp_types::Diagnostic),
+) {
     for entry in ws.workspace_raw().iter() {
         let file = entry.key().display().to_string();
         // Names the file on stderr if this one unit runs long. The sweep is
@@ -1143,7 +1179,7 @@ fn enriched_tree_diagnostics(
             }
         };
         for d in diags {
-            all.push((file.clone(), d));
+            emit(&file, d);
         }
         crate::util::timings::set_current_file(None);
     }
@@ -1158,11 +1194,10 @@ fn enriched_tree_diagnostics(
             // Same whole-view routing: pack index copies are evicted.
             let whole = file_analysis::CrossFileLookup::whole_present(pack.as_ref(), cm);
             for d in symbols::pack_diagnostics(&whole, options) {
-                all.push((file.clone(), d));
+                emit(&file, d);
             }
         });
     });
-    all
 }
 
 /// Whole-tree diagnostics as the pretty-JSON array string (warning+; shared by
