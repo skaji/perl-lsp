@@ -84,6 +84,16 @@ pub(crate) struct IndexCore {
     /// persisted mark table paired with sessional stamps would be sound; a
     /// persisted STAMP paired with sessional marks would silently skip a
     /// re-stamp that was owed, so neither half may outlive the other.
+    ///
+    /// **A dedicated clock, and not the conclusion store's generation** — the
+    /// obvious-looking consolidation, ruled out on purpose. A comparison clock
+    /// must share its lifetime with the operands it orders, and these operands
+    /// are sessional. A persistent clock over sessional operands fails the
+    /// mirror of the half-persistence case above: a restart resets stamps and
+    /// marks while the store generation carries on, so any path that ever
+    /// seeded `stamped_at` from a persisted value would compare a new-session
+    /// stamp against an old-session clock. This counter cannot express that
+    /// bug. If the marks are ever persisted, all three move together.
     pub(crate) flush_epoch: std::sync::atomic::AtomicU64,
     pub(crate) provider_diff_gen: DashMap<std::path::PathBuf, u64>,
     /// The witness seams' fallback-on-miss enriched retries only pay off
