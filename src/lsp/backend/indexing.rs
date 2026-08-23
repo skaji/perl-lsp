@@ -4,6 +4,160 @@
 use super::*;
 
 impl Backend {
+
+    /// Re-index Perl files whose bytes on disk changed, and name everyone who
+    /// must be refreshed because of it.
+    ///
+    /// Two seams reach this, and for a while only one of them existed.
+    /// `didChangeWatchedFiles` is the obvious one — and it is the one that does
+    /// not fire when the editor saves a buffer it has open, which is how a
+    /// developer actually edits a dependency. `did_save` is the other, and its
+    /// absence meant that saving a module left every consumer in the session
+    /// answering from the version before the save, for the rest of the
+    /// session. The pack languages were given this (`schedule_pack_invalidate`,
+    /// the H1 fix); Perl was not. `e2e/saved_dep_edit.lua` is the guard.
+    pub(super) async fn reindex_saved_perl(
+        &self,
+        perl_changes: Vec<(PathBuf, FileChangeType)>,
+    ) {
+        if perl_changes.is_empty() {
+            return;
+        }
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let dirty = tokio::task::spawn_blocking(move || {
+            // Externally changed deps break their consumers' enrichment too
+            // — collect the dirty closure while the records are in hand and
+            // hand it back for the open-doc republish below.
+            let mut dirty_all: std::collections::HashSet<PathBuf> = Default::default();
+            // Each changed file's fresh map, and where the refresh wave
+            // starts. They differ for a DELETED file: it has no map and
+            // nothing to evaluate, so it enters the wave as its direct
+            // consumers instead.
+            let mut fresh: Vec<(PathBuf, crate::model::witnesses::ConclusionMap)> = Vec::new();
+            let mut frontier: Vec<PathBuf> = Vec::new();
+            // The persisted generation (blob + ref rows) is now stale for
+            // these paths; drop it so warm starts re-parse and the
+            // relational retrieval can't serve outdated spans. The fresh
+            // in-RAM copy registered below is FULL (never stripped), so the
+            // resident sweep covers it until the next bulk index persists a
+            // new generation.
+            let ws_key = module_index.workspace_root();
+            let conn = crate::index::module_cache::open_cache_db(ws_key.as_deref(), "perl");
+            for (path, typ) in perl_changes {
+                // A DELETED file can't canonicalize (it's gone) — resolve the
+                // parent instead so the spelling still matches the canonical
+                // keys everything was registered/persisted under.
+                let canon = path.canonicalize().unwrap_or_else(|_| {
+                    match (path.parent(), path.file_name()) {
+                        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                            .map(|d| d.join(name))
+                            .unwrap_or_else(|_| path.clone()),
+                        _ => path.clone(),
+                    }
+                });
+                if let Some(ref conn) = conn {
+                    crate::index::module_cache::invalidate_generation(conn, &canon.to_string_lossy());
+                    if canon != path {
+                        crate::index::module_cache::invalidate_generation(
+                            conn,
+                            &path.to_string_lossy(),
+                        );
+                    }
+                }
+                module_index.invalidate_derived_copies(&canon);
+                match typ {
+                    FileChangeType::DELETED => {
+                        files.remove_workspace(&path);
+                        files.remove_workspace(&canon);
+                        // Consumers of the departed file's packages, BEFORE
+                        // the record (and its provided names) are removed.
+                        dirty_all.extend(module_index.dirty_consumers(&canon));
+                        // Consumers that answered through the departed file
+                        // now resolve to nothing — a move, and the wave
+                        // carries it onward from them.
+                        frontier.extend(module_index.dirty_consumers(&canon));
+                        // The hub's path/name registrations must go too, or
+                        // the dead file stays a retrieval candidate and a
+                        // phantom module in name lookups.
+                        module_index.unregister_workspace_path(&canon);
+                    }
+                    _ => {
+                        // Re-index the file (created or changed). The fresh
+                        // copy registers WHOLE (refs + bag) in both stores:
+                        // its persisted generation was just invalidated, so
+                        // the resident copy is the only source until the
+                        // next bulk index re-persists.
+                        if let Ok(source) = std::fs::read_to_string(&path) {
+                            let mut parser = crate::index::module_resolver::create_parser();
+                            if let Some(tree) = parser.parse(&source, None) {
+                                let analysis = crate::build::builder::build(&tree, source.as_bytes());
+                                let arc = Arc::new(analysis);
+                                files.insert_workspace_arc(canon.clone(), arc.clone());
+                                module_index.record_workspace_projections(&canon, &arc);
+                                // register_workspace_resident routes through
+                                // record_and_dirty: the dirty set is bound to
+                                // the record, so a re-register can't drop it.
+                                let sd = module_index
+                                    .register_workspace_resident(canon.clone(), arc.clone());
+                                dirty_all.extend(sd.dirty);
+                                // The caller bakes: the analysis is in hand
+                                // and its blob was just invalidated, so the
+                                // flush has nothing to decode it from.
+                                fresh.push((
+                                    canon.clone(),
+                                    crate::index::module_cache::bake_conclusion_map(
+                                        &arc,
+                                        &arc.witnesses,
+                                    ),
+                                ));
+                                frontier.push(canon.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // The refresh wave. `dirty_consumers` names DIRECT consumers only,
+            // so a change two hops away has never refreshed anything — the
+            // wave carries it as far as the answers actually move and stops
+            // there, which is the bound a transitive closure would not have.
+            // Additive to the one-hop set rather than replacing it: a file
+            // whose surface did not move can still need re-enrichment for
+            // reasons this layer does not model.
+            if let Some(ref conn) = conn {
+                let candidates_of = |class: &str| -> Vec<PathBuf> {
+                    use crate::model::file_analysis::CrossFileLookup;
+                    module_index
+                        .visible_def_candidates(class)
+                        .iter()
+                        .map(|c| c.path.clone())
+                        .collect()
+                };
+                let consumers_of = |p: &std::path::Path| -> Vec<PathBuf> {
+                    module_index.dirty_consumers(p).into_iter().collect()
+                };
+                let out = crate::util::timings::phase("flush.wave", || {
+                    crate::index::conclusion_flush::flush_refresh_set(
+                        conn,
+                        fresh,
+                        frontier,
+                        &consumers_of,
+                        &candidates_of,
+                    )
+                });
+                crate::util::ghost_stats::count_by(
+                    "flush.refresh_set",
+                    out.changed.len() as u64,
+                );
+                dirty_all.extend(out.changed.into_iter().map(|(p, _)| p));
+            }
+            dirty_all
+        })
+        .await
+        .unwrap_or_default();
+        // Off-pipeline: each republish re-enriches.
+        self.spawn_republish(dirty);
+    }
     pub(super) fn diagnostic_options(&self) -> symbols::DiagnosticOptions {
         *self.diag_options.lock().unwrap()
     }

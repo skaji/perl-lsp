@@ -77,6 +77,7 @@ suites=(
   mojo_events.lua
   dbic_parametric.lua
   roles.lua
+  saved_dep_edit.lua
 )
 
 total_passed=0

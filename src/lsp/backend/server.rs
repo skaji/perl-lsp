@@ -479,11 +479,22 @@ impl LanguageServer for Backend {
             self.schedule_diag_refresh(uri.clone());
         }
         // The saved bytes are on disk: re-register this file's indexed copy,
-        // evict the macro/closure caches it participates in, and refresh its
-        // open consumers (H1 — a saved header must become visible to its
-        // includers without a restart). Runs regardless of includeText.
-        if let Some(path) = pack_path {
-            self.schedule_pack_invalidate(path, false);
+        // evict the caches it participates in, and refresh its open consumers
+        // (H1 — a saved dependency must become visible to its consumers
+        // without a restart). Runs regardless of includeText.
+        //
+        // Both language families need this and only the pack half had it.
+        // `didChangeWatchedFiles` looks like it should cover the hub — it
+        // does not fire when the editor saves a buffer it has open, which is
+        // exactly how a dependency gets edited, so a saved `.pm` left every
+        // consumer in the session answering from the version before the save.
+        match pack_path {
+            Some(path) => self.schedule_pack_invalidate(path, false),
+            None => {
+                if let Ok(path) = uri.to_file_path() {
+                    self.reindex_saved_perl(vec![(path, FileChangeType::CHANGED)]).await;
+                }
+            }
         }
     }
 
@@ -1612,88 +1623,7 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        if perl_changes.is_empty() {
-            return;
-        }
-        let files = Arc::clone(&self.files);
-        let module_index = Arc::clone(&self.module_index);
-        let dirty = tokio::task::spawn_blocking(move || {
-            // Externally changed deps break their consumers' enrichment too
-            // — collect the dirty closure while the records are in hand and
-            // hand it back for the open-doc republish below.
-            let mut dirty_all: std::collections::HashSet<PathBuf> = Default::default();
-            // The persisted generation (blob + ref rows) is now stale for
-            // these paths; drop it so warm starts re-parse and the
-            // relational retrieval can't serve outdated spans. The fresh
-            // in-RAM copy registered below is FULL (never stripped), so the
-            // resident sweep covers it until the next bulk index persists a
-            // new generation.
-            let ws_key = module_index.workspace_root();
-            let conn = crate::index::module_cache::open_cache_db(ws_key.as_deref(), "perl");
-            for (path, typ) in perl_changes {
-                // A DELETED file can't canonicalize (it's gone) — resolve the
-                // parent instead so the spelling still matches the canonical
-                // keys everything was registered/persisted under.
-                let canon = path.canonicalize().unwrap_or_else(|_| {
-                    match (path.parent(), path.file_name()) {
-                        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
-                            .map(|d| d.join(name))
-                            .unwrap_or_else(|_| path.clone()),
-                        _ => path.clone(),
-                    }
-                });
-                if let Some(ref conn) = conn {
-                    crate::index::module_cache::invalidate_generation(conn, &canon.to_string_lossy());
-                    if canon != path {
-                        crate::index::module_cache::invalidate_generation(
-                            conn,
-                            &path.to_string_lossy(),
-                        );
-                    }
-                }
-                module_index.invalidate_derived_copies(&canon);
-                match typ {
-                    FileChangeType::DELETED => {
-                        files.remove_workspace(&path);
-                        files.remove_workspace(&canon);
-                        // Consumers of the departed file's packages, BEFORE
-                        // the record (and its provided names) are removed.
-                        dirty_all.extend(module_index.dirty_consumers(&canon));
-                        // The hub's path/name registrations must go too, or
-                        // the dead file stays a retrieval candidate and a
-                        // phantom module in name lookups.
-                        module_index.unregister_workspace_path(&canon);
-                    }
-                    _ => {
-                        // Re-index the file (created or changed). The fresh
-                        // copy registers WHOLE (refs + bag) in both stores:
-                        // its persisted generation was just invalidated, so
-                        // the resident copy is the only source until the
-                        // next bulk index re-persists.
-                        if let Ok(source) = std::fs::read_to_string(&path) {
-                            let mut parser = crate::index::module_resolver::create_parser();
-                            if let Some(tree) = parser.parse(&source, None) {
-                                let analysis = crate::build::builder::build(&tree, source.as_bytes());
-                                let arc = Arc::new(analysis);
-                                files.insert_workspace_arc(canon.clone(), arc.clone());
-                                module_index.record_workspace_projections(&canon, &arc);
-                                // register_workspace_resident routes through
-                                // record_and_dirty: the dirty set is bound to
-                                // the record, so a re-register can't drop it.
-                                let sd = module_index
-                                    .register_workspace_resident(canon.clone(), arc);
-                                dirty_all.extend(sd.dirty);
-                            }
-                        }
-                    }
-                }
-            }
-            dirty_all
-        })
-        .await
-        .unwrap_or_default();
-        // Off-pipeline: each republish re-enriches.
-        self.spawn_republish(dirty);
+        self.reindex_saved_perl(perl_changes).await;
     }
 
     async fn range_formatting(
