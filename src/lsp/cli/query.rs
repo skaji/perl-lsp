@@ -1334,6 +1334,17 @@ pub(crate) fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
     }
 }
 
+/// Put every file declaring a package into a stable order.
+///
+/// Extracted so the property has a name and a test: this verb must collect
+/// ALL declaring files and order them, never take whichever one an unordered
+/// map yields first. `workspace_raw()` is a `DashMap`, so a `break` on the
+/// first hit made the answer for any reopened package vary run to run.
+fn order_declaring_files<T>(mut matches: Vec<(String, T)>) -> Vec<(String, T)> {
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches
+}
+
 /// --dump-package <root> <package> — Dump every sub in a package with
 /// derived type info. Debugging aid for the witness/reducer pipeline:
 /// prints the raw `return_type` baked into the Symbol, the witness-bag
@@ -1352,7 +1363,20 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
     // Find a FileAnalysis whose package matches. Workspace first; fall
     // back to cached @INC modules. No bespoke discovery — only what
     // the normal startup populated.
-    let mut found: Option<(String, Arc<file_analysis::CachedModule>)> = None;
+    //
+    // EVERY match, then sorted — not the first the iteration reaches. A Perl
+    // package is open: `PPI::XSAccessor` reopens `PPI::Token`, so two
+    // workspace files declare it, and `workspace_raw()` is a `DashMap` whose
+    // iteration order varies run to run. This verb used to `break` on the
+    // first hit, which made its answer for any reopened package a coin flip —
+    // `--dump-package PPI::Token` alternated between `Token.pm` and
+    // `XSAccessor.pm` across five consecutive runs of the same binary.
+    //
+    // That is worse than an arbitrary choice, because this output is used as a
+    // comparison ORACLE ("byte-identical across 312 KB" appears in this
+    // project's own measurement notes). A flaky oracle silently launders a
+    // real difference into noise, and noise into a real difference.
+    let mut matches: Vec<(String, Arc<file_analysis::CachedModule>)> = Vec::new();
     for entry in ws.workspace_raw().iter() {
         let cm = std::sync::Arc::new(file_analysis::CachedModule::new(
             entry.key().clone(),
@@ -1364,10 +1388,25 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
                 && s.name == package_name
         });
         if has_package {
-            found = Some((entry.key().display().to_string(), cm));
-            break;
+            matches.push((entry.key().display().to_string(), cm));
         }
     }
+    let matches = order_declaring_files(matches);
+    if matches.len() > 1 {
+        // Named, not just deduped. A reopened package is exactly the situation
+        // where "why does this return X?" has a different answer per file, so
+        // dumping one of them without saying the others exist answers a
+        // question the user did not ask.
+        eprintln!(
+            "note: '{}' is declared in {} files; dumping the first and listing the rest:",
+            package_name,
+            matches.len()
+        );
+        for (p, _) in &matches {
+            eprintln!("  {p}");
+        }
+    }
+    let mut found = matches.into_iter().next();
     if found.is_none() {
         if let Some(cached) = module_index.get_cached(package_name) {
             found = Some((cached.path.display().to_string(), cached));
@@ -1609,4 +1648,50 @@ pub(crate) fn cli_workspace_symbol(root: &str, query: &str) {
     // workspace-symbol emits engine-coordinated spans (0-based/byte) directly,
     // independent of the location seam; the dialect here is nominal.
     print_run_one(&ws, &idx, &req, CoordFmt::ZeroBasedByte);
+}
+
+#[cfg(test)]
+mod declaring_file_tests {
+    use super::order_declaring_files;
+
+    /// `--dump-package` must consider EVERY file declaring a package, in a
+    /// stable order — not whichever one an unordered map happens to yield.
+    ///
+    /// Perl packages are open. `PPI::XSAccessor` reopens `PPI::Token`, so two
+    /// workspace files declare it, and the store this verb scans is a
+    /// `DashMap`. Taking the first hit made the answer a coin flip:
+    /// `--dump-package PPI::Token` alternated between `Token.pm` and
+    /// `XSAccessor.pm` across five consecutive runs of one binary.
+    ///
+    /// That matters beyond tidiness because this output is used as a
+    /// comparison ORACLE elsewhere in the project. A flaky oracle launders a
+    /// real difference into noise and noise into a real difference, in both
+    /// directions, silently.
+    ///
+    /// Base-verify by restoring the `break` in the collection loop: only one
+    /// match survives and the length assertion fails.
+    #[test]
+    fn every_declaring_file_is_kept_and_ordered() {
+        let unordered = vec![
+            ("/w/PPI/XSAccessor.pm".to_string(), 2u8),
+            ("/w/PPI/Token.pm".to_string(), 1u8),
+        ];
+        let ordered = order_declaring_files(unordered);
+        assert_eq!(
+            ordered.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec!["/w/PPI/Token.pm", "/w/PPI/XSAccessor.pm"],
+            "a reopened package's files must be kept and ordered, so the verb's \
+             answer does not depend on map iteration order"
+        );
+        // Reversing the input must not reverse the answer.
+        let other_way = order_declaring_files(vec![
+            ("/w/PPI/Token.pm".to_string(), 1u8),
+            ("/w/PPI/XSAccessor.pm".to_string(), 2u8),
+        ]);
+        assert_eq!(
+            ordered.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            other_way.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            "the order must come from the paths, not from the input's order"
+        );
+    }
 }
