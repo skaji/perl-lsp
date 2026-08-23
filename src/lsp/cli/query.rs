@@ -1135,6 +1135,49 @@ fn enriched_tree_diagnostics(
     all
 }
 
+/// One file's enriched diagnostics. Lifted out of the sweep so the serial and
+/// parallel drivers cannot drift — the thread-locals it touches (the stall
+/// watchdog's current file, the sweep memo, `enriched_snapshot`'s cycle guard
+/// and depth counter) are per-worker by construction, which is what makes the
+/// body safe to run concurrently.
+fn sweep_one_file(
+    idx: &module_index::ModuleIndex,
+    options: symbols::DiagnosticOptions,
+    path: &std::path::Path,
+    fa: &std::sync::Arc<file_analysis::FileAnalysis>,
+) -> Vec<(String, tower_lsp::lsp_types::Diagnostic)> {
+    let file = path.display().to_string();
+    // Names the file on stderr if this one unit runs long. The sweep is
+    // where a single pathological file can grind for minutes while the run
+    // looks merely slow — and a run that never finishes never reaches an
+    // after-the-fact report, so the warning has to come from a watchdog
+    // while the unit is still held.
+    crate::util::timings::set_current_file(Some(path));
+    let cached = std::sync::Arc::new(file_analysis::CachedModule::new(
+        path.to_path_buf(),
+        std::sync::Arc::clone(fa),
+    ));
+    let _sweep = crate::util::ghost_stats::SweepScope::start();
+    let _memo = module_index::SweepMemoGuard::open();
+    // The region the four `diag.*` tags did NOT cover, and the one that holds
+    // the volume: enriching a file pulls its providers' analyses, and that
+    // happens BEFORE `collect_diagnostics` is entered. Bounding the callee
+    // from the inside is worth nothing if the caller is outside every region.
+    let _g_enrich = crate::util::ghost_stats::ScopedNs::start("diag.0_enriched_snapshot");
+    let diags = match idx.enriched_snapshot(&cached) {
+        Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
+        None => {
+            // Index copies may be refs/bag-evicted; diagnostics read refs AND
+            // the bag, so degrade to the whole-on-both-axes view, not the
+            // resident copy.
+            let whole = file_analysis::CrossFileLookup::whole_present(idx, &cached);
+            symbols::collect_diagnostics(&whole, idx, options)
+        }
+    };
+    crate::util::timings::set_current_file(None);
+    diags.into_iter().map(|d| (file.clone(), d)).collect()
+}
+
 /// The per-file diagnostics sweep, streamed: `emit` runs as each file's
 /// diagnostics are computed, so `--check` produces output THROUGHOUT a
 /// corpus-scale run instead of buffering hours of work into one final
@@ -1147,42 +1190,34 @@ fn for_each_enriched_diagnostic(
     options: symbols::DiagnosticOptions,
     emit: &mut dyn FnMut(&str, tower_lsp::lsp_types::Diagnostic),
 ) {
-    for entry in ws.workspace_raw().iter() {
-        let file = entry.key().display().to_string();
-        // Names the file on stderr if this one unit runs long. The sweep is
-        // where a single pathological file can grind for minutes while the
-        // run looks merely slow — and a run that never finishes never
-        // reaches an after-the-fact report, so the warning has to come from
-        // a watchdog while the unit is still held.
-        crate::util::timings::set_current_file(Some(entry.key()));
-        let cached = std::sync::Arc::new(file_analysis::CachedModule::new(
-            entry.key().clone(),
-            std::sync::Arc::clone(entry.value()),
-        ));
-        let _sweep = crate::util::ghost_stats::SweepScope::start();
-        let _memo = module_index::SweepMemoGuard::open();
-        // The region the four `diag.*` tags did NOT cover, and the one that
-        // holds the volume: enriching a file pulls its providers' analyses,
-        // and that happens BEFORE `collect_diagnostics` is entered. Bounding
-        // the callee from the inside is worth nothing if the caller is
-        // outside every region.
-        let _g_enrich = crate::util::ghost_stats::ScopedNs::start("diag.0_enriched_snapshot");
-        let diags = match idx.enriched_snapshot(&cached) {
-            Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
-            None => {
-                // Index copies may be refs/bag-evicted; diagnostics read
-                // refs AND the bag, so degrade to the whole-on-both-axes
-                // view, not the resident copy.
-                let whole =
-                    file_analysis::CrossFileLookup::whole_present(idx, &cached);
-                symbols::collect_diagnostics(&whole, idx, options)
-            }
-        };
-        for d in diags {
+    // Snapshot before working: values are `Arc`s, so this is a pointer copy
+    // per file, and it releases the DashMap shard guards an `iter()` would
+    // otherwise hold closed to writers for the whole sweep.
+    let entries: Vec<(std::path::PathBuf, std::sync::Arc<file_analysis::FileAnalysis>)> = ws
+        .workspace_raw()
+        .iter()
+        .map(|e| (e.key().clone(), std::sync::Arc::clone(e.value())))
+        .collect();
+    // Streaming survives the parallelism: workers send as each file finishes
+    // and the calling thread drains, so `--check` still produces output
+    // THROUGHOUT the run rather than buffering it into a final print a
+    // timeout discards whole (`docs/adr/instrument-blindness.md`). `emit` is
+    // `&mut` and stays on this thread — only the diagnostics cross.
+    let (tx, rx) =
+        std::sync::mpsc::channel::<(String, tower_lsp::lsp_types::Diagnostic)>();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            use rayon::prelude::*;
+            entries.par_iter().for_each_with(tx, |tx, (path, fa)| {
+                for (file, d) in sweep_one_file(idx, options, path, fa) {
+                    let _ = tx.send((file, d));
+                }
+            });
+        });
+        for (file, d) in rx {
             emit(&file, d);
         }
-        crate::util::timings::set_current_file(None);
-    }
+    });
     // Pack-language files (C++/…) live in the per-language sub-indexes, not the
     // Perl-only `FileStore` above. Mirror the backend's language dispatch: they
     // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
