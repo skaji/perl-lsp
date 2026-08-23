@@ -193,3 +193,38 @@ fn a_fan_in_evaluates_each_file_once_per_round() {
     );
     assert_eq!(out.changed.len(), 4);
 }
+
+/// The enqueued set includes consumers the wave then CUT.
+///
+/// It is not `changed`, and the difference is the whole point of the re-stamp
+/// gate it feeds. A consumer whose own conclusion answers did not move can
+/// still DISPATCH differently now that its provider changed, because a
+/// dispatch target resolves through the index rather than off a surface.
+/// Marking only what moved would skip exactly those — silently, since a frozen
+/// `MethodTarget` that is never re-derived just keeps answering.
+#[test]
+fn the_enqueued_set_covers_consumers_that_cut() {
+    let base = surface(&[("m", "Old")]);
+    let moved = surface(&[("m", "New")]);
+    let evaluate = |p: &Path| {
+        Some(if p == Path::new("/A.pm") { moved.clone() } else { base.clone() })
+    };
+    let baseline = |_: &Path| Some(base.clone());
+    let consumers_of = |p: &Path| {
+        if p == Path::new("/A.pm") { vec![PathBuf::from("/B.pm")] } else { Vec::new() }
+    };
+
+    let out = run_flush(vec![PathBuf::from("/A.pm")], &evaluate, &baseline, &consumers_of);
+
+    assert_eq!(
+        out.changed.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+        vec![PathBuf::from("/A.pm")],
+        "B's surface matched its baseline, so B did not move"
+    );
+    assert_eq!(
+        out.enqueued,
+        vec![PathBuf::from("/B.pm")],
+        "B was still enqueued because its provider moved — that is what the \
+         re-stamp gate needs to know, and `changed` does not say it"
+    );
+}

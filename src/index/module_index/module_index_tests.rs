@@ -2330,3 +2330,46 @@ fn invalidating_derived_copies_takes_the_bake_as_well_as_the_bag() {
          consult would be answered from the previous version of the file"
     );
 }
+
+/// The push half of the re-stamp gate, over the real index.
+///
+/// What IS tested here: a mark postdates every clock reading taken before it,
+/// so a stamp from before the wave is owed a re-stamp; a second wave re-opens
+/// the debt; and never-stamped is owed regardless.
+///
+/// What is NOT: the `max` on the mark guards two waves whose writes interleave
+/// across threads, which this single-threaded API cannot produce. It rests on
+/// the argument in `mark_provider_diff`, not on this test — said plainly so
+/// nobody reads a green suite as covering it.
+#[test]
+fn a_mark_postdates_every_stamp_that_preceded_it() {
+    use crate::model::file_analysis::CrossFileLookup;
+    let idx = ModuleIndex::new_for_cli();
+    let a = std::path::PathBuf::from("/mark/A.pm");
+
+    let before = idx.flush_epoch();
+    assert!(
+        idx.restamp_owed(&a, Some(before)),
+        "no mark yet: the gate has nothing to prove a skip with, so it fails open"
+    );
+
+    let e1 = idx.mark_provider_diff([a.clone()]);
+    assert!(
+        e1 > before,
+        "the mark postdates every clock reading a racing stamp could have taken"
+    );
+    assert!(
+        idx.restamp_owed(&a, Some(before)),
+        "a stamp taken before the wave is owed a re-stamp, even though it \
+         happened after this file's previous one"
+    );
+    assert!(!idx.restamp_owed(&a, Some(e1)), "stamped after the wave: covered");
+
+    let e2 = idx.mark_provider_diff([a.clone()]);
+    assert!(e2 > e1, "the clock is monotone across waves");
+    assert!(idx.restamp_owed(&a, Some(e1)), "a second wave re-opens the debt");
+    assert!(
+        idx.restamp_owed(&a, None),
+        "never stamped is owed regardless — a rehydrated copy always reads None"
+    );
+}

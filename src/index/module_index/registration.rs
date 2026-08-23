@@ -537,7 +537,7 @@ impl ModuleIndex {
         // them back — an enriched copy of a DEGRADED analysis claimed to be
         // whole. Clone carries them.
         let mut copy: FileAnalysis = (*whole).clone();
-        copy.enrich_imported_types_with_keys(Some(self));
+        copy.enrich_imported_types_with_keys_for(Some(self), Some(&cached.path));
         let arc = Arc::new(copy);
         // Cycle-tainted: some dep declined mid-enrich (mutual imports), so
         // this copy baked a RAW view of that dep. Caching it would serve
@@ -950,6 +950,42 @@ impl ModuleIndex {
     /// changed/saved file's copy is stale). Pack sub-indexes AND the Perl
     /// hub each carry one — the watcher and the bulk-index writers rely on
     /// this taking effect on both.
+    /// Record that a provider of each path moved. Returns the epoch used.
+    ///
+    /// The push half of the re-stamp gate. The epoch is minted before the
+    /// marks are written, which is safe only because the CALLER has already
+    /// registered the changed files' fresh analyses by the time it gets here:
+    /// a stamp that reads the new clock therefore also sees the new provider,
+    /// so honouring its own mark is correct. A caller that marked BEFORE
+    /// publishing the change would break that and needs a different ordering —
+    /// stated here rather than left as an accident of one call site.
+    ///
+    /// Called with the wave's ENQUEUED set, not its moved set: a consumer
+    /// whose own answers did not move can still dispatch differently once its
+    /// provider changed, and cutting the mark where the wave cut would skip
+    /// exactly those.
+    pub fn mark_provider_diff(
+        &self,
+        paths: impl IntoIterator<Item = std::path::PathBuf>,
+    ) -> u64 {
+        use std::sync::atomic::Ordering;
+        let epoch = self.core.flush_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut n = 0u64;
+        for p in paths {
+            // Max, not overwrite: marks arrive from concurrent waves and the
+            // gate is a `>=` against the LATEST provider move. A lower epoch
+            // landing last would license a skip the newer wave forbade.
+            self.core
+                .provider_diff_gen
+                .entry(p)
+                .and_modify(|g| *g = (*g).max(epoch))
+                .or_insert(epoch);
+            n += 1;
+        }
+        crate::util::ghost_stats::count_by("restamp.marked", n);
+        epoch
+    }
+
     /// Drop every resident copy DERIVED from a path's blob — the decoded bag
     /// and the baked conclusion map together.
     ///

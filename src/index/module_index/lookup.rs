@@ -242,6 +242,38 @@ impl CrossFileLookup for ModuleIndex {
         self.enrichment_epoch()
     }
 
+    fn flush_epoch(&self) -> u64 {
+        self.core.flush_epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn restamp_owed(&self, path: &std::path::Path, stamped_at: Option<u64>) -> bool {
+        // Never stamped: owed, unconditionally. Every rehydrated copy reads
+        // `None` (the field is `serde(skip)`), so this is the arm that keeps a
+        // cold process behaving exactly as it did before the gate existed.
+        let Some(stamped_at) = stamped_at else {
+            crate::util::ghost_stats::count("restamp.owed_never_stamped");
+            return true;
+        };
+        match self.core.provider_diff_gen.get(path) {
+            Some(mark) if stamped_at >= *mark => {
+                crate::util::ghost_stats::count("restamp.skipped");
+                false
+            }
+            Some(_) => {
+                crate::util::ghost_stats::count("restamp.owed_provider_moved");
+                true
+            }
+            // No mark at all. Not "no provider moved" — "no wave has ever
+            // spoken about this file", which is also what a lost mark, a
+            // never-flushed session and an uncovered freshness edge all look
+            // like. Fail open; the gate is worth only what it can prove.
+            None => {
+                crate::util::ghost_stats::count("restamp.owed_no_mark");
+                true
+            }
+        }
+    }
+
     fn get_cached(&self, module_name: &str) -> Option<Arc<CachedModule>> {
         self.get_cached(module_name)
     }

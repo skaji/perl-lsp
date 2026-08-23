@@ -45,6 +45,15 @@ pub struct FlushOutcome {
     pub rounds: usize,
     /// Files evaluated, including those that cut. The propagation's real cost.
     pub evaluated: usize,
+    /// Every file the wave ENQUEUED because a provider's answers moved —
+    /// including those that then cut.
+    ///
+    /// Distinct from `changed` on purpose, and the difference is the whole
+    /// point of the re-stamp gate: a consumer whose own conclusion answers did
+    /// not move can still DISPATCH differently now that its provider changed,
+    /// because a dispatch target is resolved through the index rather than
+    /// read off a surface. Marking only what moved would skip exactly those.
+    pub enqueued: Vec<PathBuf>,
     /// The round cap fired: the surfaces never stopped moving. The flush is
     /// abandoned rather than published — a half-propagated generation is worse
     /// than none, because a consult pinned to it would compose answers from a
@@ -109,10 +118,14 @@ pub fn run_flush(
             }
             crate::util::ghost_stats::count("flush.moved");
             recorded.insert(path.clone(), surface);
-            frontier.extend(consumers_of(&path));
+            let consumers = consumers_of(&path);
+            out.enqueued.extend(consumers.iter().cloned());
+            frontier.extend(consumers);
         }
     }
 
+    out.enqueued.sort();
+    out.enqueued.dedup();
     out.changed = recorded.into_iter().collect();
     // Sorted for the same reason the surface itself is: the caller publishes
     // this and compares it, and a `HashMap` drain order would make two equal
