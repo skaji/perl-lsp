@@ -491,8 +491,13 @@ impl LanguageServer for Backend {
         match pack_path {
             Some(path) => self.schedule_pack_invalidate(path, false),
             None => {
+                // Spawned, not awaited — the same shape `schedule_pack_invalidate`
+                // uses, and for the same reason: tower-lsp runs notifications on
+                // one task, so awaiting a re-parse + re-register here would hold
+                // every following didChange behind it. A save is the most
+                // frequent trigger this path has.
                 if let Ok(path) = uri.to_file_path() {
-                    self.reindex_saved_perl(vec![(path, FileChangeType::CHANGED)]).await;
+                    self.spawn_reindex_saved_perl(path);
                 }
             }
         }

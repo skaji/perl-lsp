@@ -4,6 +4,46 @@
 use super::*;
 
 impl Backend {
+    /// Fire-and-forget re-index for one saved file.
+    ///
+    /// Spawned rather than awaited, the same shape `schedule_pack_invalidate`
+    /// uses and for the same reason: tower-lsp runs notifications on one task,
+    /// so awaiting a re-parse + re-register inside `did_save` would hold every
+    /// following didChange behind it — and a save is the most frequent trigger
+    /// this path has.
+    pub(super) fn spawn_reindex_saved_perl(&self, path: PathBuf) {
+        let files = Arc::clone(&self.files);
+        let module_index = Arc::clone(&self.module_index);
+        let ctx = self.diag_ctx();
+        tokio::spawn(async move {
+            let dirty = Self::reindex_perl_blocking(
+                files,
+                module_index,
+                vec![(path, FileChangeType::CHANGED)],
+            )
+            .await;
+            if !dirty.is_empty() {
+                ctx.republish_dirty(&dirty).await;
+            }
+        });
+    }
+
+    /// Re-index changed Perl files and refresh whoever depended on them,
+    /// awaiting the result. `didChangeWatchedFiles` uses this; a save uses the
+    /// spawned twin above.
+    pub(super) async fn reindex_saved_perl(
+        &self,
+        perl_changes: Vec<(PathBuf, FileChangeType)>,
+    ) {
+        let dirty = Self::reindex_perl_blocking(
+            Arc::clone(&self.files),
+            Arc::clone(&self.module_index),
+            perl_changes,
+        )
+        .await;
+        // Off-pipeline: each republish re-enriches.
+        self.spawn_republish(dirty);
+    }
 
     /// Re-index Perl files whose bytes on disk changed, and name everyone who
     /// must be refreshed because of it.
@@ -16,16 +56,17 @@ impl Backend {
     /// answering from the version before the save, for the rest of the
     /// session. The pack languages were given this (`schedule_pack_invalidate`,
     /// the H1 fix); Perl was not. `e2e/saved_dep_edit.lua` is the guard.
-    pub(super) async fn reindex_saved_perl(
-        &self,
+    ///
+    /// Over Arcs only, so the spawned caller can move it into a task.
+    async fn reindex_perl_blocking(
+        files: Arc<crate::index::file_store::FileStore>,
+        module_index: Arc<ModuleIndex>,
         perl_changes: Vec<(PathBuf, FileChangeType)>,
-    ) {
+    ) -> std::collections::HashSet<PathBuf> {
         if perl_changes.is_empty() {
-            return;
+            return Default::default();
         }
-        let files = Arc::clone(&self.files);
-        let module_index = Arc::clone(&self.module_index);
-        let dirty = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             // Externally changed deps break their consumers' enrichment too
             // — collect the dirty closure while the records are in hand and
             // hand it back for the open-doc republish below.
@@ -162,9 +203,7 @@ impl Backend {
             dirty_all
         })
         .await
-        .unwrap_or_default();
-        // Off-pipeline: each republish re-enriches.
-        self.spawn_republish(dirty);
+        .unwrap_or_default()
     }
     pub(super) fn diagnostic_options(&self) -> symbols::DiagnosticOptions {
         *self.diag_options.lock().unwrap()
