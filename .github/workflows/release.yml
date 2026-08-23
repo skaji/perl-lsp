@@ -58,8 +58,10 @@ jobs:
           cpm install -g Carton::Snapshot   # --resolver snapshot needs this to read cpanfile.snapshot
           cpm install -L local --resolver snapshot
 
+      # The release gate has the same half-gate as CI's: a plain build
+      # lang-skips the pack corpus and reports it green. Ship on the whole one.
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --features cpp
 
       - name: Run gold-corpus harness
         run: perl gold-corpus/run.pl

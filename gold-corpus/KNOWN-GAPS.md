@@ -447,3 +447,25 @@ diagnostic downstream of it went quiet. Any consumer of a warm-scanned analysis
 that reads type facts was exposed to the same thing. Fixed by routing the warm
 decodes through the API that marks a bagless copy evicted, and rehydrating for
 the files whose projections actually need the bag.
+
+## The gates test a configuration the releases do not ship
+
+CI and the release gate build `--features cpp`, so the whole corpus runs and
+`lang-skip` is 0. The **shipped artifacts do not**: `release.yml`'s
+per-target build stays plain, deliberately, because whether the pack
+languages ship enabled is a product decision — they are beta, and
+`--languages` advertises them as such — not a CI-hygiene one.
+
+So the gates are now honest about the code the repo CONTAINS, and silent
+about the code a user RECEIVES. Two things follow, and neither is implied by
+a green check:
+
+- A pack regression is caught before merge, but a released binary is not
+  exercised in the configuration it ships in. The reverse is also true: a
+  Perl-only build could break in a way no gate sees, because nothing now
+  builds one.
+- "CI tests cpp" must not be read as "releases contain tested cpp." Until
+  the product decision lands, those are different binaries.
+
+Closing this means deciding what releases ship, then making the gate build
+match it — not adding a flag.
