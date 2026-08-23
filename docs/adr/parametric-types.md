@@ -28,17 +28,20 @@ pub enum ParametricType {
     /// Two distinct fields because the duality is intrinsic.
     ResultSet { base: String, row: String },
 
-    /// Type-level projection. `RowOf<ResultSet>` reduces to
-    /// `ClassName(row)`. Lazy — the bag's projection reducer
-    /// evaluates when consumed. Plugin emits `RowOf(receiver)`
-    /// for `find` / `first` / `single` / etc. when the port lands.
-    RowOf(Box<InferredType>),
+    /// A template/generic instance (`Box<Widget>`) peeled from its
+    /// declared-type spelling. `base` is the dispatch axis; `args`
+    /// ride along un-consumed for instantiation-aware typing.
+    Instance { base: String, args: Vec<InferredType> },
 
     // Future: Wrapped { class, inner } for Promise/Future/Lazy,
     // ListOf { class?, element } for Mojo::Collection/ArrayRef,
     // HashRef { key, value? }, Plugin { id, args } escape hatch.
 }
 ```
+
+There is no value-side `RowOf` variant — `find`/`first`/… project
+lazily through `ReturnExpr::Operator(RowOf)` on the deferred side
+(see "`RowOf` is a type, not a method-table entry" below).
 
 `Box<dyn Trait>` (literal "abstract base class") loses serde —
 trait objects don't roundtrip through bincode without `typetag`.
@@ -59,18 +62,22 @@ impl ParametricType {
 ```
 
 `ResultSet` returns `&base` for `class_name`, `&row` for
-`hash_key_class`, and `Some(Class(row))` for `method_arg_owner`
-when `m` is a row-keyed method (search/find/create/update/...) —
-None otherwise. Future flavors carry their own policy inside
-their own match arm. **No data-layout-special-casing on
-`InferredType` accessors.** No method-name allowlist in
+`hash_key_class`, and `Some(Bridged { class: row })` for
+`method_arg_owner` when `m` is a row-keyed method
+(search/find/create/update/...) — None otherwise. `Bridged` is
+deliberately distinct from `Class`: a DBIC column is addressable
+via `search`/`find` args and its accessor, but `$row->{col}` is
+not a literal hash slot (Rule #8 — plugin-owned content doesn't
+masquerade as the class's own keys). Future flavors carry their
+own policy inside their own match arm. **No data-layout-special-
+casing on `InferredType` accessors.** No method-name allowlist in
 consumers.
 
 ### `RowOf` is a type, not a method-table entry
 
 `find`'s return type isn't "ClassName(row)" baked at the call site
 or hardcoded in a per-method table — it's `RowOf(receiver_type)`.
-The bag-side `ParametricProjectionReducer` evaluates by recursing
+`ReturnExprReducer`'s `eval_return_expr` evaluates by recursing
 into the operand. Composes: `ListOf<None, RowOf<Receiver>>` is the
 shape for `->all` when it lands.
 

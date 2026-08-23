@@ -19,7 +19,7 @@ pub struct ReceiverGated<T> { gate: String /*ClassName*/, inner: T }
 pub enum GateResult<U> { Applies(U), DoesNotApply, ReceiverUntyped }
 impl<T> ReceiverGated<T> {
     pub fn resolve_for(&self, receiver_class: Option<&str>,
-        parents: &PackageParents, mi: Option<&ModuleIndex>) -> GateResult<&T>;
+        local: &dyn LocalParents, module_index: Option<&dyn CrossFileLookup>) -> GateResult<&T>;
 }
 ```
 
@@ -32,8 +32,10 @@ structural: the type carries the rule, the consumer can't re-decide it.
 
 `resolve_for` walks the single isa seam — the free `class_isa(class,
 target, local, module_index)` over local `PackageFacts::parents` ∪
-cross-file `parents_cached`, the same nodes `parents_of` enumerates. No
-second ancestry walk exists.
+cross-file `parents_cached`. That is real ancestry only — a strict
+subset of what `parents_of` enumerates, which also appends the synthetic
+app-surface edge (see "Still deferred," below). No second ancestry walk
+exists.
 
 The `gate` is one `ClassName` in Phase 1. Widening it to a small set later
 is a change to `resolve_for`'s body, not to call sites — they only ever

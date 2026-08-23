@@ -62,10 +62,13 @@ PERL_LSP_HEAP_DUMP=1 /usr/bin/time -v perl-lsp --references <abseil-root> \
 Read `Maximum resident set size` from the `time -v` output (KB; divide by
 1024 for MB) and the `[heap-dump]` block for the payload breakdown. Note:
 this CLI path (`cli_full_startup`) is a fair proxy for cold **indexing**
-wall-time and peak RAM, but do NOT use its `--references`/`--definition`
-*query results* as ground truth for what the real async LSP server answers
-— see the caveat in step 3 (the CLI path returned 0 references for a query
-that the real LSP-protocol path returned 34 for, on the same position).
+wall-time and peak RAM. Its `--references`/`--definition` *query results*
+match what the real async LSP server answers once indexing completes — the
+CLI and the live session share the exact `resolve()`/`references()` path
+(`docs/clangd-comparison.md`) — but the live server can still answer
+`null`/degraded before that point (the bounded-wait window in step 3), so
+don't compare an early live-session response against the CLI's
+already-fully-indexed one.
 
 ## 2. Cold full-workspace index + peak RAM (clangd)
 
@@ -93,9 +96,11 @@ quoting a peak.
 ## 3. Cold time-to-first-answer over the real LSP protocol (both tools)
 
 This is the number that matters for "does the editor feel responsive on
-open" — NOT the CLI `--batch`/`--references` paths, which under- or
-over-report relative to the real async server; this extends to the CLI
-`--references` path too — see the coverage caveats in `docs/clangd-comparison.md`.
+open" — NOT the CLI `--batch` path, which runs a full synchronous index
+before answering and so never shows the live server's early
+null/degraded window; `--references` is not a separate concern here —
+the CLI and the live session share the exact `resolve()`/`references()`
+path, see `docs/clangd-comparison.md`'s Coverage section.
 
 ```bash
 python3 e2e/lsp_latency.py --bin ./target/release/perl-lsp \
@@ -178,8 +183,11 @@ that:
 Symbols used in this pass (abseil): `absl::Mutex` (class, `mutex.h:163:48`),
 `absl::StrCat` (free function, `str_cat.cc:58:13` / `str_cat.h:574:34`),
 `ABSL_GUARDED_BY` (function-like macro, `thread_annotations.h:58:9`),
-`Mutex::Lock` (method, `mutex.h:195:15`). All four showed the same
-cross-TU-references gap — see the comparison doc.
+`Mutex::Lock` (method, `mutex.h:195:15`). All four are a reminder to get
+the coordinate convention right: `--references` takes 0-based input, and a
+1-based position lands one row off the target token and reads as a
+references gap that isn't one — see the comparison doc's Coverage section
+for the corrected counts.
 
 ## What a future full-LLVM run would need
 

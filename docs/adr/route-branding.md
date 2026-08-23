@@ -61,8 +61,9 @@ parent's map plus the local key."
 `->to('ctrl#')` / `->to(controller => …)` **set** the controller (and
 stash) on the produced `BrandedRoute`; `->to('#action')` **reads** the
 inherited controller off its receiver's brand. The plugin exposes the
-receiver's accumulated defaults to its `on_method_call` hook as
-`ctx.receiver_route_defaults` (`[[key, value], ...]`, `()` when
+receiver's accumulated defaults to its `on_match` hook via the
+`route_defaults` projection on the receiver capture
+(`m.captures.recv.route_defaults`, `[[key, value], ...]`, `()` when
 unbranded); `controller` is the distinguished key. No second
 symbolic-execution pass — the brand resolves inside
 `Builder::resolve_invocant_class_tree`, the single chain typer (rule:

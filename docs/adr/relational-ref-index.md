@@ -53,11 +53,14 @@ Three sub-decisions, each load-bearing:
    (only rows that already match the name key). No semantic rule moves into
    the database, so no rule can drift between a SQL copy and a Rust copy.
 
-2. **Rows carry the post-fold verdicts.** Shredding happens at the same seam
-   where the blob is encoded — *after* `fold_to_fixed_point` has baked
-   each ref's `RefBinding` (method target, invocant class, package pin) and
-   rewritability into the refs. So the columns are decision-ready facts, not
-   raw syntax, and the common matcher arms run on rows alone.
+2. **Rows are a name/file candidate pair, not a verdict store.** The design
+   below sketches a row-level fast path — decision-ready columns the common
+   matcher arms could read straight off a row — but that path was never
+   built: no matcher arm reads a column today, so the shipped `refs` table
+   carries only `(name_id, file_id)`. Retrieval narrows the candidate file
+   set; the per-`RefKind` matcher then runs Rust's full predicate against
+   the rehydrated `Ref`, for every candidate file, every time (see "The
+   query path" and `matcher_view` below).
 
 3. **The row-can't-decide fallback is single-file rehydration, and it is
    bounded by construction.** Any matcher arm that today consults analysis
@@ -92,33 +95,23 @@ CREATE TABLE IF NOT EXISTS strings(  -- the interner: names, packages, classes
   s      TEXT NOT NULL UNIQUE
 );
 CREATE TABLE IF NOT EXISTS refs(
-  file_id   INTEGER NOT NULL,       -- REFERENCES files
   name_id   INTEGER NOT NULL,       -- match key: unqualified_target_name(), interned
-  full_name_id INTEGER,             -- interned full spelling iff != match key (FQ calls)
-  kind      INTEGER NOT NULL,       -- RefKind discriminant
-  start_row INTEGER NOT NULL, start_col INTEGER NOT NULL,
-  end_row   INTEGER NOT NULL, end_col   INTEGER NOT NULL,
-  access    INTEGER NOT NULL,       -- Read / Write / Declaration
-  flags     INTEGER NOT NULL,       -- bitfield: rewritable, folded_from-present,
-                                    -- resolved (qual is a build-time verdict vs unknown), ...
-  qual_kind INTEGER NOT NULL,       -- what qual_id means, per RefKind (see below)
-  qual_id   INTEGER,                -- interned qualifier; NULL = none/unresolved
-  arg_count INTEGER                 -- NULL when unknown
-);
-CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name_id);
+  file_id   INTEGER NOT NULL,       -- REFERENCES files
+  PRIMARY KEY (name_id, file_id)
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);   -- invalidation + per-file ops
 ```
 
-The `qual_kind`/`qual_id` pair is the one column every kind-specific matcher
-arm keys on — the qualifier that arm compares against the target:
-
-| RefKind | qual_kind | qual_id |
-|---|---|---|
-| `FunctionCall` | `ResolvedPackage` | the `Function` binding's package |
-| `MethodCall` | `InvocantClass` | the `Method` binding's PostFold `invocant_class`; NULL = build-unresolved (fallback candidate) |
-| `DispatchCall` | `Dispatcher` | `dispatcher` |
-| `HashKeyAccess` | `HashKeyOwnerSub` / `HashKeyOwnerClass` | owner name |
-| `Variable` / `PackageRef` / `ContainerAccess` | `None` | NULL |
+The table IS the name index (`WITHOUT ROWID` on `(name_id, file_id)`), and
+every reader is a set-valued projection onto that pair — `DISTINCT file_id`
+for a name, `DISTINCT name_id`, `EXISTS` on the pair. There is no `qual_kind`
+column: a row-level verdict per `RefKind` (which qualifier a `FunctionCall`,
+`MethodCall`, `DispatchCall`, or `HashKeyAccess` compares against the target)
+was the design's row-level fast path, but no matcher arm ever earned one —
+every arm still rehydrates the file's full `Ref` and compares in Rust (see
+"The query path"). A row count is likewise a *candidate* count, not an
+occurrence count, and the over-approximation is what makes
+`unused_exported_syms` sound.
 
 One row shape for every kind, no per-kind tables: the matcher arms already
 switch on `RefKind`; the row just needs to carry each arm's compare key. Any

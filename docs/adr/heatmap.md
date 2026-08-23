@@ -152,8 +152,8 @@ Identity + counting go through `resolve::resolve(...)` at the symbol's declared
 name token, then `references()` — the heatmap never maps a `Symbol` to a target
 itself, so its counts cannot diverge from the references verb (the N-path
 asymmetry the CandidateSet ADR exists to prevent). `heatmap_symbol_eligible` in
-`main.rs` is only a listing policy (which kinds a usage report shows), not an
-identity decision. Should whole-workspace scale ever demand a bulk path, it must
+`lsp/cli/heatmap.rs` is only a listing policy (which kinds a usage report
+shows), not an identity decision. Should whole-workspace scale ever demand a bulk path, it must
 be built as a CandidateSet-based enumeration (one construction shared with the
 projections), never a parallel walk over raw refs.
 

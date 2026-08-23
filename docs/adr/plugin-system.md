@@ -146,9 +146,10 @@ inference returns nothing useful — but `Expr(span)` for the body's last
 expression IS populated by the time anyone queries the synthesized
 callable's return type.
 
-Mechanism: `EmitAction::Method.return_via_edge: Option<Span>`. Plugin
-sets it to `args[N].sub_body_last_expr_span` (populated by the builder
-on anonymous-sub args). Builder pushes `Symbol(sid) → Edge(Expr(span))`
+Mechanism: `EmitAction::Method.return_via_edge: Option<WitnessAttachment>`.
+Plugin sets it to `args[N].callable_return_edge` (populated by the builder
+from the arg's bag-resolved `CodeRef` shape — an anonymous-sub body, a
+rebound scalar, or a named `\&Foo::bar` ref). Builder pushes `Symbol(sid) → Edge(Expr(span))`
 instead of the usual `Symbol(sid) → InferredType(rt)`. The bag's edge-
 chase resolver follows it at query time. Class-scoped synth gets the
 edge mirrored to `PackageSymbol{package, name}` by
@@ -198,7 +199,7 @@ trust boundary between bundled and user scripts.
 
 - `src/plugin/mod.rs` — authoritative type definitions for `EmitAction`,
   `CallContext`, `Trigger`, query-hook answer shapes.
-- `frameworks/*.rhai` — six bundled examples; `mojo-routes.rhai` exercises
+- `frameworks/*.rhai` — bundled examples; `mojo-routes.rhai` exercises
   `MethodCallRef` + `overrides()`, `minion.rhai` exercises `on_completion` +
   `on_signature_help` + the `ctx["call"]` workaround.
 - `docs/PLUGIN_AUTHORING.md` — author-facing reference (write, validate,

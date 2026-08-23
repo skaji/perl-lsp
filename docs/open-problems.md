@@ -35,11 +35,12 @@ idiom and resolves without it.
 
 ## Qualified-name resolution suppression is coarse
 
-`SUPER::method` and other `::`-qualified call forms are flagged
-unresolved more aggressively than they should be. The suppression rule
-keys on syntactic shape rather than asking "does this qualified name
-resolve through the MRO / the named package?" — so legitimate
-`SUPER::` dispatch reads as a diagnostic-worthy unresolved call. The
+`SUPER::method` and other `::`-qualified call forms are unconditionally
+skipped by the unresolved-method diagnostic, before any resolution is
+attempted. The skip keys on syntactic shape (any non-bare `MethodToken`)
+rather than asking "does this qualified name resolve through the MRO /
+the named package?" — so a genuinely broken `SUPER::` or `Class::method`
+dispatch goes undiagnosed right alongside the legitimate ones. The
 honest fix resolves the qualified target against the same ancestor /
 package graph method dispatch already walks, rather than special-casing
 the `SUPER::`/`::` token shape (a rule-#10 smell). Hint-level today, so

@@ -59,7 +59,6 @@ The witness bag is a **build-time type-inference scaffold** (see
 `docs/adr/bag-canonical.md`). During `build()` the fold consumes it to a fixed
 point and **bakes its conclusions into ordinary `FileAnalysis` fields**:
 
-- `return_types` (name-keyed map) — `seed_return_types_from_bag`.
 - `Ref::binding` — the build-time resolution outcome (dispatch edge,
   invocant class, package pin), filled PostFold.
 - `Ref::arg_count`, `Symbol::arity`, `Symbol::deref_stack`, etc.
@@ -95,8 +94,8 @@ Held resident for **every** indexed file, exactly as today:
   `workspace/symbol` and "which files could reference X" without touching any
   body.
 - `PackFacts` (the include closure, specialization edges, template params),
-  `packages`, `return_types` — the cross-file visibility / inheritance /
-  baked-return metadata the graph walk and MRO need.
+  `packages` — the cross-file visibility / inheritance metadata the graph
+  walk and MRO need.
 
 The completeness-critical, whole-tree queries are **bag-free by construction**
 (none of them call a reducer). So dropping the bag cannot make references or
@@ -189,12 +188,12 @@ kept as an optional **Slice 3** to chase clangd's ~320 MB, not needed to hit
 | `goto-def` | `Ref::binding` (method target), `symbols` | no | complete, resident |
 | `rename` / `prepareRename` | `refs`, `symbols` | no | complete, resident |
 | `workspace/symbol` | `all_defs` (name→file) | no | complete, resident |
-| `hover` on a def / signature | `symbols`, `return_types` | no | complete, resident |
-| `hover`-type / type-constrained completion | reducers / `expr_type_at_span` | **yes** | rehydrate exact bag from SQLite |
+| `hover` on a def / signature (name, params, doc) | `symbols` | no | complete, resident |
+| `hover`'s return-type line, type-constrained completion | reducers / `expr_type_at_span` / `SubInfo::return_type` | **yes** | rehydrate exact bag from SQLite |
 | cross-file method-return chain | `find_method_return_type` → `PackageSymbol` | **yes** | rehydrate target file's bag |
 
 The whole-tree completeness invariant lives entirely in the first five rows, all bag-free
-— so it holds by construction, resident or not. The two bag-consuming rows are
+— so it holds by construction, resident or not. The bag-consuming rows are
 *type-inference value-adds*, not the completeness differentiator; they rehydrate
 the **exact** persisted bag and therefore return byte-identical answers to
 today. The transparency invariant holds: a rehydrated `FileAnalysis` is the same

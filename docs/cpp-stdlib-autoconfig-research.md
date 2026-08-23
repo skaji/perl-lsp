@@ -5,10 +5,11 @@
 > hinges on a correct `compile_commands.json`; without it the stdlib isn't found and the
 > experience "collapses to red squiggles everywhere." If we make a hand-maintained compile DB
 > a *requirement*, we forfeit the whole advantage. The `#include`-closure macro gather in
-> `src/build/cpp_reparse/` already walks quoted includes up ancestor dirs — but it skips `<...>`
-> system includes because it doesn't know **where the stdlib lives**. This doc is about
-> discovering (a) system/stdlib header roots, (b) the project's own `-I` dirs, and (c) key
-> predefined macros — **without running a build**, cheaply, cached, and degrading gracefully.
+> `src/build/cpp_reparse/` already walks quoted includes up ancestor dirs, and resolves `<...>`
+> system includes by asking the compiler **where the stdlib lives** (`src/build/cpp_toolchain.rs`,
+> §3 below). This doc is the design record for that discovery: (a) system/stdlib header roots,
+> (b) the project's own `-I` dirs, and (c) key predefined macros — **without running a build**,
+> cheaply, cached, and degrading gracefully.
 
 ---
 
@@ -48,10 +49,11 @@ the driver), so the compiler-probe of `arguments[0]` remains necessary. The two 
 3. Heuristic fallback when no compiler and no DB: known stdlib locations + walk-up for project
    `-I` roots.
 
-**Single highest-payoff first step:** implement the compiler probe (#2) — `cc -E -v -` +
-`cc -dM -E -` + `-print-resource-dir`, cached per toolchain — because it delivers the stdlib
-header roots *and* the predefined macros that unblock the existing `<...>` macro-gather in one
-cheap, build-free shot, and it is the fallback that makes every other layer optional.
+**Shipped:** the compiler probe (#2) — `cc -E -v -` + `cc -dM -E -` + `-print-resource-dir`,
+cached per toolchain — is implemented in `src/build/cpp_toolchain.rs` and wired into the
+existing `<...>` macro-gather, delivering the stdlib header roots *and* the predefined macros
+in one cheap, build-free shot; it is the fallback that makes every other layer optional. L1
+(`compile_commands.json` consumption) is the natural next layer to add.
 
 ---
 
@@ -356,20 +358,21 @@ Parsing rules: L2a — literal-marker slice, trim, keep order, dedup. L2b — sp
 into name + rest. Both gcc and clang share these interfaces, so **one parser** covers Linux + macOS;
 MSVC is the separate env-diff path.
 
-### The single highest-payoff first step
+### L2 shipped first — why that was the right call
 
-**Ship L2 (the compiler probe), cached per toolchain, before anything else.** Rationale:
+**L2 (the compiler probe) is implemented** (`src/build/cpp_toolchain.rs`), cached per toolchain
+and wired into `cpp_reparse::gather`. Rationale, for the record:
 
-- It directly unblocks the **existing** `<...>` macro-gather in `cpp_reparse.rs` — today it skips
-  system includes purely because it lacks the roots; L2a hands it the roots and L2b hands it the
-  predefined-macro seed that makes conditional-compilation in those headers resolve correctly.
+- It directly unblocks the **existing** `<...>` macro-gather in `cpp_reparse.rs` — L2a hands it
+  the roots and L2b hands it the predefined-macro seed that makes conditional-compilation in
+  those headers resolve correctly.
 - It's the **fallback that makes L0/L1 optional** — with L2 working, the engine is genuinely
   zero-config on any machine that has a compiler on PATH (i.e. any machine that can build C/C++),
   which is the whole differentiator.
 - It's **cheap and one-shot** — 2–3 spawns, cached under toolchain identity, amortized to zero.
 - It's **portable** — the same `-E -v` / `-dM` parser serves gcc and clang on Linux and macOS.
 
-L1 (consume `compile_commands.json` when present) is the natural **second** step — it sharpens
+L1 (consume `compile_commands.json` when present) is the natural **next** layer — it sharpens
 *project* include/define accuracy for configured builds at near-zero cost — and L3 heuristics are a
 thin safety net for the no-compiler sandbox. Do **not** build CMake File API or Makefile parsing
 until real usage shows L1+L2 leaving a gap; they're heavier and mostly redundant with the probe.

@@ -387,6 +387,14 @@ skip count as something the summary shouts about.
 
 # The gate split — adjudication
 
+**Closed by measurement, not by this adjudication.**
+`docs/prompt-scale-validation-hitlist.md` measures the post-walk drain at
+1.4 s at 138k files — the multi-minute drain this section's risk-weighing
+assumes throughout does not exist, which retires the `attached`/`durable`
+split before it is built. What follows is kept as the reasoning against a
+drain that turned out not to exist; the verdict below is moot, not a live
+recommendation.
+
 The design, from `fc863769`'s Tier 1 #1: split `IndexReady.perl` into
 `attached` (opens at walk end) and `durable` (opens at drain end), plus
 worker-time registration of stripped copies behind a pending-blob overlay.

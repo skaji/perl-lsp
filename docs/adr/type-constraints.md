@@ -90,10 +90,14 @@ Erasure is the right call because it satisfies every *resolution* need
 A first-class `InferredType::Maybe(_)` would buy exactly one capability
 erasure can't: the unguarded-optional-access diagnostic (`$t->process`
 on a `Maybe` with no intervening `if ($t)` / `//` guard). That
-capability is not buildable on the variant alone — it needs
-flow-sensitive guard narrowing the engine doesn't have, and to avoid
-being a misleading partial lint it needs optionalness sourced from
-`//` / guards / `->{k}` / signature defaults, not just `Maybe[...]`.
+diagnostic has since landed — flow-sensitive guard narrowing
+(`docs/adr/flow-narrowing.md`) feeds a first-class
+`InferredType::Optional(Box<_>)` (`docs/adr/optional-types.md`) into D2
+`optional-deref` (`docs/adr/narrowing-diagnostics.md`) — but its
+optionalness comes from branch/return arms and the quoted-string
+`isa => 'Maybe[T]'` form, not from this plugin's bareword `Maybe[...]`
+constructor fold, which still erases (`docs/prompt-optional-types.md`
+tracks wiring it in).
 
 A speculative variant would ripple through every `match` on
 `InferredType` (the "never `_ =>`" invariant means every consumer must
@@ -105,8 +109,10 @@ like `Parametric` delegates to its flavor) plus a new `maybe_inner()`
 projection, the plugin fold flips passthrough → wrap. Additive, not a
 refactor — which is *why* deferring is safe.
 
-**Revisit only when the nullability diagnostic is committed as a
-feature, and budget the flow-narrowing + idiom-sourcing with it.**
+**Revisit this fold when the bareword `Maybe[...]` path needs to feed
+the landed `Optional` lattice** (`docs/prompt-optional-types.md`) — the
+diagnostic and its flow-narrowing are already budgeted and built; what
+remains is wiring this constructor's fold into them.
 
 ## Trade-offs
 

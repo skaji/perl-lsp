@@ -42,9 +42,10 @@ resolvable by the time each contribution is queried.
 
 `resolve_expression_type` gains an `array_element_expression` arm
 that queries the array's witness and projects via `element_at`.
-Both cursor-context completion AND
-`method_call_invocant_class_with_tree` (hover, dispatch) route
-through this same arm.
+Cursor-context completion falls back to this arm when no witness is
+recorded at the node's span; `method_call_invocant_class` (hover,
+dispatch) reads the same witness tree-free, through
+`expr_type_at_span`.
 
 No new bag attachment was needed. `Variable{"@arr", scope}` is
 already the canonical store; tuple-shape sequences ride a richer
@@ -52,7 +53,9 @@ payload there. `Container(ArrayId)` and `SequenceAccess(Span)`
 attachments earn their entry in later phases when cross-method
 contributions and reducer-time projection become load-bearing.
 
-### List operators ride a `SequenceTransform` payload
+### List operators would ride a `SequenceTransform` payload
+
+Proposed shape, not landed — the spike scope was the container only.
 
 ```rust
 pub enum WitnessPayload {
@@ -69,13 +72,13 @@ pub enum SeqOp {
 }
 ```
 
-One `SequenceTransformReducer` claims the payload, recurses on
-`source` via the registry, applies the per-op rule. Nested
-operators (`map { … } sort grep { … } @names`) are nested
-witnesses; the reducer materializes innermost first.
+A `SequenceTransformReducer` would claim the payload, recurse on
+`source` via the registry, and apply the per-op rule. Nested
+operators (`map { … } sort grep { … } @names`) would be nested
+witnesses; the reducer would materialize innermost first.
 
 New operator (`first`, `pairs`, `pairmap`) → one `SeqOp` variant +
-one `match` arm. Not landed yet; the spike scope was the container.
+one `match` arm, once this lands.
 
 ### Top-level scripts seed `current_package = Some("main")`
 

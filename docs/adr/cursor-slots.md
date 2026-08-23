@@ -43,8 +43,10 @@ enum Slot {
 }
 ```
 
-- **`detect_slot(doc, point) → Slot`** is the one entry; per-language
-  detectors live BEHIND it (Perl's = today's `cursor_context` logic,
+- **`detect_slot(doc, point) → Slot`** answers the identity question
+  (Member/Key/Identifier/Import/ModulePath); `detect_call_slot` answers
+  the orthogonal arg-position question sig-help needs. Per-language
+  detectors live BEHIND both (Perl's = today's `cursor_context` logic,
   pack's = today's `cursor_sentinel` logic — re-expressed outputs, NOT
   rewritten internals). Consumers switch on `Slot`, never on language.
 - **Each Slot variant declares its candidate question**: Identifier/
@@ -56,9 +58,9 @@ enum Slot {
 - **`Slot::expected_type()`** — the type-constrained completion hook:
   `ArgPosition` (param type at index) and comparison-shaped slots
   (`op_type == |` → the field's DOMAIN) return the expected
-  `InferredType`; everything else `None`. A STUB consumed by nothing: the
-  seam exists; ranking/filtering by expected type is a separate slice that
-  plugs in.
+  `InferredType`; everything else `None`. Consumed by completion ranking
+  at both the backend and symbols call sites, which reorder candidates by
+  matching type.
 
 ## Loose-coupling / undo story (per the standing forks convention)
 

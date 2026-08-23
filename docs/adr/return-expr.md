@@ -46,11 +46,13 @@ pub enum WitnessPayload {
 pub enum ReturnExpr {
     Concrete(InferredType),
     Receiver,
+    ReceiverOr(InferredType),                // fallback when there's no call-site receiver
     Operator(ParametricOp),                 // RowOf(Box<ReturnExpr>)
     UnionOnArgs { branches: Vec<(ArgGuard, ReturnExpr)> },
+    Arg(u32),                               // n-th call argument, the positional mirror of Receiver
 }
 
-pub enum ArgGuard { Empty, Exact(u32), AtLeast(N), Any }
+pub enum ArgGuard { Empty, Exact(u32), AtLeast(N), AtMost(N), Any }
 ```
 
 Subs publish one `ReturnExpr` on whichever attachment carries the
@@ -139,17 +141,19 @@ per accessor name, so the per-Symbol UnionOnArgs is the only
 needed declaration — class-keyed lookups fall through to it via
 the standard inheritance walks.
 
-### Receiver discriminant in the cycle guard
+### Receiver identity in the cycle guard
 
 `ReturnExprReducer`'s receiver substitution and `UnionOnArgs`
 dispatch can produce different answers for the same attachment
 under different `q.receiver` / `q.arity_hint`. The cycle-guard
-key widens to `(bag_ptr, attachment, receiver_discriminant,
-arity_hint)` so re-entries on the same attachment with different
-queries aren't false-positive duplicates. Without the widening,
-inheritance walks that visit the same class with different
-invocants would short-circuit and return `None` on the second
-hop.
+key widens to `(bag_ptr, attachment, receiver_identity,
+arity_hint)`, where `receiver_identity` is the receiver's full
+structural identity (a Debug projection of the whole
+`InferredType`), not a coarse discriminant — two different
+`ClassName` receivers must stay distinct or the memo hands one
+class's answer to another. Without the widening, inheritance
+walks that visit the same class with different invocants would
+short-circuit and return `None` on the second hop.
 
 ### Anon subs are `Symbol(_)`, not `Expr(_)`
 
@@ -185,12 +189,14 @@ shape uniformity:
 ## Trade-offs
 
 **Cycle-guard cost.** Widening the cycle key to include the
-receiver discriminant + arity hint inflates the guard map under
+receiver's full identity + arity hint inflates the guard map under
 deep inheritance chains. Acceptable today — hot-path bag queries
 short-circuit on the first matching reducer and don't recurse
-through the full registry. If profiling ever flags the guard,
-pruning the discriminant down to "any non-None vs None" would
-shrink the key without losing correctness.
+through the full registry. Coarsening the receiver slot to a
+variant-only discriminant (or "any non-None vs None") is not a
+safe pruning — two distinct receivers reaching the same attachment
+would then share a memo entry, and the memo would hand one
+receiver's answer to the other.
 
 **Cycle-guard cost** (above) is the standing trade-off. Per-arm
 return witnesses live on their own `SymbolReturnArm(sid)`

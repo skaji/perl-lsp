@@ -31,9 +31,10 @@ sees how edges are produced, so caching slots in behind `edges_from`
 with zero consumer change. Per-edge-kind, not all-or-nothing —
 `children_index` is the materialised form of the INHERITS_INV edge (the
 reverse walk was expensive, precomputed once), while INHERITS stays a
-lazy `parents_of` lookup. The home for an edge cache is `ModuleIndex`
-(the only `CrossFileLookup` impl), behind the trait method — the view
-never owns cross-query state. Lazy is the default so nothing pays for
+lazy `parents_of` lookup. The home for an edge cache is `ModuleIndex`,
+which every `ScopedLookup` (the visibility-scoping decorator production
+resolution wraps around it) delegates through, behind the trait method
+— the view never owns cross-query state. Lazy is the default so nothing pays for
 that machinery until a profiler asks.
 
 ## `EdgeKind` is a closed enum; `edges_from` is exhaustive
@@ -71,7 +72,8 @@ caching lives at the Index layer behind the trait.
 ## The inheritance axis is one walk
 
 Every inheritance consumer funnels through `for_each_ancestor_class`,
-which is now `visit(self)` then `walk(class, INHERITS)`. Self-handling
+which is now `visit(self)` then `walk(class, INHERITS | APP_SURFACE)`.
+Self-handling
 lives in that one wrapper — it runs the consumer's own closure on the
 origin, which is consumer-specific (`class_isa` checks equality,
 `resolve_method_in_ancestors` checks the method) and so cannot move

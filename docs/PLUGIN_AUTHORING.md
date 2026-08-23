@@ -103,12 +103,16 @@ Drop it in your plugin directory (see below), restart the LSP — done.
 
 ## Distribution & discovery
 
-The LSP loads plugins from two sources:
+The LSP loads plugins from three sources:
 
 1. **Bundled plugins** — `frameworks/*.rhai` in this repo, compiled into
    the binary. Use these as worked examples.
 2. **User plugins** — every `.rhai` file in the directory pointed to by
    `$PERL_LSP_PLUGIN_DIR`.
+3. **Repo-local plugins** — every `.rhai` file in `<workspace-root>/.perl-lsp/`,
+   for a project that wants to ship plugins for its own kits without
+   global config. Loaded alongside `$PERL_LSP_PLUGIN_DIR`, not instead
+   of it.
 
 ```bash
 export PERL_LSP_PLUGIN_DIR=~/.config/perl-lsp/plugins
@@ -137,7 +141,8 @@ every startup and clears the cache when the fingerprint changes:
 - **Bundled plugin edit** (you rebuilt the binary after touching a
   `frameworks/*.rhai`) → source hash changes → cache clears.
 - **User plugin edit / add / remove / rename** in
-  `$PERL_LSP_PLUGIN_DIR` → cache clears.
+  `$PERL_LSP_PLUGIN_DIR` or `<workspace-root>/.perl-lsp/` → cache
+  clears.
 
 This is what makes plugin QA actually work: edit your plugin, restart
 the LSP, and the next build re-runs your plugin against every

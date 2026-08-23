@@ -178,11 +178,7 @@ this scale.
    clangd answers in the 80–500ms range; we're gated on the full
    workspace-wide pack-language scan (seconds) regardless of how small the
    actual dependency is for that one file.
-2. **Cross-TU references aggregation**, on this build, full stop — see
-   Coverage section. clangd's background index finds cross-file references
-   as designed; ours currently doesn't surface them for the four symbol
-   kinds tested.
-3. Template/overload/SFINAE-grade semantic accuracy is clangd's designed
+2. Template/overload/SFINAE-grade semantic accuracy is clangd's designed
    strength and wasn't touched by this pass (out of scope; abseil doesn't
    stress it much either).
 

@@ -18,8 +18,9 @@ a `typedef`/`using` landing on a template spelling chases to the same Instance.
 `class_name()` projects `"Box"` (the dispatch axis), so member gd / completion /
 refs / hover light up through the existing `PackageSymbol` path with no
 projection logic. `FileAnalysis::dispatch_class_of` adds the one index-aware
-refinement: an instance whose exact canonical spelling names a per-spec class
-dispatches there, exact-or-primary only; hover keeps the full spelling
+refinement: it returns the head of the full specialization ladder — exact-spelling
+spec, then partial-pattern spec, then primary (the same ladder
+`dispatch_ladder_of` exposes in full below); hover keeps the full spelling
 (`Symbol::display_type` prefers `exact_spelling()`).
 
 The args are carried deliberately uninterpreted (`int` stays `ClassName("int")`,

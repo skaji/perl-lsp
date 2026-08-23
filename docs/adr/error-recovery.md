@@ -21,9 +21,11 @@ sub hiThisWasDefinedBefore () {
 }
 ```
 
-Tree-sitter parses `sub` as a method name (invocant `$self`, method `sub`).
-The whole sub declaration becomes a method call expression. **No ERROR node**
-— the tree is structurally valid but semantically wrong.
+Tree-sitter parses the dangling `$self->` as a `method_call_expression` whose
+`method` field is empty (nothing consumed) rather than backtracking past the
+blank line; `sub hiThisWasDefinedBefore` then parses as its own correctly-named
+`subroutine_declaration_statement`. **No ERROR node** — the tree is
+structurally valid but the method call is semantically empty.
 
 ## Decisions worth keeping
 
@@ -89,5 +91,5 @@ this.
 
 Upstream parser improvements that would shrink Layer 1's load (preserve
 `sub`/`use` inside ERROR, prevent `package` from being eaten as an argument)
-are tracked in `gold-corpus/KNOWN-GAPS.md`. They're not
+aren't tracked in a dedicated gaps doc. They're not
 blockers — Layer 1 is the right insurance to keep regardless.

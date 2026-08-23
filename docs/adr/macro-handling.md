@@ -172,8 +172,8 @@ stay in the delegation lane; projection macros returning a member
 - Determinism precondition: the join-vs-chase winner must be a **principled,
   deterministic** rule, not witness/iteration order (owned by the flakiness
   fix). The function-like *return-typing* slice waits on that verdict.
-- **Function-like implied return typing** is coupled to the expansion-policy
-  flip: the "unexpanded macro parses as a `call_expression` → sub-return bag
-  path" mechanism only exists once expansion is parse-repair-only (the full
-  leave/blank/expand generalization of the member-block blank). Largest blast
-  radius, sequenced after the splice/gather work stabilizes.
+- **Function-like implied return typing** rides the expansion-policy flip: a
+  function-like macro whose use already parses as a clean `call_expression` is
+  left unexpanded, and the existing sub-return bag path types the call for
+  free (`SkeletonAnalysis::macro_returns`, landed). Parametric return
+  (`Param(n)`) is gold-tested end-to-end.

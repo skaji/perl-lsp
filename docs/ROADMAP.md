@@ -135,11 +135,6 @@ scale-free; query paths break. Findings, tiers, corpora and repros:
   way (rule #10 — aliasing breaks it). A downstream consumer of the
   long-distance value-provenance tier (`prompt-type-inference-residual.md`
   Parts 1–5); the birth-site design lives in `prompt-graph-walking.md`.
-- **Re-export chains** — branch `worktree-agent-aae99d42f4d5d74bc`
-  (correct in isolation; design in `adr/reexport-surface.md` on the
-  branch). Blocked on the ts-parser-perl X1 scanner thread-safety fix
-  (`parser-shortcomings.md`). On rework: rebase, confirm no
-  Bugzilla-cold abort, re-verify Test::Most → Test::More end-to-end.
 - **Sequence-types phases** — QA pulls; `prompt-sequence-types.md`.
 - **Type-system encoding** (axis dispatch) — waits for the full axis
   set; graph walking informs it. `prompt-type-system-encoding.md`.
@@ -160,9 +155,9 @@ scale-free; query paths break. Findings, tiers, corpora and repros:
 - Web extension — `prompt-wasm-web-extension.md` (the crate split it
   assumed was executed and REJECTED; branch `workspace-split` is the
   playbook if wasm ever forces it).
-- Multi-language engine — proven in spikes; design + working packs on
-  branch `worktree-query-extraction-spike`
-  (`docs/prompt-multi-language.md` there).
+- Multi-language engine — the go-live arc (cpp/python) is live on
+  mainline (`build/language_driver.rs`, altitude map in
+  `docs/cpp-golive-map.md`); design in `docs/prompt-multi-language.md`.
 
 ## Out of scope
 
