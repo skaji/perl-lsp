@@ -89,7 +89,7 @@ fn a_consumer_is_evaluated_against_the_seeds_fresh_bake_not_the_frozen_one() {
     );
 
     let world = FlushWorld::new(&frozen_src, &re_bake, &candidates_of, vec![p("/A.pm")]);
-    let (outcome, writes) = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
+    let outcome = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
 
     assert!(!outcome.non_convergent);
     let moved: Vec<&PathBuf> = outcome.changed.iter().map(|(q, _)| q).collect();
@@ -100,24 +100,16 @@ fn a_consumer_is_evaluated_against_the_seeds_fresh_bake_not_the_frozen_one() {
     );
     assert_eq!(outcome.evaluated, 3, "the wave reached C, which then cut");
 
-    let written: Vec<&PathBuf> = writes.iter().map(|(q, _)| q).collect();
-    assert_eq!(
-        written,
-        vec![&p("/A.pm")],
-        "B's ANSWERS moved, so B is in the refresh set — but B's MAP did not, \
-         so B is not written. Conflating the two would rewrite every reached \
-         file's row with a byte-identical copy of itself"
-    );
 }
 
-/// A seed's own row is refreshed even when its surface did not move.
+/// A seed whose surface did not move stops the wave dead — its consumers are
+/// not even enumerated.
 ///
-/// The surface is evaluated with no binders, so a change visible only under a
-/// receiver or an arity is invisible to it. Cutting the seed on surface
-/// equality would leave the store serving a map the file no longer has — the
-/// cutoff governs propagation, not whether the file that changed is rewritten.
+/// The reverse-dep walk is part of what the cutoff saves, not just the
+/// evaluation. A driver that computed the consumer set first and then asked
+/// whether it needed it would have paid the walk on every no-op save.
 #[test]
-fn a_seed_is_written_even_when_its_surface_did_not_move() {
+fn a_seed_that_did_not_move_never_enumerates_its_consumers() {
     let same = map_of("A", "m", Conclusion::Value(InferredType::String));
     let frozen_src = |_: &Path| Some(same.clone());
     let re_bake = |_: &Path| Some(same.clone());
@@ -129,39 +121,31 @@ fn a_seed_is_written_even_when_its_surface_did_not_move() {
     };
 
     let world = FlushWorld::new(&frozen_src, &re_bake, &candidates_of, vec![p("/A.pm")]);
-    let (outcome, writes) = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
+    let outcome = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
 
     assert!(outcome.changed.is_empty(), "the surface did not move");
     assert_eq!(outcome.evaluated, 1);
-    assert!(
-        reached.borrow().is_empty(),
-        "a cut file's consumers are never even enumerated — the reverse-dep \
-         walk is part of what the cutoff saves"
-    );
-    assert_eq!(
-        writes.iter().map(|(q, _)| q.clone()).collect::<Vec<_>>(),
-        vec![p("/A.pm")],
-        "the seed is written regardless — its blob changed"
-    );
+    assert!(reached.borrow().is_empty());
 }
 
-/// A seed whose blob cannot be decoded writes nothing and propagates nothing.
+/// A file with no map at all is not a change — it is an absence of evidence.
 ///
-/// Publishing an empty map for it would be worse than leaving the old row:
-/// absence in a map is read as a proven `None`, so an "empty because we could
-/// not look" map answers `None` to every key the file used to conclude.
+/// Inventing a move for it would propagate noise from a file we cannot read,
+/// and the wave's whole value is that it stops where the answers stop moving.
+/// A DELETED file is handled at the caller instead, by entering the wave as
+/// its direct consumers: they resolve through a file the store has forgotten,
+/// which is a real move with real evidence behind it.
 #[test]
-fn an_unbakeable_seed_writes_nothing() {
+fn a_file_with_no_map_cuts_rather_than_inventing_a_move() {
     let frozen_src = |_: &Path| None;
     let re_bake = |_: &Path| None;
     let candidates_of = |_: &str| Vec::new();
     let consumers_of = |_: &Path| vec![p("/B.pm")];
 
     let world = FlushWorld::new(&frozen_src, &re_bake, &candidates_of, vec![p("/A.pm")]);
-    let (outcome, writes) = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
+    let outcome = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
     assert_eq!(outcome.evaluated, 1);
     assert!(outcome.changed.is_empty());
-    assert!(writes.is_empty(), "nothing decodable, nothing to publish");
 }
 
 /// The propagation decodes maps, never blobs.
@@ -207,7 +191,7 @@ fn the_propagation_never_re_bakes_past_the_frontier() {
     };
 
     let world = FlushWorld::new(&frozen_src, &re_bake, &candidates_of, vec![p("/A.pm")]);
-    let (outcome, _) = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
+    let outcome = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
     assert!(!outcome.non_convergent);
     assert!(outcome.evaluated > 1, "precondition: the wave did reach past A");
     assert_eq!(
@@ -259,7 +243,7 @@ fn a_seed_revisited_by_a_cycle_is_baked_once() {
     };
 
     let world = FlushWorld::new(&frozen_src, &re_bake, &candidates_of, vec![p("/A.pm")]);
-    let (outcome, _) = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
+    let outcome = flush_over_world(&world, vec![p("/A.pm")], &consumers_of);
     assert!(
         !outcome.non_convergent,
         "the cycle terminates by cutting, not by the round cap"
@@ -276,99 +260,64 @@ fn store_db() -> rusqlite::Connection {
     conn
 }
 
-/// A converged flush advances the generation by exactly one, and a reader
-/// still pinned to the old one keeps reading the old world.
+/// `flush_refresh_set` end to end, over a real store: the caller's fresh map
+/// beats the stored one, and the wave reaches the consumer that answers
+/// through it.
 ///
-/// The retention half is the one that fails silently: rows are keyed
-/// `(path, generation)` precisely so publishing N+1 does not REPLACE the gen-N
-/// row. Under path-keying a pinned reader finds nothing, and absence in this
-/// layer means a proven `None` — the pin would have become a way to get wrong
-/// answers instead of a way to avoid them.
+/// Also pins the thing that made this entry point worth reshaping: it reads
+/// the caller's map for the seed and the store's map for everyone else, and
+/// decodes no blob at either. At the seam it is wired to, the seed's blob has
+/// already been invalidated, so a version that re-derived the seed's map from
+/// the store would quietly find nothing and cut on its own frontier.
 #[test]
-fn a_published_flush_advances_one_generation_and_leaves_the_old_one_readable() {
-    use crate::index::module_cache::{load_conclusions, publish_generation, Generation};
+fn flush_refresh_set_moves_a_consumer_over_a_real_store() {
+    use crate::index::module_cache::{publish_generation, Generation};
     let conn = store_db();
-    let path = "/store/A.pm";
+    let a = p("/store/A.pm");
+    let b = p("/store/B.pm");
 
-    // A deliberate gen-1 world, written directly rather than through a
-    // persist: the persist path bakes its own conclusions, which would make
-    // the baseline whatever the bake happens to produce instead of a value
-    // this test controls.
-    let before = map_of("A", "m", Conclusion::Value(InferredType::ClassName("Old".into())));
-    let after = map_of("A", "m", Conclusion::Value(InferredType::ClassName("New".into())));
-    publish_generation(&conn, Generation(1), &[(path.to_string(), before.clone())])
-        .expect("baseline");
-
-    let re_bake = |_: &Path| Some(after.clone());
-    let frozen_src =
-        |q: &Path| load_conclusions(&conn, &q.to_string_lossy(), Generation(1));
-    let candidates_of = |_: &str| vec![p(path)];
-    let consumers_of = |_: &Path| Vec::new();
-
-    let world = FlushWorld::new(&frozen_src, &re_bake, &candidates_of, vec![p(path)]);
-    let (_, writes) = flush_over_world(&world, vec![p(path)], &consumers_of);
-    let entries: Vec<(String, ConclusionMap)> = writes
-        .iter()
-        .map(|(q, m)| (q.to_string_lossy().into_owned(), (**m).clone()))
-        .collect();
-    publish_generation(&conn, Generation(2), &entries).expect("publish");
-
-    assert_eq!(
-        crate::index::module_cache::current_generation(&conn),
-        Generation(2)
+    let a_old = map_of("A", "m", Conclusion::Value(InferredType::ClassName("Old".into())));
+    let a_new = map_of("A", "m", Conclusion::Value(InferredType::ClassName("New".into())));
+    let b_map = map_of(
+        "B",
+        "m",
+        Conclusion::Link {
+            targets: vec![key("A", "m")],
+            arity: None,
+            receiver: ReceiverRule::Thread,
+        },
     );
-    assert_eq!(
-        load_conclusions(&conn, path, Generation(2)),
-        Some(after),
-        "a fresh reader gets the flush's map"
-    );
-    assert_eq!(
-        load_conclusions(&conn, path, Generation(1)),
-        Some(before),
-        "a reader pinned to gen 1 still reads gen 1 — the pin is the whole \
-         point of freezing a generation for the duration of a consult"
-    );
-}
-
-/// `flush_to_store` end to end: a real blob in, a real conclusion row out at
-/// the next generation.
-#[test]
-fn flush_to_store_republishes_a_real_blob() {
-    use crate::index::module_cache::{current_generation, load_conclusions, save_to_db};
-    let conn = store_db();
-    let dir = std::env::temp_dir();
-    let pm = dir.join("perl_lsp_flush_store_A.pm");
-    std::fs::write(
-        &pm,
-        "package FlushStoreA;\nsub val { return 'x' }\n1;\n",
+    publish_generation(
+        &conn,
+        Generation(1),
+        &[
+            (a.to_string_lossy().into_owned(), a_old),
+            (b.to_string_lossy().into_owned(), b_map),
+        ],
     )
-    .unwrap();
-    let source = std::fs::read_to_string(&pm).unwrap();
+    .expect("baseline");
 
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&ts_parser_perl::LANGUAGE.into()).unwrap();
-    let tree = parser.parse(&source, None).unwrap();
-    let fa = crate::build::builder::build(&tree, source.as_bytes());
-    let cached = std::sync::Arc::new(crate::index::module_index::CachedModule::new(
-        pm.clone(),
-        std::sync::Arc::new(fa),
-    ));
-    assert!(save_to_db(&conn, &pm.to_string_lossy(), &Some(cached), "workspace"));
+    let candidates_of = |class: &str| match class {
+        "A" => vec![a.clone()],
+        "B" => vec![b.clone()],
+        _ => Vec::new(),
+    };
+    let consumers_of = |path: &Path| {
+        if path == a.as_path() { vec![b.clone()] } else { Vec::new() }
+    };
 
-    let before = current_generation(&conn);
-    let report = flush_to_store(&conn, vec![pm.clone()], &|_| Vec::new(), &|_| Vec::new());
-    assert_eq!(report.published, 1, "the seed is always written");
-    assert_eq!(report.generation, Generation(before.0 + 1));
-    assert_eq!(current_generation(&conn), report.generation);
-
-    let published = load_conclusions(&conn, &pm.to_string_lossy(), report.generation)
-        .expect("the flush wrote a map at the new generation");
-    assert!(
-        !published.is_empty(),
-        "a re-bake WITH the bag concludes something; an empty map here would \
-         mean the decode dropped the witnesses and the flush published the \
-         emptiness over a good row"
+    let out = flush_refresh_set(
+        &conn,
+        vec![(a.clone(), a_new)],
+        vec![a.clone()],
+        &consumers_of,
+        &candidates_of,
     );
 
-    let _ = std::fs::remove_file(&pm);
+    let moved: Vec<PathBuf> = out.changed.into_iter().map(|(q, _)| q).collect();
+    assert_eq!(
+        moved,
+        vec![a.clone(), b.clone()],
+        "A moved, and B moved through it — B's stored map never changed"
+    );
 }

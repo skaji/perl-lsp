@@ -270,114 +270,84 @@ impl<'a> FlushWorld<'a> {
     }
 }
 
-/// Propagate over a world, and hand back the seeds' fresh maps.
+/// Propagate over a world.
 ///
-/// The two halves of the result answer different questions, and conflating
-/// them is the mistake this shape exists to prevent:
-///
-/// * `FlushOutcome::changed` is the **refresh set** — the files whose ANSWERS
-///   moved. It is what the wave is computed for: whoever consumes these must
-///   re-enrich, re-diagnose, or re-publish. Their maps are untouched.
-/// * The returned maps are the **write set**, and it is exactly the seeds. A
-///   seed is written whether or not its surface moved: the surface is
-///   evaluated with no binders, so a change visible only under a receiver or
-///   an arity is invisible to it, and cutting a seed on surface equality would
-///   leave the store serving a map its file no longer has. The cutoff governs
-///   propagation, never whether the file that changed gets its own row
-///   refreshed.
+/// The result is the **refresh set**: the files whose ANSWERS moved, and whose
+/// consumers must therefore re-enrich, re-diagnose or re-publish. No map is
+/// written — a map goes stale only when its own blob changes, so every file
+/// the wave reaches already has the right one in the store.
 fn flush_over_world(
     world: &FlushWorld<'_>,
-    dirty: Vec<PathBuf>,
+    frontier: Vec<PathBuf>,
     consumers_of: &dyn Fn(&Path) -> Vec<PathBuf>,
-) -> (FlushOutcome, Vec<(PathBuf, Arc<ConclusionMap>)>) {
-    let mut seeds = dirty.clone();
-    let outcome = run_flush(
-        dirty,
+) -> FlushOutcome {
+    run_flush(
+        frontier,
         &|p| world.evaluate(p),
         &|p| world.baseline(p),
         consumers_of,
-    );
-    if outcome.non_convergent {
-        return (outcome, Vec::new());
-    }
-    seeds.sort();
-    seeds.dedup();
-    let writes = seeds
-        .into_iter()
-        .filter_map(|p| world.baked(&p).map(|m| (p, m)))
-        .collect();
-    (outcome, writes)
+    )
 }
 
-/// What one store-backed flush did.
-#[derive(Debug)]
-pub struct FlushReport {
-    pub outcome: FlushOutcome,
-    /// Files whose map landed in the new generation — the seeds, and only
-    /// the seeds. `outcome.changed` is the larger, different set.
-    pub published: usize,
-    /// The generation a reader should pin AFTER this flush. Unchanged from
-    /// the frozen one when nothing was published — including on a
-    /// non-convergent flush, which publishes nothing by construction.
-    pub generation: Generation,
-}
-
-/// Run one flush against the store and publish the result as one generation.
+/// Compute the refresh set for a set of just-changed files.
 ///
-/// `dirty` is the frontier — the files whose blobs just changed.
+/// `fresh` carries each CHANGED file's newly baked map. The caller bakes,
+/// because the caller is the one that just built the analysis; making the
+/// flush decode a blob to re-derive a map already in RAM would be this
+/// layer's own antipattern, and at the seam this is wired to
+/// (`didChangeWatchedFiles`) the blob has already been invalidated, so there
+/// would be nothing to decode. With `fresh` supplied, the wave reads
+/// conclusion maps and nothing else.
+///
+/// `frontier` is where the wave STARTS, which is not always `fresh`'s keys. A
+/// DELETED file has no fresh map and nothing to evaluate, so it enters as its
+/// direct consumers instead — they now resolve through a file the store has
+/// forgotten, which is a move, and the wave carries it onward from there.
+///
 /// `consumers_of` is the freshness reverse-dep walk (`dirty_consumers`);
 /// `candidates_of` maps a class to the files that declare it, the same
 /// relation the live `follow_link` resolves through.
 ///
-/// The generation is read ONCE and frozen for the whole flush: a round that
-/// re-read it could compose answers from two worlds, which is the failure the
+/// Deliberately does NOT publish. The seeds' fresh maps belong in the store —
+/// that is what keeps a consult on a just-edited file cheap — but their blobs
+/// were invalidated a moment ago, and a conclusion row with no `modules` row
+/// behind it can never be caught by a stamp check, because the stamp lives on
+/// the `modules` row. Writing one would re-open, by a different door, exactly
+/// the "a bake outlived its blob" hole that `invalidate_generation` was just
+/// taught to close. Publishing wants the conclusions table to carry its own
+/// freshness stamp first.
+///
+/// The generation is read ONCE and frozen for the whole wave: reading it again
+/// mid-flush could compose answers from two worlds, which is the failure the
 /// pin exists to prevent.
-pub fn flush_to_store(
+pub fn flush_refresh_set(
     conn: &Connection,
-    dirty: Vec<PathBuf>,
+    fresh: Vec<(PathBuf, ConclusionMap)>,
+    frontier: Vec<PathBuf>,
     consumers_of: &dyn Fn(&Path) -> Vec<PathBuf>,
     candidates_of: &dyn Fn(&str) -> Vec<PathBuf>,
-) -> FlushReport {
+) -> FlushOutcome {
     let at = module_cache::current_generation(conn);
+    let supplied: HashMap<PathBuf, ConclusionMap> = fresh.into_iter().collect();
+    let seeds: Vec<PathBuf> = supplied.keys().cloned().collect();
     let frozen_src = |path: &Path| {
         module_cache::load_conclusions(conn, &path.to_string_lossy(), at)
     };
+    // A seed's map comes from the caller. Anything else is only ever asked for
+    // under `PERL_LSP_FLUSH_EQUIV`, which has to pay the blob decode precisely
+    // because that is the assumption being checked — and with the bag, for the
+    // reason the repair path takes it: a bagless decode bakes a map that
+    // concludes nothing while looking like a clean re-bake, and the checker
+    // would then report every file as a break.
     let re_bake = |path: &Path| {
-        // WITH the bag, for the reason the repair path takes it: a bagless
-        // decode bakes a map that concludes nothing while looking like a
-        // successful re-bake, and the flush would then publish that emptiness
-        // over a good map.
+        if let Some(m) = supplied.get(path) {
+            return Some(m.clone());
+        }
         let fa = module_cache::load_one_diag(conn, &path.to_string_lossy(), true).ok()?;
         Some(module_cache::bake_conclusion_map(&fa, &fa.witnesses))
     };
-    let world = FlushWorld::new(&frozen_src, &re_bake, candidates_of, dirty.clone());
-    let (outcome, writes) = flush_over_world(&world, dirty, consumers_of);
-    if writes.is_empty() {
-        // Nothing to say. Advancing the generation anyway would retire every
-        // reader's pin for no new information and leave a generation whose
-        // rows are all inherited from the one below it.
-        return FlushReport { outcome, published: 0, generation: at };
-    }
-
-    let entries: Vec<(String, ConclusionMap)> = writes
-        .iter()
-        .map(|(p, m)| (p.to_string_lossy().into_owned(), (**m).clone()))
-        .collect();
-    let next = Generation(at.0 + 1);
-    match module_cache::publish_generation(conn, next, &entries) {
-        Ok(()) => {
-            crate::util::ghost_stats::count_by("flush.published", entries.len() as u64);
-            FlushReport { outcome, published: entries.len(), generation: next }
-        }
-        Err(e) => {
-            // The publish is one transaction, so a failure left gen N intact.
-            // Reporting the OLD generation is what keeps that true for the
-            // caller: a reader pinned to it reads a complete world.
-            log::warn!("conclusion flush: publish failed, generation {} stands: {e}", at.0);
-            crate::util::ghost_stats::count("flush.publish_failed");
-            FlushReport { outcome, published: 0, generation: at }
-        }
-    }
+    let world = FlushWorld::new(&frozen_src, &re_bake, candidates_of, seeds);
+    flush_over_world(&world, frontier, consumers_of)
 }
 
 #[cfg(test)]

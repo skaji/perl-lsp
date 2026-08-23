@@ -122,14 +122,16 @@ fn a_dependency_cycle_terminates_by_cutting_not_by_the_cap() {
     assert_eq!(out.changed.len(), 2, "both files moved, once each");
 }
 
-/// A surface that never settles is ABANDONED, not published.
+/// A surface that never settles is ABANDONED, and reports an EMPTY refresh
+/// set rather than the half of one it managed to compute.
 ///
-/// A half-propagated generation is worse than no generation: a consult pinned
-/// to it composes answers from a wave that never finished, and nothing in the
-/// result says so. Abandoning leaves gen N intact, which is merely stale — and
-/// stale is a cost, where half-propagated is a wrong answer.
+/// A partial refresh set is worse than none: a caller acting on it refreshes
+/// some consumers and leaves the rest silently stale, with nothing in the
+/// result saying which is which. An empty set with `non_convergent` set is at
+/// least legible — the caller can fall back to its own coarser rule, which is
+/// exactly what the one-hop `dirty_consumers` walk still provides.
 #[test]
-fn a_non_convergent_flush_publishes_nothing() {
+fn a_non_convergent_flush_reports_no_refresh_set() {
     // Per-PATH, not per-call. A global flip alternates with the visit order and
     // can line up so each file sees the same value twice running — which cuts,
     // and the fixture then passes while testing nothing. My first version did
