@@ -13,6 +13,10 @@ gold-corpus/run.pl --emit <capability> <file> <line> <col>   # 0-based line/col
 
 None are ref-graph (those are all closed).
 
+One gap is a **warm gap** rather than an xfail: the assertion holds on a cold
+cache and stops holding on a warm one. Those are declared `"warm": "xfail"` on
+the row and written up in the last section here.
+
 ---
 
 ## 1. Type-system / runtime codegen
@@ -417,3 +421,58 @@ Worth recording that the hoist cut the SET-moving class too (33 -> 15), which
 the diagnosis did not predict: roughly half of what looked like pool
 variation was the cut boundary itself falling differently, because a
 non-total order made "the top 200" ambiguous even for an identical pool.
+
+---
+
+## Warm gaps (`"warm": "xfail"`)
+
+A warm gap is not a missing feature — it is a feature that works once. The
+assertion holds on a cold cache and stops holding when the same analysis is
+rehydrated from a cache blob, so the capability is present the first time a user
+opens a project and silently absent from their second session onward. Nothing
+errors; the answer just gets quieter. CI never sees this class, because CI
+checks out fresh and starts cold every time.
+
+### `loader-config-conf-shape-closed` — the closed hash shape does not survive rehydration
+- **Capability:** diagnostics · **Root:** `gold-corpus/longdist-fixture`
+- **Expect:** `key 'alpa' is not in $conf's literal shape (keys: alpha, beta)`
+- **Actual (warm only):** that diagnostic is absent entirely — the file reports
+  just the unrelated `helper-not-loaded` hint. Not a weakened answer, a missing one.
+- **Reproduced four times independently**, on four setups, all landing here.
+- **Deterministic, not a race:** first run after a cold cache passes, every
+  subsequent run against that cache fails. Four consecutive runs give
+  PASS/FAIL/FAIL/FAIL. That rules out a startup-readiness explanation, which
+  is where the shape otherwise points — and would be the wrong tree anyway,
+  since the warm path is the *faster* one.
+- **There is no path sensitivity, and no symlink involvement.** Both were
+  briefly believed. The apparent path-dependent case was a bare
+  `perl-lsp --clear-cache` — which with no root argument wipes the whole
+  `~/.cache/perl-lsp` tree, across checkouts — run between the two
+  measurements, so both of those runs were cold and passed for the ordinary
+  reason. Recorded because it cost real time twice in one evening and the
+  retraction is more useful than the hypothesis: a measurement taken around
+  an unlogged cache-clearing step measures the clear, not the code.
+- **Lead, not a conclusion:** the diagnostic that shows up instead is
+  `'orphan_h' is provided by My::Plugin::Orphan, which no workspace entrypoint
+  loads`, and entrypoint discovery is a **shallow** scan — root plus `bin/` and
+  `script/` (`scan_entrypoint_scripts`). The chain this row pins begins at "the
+  PluginLoad fact from a PACKAGELESS lite entrypoint", and this fixture's
+  loading entrypoints are `app.pl` and the extensionless `jobs` script. Worth
+  ruling out before anything deeper in the rehydration path: if the entrypoint
+  is found cold and missed warm, the shape has nothing to close over and you
+  get exactly this substitution. Not yet verified — check it before believing it.
+- **Fast repro** — 21 rows over 6 roots instead of the full 500:
+  ```sh
+  gold-corpus/run.pl diagnostics
+  ```
+  ~55s measured for both passes (the cold pass alone is ~10s; the rest is the
+  second pass plus per-root startup). The warm lane runs both passes in that one
+  invocation and reports the verdict directly, so no manual cold/warm sequencing
+  — and no cache clearing — is needed.
+- **Fix sketch:** unknown pending the above. The two candidate shapes are (a) the
+  entrypoint/PluginLoad fact is not re-registered on a warm start, or (b) it is
+  registered but the registration-time shape projection is not re-derived from
+  the blob. They are distinguishable by whether the `helper-not-loaded` hint for
+  `orphan_h` is itself correct on the warm run: under (a) the set of
+  entrypoint-loaded plugins changes, so that hint's own claim should move too;
+  under (b) it should be unchanged and only the shape should be lost.

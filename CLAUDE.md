@@ -21,7 +21,13 @@ net over real CPAN modules from a snapshot-pinned substrate
 (`gold-corpus/local/`). `fixtures/*.json` is the source of truth; statuses:
 gold (must hold → FAIL on regression), xfail (known gap → XPASS when a fix
 lands, promote the row), provisional (reported, never fails). A crash is
-always a hard fail. Run it alongside `cargo test` + `./e2e/run.sh` before
+always a hard fail. The suite runs **twice — cold, then warm against the cache
+the cold pass wrote** — under a private throwaway `XDG_CACHE_HOME`, so a row
+that passes cold and fails warm surfaces as `warm-FAIL` instead of being
+invisible (CI always starts cold). Known warm gaps are declared per row as
+`"warm": "xfail"`; `--no-warm` skips the second pass. Never "fix" a flaky gold
+run by clearing the real cache — that deletes the evidence a warm gap exists,
+and a PARTIAL clear is worse than none. Run it alongside `cargo test` + `./e2e/run.sh` before
 calling a change verified; `gold-corpus/run.pl --emit <cap> <file> <row>
 <col>` authors new rows. Known gaps live in `gold-corpus/KNOWN-GAPS.md`.
 

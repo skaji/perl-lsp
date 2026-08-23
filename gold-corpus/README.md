@@ -16,7 +16,8 @@ Positions are **0-based on input, 1-based on output**.
 `gold-corpus/run.pl` is an **exact-assertion** regression runner. **`fixtures/*.json` is the source of truth** (machine-checkable rows); each per-capability **`*.md` is the human view** of the same rows. The runner needs the substrate (default `gold-corpus/local/lib/perl5`, override `CORPUS=`) and a release build (override `BIN=`); it is **not** a cargo/CI test (it depends on the locally-installed substrate).
 
 ```sh
-gold-corpus/run.pl                 # run the suite (exits non-zero on FAIL/CRASH/XPASS)
+gold-corpus/run.pl                 # run the suite, cold + warm (non-zero on FAIL/CRASH/XPASS/warm-FAIL)
+gold-corpus/run.pl --no-warm       # cold pass only (faster iteration)
 gold-corpus/run.pl definition hover
 gold-corpus/run.pl --list          # capabilities + gold/xfail/prov counts
 gold-corpus/run.pl --emit definition LWP/RobotUA.pm 64 23   # author against this
@@ -27,6 +28,10 @@ Each fixture row asserts the query's **normalized** output against two substring
 - **gold** — the assertion must hold; otherwise **FAIL** (a real regression).
 - **xfail** — a known gap: the (correct) assertion must currently *not* hold. If it starts holding → **XPASS**, a soft failure telling you to promote the row to gold. Known gaps can't silently rot, and a fix is detected automatically.
 - **provisional** — run and reported, never fails the suite.
+
+The suite runs **twice**: once cold, then again against the cache the cold pass wrote. A row that passes cold and fails warm is **warm-FAIL** — a fact that survives the first analysis but not rehydration. Cold is a user's first open; warm is every session after, so a cold-only run cannot see this class at all. A known warm gap is declared per row with `"warm": "xfail"` (reported as `warm-xfail`; it becomes **warm-XPASS** when fixed, exactly like `xfail` → `XPASS`). `--no-warm` skips the second pass, and the summary says so rather than printing zeros it did not earn.
+
+Both passes run under a **private, throwaway `XDG_CACHE_HOME`**, so the cold pass is cold by construction and the run never touches the cache of any project on the machine. This is deliberately *not* done by clearing the real cache: bare `perl-lsp --clear-cache` wipes every project's cache dir, and clearing only *some* roots is worse than clearing none — an uncleared root makes the cold pass silently warm and nothing reports which roots were reused. The header line names the cache dir and the number of roots (26, not the 17 fixture directories — the substrate and per-row roots count too), so "every root started cold" is checkable rather than assumed.
 
 A process abort (the scanner-overflow class) is always a hard **CRASH** fail. Output is normalized before matching — absolute paths reduced to basenames; JSON outputs (references / workspace-symbol / outline / rename / diagnostics) decoded and re-encoded canonically (sorted keys, compact) so one substring ties file+line+kind. The **same** `normalize()` backs `--emit`, so fixtures authored against `--emit` output match the runner by construction.
 
