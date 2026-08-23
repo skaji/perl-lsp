@@ -115,6 +115,36 @@ fn surface_changing_edits_are_unequal() {
     assert_ne!(s0, surface(&add_import), "import change must change the surface");
 }
 
+/// A key added to a plugin's config hash changes no member anywhere, and is
+/// cross-file semantics all the same: the LOADED module's `register($self,
+/// $conf)` gets `$conf` typed from this value, and its consumers'
+/// unknown-hash-key diagnostics key off the resulting closed shape.
+///
+/// Without the `loader_shapes` arm the verdict reads Unchanged, no open
+/// consumer re-enriches, and every one of them keeps diagnosing against the old
+/// key set for the rest of the session — the invalidation half of the same bug
+/// #155 fixed the read half of.
+///
+/// Base-verify by projecting an empty `loader_shapes`: the precondition fails.
+#[test]
+fn a_config_shape_edit_flips_the_verdict() {
+    let base = "package My::App;\nuse Mojolicious::Lite;\n\
+                plugin 'CloveApp', { alpha => 1, beta => 2 };\n1;\n";
+    let s0 = surface(base);
+    assert!(
+        !s0.loader_shapes.is_empty(),
+        "precondition: the load's config shape reaches the surface; got {:?}",
+        s0.loader_shapes
+    );
+    let widened = base.replace("beta => 2", "beta => 2, gamma => 3");
+    assert_ne!(
+        s0,
+        surface(&widened),
+        "a key added to the config hash must change the surface — it changes \
+         what the loaded module's $conf closes over"
+    );
+}
+
 /// `%EXPORT_TAGS` grouping is cross-file semantics on its own: moving a
 /// member between tags keeps the flat `exports_ok` set identical while
 /// changing what a consumer's `use Foo qw(:tag)` binds — the verdict must

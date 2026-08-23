@@ -335,12 +335,14 @@ Two findings worth carrying forward:
   `resolve/definitions.rs` / `resolve/hierarchy.rs` read the cursor's own open
   document, never stripped. The loader shape was the only one.
 
-  One residual worth landing separately, which #155 does not cover: **the
-  config shape is not on the Surface.** An edit that only adds a key to a
-  plugin's config hash changes no member anywhere, so the verdict reads
-  Unchanged, no open consumer re-enriches, and every one of them keeps
-  diagnosing against the old closed key set for the rest of the session. That
-  is a second bug of the same family and independent of how the shape is read.
+  One residual #155 does not cover, fixed here: **the config shape was not on
+  the Surface.** An edit that only adds a key to a plugin's config hash changes
+  no member anywhere, so the verdict read Unchanged, no open consumer
+  re-enriched, and every one of them kept diagnosing against the old closed key
+  set for the rest of the session. #155 fixes how the shape is READ; this is
+  its invalidation, and the two are independent. Projected in
+  `Surface::project`, which already runs on the whole analysis before any
+  eviction — so it needs no second copy of the answer to keep in sync.
 
   It also says something about the harness — which the base has since acted on
   (#153): gold ran once against whatever cache was on the box, so the only run
