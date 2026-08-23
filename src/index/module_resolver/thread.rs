@@ -40,7 +40,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
         // conclusions only — the blobs stay, because the repair is a re-bake.
         let _ = module_cache::validate_conclusion_fingerprint(
             conn,
-            module_cache::CONCLUSION_FINGERPRINT,
+            module_cache::conclusion_fingerprint(),
         );
         if server.is_some() {
             // Hydrate Perl builtin hover docs (cached in SQLite, re-parsed

@@ -27,7 +27,86 @@ pub(super) const REF_ROWS_VERSION: &str = "6";
 /// answer wrongly — and there is nothing downstream to notice. A version
 /// someone has to remember to bump is the wrong instrument for a failure
 /// nothing else can see (`docs/prompt-conclusion-layer.md`).
-pub const CONCLUSION_FINGERPRINT: &str = env!("PERL_LSP_CONCLUSION_FINGERPRINT");
+const CONCLUSION_SOURCE_FINGERPRINT: &str = env!("PERL_LSP_CONCLUSION_FINGERPRINT");
+
+/// The source fingerprint, plus the ENV that steers what a bake produces.
+///
+/// Source alone is not the derivation. `PERL_LSP_MINT_LINKS` and
+/// `PERL_LSP_NO_BAKE` change what gets STORED, and their output outlives the
+/// process that wrote it — so one measurement run under a flag leaves every
+/// later run reading maps it would never have baked, with nothing to notice.
+/// Caught the honest way: a `--check` under `MINT_LINKS=1` took a gold row from
+/// PASS to FAIL for every subsequent run until the cache was wiped by hand, and
+/// the failure looked exactly like a code regression.
+///
+/// Consult-side flags (`PERL_LSP_CONCL_EQUIV`, `PERL_LSP_NO_TRUST_ABSENT`)
+/// deliberately stay OUT: they change how a stored map is READ, not what it
+/// contains, so folding them in would discard a good cache on every
+/// measurement.
+pub fn conclusion_fingerprint() -> &'static str {
+    static FP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FP.get_or_init(|| {
+        let set: Vec<bool> = BAKE_STEERING_FLAGS
+            .iter()
+            .map(|f| std::env::var(f).is_ok())
+            .collect();
+        fingerprint_with(CONCLUSION_SOURCE_FINGERPRINT, &set)
+    })
+}
+
+/// The env vars that change what a bake STORES. Consult-side flags do not
+/// belong here — see `conclusion_fingerprint`.
+const BAKE_STEERING_FLAGS: [&str; 2] = ["PERL_LSP_MINT_LINKS", "PERL_LSP_NO_BAKE"];
+
+/// Split from the env read so the property — a set flag yields a DIFFERENT
+/// fingerprint — is testable. `conclusion_fingerprint` memoizes into a
+/// `OnceLock` on first use, so a test that set the variable could never observe
+/// it.
+fn fingerprint_with(source: &str, set: &[bool]) -> String {
+    let mut fp = source.to_string();
+    for (flag, on) in BAKE_STEERING_FLAGS.iter().zip(set) {
+        if *on {
+            fp.push('+');
+            fp.push_str(flag);
+        }
+    }
+    fp
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    /// A bake-steering flag must move the fingerprint, because its output
+    /// OUTLIVES the process that wrote it.
+    ///
+    /// Base-verify by returning `source.to_string()` unconditionally: this
+    /// fails, and the failure it stands in for does not — one `--check` under
+    /// `PERL_LSP_MINT_LINKS=1` left a gold row failing for every later run
+    /// until the cache was wiped by hand, looking exactly like a code
+    /// regression.
+    #[test]
+    fn a_bake_steering_flag_changes_the_fingerprint() {
+        let plain = fingerprint_with("abc", &[false, false]);
+        assert_eq!(plain, "abc", "no flag set must leave the source alone");
+        for i in 0..BAKE_STEERING_FLAGS.len() {
+            let mut set = vec![false; BAKE_STEERING_FLAGS.len()];
+            set[i] = true;
+            assert_ne!(
+                fingerprint_with("abc", &set),
+                plain,
+                "{} does not move the fingerprint, so a run under it silently \
+                 leaves its maps for every later run to read",
+                BAKE_STEERING_FLAGS[i]
+            );
+        }
+        // And they must not collide with each other.
+        assert_ne!(
+            fingerprint_with("abc", &[true, false]),
+            fingerprint_with("abc", &[false, true]),
+        );
+    }
+}
 
 pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(

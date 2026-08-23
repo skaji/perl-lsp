@@ -137,7 +137,7 @@ pub fn index_workspace_with_index(
         // conclusions only — the blobs stay, because the repair is a re-bake.
         let _ = module_cache::validate_conclusion_fingerprint(
             conn,
-            module_cache::CONCLUSION_FINGERPRINT,
+            module_cache::conclusion_fingerprint(),
         );
     }
     // Persistence and eviction are independent: blobs + rows are written

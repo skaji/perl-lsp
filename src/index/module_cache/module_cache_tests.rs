@@ -1658,7 +1658,7 @@ fn the_conclusion_fingerprint_is_not_stale() {
     }
     assert_eq!(
         format!("{acc:016x}"),
-        CONCLUSION_FINGERPRINT,
+        conclusion_fingerprint(),
         "the compiled-in conclusion fingerprint does not match the current \
          source tree — build.rs did not re-run for some file it hashes, so \
          the guard is describing a tree that no longer exists"
