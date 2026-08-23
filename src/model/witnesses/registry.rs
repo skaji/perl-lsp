@@ -610,6 +610,25 @@ impl ReducerRegistry {
                                             );
                                             baked_said_absent = false;
                                         }
+                                        // The bridge guard, and it closes a
+                                        // hole that PREDATES the conclusion
+                                        // layer: trusting absence asks only
+                                        // "no ancestors", while the live
+                                        // ladder's bridge arm runs regardless
+                                        // of ancestry. A PARENTLESS BRIDGED
+                                        // class therefore has its absence
+                                        // trusted while the chase answers
+                                        // through the bridge. The substrate
+                                        // happens to contain no such class —
+                                        // corpus luck, not soundness.
+                                        if baked_said_absent
+                                            && idx.class_is_bridged_to(class)
+                                        {
+                                            crate::util::ghost_stats::count(
+                                                "consult.absent_but_bridged",
+                                            );
+                                            baked_said_absent = false;
+                                        }
                                         // Under the equivalence flag, do NOT
                                         // trust it — fall through, run the
                                         // real chase, and let the arm below
@@ -652,7 +671,7 @@ impl ReducerRegistry {
                                         target,
                                         arity,
                                         receiver,
-                                    } => {
+                                    } if !idx.class_is_bridged_to(class) => {
                                         match follow_link(idx, &target, &receiver, arity, &q.args) {
                                             Some(t) => {
                                                 crate::util::ghost_stats::count(
@@ -674,6 +693,14 @@ impl ReducerRegistry {
                                                 );
                                             }
                                         }
+                                    }
+                                    // A `Link` says "everything before the
+                                    // bridge arm answered None", which a
+                                    // bridged class can contradict. Decode.
+                                    super::Outcome::Follow { .. } => {
+                                        crate::util::ghost_stats::count(
+                                            "consult.follow_but_bridged",
+                                        );
                                     }
                                     super::Outcome::Decode => {
                                         crate::util::ghost_stats::count("consult.baked_open");

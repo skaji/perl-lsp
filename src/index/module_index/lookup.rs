@@ -330,6 +330,18 @@ impl CrossFileLookup for ModuleIndex {
         self.enriched_snapshot(cached)
             .unwrap_or_else(|| self.bag_present(cached))
     }
+    fn class_is_bridged_to(&self, class: &str) -> bool {
+        // Bucket NON-EMPTY, not key-present: `purge_module` can leave an empty
+        // bucket behind, and a key-exists test would then report a bridge that
+        // no longer exists — permanently pessimising a class that used to be
+        // bridged.
+        self.core
+            .edges
+            .bridges
+            .get(class)
+            .is_some_and(|b| !b.is_empty())
+    }
+
     fn conclusions_for(
         &self,
         path: &std::path::Path,

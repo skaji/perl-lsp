@@ -430,6 +430,31 @@ pub trait CrossFileLookup {
     fn resolution_epoch(&self) -> u64 {
         0
     }
+    /// Does ANY file bridge plugin-synthesized entities onto `class`?
+    ///
+    /// The guard on every conclusion form that encodes "everything before the
+    /// bridge arm answered None" — trusted absence and `Link`. The live ladder
+    /// is local → primary → parents → bridges, so a baked `Value`/`ReturnOf`
+    /// came from an arm that beats bridges in every world and needs no guard;
+    /// the other two are exactly the set that could be contradicted by a
+    /// bridged answer they never saw.
+    ///
+    /// Asked HERE rather than baked, and that is the whole point. A bake-time
+    /// "no file bridges to C" is a negative GLOBAL fact stored in a map whose
+    /// invalidation covers the derivation code and the file's own stamp —
+    /// foreign registry state is covered by neither, by design. A newly indexed
+    /// file that starts bridging to C would change nothing about the consumer,
+    /// no re-bake would fire, and the stale map would durably skip the bridged
+    /// answer. Asking the index at trust time is self-healing in both
+    /// directions with no invalidation machinery at all.
+    ///
+    /// Defaults to `true` — the conservative answer. An index that cannot say
+    /// makes its callers decode rather than trust, which is slow and never
+    /// wrong.
+    fn class_is_bridged_to(&self, _class: &str) -> bool {
+        true
+    }
+
     /// This file's baked conclusions, if the store has them at the reader's
     /// pinned generation.
     ///

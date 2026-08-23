@@ -335,3 +335,40 @@ fn a_none_candidate_does_not_stop_the_ladder() {
         "the first candidate's None ended the walk instead of falling through"
     );
 }
+
+/// A parentless BRIDGED class must not have its absence trusted.
+///
+/// The hole this closes predates the conclusion layer. Trusting absence asks
+/// only "does the class have ancestors"; the live ladder is local → primary →
+/// parents → **bridges**, and the bridge arm runs regardless of ancestry. So a
+/// class with no parents but a plugin bridging entities onto it gets its
+/// absence trusted, serving `None` while the chase answers through the bridge.
+///
+/// `PERL_LSP_CONCL_EQUIV` reports zero breaks on the substrate, which proves
+/// only that the substrate contains no such class. That is corpus luck, and
+/// this is the case the corpus lacks.
+#[test]
+fn a_parentless_bridged_class_does_not_get_its_absence_trusted() {
+    use crate::model::file_analysis::CrossFileLookup;
+
+    // The map's own view: `B` is closed — no ancestors — so absence in the map
+    // reads as a proven `None`. That is what makes the guard load-bearing
+    // rather than belt-and-braces.
+    let map = ConclusionMap(Default::default(), ["B".to_string()].into_iter().collect());
+    assert_eq!(
+        map.evaluate(&moc("B", "f"), None, None, &[]),
+        Outcome::None,
+        "the map no longer reports a closed class's absence as None — if that \
+         changed, the guard is no longer what stands between us and the bug"
+    );
+
+    // The real index is the thing that answers the guard, so ask it rather
+    // than restating the boolean. An unbridged class must be trustable, or the
+    // guard would cost every absence rather than the bridged ones.
+    let idx = crate::index::module_index::ModuleIndex::new_for_cli();
+    assert!(
+        !idx.class_is_bridged_to("B"),
+        "an index with no bridges reported one; the guard would then decode \
+         every absence and the layer's main win would be off"
+    );
+}
