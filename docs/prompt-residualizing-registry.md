@@ -172,3 +172,42 @@ time, so the exit poisons only when it would really have found something:
 Either way the measurement to re-run afterwards is the per-chase poison rate,
 not the per-exit ratio. **Whoever picks this up should not size the work from
 the 66.8%.**
+
+---
+
+## Per-class bridge yield histogram (round-2 point 3)
+
+The 98.3%-vacuous figure is per CALL; the guard is per CLASS. If the real yields
+concentrate, those classes stay guarded-off permanently and the decode cost
+lands exactly where bridges are real. Measured over one substrate `--check`:
+
+**All 2,251 real yields fall in 13 distinct classes.**
+
+```
+415  Mojolicious::_AppSurface
+389  Mojo::Server
+281  Mojo::UserAgent
+269  Mojolicious::Controller
+264  Mojo::IOLoop
+214  Mojolicious::Plugin::DefaultHelpers
+124  Minion::Worker
+ 94  Mojo::IOLoop::Stream
+```
+
+Top eight are 2,050 of 2,251 — 91%. Every one is a Mojo/Minion app surface,
+which is what the round-2 answer predicted.
+
+Two consequences, and they point opposite ways:
+
+**The guard is nearly free.** Thirteen classes lose trusted absence. Everything
+else keeps it, so the guard costs approximately nothing against the ~127k
+absences a check performs — it is not a tax on the layer, it is a fence around
+a small pen.
+
+**The follow-on is now sized, and it is small.** Refining "bridged → decode"
+into "bridged → consult the bridging files' maps" recovers 2,251 consults, all
+in 13 classes. Worth doing for correctness of shape rather than for the number:
+it removes the last place where a conclusion form degrades to a decode for a
+reason the layer could in principle represent. Anyone sizing it from the raw
+`OpenNone` population (91,525) will be disappointed — that population is
+dominated by other causes.

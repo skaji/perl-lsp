@@ -865,6 +865,17 @@ impl ReducerRegistry {
                     } else {
                         "bridge.live_empty"
                     });
+                    // Per-CLASS, because the guard is per-class while the
+                    // 98.3%-vacuous figure is per-call. If the real yields
+                    // concentrate in a few hot classes, those stay guarded-off
+                    // permanently and the decode cost lands exactly where
+                    // bridges are real — which is what sizes the follow-on.
+                    if bridge_seen && crate::util::ghost_stats::enabled() {
+                        // `enabled()` first: `format!` allocates before `count`
+                        // can decline, so the naive spelling pays for a string
+                        // per yield even with stats off.
+                        crate::util::ghost_stats::count(&format!("bridgecls.{class}"));
+                    }
                     let mut found: Option<InferredType> = None;
                     idx.for_each_entity_bridged_to(package, &mut |_mod, cached, sym| {
                         if found.is_some() {
