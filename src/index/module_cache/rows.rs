@@ -237,11 +237,18 @@ pub fn invalidate_generation(conn: &Connection, path: &str) {
 
 /// Drop a path's baked map once no blob is left to have derived it.
 ///
-/// The bake is a derivation of the blob, so it must not outlive it — and this
-/// is not a cost question, it is a wrong-answer question: the cross-file
-/// primary consults the map BEFORE it decodes anything, and an
-/// `Outcome::Answer` short-circuits the chase, so an orphaned map answers with
-/// full confidence from the source the user just edited away.
+/// The bake is a derivation of the blob, so it must not outlive it. What an
+/// orphaned map RISKS is a wrong answer rather than a slow one — the
+/// cross-file primary consults the map before it decodes anything, and an
+/// `Outcome::Answer` short-circuits the chase.
+///
+/// Honest about its own reach: no end-to-end path has been demonstrated that
+/// reads an orphaned map. Both routes that produce one re-persist the file
+/// (blob and map together) or answer from the open-document tier before any
+/// consult reaches the stale row. This closes the invariant, not a reproduced
+/// bug — and it is worth closing regardless, because "a derivation outlives
+/// its source" is exactly the shape whose consequences are invisible until a
+/// future caller order makes them visible.
 ///
 /// Conditioned on the modules row rather than unconditional, because the
 /// tier-scoped eraser legitimately leaves one behind: a dual-homed file whose

@@ -54,6 +54,24 @@ vim.fn.writefile({
   "1;",
 }, consumer)
 
+-- Warm this workspace's cache before the server sees it, the same way
+-- `run.sh` warms the repo fixtures: `--check` runs `cli_full_startup`, which
+-- indexes and PERSISTS — including each file's baked conclusion map.
+--
+-- Without it the server races its own background persist, `conclusions_for`
+-- misses for the whole run, and the assertions below exercise the live chase
+-- rather than the baked layer. Warm is also the realistic state: a developer's
+-- second session, not their first. Deliberately a warm and not a sleep — the
+-- cache either exists when `--check` returns or the run failed loudly.
+--
+-- It does NOT reach the stale-conclusion-map case; that is still unit-covered
+-- only. See `invalidating_a_generation_drops_the_bake_that_came_with_it`.
+local bin = vim.env.PERL_LSP_BIN
+  and vim.fn.fnamemodify(vim.env.PERL_LSP_BIN, ":p")
+  or (vim.fn.getcwd() .. "/target/release/perl-lsp")
+vim.fn.system({ bin, "--clear-cache", ws })
+vim.fn.system({ bin, "--check", ws, "--severity", "warning" })
+
 local buf = lsp.open_and_attach(consumer)
 
 -- `$w->go` on row 4; the cursor sits inside `go`.

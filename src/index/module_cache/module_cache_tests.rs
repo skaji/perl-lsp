@@ -1944,11 +1944,17 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
 ///
 /// `invalidate_generation` is the "this path's persisted derivation is void"
 /// eraser — it takes the modules row, the stub and the ref rows. The
-/// conclusion map is a derivation of that same blob, and leaving it behind is
-/// not a cost, it is a WRONG ANSWER: `moc_cross_file_primary` consults the map
-/// before it decodes anything, and `Outcome::Answer` short-circuits the chase.
-/// The file's next consult would then be answered, with full confidence, from
-/// the source the user just edited away.
+/// conclusion map is a derivation of that same blob, and leaving it behind
+/// risks a wrong answer rather than a slow one: `moc_cross_file_primary`
+/// consults the map before it decodes anything, and `Outcome::Answer`
+/// short-circuits the chase.
+///
+/// Scope, stated because it was overstated once: this pins the INVARIANT. No
+/// end-to-end path is known that actually reads an orphaned map — the routes
+/// that produce one re-persist the file or answer from the open-document tier
+/// first. The invariant is still worth holding, because "a derivation outlives
+/// its source" has consequences that stay invisible until some future caller
+/// order exposes them.
 #[test]
 fn invalidating_a_generation_drops_the_bake_that_came_with_it() {
     let conn = test_db();
