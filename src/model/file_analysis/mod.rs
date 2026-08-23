@@ -38,7 +38,7 @@ mod ancestry;
 pub use ancestry::*;
 mod queries;
 mod enrichment;
-pub use enrichment::{declare_enrichment_profile, enrichment_profile, EnrichmentProfile};
+pub use enrichment::{declare_enrichment_profile, EnrichmentProfile};
 mod class_queries;
 mod cursor_queries;
 mod invocants;

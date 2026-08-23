@@ -10,5 +10,6 @@ pub mod module_index;
 pub mod module_resolver;
 pub mod pack_bag_cache;
 pub mod conclusion_cache;
+pub mod conclusion_flush;
 pub mod pack_invalidator;
 pub mod resolve;
