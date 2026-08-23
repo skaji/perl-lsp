@@ -929,15 +929,6 @@ impl ModuleIndex {
         self.core.conclusion_cache.read().ok().and_then(|g| g.clone())
     }
 
-    /// A changed file's bake is void — drop it from the resident cache as well
-    /// as the store. Called beside `invalidate_bag_cache`, and for the same
-    /// reason: a resident derived copy outliving its source is how a stale
-    /// answer gets served with full confidence.
-    pub fn invalidate_conclusions(&self, path: &std::path::Path) {
-        if let Some(c) = self.conclusion_cache_ref() {
-            c.invalidate(path);
-        }
-    }
 
     /// Install the relational ref index's read-connection opener (once).
     /// Callable post-`Arc` (interior `OnceLock`) because the hub is shared
@@ -959,9 +950,23 @@ impl ModuleIndex {
     /// changed/saved file's copy is stale). Pack sub-indexes AND the Perl
     /// hub each carry one — the watcher and the bulk-index writers rely on
     /// this taking effect on both.
-    pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
+    /// Drop every resident copy DERIVED from a path's blob — the decoded bag
+    /// and the baked conclusion map together.
+    ///
+    /// One call rather than two because they are void for the same reason and
+    /// at the same moment, and dropping only one is silently wrong in
+    /// different ways: a stale bag costs a wrong reference walk, a stale map
+    /// costs a wrong ANSWER (the cross-file primary consults it before it
+    /// decodes anything, and an `Outcome::Answer` short-circuits the chase).
+    /// The conclusion half went unwired for exactly as long as it was a
+    /// separate method someone had to remember. The store-side twin is
+    /// `module_cache::invalidate_generation`.
+    pub fn invalidate_derived_copies(&self, path: &std::path::Path) {
         if let Some(bc) = self.bag_cache_ref() {
             bc.invalidate(path);
+        }
+        if let Some(c) = self.conclusion_cache_ref() {
+            c.invalidate(path);
         }
     }
 

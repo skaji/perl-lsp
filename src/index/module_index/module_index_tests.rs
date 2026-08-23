@@ -2289,3 +2289,44 @@ fn provider_edges_replay_for_a_symbol_evicted_copy() {
         "the stripped copy's provider edge must come from the pre-strip record"
     );
 }
+
+/// One eraser drops BOTH derived copies.
+///
+/// They are void for the same reason and at the same moment, and dropping only
+/// one is silently wrong in different ways — a stale bag costs a wrong
+/// reference walk, a stale map costs a wrong ANSWER, because the cross-file
+/// primary consults the map before it decodes anything and an
+/// `Outcome::Answer` short-circuits the chase. The conclusion half sat unwired
+/// for as long as it was a separate method a caller had to remember; this
+/// pins that it no longer can be.
+#[test]
+fn invalidating_derived_copies_takes_the_bake_as_well_as_the_bag() {
+    use crate::index::conclusion_cache::{Cached, ConclusionCache};
+    use crate::model::witnesses::ConclusionMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let path = std::path::PathBuf::from("/derived/A.pm");
+    let loads = Arc::new(AtomicUsize::new(0));
+    let l = Arc::clone(&loads);
+    let cache = Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        l.fetch_add(1, Ordering::Relaxed);
+        Some(ConclusionMap::default())
+    }));
+
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::clone(&cache));
+
+    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert_eq!(loads.load(Ordering::Relaxed), 1, "precondition: memoized");
+
+    idx.invalidate_derived_copies(&path);
+
+    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert_eq!(
+        loads.load(Ordering::Relaxed),
+        2,
+        "the baked map survived a derived-copy invalidation — the next \
+         consult would be answered from the previous version of the file"
+    );
+}

@@ -1911,3 +1911,45 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
         "a repaired file must leave the frontier, or the background pass never ends"
     );
 }
+
+/// A changed file's blob is dropped; its BAKE must go with it.
+///
+/// `invalidate_generation` is the "this path's persisted derivation is void"
+/// eraser — it takes the modules row, the stub and the ref rows. The
+/// conclusion map is a derivation of that same blob, and leaving it behind is
+/// not a cost, it is a WRONG ANSWER: `moc_cross_file_primary` consults the map
+/// before it decodes anything, and `Outcome::Answer` short-circuits the chase.
+/// The file's next consult would then be answered, with full confidence, from
+/// the source the user just edited away.
+#[test]
+fn invalidating_a_generation_drops_the_bake_that_came_with_it() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("perl_lsp_invalidate_bake.pm");
+    std::fs::write(&pm, "package InvBake;\nsub val { return 'x' }\n1;\n").unwrap();
+    let source = std::fs::read_to_string(&pm).unwrap();
+    let path_str = pm.to_string_lossy().into_owned();
+    let cached = parse_source_to_cached(&source, &pm);
+    assert!(save_to_db(&conn, &path_str, &Some(cached), "workspace"));
+
+    let at = current_generation(&conn);
+    assert!(
+        load_conclusions(&conn, &path_str, at).is_some(),
+        "precondition: the persist wrote a map beside the blob"
+    );
+
+    invalidate_generation(&conn, &path_str);
+
+    assert!(
+        load_one_diag(&conn, &path_str, true).is_err(),
+        "precondition: the blob is gone"
+    );
+    assert!(
+        load_conclusions(&conn, &path_str, at).is_none(),
+        "the map outlived the blob it was baked from — a consult would be \
+         answered from the previous version of the file, and nothing \
+         downstream can tell"
+    );
+
+    let _ = std::fs::remove_file(&pm);
+}

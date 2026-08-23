@@ -529,7 +529,7 @@ impl PackInvalidator {
         // Drop the stale LRU pin BEFORE the new copy becomes reachable — a
         // query racing this re-register must not rehydrate the pre-edit
         // generation against the new registration.
-        pack.invalidate_bag_cache(path);
+        pack.invalidate_derived_copies(path);
         if landed && !arc.degraded && crate::index::module_resolver::eviction_enabled() {
             // Registration-owned strip (feeds read the whole copy).
             let _ = pack.register_symbols_stripping(path.to_path_buf(), (**arc).clone(), crate::model::file_analysis::Residency::Skeleton);

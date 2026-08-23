@@ -339,7 +339,7 @@ pub fn index_workspace_with_index(
                         // Clear any stale LRU pin BEFORE the stripped copy
                         // becomes reachable, so its first rehydration reads
                         // the just-committed blob.
-                        idx.invalidate_bag_cache(&e.path);
+                        idx.invalidate_derived_copies(&e.path);
                     }
                     if e.deferred {
                         files.insert_workspace_arc(e.path.clone(), e.arc.clone());
@@ -355,7 +355,7 @@ pub fn index_workspace_with_index(
                     // beyond the persistence itself (disk full / lock storm
                     // stays loud AND self-heals) — up to the budget.
                     if let Some(idx) = module_index {
-                        idx.invalidate_bag_cache(&e.path);
+                        idx.invalidate_derived_copies(&e.path);
                     }
                     if let Some(fa) = e.blob.decode_whole() {
                         let bytes = fa.heap_estimate().total();

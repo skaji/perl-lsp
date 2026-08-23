@@ -358,13 +358,13 @@ pub fn index_pack_languages(
                         // Stale-pin clear BEFORE the stripped copy is
                         // reachable, so its first rehydration reads the
                         // just-committed blob.
-                        pack_index_writer.invalidate_bag_cache(&e.path);
+                        pack_index_writer.invalidate_derived_copies(&e.path);
                         if let Some(parts) = e.parts {
                             pack_index_writer.register_symbols_inner(e.path, parts);
                         }
                     },
                     |e: FreshEntry| {
-                        pack_index_writer.invalidate_bag_cache(&e.path);
+                        pack_index_writer.invalidate_derived_copies(&e.path);
                         if let Some(fa) = e.blob.decode_whole() {
                             let bytes = fa.heap_estimate().total();
                             if fallback_bytes.saturating_add(bytes) <= FALLBACK_WHOLE_BYTE_CAP {

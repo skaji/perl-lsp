@@ -1651,7 +1651,7 @@ impl LanguageServer for Backend {
                         );
                     }
                 }
-                module_index.invalidate_bag_cache(&canon);
+                module_index.invalidate_derived_copies(&canon);
                 match typ {
                     FileChangeType::DELETED => {
                         files.remove_workspace(&path);
