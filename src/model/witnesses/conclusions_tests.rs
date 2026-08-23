@@ -290,7 +290,7 @@ fn an_open_none_on_the_chain_degrades_to_a_decode() {
             receiver: ReceiverRule::Thread,
         },
     )]);
-    let b = m(vec![(moc("B", "f"), Conclusion::OpenNone)]);
+    let b = m(vec![(moc("B", "f"), Conclusion::OpenNone(OpenReason::NoAnswerOpaque))]);
     let resolve = move |class: &str| match class {
         "A" => vec![("/a.pm".to_string(), Some(a.clone()))],
         "B" => vec![("/b.pm".to_string(), Some(b.clone()))],

@@ -9,7 +9,7 @@ fn map_of(n: usize) -> ConclusionMap {
     for i in 0..n {
         m.insert(
             ConclusionKey::SubByName(format!("f{i}")),
-            Conclusion::OpenNone,
+            Conclusion::OpenNone(crate::model::witnesses::OpenReason::NoAnswerOpaque),
         );
     }
     ConclusionMap(m, Default::default())

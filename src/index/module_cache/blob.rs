@@ -973,7 +973,7 @@ mod bake_probe {
                     crate::model::witnesses::Conclusion::Value(_) => value += 1,
                     crate::model::witnesses::Conclusion::ReturnOf(_) => return_of += 1,
                     crate::model::witnesses::Conclusion::Link { .. } => link += 1,
-                    crate::model::witnesses::Conclusion::OpenNone => open += 1,
+                    crate::model::witnesses::Conclusion::OpenNone(_) => open += 1,
                 }
             }
             map_bytes += bincode::serialize(&map).map(|v| v.len()).unwrap_or(0);

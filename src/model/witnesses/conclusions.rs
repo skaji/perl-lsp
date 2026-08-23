@@ -101,7 +101,55 @@ pub enum Conclusion {
     },
     /// Present, and deliberately unbakeable: decode the blob and run the real
     /// chase for THIS key. Distinct from absent, which means "None".
-    OpenNone,
+    ///
+    /// The reason is carried rather than counted at the bake, because the
+    /// question a widening has to answer is which cause drives DECODES, and a
+    /// bake-side tally counts KEYS. Those differ by however often each key is
+    /// consulted, which is exactly the kind of unweighted total that has
+    /// mis-sized every step of this arc.
+    OpenNone(OpenReason),
+}
+
+/// Why a key could not be baked. Measurement-bearing, not behaviour-bearing:
+/// every variant evaluates to `Outcome::Decode`, and a consumer that branched
+/// on one would be reading a bake-time accident as a semantic distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OpenReason {
+    /// No answer without binders, and the chase named no portable exit — it
+    /// was poisoned, or it recorded nothing at all. Nothing a richer
+    /// conclusion FORM could carry; this is the bag's own openness.
+    NoAnswerOpaque,
+    /// No answer, and the only rung the chase named was the key being baked.
+    /// A `Link` here would walk to where the consult already is.
+    NoAnswerSelfOnly,
+    /// No answer, and the chase named rungs a `Link` could carry. This is the
+    /// population a widening would convert, and the only one that is.
+    NoAnswerLinkable,
+    /// The answer moved, or vanished, under a different receiver or arity.
+    /// `Value` may not represent it and `ReturnOf` did not claim it.
+    BinderDependent,
+    /// The bare and probed queries disagreed about the KIND of answer — a type
+    /// against a fact map — which no conclusion form represents.
+    KindDisagreement,
+    /// Two attachments projected onto one key with different conclusions.
+    /// Cannot fire while `from_attachment` is injective; counted so that
+    /// "cannot fire" is something the numbers say rather than a comment.
+    KeyCollision,
+}
+
+impl OpenReason {
+    /// Stable tag for the counters. A `Debug` projection would rename every
+    /// series the day someone renames a variant.
+    pub fn tag(self) -> &'static str {
+        match self {
+            OpenReason::NoAnswerOpaque => "concl.open.no_answer_opaque",
+            OpenReason::NoAnswerSelfOnly => "concl.open.no_answer_self_only",
+            OpenReason::NoAnswerLinkable => "concl.open.no_answer_linkable",
+            OpenReason::BinderDependent => "concl.open.binder_dependent",
+            OpenReason::KindDisagreement => "concl.open.kind_disagreement",
+            OpenReason::KeyCollision => "concl.open.key_collision",
+        }
+    }
 }
 
 /// Per-file map, persisted beside the blob and invalidated with it.
@@ -152,6 +200,29 @@ impl ConclusionMap {
             // answer is "I do not know", which is a decode.
             return match key {
                 ConclusionKey::MethodOnClass { class, .. } if !self.1.contains(class) => {
+                    // ABSENT on a class this map cannot prove closed. Counted
+                    // beside the `OpenNone` reasons because it is the same
+                    // outcome from the consult's point of view — a decode —
+                    // and leaving it uncounted made the reason tally look like
+                    // it explained the decodes when it explained a quarter of
+                    // them.
+                    // Split for measurement only, and gated because it is an
+                    // O(keys) scan: does this map conclude ANYTHING about the
+                    // class? "The file declares it but cannot prove it closed"
+                    // and "the file has never heard of it" are the same
+                    // outcome and completely different problems, and the
+                    // second is not something a richer conclusion form fixes.
+                    if crate::util::ghost_stats::enabled() {
+                        let mentioned = self.0.keys().any(|k| {
+                            matches!(k, ConclusionKey::MethodOnClass { class: c, .. } if c == class)
+                        });
+                        crate::util::ghost_stats::count(if mentioned {
+                            "concl.open.absent_class_known_open"
+                        } else {
+                            "concl.open.absent_class_unknown"
+                        });
+                    }
+                    crate::util::ghost_stats::count("concl.open.absent_not_closed");
                     Outcome::Decode
                 }
                 _ => Outcome::None,
@@ -196,7 +267,12 @@ impl ConclusionMap {
                     ReceiverRule::Dispatch(class) => Some(fresh_receiver(receiver, class)),
                 },
             },
-            Conclusion::OpenNone => Outcome::Decode,
+            // Counted HERE rather than at the bake: this is the consult, so
+            // the tally is weighted by how often each key is actually asked.
+            Conclusion::OpenNone(reason) => {
+                crate::util::ghost_stats::count(reason.tag());
+                Outcome::Decode
+            }
         }
     }
 }
@@ -470,7 +546,7 @@ pub fn bake_in_context(
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 if *o.get() != conclusion {
                     crate::util::ghost_stats::count("bake.key_collision");
-                    o.insert(Conclusion::OpenNone);
+                    o.insert(Conclusion::OpenNone(OpenReason::KeyCollision));
                 }
             }
         }
@@ -583,21 +659,32 @@ fn bake_one(
         // would have done anyway. The `Link` cannot pay off while `OpenNone`
         // dominates the rungs; the leverage is in shrinking that population.
         // `docs/prompt-residualizing-registry.md` carries the table.
+        // Where the chase would have gone, read UNCONDITIONALLY — not behind
+        // the minting flag. The composition of this population is what decides
+        // whether widening the `Link` form is worth building, and it cannot be
+        // measured behind the flag the widening would turn on.
+        //
+        // The self-rung is dropped first. The cross-file primary records the
+        // key being baked as its own first rung, which is true of the ladder
+        // and useless as a `Link`: the consult reached this map by doing
+        // exactly that, so a walk back to it is a walk to where we already are.
+        let residual = registry.residuals_of_last_query().map(|targets| {
+            let self_key = ConclusionKey::from_attachment(att);
+            targets
+                .into_iter()
+                .filter(|t| Some(t) != self_key.as_ref())
+                .collect::<Vec<_>>()
+        });
+        let open_reason = match &residual {
+            // Poisoned, or nothing recorded: no portable exit exists, so no
+            // richer conclusion FORM would reach this key. It is the bag's own
+            // openness, and it is the population a widening cannot touch.
+            None => OpenReason::NoAnswerOpaque,
+            Some(t) if t.is_empty() => OpenReason::NoAnswerSelfOnly,
+            Some(_) => OpenReason::NoAnswerLinkable,
+        };
         if mint_links_enabled() {
-            if let Some(targets) = registry.residuals_of_last_query() {
-                // Drop the rung that names the key being baked. The cross-file
-                // primary records it because "ask the index for this class"
-                // genuinely is the ladder's first rung — but the consult path
-                // reached this map by doing exactly that, so a `Link` back to
-                // it is a walk to where we already are. Left in, it converted
-                // essentially the whole `OpenNone` population into `Link`s that
-                // burn two follow hops and abandon: 14,923 incomplete follows
-                // against 15 that answered, over one substrate check.
-                let self_key = ConclusionKey::from_attachment(att);
-                let targets: Vec<_> = targets
-                    .into_iter()
-                    .filter(|t| Some(t) != self_key.as_ref())
-                    .collect();
+            if let Some(targets) = residual {
                 if !targets.is_empty() {
                     crate::util::ghost_stats::count("bake.link_from_residual");
                     return Conclusion::Link {
@@ -630,7 +717,7 @@ fn bake_one(
         // report "I would have consulted the index here, for key K" instead of
         // returning None: a residualizing mode, which is a design step rather
         // than a fix. Until then these cost one decode each.
-        return Conclusion::OpenNone;
+        return Conclusion::OpenNone(open_reason);
     };
 
     // A receiver the file cannot have produced. If the answer moves, the
@@ -641,9 +728,9 @@ fn bake_one(
         )),
         Some(1),
     );
-    let demote = |why: &'static str| {
+    let demote = |why: &'static str, reason: OpenReason| {
         crate::util::ghost_stats::count(why);
-        Conclusion::OpenNone
+        Conclusion::OpenNone(reason)
     };
     match probed {
         ReducedValue::Type(t2) if t2 == t => {
@@ -653,14 +740,20 @@ fn bake_one(
         // Answered differently under a different receiver/arity. That IS
         // binder-dependence, and not in a shape we can store — decode rather
         // than freeze whichever of the two answers we happened to see first.
-        ReducedValue::Type(_) => demote("bake.demoted_by_binder_probe"),
+        ReducedValue::Type(_) => {
+            demote("bake.demoted_by_binder_probe", OpenReason::BinderDependent)
+        }
         // Facts, not a type, where the bare probe gave a type. The two probes
         // disagree about the KIND of answer, which no conclusion form
         // represents.
-        ReducedValue::FactMap(_) => demote("bake.demoted_kind_disagreement"),
+        ReducedValue::FactMap(_) => {
+            demote("bake.demoted_kind_disagreement", OpenReason::KindDisagreement)
+        }
         // The answer vanished once a receiver was supplied — binder-dependent
         // in the most direct way there is.
-        ReducedValue::None => demote("bake.demoted_by_binder_probe"),
+        ReducedValue::None => {
+            demote("bake.demoted_by_binder_probe", OpenReason::BinderDependent)
+        }
     }
 }
 

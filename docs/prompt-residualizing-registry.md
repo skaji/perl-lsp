@@ -348,3 +348,52 @@ Two findings worth carrying forward:
   (#153): gold ran once against whatever cache was on the box, so the only run
   that still worked was the one being scored. It now runs cold and warm against
   a private throwaway cache dir, with a `warm: xfail` status for known gaps.
+
+---
+
+## The `OpenNone` population, attributed by cause — and the widening premise is dead
+
+`Conclusion::OpenNone` now carries an `OpenReason`, counted at the CONSULT
+rather than at the bake. That distinction is the whole point: a bake-side tally
+counts KEYS, and the question a widening has to answer is which cause drives
+DECODES. The two differ by however often each key is asked, which is exactly
+the kind of unweighted total that has mis-sized every step of this arc.
+
+One warm substrate `--check`, 92,256 decodes:
+
+| cause | consults | share |
+|---|---|---|
+| absent, class known to the map but not provably closed | 64,901 | **70.3%** |
+| no answer, chase was opaque (poisoned / recorded nothing) | 9,732 | 10.5% |
+| no answer, chase named rungs a `Link` could carry | **8,583** | **9.3%** |
+| no answer, only rung was the key being baked | 6,945 | 7.5% |
+| absent, class the map has never heard of | 1,567 | 1.7% |
+| binder-dependent (answer moved under receiver/arity) | 532 | 0.6% |
+
+Two conclusions, and the first was not visible before this split.
+
+**Widening the `Link` form addresses at most 9.3%, and realistically far less.**
+`no_answer_linkable` is the ONLY population a binder-carrying residual could
+convert. We already know from the minting measurement that a `Link` mostly
+abandons at the first rung whose own map says `Decode` — 7,992 incomplete
+follows against 34 answered — so the realizable fraction of that 9.3% is a
+fraction of a fraction. **Do not build binder-carrying residuals.**
+
+**The lever is the 70.3%, and it is a different shape entirely.** These are
+absences on a class the map DOES conclude about, where the only thing stopping
+the absence from being trusted is that the class inherits from somewhere this
+file cannot see. The bake cannot enumerate an inherited method — it has no key
+to attach anything to, because the name could be anything.
+
+That points at a form this layer does not have: not per-key, but **per-class**.
+"Any key absent for class C inherits from these parents" is one fact per class,
+and the parents are the one thing the bake genuinely knows. An absent key would
+then evaluate to a `Follow` constructed at consult time from the name being
+asked, instead of a decode whose entire job is to walk to the same parents.
+
+Stated as a hypothesis, not a finding, because one number would confirm or kill
+it and I have not taken it: **of those 64,901, how many are answered by a parent
+rung rather than by the candidate file itself?** If most are, the per-class form
+converts them; if most resolve locally after the decode, it does not. That is
+the measurement the next step should start from — the same "read the composition
+before sizing the fix" discipline that produced this table.
