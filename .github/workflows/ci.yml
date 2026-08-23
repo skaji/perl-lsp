@@ -80,6 +80,30 @@ jobs:
       - name: Run e2e tests
         run: ./e2e/run.sh
 
+  pack-e2e-tests:
+    name: Pack E2E tests (headless nvim)
+    if: github.event.action != 'edited' || github.event.changes.base   # see `on:`
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: v0.11.0
+
+      # Separate from `e2e-tests` because the suites need `--features
+      # all-langs`, which the script builds itself — there is no flag to add
+      # here. Covers the C/C++ suites AND `python_members`, so this is the
+      # pack lane generally, not a cpp one.
+      - name: Run pack e2e tests
+        run: ./e2e/run-cpp.sh
+
   gold-corpus:
     name: Gold corpus
     if: github.event.action != 'edited' || github.event.changes.base   # see `on:`
