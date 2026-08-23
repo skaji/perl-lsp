@@ -33,9 +33,7 @@
         "none": []
       },
       "status": "gold",
-      "note": "The $conf typo hint proves the whole loader-config chain: the PluginLoad fact from a PACKAGELESS lite entrypoint, the registration-time shape projection, the enrichment join, and the resulting CLOSED HashWithKeys{alpha, beta} feeding the unknown-hash-key diagnostic.",
-      "warm": "xfail",
-      "warm_note": "Passes cold, fails warm: the closed HashWithKeys{alpha, beta} is derived when the PluginLoad fact is registered and is not rebuilt from the cache blob, so on a warm start the shape comes back open and the unknown-key diagnostic has nothing to fire on. Present at 9db9ba19, predates the warm lane that reports it."
+      "note": "The $conf typo hint proves the whole loader-config chain: the PluginLoad fact from a PACKAGELESS lite entrypoint, the registration-time shape projection, the enrichment join, and the resulting CLOSED HashWithKeys{alpha, beta} feeding the unknown-hash-key diagnostic."
     }
   ]
 }

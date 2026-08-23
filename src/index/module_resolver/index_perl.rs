@@ -186,7 +186,25 @@ pub fn index_workspace_with_index(
                     ));
                 }
                 if let Some(idx) = module_index {
-                    idx.record_workspace_projections(&path, &fa);
+                    // The loader-shape half of these projections reads the
+                    // witness bag (`expr_type_at_span` over the config
+                    // literal's `Expr` witnesses), and the warm scan hands
+                    // out bag-evicted copies. Reading one anyway does not
+                    // fail — it records NO shape, so the closed
+                    // `HashWithKeys` a `plugin 'X', {...}` load contributes
+                    // simply never exists on a warm start and every
+                    // diagnostic downstream of it goes quiet. Rehydrate for
+                    // the files that actually carry loads: entrypoints and
+                    // little else, so this is a handful of point fetches,
+                    // not a re-decode of the workspace.
+                    if !fa.plugin.loads.is_empty() && fa.bag_is_evicted() {
+                        match module_cache::load_one(conn, &path.to_string_lossy()) {
+                            Some(whole) => idx.record_workspace_projections(&path, &whole),
+                            None => idx.record_workspace_projections(&path, &fa),
+                        }
+                    } else {
+                        idx.record_workspace_projections(&path, &fa);
+                    }
                 }
                 // Registration-owned strip: the name/edge feeds read the
                 // WHOLE analysis, then the requested axes evict, then the
