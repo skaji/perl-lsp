@@ -35,9 +35,11 @@ pub const MAX_FLUSH_ROUNDS: usize = 32;
 /// can assert on the shape of the propagation, not just its result.
 #[derive(Debug, Default, PartialEq)]
 pub struct FlushOutcome {
-    /// Files whose evaluated surface moved, with the surface that will be
-    /// published. A file evaluated and found unchanged is deliberately absent:
-    /// the cutoff is the point.
+    /// The REFRESH set: files whose evaluated surface moved, with the surface
+    /// it moved to. Whoever consumes these must re-enrich, re-diagnose or
+    /// re-publish — their conclusion maps are untouched, because a map goes
+    /// stale only when its own blob changes. A file evaluated and found
+    /// unchanged is deliberately absent: the cutoff is the point.
     pub changed: Vec<(PathBuf, EvaluatedSurface)>,
     /// How many worklist rounds ran. `1` means the frontier cut immediately.
     pub rounds: usize,
@@ -52,9 +54,9 @@ pub struct FlushOutcome {
 
 /// Run one flush to quiescence.
 ///
-/// `evaluate` re-bakes a file and evaluates its surface against the FROZEN
-/// generation; `baseline` is that file's surface as of the same generation;
-/// `consumers_of` is the freshness reverse-dep walk.
+/// `evaluate` gives a file's surface in the world this flush is building;
+/// `baseline` gives it as of the frozen generation; `consumers_of` is the
+/// freshness reverse-dep walk.
 ///
 /// The cutoff compares against the surface recorded EARLIER IN THIS FLUSH when
 /// there is one, and against the baseline otherwise. That distinction is what
@@ -121,26 +123,53 @@ pub fn run_flush(
 
 
 /// The world one flush evaluates against: a frozen generation underneath, the
-/// maps this flush has already re-baked on top.
+/// seeds this flush re-baked on top.
 ///
-/// The overlay is the whole reason a wave moves past its first hop. B's map is
-/// index-free, so re-baking B after A changed yields BYTE-IDENTICAL bytes; the
-/// only thing that moved is what B's `Link`s chase THROUGH. Evaluating B
-/// against the frozen store would therefore reproduce B's frozen surface
-/// exactly, cut, and starve B's consumers — the map-equality failure
-/// `EvaluatedSurface` exists to avoid, arriving through the resolver instead
-/// of through the diff.
+/// **A map goes stale only when its OWN file's blob changes.** The bake runs
+/// with the index deliberately withheld, so it cannot produce a value that
+/// depended on another file — anything cross-file comes out as a `Link` that
+/// chases at read time, or as `OpenNone`. A downstream change therefore moves
+/// a consumer's ANSWERS without moving its MAP, which is why the propagation
+/// re-bakes nothing past the frontier: it decodes one map per reached file and
+/// no blobs at all. `module_cache_tests::a_cleared_conclusion_row_is_re_baked_
+/// to_the_same_map` is the standing evidence that a re-bake of an unchanged
+/// blob reproduces the stored map exactly.
 ///
-/// Its two map sources are closures rather than a `Connection` for the same
-/// reason `follow_link_with` takes a resolver: the overlay is delicate, and a
-/// world that can only be built from a store is a world only exercised by
-/// whatever a corpus happens to contain.
+/// The overlay is what lets the wave move past its first hop. B's map is
+/// index-free, so it reads identically before and after A changes; the only
+/// thing that moved is what B's `Link`s chase THROUGH. Evaluating B against
+/// the frozen store would reproduce B's frozen surface exactly, cut, and
+/// starve B's consumers — the map-equality failure `EvaluatedSurface` exists
+/// to avoid, arriving through the resolver instead of through the diff.
+///
+/// Its map sources are closures rather than a `Connection` for the same reason
+/// `follow_link_with` takes a resolver: the overlay is delicate, and a world
+/// that can only be built from a store is a world only exercised by whatever a
+/// corpus happens to contain.
 struct FlushWorld<'a> {
     frozen_src: &'a dyn Fn(&Path) -> Option<ConclusionMap>,
     re_bake: &'a dyn Fn(&Path) -> Option<ConclusionMap>,
     candidates_of: &'a dyn Fn(&str) -> Vec<PathBuf>,
+    /// The files whose blobs changed — the only ones re-baked.
+    seeds: HashSet<PathBuf>,
     frozen: RefCell<HashMap<PathBuf, Option<Arc<ConclusionMap>>>>,
     fresh: RefCell<HashMap<PathBuf, Option<Arc<ConclusionMap>>>>,
+    /// Re-bake-equals-frozen breaks found under `PERL_LSP_FLUSH_EQUIV`.
+    breaks: std::cell::Cell<usize>,
+}
+
+/// Re-bake every reached file, not just the seeds, and score the invariant the
+/// propagation rests on.
+///
+/// The invariant is load-bearing and its violation is SILENT: a bake that
+/// learned to consult an index would make non-seed maps genuinely stale, the
+/// wave would evaluate the old ones, and the only symptom would be consumers
+/// that quietly stopped being refreshed. Same discipline as
+/// `PERL_LSP_CONCL_EQUIV` one tier down — the assumption ships with the switch
+/// that checks it.
+fn flush_equiv_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PERL_LSP_FLUSH_EQUIV").is_ok())
 }
 
 impl<'a> FlushWorld<'a> {
@@ -148,13 +177,16 @@ impl<'a> FlushWorld<'a> {
         frozen_src: &'a dyn Fn(&Path) -> Option<ConclusionMap>,
         re_bake: &'a dyn Fn(&Path) -> Option<ConclusionMap>,
         candidates_of: &'a dyn Fn(&str) -> Vec<PathBuf>,
+        seeds: impl IntoIterator<Item = PathBuf>,
     ) -> Self {
         FlushWorld {
             frozen_src,
             re_bake,
             candidates_of,
+            seeds: seeds.into_iter().collect(),
             frozen: RefCell::new(HashMap::new()),
             fresh: RefCell::new(HashMap::new()),
+            breaks: std::cell::Cell::new(0),
         }
     }
 
@@ -167,18 +199,41 @@ impl<'a> FlushWorld<'a> {
         loaded
     }
 
-    /// This flush's bake of a file, memoized.
+    /// A seed's re-bake, memoized.
     ///
     /// Memoized because the bake is a pure function of the file's own blob —
-    /// nothing about it depends on the round, so a file revisited by a cycle
+    /// nothing about it depends on the round, so a seed revisited by a cycle
     /// or a fan-in re-EVALUATES (which is the point) but never re-BAKES.
-    fn fresh_map(&self, path: &Path) -> Option<Arc<ConclusionMap>> {
+    fn baked(&self, path: &Path) -> Option<Arc<ConclusionMap>> {
         if let Some(hit) = self.fresh.borrow().get(path) {
             return hit.clone();
         }
         let baked = (self.re_bake)(path).map(Arc::new);
         self.fresh.borrow_mut().insert(path.to_path_buf(), baked.clone());
         baked
+    }
+
+    /// The map this flush believes a file has: its re-bake if its blob
+    /// changed, its stored map otherwise.
+    fn current_map(&self, path: &Path) -> Option<Arc<ConclusionMap>> {
+        if self.seeds.contains(path) {
+            return self.baked(path);
+        }
+        let frozen = self.frozen_map(path);
+        if flush_equiv_enabled() {
+            let baked = (self.re_bake)(path);
+            if baked.is_some() && baked.as_ref() != frozen.as_deref() {
+                self.breaks.set(self.breaks.get() + 1);
+                crate::util::ghost_stats::count("flushequiv.break");
+                log::warn!(
+                    "flush equiv: re-baking '{}' did not reproduce its stored \
+                     map — a downstream change moved a map, which the \
+                     propagation assumes cannot happen",
+                    path.display()
+                );
+            }
+        }
+        frozen
     }
 
     fn resolve(&self, class: &str, overlay: bool) -> Vec<(String, Option<Arc<ConclusionMap>>)> {
@@ -202,7 +257,7 @@ impl<'a> FlushWorld<'a> {
     }
 
     fn evaluate(&self, path: &Path) -> Option<EvaluatedSurface> {
-        let map = self.fresh_map(path)?;
+        let map = self.current_map(path)?;
         Some(map.evaluated_surface(&|class| self.resolve(class, true)))
     }
 
@@ -215,24 +270,27 @@ impl<'a> FlushWorld<'a> {
     }
 }
 
-/// Propagate over a world and hand back the maps that must be written.
+/// Propagate over a world, and hand back the seeds' fresh maps.
 ///
-/// Two publication rules, and they answer different questions:
+/// The two halves of the result answer different questions, and conflating
+/// them is the mistake this shape exists to prevent:
 ///
-/// * A file the propagation found MOVED is written because its consumers'
-///   answers depend on it.
-/// * A SEED is written whether or not its surface moved, because its own blob
-///   changed. The surface is evaluated with no binders, so a change visible
-///   only under a receiver or an arity is invisible to it — cutting a seed on
-///   surface equality would leave the store serving a map its file no longer
-///   has. The cutoff governs PROPAGATION, never whether the file that changed
-///   gets its own row refreshed.
+/// * `FlushOutcome::changed` is the **refresh set** — the files whose ANSWERS
+///   moved. It is what the wave is computed for: whoever consumes these must
+///   re-enrich, re-diagnose, or re-publish. Their maps are untouched.
+/// * The returned maps are the **write set**, and it is exactly the seeds. A
+///   seed is written whether or not its surface moved: the surface is
+///   evaluated with no binders, so a change visible only under a receiver or
+///   an arity is invisible to it, and cutting a seed on surface equality would
+///   leave the store serving a map its file no longer has. The cutoff governs
+///   propagation, never whether the file that changed gets its own row
+///   refreshed.
 fn flush_over_world(
     world: &FlushWorld<'_>,
     dirty: Vec<PathBuf>,
     consumers_of: &dyn Fn(&Path) -> Vec<PathBuf>,
 ) -> (FlushOutcome, Vec<(PathBuf, Arc<ConclusionMap>)>) {
-    let seeds = dirty.clone();
+    let mut seeds = dirty.clone();
     let outcome = run_flush(
         dirty,
         &|p| world.evaluate(p),
@@ -242,13 +300,11 @@ fn flush_over_world(
     if outcome.non_convergent {
         return (outcome, Vec::new());
     }
-    let mut paths: Vec<PathBuf> = outcome.changed.iter().map(|(p, _)| p.clone()).collect();
-    paths.extend(seeds);
-    paths.sort();
-    paths.dedup();
-    let writes = paths
+    seeds.sort();
+    seeds.dedup();
+    let writes = seeds
         .into_iter()
-        .filter_map(|p| world.fresh_map(&p).map(|m| (p, m)))
+        .filter_map(|p| world.baked(&p).map(|m| (p, m)))
         .collect();
     (outcome, writes)
 }
@@ -257,7 +313,8 @@ fn flush_over_world(
 #[derive(Debug)]
 pub struct FlushReport {
     pub outcome: FlushOutcome,
-    /// Files whose map landed in the new generation.
+    /// Files whose map landed in the new generation — the seeds, and only
+    /// the seeds. `outcome.changed` is the larger, different set.
     pub published: usize,
     /// The generation a reader should pin AFTER this flush. Unchanged from
     /// the frozen one when nothing was published — including on a
@@ -293,7 +350,7 @@ pub fn flush_to_store(
         let fa = module_cache::load_one_diag(conn, &path.to_string_lossy(), true).ok()?;
         Some(module_cache::bake_conclusion_map(&fa, &fa.witnesses))
     };
-    let world = FlushWorld::new(&frozen_src, &re_bake, candidates_of);
+    let world = FlushWorld::new(&frozen_src, &re_bake, candidates_of, dirty.clone());
     let (outcome, writes) = flush_over_world(&world, dirty, consumers_of);
     if writes.is_empty() {
         // Nothing to say. Advancing the generation anyway would retire every
