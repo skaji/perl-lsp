@@ -495,3 +495,65 @@ work: it reported 555 failures of a mechanism that was behaving correctly. Both
 times the fix was to make the comparison ask the question the claim actually
 makes — the same correction as the `Link` classifier that excused every break
 because it tested the wrong key.
+
+---
+
+## The verb-declared enrichment profile (SPEC 2)
+
+`LanguageScope`'s shape, one tier down: the verb declares what its consumers
+read, and enrichment obeys without ever learning which verb it serves.
+Soundness is by construction rather than by freshness — a product no consumer
+reads need not be produced, and that argument does not decay the way a cache's
+does.
+
+`--check` declares `EnrichmentProfile::diagnostics()`, which omits the
+`MethodCall` dispatch-target re-stamp.
+
+**CLI-only, unconditionally.** A one-shot CLI process serves exactly one verb,
+and the `enriched_snapshot` overlay is resident rather than persisted, so a
+partial copy cannot outlive the process or reach a fuller verb. The
+profile-in-the-overlay-key form is required only when a SERVER verb wants a
+partial profile — the overlay there is shared and fingerprint-keyed, so a
+partial copy under a profile-blind key would be served to a verb that reads
+more, silently, as a missing answer rather than an error. Nothing wants that
+today, so it is deliberately not built; the reason is in the code so its
+absence does not read as an oversight.
+
+| | full (control) | diagnostics profile |
+|---|---|---|
+| `diag.0_enriched_snapshot` | 7,531 / 7,977 / 7,691 ms | **6,537 / 6,834 / 6,356 ms** |
+| `consult.attempt` | 455.9 ms / 14,647 | **246.7 ms / 7,665** |
+
+**13–15% off `--check`'s enrichment**, three runs each way. The estimate going
+in was ~20%; the measured range is lower and that is the number.
+
+### The control is the part worth guarding
+
+`PERL_LSP_FULL_ENRICHMENT=1` forces the full profile back. Without it the full
+behaviour becomes unreachable the moment a verb declares a partial one, and
+"output is set-identical" turns unfalsifiable — a claim that cannot be re-run
+is not evidence. `PERL_LSP_SKIP_MC_STAMP` cannot serve: it skips *harder*, the
+same direction as the profile.
+
+That precedence is unit-tested, because getting it backwards fails nothing —
+it just quietly disables the control. Same shape as a watcher that cannot tell
+quiet from blind.
+
+### The gate, and what it took to run it at all
+
+Set-valued, per [E]: `--check`'s output order comes from a DashMap walk, so
+byte-diff is the wrong instrument. **N=2,431, only-A=0, only-B=0,
+set-identical**, with a same-arm noise floor run first.
+
+Getting a usable N took three corrections, all the same family:
+
+- The default `--severity warning` filters out the hint-severity lanes, so the
+  substrate looked empty.
+- The QA lanes are opt-in flags; without all six the volume is small.
+- **Human-mode diagnostics go to stderr.** My first three attempts measured
+  stdout and reported `N=0` — and the comparator I had just written refused
+  them, which is the only reason I did not publish "set-identical" over an
+  empty set for the second time today.
+
+The floor in that comparator (refuse a comparison below N) earned its keep
+within minutes of being written, against its own author.
