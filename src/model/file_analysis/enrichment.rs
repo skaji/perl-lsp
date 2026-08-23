@@ -619,7 +619,12 @@ impl FileAnalysis {
         // edge; this re-derives it with the index so cross-file-typed
         // invocants resolve. Single-sourced: refs_to / find_def / hover
         // read this frozen edge, never re-derive at query time.
-        self.stamp_method_call_targets(module_index);
+        // ABLATION GATE (measurement, not a mode): `PERL_LSP_SKIP_MC_STAMP=1`
+        // skips the re-stamp so a verb can be diffed byte-for-byte with and
+        // without it — the decisive test for "does this verb read the edge".
+        if std::env::var_os("PERL_LSP_SKIP_MC_STAMP").is_none() {
+            self.stamp_method_call_targets(module_index);
+        }
         self.rebuild_enrichment_indices();
     }
 
