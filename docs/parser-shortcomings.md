@@ -8,7 +8,7 @@ salvages declarations that survive *as ERROR children*; a token-stream
 bleed or a whole-file ERROR wrap loses them entirely).
 
 For each: minimal repro, expected vs actual tree, downstream impact.
-Inspect any snippet with `perl-lsp --parse <file>` (or `--` for stdin).
+Inspect any snippet with `perl-lsp --parse <file>` (or `-` for stdin).
 
 Parser version at time of writing: **ts-parser-perl 1.1.1**.
 
@@ -25,11 +25,12 @@ punctuation-var deref-casts, and arrow-chained subscripts in strings; it also
 fixed list-op `{…}` parsing as a hashref argument (`bless {@_}, $class`) — which
 flipped `bless {…}, ref $_[0]` from a mis-parsed indirect-object block to a
 correct two-arg call, so the builder now resolves the clone idiom's class from
-`ref EXPR` directly (`bless_class_of`). Only the items below remain.
+`ref EXPR` directly (`bless_class_of`). The `} or next` gap below remains
+open; G2 (also below) has since landed upstream.
 
 ---
 
-## G2 — top-level bare `{ ... }` block wrapping a whole package
+## G2 — top-level bare `{ ... }` block wrapping a whole package (fixed upstream)
 
 The "non-indenting brace" idiom (perltidy emits `{ #<<< ... }` to contain
 a package's lexicals without indenting the body) puts the *entire* package
@@ -47,31 +48,19 @@ package Perl::Tidy::Formatter;
 1;
 ```
 
-**Actual** — on the real 39,305-line `Perl/Tidy/Formatter.pm` the parse is
-a single root ERROR spanning the **whole file**:
-```
-(source_file
-  (ERROR [0, 0] - [39305, 0]
-    (comment ...) (comment ...) ...))
-```
-509 ERROR nodes total. A small, balanced version of the same shape parses
-*cleanly* as `block_statement` — so the root wrap is content-dependent: one
-unrecoverable error among the thousands of lines *inside* the block bubbles
-all the way out, because the file-scope `{...}` is the recovery boundary.
-The block's "is this a hash-ref expression or a block?" ambiguity makes the
-parser unable to re-sync at an inner statement boundary; the failure
-propagates to the block's extent, which is the file.
+**Actual** — fixed upstream: the currently pinned ts-parser-perl (1.1.4)
+parses a real `Perl/Tidy/Formatter.pm` with 0 ERROR nodes, in the shape
+described below as *Expected* — a `package_statement` immediately followed
+by a sibling `block_statement` holding the `use`/`our`/`sub` declarations
+as direct children.
 
 **Expected** — a `block_statement` (or `package`-scoped block) whose body
 holds the `use`/`our`/`sub` declarations as direct children, so structural
 recovery can find them even when an inner sub fails to parse.
 
-**Downstream impact** — **severe**. `perl-lsp --dump-package
-Perl::Tidy::Formatter` reports *"Package not found"*: the package is indexed
-as `main` (the `package` statement is inside the ERROR, detached from the
-body), 31+ subs vanish from the symbol table, goto-def / references /
-completion all dead for the file. This is the single highest-impact grammar
-gap found — one idiom loses one of perltidy's largest modules wholesale.
+**Downstream impact** — none currently: `perl-lsp --dump-package
+Perl::Tidy::Formatter` finds the package and its subs, and goto-def /
+references / completion all work for the file.
 
 ---
 

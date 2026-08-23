@@ -53,8 +53,10 @@ navigation — display + diagnostics only.
 ## Consumers
 
 - **hover** — `base + stack.render()` → `Box* const`, `Box****`.
-- **member-access DX** *(next)* — `(stack, operator-typed)` → validate /
-  auto-correct (`p.` on `[Pointer]` → offer `->`).
+- **member-access DX** — `expected_member_op(stack)` validates / auto-corrects
+  the single-level case (`p.` on `[Pointer]` → offer `->`); a DEEP stack
+  (`Box**`) falls to `deref_peel` for a show-only wrap hint (`(*pp)->`), since
+  that fix is an expression wrap, not a token swap.
 - **diagnostics** *(future)* — const-correctness reads `annotations`.
 
 Resolution itself never consults the stack — it stays "drop to the leaf

@@ -15,13 +15,18 @@ LSP side adds nothing.
 `Import::Base` subclasses ARE their `our @IMPORT_MODULES` and
 `%IMPORT_BUNDLES` declarations. `require <Kit>` populates them at
 compile time without triggering the kit's `import` method. The
-generator reads them directly. No probe namespace, no
-`Import::Into` monkey-patching, no coderef bodies executing at
-generator time.
+generator reads them directly — no `Import::Into` monkey-patching,
+no probe stand-in for the *consumer's* `import` dispatch.
 
 The alternative — monkey-patch `Import::Into` and run `Kit->import`
 in a probe — works and is the only path for hand-rolled
 `sub import` kits. Skip it when reading the tables suffices.
+
+A `%IMPORT_BUNDLES` *value* can itself be a coderef, and that one the
+generator does run — against `App::PerlLSP::PluginGen::Probe`, a
+recording stand-in (`can`/`AUTOLOAD`) — because a coderef's side
+effects (`extends`/`with`/`load_components`) and return value are
+the only way to see what it wires up. See "Coderefs" below.
 
 ### Generator is Perl, output is a committed `.rhai`
 
@@ -52,15 +57,24 @@ non-dash arg is the bundle name (`'Class'`); the dashed form
 (`-Class`) is accepted as a synonym because some kit READMEs
 document it that way.
 
-### Coderefs are TODO comments
+### Coderefs are probed, best-effort
 
 `%IMPORT_BUNDLES` values can contain coderefs (`load_components`,
-`extends('X')`, ...). Without executing the kit, the generator
-can't decode these. v1 emits `// TODO: coderef at <kit>.pm:<line>`
-at the right position; the user reads the kit source and hand-
-authors the equivalent `SyntheticUse` / `PackageParent` emissions.
-B::Deparse + pattern-matching is deferred — adds machinery only
-worth it if the same coderef shapes recur across many kits.
+`extends('X')`, ...). The generator runs each one, once, against the
+recording `Probe` stand-in: verbs it recognizes (`extends`/`with`/
+`parent`/`base`/`load_components`) become `PackageParent` emissions,
+and the coderef's return value walks the same entry parser as a
+static list, becoming `SyntheticUse` (args/imports dropped — a
+coderef computes those at runtime, and fabricating a list we can't
+verify is worse than a bare `use`). A `// best-effort: ... was
+probed by running it ONCE` comment marks the emission so the author
+knows conditional branches on the consumer or bundle name weren't
+seen. When the probe run itself dies, or a verb it calls has no
+`PackageParent`/`SyntheticUse` mapping, that one entry falls back to
+`// TODO: coderef at <kit>.pm:<line>` and the user hand-authors it.
+B::Deparse + pattern-matching for the cases the probe can't reach is
+deferred — adds machinery only worth it if the same shapes recur
+across many kits.
 
 ## What's intentionally not here
 

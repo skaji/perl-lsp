@@ -113,7 +113,7 @@ the recording sites, not consumers. This trade-off is ratified in
 Salsa"); revisit if the query graph deepens past what a dirty-set walk
 comfortably serves (e.g. the phase-4 materialized views below).
 
-Consumers: `Backend::republish_open_docs_in` re-enriches open Perl
+Consumers: `Backend::republish_dirty` re-enriches open Perl
 documents on a Changed verdict (through `FileStore::enrich_open`, the one
 open-doc enrichment writer; the open doc's own record is its build-time
 `Document::baseline_surface`, so enrichment never reaches a freshness

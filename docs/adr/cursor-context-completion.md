@@ -40,9 +40,13 @@ edit + reparse + span remap. The others fix a parse corrupted by a
 cursor so the access becomes syntactically complete, reparse, find the
 placeholder, and take its member node's receiver (`named_child(0)`).
 
+The production entry point folds the receiver step and the type
+resolution together; a test-only `Receiver{text,start,end,arrow}` probe
+isolates just the sentinel mechanics for assertions:
+
 ```rust
-pub fn receiver_at_incremental(parser, cfg, src, old_tree, cursor) -> Option<Receiver>
-pub struct Receiver { text: String, start: usize, end: usize, arrow: bool }
+pub fn member_completion_ctx_incremental(parser, cfg, src, old_tree, cursor, analysis, module_index) -> Option<MemberCompletionCtx>
+pub struct MemberCompletionCtx { receiver_type: Option<InferredType>, op_fix: Option<(Span, String)>, op: MemberOp }
 ```
 
 Two properties make it cheap and exact:
@@ -55,11 +59,12 @@ Two properties make it cheap and exact:
   exact: tree-sitter reparses only the damaged region around the cursor,
   reusing the document tree `document.rs` already holds.
 
-Per-language config is a two-field table (`LangCfg { member_kinds,
-skip_kinds }`), not a branch — the member-access node kinds and the
-"don't splice into strings/comments" set are the only facts that vary.
-`lang_cfg(language)` maps a driver id to its `LangCfg`; `None` means the
-language gets in-scope completion only.
+Per-language config comes from `LangPack` — a single struct, not a
+branch. The member-access node kinds (`member_kinds`) and the "don't
+splice into strings/comments" set (`skip_kinds`) are the facts this seam
+reads, alongside the pack's other per-language config for the rest of
+completion. `LanguageDriver::lang_pack(language)` maps a driver id to its
+`LangPack`; `None` means the language gets in-scope completion only.
 
 ### Receiver → members: tree-free, reusing the bag
 
@@ -102,6 +107,4 @@ already has, and its receiver→type→members tail is the same bag +
 inheritance walk Perl uses. The protocol signal rides on top as the cheap
 gate.
 
-Deferred: the CLI/`--batch` completion arm still does in-scope only (member
-completion is backend-wired); inheritance across namespaces (qualified
-class names); chained-receiver typing (`a.b.c.`).
+Deferred: inheritance across namespaces (qualified class names).

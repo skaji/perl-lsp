@@ -42,16 +42,19 @@ LANDED (additive, Perl path untouched, default suite 1062/0):
   `cpp-lsp` = `cargo build --features cpp`; `--features all-langs` serves
   all five. `--languages` / `--lang-analyze <file>` prove it at the CLI
   (a macro-heavy `.cpp` routes through the reparse seam and outlines).
+- **Async LSP backend routing.** `FileStore::open` routes `did_open` by
+  extension/content-sniff through `LanguageRegistry`; `did_change` and
+  watched-file events dispatch per-driver capability the same way, and
+  `ensure_workspace_indexed` latches per language family — `cpp-lsp` works
+  *in an editor*, not just the CLI.
+- **Per-language `ModuleIndex`** (keyspace isolation): `pack_indexes` keeps
+  a separate sub-index per language (own cache, own `modules-{lang}.db`),
+  and `lookup_for` routes a query to the right one by the queried file's
+  language — names never comingle across languages.
 
 STILL DEFERRED (the risky part — needs e2e, do with review, NOT blind):
-- **Async LSP backend routing.** `document.rs` / `backend.rs`
-  `did_open`/`did_change` still hardwire Perl; routing them through the
-  registry (by `language_id` / extension) + watcher globs is what makes
-  `cpp-lsp` work *in an editor* (not just the CLI). Per
-  `docs/prompt-multi-language.md` §"Touch points".
 - **`FileAnalysis.language` tag + the two cross-file filters** (refs_to /
   workspace-symbol) so a Python `helper` doesn't match a Perl `helper`.
-- **Per-language `ModuleIndex`** (keyspace isolation).
 
 Why keystone: **every C/C++ spike below is a standalone module that the
 driver now hosts.** The CLI slice proves the seam; the backend routing +

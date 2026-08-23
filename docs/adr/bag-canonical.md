@@ -22,8 +22,12 @@ through the registry.
 
 There is no `Builder::infer_expression_type`. The closed-syntax
 cases (literals, anon-sub `CodeRef`, constructor → `ClassName`)
-live in `expr_payload`'s match, called only by
-`emit_expr_witness`. Callers that need the type at walk time do
+live in `expr_payload`'s match, called from `emit_expr_witness` at
+walk time and from `resolve_forward_expr_witnesses` — its own
+post-walk pipeline phase that re-resolves queued forward-referenced
+expression nodes once the symbol table is final, under the same
+source tag and span so reducers can't tell the two emission sites
+apart. Callers that need the type at walk time do
 `emit_expr_witness(node); bag_query_expr_span(node_to_span(node))`
 — emit first, query after.
 

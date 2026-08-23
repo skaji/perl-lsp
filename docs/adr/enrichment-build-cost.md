@@ -10,7 +10,7 @@ Measured, so the next attempt starts from numbers rather than from the idea.
 
 The dominant one is `stamp_method_call_targets`, and every proposal for doing
 less of it has closed — see `docs/adr/skipping-cross-file-work.md` for the
-seven and their numbers.
+eight and their numbers.
 
 ## Measurements
 

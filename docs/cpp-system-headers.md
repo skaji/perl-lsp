@@ -1,9 +1,12 @@
 # C/C++ system-header resolution — challenges (parked)
 
 `iswspace` (and any libc/STL symbol) gets no goto-def/hover because we index
-only *project* files: the workspace walk skips non-project trees and the
-macro gather skips `<...>` includes. Closing that is **not** "index system
-headers like Perl indexes @INC" — the tradeoffs are different on every axis.
+only *project* files: the workspace walk skips non-project trees, and the
+macro gather's toolchain-probed `<...>` resolution (`resolve_include` in
+`cpp_reparse/gather.rs`) only reaches system headers to seed the macro table —
+it extracts no declarations, so nothing backs a goto-def/hover target. Closing
+that is **not** "index system headers like Perl indexes @INC" — the tradeoffs
+are different on every axis.
 
 ## Why the Perl model doesn't transfer
 

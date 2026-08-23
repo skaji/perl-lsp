@@ -284,14 +284,15 @@ multi-language path (`prompt-multi-language.md`).
 
 ## Recommendation (revised after spike 2)
 
-Keep the branch as evidence; don't merge. The Perl path stays
-walker-built — its ring 2/3 fidelity is far ahead of what packs
-reach. But the multi-language thesis is now demonstrated, not
-speculated: the engine answers type queries for a language it has
-never heard of, through a 45-line query pack and one predicate. If a
-second language ever matters, the path is: skeleton tier (outline /
-workspace symbols — driver as-is) → lexical typing (this spike's
-vocabulary) → per-language module resolution → dispatch emission.
-Each step is pack work. The design round worth pre-investing is none;
-the next round worth having is module resolution strategy, and only
-when a concrete second language shows up.
+The Perl path stays walker-built — its ring 2/3 fidelity is far ahead
+of what packs reach. But the multi-language thesis is demonstrated,
+not speculated: the engine answers type queries for a language it has
+never heard of, through a 45-line query pack and one predicate. The
+path this section once deferred — skeleton tier (outline / workspace
+symbols — driver as-is) → lexical typing (this spike's vocabulary) →
+per-language module resolution → dispatch emission — has since been
+walked for real: the driver and packs landed as
+`src/build/query_extract/`, wired into `LanguageDriver`/
+`LanguageRegistry`, with C++/Python/R/CMake packs live behind opt-in
+Cargo features (`--features cpp|python|r|cmake`). The design that
+carried this from spike to landing is `docs/prompt-multi-language.md`.

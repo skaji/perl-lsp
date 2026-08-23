@@ -24,10 +24,12 @@ deep nesting (`B<I<C<foo>>>`), `=begin`/`=end` data regions, and EOF without
 
 ### Builder consumes rendered markdown — never re-render
 
-`builder.rs::extract_pod_for_sub` and the tail-POD pass call
-`extract_head2_section` / `extract_item_section` directly and store the result
-as `SymbolDetail::Sub.doc`. **It must NOT call `pod_to_markdown` on the
-result** — those extractors already returned markdown; re-rendering double-
+`builder/docs.rs::extract_preceding_doc` calls `extract_head2_section` /
+`extract_item_section` directly; the tail-POD pass (`resolve_tail_pod_docs`)
+calls `pod.rs::extract_sub_doc_sections`, the batched companion that walks the
+same head2/item boundaries in one pass. Both store the result as
+`SymbolDetail::Sub.doc`. **None of them may call `pod_to_markdown` on the
+result** — these extractors already return markdown; re-rendering double-
 escapes everything.
 
 This is the most likely accident when extending the POD path. The extractors
