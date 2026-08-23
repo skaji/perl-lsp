@@ -308,8 +308,41 @@ Two findings worth carrying forward:
   reads 156,746 in that state. This is answer-neutral (absent means decode) and
   purely a cost, but it means any measurement taken after a source edit without
   a full clear is measuring an empty layer. It belongs with the flush driver.
-- **Open, and NOT ours: `gold-corpus/run.pl` fails
-  `diagnostics/loader-config-conf-shape-closed` on a WARM cache and passes on a
-  cold one.** Confirmed identical at `f337fc7` with no changes applied, so it
-  predates this work. Cold 502/0, warm 501/1, reproducible on both trees. Worth
-  a row of its own: the harness is normally run cold, which hides it.
+- **Fixed on the base, and it was ours: the warm-cache gold failure.**
+  `gold-corpus/run.pl` failed `diagnostics/loader-config-conf-shape-closed` on
+  a WARM cache and passed cold (502/0 cold, 501/1 warm, on both trees, so it
+  predated this arc's commits). Root cause was the bag-column split:
+  `record_loader_shapes` resolved each plugin's config value by asking the
+  witness bag, and both warm scans decode without the bag column, so the
+  projection silently produced nothing on every run after the first.
+
+  Independently diagnosed and fixed on the base (#155) while this arc was in
+  flight, by the better of the two available repairs: the warm scans now decode
+  through `decode_analysis_parts`, so the copy is MARKED bag-evicted and a type
+  query rehydrates instead of reading an empty bag as "no facts". That fixes
+  every reader of a warm copy rather than the one that happened to be caught.
+
+  The general form is worth naming either way: **a span plus "go ask the bag"
+  is not a fact that survives a strip, and a copy that cannot say which axes it
+  is missing makes every such reader silently wrong.** The residency discipline
+  covers who may hold a whole copy; it does not yet cover who may DERIVE from
+  one, nor require a stripped copy to be honest about it.
+
+  Sweep of the other bag reads reachable from an index path, done after the
+  fact: `module_resolver/thread.rs`'s transitive `symbol_return_type_via_bag`
+  is safe (`strip_import_copy_one` clones and evicts the CLONE, and the walk
+  only runs for names not already cached, i.e. right after a fresh parse), and
+  `resolve/definitions.rs` / `resolve/hierarchy.rs` read the cursor's own open
+  document, never stripped. The loader shape was the only one.
+
+  One residual worth landing separately, which #155 does not cover: **the
+  config shape is not on the Surface.** An edit that only adds a key to a
+  plugin's config hash changes no member anywhere, so the verdict reads
+  Unchanged, no open consumer re-enriches, and every one of them keeps
+  diagnosing against the old closed key set for the rest of the session. That
+  is a second bug of the same family and independent of how the shape is read.
+
+  It also says something about the harness — which the base has since acted on
+  (#153): gold ran once against whatever cache was on the box, so the only run
+  that still worked was the one being scored. It now runs cold and warm against
+  a private throwaway cache dir, with a `warm: xfail` status for known gaps.
