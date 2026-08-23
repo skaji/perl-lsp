@@ -171,3 +171,113 @@ pub fn prune_generations_below(conn: &Connection, keep: Generation) -> usize {
     )
     .unwrap_or(0)
 }
+
+/// Paths holding a valid blob but no conclusion row a reader could use.
+///
+/// The repair frontier. `validate_conclusion_fingerprint` clears conclusions
+/// and deliberately keeps the blobs, "because the repair is a re-bake" — but
+/// nothing drove that re-bake, so after any source edit the layer stayed dark
+/// until someone ran a full `--clear-cache` by hand
+/// (`conclcache.known_absent` read 156,746 in that state). Answer-neutral —
+/// absent from the STORE means decode, not "no answer" — and purely a cost,
+/// but a permanent one, and it silently made every measurement taken after a
+/// rebuild a measurement of an empty layer.
+///
+/// Enumerated by QUERY rather than by remembering what the clear touched, so
+/// it also covers a file whose bake failed to encode, one written by a
+/// `PERL_LSP_NO_BAKE` run, and any future path that persists a blob without a
+/// map. "Which rows are missing" is a question the store can always answer;
+/// "which rows did we drop" is one only the dropper knows.
+///
+/// Version-filtered: a row below `EXTRACT_VERSION` is going to be re-parsed
+/// anyway, and baking it would spend the work twice.
+pub fn paths_missing_conclusions(conn: &Connection, at: Generation) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT m.path FROM modules m \
+         WHERE m.analysis IS NOT NULL AND m.extract_version = ?1 \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM conclusions c \
+             WHERE c.path = m.path AND c.generation <= ?2 \
+           )",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("conclusion repair: could not enumerate frontier: {e}");
+            return Vec::new();
+        }
+    };
+    let rows = stmt.query_map(params![EXTRACT_VERSION, at.0], |r| r.get::<_, String>(0));
+    match rows {
+        Ok(it) => it.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            log::warn!("conclusion repair: frontier query failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// How many paths one repair slice takes.
+///
+/// Small on purpose. The slice runs where the resolver thread would otherwise
+/// be blocked on its condvar, so its length is the worst-case delay a real
+/// resolve request waits behind — this is a latency bound, not a throughput
+/// knob. Bigger chunks would amortize the transaction better and make the
+/// server less responsive, which is the wrong trade for work that has no
+/// deadline.
+pub const REPAIR_SLICE: usize = 32;
+
+/// Re-bake one slice of the frontier and store it. Returns how many landed.
+///
+/// The decode and the bake happen OUTSIDE the transaction, and only the writes
+/// go inside it: a slice is tens of milliseconds of CPU, and holding SQLite's
+/// write lock across that would stall every other writer for the duration of
+/// work that is not writing.
+pub fn repair_conclusions_slice(
+    conn: &Connection,
+    paths: &[String],
+    at: Generation,
+) -> usize {
+    let baked: Vec<(&String, Vec<u8>)> = paths
+        .iter()
+        .filter_map(|path| {
+            // WITH the bag: the bake reads witnesses, and a bagless decode
+            // would produce a map that concludes nothing while looking like a
+            // successful repair — the same silent-empty shape this whole
+            // repair exists to undo.
+            let fa = super::load_one_diag(conn, path, true).ok()?;
+            let blob = super::bake_conclusions_blob(&fa, &fa.witnesses);
+            if blob.is_empty() {
+                // Nothing encodable. Leaving the row absent is right: the
+                // reader falls back to a decode, which is where it already was.
+                crate::util::ghost_stats::count("repair.nothing_to_bake");
+                return None;
+            }
+            Some((path, blob))
+        })
+        .collect();
+    if baked.is_empty() {
+        return 0;
+    }
+    let mut landed = 0usize;
+    if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+        log::warn!("conclusion repair: txn open failed; the slice defers to the next pass");
+        return 0;
+    }
+    for (path, blob) in &baked {
+        let r = conn.execute(
+            "INSERT OR REPLACE INTO conclusions (path, generation, map) VALUES (?1, ?2, ?3)",
+            params![path, at.0, blob],
+        );
+        match r {
+            Ok(_) => landed += 1,
+            Err(e) => log::warn!("conclusion repair: store failed for '{path}': {e}"),
+        }
+    }
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        log::warn!("conclusion repair: commit failed: {e}");
+        let _ = conn.execute_batch("ROLLBACK");
+        return 0;
+    }
+    crate::util::ghost_stats::count_by("repair.baked", landed as u64);
+    landed
+}

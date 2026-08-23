@@ -187,6 +187,30 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<EncodedAnalysis> {
     let conclusions = if std::env::var("PERL_LSP_NO_BAKE").is_ok() {
         Vec::new()
     } else {
+    bake_conclusions_blob(fa, &bag)
+    };
+    Some(EncodedAnalysis {
+        analysis,
+        bag: bag_blob,
+        conclusions,
+    })
+}
+
+
+/// Bake one analysis's conclusions and encode them for the store.
+///
+/// Factored out of `encode_analysis` because the REPAIR path bakes the same
+/// thing from an already-persisted blob, and two bakes that could drift is
+/// precisely the failure the derivation fingerprint exists to catch: bytes
+/// that decode cleanly and answer wrongly. One speller, two callers.
+///
+/// The bag is a parameter rather than read off `fa` because the persist path
+/// has already taken it out (it travels in its own column); the repair path
+/// passes the analysis's own.
+pub fn bake_conclusions_blob(
+    fa: &FileAnalysis,
+    bag: &crate::model::witnesses::WitnessBag,
+) -> Vec<u8> {
     crate::util::ghost_stats::timed("persist.bake", || {
         // Every declared sub/method becomes a key, not just those the bag
         // indexed — see `bake_with_symbols`. Without this, a method resolved
@@ -233,12 +257,6 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<EncodedAnalysis> {
             .ok()
             .and_then(|b| zstd::encode_all(b.as_slice(), ZSTD_LEVEL).ok())
             .unwrap_or_default()
-    })
-    };
-    Some(EncodedAnalysis {
-        analysis,
-        bag: bag_blob,
-        conclusions,
     })
 }
 

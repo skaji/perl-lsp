@@ -1836,3 +1836,78 @@ fn a_derivation_change_clears_conclusions_but_keeps_blobs() {
     );
     let _ = std::fs::remove_file(&pm);
 }
+
+/// A blob whose map the fingerprint gate cleared must get its map back, and
+/// the map it gets back must be the one the persist path would have written.
+///
+/// Both halves matter and they fail differently. Without the enumeration the
+/// layer stays dark after every source edit until someone runs a full
+/// `--clear-cache` by hand — `conclcache.known_absent` read 156,746 in that
+/// state, which is purely a cost but a permanent one, and it silently made
+/// every measurement taken after a rebuild a measurement of an empty layer.
+/// Without the SHARED bake, the repair writes well-formed bytes carrying a
+/// different answer than the persist path — the exact failure mode the
+/// derivation fingerprint exists to catch, arriving through the repair that
+/// fingerprint triggers.
+///
+/// Base-verify by dropping `paths_missing_conclusions`' `NOT EXISTS` clause:
+/// the frontier then also contains the file that already has a map, and the
+/// repair rewrites rows nothing asked for.
+#[test]
+fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
+    let conn = test_db();
+    let path = std::path::Path::new("/repair/App.pm");
+    let cached = parse_source_to_cached(
+        "package My::App;\nuse Mojolicious::Lite;\n\
+         plugin 'CloveApp', { alpha => 1, beta => 2 };\n\
+         sub helper { return 'x' }\n1;\n",
+        path,
+    );
+    let some = Some(cached.clone());
+    assert!(save_to_db(&conn, "My::App", &some, "workspace"));
+
+    let at = current_generation(&conn);
+    let persisted = load_conclusions(&conn, "/repair/App.pm", at)
+        .expect("precondition: the persist path writes a map");
+
+    // What `validate_conclusion_fingerprint` does: clear the maps, keep the
+    // blobs, on the promise that each file re-bakes from the blob it has.
+    conn.execute("DELETE FROM conclusions", []).unwrap();
+    assert!(
+        load_conclusions(&conn, "/repair/App.pm", at).is_none(),
+        "precondition: the map is gone"
+    );
+
+    let frontier = paths_missing_conclusions(&conn, at);
+    assert_eq!(
+        frontier,
+        vec!["/repair/App.pm".to_string()],
+        "the file holds a blob and no map, so it is the repair frontier"
+    );
+
+    assert_eq!(repair_conclusions_slice(&conn, &frontier, at), 1);
+    let repaired = load_conclusions(&conn, "/repair/App.pm", at)
+        .expect("the repair puts a map back");
+
+    // Same map, not merely A map. A repair that concluded something else
+    // would look identical to a working one from every angle but this.
+    assert_eq!(
+        repaired.0.len(),
+        persisted.0.len(),
+        "the repair baked a different number of keys than the persist path"
+    );
+    for (k, v) in persisted.0.iter() {
+        assert_eq!(
+            repaired.0.get(k),
+            Some(v),
+            "key {k:?} concludes differently after a repair than it did at persist"
+        );
+    }
+
+    // Idempotent: nothing is left on the frontier, so a second pass is a no-op
+    // rather than a rewrite loop.
+    assert!(
+        paths_missing_conclusions(&conn, at).is_empty(),
+        "a repaired file must leave the frontier, or the background pass never ends"
+    );
+}
