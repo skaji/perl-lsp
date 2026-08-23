@@ -102,12 +102,14 @@ impl ConclusionCache {
     }
 
     /// Forget everything — the derivation changed, so every map is void.
+    #[allow(dead_code)] // wholesale drop; production invalidates per path
     pub fn clear(&self) {
         self.entries.clear();
         self.absent.clear();
         self.bytes.store(0, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)] // byte accounting, read by the cap tests
     pub fn resident_bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
     }

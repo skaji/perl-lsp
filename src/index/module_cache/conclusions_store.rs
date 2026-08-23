@@ -84,6 +84,12 @@ pub fn load_conclusions(
 /// one generation, and letting each write pick its own would scatter a single
 /// logical round across several, which is exactly the half-built state the
 /// pinning is designed to prevent.
+/// Deliberately driver-less: the flush stopped publishing once it became
+/// clear that a conclusion row with no `modules` row behind it can never be
+/// caught by a stamp check. Publication waits on the conclusions table
+/// carrying its own freshness stamp; the store side is built and tested for
+/// when it does.
+#[allow(dead_code)]
 pub fn save_conclusions(
     conn: &Connection,
     path: &str,
@@ -113,6 +119,7 @@ pub fn save_conclusions(
 /// all exist yet, and `load_conclusions` would serve absence — which the
 /// evaluator reads as a definite `None`, the one thing absence must never
 /// mean.
+#[allow(dead_code)] // see `save_conclusions` — publication awaits a conclusions-row stamp
 pub fn publish_generation(
     conn: &Connection,
     at: Generation,
@@ -158,6 +165,7 @@ pub fn forget_conclusions(conn: &Connection, path: &str) {
 /// automatic: a sweep that guessed would delete the generation a live consult
 /// is reading, which is the same absence-as-answer failure the retention
 /// exists to prevent, arriving by a different door.
+#[allow(dead_code)] // reclaims what publication would produce; see `save_conclusions`
 pub fn prune_generations_below(conn: &Connection, keep: Generation) -> usize {
     // Keep the newest row at or below `keep` for each path — that is the one a
     // reader pinned at `keep` still resolves to. Only rows OLDER than that are

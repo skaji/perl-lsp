@@ -130,6 +130,7 @@ pub struct EncodedAnalysis {
 
 impl EncodedAnalysis {
     /// Total stored size, for the writers' byte accounting.
+    #[allow(dead_code)] // byte accounting for a writer that now measures its own chunks
     pub fn len(&self) -> usize {
         self.analysis.len() + self.bag.len() + self.conclusions.len()
     }
@@ -146,6 +147,7 @@ impl EncodedAnalysis {
     }
 
     /// The baked map, decoded.
+    #[allow(dead_code)] // decodes the encoded map; the flush takes `bake_conclusion_map` instead
     pub fn conclusion_map(&self) -> Option<crate::model::witnesses::ConclusionMap> {
         let bin = zstd::decode_all(self.conclusions.as_slice()).ok()?;
         bincode::deserialize(&bin).ok()

@@ -224,9 +224,11 @@ impl ConclusionMap {
     pub fn len(&self) -> usize {
         self.0.len()
     }
+    #[allow(dead_code)] // read by tests; the evaluator goes through `evaluate`
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+    #[allow(dead_code)] // read by tests; the evaluator goes through `evaluate`
     pub fn get(&self, key: &ConclusionKey) -> Option<&Conclusion> {
         self.0.get(key)
     }
@@ -629,6 +631,7 @@ pub fn shared_registry() -> &'static ReducerRegistry {
 /// fallback residualizes rather than materializing. That is not an
 /// optimization; a materialized cross-file value would freeze a world that
 /// can change without this file changing.
+#[allow(dead_code)] // defaulting wrapper over `bake_in_context`; production passes its own context
 pub fn bake(
     bag: &WitnessBag,
     registry: &ReducerRegistry,
@@ -649,6 +652,7 @@ pub fn bake(
 /// on the attachment, so a witness-less `MethodOnClass` still gets whatever
 /// answer the live path would give it, including one composed entirely from
 /// edges.
+#[allow(dead_code)] // see `bake`
 pub fn bake_with_symbols(
     bag: &WitnessBag,
     registry: &ReducerRegistry,
@@ -662,6 +666,7 @@ pub fn bake_with_symbols(
 ///
 /// Parents decide which classes are CLOSED — reasoned about completely from
 /// this file — and only a closed class may have its absences read as proofs.
+#[allow(dead_code)] // see `bake`
 pub fn bake_full(
     bag: &WitnessBag,
     registry: &ReducerRegistry,
