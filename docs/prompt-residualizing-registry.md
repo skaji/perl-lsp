@@ -424,3 +424,74 @@ consults, because a candidate can be skipped before the chase runs (the
 self-bag `ptr::eq` continue, an exhausted consult budget). The wasted/paid split
 is over decodes that actually ran a chase, which is the population the question
 is about.
+
+---
+
+## The third absence verdict, built — and the biggest win of the arc
+
+Not a new conclusion form. `Outcome::NotLocal`, a third answer to "the key is
+absent":
+
+| class | verdict | licence |
+|---|---|---|
+| closed (every ancestor declared here) | `None` | absence is a proven no-answer |
+| enumerated but not closed | **`NotLocal`** | skip THIS candidate, ladder continues |
+| never declared here | `Decode` | the bake never looked |
+
+Deliberately not a constructed `Follow` at the class's parents. A `Follow` from
+candidate 1's map jumps to the parent walk and never asks candidates 2..n — and
+a REOPENED package's method lives in exactly such a later candidate
+(`PPI::XSAccessor` reopening `PPI::Token`, which has already cost this layer 75
+breaks once). Continuing the loop keeps candidates-before-parents and the bridge
+guard correct by construction instead of by re-derivation. Pinned by
+`a_not_local_verdict_does_not_skip_a_later_candidate`.
+
+| | verdict off | verdict on |
+|---|---|---|
+| `consult.attempt` | 1,715.0 ms / 63,950 calls | **453.9 ms / 14,293** |
+| `moc.provider_fetched` | 105,670 | **33,986** |
+| `bagcache.decode` | 2,443.8 ms / 4,251 | 2,344.6 ms / 4,262 |
+
+**A 1.26 s saving per warm substrate check, and a 74% cut in the chase.** Note
+`bagcache.decode` barely moves: the saving is in the CHASE, not in bytes
+decoded — the resident/LRU tier was already absorbing repeats, and `consult.attempt`
+is the term that was actually paying.
+
+### The soundness gap, which is where the whole difficulty lived
+
+First measurement: **555 breaks.** Every one an inherited accessor the verdict
+was RIGHT about — the check compared against the candidate's full chase, which
+walks its own parents. A check that fires on correct behaviour is worse than
+none; it would have sent me hunting a gap that was not there. The comparison has
+to be against an INDEX-LESS chase of that file — the same context the bake ran
+under — because the failure being guarded is "the file had a local answer and
+the bake missed it".
+
+Corrected check: **40 breaks**, all real, all one shape:
+
+```
+PackageSymbol{Mojo::Server::Daemon, app} => ClassName("Mojolicious")
+```
+
+No local symbol, no attachment at that key, and not an app-surface consumer —
+and an index-less chase still answers. The answer comes from
+`PackageSymbol{Mojo::Server, app}`, whose key **this same map holds**: the file's
+bag carries witnesses about a parent whose code lives elsewhere.
+
+So absence of a KEY is not the question the chase asks. The chase composes over
+the CLASS. `ConclusionMap` now carries each enumerated class's declared parents
+and walks them before judging an absence — depth-capped rather than
+cycle-guarded, because a declared-parent chain inside one file is short and a
+`HashSet` allocation per lookup is not free on a path taken 31,000 times a check.
+
+Breaks went 40 → **0**, and `concl.inherited_hit` reads exactly 40: the same
+population, now answered instead of misjudged.
+
+### What generalises
+
+**A verdict about a key cannot be validated against a chase about a class.** The
+first check was not weakly wrong, it was wrong in the direction that manufactures
+work: it reported 555 failures of a mechanism that was behaving correctly. Both
+times the fix was to make the comparison ask the question the claim actually
+makes — the same correction as the `Link` classifier that excused every break
+because it tested the wrong key.

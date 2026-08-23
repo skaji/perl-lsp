@@ -62,8 +62,9 @@ fn a_baked_conclusion_agrees_with_the_live_chase() {
             match map.evaluate(&key, None, None, &[]) {
                 // A decode defers to the live path, so it cannot disagree
                 // with it — that is the point of keeping it distinct from
-                // absent.
-                Outcome::Decode(_) | Outcome::Follow { .. } => {}
+                // absent. `NotLocal` likewise defers: it skips ONE candidate
+                // and licenses nothing about the answer.
+                Outcome::Decode(_) | Outcome::Follow { .. } | Outcome::NotLocal => {}
                 Outcome::Answer(baked) => {
                     checked += 1;
                     assert_eq!(
@@ -201,6 +202,8 @@ fn m(entries: Vec<(ConclusionKey, Conclusion)>) -> Arc<ConclusionMap> {
     Arc::new(ConclusionMap(
         entries.into_iter().collect(),
         Default::default(),
+        Default::default(),
+        Default::default(),
     ))
 }
 
@@ -317,6 +320,8 @@ fn a_none_candidate_does_not_stop_the_ladder() {
     let empty = Arc::new(ConclusionMap(
         Default::default(),
         ["B".to_string()].into_iter().collect(),
+        ["B".to_string()].into_iter().collect(),
+        Default::default(),
     ));
     let real = m(vec![(
         moc("B", "f"),
@@ -354,7 +359,12 @@ fn a_parentless_bridged_class_does_not_get_its_absence_trusted() {
     // The map's own view: `B` is closed — no ancestors — so absence in the map
     // reads as a proven `None`. That is what makes the guard load-bearing
     // rather than belt-and-braces.
-    let map = ConclusionMap(Default::default(), ["B".to_string()].into_iter().collect());
+    let map = ConclusionMap(
+        Default::default(),
+        ["B".to_string()].into_iter().collect(),
+        ["B".to_string()].into_iter().collect(),
+        Default::default(),
+    );
     assert_eq!(
         map.evaluate(&moc("B", "f"), None, None, &[]),
         Outcome::None,
@@ -471,5 +481,102 @@ fn a_parent_walk_exit_is_still_residualized() {
         ))),
         "a parent rung was not recorded; got {residuals:?} — with this failing, \
          the two poisoning tests above prove nothing"
+    );
+}
+
+
+/// A not-local verdict must skip ONE candidate, never the rest of the ladder.
+///
+/// This is why the verdict is not a constructed `Follow` at the class's
+/// parents. A `Follow` returned from candidate 1's map jumps straight to the
+/// parent walk and never asks candidates 2..n — and a REOPENED package's
+/// method lives in exactly such a later candidate. `PPI::XSAccessor` reopens
+/// `PPI::Token` in the substrate, which has already cost this layer 75
+/// equivalence breaks once, under a different rule.
+///
+/// Here: candidate 1 declares the class and does not define `f`; candidate 2
+/// reopens it and does. The ladder must reach candidate 2.
+///
+/// Base-verify by making the not-local arm return the parent rungs as a
+/// `Follow` instead of continuing: candidate 2 is skipped and this asserts.
+#[test]
+fn a_not_local_verdict_does_not_skip_a_later_candidate() {
+    // Candidate 1: declares B, enumerates its members, has no `f`.
+    let first = Arc::new(ConclusionMap(
+        Default::default(),
+        // Not closed — B has a parent — so absence is NOT a proven None.
+        Default::default(),
+        ["B".to_string()].into_iter().collect(),
+        [("B".to_string(), vec!["Base".to_string()])]
+            .into_iter()
+            .collect(),
+    ));
+    assert_eq!(
+        first.evaluate(&moc("B", "f"), None, None, &[]),
+        Outcome::NotLocal,
+        "precondition: candidate 1 declares B, enumerated it, and has no f"
+    );
+
+    // Candidate 2: the reopening file, which DOES define it.
+    let second = m(vec![(
+        moc("B", "f"),
+        Conclusion::Value(InferredType::ClassName("Answer".into())),
+    )]);
+
+    let resolve = |_class: &str| {
+        vec![
+            ("/first.pm".to_string(), Some(first.clone())),
+            ("/second.pm".to_string(), Some(second.clone())),
+        ]
+    };
+    assert_eq!(
+        crate::model::witnesses::registry::follow_link_with(&resolve, &[moc("B", "f")], &None, None, &[]),
+        Some(InferredType::ClassName("Answer".into())),
+        "a not-local candidate must let the ladder continue to the file that \
+         reopens the package, not end the walk"
+    );
+}
+
+/// Absence is a question about the KEY; the chase asks one about the CLASS.
+///
+/// A file can hold no conclusion for `C::m` and still answer it, from a
+/// `Parent::m` key the same file holds — its bag carries witnesses about the
+/// parent even when the parent's code lives elsewhere. Reading the child's
+/// absence as "not local" then serves a grandparent's answer over it, which is
+/// a wrong answer rather than a slow one.
+///
+/// `Mojo::Server::Daemon::app` is the substrate case: no local symbol, no
+/// attachment, no app-surface edge, and an index-less chase still answers
+/// `ClassName("Mojolicious")` — from `Mojo::Server::app`, in the same map. It
+/// cost 40 equivalence breaks per check before absence learned to walk the
+/// declared parents first.
+///
+/// Base-verify by deleting the `inherited` call in `evaluate`: this returns
+/// `NotLocal` and asserts.
+#[test]
+fn absence_resolves_through_a_parent_the_same_map_holds() {
+    let map = ConclusionMap(
+        [(
+            moc("Parent", "m"),
+            Conclusion::Value(InferredType::ClassName("Answer".into())),
+        )]
+        .into_iter()
+        .collect(),
+        Default::default(),
+        ["Child".to_string()].into_iter().collect(),
+        [("Child".to_string(), vec!["Parent".to_string()])]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(
+        map.evaluate(&moc("Child", "m"), None, None, &[]),
+        Outcome::Answer(InferredType::ClassName("Answer".into())),
+        "the child's absence must resolve through the parent key this map holds"
+    );
+    // And a member no parent has still reads as not-local.
+    assert_eq!(
+        map.evaluate(&moc("Child", "absent"), None, None, &[]),
+        Outcome::NotLocal,
+        "walking the parents must not turn every absence into an answer"
     );
 }

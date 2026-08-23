@@ -1043,6 +1043,10 @@ impl ReducerRegistry {
             //             full price for this key alone.
             // A `Follow` is not yet honoured — see below.
             let mut baked_said_absent = false;
+            // The map proved this candidate has no LOCAL answer. Weaker than
+            // `baked_said_absent` (which can end the whole resolution) and
+            // stronger than a decode (which would discover the same thing).
+            let mut not_local = false;
             // WHY this candidate is about to be decoded, so the decode's
             // OUTCOME can be attributed back to its cause. That is the number
             // that decides whether a per-class conclusion form is worth
@@ -1179,6 +1183,28 @@ impl ReducerRegistry {
                                 continue;
                             }
                         }
+                        // PROVEN NOT-LOCAL. The file declares the
+                        // class and enumerated its own members;
+                        // the key is not among them, so its chase
+                        // has nothing local to find. Skip the
+                        // candidate and let the ladder continue —
+                        // more candidates, then the parent walk,
+                        // then bridges — which is precisely what
+                        // the decode was going to discover.
+                        //
+                        // Measured before it was built: of the
+                        // decodes this replaces, 43,465 answered
+                        // nothing against 558 that answered.
+                        //
+                        // NOT a `Follow` at the parents. That would
+                        // skip candidates 2..n, and a reopened
+                        // package's method lives in a later
+                        // candidate. Continuing the loop keeps the
+                        // ladder's order correct by construction.
+                        super::Outcome::NotLocal => {
+                            crate::util::ghost_stats::count("consult.not_local");
+                            not_local = !super::not_local_disabled();
+                        }
                         // Cross-file hop: re-enter the ladder at
                         // the target file's map, no decode.
                         //
@@ -1238,6 +1264,79 @@ impl ReducerRegistry {
                 } else {
                     crate::util::ghost_stats::count("consult.not_baked");
                 }
+            }
+            // Skip the decode the verdict just made pointless. Under the
+            // equivalence flag, do NOT skip: run the chase and let the arm
+            // below report any answer the verdict claimed this file could not
+            // give.
+            if not_local {
+                // THE CHECK, and it has to ask the right question. The failure
+                // this verdict can cause is serving a PARENT's answer where the
+                // candidate defines the method itself and the bake's
+                // enumeration missed it. So the comparison is against a
+                // LOCAL-ONLY chase — the same index-less context the bake ran
+                // under — not against the candidate's full chase, which walks
+                // its own parents and legitimately answers for methods the
+                // verdict correctly calls not-local.
+                //
+                // My first version compared against the full chase and read
+                // 555 breaks, every one an inherited accessor the verdict was
+                // right about. A check that fires on correct behaviour is
+                // worse than none: it would have sent me hunting an
+                // enumeration gap that isn't there.
+                if super::verify_absent_conclusions() {
+                    let full = idx.bag_present(cached);
+                    let local_ctx = BagContext {
+                        scopes: &full.scopes,
+                        package_framework: &full.packages,
+                        module_index: None,
+                        package_parents: &full.packages,
+                        app_surface_consumers: &full.plugin.app_surface_consumers,
+                    };
+                    let sub_q = ReducerQuery {
+                        attachment: q.attachment,
+                        point: q.point,
+                        framework: q.framework,
+                        arity_hint: q.arity_hint,
+                        receiver: q.receiver.clone(),
+                        args: q.args.clone(),
+                        context: Some(&local_ctx),
+                    };
+                    // A fresh state: this is a separate question, and threading
+                    // the live one would let its cycle guard answer `None` for
+                    // a key the local chase can actually resolve.
+                    let mut probe_state = QueryState::new();
+                    let local = (*self.query_rec(&full.witnesses, &sub_q, &mut probe_state))
+                        .clone();
+                    if local != ReducedValue::None {
+                        crate::util::ghost_stats::count("concl.not_local_break");
+                        log::error!(
+                            "conclusion not-local break: the map proved {:?} has no LOCAL \
+                             answer in {:?}, but an index-less chase of that file answered \
+                             {local:?} — the bake's local enumeration is incomplete, and \
+                             skipping the candidate would serve a parent's answer over its \
+                             own",
+                            q.attachment,
+                            cached.path
+                        );
+                        debug_assert!(
+                            false,
+                            "a not-local verdict hid a local answer; see log"
+                        );
+                    } else {
+                        crate::util::ghost_stats::count("concl.not_local_ok");
+                    }
+                }
+                // Remember it, for the reason trusting absence had to learn
+                // the hard way: a candidate is asked hundreds of times per
+                // run, and skipping the memo costs more than the decode saved.
+                super::session::remember_candidate_answer(
+                    idx,
+                    &cached.path,
+                    q,
+                    &ReducedValue::None,
+                );
+                continue;
             }
             crate::util::ghost_stats::count("moc.provider_fetched");
             // The three costs of one cross-file consult, split
@@ -1858,6 +1957,9 @@ fn follow_one(
                 // as the live chase's candidate loop does.
                 super::Outcome::None => continue,
                 // Unbakeable here, so the walk cannot answer without the bag.
+                // Proves nothing LOCAL, which for a follow is the same licence
+                // as `None`: this candidate cannot answer, the ladder moves on.
+                super::Outcome::NotLocal => continue,
                 super::Outcome::Decode(_) => return None,
                 super::Outcome::Follow {
                     targets,

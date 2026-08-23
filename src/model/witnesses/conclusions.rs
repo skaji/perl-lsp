@@ -182,6 +182,42 @@ pub struct ConclusionMap(
     /// can be reasoned about at all.
     #[serde(default)]
     pub std::collections::HashSet<String>,
+    /// Classes this file DECLARES — the ones whose local keys the bake
+    /// enumerated. A superset of the closed set.
+    ///
+    /// The difference between the two sets is the whole of a third absence
+    /// verdict. For a class in here but not closed, a missing key proves
+    /// something weaker than "no answer" and much stronger than nothing: this
+    /// file does not answer it LOCALLY. It may still inherit it — which is
+    /// exactly what the live ladder goes on to check, so the honest reply is
+    /// "not mine, keep walking" rather than a decode that discovers the same
+    /// thing 98.7% of the time.
+    ///
+    /// Soundness rests on one property, and it is the only one: absent from
+    /// this map ⇒ this file has no local answer. The bake enumerates every
+    /// declared sub and method (`bake_with_symbols`) precisely so that holds.
+    /// Today's decode silently covers any gap in it; this verdict does not,
+    /// which is why it ships with `PERL_LSP_CONCL_EQUIV`.
+    #[serde(default)]
+    pub std::collections::HashSet<String>,
+    /// Each enumerated class's DECLARED parents, in MRO order.
+    ///
+    /// Needed because a key's absence is not the same question as a class's.
+    /// The live chase composes: asked for `C::m` with no witnesses, it walks
+    /// C's parents and can answer from `Parent::m` — and this file may well
+    /// hold a conclusion for `Parent::m` even when the parent lives elsewhere,
+    /// because its own bag carries witnesses about it.
+    ///
+    /// `Mojo::Server::Daemon::app` is the case: no local symbol, no attachment,
+    /// no app-surface edge, and an index-less chase still answers
+    /// `ClassName("Mojolicious")` — from `Mojo::Server::app`, whose key this
+    /// same map holds. Reading the child's absence as "not local" served a
+    /// grandparent's answer over it, 40 times per substrate check.
+    ///
+    /// So absence walks these before concluding anything. Cross-file parents
+    /// the map has nothing for are the outer ladder's business, unchanged.
+    #[serde(default)]
+    pub HashMap<String, Vec<String>>,
 );
 
 impl ConclusionMap {
@@ -212,9 +248,29 @@ impl ConclusionMap {
             // ABSENT. Conclusive only for a class this file can reason about
             // completely — see the `closed` field. For anything else the honest
             // answer is "I do not know", which is a decode.
+            // The key is absent, which is a question about the KEY. Before
+            // answering it, ask the question about the CLASS: does an
+            // enumerated parent hold this member? The live chase composes that
+            // way, so a verdict that skipped it would be answering a narrower
+            // question than the one it replaces.
+            if let ConclusionKey::MethodOnClass { class, name } = key {
+                if let Some(t) = self.inherited(class, name, receiver, arity, args, 0) {
+                    return t;
+                }
+            }
             return match key {
-                ConclusionKey::MethodOnClass { class, .. } if !self.1.contains(class) => {
-                    Outcome::Decode(OpenReason::AbsentNotClosed)
+                ConclusionKey::MethodOnClass { class, .. } => {
+                    if self.1.contains(class) {
+                        // Closed: every ancestor is declared here, so there is
+                        // nowhere else an answer could have come from.
+                        Outcome::None
+                    } else if self.2.contains(class) {
+                        Outcome::NotLocal
+                    } else {
+                        // A class this file never declared. Absence says
+                        // nothing at all — the bake never looked.
+                        Outcome::Decode(OpenReason::AbsentNotClosed)
+                    }
                 }
                 _ => Outcome::None,
             };
@@ -263,6 +319,46 @@ impl ConclusionMap {
     }
 }
 
+impl ConclusionMap {
+    /// Resolve `class::name` through the class's declared parents, within this
+    /// map only. `None` when no parent chain in this file has anything to say.
+    ///
+    /// Depth-capped rather than cycle-guarded: a declared-parent chain inside
+    /// one file is short, and a cap is one comparison against a `HashSet`
+    /// allocation per lookup on a path taken tens of thousands of times per
+    /// check. A cycle therefore truncates instead of looping, which degrades
+    /// to the verdict the absence would have produced anyway.
+    fn inherited(
+        &self,
+        class: &str,
+        name: &str,
+        receiver: Option<&InferredType>,
+        arity: Option<u32>,
+        args: &[InferredType],
+        depth: usize,
+    ) -> Option<Outcome> {
+        const MAX_LOCAL_MRO: usize = 8;
+        if depth >= MAX_LOCAL_MRO {
+            crate::util::ghost_stats::count("concl.local_mro_cap");
+            return None;
+        }
+        for parent in self.3.get(class)? {
+            let key = ConclusionKey::MethodOnClass {
+                class: parent.clone(),
+                name: name.to_string(),
+            };
+            if self.0.contains_key(&key) {
+                crate::util::ghost_stats::count("concl.inherited_hit");
+                return Some(self.evaluate(&key, receiver, arity, args));
+            }
+            if let Some(o) = self.inherited(parent, name, receiver, arity, args, depth + 1) {
+                return Some(o);
+            }
+        }
+        None
+    }
+}
+
 /// What one map lookup produced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
@@ -270,6 +366,23 @@ pub enum Outcome {
     /// The map proves no answer — the ladder moves on (parents, next
     /// candidate) exactly as a local-reducer miss does today.
     None,
+    /// The map proves no LOCAL answer: this file declares the class and
+    /// enumerated its own members, and the key is not among them. It may still
+    /// be inherited or bridged.
+    ///
+    /// Distinct from `None` because it licenses less: `None` can end the whole
+    /// resolution, this may only skip the file that said it. Distinct from
+    /// `Decode` because it licenses more: the chase this would have paid for
+    /// answers nothing locally by construction.
+    ///
+    /// Deliberately NOT a constructed `Follow` at the parents. A `Follow`
+    /// returned from candidate 1's map would short-circuit candidates 2..n,
+    /// and a reopened package's method lives in a later candidate
+    /// (`PPI::XSAccessor` reopening `PPI::Token` is the case that has already
+    /// cost this layer 75 equivalence breaks once). Continuing the loop keeps
+    /// candidates-before-parents and the bridge guard correct by construction
+    /// rather than by re-derivation.
+    NotLocal,
     /// Unbakeable here. Decode the blob and run the real chase for this key.
     ///
     /// Carries WHY, because the consult is where the cost lands and therefore
@@ -348,6 +461,15 @@ pub fn verify_absent_conclusions() -> bool {
 ///
 /// OFF until the ladder-frame rule's poisoning half lands — see the comment at
 /// the mint site for the measured error rate.
+/// Escape hatch and A/B control for the not-local verdict, same shape as
+/// `PERL_LSP_NO_BAKE`: a change that removes work from the ladder must be
+/// switchable off without a rebuild, or its correctness can only be argued
+/// rather than measured.
+pub fn not_local_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("PERL_LSP_NO_NOT_LOCAL").is_ok())
+}
+
 pub fn mint_links_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PERL_LSP_MINT_LINKS").is_ok())
@@ -571,7 +693,39 @@ pub fn bake_in_context(
             closed.insert(class.clone());
         }
     }
-    ConclusionMap(map, closed)
+    // The ENUMERATED set: classes for which "absent from this map" really does
+    // imply "no local answer". That is not every class this file declares.
+    //
+    // The bake enumerates keys from the bag's attachments and the file's
+    // declared symbols. A member that arrives by an edge NEITHER of those
+    // follows leaves no key, and its absence then says the opposite of the
+    // truth. The synthetic app-surface parent is exactly such an edge:
+    // `parents_of` composes it, `declared_parents` never reports it, so
+    // `Mojo::Server::Daemon::app` resolves locally through it and has no key
+    // here. Measured: 40 not-local breaks per substrate check, every one this
+    // shape.
+    //
+    // Asked as "does this class have a parent the DECLARED list does not
+    // carry" rather than "is this class an app-surface consumer", so a second
+    // synthetic edge kind disqualifies its classes without anyone remembering
+    // to add it here. The index is withheld — a cross-file parent already
+    // costs closedness, and this question is about edges the bake itself could
+    // not follow.
+    let consumers = ctx.map(|c| c.app_surface_consumers).unwrap_or(&[]);
+    let enumerated: std::collections::HashSet<String> = local_packages
+        .iter()
+        .filter(|class| {
+            let declared = parent_of.get(class.as_str()).map(|v| v.len()).unwrap_or(0);
+            let composed = crate::model::file_analysis::app_surface_parent(class, consumers)
+                .map_or(declared, |_| declared + 1);
+            composed == declared
+        })
+        .cloned()
+        .collect();
+    ConclusionMap(map, closed, enumerated, parent_of
+        .iter()
+        .map(|(c, ps)| ((*c).to_string(), (*ps).clone()))
+        .collect())
 }
 
 /// One attachment's conclusion.

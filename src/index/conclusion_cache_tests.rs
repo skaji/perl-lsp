@@ -12,7 +12,7 @@ fn map_of(n: usize) -> ConclusionMap {
             Conclusion::OpenNone(crate::model::witnesses::OpenReason::NoAnswerOpaque),
         );
     }
-    ConclusionMap(m, Default::default())
+    ConclusionMap(m, Default::default(), Default::default(), Default::default())
 }
 
 /// A path the store has nothing for must be re-queried at most once.
