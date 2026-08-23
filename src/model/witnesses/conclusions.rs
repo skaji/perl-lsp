@@ -359,6 +359,91 @@ impl ConclusionMap {
     }
 }
 
+/// One file's answers, evaluated against the CURRENT store.
+///
+/// This — not the persisted map — is the driver's diff artifact, and the
+/// distinction is the entire soundness of the propagation cutoff.
+///
+/// A persisted map is index-free by construction: the bake withholds the
+/// module index so a cross-file answer residualizes as a `Link` instead of
+/// freezing a world that can change without this file changing. That is what
+/// makes the map durable, and it is exactly what makes it useless as a change
+/// signal. When C changes, B's map is BYTE-IDENTICAL — B's `Link` still points
+/// at the same key — while B's *answers*, chased through to C, have moved. A
+/// driver that cuts propagation on map equality stops the wave at B and
+/// starves B's consumers.
+///
+/// It fails silently, and it passes every two-file fixture: with one hop there
+/// is no B for the wave to die at. Only a chain distinguishes the two, which
+/// is why `a_chain_needs_the_evaluated_surface_not_the_map` exists and why it
+/// asserts the map's byte-identity as a PRECONDITION rather than assuming it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatedSurface(pub Vec<(ConclusionKey, EvaluatedAnswer)>);
+
+/// One key's answer after evaluation — map lookups only, never a decode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvaluatedAnswer {
+    Answer(InferredType),
+    /// The map proves no answer.
+    None,
+    /// No LOCAL answer; the live ladder continues past this file.
+    NotLocal,
+    /// Unbakeable here, or a `Link` the store cannot complete. The consumer's
+    /// answer is whatever the chase finds, so this file cannot cut a chain on
+    /// it — it compares equal only to another `Opaque`, which is the honest
+    /// conservative direction.
+    Opaque,
+}
+
+impl ConclusionMap {
+    /// Evaluate every key this map holds against the current store.
+    ///
+    /// `resolve` is the same map-lookup resolver `follow_link_with` takes:
+    /// class name → the candidate files' maps. No decodes, so this is cheap
+    /// enough to run per file per flush round.
+    ///
+    /// Sorted by key, because the driver compares these for equality and a
+    /// `HashMap` walk would make the comparison depend on iteration order —
+    /// the same defect that made `--dump-package` answer a coin flip.
+    pub fn evaluated_surface(
+        &self,
+        resolve: &dyn Fn(&str) -> Vec<(String, Option<std::sync::Arc<ConclusionMap>>)>,
+    ) -> EvaluatedSurface {
+        let mut out: Vec<(ConclusionKey, EvaluatedAnswer)> = self
+            .0
+            .keys()
+            .map(|k| (k.clone(), self.evaluate_for_surface(k, resolve)))
+            .collect();
+        out.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        EvaluatedSurface(out)
+    }
+
+    fn evaluate_for_surface(
+        &self,
+        key: &ConclusionKey,
+        resolve: &dyn Fn(&str) -> Vec<(String, Option<std::sync::Arc<ConclusionMap>>)>,
+    ) -> EvaluatedAnswer {
+        // No binders: the surface is the file's EXPORT face, and a
+        // receiver-dependent answer is not part of it — `ReturnOf` evaluates
+        // to `None` without a receiver, which is the same thing every consumer
+        // sees until it supplies one.
+        match self.evaluate(key, None, None, &[]) {
+            Outcome::Answer(t) => EvaluatedAnswer::Answer(t),
+            Outcome::None => EvaluatedAnswer::None,
+            Outcome::NotLocal => EvaluatedAnswer::NotLocal,
+            Outcome::Decode(_) => EvaluatedAnswer::Opaque,
+            Outcome::Follow { targets, arity, receiver } => {
+                match super::registry::follow_link_with(
+                    resolve, &targets, &receiver, arity, &[],
+                ) {
+                    Some(t) => EvaluatedAnswer::Answer(t),
+                    None => EvaluatedAnswer::Opaque,
+                }
+            }
+        }
+    }
+}
+
 /// What one map lookup produced.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {

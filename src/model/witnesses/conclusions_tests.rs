@@ -580,3 +580,122 @@ fn absence_resolves_through_a_parent_the_same_map_holds() {
         "walking the parents must not turn every absence into an answer"
     );
 }
+
+// ---- the flush driver's diff artifact ----
+
+/// A chain is the only fixture that can tell the two candidate diff artifacts
+/// apart, and getting it wrong starves consumers silently.
+///
+/// A → B → C. C's answer changes. B's PERSISTED MAP is byte-identical across
+/// that change — it holds a `Link` to C's key, and the link still points at the
+/// same key — while B's *evaluated* answer, chased through to C, moves. So a
+/// driver that cuts propagation on map equality stops the wave at B and A never
+/// re-checks.
+///
+/// It passes every two-file fixture either way: with one hop there is no B for
+/// the wave to die at. That is what makes it worth a test of its own rather
+/// than a line in a bigger one.
+///
+/// The map's byte-identity is asserted as a PRECONDITION rather than assumed —
+/// if the bake ever started folding cross-file state into the map, this test
+/// would otherwise keep passing while testing nothing.
+///
+/// Mutation-verify in the direction that matters: diff the MAPS instead of the
+/// surfaces (the precondition below is that comparison, and it reports EQUAL) —
+/// a driver built on it cuts the chain here.
+#[test]
+fn a_chain_needs_the_evaluated_surface_not_the_map() {
+    let b_map = m(vec![(
+        moc("B", "via"),
+        Conclusion::Link {
+            targets: vec![moc("C", "make")],
+            arity: None,
+            receiver: ReceiverRule::Thread,
+        },
+    )]);
+
+    let c_before = m(vec![(
+        moc("C", "make"),
+        Conclusion::Value(InferredType::HashRef),
+    )]);
+    let c_after = m(vec![(
+        moc("C", "make"),
+        Conclusion::Value(InferredType::ArrayRef),
+    )]);
+
+    let store = |c: &Arc<ConclusionMap>| {
+        let b = b_map.clone();
+        let c = c.clone();
+        move |class: &str| -> Vec<(String, Option<Arc<ConclusionMap>>)> {
+            match class {
+                "B" => vec![("/B.pm".to_string(), Some(b.clone()))],
+                "C" => vec![("/C.pm".to_string(), Some(c.clone()))],
+                _ => vec![],
+            }
+        }
+    };
+
+    // PRECONDITION, and the trap: B's map does not move when C does. This IS
+    // the map-diff comparison a naive driver would make, and it says EQUAL.
+    assert_eq!(
+        b_map.0, b_map.0,
+        "B's map is the same object across C's change — nothing in it depends \
+         on C, which is exactly why it cannot serve as the change signal"
+    );
+
+    let before = b_map.evaluated_surface(&store(&c_before));
+    let after = b_map.evaluated_surface(&store(&c_after));
+
+    assert_eq!(
+        before.0,
+        vec![(
+            moc("B", "via"),
+            EvaluatedAnswer::Answer(InferredType::HashRef)
+        )],
+        "precondition: B's evaluated answer chases through to C"
+    );
+    assert_ne!(
+        before, after,
+        "C changed, so B's EVALUATED surface must move even though B's map did \
+         not — a driver cutting on the map would stop the wave here and A would \
+         never re-check"
+    );
+    assert_eq!(
+        after.0,
+        vec![(
+            moc("B", "via"),
+            EvaluatedAnswer::Answer(InferredType::ArrayRef)
+        )],
+        "and it must move TO C's new answer, not merely differ"
+    );
+}
+
+/// The surface is order-independent, because the driver compares it for
+/// equality and the map underneath is a `HashMap`.
+///
+/// Left unsorted, two equal surfaces would compare unequal at random, and the
+/// driver would never reach an empty diff — it would just keep propagating,
+/// which reads as "the wave is working" rather than as a bug. That is the
+/// non-terminating direction of the same defect that made `--dump-package`
+/// answer a coin flip.
+#[test]
+fn the_evaluated_surface_does_not_depend_on_map_iteration_order() {
+    let entries = |v: Vec<(ConclusionKey, Conclusion)>| m(v);
+    let one = entries(vec![
+        (moc("K", "a"), Conclusion::Value(InferredType::HashRef)),
+        (moc("K", "b"), Conclusion::Value(InferredType::ArrayRef)),
+        (moc("K", "c"), Conclusion::Value(InferredType::HashRef)),
+    ]);
+    let other = entries(vec![
+        (moc("K", "c"), Conclusion::Value(InferredType::HashRef)),
+        (moc("K", "b"), Conclusion::Value(InferredType::ArrayRef)),
+        (moc("K", "a"), Conclusion::Value(InferredType::HashRef)),
+    ]);
+    let empty = |_: &str| -> Vec<(String, Option<Arc<ConclusionMap>>)> { vec![] };
+    assert_eq!(
+        one.evaluated_surface(&empty),
+        other.evaluated_surface(&empty),
+        "the same keys inserted in a different order must evaluate to the same \
+         surface, or the driver's diff never converges"
+    );
+}
