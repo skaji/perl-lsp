@@ -25,7 +25,10 @@ always a hard fail. The suite runs **twice — cold, then warm against the cache
 the cold pass wrote** — under a private throwaway `XDG_CACHE_HOME`, so a row
 that passes cold and fails warm surfaces as `warm-FAIL` instead of being
 invisible (CI always starts cold). Known warm gaps are declared per row as
-`"warm": "xfail"`; `--no-warm` skips the second pass. Never "fix" a flaky gold
+`"warm": "xfail"`; `--no-warm` skips the second pass. **A warm scan hands out
+bag-EVICTED analyses** — decode them through `decode_analysis_parts(.., None,
+false)`, never raw `decode_analysis`, or the copy claims a bag it does not have
+and every bag-reading projection silently records nothing. Never "fix" a flaky gold
 run by clearing the real cache — that deletes the evidence a warm gap exists,
 and a PARTIAL clear is worse than none. Run it alongside `cargo test` + `./e2e/run.sh` before
 calling a change verified; `gold-corpus/run.pl --emit <cap> <file> <row>

@@ -75,7 +75,14 @@ pub fn warm_cache_streaming(
         let Some(blob) = analysis_blob.filter(|b| !b.is_empty()) else {
             continue;
         };
-        let Some(fa) = decode_analysis(&blob) else {
+        // `decode_analysis_parts(.., None, false)` and not the raw
+        // `decode_analysis`: the scan deliberately does not fetch the bag
+        // column, and only the former marks the result bag-EVICTED. Without
+        // the marker a bagless copy is indistinguishable from one that
+        // genuinely has no type facts, so every downstream reader takes the
+        // empty bag at face value instead of rehydrating — silently, with no
+        // error and no empty-vs-evicted question it could even ask.
+        let Some(fa) = decode_analysis_parts(&blob, None, false) else {
             log::warn!("Failed to decode cached analysis for '{}', skipping", module_name);
             continue;
         };
@@ -348,7 +355,7 @@ pub fn warm_cache(
 
         match analysis_blob {
             Some(blob) if !blob.is_empty() => {
-                match decode_analysis(&blob) {
+                match decode_analysis_parts(&blob, None, false) {
                     Some(mut fa) => {
                         // A pack file's analysis bakes its headers (splices,
                         // witnesses, closure): the row is valid only while the
