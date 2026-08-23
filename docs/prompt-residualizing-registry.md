@@ -211,3 +211,105 @@ it removes the last place where a conclusion form degrades to a decode for a
 reason the layer could in principle represent. Anyone sizing it from the raw
 `OpenNone` population (91,525) will be disappointed — that population is
 dominated by other causes.
+
+---
+
+## The ladder-frame rule's other half, and what it cost the `Link`
+
+Recording says where a chase would have gone. It does not say whether the
+chase's answer IS what it finds there. `Link{targets}` claims "the first of
+these keys that answers"; that is only the enclosing query's answer if every
+frame between them returns the exit's answer unchanged.
+
+Implemented as an **opaque-frame counter** on `QueryState`. `materialize`
+enters one around every sub-chase that transforms rather than forwards, and
+`note_exit` poisons instead of recording a rung while inside one. Nesting is
+why it is a counter and not a flag: the recording site is the innermost frame
+and has to know whether ANY ancestor is opaque.
+
+Which frames are opaque, and why:
+
+| frame | why it is not a rung |
+|---|---|
+| `Edge(Variable)` | the scope walk defers a rep-only answer and lets an outer class identity beat it — the value is chosen ACROSS scopes |
+| `Edge(…)` with siblings | the answer is folded with the other witnesses at the attachment |
+| `Edge(…)` re-dispatched | `fresh_dispatch_receiver` substitutes a different receiver; `ReturnExpr::Receiver` at the far end then answers about the wrong object |
+| `CallReturn` | substitutes the call site's arity AND the dispatch receiver |
+| `QualifiedCallReturn` | same, and the lookup class and receiver class deliberately differ |
+| `Projected` | returns a value drilled OUT of the sub-chase's answer |
+| depth cap | `None` because it ran out of frames, not because there is no answer |
+
+The memo carries a "this subtree recorded an exit" bit alongside each value.
+Without it a subtree first reached transparently, then re-reached from inside a
+combining frame, returns from the memo and never re-runs `note_exit` — the
+second reach silently launders into a rung.
+
+**Result: follow breaks 44 → 0.** The 8 disagreements that remain are all one
+shape (`PPI::Token::content`) and all classified `concl.follow_break_guarded`:
+the shared cycle guard had that candidate key on the path, so the chase
+returned without walking a rung, while the outer frame still standing on it
+goes on to walk them. Reproducible across runs.
+
+### And it is worth nothing on this substrate
+
+| | minting off | minting on |
+|---|---|---|
+| `bagcache.decode` | 4103 | 4104 |
+| `consult.baked_open` | 92,393 | 83,983 |
+| `consult.baked_follow_incomplete` | 4 | 7,992 |
+| `consult.baked_follow` | — | 34 |
+
+Decodes do not move. `follow_one` abandons at the first rung whose map says
+`Decode`, and with 84k `OpenNone` still in the maps that is nearly every walk —
+the consult then falls through to the decode it would have done anyway. **The
+`Link` cannot pay off while `OpenNone` dominates the rungs.** Leverage is in
+shrinking that 84k, not in `Link` fidelity.
+
+`PERL_LSP_MINT_LINKS` therefore stays OFF — now for a measured cost reason
+rather than a soundness one.
+
+Two findings worth carrying forward:
+
+- **The self-rung.** The cross-file primary records the key being baked as its
+  own first rung, which is true of the ladder and useless as a `Link`: the
+  consult reached this map by doing exactly that. Left in, it converted
+  essentially the whole `OpenNone` population into `Link`s that burn two follow
+  hops and abandon — 14,923 incomplete against 15 answered. Filtered in
+  `bake_one`.
+- **`CallReturn` is the shape a widened `Link` would need**, and it is the one
+  the form cannot express: `Link` carries ONE arity and ONE receiver rule, and
+  a call frame substitutes both. Widening means residuals that carry their
+  binders. Do not build it until the `OpenNone` population is smaller.
+
+### Two measurement traps, both of which produced confident wrong numbers
+
+- **A probe that re-runs the chase changes the run it measures.** Diagnosing
+  the last breaks with an extra `attempt` on a fresh `QueryState` took breaks
+  from 8 to 2030 and follows from 34 to 4084 — reproducibly, so it read as a
+  real regression rather than as the instrument.
+- **A classifier that cannot fail is not a classifier.** The first "is this
+  break excusable?" probe asked whether a LINK TARGET was on the visited path.
+  Before self-rungs were filtered the targets included the key being chased, so
+  it matched every time and reported 100% of breaks as cycle-guard artifacts.
+  The guard actually cuts on the CANDIDATE key.
+
+### Two defects found on the way, one fixed
+
+- **Fixed: the conclusion fingerprint hashed source but not the env that steers
+  the bake.** One `--check` under `PERL_LSP_MINT_LINKS=1` leaves maps that every
+  later run reads, and it took a gold row from PASS to FAIL until the cache was
+  wiped by hand — looking exactly like a code regression. Bake-steering flags
+  now join the fingerprint (`schema.rs::conclusion_fingerprint`); consult-side
+  flags deliberately do not.
+- **Open: a fingerprint change clears conclusions and nothing re-bakes them.**
+  `validate_conclusion_fingerprint` keeps the blobs "because the repair is a
+  re-bake", but no one drives that re-bake — the file is not re-persisted, so
+  the layer stays dark until a full `--clear-cache`. `conclcache.known_absent`
+  reads 156,746 in that state. This is answer-neutral (absent means decode) and
+  purely a cost, but it means any measurement taken after a source edit without
+  a full clear is measuring an empty layer. It belongs with the flush driver.
+- **Open, and NOT ours: `gold-corpus/run.pl` fails
+  `diagnostics/loader-config-conf-shape-closed` on a WARM cache and passes on a
+  cold one.** Confirmed identical at `f337fc7` with no changes applied, so it
+  predates this work. Cold 502/0, warm 501/1, reproducible on both trees. Worth
+  a row of its own: the harness is normally run cold, which hides it.

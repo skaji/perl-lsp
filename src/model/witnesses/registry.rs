@@ -100,7 +100,11 @@ pub(super) struct QueryState {
     // no buckets, so a shallow query that never re-reaches a node (the
     // common hover/completion 1–2-hop case) pays nothing for the memo —
     // the table is lazily allocated on the first insert.
-    memo: std::collections::HashMap<VisitedKey, std::sync::Arc<ReducedValue>>,
+    /// The flag beside each value is "computing this subtree recorded an exit".
+    /// A memo hit skips the subtree, and with it the `note_exit` calls that
+    /// would have poisoned a re-entry from inside a combining frame — so the
+    /// fact has to be carried on the entry instead of re-derived.
+    memo: std::collections::HashMap<VisitedKey, (std::sync::Arc<ReducedValue>, bool)>,
     /// Where a BAKE's chase would have consulted the index, in the order the
     /// ladder reached them.
     ///
@@ -116,6 +120,20 @@ pub(super) struct QueryState {
     /// answer that is not "whichever ladder rung answers first", and a `Link`
     /// can only express the latter.
     pub(super) poisoned: bool,
+    /// How many COMBINING frames the chase is currently inside.
+    ///
+    /// A `Link` says "the answer is the first of these keys that answers". That
+    /// is only true of the top-level query if every frame between it and the
+    /// exit is transparent — the exit's answer is returned unchanged. A frame
+    /// that folds the sub-chase's answer together with sibling witnesses, drills
+    /// through it, or re-dispatches it under a different receiver or arity
+    /// returns something the exit key alone does not name, so a residual
+    /// recorded beneath one is not a rung and poisons instead of being kept.
+    ///
+    /// A counter rather than a flag because the frames nest, and the recording
+    /// site is the innermost one — it has to know whether ANY ancestor is
+    /// opaque, not whether its immediate parent is.
+    opaque_frames: u32,
 }
 
 impl QueryState {
@@ -126,6 +144,7 @@ impl QueryState {
             memo: std::collections::HashMap::new(),
             residual: Vec::new(),
             poisoned: false,
+            opaque_frames: 0,
         }
     }
 
@@ -138,6 +157,15 @@ impl QueryState {
     /// silent wrong `None`.
     pub(super) fn note_exit(&mut self, would_ask: Option<super::ConclusionKey>) {
         match would_ask {
+            // Nameable, but reached through a frame that will transform it.
+            // Dropping the residual silently would be worse than poisoning:
+            // the surviving rungs would then describe a ladder the answer never
+            // actually took, and a `Link` minted from them answers where the
+            // chase does not.
+            Some(_) if self.opaque_frames > 0 => {
+                crate::util::ghost_stats::count("residual.under_opaque");
+                self.poisoned = true;
+            }
             Some(k) => self.residual.push(k),
             None => self.poisoned = true,
         }
@@ -145,8 +173,24 @@ impl QueryState {
 
     /// The chase combined frames rather than taking the first answering rung,
     /// so its result is not expressible as an ordered `Link`.
+    #[allow(dead_code)]
     pub(super) fn poison(&mut self) {
         self.poisoned = true;
+    }
+
+    /// Run `f` with the chase marked as being inside a combining frame.
+    ///
+    /// Paired via a closure rather than enter/leave calls because every early
+    /// return inside `materialize`'s arms would otherwise have to remember to
+    /// decrement, and a missed decrement does not fail — it silently poisons
+    /// the rest of the chase, which reads as "the layer just does not mint
+    /// Links here" and is the hardest kind of bug to see.
+    ///
+    pub(super) fn in_opaque_frame<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.opaque_frames += 1;
+        let out = f(self);
+        self.opaque_frames -= 1;
+        out
     }
 }
 
@@ -289,6 +333,10 @@ thread_local! {
     static QUERY_REC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// One-shot so we don't flood stderr while a deep walk unwinds.
     static QUERY_REC_DEPTH_WARNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many times the cap has fired on this thread. Read as a DIFFERENCE
+    /// across a region — an absolute count would be sticky for the rest of the
+    /// process once any chase anywhere truncated.
+    static QUERY_REC_TRUNCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -479,6 +527,20 @@ impl ReducerRegistry {
             // fired, but only a count distinguishes one pathological file
             // from a systematic truncation across the corpus.
             crate::util::ghost_stats::count("query_rec.depth_cap");
+            // A truncated chase answers `None` for a reason no key names. Any
+            // `Link` minted around it would claim the ladder ended where the
+            // budget ran out, not where the answer was. `truncated` is the
+            // separate, non-poison record of the same event: a LIVE chase that
+            // truncates is not wrong, it is incomplete, so comparing a
+            // conclusion against it proves nothing either way.
+            state.poisoned = true;
+            // The LIVE counterpart of the poison above, and it has to be
+            // thread-local rather than a `QueryState` field: the cap counts
+            // frames across the whole THREAD, so it fires inside nested
+            // top-level queries (`symbol_return_type_via_bag`, the enrichment
+            // overlay) that carry a `QueryState` of their own. A per-state flag
+            // reads false for exactly the chases truncated deepest.
+            QUERY_REC_TRUNCATIONS.with(|c| c.set(c.get() + 1));
             QUERY_REC_DEPTH_WARNED.with(|w| {
                 if !w.get() {
                     w.set(true);
@@ -502,9 +564,18 @@ impl ReducerRegistry {
         );
         // Memo hit: this key was fully resolved earlier in THIS query and
         // isn't on the current path (cycle guard handles on-path keys).
-        if let Some(cached) = state.memo.get(&key) {
+        if let Some((cached, recorded_exit)) = state.memo.get(&key) {
+            let cached = std::sync::Arc::clone(cached);
+            // Re-reaching an exiting subtree from inside a combining frame is
+            // the same claim as reaching it there the first time; the memo must
+            // not launder it into a rung just because the first reach happened
+            // to be transparent.
+            if *recorded_exit && state.opaque_frames > 0 {
+                crate::util::ghost_stats::count("residual.memo_under_opaque");
+                state.poisoned = true;
+            }
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
-            return std::sync::Arc::clone(cached);
+            return cached;
         }
         // `key` has two owners (the visited set, transiently; the memo,
         // for the rest of the query). Clone once for visited, then move
@@ -513,12 +584,16 @@ impl ReducerRegistry {
             QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
             return std::sync::Arc::new(ReducedValue::None);
         }
+        let exits_before = state.residual.len();
+        let poison_before = state.poisoned;
         let result = std::sync::Arc::new(self.query_rec_body(bag, q, state));
+        let recorded_exit =
+            state.residual.len() > exits_before || (state.poisoned && !poison_before);
         state.visited.remove(&key);
         // Cache the off-path resolution. The query depends only on
         // `(bag, attachment, receiver-class, arity)` (all in `key`) plus
         // the static context, which is fixed for one top-level query.
-        state.memo.insert(key, std::sync::Arc::clone(&result));
+        state.memo.insert(key, (std::sync::Arc::clone(&result), recorded_exit));
         QUERY_REC_DEPTH.with(|c| c.set(c.get() - 1));
         result
     }
@@ -583,342 +658,13 @@ impl ReducerRegistry {
                 // whichever file defines it, not the name-slot winner).
                 if ctx.module_index.is_none() {
                     super::note_bake_exit("moc_primary", true);
-                    note_moc_exit(state, class, name);
+                    note_moc_exit(state, package, name);
                 }
                 if let Some(idx) = ctx.module_index {
-                    for cached in super::session::visible_def_candidates(idx, package).iter() {
-                        // Rehydrate the target file's bag if its resident copy
-                        // was Slice-2-evicted; the cross-file chase reads its
-                        // witnesses (`docs/adr/memory-slice-2-lru.md`).
-                        let attempt =
-                            |full: &std::sync::Arc<crate::model::file_analysis::FileAnalysis>,
-                             state: &mut _| {
-                                let cached_ctx = BagContext {
-                                    scopes: &full.scopes,
-                                    package_framework: &full.packages,
-                                    module_index: Some(idx),
-                                    package_parents: &full.packages,
-                                    app_surface_consumers: &full.plugin.app_surface_consumers,
-                                };
-                                let sub_q = ReducerQuery {
-                                    attachment: q.attachment,
-                                    point: q.point,
-                                    framework: q.framework,
-                                    arity_hint: q.arity_hint,
-                                    receiver: q.receiver.clone(),
-                                    args: q.args.clone(),
-                                    context: Some(&cached_ctx),
-                                };
-                                (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
-                            };
-                        // This candidate's contribution, remembered ACROSS
-                        // top-level queries. `attempt` is a pure function of
-                        // (candidate file, attachment, receiver, arity, point,
-                        // framework) — the whole key — so one walk derives it
-                        // once instead of once per call site.
-                        if let Some(hit) =
-                            super::session::candidate_answer(idx, &cached.path, q)
-                        {
-                            if *hit != ReducedValue::None {
-                                return (*hit).clone();
-                            }
-                            continue;
-                        }
-                        if !super::session::spend_consult(idx) {
-                            break;
-                        }
-                        // THE CONCLUSION LOOKUP, ahead of the decode.
-                        //
-                        // This is the whole point of the layer: 78% of a
-                        // consult is the chase, not the fetch, and a baked
-                        // answer skips both. Placed after the session memo
-                        // (a hit there is cheaper still) and before
-                        // `bag_present` (which decodes).
-                        //
-                        // The three outcomes are NOT interchangeable:
-                        //   Answer  — serve it, no decode.
-                        //   None    — the map PROVES no answer; fall through
-                        //             to the next candidate exactly as a
-                        //             decoded miss would, still no decode.
-                        //   Decode  — `OpenNone`: unbakeable here, so pay the
-                        //             full price for this key alone.
-                        // A `Follow` is not yet honoured — see below.
-                        let mut baked_said_absent = false;
-                        // Under the equivalence flag a followed answer is held
-                        // rather than returned, so the chase below runs and can
-                        // contradict it.
-                        let mut followed_answer: Option<InferredType> = None;
-                        if let Some(key) =
-                            super::ConclusionKey::from_attachment(q.attachment)
-                        {
-                            if let Some(map) = idx.conclusions_for(&cached.path) {
-                                match map.evaluate(
-                                    &key,
-                                    q.receiver.as_ref(),
-                                    q.arity_hint,
-                                    &q.args,
-                                ) {
-                                    super::Outcome::Answer(t) => {
-                                        crate::util::ghost_stats::count("consult.baked_answer");
-                                        let v = ReducedValue::Type(t);
-                                        // The memo still gets the answer. A
-                                        // baked hit is cheap but not free, and
-                                        // the memo is the tier above it.
-                                        super::session::remember_candidate_answer(
-                                            idx, &cached.path, q, &v,
-                                        );
-                                        return v;
-                                    }
-                                    // ABSENT. The spec lets this mean a proven
-                                    // `None` and skip the candidate outright —
-                                    // "the sharpest knife in the design" — but
-                                    // that is sound only if the bake enumerated
-                                    // every key the bag could answer, and today
-                                    // it does not: it walks the bag's
-                                    // attachment index, while the live chase
-                                    // also answers keys that carry no witnesses
-                                    // (inheritance edges, reducer synthesis).
-                                    //
-                                    // A wrongly-absent key makes the ladder
-                                    // skip a candidate that would have
-                                    // answered; the answer is then found
-                                    // further up the parent walk, so the OUTPUT
-                                    // agrees and only the cost betrays it.
-                                    // Measured on `--dump-package Catalyst`:
-                                    // trusting absence took 892 decodes to
-                                    // 2,721 and 2.76s to 4.20s, byte-identical
-                                    // output throughout. A silent 3x, invisible
-                                    // to every correctness check we have.
-                                    //
-                                    // So absence falls through to the decode
-                                    // until the enumeration is provably
-                                    // complete. `PERL_LSP_TRUST_ABSENT` turns
-                                    // the knife back on for measuring that work
-                                    // as it lands.
-                                    super::Outcome::None => {
-                                        crate::util::ghost_stats::count("consult.baked_none");
-                                        baked_said_absent = true;
-                                        // Absence is conclusive only for a
-                                        // class with NO ancestors at all. The
-                                        // per-file bake cannot establish that:
-                                        // Perl packages are open, and a file
-                                        // that REOPENS a package without
-                                        // repeating its `@ISA` sees a
-                                        // parentless class. `PPI::XSAccessor`
-                                        // does exactly that to `PPI::Token`,
-                                        // and it accounted for 75 of the
-                                        // equivalence breaks left after the
-                                        // per-file check.
-                                        //
-                                        // So the question is asked where the
-                                        // cross-file union lives, through the
-                                        // same `parents_of` every other
-                                        // ancestor walk uses.
-                                        let has_ancestors =
-                                            !crate::model::file_analysis::parents_of(
-                                                class,
-                                                ctx.package_parents,
-                                                ctx.module_index,
-                                                ctx.app_surface_consumers,
-                                            )
-                                            .is_empty();
-                                        if has_ancestors {
-                                            crate::util::ghost_stats::count(
-                                                "consult.absent_but_inherits",
-                                            );
-                                            baked_said_absent = false;
-                                        }
-                                        // The bridge guard, and it closes a
-                                        // hole that PREDATES the conclusion
-                                        // layer: trusting absence asks only
-                                        // "no ancestors", while the live
-                                        // ladder's bridge arm runs regardless
-                                        // of ancestry. A PARENTLESS BRIDGED
-                                        // class therefore has its absence
-                                        // trusted while the chase answers
-                                        // through the bridge. The substrate
-                                        // happens to contain no such class —
-                                        // corpus luck, not soundness.
-                                        if baked_said_absent
-                                            && idx.class_is_bridged_to(class)
-                                        {
-                                            crate::util::ghost_stats::count(
-                                                "consult.absent_but_bridged",
-                                            );
-                                            baked_said_absent = false;
-                                        }
-                                        // Under the equivalence flag, do NOT
-                                        // trust it — fall through, run the
-                                        // real chase, and let the arm below
-                                        // report any answer that absence
-                                        // claimed did not exist.
-                                        if baked_said_absent
-                                            && super::trust_absent_conclusions()
-                                            && !super::verify_absent_conclusions()
-                                        {
-                                            // Remember the None BEFORE
-                                            // continuing. Skipping the memo
-                                            // was the actual cost of trusting
-                                            // absence: this candidate is asked
-                                            // hundreds of times per run, and
-                                            // each repeat re-walked its
-                                            // ancestors instead of hitting the
-                                            // tier that exists to stop exactly
-                                            // that.
-                                            super::session::remember_candidate_answer(
-                                                idx,
-                                                &cached.path,
-                                                q,
-                                                &ReducedValue::None,
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    // Cross-file hop: re-enter the ladder at
-                                    // the target file's map, no decode.
-                                    //
-                                    // This is the first conclusion form whose
-                                    // failure is UNSOUND rather than merely
-                                    // slow — a wrong absence costs a decode, a
-                                    // wrong `Link` serves a wrong answer — so
-                                    // it is scored by `PERL_LSP_CONCL_EQUIV`
-                                    // against the chase it replaces, and it
-                                    // degrades to that chase whenever the walk
-                                    // cannot complete.
-                                    super::Outcome::Follow {
-                                        targets,
-                                        arity,
-                                        receiver,
-                                    } if !idx.class_is_bridged_to(class) => {
-                                        match follow_link(idx, &targets, &receiver, arity, &q.args) {
-                                            Some(t) => {
-                                                crate::util::ghost_stats::count(
-                                                    "consult.baked_follow",
-                                                );
-                                                if super::verify_absent_conclusions() {
-                                                    followed_answer = Some(t);
-                                                } else {
-                                                    let v = ReducedValue::Type(t);
-                                                    super::session::remember_candidate_answer(
-                                                        idx, &cached.path, q, &v,
-                                                    );
-                                                    return v;
-                                                }
-                                            }
-                                            None => {
-                                                crate::util::ghost_stats::count(
-                                                    "consult.baked_follow_incomplete",
-                                                );
-                                            }
-                                        }
-                                    }
-                                    // A `Link` says "everything before the
-                                    // bridge arm answered None", which a
-                                    // bridged class can contradict. Decode.
-                                    super::Outcome::Follow { .. } => {
-                                        crate::util::ghost_stats::count(
-                                            "consult.follow_but_bridged",
-                                        );
-                                    }
-                                    super::Outcome::Decode => {
-                                        crate::util::ghost_stats::count("consult.baked_open");
-                                    }
-                                }
-                            } else {
-                                crate::util::ghost_stats::count("consult.not_baked");
-                            }
-                        }
-                        crate::util::ghost_stats::count("moc.provider_fetched");
-                        // The three costs of one cross-file consult, split
-                        // because a conclusion layer would remove the first
-                        // two and CANNOT remove the third (enrichment is bag
-                        // surgery). Sizing stage 2 means knowing which is
-                        // which, not the total.
-                        //
-                        // These NEST over the `decode.*` stage split rather
-                        // than restating it: a miss here descends through
-                        // `bagcache.decode` into `decode.2_zstd`/`3_bincode`.
-                        // Summing a `consult.*` against a `decode.*` term
-                        // double-counts the same microseconds.
-                        let full = crate::util::ghost_stats::timed(
-                            "consult.bag_present", || idx.bag_present(cached));
-                        if std::ptr::eq(bag, &full.witnesses) {
-                            // Self: the reducers above already tried this bag.
-                            // Not an answer about the candidate, so nothing to
-                            // remember either.
-                            continue;
-                        }
-                        let v = {
-                            let v = crate::util::ghost_stats::timed(
-                                "consult.attempt", || attempt(&full, state));
-                            crate::util::ghost_stats::count(if v == ReducedValue::None {
-                                "moc.provider_no_answer"
-                            } else {
-                                "moc.provider_answered"
-                            });
-                            if v != ReducedValue::None {
-                                v
-                            } else {
-                            // Fallback-on-miss (R4): the package file's method
-                            // return may chain through ITS OWN imports —
-                            // invisible to the raw bag, present in the
-                            // enriched overlay.
-                            crate::util::ghost_stats::count("consult.moc_primary");
-                            let enriched = crate::util::ghost_stats::timed(
-                                "consult.enriched", || idx.enriched_present(cached));
-                            if !std::sync::Arc::ptr_eq(&enriched, &full)
-                                && !std::ptr::eq(bag, &enriched.witnesses)
-                            {
-                                state.pins.push(std::sync::Arc::clone(&enriched));
-                                attempt(&enriched, state)
-                            } else {
-                                ReducedValue::None
-                            }
-                            }
-                        };
-                        if let Some(followed) = &followed_answer {
-                            // Scored against the chase, not against the output.
-                            // A wrong `Link` is the layer's only failure mode
-                            // that serves a wrong ANSWER rather than costing a
-                            // decode, so it is the one that must be compared
-                            // where the claim is made.
-                            let agrees = matches!(&v, ReducedValue::Type(t) if t == followed);
-                            if !agrees {
-                                crate::util::ghost_stats::count("concl.follow_break");
-                                log::error!(
-                                    "conclusion follow break: a Link for {:?} in {:?} \
-                                     resolved to {followed:?} but the chase answered {v:?} \
-                                     — a baked cross-file hop disagrees with the hop it \
-                                     replaces",
-                                    q.attachment,
-                                    cached.path
-                                );
-                                debug_assert!(false, "Link disagreed with the chase; see log");
-                            } else {
-                                crate::util::ghost_stats::count("concl.follow_ok");
-                            }
-                        }
-                        if super::verify_absent_conclusions()
-                            && baked_said_absent
-                            && v != ReducedValue::None
-                        {
-                            crate::util::ghost_stats::count("concl.equiv_break");
-                            log::error!(
-                                "conclusion equivalence break: the map reported {:?} ABSENT for \
-                                 {:?} (which is read as a proven None) but the chase answered \
-                                 {v:?} — the bake's key enumeration is incomplete",
-                                q.attachment,
-                                cached.path
-                            );
-                            debug_assert!(
-                                false,
-                                "conclusion absence disagreed with the chase; see log"
-                            );
-                        }
-                        super::session::remember_candidate_answer(idx, &cached.path, q, &v);
-                        if v != ReducedValue::None {
-                            return v;
-                        }
+                    if let Some(v) =
+                        self.moc_cross_file_primary(bag, q, state, ctx, idx, package)
+                    {
+                        return v;
                     }
                 }
                 // (2) Inheritance walk via package_parents (local ∪
@@ -986,7 +732,7 @@ impl ReducerRegistry {
                     // dependence, and counting it as one makes the poison rate
                     // look total when it may be negligible.
                     let mut bridge_seen = false;
-                    idx.for_each_entity_bridged_to(class, &mut |_m, _c, _s| {
+                    idx.for_each_entity_bridged_to(package, &mut |_m, _c, _s| {
                         bridge_seen = true;
                     });
                     crate::util::ghost_stats::count(if bridge_seen {
@@ -1003,7 +749,7 @@ impl ReducerRegistry {
                         // `enabled()` first: `format!` allocates before `count`
                         // can decline, so the naive spelling pays for a string
                         // per yield even with stats off.
-                        crate::util::ghost_stats::count(&format!("bridgecls.{class}"));
+                        crate::util::ghost_stats::count(&format!("bridgecls.{package}"));
                     }
                     let mut found: Option<InferredType> = None;
                     idx.for_each_entity_bridged_to(package, &mut |_mod, cached, sym| {
@@ -1217,6 +963,409 @@ impl ReducerRegistry {
     /// the recursion shares the caller's cycle guard (calling the public
     /// `query_variable_type` would reset visited and reopen mutual
     /// `Edge(Variable)` loops).
+
+
+    /// The cross-file primary hop of the `PackageSymbol` ladder: every file
+    /// declaring `package`, asked in ladder order, first answer wins.
+    ///
+    /// Out of line, and `#[inline(never)]`, because of the STACK. This block's
+    /// locals — two capture-heavy `attempt` closures, the conclusion-outcome
+    /// bookkeeping, the equivalence probes — otherwise live in the caller's
+    /// frame, and the caller is `query_rec_body`, which is live once per MRO
+    /// hop against the 2 MiB stack the depth-cap test pins. An index-less chase
+    /// (a bake, a hand-built FA) never enters here at all, so keeping it inline
+    /// charged every one of those hops for a block it does not run.
+    #[inline(never)]
+    fn moc_cross_file_primary(
+        &self,
+        bag: &WitnessBag,
+        q: &ReducerQuery,
+        state: &mut QueryState,
+        ctx: &BagContext,
+        idx: &dyn crate::model::file_analysis::CrossFileLookup,
+        package: &str,
+    ) -> Option<ReducedValue> {
+        for cached in super::session::visible_def_candidates(idx, package).iter() {
+            // Rehydrate the target file's bag if its resident copy
+            // was Slice-2-evicted; the cross-file chase reads its
+            // witnesses (`docs/adr/memory-slice-2-lru.md`).
+            let attempt =
+                |full: &std::sync::Arc<crate::model::file_analysis::FileAnalysis>,
+                 state: &mut _| {
+                    let cached_ctx = BagContext {
+                        scopes: &full.scopes,
+                        package_framework: &full.packages,
+                        module_index: Some(idx),
+                        package_parents: &full.packages,
+                        app_surface_consumers: &full.plugin.app_surface_consumers,
+                    };
+                    let sub_q = ReducerQuery {
+                        attachment: q.attachment,
+                        point: q.point,
+                        framework: q.framework,
+                        arity_hint: q.arity_hint,
+                        receiver: q.receiver.clone(),
+                        args: q.args.clone(),
+                        context: Some(&cached_ctx),
+                    };
+                    (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
+                };
+            // This candidate's contribution, remembered ACROSS
+            // top-level queries. `attempt` is a pure function of
+            // (candidate file, attachment, receiver, arity, point,
+            // framework) — the whole key — so one walk derives it
+            // once instead of once per call site.
+            if let Some(hit) =
+                super::session::candidate_answer(idx, &cached.path, q)
+            {
+                if *hit != ReducedValue::None {
+                    return Some((*hit).clone());
+                }
+                continue;
+            }
+            if !super::session::spend_consult(idx) {
+                break;
+            }
+            // THE CONCLUSION LOOKUP, ahead of the decode.
+            //
+            // This is the whole point of the layer: 78% of a
+            // consult is the chase, not the fetch, and a baked
+            // answer skips both. Placed after the session memo
+            // (a hit there is cheaper still) and before
+            // `bag_present` (which decodes).
+            //
+            // The three outcomes are NOT interchangeable:
+            //   Answer  — serve it, no decode.
+            //   None    — the map PROVES no answer; fall through
+            //             to the next candidate exactly as a
+            //             decoded miss would, still no decode.
+            //   Decode  — `OpenNone`: unbakeable here, so pay the
+            //             full price for this key alone.
+            // A `Follow` is not yet honoured — see below.
+            let mut baked_said_absent = false;
+            // Under the equivalence flag a followed answer is held
+            // rather than returned, so the chase below runs and can
+            // contradict it.
+            let mut followed_answer: Option<InferredType> = None;
+            if let Some(key) =
+                super::ConclusionKey::from_attachment(q.attachment)
+            {
+                if let Some(map) = idx.conclusions_for(&cached.path) {
+                    match map.evaluate(
+                        &key,
+                        q.receiver.as_ref(),
+                        q.arity_hint,
+                        &q.args,
+                    ) {
+                        super::Outcome::Answer(t) => {
+                            crate::util::ghost_stats::count("consult.baked_answer");
+                            let v = ReducedValue::Type(t);
+                            // The memo still gets the answer. A
+                            // baked hit is cheap but not free, and
+                            // the memo is the tier above it.
+                            super::session::remember_candidate_answer(
+                                idx, &cached.path, q, &v,
+                            );
+                            return Some(v);
+                        }
+                        // ABSENT. The spec lets this mean a proven
+                        // `None` and skip the candidate outright —
+                        // "the sharpest knife in the design" — but
+                        // that is sound only if the bake enumerated
+                        // every key the bag could answer, and today
+                        // it does not: it walks the bag's
+                        // attachment index, while the live chase
+                        // also answers keys that carry no witnesses
+                        // (inheritance edges, reducer synthesis).
+                        //
+                        // A wrongly-absent key makes the ladder
+                        // skip a candidate that would have
+                        // answered; the answer is then found
+                        // further up the parent walk, so the OUTPUT
+                        // agrees and only the cost betrays it.
+                        // Measured on `--dump-package Catalyst`:
+                        // trusting absence took 892 decodes to
+                        // 2,721 and 2.76s to 4.20s, byte-identical
+                        // output throughout. A silent 3x, invisible
+                        // to every correctness check we have.
+                        //
+                        // So absence falls through to the decode
+                        // until the enumeration is provably
+                        // complete. `PERL_LSP_TRUST_ABSENT` turns
+                        // the knife back on for measuring that work
+                        // as it lands.
+                        super::Outcome::None => {
+                            crate::util::ghost_stats::count("consult.baked_none");
+                            baked_said_absent = true;
+                            // Absence is conclusive only for a
+                            // class with NO ancestors at all. The
+                            // per-file bake cannot establish that:
+                            // Perl packages are open, and a file
+                            // that REOPENS a package without
+                            // repeating its `@ISA` sees a
+                            // parentless class. `PPI::XSAccessor`
+                            // does exactly that to `PPI::Token`,
+                            // and it accounted for 75 of the
+                            // equivalence breaks left after the
+                            // per-file check.
+                            //
+                            // So the question is asked where the
+                            // cross-file union lives, through the
+                            // same `parents_of` every other
+                            // ancestor walk uses.
+                            let has_ancestors =
+                                !crate::model::file_analysis::parents_of(
+                                    package,
+                                    ctx.package_parents,
+                                    ctx.module_index,
+                                    ctx.app_surface_consumers,
+                                )
+                                .is_empty();
+                            if has_ancestors {
+                                crate::util::ghost_stats::count(
+                                    "consult.absent_but_inherits",
+                                );
+                                baked_said_absent = false;
+                            }
+                            // The bridge guard, and it closes a
+                            // hole that PREDATES the conclusion
+                            // layer: trusting absence asks only
+                            // "no ancestors", while the live
+                            // ladder's bridge arm runs regardless
+                            // of ancestry. A PARENTLESS BRIDGED
+                            // class therefore has its absence
+                            // trusted while the chase answers
+                            // through the bridge. The substrate
+                            // happens to contain no such class —
+                            // corpus luck, not soundness.
+                            if baked_said_absent
+                                && idx.class_is_bridged_to(package)
+                            {
+                                crate::util::ghost_stats::count(
+                                    "consult.absent_but_bridged",
+                                );
+                                baked_said_absent = false;
+                            }
+                            // Under the equivalence flag, do NOT
+                            // trust it — fall through, run the
+                            // real chase, and let the arm below
+                            // report any answer that absence
+                            // claimed did not exist.
+                            if baked_said_absent
+                                && super::trust_absent_conclusions()
+                                && !super::verify_absent_conclusions()
+                            {
+                                // Remember the None BEFORE
+                                // continuing. Skipping the memo
+                                // was the actual cost of trusting
+                                // absence: this candidate is asked
+                                // hundreds of times per run, and
+                                // each repeat re-walked its
+                                // ancestors instead of hitting the
+                                // tier that exists to stop exactly
+                                // that.
+                                super::session::remember_candidate_answer(
+                                    idx,
+                                    &cached.path,
+                                    q,
+                                    &ReducedValue::None,
+                                );
+                                continue;
+                            }
+                        }
+                        // Cross-file hop: re-enter the ladder at
+                        // the target file's map, no decode.
+                        //
+                        // This is the first conclusion form whose
+                        // failure is UNSOUND rather than merely
+                        // slow — a wrong absence costs a decode, a
+                        // wrong `Link` serves a wrong answer — so
+                        // it is scored by `PERL_LSP_CONCL_EQUIV`
+                        // against the chase it replaces, and it
+                        // degrades to that chase whenever the walk
+                        // cannot complete.
+                        super::Outcome::Follow {
+                            targets,
+                            arity,
+                            receiver,
+                        } if !idx.class_is_bridged_to(package) => {
+                            match follow_link(idx, &targets, &receiver, arity, &q.args) {
+                                Some(t) => {
+                                    crate::util::ghost_stats::count(
+                                        "consult.baked_follow",
+                                    );
+                                    if super::verify_absent_conclusions() {
+                                        followed_answer = Some(t);
+                                    } else {
+                                        let v = ReducedValue::Type(t);
+                                        super::session::remember_candidate_answer(
+                                            idx, &cached.path, q, &v,
+                                        );
+                                        return Some(v);
+                                    }
+                                }
+                                None => {
+                                    crate::util::ghost_stats::count(
+                                        "consult.baked_follow_incomplete",
+                                    );
+                                }
+                            }
+                        }
+                        // A `Link` says "everything before the
+                        // bridge arm answered None", which a
+                        // bridged class can contradict. Decode.
+                        super::Outcome::Follow { .. } => {
+                            crate::util::ghost_stats::count(
+                                "consult.follow_but_bridged",
+                            );
+                        }
+                        super::Outcome::Decode => {
+                            crate::util::ghost_stats::count("consult.baked_open");
+                        }
+                    }
+                } else {
+                    crate::util::ghost_stats::count("consult.not_baked");
+                }
+            }
+            crate::util::ghost_stats::count("moc.provider_fetched");
+            // The three costs of one cross-file consult, split
+            // because a conclusion layer would remove the first
+            // two and CANNOT remove the third (enrichment is bag
+            // surgery). Sizing stage 2 means knowing which is
+            // which, not the total.
+            //
+            // These NEST over the `decode.*` stage split rather
+            // than restating it: a miss here descends through
+            // `bagcache.decode` into `decode.2_zstd`/`3_bincode`.
+            // Summing a `consult.*` against a `decode.*` term
+            // double-counts the same microseconds.
+            // Snapshotted before the chase runs, so the classifier
+            // below asks "did the cap fire during THIS chase"
+            // rather than "has it ever fired on this thread".
+            let truncations_before = QUERY_REC_TRUNCATIONS.with(|c| c.get());
+            let full = crate::util::ghost_stats::timed(
+                "consult.bag_present", || idx.bag_present(cached));
+            if std::ptr::eq(bag, &full.witnesses) {
+                // Self: the reducers above already tried this bag.
+                // Not an answer about the candidate, so nothing to
+                // remember either.
+                continue;
+            }
+            let v = {
+                let v = crate::util::ghost_stats::timed(
+                    "consult.attempt", || attempt(&full, state));
+                crate::util::ghost_stats::count(if v == ReducedValue::None {
+                    "moc.provider_no_answer"
+                } else {
+                    "moc.provider_answered"
+                });
+                if v != ReducedValue::None {
+                    v
+                } else {
+                // Fallback-on-miss (R4): the package file's method
+                // return may chain through ITS OWN imports —
+                // invisible to the raw bag, present in the
+                // enriched overlay.
+                crate::util::ghost_stats::count("consult.moc_primary");
+                let enriched = crate::util::ghost_stats::timed(
+                    "consult.enriched", || idx.enriched_present(cached));
+                if !std::sync::Arc::ptr_eq(&enriched, &full)
+                    && !std::ptr::eq(bag, &enriched.witnesses)
+                {
+                    state.pins.push(std::sync::Arc::clone(&enriched));
+                    attempt(&enriched, state)
+                } else {
+                    ReducedValue::None
+                }
+                }
+            };
+            if let Some(followed) = &followed_answer {
+                // Scored against the chase, not against the output.
+                // A wrong `Link` is the layer's only failure mode
+                // that serves a wrong ANSWER rather than costing a
+                // decode, so it is the one that must be compared
+                // where the claim is made.
+                let agrees = matches!(&v, ReducedValue::Type(t) if t == followed);
+                if !agrees {
+                    // WHY the chase said `None`, because two of
+                    // the reasons are not disagreement at all:
+                    //
+                    //  * TRUNCATED — the depth cap fired, so the
+                    //    `None` means "ran out of frames".
+                    //  * GUARDED — the shared cycle guard had this
+                    //    very candidate key on the path, so the
+                    //    chase returned without walking a rung. The
+                    //    outer frame still standing on it walks
+                    //    them.
+                    //
+                    // Over the substrate every remaining break is
+                    // the second. The probe this replaced asked
+                    // whether a LINK TARGET was on the path, which
+                    // was doubly wrong: the guard cuts on the
+                    // candidate key, and before self-rungs were
+                    // filtered the targets included the key being
+                    // chased, so it matched every time. A
+                    // classifier that cannot fail is not one.
+                    let candidate_key: VisitedKey = (
+                        &full.witnesses as *const _ as usize,
+                        q.attachment.clone(),
+                        receiver_key(&q.receiver),
+                        q.arity_hint,
+                    );
+                    let excused = if truncations_before
+                        != QUERY_REC_TRUNCATIONS.with(|c| c.get())
+                    {
+                        Some("concl.follow_break_truncated")
+                    } else if state.visited.contains(&candidate_key) {
+                        Some("concl.follow_break_guarded")
+                    } else {
+                        None
+                    };
+                    crate::util::ghost_stats::count(
+                        excused.unwrap_or("concl.follow_break"),
+                    );
+                    log::error!(
+                        "conclusion follow break: a Link for {:?} in {:?} \
+                         resolved to {followed:?} but the chase answered {v:?} \
+                         — a baked cross-file hop disagrees with the hop it \
+                         replaces",
+                        q.attachment,
+                        cached.path
+                    );
+                    debug_assert!(
+                        excused.is_some(),
+                        "Link disagreed with a chase that actually walked; see log"
+                    );
+                } else {
+                    crate::util::ghost_stats::count("concl.follow_ok");
+                }
+            }
+            if super::verify_absent_conclusions()
+                && baked_said_absent
+                && v != ReducedValue::None
+            {
+                crate::util::ghost_stats::count("concl.equiv_break");
+                log::error!(
+                    "conclusion equivalence break: the map reported {:?} ABSENT for \
+                     {:?} (which is read as a proven None) but the chase answered \
+                     {v:?} — the bake's key enumeration is incomplete",
+                    q.attachment,
+                    cached.path
+                );
+                debug_assert!(
+                    false,
+                    "conclusion absence disagreed with the chase; see log"
+                );
+            }
+            super::session::remember_candidate_answer(idx, &cached.path, q, &v);
+            if v != ReducedValue::None {
+                return Some(v);
+            }
+        }
+                
+        None
+    }
+
     fn materialize(
         &self,
         bag: &WitnessBag,
@@ -1224,6 +1373,11 @@ impl ReducerRegistry {
         state: &mut QueryState,
     ) -> Vec<Witness> {
         let raw = bag.for_attachment(q.attachment);
+        // Is this attachment's value a pass-through of ONE sub-chase, or a fold
+        // over several? With siblings present, whatever a sub-chase answers is
+        // combined with them before this frame returns, so no single exit key
+        // names this frame's answer.
+        let sole_witness = raw.len() == 1;
         let mut out: Vec<Witness> = Vec::with_capacity(raw.len());
         for w in raw {
             match &w.payload {
@@ -1232,7 +1386,7 @@ impl ReducerRegistry {
                         (
                             WitnessAttachment::Variable { name, scope },
                             Some(ctx),
-                        ) => {
+                        ) => state.in_opaque_frame(|state| {
                             // Narrowing point: an edge reached FROM a positioned
                             // expression (a variable read recorded at `Expr(span)`)
                             // resolves the slot at the read's own location, so a
@@ -1244,11 +1398,15 @@ impl ReducerRegistry {
                                 WitnessAttachment::Expr(span) => span.start,
                                 _ => scope_point(ctx.scopes, *scope),
                             };
+                            // Opaque: the scope walk defers a rep-only answer
+                            // and lets an outer class identity beat it, so the
+                            // value is chosen ACROSS scopes rather than taken
+                            // from the first that answers.
                             self.query_variable_with_visited(
                                 bag, ctx, name, *scope, point,
                                 q.receiver.as_ref(), state,
                             )
-                        }
+                        }),
                         _ => {
                             // A `PackageSymbol{package,..}` reached through an edge is
                             // a fresh method dispatch: its receiver is that call's
@@ -1260,12 +1418,16 @@ impl ReducerRegistry {
                             // there the source is itself a `PackageSymbol`, and the
                             // child's receiver must carry through so an inherited fluent
                             // accessor returns the child, not where `has` was declared.
+                            let redispatched = matches!(
+                                target,
+                                WitnessAttachment::PackageSymbol { .. }
+                            ) && !matches!(
+                                q.attachment,
+                                WitnessAttachment::PackageSymbol { .. }
+                            );
                             let receiver = match target {
                                 WitnessAttachment::PackageSymbol { package, .. }
-                                    if !matches!(
-                                        q.attachment,
-                                        WitnessAttachment::PackageSymbol { .. }
-                                    ) =>
+                                    if redispatched =>
                                 {
                                     fresh_dispatch_receiver(&q.receiver, package, q.context)
                                 }
@@ -1280,10 +1442,25 @@ impl ReducerRegistry {
                                 args: q.args.clone(),
                                 context: q.context,
                             };
-                            match &*self.query_rec(bag, &sub_q, state) {
-                                ReducedValue::Type(t) => Some(t.clone()),
-                                ReducedValue::FactMap(_)
-                                | ReducedValue::None => None,
+                            // The ONE transparent frame in `materialize`: a lone
+                            // edge, chased under the query it was reached with,
+                            // whose answer this frame returns unchanged. A
+                            // re-dispatch substitutes a different receiver, and
+                            // a `ReturnExpr::Receiver` at the far end then
+                            // answers about that receiver rather than the one a
+                            // `Link` follow would thread.
+                            let transparent = sole_witness && !redispatched;
+                            let chase = |state: &mut QueryState| {
+                                match &*self.query_rec(bag, &sub_q, state) {
+                                    ReducedValue::Type(t) => Some(t.clone()),
+                                    ReducedValue::FactMap(_)
+                                    | ReducedValue::None => None,
+                                }
+                            };
+                            if transparent {
+                                chase(state)
+                            } else {
+                                state.in_opaque_frame(chase)
                             }
                         }
                     };
@@ -1319,11 +1496,17 @@ impl ReducerRegistry {
                         args: q.args.clone(),
                         context: q.context,
                     };
-                    match &*self.query_rec(bag, &sub_q, state) {
+                    // Opaque: the call site's arity and dispatch receiver both
+                    // replace the outer query's, so the exit key is asked a
+                    // different question than a `Link` follow would ask.
+                    let v = state.in_opaque_frame(|state| {
+                        (*self.query_rec(bag, &sub_q, state)).clone()
+                    });
+                    match v {
                         ReducedValue::Type(t) => out.push(Witness {
                             attachment: w.attachment.clone(),
                             source: w.source.clone(),
-                            payload: WitnessPayload::InferredType(t.clone()),
+                            payload: WitnessPayload::InferredType(t),
                             span: w.span,
                         }),
                         ReducedValue::FactMap(_) | ReducedValue::None => {}
@@ -1337,7 +1520,10 @@ impl ReducerRegistry {
                     // A Variable base scope-walks like the Edge arm above
                     // (`$h{k}` projects off `%h`, whose witnesses live on
                     // the decl scope, not the access scope).
-                    let base_t = match (base, q.context) {
+                    // Opaque throughout: this frame returns a value drilled OUT
+                    // of the sub-chase's answer, never the answer itself, so no
+                    // exit key beneath it names what this frame produces.
+                    let base_t = state.in_opaque_frame(|state| match (base, q.context) {
                         (WitnessAttachment::Variable { name, scope }, Some(ctx)) => {
                             let point = scope_point(ctx.scopes, *scope);
                             self.query_variable_with_visited(
@@ -1361,7 +1547,7 @@ impl ReducerRegistry {
                                 | ReducedValue::None => None,
                             }
                         }
-                    };
+                    });
                     if let Some(t) = base_t {
                         let projected = match step {
                             ProjectionStep::HashKey(k) => {
@@ -1388,11 +1574,13 @@ impl ReducerRegistry {
                                         args: q.args.clone(),
                                         context: q.context,
                                     };
-                                    match &*self.query_rec(bag, &sub_q, state) {
-                                        ReducedValue::Type(t) => Some(t.clone()),
-                                        ReducedValue::FactMap(_)
-                                        | ReducedValue::None => None,
-                                    }
+                                    state.in_opaque_frame(|state| {
+                                        match &*self.query_rec(bag, &sub_q, state) {
+                                            ReducedValue::Type(t) => Some(t.clone()),
+                                            ReducedValue::FactMap(_)
+                                            | ReducedValue::None => None,
+                                        }
+                                    })
                                 })
                             }
                             ProjectionStep::ArrayIndex(i) => t.element_at(*i).cloned(),
@@ -1423,11 +1611,16 @@ impl ReducerRegistry {
                         args: q.args.clone(),
                         context: q.context,
                     };
-                    match &*self.query_rec(bag, &sub_q, state) {
+                    // Opaque for the same reason as `CallReturn`, plus the
+                    // lookup class and the receiver class deliberately differ.
+                    let v = state.in_opaque_frame(|state| {
+                        (*self.query_rec(bag, &sub_q, state)).clone()
+                    });
+                    match v {
                         ReducedValue::Type(t) => out.push(Witness {
                             attachment: w.attachment.clone(),
                             source: w.source.clone(),
-                            payload: WitnessPayload::InferredType(t.clone()),
+                            payload: WitnessPayload::InferredType(t),
                             span: w.span,
                         }),
                         ReducedValue::FactMap(_) | ReducedValue::None => {}

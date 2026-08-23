@@ -50,8 +50,8 @@ impl ConclusionKey {
     /// attachment is file-internal.
     pub fn from_attachment(att: &WitnessAttachment) -> Option<Self> {
         match att {
-            WitnessAttachment::MethodOnClass { class, name } => Some(Self::MethodOnClass {
-                class: class.clone(),
+            WitnessAttachment::PackageSymbol { package, name } => Some(Self::MethodOnClass {
+                class: package.clone(),
                 name: name.clone(),
             }),
             WitnessAttachment::SlotType { class, key } => Some(Self::SlotType {
@@ -163,8 +163,8 @@ impl ConclusionMap {
                 // The live evaluator, not a copy of it. A second spelling of
                 // `ReturnExpr` semantics is a place for the baked answer to
                 // drift from the answer it is supposed to equal.
-                let att = WitnessAttachment::MethodOnClass {
-                    class: String::new(),
+                let att = WitnessAttachment::PackageSymbol {
+                    package: String::new(),
                     name: String::new(),
                 };
                 let q = ReducerQuery {
@@ -438,8 +438,8 @@ pub fn bake_in_context(
         }
         if let Some(pkg) = package {
             enumerate(
-                WitnessAttachment::MethodOnClass {
-                    class: pkg.clone(),
+                WitnessAttachment::PackageSymbol {
+                    package: pkg.clone(),
                     name: name.clone(),
                 },
                 &mut map,
@@ -573,36 +573,42 @@ fn bake_one(
         // No answer without binders. Before settling for `OpenNone`, ask
         // whether the chase told us WHERE it would have gone: an un-poisoned
         // chase whose residuals are all ladder rungs is exactly a `Link`.
-        // MINTING IS OFF BY DEFAULT, because it is measurably unsound.
         //
-        // Recording residuals and minting them wholesale converts almost the
-        // whole `OpenNone` population — 10,314 -> 293, with `Link` going
-        // 44 -> 10,065. It also produces WRONG ANSWERS: 44 follow breaks
-        // against 65 correct follows under `PERL_LSP_CONCL_EQUIV`, a 40%
-        // error rate on the links it mints.
-        //
-        // The recording half is right; the missing half is the ladder-frame
-        // rule's other side. A chase that COMBINES frames — an arm fold, a
-        // `materialize` splice into a populated witness list — has an answer
-        // that is not "whichever rung answers first", and nothing here poisons
-        // those yet, so they mint a `Link` that means something else. The
-        // observed breaks are consistent with that and NOT with the receiver
-        // rule (the live parent hop threads the receiver unchanged, which is
-        // what `Thread` already does).
-        //
-        // Kept behind a flag rather than deleted: the machinery, the counters
-        // and the 44-break population are exactly what the fix needs to work
-        // against.
+        // MINTING IS OFF BY DEFAULT, and the reason is COST, not soundness.
+        // With the ladder-frame rule's poisoning half in place the follow
+        // breaks go to zero over the substrate — but the decodes do not move
+        // (4103 -> 4104). `follow_one` abandons at the first rung whose map
+        // says `Decode`, and with ~84k `OpenNone` still in the maps that is
+        // nearly every walk, so the consult falls through to the decode it
+        // would have done anyway. The `Link` cannot pay off while `OpenNone`
+        // dominates the rungs; the leverage is in shrinking that population.
+        // `docs/prompt-residualizing-registry.md` carries the table.
         if mint_links_enabled() {
             if let Some(targets) = registry.residuals_of_last_query() {
-                crate::util::ghost_stats::count("bake.link_from_residual");
-                return Conclusion::Link {
-                    targets,
-                    arity: None,
-                    // The live candidate/parent hops thread the receiver
-                    // unchanged; the call is still on the original object.
-                    receiver: ReceiverRule::Thread,
-                };
+                // Drop the rung that names the key being baked. The cross-file
+                // primary records it because "ask the index for this class"
+                // genuinely is the ladder's first rung — but the consult path
+                // reached this map by doing exactly that, so a `Link` back to
+                // it is a walk to where we already are. Left in, it converted
+                // essentially the whole `OpenNone` population into `Link`s that
+                // burn two follow hops and abandon: 14,923 incomplete follows
+                // against 15 that answered, over one substrate check.
+                let self_key = ConclusionKey::from_attachment(att);
+                let targets: Vec<_> = targets
+                    .into_iter()
+                    .filter(|t| Some(t) != self_key.as_ref())
+                    .collect();
+                if !targets.is_empty() {
+                    crate::util::ghost_stats::count("bake.link_from_residual");
+                    return Conclusion::Link {
+                        targets,
+                        arity: None,
+                        // The live candidate/parent hops thread the receiver
+                        // unchanged; the call is still on the original object.
+                        receiver: ReceiverRule::Thread,
+                    };
+                }
+                crate::util::ghost_stats::count("bake.link_was_self_only");
             }
         }
 
@@ -678,15 +684,15 @@ fn sole_foreign_edge(
     let mut found: Option<ConclusionKey> = None;
     for w in &ws {
         match &w.payload {
-            super::types::WitnessPayload::Edge(WitnessAttachment::MethodOnClass {
-                class,
+            super::types::WitnessPayload::Edge(WitnessAttachment::PackageSymbol {
+                package,
                 name,
-            }) if !local_packages.contains(class) => {
+            }) if !local_packages.contains(package) => {
                 if found.is_some() {
                     return None;
                 }
                 found = Some(ConclusionKey::MethodOnClass {
-                    class: class.clone(),
+                    class: package.clone(),
                     name: name.clone(),
                 });
             }

@@ -372,3 +372,104 @@ fn a_parentless_bridged_class_does_not_get_its_absence_trusted() {
          every absence and the layer's main win would be off"
     );
 }
+
+/// Where the chase would have gone, for a given key.
+///
+/// Threaded through the real registry rather than asserting on `bake`'s output
+/// so the property under test is the RECORDING rule, not the env gate that
+/// currently keeps minting switched off — the gate is a shipping decision and
+/// the rule has to hold regardless of it.
+fn residuals_for(fa: &FileAnalysis, class: &str, name: &str) -> Option<Vec<ConclusionKey>> {
+    let registry = ReducerRegistry::with_defaults();
+    let ctx = crate::model::witnesses::reducers::BagContext {
+        scopes: &fa.scopes,
+        package_framework: &fa.packages,
+        // Withheld: this is what makes the chase EXIT rather than answer, and
+        // the exit is the thing being recorded.
+        module_index: None,
+        package_parents: &fa.packages,
+        app_surface_consumers: &fa.plugin.app_surface_consumers,
+    };
+    let att = WitnessAttachment::PackageSymbol {
+        package: class.to_string(),
+        name: name.to_string(),
+    };
+    let _bake = BakeScope::enter();
+    let _ = registry.query(
+        &fa.witnesses,
+        &ReducerQuery {
+            attachment: &att,
+            point: None,
+            framework: FrameworkFact::Plain,
+            arity_hint: None,
+            receiver: None,
+            args: Vec::new(),
+            context: Some(&ctx),
+        },
+    );
+    registry.residuals_of_last_query()
+}
+
+/// An exit reached through a CALL frame must not be residualized.
+///
+/// This is the half of the ladder-frame rule that recording alone does not
+/// give you, and skipping it is not a missed optimisation — it is a wrong
+/// answer. `Link{targets, arity, receiver}` carries ONE set of binders, and a
+/// `CallReturn` frame substitutes both: the call site's arity, and the
+/// dispatch class as the receiver. Minted from the outer query's binders it
+/// asks the exit key a different question than the chase did, and a
+/// receiver-dependent answer at the far end then answers about the wrong
+/// object. That was 4 of the 44 follow breaks the unpoisoned version produced.
+///
+/// Base-verify by deleting the `opaque_frames` check in `note_exit`: the rung
+/// survives and this asserts.
+#[test]
+fn a_call_frame_exit_is_not_residualized() {
+    let fa = analyze("package B;\nsub mk { return Elsewhere::Thing->make }\n1;\n");
+    assert_eq!(
+        residuals_for(&fa, "B", "mk"),
+        None,
+        "a call frame's exit was offered as a Link rung, and the Link form \
+         cannot carry the arity and dispatch receiver that frame substituted"
+    );
+}
+
+/// A drill through a value is not a hop to it.
+///
+/// `$ua->{name}` returns something projected OUT of the sub-chase's answer. A
+/// `Link` at the base's key would serve the base object, not the field.
+#[test]
+fn a_chase_that_drills_through_a_value_does_not_residualize() {
+    let fa = analyze(
+        "package B;\n\
+         sub host { my $ua = Elsewhere::Agent->new; return $ua->{name} }\n1;\n",
+    );
+    assert_eq!(
+        residuals_for(&fa, "B", "host"),
+        None,
+        "a projection's exit was offered as a Link rung — following it would \
+         serve the value drilled THROUGH, not the value drilled OUT"
+    );
+}
+
+/// Control, and it is what keeps the two tests above from passing vacuously:
+/// the recording rule must still fire on the shape it exists for.
+///
+/// A parent walk is the ladder in its purest form — each rung is asked the
+/// same question under the same binders, and the first to answer wins. Every
+/// frame between the query and the exit returns the exit's answer unchanged,
+/// so the exit key names this method's return exactly.
+#[test]
+fn a_parent_walk_exit_is_still_residualized() {
+    let fa = analyze("package B;\nour @ISA = ('Elsewhere::Base');\nsub other { 1 }\n1;\n");
+    let residuals = residuals_for(&fa, "B", "inherited");
+    assert!(
+        residuals.as_deref().is_some_and(|r| r.iter().any(|k| matches!(
+            k,
+            ConclusionKey::MethodOnClass { class, name }
+                if class == "Elsewhere::Base" && name == "inherited"
+        ))),
+        "a parent rung was not recorded; got {residuals:?} — with this failing, \
+         the two poisoning tests above prove nothing"
+    );
+}
