@@ -63,7 +63,7 @@ fn a_baked_conclusion_agrees_with_the_live_chase() {
                 // A decode defers to the live path, so it cannot disagree
                 // with it — that is the point of keeping it distinct from
                 // absent.
-                Outcome::Decode | Outcome::Follow { .. } => {}
+                Outcome::Decode(_) | Outcome::Follow { .. } => {}
                 Outcome::Answer(baked) => {
                     checked += 1;
                     assert_eq!(

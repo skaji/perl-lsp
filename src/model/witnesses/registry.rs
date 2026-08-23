@@ -1043,6 +1043,12 @@ impl ReducerRegistry {
             //             full price for this key alone.
             // A `Follow` is not yet honoured — see below.
             let mut baked_said_absent = false;
+            // WHY this candidate is about to be decoded, so the decode's
+            // OUTCOME can be attributed back to its cause. That is the number
+            // that decides whether a per-class conclusion form is worth
+            // building: a decode whose chase then answers nothing locally was
+            // spent walking to a parent the map could have named.
+            let mut decode_cause: Option<super::OpenReason> = None;
             // Under the equivalence flag a followed answer is held
             // rather than returned, so the chase below runs and can
             // contradict it.
@@ -1219,8 +1225,14 @@ impl ReducerRegistry {
                                 "consult.follow_but_bridged",
                             );
                         }
-                        super::Outcome::Decode => {
+                        // The cause rides the outcome, so the tally is taken
+                        // where the cost lands. A bake-side count would count
+                        // KEYS; this counts decodes, weighted by how often
+                        // each key is actually asked.
+                        super::Outcome::Decode(reason) => {
                             crate::util::ghost_stats::count("consult.baked_open");
+                            crate::util::ghost_stats::count(reason.tag());
+                            decode_cause = Some(reason);
                         }
                     }
                 } else {
@@ -1259,6 +1271,17 @@ impl ReducerRegistry {
                 } else {
                     "moc.provider_answered"
                 });
+                if let Some(cause) = decode_cause {
+                    // `enabled()` first: `format!` allocates before `count`
+                    // can decline.
+                    if crate::util::ghost_stats::enabled() {
+                        crate::util::ghost_stats::count(&format!(
+                            "{}.{}",
+                            cause.tag(),
+                            if v == ReducedValue::None { "wasted" } else { "paid" }
+                        ));
+                    }
+                }
                 if v != ReducedValue::None {
                     v
                 } else {
@@ -1835,7 +1858,7 @@ fn follow_one(
                 // as the live chase's candidate loop does.
                 super::Outcome::None => continue,
                 // Unbakeable here, so the walk cannot answer without the bag.
-                super::Outcome::Decode => return None,
+                super::Outcome::Decode(_) => return None,
                 super::Outcome::Follow {
                     targets,
                     arity,

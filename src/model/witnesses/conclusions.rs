@@ -135,6 +135,19 @@ pub enum OpenReason {
     /// Cannot fire while `from_attachment` is injective; counted so that
     /// "cannot fire" is something the numbers say rather than a comment.
     KeyCollision,
+    /// Not a stored conclusion at all: the key is ABSENT and the class cannot
+    /// be proven closed, so absence proves nothing and the chase must run.
+    ///
+    /// Carried alongside the stored reasons because from the consult's side it
+    /// is the same event — a decode — and separating them by provenance is
+    /// what made the first attribution describe a quarter of the population
+    /// while reading as if it described all of it: 25,897 counted against
+    /// 92,559 measured, and the gap WAS the answer.
+    ///
+    /// Measured at 70.3% of all decodes, and 97.6% of those on a class the map
+    /// DOES conclude about — it simply inherits from somewhere this file
+    /// cannot see.
+    AbsentNotClosed,
 }
 
 impl OpenReason {
@@ -148,6 +161,7 @@ impl OpenReason {
             OpenReason::BinderDependent => "concl.open.binder_dependent",
             OpenReason::KindDisagreement => "concl.open.kind_disagreement",
             OpenReason::KeyCollision => "concl.open.key_collision",
+            OpenReason::AbsentNotClosed => "concl.open.absent_not_closed",
         }
     }
 }
@@ -200,30 +214,7 @@ impl ConclusionMap {
             // answer is "I do not know", which is a decode.
             return match key {
                 ConclusionKey::MethodOnClass { class, .. } if !self.1.contains(class) => {
-                    // ABSENT on a class this map cannot prove closed. Counted
-                    // beside the `OpenNone` reasons because it is the same
-                    // outcome from the consult's point of view — a decode —
-                    // and leaving it uncounted made the reason tally look like
-                    // it explained the decodes when it explained a quarter of
-                    // them.
-                    // Split for measurement only, and gated because it is an
-                    // O(keys) scan: does this map conclude ANYTHING about the
-                    // class? "The file declares it but cannot prove it closed"
-                    // and "the file has never heard of it" are the same
-                    // outcome and completely different problems, and the
-                    // second is not something a richer conclusion form fixes.
-                    if crate::util::ghost_stats::enabled() {
-                        let mentioned = self.0.keys().any(|k| {
-                            matches!(k, ConclusionKey::MethodOnClass { class: c, .. } if c == class)
-                        });
-                        crate::util::ghost_stats::count(if mentioned {
-                            "concl.open.absent_class_known_open"
-                        } else {
-                            "concl.open.absent_class_unknown"
-                        });
-                    }
-                    crate::util::ghost_stats::count("concl.open.absent_not_closed");
-                    Outcome::Decode
+                    Outcome::Decode(OpenReason::AbsentNotClosed)
                 }
                 _ => Outcome::None,
             };
@@ -267,12 +258,7 @@ impl ConclusionMap {
                     ReceiverRule::Dispatch(class) => Some(fresh_receiver(receiver, class)),
                 },
             },
-            // Counted HERE rather than at the bake: this is the consult, so
-            // the tally is weighted by how often each key is actually asked.
-            Conclusion::OpenNone(reason) => {
-                crate::util::ghost_stats::count(reason.tag());
-                Outcome::Decode
-            }
+            Conclusion::OpenNone(reason) => Outcome::Decode(*reason),
         }
     }
 }
@@ -285,7 +271,12 @@ pub enum Outcome {
     /// candidate) exactly as a local-reducer miss does today.
     None,
     /// Unbakeable here. Decode the blob and run the real chase for this key.
-    Decode,
+    ///
+    /// Carries WHY, because the consult is where the cost lands and therefore
+    /// where the attribution has to be taken. Counting causes at the bake
+    /// counts keys; counting them at the consult weights each by how often it
+    /// is actually asked, and the two differ by orders of magnitude.
+    Decode(OpenReason),
     /// The answer is in another file; follow with these binders. Ordered,
     /// first-answer-wins.
     Follow {

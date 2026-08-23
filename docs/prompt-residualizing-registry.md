@@ -391,9 +391,36 @@ and the parents are the one thing the bake genuinely knows. An absent key would
 then evaluate to a `Follow` constructed at consult time from the name being
 asked, instead of a decode whose entire job is to walk to the same parents.
 
-Stated as a hypothesis, not a finding, because one number would confirm or kill
-it and I have not taken it: **of those 64,901, how many are answered by a parent
-rung rather than by the candidate file itself?** If most are, the per-class form
-converts them; if most resolve locally after the decode, it does not. That is
-the measurement the next step should start from — the same "read the composition
-before sizing the fix" discipline that produced this table.
+### The number that decides it, taken
+
+`Outcome::Decode` now carries its cause, so a decode's OUTCOME can be attributed
+back to the reason it happened. "Wasted" = the chase this decode paid for
+answered nothing for that candidate; the answer, if any, came from the next
+candidate, a parent rung, or the bridge arm.
+
+| cause | chase answered nothing | chase answered | wasted |
+|---|---|---|---|
+| absent, class not provably closed | **43,465** | 558 | **98.7%** |
+| no answer, chase opaque | 6,074 | 333 | 94.8% |
+| no answer, linkable rungs | 5,033 | 49 | 99.0% |
+| no answer, self-rung only | 3,748 | 20 | 99.5% |
+| binder-dependent | 6 | **508** | 1.2% |
+
+**58,326 decodes per warm check are spent on a chase that answers nothing.**
+
+The hypothesis is confirmed and its shape is sharper than stated. The dominant
+population decodes a file only to discover the method is not in it and walk to a
+parent — which is exactly what a per-class "any absent key on C inherits from
+these parents" fact would let the map say without the decode.
+
+And the inverse is the sanity check that makes the table believable:
+**`binder_dependent` is 98.8% PAID.** It is the one cause whose decode is
+genuinely earning its keep, and it is 0.6% of the population. A metric where
+every row pointed the same way would be measuring something other than what it
+claims.
+
+Note the totals: 43,465 + 558 is less than the 66,476 `absent_not_closed`
+consults, because a candidate can be skipped before the chase runs (the
+self-bag `ptr::eq` continue, an exhausted consult budget). The wasted/paid split
+is over decodes that actually ran a chase, which is the population the question
+is about.
