@@ -519,13 +519,42 @@ more, silently, as a missing answer rather than an error. Nothing wants that
 today, so it is deliberately not built; the reason is in the code so its
 absence does not read as an oversight.
 
+**Measured twice, because the workload changed underneath the first
+measurement.** The sweep was serialised when I measured it and parallel by the
+time I published; the numbers are not interchangeable and the second set is the
+one that describes the shipping product.
+
+On the SERIAL sweep (the workload that no longer exists):
+
 | | full (control) | diagnostics profile |
 |---|---|---|
-| `diag.0_enriched_snapshot` | 7,531 / 7,977 / 7,691 ms | **6,537 / 6,834 / 6,356 ms** |
-| `consult.attempt` | 455.9 ms / 14,647 | **246.7 ms / 7,665** |
+| `diag.0_enriched_snapshot` | 7,531 / 7,977 / 7,691 ms | 6,537 / 6,834 / 6,356 ms |
+| `consult.attempt` | 455.9 ms / 14,647 | 246.7 ms / 7,665 |
 
-**13–15% off `--check`'s enrichment**, three runs each way. The estimate going
-in was ~20%; the measured range is lower and that is the number.
+13–15% off the enrichment region. On the PARALLEL sweep, same corpus, same
+flags, n=8 per arm interleaved:
+
+| | full (control) | diagnostics profile |
+|---|---|---|
+| wall, median | 4.36 s (4.20–4.80) | **4.12 s (3.99–4.56)** |
+| `diag.0_enriched_snapshot` | 10,762 ms | 10,049 ms |
+
+**~5% of wall.** The ranges overlap — profile's slowest sample exceeds full's
+fastest — so the honest evidence is the shift, not the gap: **six of eight
+profile samples fall strictly below the full arm's minimum.** A single pair
+would have shown anything from 12% to nothing; the fourth pair I ran showed
+4.20 vs 4.21.
+
+Note the enrichment region grew from ~7,500 ms to ~10,800 ms while wall FELL to
+4.2 s. It accumulates per thread, so it now sums to 2.5× the wall it sits
+inside. It remains usable as a same-thread-count A/B ratio and is worthless as
+a cost — which is the general rule, not a footnote: **a nesting per-thread
+region cannot be compared across thread counts, and cannot be read as wall at
+any thread count.**
+
+The estimate going in was ~20% of enrichment. Enrichment CPU is down 6.6% and
+wall about 5%; the estimate was of a term that had already stopped being the
+bottleneck.
 
 ### The control is the part worth guarding
 
