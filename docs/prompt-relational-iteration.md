@@ -69,7 +69,9 @@ the relation that answers it, and the soundness constraint.
    the bridge survives the strip, the names it points at do not. Either a
    `(class, entity_name, file)` row family or entity names denormalized into
    the plugin lane deletes the per-helper-call scan of every plugin file. The
-   visitor also has no early exit; with names resident that stops mattering.
+   visitor's missing early exit is FIXED (`ControlFlow`, Break before the next
+   candidate's decode) — that bounds a first-match hit at the matching module;
+   the name relation is still what deletes the scan for misses.
 
 4. **The `MethodCall` stamp as a `Link`.** The frozen `MethodTarget` exists so
    an answer cannot depend on which verb asked; a conclusion `Link` is
