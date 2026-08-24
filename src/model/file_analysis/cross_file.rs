@@ -602,6 +602,18 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         self.bag_present(cached)
     }
+    /// Can `enriched_present` ever hand back a view DISTINCT from the bag?
+    /// The witness seams' fallback-on-miss arms ask this BEFORE calling it:
+    /// when the answer is no (one-shot CLI — the overlay is long-lived-only),
+    /// the retry is a guaranteed no-op, and skipping it saves a redundant
+    /// per-escalation fetch — measured at 706k calls / 5.3% of a cold
+    /// `--check` wall on a script-heavy corpus — plus the re-chase hazard
+    /// when the LRU evicts between the two fetches. Default `true`: an
+    /// implementor that overrides `enriched_present` without this probe
+    /// keeps its retries.
+    fn serves_enriched(&self) -> bool {
+        true
+    }
     /// A cached module's analysis whole on EVERY evictable axis — bag, refs,
     /// AND symbols present. Consumers that read more than one axis from the
     /// same copy (the diagnostics sweep, the `refs_to` matcher, `sub_info`
@@ -1099,6 +1111,9 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // Same delegation rule as `bag_present` — the inner index owns the
         // enrichment overlay.
         self.inner.enriched_present(cached)
+    }
+    fn serves_enriched(&self) -> bool {
+        self.inner.serves_enriched()
     }
     fn whole_present(
         &self,

@@ -2635,3 +2635,24 @@ fn the_overlay_never_serves_a_partial_copy_to_a_fuller_request() {
          makes the two verbs evict each other on every alternation"
     );
 }
+
+/// The witness seams' retry gate: a one-shot process's `enriched_present` is
+/// `bag_present` — never a distinct view — so `serves_enriched` must say no,
+/// or every R4 escalation pays a fetch to learn nothing (measured: 706k
+/// no-op fetches, 5.3% of a cold `--check` wall on a script-heavy corpus).
+/// Marking long-lived (the server, or `PERL_LSP_LONG_LIVED=1` — the A/B
+/// control) turns the retries back on.
+#[test]
+fn serves_enriched_follows_the_long_lived_mark() {
+    use crate::model::file_analysis::CrossFileLookup;
+    let idx = ModuleIndex::new_for_cli();
+    assert!(
+        !idx.serves_enriched(),
+        "one-shot: the overlay is off, so a retry can never see a distinct view"
+    );
+    idx.mark_long_lived();
+    assert!(
+        idx.serves_enriched(),
+        "long-lived: the overlay is live and the seams' retries are worth paying"
+    );
+}

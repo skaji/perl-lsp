@@ -407,6 +407,13 @@ impl CrossFileLookup for ModuleIndex {
         self.enriched_snapshot(cached)
             .unwrap_or_else(|| self.bag_present(cached))
     }
+
+    fn serves_enriched(&self) -> bool {
+        // The overlay is long-lived-only (the deep copies never pay for
+        // themselves in a one-shot process), so a not-long-lived index's
+        // `enriched_present` is `bag_present` — never distinct.
+        self.core.long_lived.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn class_is_bridged_to(&self, class: &str) -> bool {
         // Bucket NON-EMPTY, not key-present: `purge_module` can leave an empty
         // bucket behind, and a key-exists test would then report a bridge that

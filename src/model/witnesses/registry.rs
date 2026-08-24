@@ -796,11 +796,15 @@ impl ReducerRegistry {
                         // ENRICHING-guarded bake is the safe route to the same
                         // transitive answer.
                         crate::util::ghost_stats::count("consult.bridged");
-                        let enriched = idx.enriched_present(cached);
-                        if !std::sync::Arc::ptr_eq(&enriched, &full) {
-                            if let Some(t) = enriched.symbol_return_type_via_bag(sym.id, None) {
-                                found = Some(t);
-                                return ControlFlow::Break(());
+                        if idx.serves_enriched() {
+                            let enriched = idx.enriched_present(cached);
+                            if !std::sync::Arc::ptr_eq(&enriched, &full) {
+                                if let Some(t) =
+                                    enriched.symbol_return_type_via_bag(sym.id, None)
+                                {
+                                    found = Some(t);
+                                    return ControlFlow::Break(());
+                                }
                             }
                         }
                         ControlFlow::Continue(())
@@ -870,14 +874,16 @@ impl ReducerRegistry {
                             // enriched Arc: this chase threads the SHARED
                             // QueryState, whose memo keys on bag pointers.
                             crate::util::ghost_stats::count("consult.slot_type");
-                            let enriched = idx.enriched_present(&cached);
-                            if !std::sync::Arc::ptr_eq(&enriched, &full)
-                                && !std::ptr::eq(bag, &enriched.witnesses)
-                            {
-                                state.pins.push(std::sync::Arc::clone(&enriched));
-                                let v = attempt(&enriched, state);
-                                if v != ReducedValue::None {
-                                    return v;
+                            if idx.serves_enriched() {
+                                let enriched = idx.enriched_present(&cached);
+                                if !std::sync::Arc::ptr_eq(&enriched, &full)
+                                    && !std::ptr::eq(bag, &enriched.witnesses)
+                                {
+                                    state.pins.push(std::sync::Arc::clone(&enriched));
+                                    let v = attempt(&enriched, state);
+                                    if v != ReducedValue::None {
+                                        return v;
+                                    }
                                 }
                             }
                         }
@@ -1410,13 +1416,20 @@ impl ReducerRegistry {
                 // invisible to the raw bag, present in the
                 // enriched overlay.
                 crate::util::ghost_stats::count("consult.moc_primary");
-                let enriched = crate::util::ghost_stats::timed(
-                    "consult.enriched", || idx.enriched_present(cached));
-                if !std::sync::Arc::ptr_eq(&enriched, &full)
-                    && !std::ptr::eq(bag, &enriched.witnesses)
-                {
-                    state.pins.push(std::sync::Arc::clone(&enriched));
-                    attempt(&enriched, state)
+                // `serves_enriched` first: when the overlay is off (one-shot
+                // CLI) the fetch below returns the bag it already has, so the
+                // retry is a guaranteed no-op paid per escalation.
+                if idx.serves_enriched() {
+                    let enriched = crate::util::ghost_stats::timed(
+                        "consult.enriched", || idx.enriched_present(cached));
+                    if !std::sync::Arc::ptr_eq(&enriched, &full)
+                        && !std::ptr::eq(bag, &enriched.witnesses)
+                    {
+                        state.pins.push(std::sync::Arc::clone(&enriched));
+                        attempt(&enriched, state)
+                    } else {
+                        ReducedValue::None
+                    }
                 } else {
                     ReducedValue::None
                 }
