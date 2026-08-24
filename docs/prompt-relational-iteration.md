@@ -115,12 +115,18 @@ the relation that answers it, and the soundness constraint.
    owns the SUSTAINED figure — `MALLOC_MMAP_THRESHOLD_=65536` returns 53%
    (the server's number; ship posture is a product trade — jemalloc /
    threshold / accept); (b) **per-worker in-flight working sets** own the
-   CREST — one file's sweep memo measured 633 MB, peak linear in worker
-   count at an invariant per-file footprint — fixed by byte-capping the
-   per-file sweep memo (256 MB drop-oldest, `PERL_LSP_SWEEP_MEMO_MB`),
-   the corpus-neutral shape: a worker cap was measured nearly free on
-   FHEM (memory-bound) but would tax a CPU-bound corpus. The path memo
-   itself is LOAD-BEARING (1.55x wall) and stays.
+   CREST — ~414 MB marginal per worker, peak linear in worker count at an
+   invariant per-file footprint. Two fix attempts, one reverted: byte-
+   capping the per-file sweep memo measured NET-NEGATIVE at n=500 (+51%
+   wall, +15% RSS — 19,929 drop-oldest evictions converted retention into
+   re-decode churn; the memo is the measurable MINORITY of the per-worker
+   set, and a safety bound that degrades the case it protects is not one).
+   The landed fix is **byte-budgeted ADMISSION** on the sweep: permits =
+   source bytes (the a-priori footprint proxy, ~65x expansion measured)
+   against an in-flight budget — bounds the product (concurrency × size)
+   without converting anything, since a queued file is decoded later, not
+   twice; provably no-ops on small-file corpora. The path memo itself is
+   LOAD-BEARING (1.55x wall) and stays untouched.
 
 4. **The registry chase's no-answer fetches, and `main`'s program scope.**
    Measured on a real-CPAN corpus (12k files, 54% package-less scripts)
