@@ -112,6 +112,17 @@ pub fn index_workspace_with_index(
 
     let count = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    // Paths whose surface CHANGED during this bulk — the re-stamp gate's
+    // seeds, collected through the walk and acted on once at the drain.
+    //
+    // Paths, not consumer sets. The reverse-dep answer is only correct once
+    // every file is registered, so asking `dirty_consumers` from inside the
+    // parallel walk would return a partial set for every file that happened
+    // to be indexed early — and would pay an O(corpus) reverse-dep walk on
+    // the hot lane to do it. Deferring to the drain is both the cheaper and
+    // the only correct time: the H9-2 defer/reconcile shape.
+    let surface_changed: std::sync::Mutex<Vec<std::path::PathBuf>> =
+        std::sync::Mutex::new(Vec::new());
     let total = paths.len();
 
     // Perl workspace persistence (`docs/adr/relational-ref-index.md`,
@@ -495,7 +506,16 @@ pub fn index_workspace_with_index(
                                 // the writer's registration half discards it, so
                                 // it would otherwise ride the queue only to be
                                 // dropped.
-                                crate::util::ghost_stats::timed("walk.record_surface", || parts.record_surface(idx, &canon));
+                                let verdict = crate::util::ghost_stats::timed("walk.record_surface", || parts.record_surface(idx, &canon));
+                                // The record half already happened here; what
+                                // was missing is the routing the record exists
+                                // to feed. `Changed` is the only verdict that
+                                // names stale consumers.
+                                if matches!(verdict, crate::model::surface::SurfaceVerdict::Changed) {
+                                    if let Ok(mut q) = surface_changed.lock() {
+                                        q.push(canon.clone());
+                                    }
+                                }
                                 (std::sync::Arc::clone(parts.arc()), Some(parts))
                             }
                             None => {
@@ -518,14 +538,28 @@ pub fn index_workspace_with_index(
                     } else {
                         // Whole copy (no persistence, degraded, or NO_EVICT):
                         // register immediately (no strip — the whole-copy door);
-                        // still persist when a blob exists. `false, false` mints
-                        // the token without evicting or recording surface, so
-                        // this path's freshness behavior is unchanged.
+                        // still persist when a blob exists.
                         let arc = match module_index {
                             Some(idx) => {
-                                let parts =
+                                let mut parts =
                                     idx.prepare_workspace_parts(&canon, analysis, crate::model::file_analysis::Residency::Whole);
                                 let arc = std::sync::Arc::clone(parts.arc());
+                                // Record here too. Whether a file's surface is
+                                // recorded must not depend on which residency
+                                // lane it took — that would make the freshness
+                                // engine's coverage a function of whether the
+                                // cache DB happened to open, so a workspace
+                                // running unpersisted or under NO_EVICT would
+                                // silently have no bulk records and no marks.
+                                // The projection is already in `parts` and is
+                                // otherwise dropped; `Background` writes for an
+                                // open path suppress themselves.
+                                let verdict = parts.record_surface(idx, &canon);
+                                if matches!(verdict, crate::model::surface::SurfaceVerdict::Changed) {
+                                    if let Ok(mut q) = surface_changed.lock() {
+                                        q.push(canon.clone());
+                                    }
+                                }
                                 idx.register_workspace_residency(canon.clone(), parts);
                                 // Deliberate whole pin (unpersistable /
                                 // degraded / NO_EVICT) — accounted for the
@@ -597,6 +631,46 @@ pub fn index_workspace_with_index(
                     idx.count_fully_resident(),
                     expected_whole.load(Ordering::Relaxed),
                 );
+            });
+        }
+    }
+
+    // End-of-bulk drain: the re-stamp gate's mark, once.
+    //
+    // Once, and here, for two reasons that point the same way. The reverse-dep
+    // answer is only complete now — every file is registered, so
+    // `dirty_consumers` finally returns the whole consumer set rather than
+    // whichever consumers happened to be indexed before the asker. And a
+    // per-file mark during the walk would mint one epoch per file, so a stamp
+    // taken mid-bulk could satisfy an early file's mark while a later file's
+    // change went unaccounted; one epoch for the whole bulk cannot express
+    // that.
+    //
+    // Deliberately a MARK and not a flush wave. The wave's product is a diff
+    // — which files' answers moved — and a bulk has no before-state to diff
+    // against: the persist writer has already written each seed's new map at
+    // the current generation, so the frozen map a wave would compare against
+    // IS the new one, and every surface would compare equal. Marking the
+    // consumers is the whole of what the gate needs, and it is the part a
+    // bulk can actually answer.
+    if let Some(idx) = module_index {
+        let seeds = surface_changed
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        if !seeds.is_empty() {
+            crate::util::timings::phase("index.restamp_mark", || {
+                let mut consumers: std::collections::HashSet<std::path::PathBuf> =
+                    Default::default();
+                for p in &seeds {
+                    consumers.extend(idx.dirty_consumers(p));
+                }
+                crate::util::ghost_stats::count_by(
+                    "bulk.surface_changed",
+                    seeds.len() as u64,
+                );
+                if !consumers.is_empty() {
+                    idx.mark_provider_diff(consumers);
+                }
             });
         }
     }
