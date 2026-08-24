@@ -1219,19 +1219,42 @@ fn for_each_enriched_diagnostic(
     // are the n² a package-main corpus produces. Shared across the rayon
     // workers; stamp-cleared on any index shape change.
     let _answers = module_index::SweepAnswerGuard::open();
+    // Channel attribution: the unbounded mpsc holds diagnostics until the
+    // single consumer drains them — a sweep-proportional holder candidate for
+    // the FHEM RSS knee. Measured, not fit: sends, bytes, and PEAK BACKLOG
+    // (sends minus receives, high-water) — if peak_pending × per-diag bytes
+    // is GB-scale, the channel is the holder; if the counters are small, the
+    // suspect dies by the same reading.
+    let pending = std::sync::atomic::AtomicI64::new(0);
+    let peak_pending = std::sync::atomic::AtomicI64::new(0);
     std::thread::scope(|scope| {
+        let pending_ref = &pending;
+        let peak_ref = &peak_pending;
         scope.spawn(move || {
             use rayon::prelude::*;
             entries.par_iter().for_each_with(tx, |tx, (path, fa)| {
                 for (file, d) in sweep_one_file(idx, options, path, fa) {
+                    crate::util::ghost_stats::count("diag.sent");
+                    crate::util::ghost_stats::add_n(
+                        "diag.bytes_sent",
+                        (file.len() + d.message.len() + 160) as u64,
+                    );
+                    let now =
+                        pending_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    peak_ref.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
                     let _ = tx.send((file, d));
                 }
             });
         });
         for (file, d) in rx {
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             emit(&file, d);
         }
     });
+    crate::util::ghost_stats::add_n(
+        "diag.peak_pending",
+        peak_pending.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64,
+    );
     // Pack-language files (C++/…) live in the per-language sub-indexes, not the
     // Perl-only `FileStore` above. Mirror the backend's language dispatch: they
     // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
