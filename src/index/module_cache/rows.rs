@@ -484,6 +484,49 @@ pub fn sym_rows_matching(conn: &Connection, query: &str) -> Vec<SymRowHit> {
     out
 }
 
+/// Can the row store rule out a member named `name` attributed to container
+/// `container` in `path`'s file? Three-valued, and the caller's license to
+/// skip a decode hangs on the distinction:
+///
+/// - `None` — the file was never shredded (`files` presence is the single
+///   shredded marker), so the store cannot speak for it. Fail open.
+/// - `Some(true)` — a matching sym row exists; the decode is warranted.
+/// - `Some(false)` — the file is covered and no row matches: the only
+///   verdict that licenses skipping the rehydrate.
+///
+/// Deliberately kind-blind, and matching `name_id` OR `key_id`: the walk's
+/// member test also accepts class-content variables/fields, which rows cannot
+/// express — so ANY symbol row under `(name|key, container)` forces the
+/// decode. Over-approximation toward the decode is the sound direction: a
+/// wasted rehydrate, never a hidden member
+/// (`docs/prompt-relational-iteration.md`).
+pub fn sym_member_row_exists(
+    conn: &Connection,
+    path: &str,
+    name: &str,
+    container: &str,
+) -> Option<bool> {
+    let file_id: i64 = conn
+        .prepare_cached("SELECT file_id FROM files WHERE path = ?1")
+        .ok()?
+        .query_row(params![path], |row| row.get(0))
+        .ok()?;
+    // A name or container the strings table never interned yields NULL from
+    // the subselect, the comparison is false, and EXISTS answers 0 — which is
+    // correct: no row can reference a string that was never stored.
+    conn.prepare_cached(
+        "SELECT EXISTS(
+            SELECT 1 FROM syms y
+             WHERE y.file_id = ?1
+               AND y.container_id = (SELECT str_id FROM strings WHERE s = ?3)
+               AND (y.name_id = (SELECT str_id FROM strings WHERE s = ?2)
+                    OR y.key_id = (SELECT str_id FROM strings WHERE s = ?2)))",
+    )
+    .ok()?
+    .query_row(params![file_id, name, container], |row| row.get(0))
+    .ok()
+}
+
 /// How many FILES carry a ref row for one match key.
 ///
 /// Deliberately not called a reference count: rows are `(name_id, file_id)`

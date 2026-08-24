@@ -319,6 +319,41 @@ impl CrossFileLookup for ModuleIndex {
         self.rehydrate_rows_or_resident(cached)
     }
 
+    fn candidate_may_declare(
+        &self,
+        cached: &Arc<CachedModule>,
+        name: &str,
+        class: &str,
+    ) -> bool {
+        // Gate on eviction FIRST: a symbols-resident copy answers the member
+        // probe from RAM for free, and it may be fresher than its rows (the
+        // whole-copy registration paths precede persist). Stripped copies
+        // register only AFTER their chunk commits, so for them the rows are
+        // at least as fresh as the copy — the freshness argument the skip
+        // leans on.
+        if !cached.analysis.symbols_are_evicted() {
+            return true;
+        }
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED
+            .get_or_init(|| std::env::var_os("PERL_LSP_NO_MEMBER_PREFILTER").is_some())
+        {
+            return true;
+        }
+        let rows = self.with_rows_conn(|conn| {
+            crate::index::module_cache::sym_member_row_exists(
+                conn,
+                &cached.path.to_string_lossy(),
+                name,
+                class,
+            )
+        });
+        member_prefilter_may_declare(
+            !cached.analysis.plugin.gated_emissions.is_empty(),
+            rows,
+        )
+    }
+
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         self.with_rows_conn(|conn| {
             crate::index::module_cache::ref_candidate_files(conn, keys)
@@ -603,5 +638,62 @@ impl CrossFileLookup for ModuleIndex {
         visible: &std::collections::HashSet<String>,
     ) -> Vec<(String, Arc<CachedModule>)> {
         self.visible_defs_with_prefix(prefix, visible)
+    }
+}
+
+/// The member pre-filter's verdict, separated from the store and the copy so
+/// the truth table is testable without either. `rows` is
+/// `sym_member_row_exists` behind `with_rows_conn`: outer `None` = no store,
+/// inner `None` = file never shredded.
+///
+/// The ONLY skip is (no post-shred emissions, store present, file covered,
+/// provably no matching row). Deferred plugin emissions materialize into the
+/// resident copy AFTER the shred (`materialize_gated_emissions`), so their
+/// symbols have no rows — a file carrying any must fail open or a DBIC result
+/// class's synthesized accessors silently stop resolving.
+pub(crate) fn member_prefilter_may_declare(
+    has_gated_emissions: bool,
+    rows: Option<Option<bool>>,
+) -> bool {
+    if has_gated_emissions {
+        return true;
+    }
+    !matches!(rows, Some(Some(false)))
+}
+
+#[cfg(test)]
+mod member_prefilter_tests {
+    use super::member_prefilter_may_declare;
+
+    /// Every unknown fails OPEN — to a decode, never away from one. The
+    /// same discipline as `restamp_owed`: the skip needs positive evidence,
+    /// and a wrong skip is a silently missing method, not an error.
+    #[test]
+    fn only_proven_absence_skips() {
+        assert!(
+            member_prefilter_may_declare(false, None),
+            "no row store: the filter cannot speak, decode"
+        );
+        assert!(
+            member_prefilter_may_declare(false, Some(None)),
+            "file never shredded: the store does not cover it, decode"
+        );
+        assert!(
+            member_prefilter_may_declare(false, Some(Some(true))),
+            "a matching row: the decode is warranted"
+        );
+        assert!(
+            !member_prefilter_may_declare(false, Some(Some(false))),
+            "covered and provably absent: the one skip"
+        );
+    }
+
+    /// Post-shred plugin emissions beat everything: their symbols exist only
+    /// on the materialized resident copy, so the rows' "provably absent" is
+    /// a lie for exactly these files.
+    #[test]
+    fn gated_emissions_fail_open_over_a_provably_absent_row() {
+        assert!(member_prefilter_may_declare(true, Some(Some(false))));
+        assert!(member_prefilter_may_declare(true, None));
     }
 }

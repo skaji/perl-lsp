@@ -4,6 +4,15 @@
 
 use super::*;
 
+/// `PERL_LSP_MEMBER_PREFILTER_EQUIV`: run every candidate scan the member
+/// pre-filter would skip and score the agreement. Costs strictly more than
+/// not filtering, by design — a measurement mode, not a safety net; the same
+/// discipline as `PERL_LSP_RESTAMP_EQUIV`.
+fn member_prefilter_equiv() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PERL_LSP_MEMBER_PREFILTER_EQUIV").is_ok())
+}
+
 /// The REAL parent edges: the file's own `PackageFacts::parents` ∪
 /// cross-file `parents_cached`. One of `parents_of`'s two component
 /// spellers — the graph's `EdgeKind::Inherits` derivation reads this
@@ -515,6 +524,18 @@ impl FileAnalysis {
             // defining candidate with the same test.
             crate::util::ghost_stats::mroc_begin();
             for cached in idx.visible_def_candidates(cls) {
+                // Rows-backed pre-filter (`docs/prompt-relational-iteration.md`):
+                // skip the rehydrate when the row store PROVES this candidate
+                // declares nothing named `method_name` under `cls`. Fail-open
+                // everywhere the store cannot speak; the equiv switch runs the
+                // skipped scan anyway and screams on divergence.
+                let may_declare = idx.candidate_may_declare(&cached, method_name, cls);
+                if !may_declare {
+                    crate::util::ghost_stats::count("mroc.candidate_prefiltered");
+                    if !member_prefilter_equiv() {
+                        continue;
+                    }
+                }
                 // Class-scoped, not file-scoped: a pack file holds MANY
                 // classes, so "some sub of this name exists in cls's file"
                 // would let an unrelated same-named member hijack
@@ -551,6 +572,23 @@ impl FileAnalysis {
                 } else {
                     "mroc.candidate_wasted"
                 });
+                if !may_declare {
+                    // PERL_LSP_MEMBER_PREFILTER_EQUIV: the skipped scan ran —
+                    // score the verdict the gate would have acted on.
+                    crate::util::ghost_stats::count(if has_member {
+                        "memberprefilter.break"
+                    } else {
+                        "memberprefilter.agreed"
+                    });
+                    if has_member {
+                        log::warn!(
+                            "member prefilter equiv: rows said {cls}::{method_name} \
+                             absent in {:?} but the decode found it — the shred \
+                             missed a symbol-minting path",
+                            cached.path
+                        );
+                    }
+                }
                 if has_member {
                     return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: None });
                 }

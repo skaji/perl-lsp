@@ -636,6 +636,24 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         self.whole_present(cached)
     }
+    /// May `cached`'s file declare a member named `name` attributed to
+    /// package `class`? The rows-backed pre-filter for the ancestor walk's
+    /// per-candidate existence probe (`docs/prompt-relational-iteration.md`):
+    /// `false` licenses skipping the `symbols_present` rehydrate outright, so
+    /// it requires POSITIVE evidence of absence — a store that covers the
+    /// file and holds no matching sym row. Everything else — no store, file
+    /// never shredded, a resident (unevicted) copy, post-shred plugin
+    /// emissions — answers `true`, which is this default: an implementor
+    /// that cannot prove absence inherits the decode, never the skip.
+    fn candidate_may_declare(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+        name: &str,
+        class: &str,
+    ) -> bool {
+        let _ = (cached, name, class);
+        true
+    }
     /// The ROWS-axes view — refs AND symbols populated: the backward-walk
     /// matcher's axes (usage sites + declaration sites). The @INC strip is
     /// bag-only, so import-tier copies answer resident; the workspace strip
@@ -1095,6 +1113,16 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     ) -> std::sync::Arc<FileAnalysis> {
         // Same delegation rule as `symbols_present`.
         self.inner.refs_present(cached)
+    }
+    fn candidate_may_declare(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+        name: &str,
+        class: &str,
+    ) -> bool {
+        // Same delegation rule as `symbols_present` — the inner index owns
+        // the row store; the default would fail open and lose the skip.
+        self.inner.candidate_may_declare(cached, name, class)
     }
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         // Unscoped by design, like `def_candidates`: the backward walk applies
