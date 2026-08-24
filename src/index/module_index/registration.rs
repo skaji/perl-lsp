@@ -672,12 +672,59 @@ impl ModuleIndex {
         key
     }
 
+    /// One walked name's share of the BRIDGE and PROVIDER relations, onto
+    /// the key. Enrichment reads both outside the dep-name closure — the
+    /// stamp's bridged arm freezes a bridging module's identity into the
+    /// overlay's `MethodTarget`s, and the typeglob last resort consults the
+    /// provider bucket — but their MEMBERS are not candidates of any walked
+    /// name, so membership and (for bridges, whose content is frozen) each
+    /// member's candidates' registration generations must ride the key or a
+    /// plugin edit leaves every consumer's overlay validating stale.
+    fn hash_relations_for(&self, name: &str, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let mut bridge_members = self.modules_bridging_to(name);
+        bridge_members.sort_unstable();
+        for m in &bridge_members {
+            m.hash(h);
+            for cm in crate::model::file_analysis::CrossFileLookup::def_candidates(self, m) {
+                self.registration_gen_of(&cm.path).hash(h);
+            }
+        }
+        // Providers: membership only. The bucket's members are the files
+        // declaring content FOR the name, and the typeglob consult re-reads
+        // them per query — the overlay freezes only which module answered,
+        // which membership covers.
+        let mut providers = self.modules_providing_package(name);
+        providers.sort_unstable();
+        for m in &providers {
+            m.hash(h);
+        }
+    }
+
     fn enrichment_key(&self, cached: &Arc<CachedModule>) -> u64 {
         crate::util::ghost_stats::count("enrichment_key");
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.registration_gen_of(&cached.path).hash(&mut h);
         self.freshness.fingerprint_of(&cached.path).unwrap_or(0).hash(&mut h);
+        // The file's OWN packages are bridge targets too (helpers bridged to
+        // a controller's class) and are not in its dep-name closure. Read
+        // the REGISTRATION names (path-keyed, survives symbol eviction; a
+        // bare `package Foo;` mints no PackageFacts entry, so the facts
+        // table under-enumerates), falling back to the Package/Class
+        // symbols for unregistered copies.
+        let mut own: Vec<String> = match self.registered_names.get(&cached.path) {
+            Some(names) => names.iter().map(|(n, _)| n.clone()).collect(),
+            None => crate::index::module_index::package_names(&cached.analysis)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect(),
+        };
+        own.sort_unstable();
+        own.dedup();
+        for pkg in &own {
+            self.hash_relations_for(pkg, &mut h);
+        }
         let mut seen: std::collections::HashSet<String> = Default::default();
         let mut frontier: Vec<String> = self.freshness.deps_of_names(&cached.path);
         frontier.sort_unstable();
@@ -694,6 +741,7 @@ impl ModuleIndex {
                     continue;
                 }
                 dep.hash(&mut h);
+                self.hash_relations_for(&dep, &mut h);
                 // EVERY candidate file of the dep rides the key — a losing
                 // file's re-registration must move consumers' keys too
                 // (over-invalidation, never staleness).

@@ -148,11 +148,19 @@ the relation that answers it, and the soundness constraint.
    loops read, not from field placement. The Surface already computes
    per-file method names and throws them away.
 
-8. **Overlay key honesty.** `enriched_snapshot`'s key fingerprints the file
-   plus its *declared* providers, but enrichment also reads bridges and
-   loader shapes from undeclared files. Today the staleness channel is masked
-   by how rarely an overlay survives to be reused; any retention improvement
-   makes it a live correctness hole. Close it before improving retention.
+8. **Overlay key honesty — the enumerable half LANDED.** The key was already
+   more honest than this rung claimed (depth-20 dep-closure walk, all loader
+   shapes hashed); the real gaps were the BRIDGE and PROVIDER relations,
+   whose members are not candidates of any walked name. Now
+   `hash_relations_for` rides the key: bridge membership + member
+   registration generations (the stamp freezes a bridging module's identity
+   into overlay `MethodTarget`s) and provider membership, for the walked
+   closure plus the file's own registration names. Pinned by
+   `a_new_bridge_to_the_consumers_class_moves_the_enrichment_key`. The
+   RESIDUAL is principled, not accidental: the stamp reads the whole world
+   (any invocant class), which no closure-scoped key can cover — that
+   residual collapses when rung 5 lands (a `Link`-shaped stamp freezes no
+   world-dependent values), which makes 5 the true closer of 8.
 
 9. **Enrichment as a delta artifact.** Every recursive consumer of an
    enriched analysis reads only the bag (`docs/adr/enrichment-build-cost.md`,

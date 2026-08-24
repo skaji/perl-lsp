@@ -2656,3 +2656,41 @@ fn serves_enriched_follows_the_long_lived_mark() {
         "long-lived: the overlay is live and the seams' retries are worth paying"
     );
 }
+
+/// Rung 8 of `docs/prompt-relational-iteration.md` (overlay key honesty):
+/// the BRIDGE relation rides the enrichment key. The stamp freezes a
+/// bridging module's identity into the overlay's `MethodTarget`s, and a
+/// bridging module is not a candidate of any of the consumer's dep names —
+/// only the relation hash sees it. Without it, registering (or editing) a
+/// plugin that bridges into the consumer's own class leaves the consumer's
+/// overlay validating stale.
+#[test]
+fn a_new_bridge_to_the_consumers_class_moves_the_enrichment_key() {
+    let idx = ModuleIndex::new_for_test();
+    let consumer = parse_source_to_cached(
+        "package App::Ctl;\nsub go { my $self = shift; return $self->helper_x() }\n1;\n",
+        "App::Ctl",
+    );
+    idx.register_workspace_module(consumer.path.to_path_buf(), Arc::clone(&consumer.analysis));
+    let snap1 = idx.enriched_snapshot(&consumer).expect("snapshot v1");
+    let snap1b = idx.enriched_snapshot(&consumer).expect("snapshot v1 cached");
+    assert!(Arc::ptr_eq(&snap1, &snap1b), "key stable before the bridge lands");
+
+    // A plugin file bridges an entity into the consumer's OWN class — a
+    // read enrichment makes through the bridged arm, invisible to the
+    // dep-name closure.
+    cache_bridged(
+        &idx,
+        "My::Plugin",
+        "package My::Plugin;\nsub helper_x { return bless {}, 'W' }\n1;\n",
+        "helper_x",
+        "App::Ctl",
+    );
+
+    let snap2 = idx.enriched_snapshot(&consumer).expect("snapshot v2");
+    assert!(
+        !Arc::ptr_eq(&snap1, &snap2),
+        "a new bridge into the consumer's class must move its enrichment key — \
+         the overlay froze bridged resolution state the dep-name walk cannot see"
+    );
+}
