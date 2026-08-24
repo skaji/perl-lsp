@@ -2841,3 +2841,61 @@ fn a_marked_file_re_stamps_and_an_unmarked_one_skips() {
         "a provider moved, so the re-stamp runs and re-derives the real target"
     );
 }
+
+/// PROBE: does `heap_estimate` track the truth on a GIANT file?
+///
+/// The FHEM investigation's RSS hypothesis: the hub LRU held 176-232 entries
+/// of 46k-line analyses while claiming 134 MB — ~600 KB/entry, absurd on its
+/// face if the estimate drifts low on big files, because then the cap
+/// retains gigabytes while believing itself within budget (the accounting-
+/// vs-reality family of the pack-bag-cache ratchet P0). Truth is measured
+/// as the RSS delta across N clones, amortized.
+#[test]
+#[ignore]
+fn probe_heap_estimate_vs_truth_on_a_giant_file() {
+    fn rss_kb() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        s.lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap()
+    }
+    // A synthetic FHEM-shaped giant: thousands of subs in main, dense
+    // hash-key traffic, string literals — ~40k lines.
+    let mut src = String::from("package main;\n");
+    for i in 0..3000 {
+        src.push_str(&format!(
+            "sub Unit{i}_Define {{\n  my ($hash, $def) = @_;\n  \
+             $hash->{{NAME}} = 'unit{i}';\n  $hash->{{STATE}} = 'defined';\n  \
+             $hash->{{READINGS}}{{temperature}}{{VAL}} = {i};\n  \
+             my $cfg = {{ host => 'h{i}', port => {i}, retry => 3 }};\n  \
+             Log3($hash, 3, \"unit{i} defined with some longer message text\");\n  \
+             return undef;\n}}\n\
+             sub Unit{i}_Set {{\n  my ($hash, @args) = @_;\n  \
+             my $name = $hash->{{NAME}};\n  \
+             return \"unknown command\" if !@args;\n  \
+             $hash->{{helper}}{{lastSet}} = join(' ', @args);\n  return undef;\n}}\n"
+        ));
+    }
+    src.push_str("1;\n");
+    let mut parser = crate::build::builder::create_parser();
+    let tree = parser.parse(&src, None).unwrap();
+    let fa = crate::build::builder::build(&tree, src.as_bytes());
+    let est = fa.heap_estimate().total();
+
+    const N: usize = 8;
+    let before = rss_kb();
+    let clones: Vec<_> = (0..N).map(|_| fa.clone()).collect();
+    let after = rss_kb();
+    let true_per_clone_kb = (after.saturating_sub(before)) / N as u64;
+    drop(clones);
+    eprintln!(
+        "lines={} est={} KB true~={} KB ratio(true/est)={:.1}",
+        src.lines().count(),
+        est / 1024,
+        true_per_clone_kb,
+        true_per_clone_kb as f64 / (est as f64 / 1024.0).max(1.0),
+    );
+    eprintln!("{}", fa.heap_estimate());
+}
