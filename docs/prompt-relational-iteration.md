@@ -212,6 +212,19 @@ the relation that answers it, and the soundness constraint.
   and screams on divergence (`PERL_LSP_RESTAMP_EQUIV` is the pattern; the
   member pre-filter ships `PERL_LSP_NO_MEMBER_PREFILTER` and
   `PERL_LSP_MEMBER_PREFILTER_EQUIV`).
+- **A plausible product landing near a measured total is not an
+  attribution.** Four fits failed in one night of the FHEM investigation
+  (12 GB / 232 entries; 929 × 12 MB walk residency; clone-boundedness;
+  "the sweep owns it so the clones own it") — every one was arithmetic
+  that terminated at "the numbers work" instead of at "I changed one thing
+  and the number moved." An attribution is a control arm or a byte counter
+  at the holder; everything else is a hypothesis and must be labeled one.
+- **An attempt counter is not a completion counter.** `moc.provider_fetched`
+  counts attempts; the sweep memo made most of them Arc bumps, and a slice
+  was cut against the wrong number before the reconciliation
+  (`sweep.memo_hit + memo_miss ≈ attempts`; only `rehydrate.loader`'s n
+  decodes) was done. State which kind any quoted counter is, and show the
+  reconciliation when the two could diverge.
 - **Counters, not vibes.** Every pre-filter counts skip/decode/unknown so the
   hit rate is a ghost-stats read, and the next ranking pass starts from
   numbers (`docs/adr/skipping-cross-file-work.md`'s denominator rules apply).
