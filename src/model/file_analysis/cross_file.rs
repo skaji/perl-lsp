@@ -779,10 +779,19 @@ pub trait CrossFileLookup {
         start: Vec<String>,
         visit: &mut dyn FnMut(&std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
     );
+    /// `visit` returns `Break` to stop the walk — and, more importantly, the
+    /// per-candidate rehydrates behind it: entity resolution decodes each
+    /// bridging module's symbols, so a first-match caller that cannot stop
+    /// the iteration pays a decode per plugin file in the workspace for
+    /// answers it already has (same shape as `for_each_reexport_module`).
     fn for_each_entity_bridged_to(
         &self,
         class_name: &str,
-        f: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>, &Symbol),
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
     );
     /// Direct children/composers of `class` as (package, module) pairs
     /// — the `children_index` inverse, depth 1 (the graph walker
@@ -1184,7 +1193,11 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     fn for_each_entity_bridged_to(
         &self,
         class_name: &str,
-        f: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>, &Symbol),
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
     ) {
         self.inner.for_each_entity_bridged_to(class_name, f)
     }

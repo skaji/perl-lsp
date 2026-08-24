@@ -227,12 +227,18 @@ impl FileAnalysis {
         let Some(idx) = module_index else { return false };
         let mut found = false;
         idx.for_each_entity_bridged_to(class_name, &mut |_mod, _cached, sym| {
-            if found { return; }
-            if sym.name != method_name { return; }
-            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+            use std::ops::ControlFlow;
+            if sym.name != method_name {
+                return ControlFlow::Continue(());
+            }
+            if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                return ControlFlow::Continue(());
+            }
             if matches!(&sym.detail, SymbolDetail::Sub { opaque_return: true, .. }) {
                 found = true;
+                return ControlFlow::Break(());
             }
+            ControlFlow::Continue(())
         });
         found
     }

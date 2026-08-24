@@ -1443,7 +1443,7 @@ mod restamp_gate_tests {
                     &str,
                     &std::sync::Arc<crate::model::file_analysis::CachedModule>,
                     &crate::model::file_analysis::Symbol,
-                ),
+                ) -> std::ops::ControlFlow<()>,
             ) {
             }
             fn direct_children_of(&self, _p: &str) -> Vec<(String, String)> {

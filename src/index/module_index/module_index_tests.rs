@@ -887,7 +887,11 @@ fn enriched_present_default_is_the_raw_bag() {
         fn for_each_entity_bridged_to(
             &self,
             _c: &str,
-            _f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::model::file_analysis::Symbol),
+            _f: &mut dyn FnMut(
+                &str,
+                &Arc<CachedModule>,
+                &crate::model::file_analysis::Symbol,
+            ) -> std::ops::ControlFlow<()>,
         ) {
         }
         fn direct_children_of(&self, _p: &str) -> Vec<(String, String)> {

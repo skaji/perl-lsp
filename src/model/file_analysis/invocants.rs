@@ -1168,12 +1168,13 @@ impl FileAnalysis {
                                 }) || {
                                 let mut hit = false;
                                 idx.for_each_entity_bridged_to(a, &mut |_m, _c, sym| {
-                                    if !hit
-                                        && matches!(sym.kind, SymKind::Sub | SymKind::Method)
+                                    if matches!(sym.kind, SymKind::Sub | SymKind::Method)
                                         && sym.name == name
                                     {
                                         hit = true;
+                                        return std::ops::ControlFlow::Break(());
                                     }
+                                    std::ops::ControlFlow::Continue(())
                                 });
                                 hit
                             }
@@ -1306,6 +1307,7 @@ impl FileAnalysis {
                             visit(sym, prov);
                         }
                     }
+                    std::ops::ControlFlow::Continue(())
                 });
             }
             std::ops::ControlFlow::Continue(())

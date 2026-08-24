@@ -148,7 +148,15 @@ impl ModuleIndex {
         // — the authoritative handle for a follow-up `get_cached(mod_name)`.
         // Don't re-derive it from the analysis: the registration name and the
         // file's first `package` can differ.
-        mut visit: impl FnMut(&str, &Arc<CachedModule>, &crate::model::file_analysis::Symbol),
+        //
+        // `Break` stops the walk BEFORE the next candidate's `symbols_present`
+        // — the rehydrate is the cost, so a first-match caller that could not
+        // stop the iteration paid a decode per bridging module for nothing.
+        mut visit: impl FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
     ) {
         use crate::model::file_analysis::CrossFileLookup;
         for mod_name in self.modules_bridging_to(class_name) {
@@ -174,7 +182,9 @@ impl ModuleIndex {
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
                     let Some(sym) = whole.symbols().get(idx) else { continue };
-                    visit(&mod_name, &cached, sym);
+                    if visit(&mod_name, &cached, sym).is_break() {
+                        return;
+                    }
                 }
             }
             }
@@ -573,7 +583,11 @@ impl CrossFileLookup for ModuleIndex {
     fn for_each_entity_bridged_to(
         &self,
         class_name: &str,
-        f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::model::file_analysis::Symbol),
+        f: &mut dyn FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
     ) {
         self.for_each_entity_bridged_to(class_name, f)
     }

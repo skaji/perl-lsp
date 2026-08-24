@@ -612,11 +612,15 @@ impl FileAnalysis {
             // lookup hits the right file, not `cls`'s own module.
             let mut bridged_module: Option<String> = None;
             idx.for_each_entity_bridged_to(cls, &mut |mod_name, _cached, sym| {
-                if bridged_module.is_some() { return; }
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
+                use std::ops::ControlFlow;
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    return ControlFlow::Continue(());
+                }
                 if sym.name == method_name {
                     bridged_module = Some(mod_name.to_string());
+                    return ControlFlow::Break(());
                 }
+                ControlFlow::Continue(())
             });
             if bridged_module.is_some() {
                 return Some(MethodResolution::CrossFile { class: cls.to_string(), def_module: bridged_module });
@@ -842,14 +846,20 @@ impl FileAnalysis {
             // issues with the closure capturing &mut seen_names/candidates.
             let mut bridged: Vec<(String, SymKind, Option<SymbolDetail>, Option<HandlerDisplay>)> = Vec::new();
             idx.for_each_entity_bridged_to(class_name, &mut |_mod, _cached, sym| {
-                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) { return; }
-                if !visible(sym) { return; }
+                use std::ops::ControlFlow;
+                if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
+                    return ControlFlow::Continue(());
+                }
+                if !visible(sym) {
+                    return ControlFlow::Continue(());
+                }
                 bridged.push((
                     sym.name.clone(),
                     sym.kind,
                     Some(sym.detail.clone()),
                     sym.presentation.display,
                 ));
+                ControlFlow::Continue(())
             });
             for (name, kind, detail, display_override) in bridged {
                 if seen_names.contains(&name) { continue; }

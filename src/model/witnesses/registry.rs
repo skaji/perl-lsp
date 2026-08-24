@@ -734,6 +734,7 @@ impl ReducerRegistry {
                     let mut bridge_seen = false;
                     idx.for_each_entity_bridged_to(package, &mut |_m, _c, _s| {
                         bridge_seen = true;
+                        std::ops::ControlFlow::Break(())
                     });
                     crate::util::ghost_stats::count(if bridge_seen {
                         "bridge.live_yields"
@@ -753,18 +754,16 @@ impl ReducerRegistry {
                     }
                     let mut found: Option<InferredType> = None;
                     idx.for_each_entity_bridged_to(package, &mut |_mod, cached, sym| {
-                        if found.is_some() {
-                            return;
-                        }
+                        use std::ops::ControlFlow;
                         if !matches!(
                             sym.kind,
                             crate::model::file_analysis::SymKind::Sub
                                 | crate::model::file_analysis::SymKind::Method
                         ) {
-                            return;
+                            return ControlFlow::Continue(());
                         }
                         if &sym.name != name {
-                            return;
+                            return ControlFlow::Continue(());
                         }
                         // Bridged Method's return lives in the bridging file's
                         // bag — rehydrate it if evicted before querying.
@@ -772,7 +771,7 @@ impl ReducerRegistry {
                         let full = idx.bag_present(cached);
                         if let Some(t) = full.symbol_return_type_via_bag(sym.id, None) {
                             found = Some(t);
-                            return;
+                            return ControlFlow::Break(());
                         }
                         // Fallback-on-miss (R4): the bridged Method's return may
                         // chain through the bridging file's OWN imports — baked
@@ -788,8 +787,10 @@ impl ReducerRegistry {
                         if !std::sync::Arc::ptr_eq(&enriched, &full) {
                             if let Some(t) = enriched.symbol_return_type_via_bag(sym.id, None) {
                                 found = Some(t);
+                                return ControlFlow::Break(());
                             }
                         }
+                        ControlFlow::Continue(())
                     });
                     if let Some(t) = found {
                         return ReducedValue::Type(t);
