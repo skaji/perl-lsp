@@ -766,7 +766,7 @@ impl ReducerRegistry {
                         crate::util::ghost_stats::count(&format!("bridgecls.{package}"));
                     }
                     let mut found: Option<InferredType> = None;
-                    idx.for_each_entity_bridged_to(package, &mut |_mod, cached, sym| {
+                    idx.for_each_entity_bridged_to_named(package, name, &mut |_mod, cached, sym| {
                         use std::ops::ControlFlow;
                         if !matches!(
                             sym.kind,

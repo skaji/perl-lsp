@@ -1167,7 +1167,7 @@ impl FileAnalysis {
                                     })
                                 }) || {
                                 let mut hit = false;
-                                idx.for_each_entity_bridged_to(a, &mut |_m, _c, sym| {
+                                idx.for_each_entity_bridged_to_named(a, &name, &mut |_m, _c, sym| {
                                     if matches!(sym.kind, SymKind::Sub | SymKind::Method)
                                         && sym.name == name
                                     {

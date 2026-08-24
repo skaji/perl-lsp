@@ -611,7 +611,7 @@ impl FileAnalysis {
             // bridged to `cls`). Record the registration module so the def
             // lookup hits the right file, not `cls`'s own module.
             let mut bridged_module: Option<String> = None;
-            idx.for_each_entity_bridged_to(cls, &mut |mod_name, _cached, sym| {
+            idx.for_each_entity_bridged_to_named(cls, method_name, &mut |mod_name, _cached, sym| {
                 use std::ops::ControlFlow;
                 if !matches!(sym.kind, SymKind::Sub | SymKind::Method) {
                     return ControlFlow::Continue(());

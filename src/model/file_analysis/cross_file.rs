@@ -805,6 +805,27 @@ pub trait CrossFileLookup {
             &Symbol,
         ) -> std::ops::ControlFlow<()>,
     );
+    /// The bridged walk for a caller that wants one NAMED entity — the
+    /// first-match-by-name consumers (the MRO walk's bridged arm, the
+    /// opaque-return check, the registry's bridged consult). `name` is a
+    /// pre-filter LICENSE, not a semantic change: the visitor still sees
+    /// every entity of every candidate it reaches, but an implementor with
+    /// a row store may skip candidates that provably declare nothing named
+    /// `name` — killing the per-miss decode of every bridging module. The
+    /// default ignores the hint (fail-open) and delegates.
+    fn for_each_entity_bridged_to_named(
+        &self,
+        class_name: &str,
+        name: &str,
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        let _ = name;
+        self.for_each_entity_bridged_to(class_name, f)
+    }
     /// Direct children/composers of `class` as (package, module) pairs
     /// — the `children_index` inverse, depth 1 (the graph walker
     /// supplies transitivity).
@@ -1215,6 +1236,20 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         ) -> std::ops::ControlFlow<()>,
     ) {
         self.inner.for_each_entity_bridged_to(class_name, f)
+    }
+    fn for_each_entity_bridged_to_named(
+        &self,
+        class_name: &str,
+        name: &str,
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        // Same delegation rule as the unnamed walk — the inner index owns
+        // the row store the name pre-filter reads.
+        self.inner.for_each_entity_bridged_to_named(class_name, name, f)
     }
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
         self.inner.direct_children_of(class)

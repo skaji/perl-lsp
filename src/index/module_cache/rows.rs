@@ -527,6 +527,34 @@ pub fn sym_member_row_exists(
     .ok()
 }
 
+/// The name-only sibling of `sym_member_row_exists`: can the store rule out
+/// ANY symbol named `name` (under any container) in `path`'s file? Same
+/// three-valued contract — `Some(false)` is the only skip license; `None`
+/// (never shredded) must stay distinguishable from it.
+///
+/// For the bridged-entity walk: a plugin namespace's entities are standard
+/// symbols of THEIR file, but their container is the plugin's canonical home
+/// package — not the bridged class — so the (name, container) probe cannot
+/// serve that walk and a container-blind one can. Over-approximation is
+/// still toward the decode.
+pub fn sym_name_row_exists(conn: &Connection, path: &str, name: &str) -> Option<bool> {
+    let file_id: i64 = conn
+        .prepare_cached("SELECT file_id FROM files WHERE path = ?1")
+        .ok()?
+        .query_row(params![path], |row| row.get(0))
+        .ok()?;
+    conn.prepare_cached(
+        "SELECT EXISTS(
+            SELECT 1 FROM syms y
+             WHERE y.file_id = ?1
+               AND (y.name_id = (SELECT str_id FROM strings WHERE s = ?2)
+                    OR y.key_id = (SELECT str_id FROM strings WHERE s = ?2)))",
+    )
+    .ok()?
+    .query_row(params![file_id, name], |row| row.get(0))
+    .ok()
+}
+
 /// How many FILES carry a ref row for one match key.
 ///
 /// Deliberately not called a reference count: rows are `(name_id, file_id)`

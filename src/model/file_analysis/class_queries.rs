@@ -226,7 +226,7 @@ impl FileAnalysis {
         }
         let Some(idx) = module_index else { return false };
         let mut found = false;
-        idx.for_each_entity_bridged_to(class_name, &mut |_mod, _cached, sym| {
+        idx.for_each_entity_bridged_to_named(class_name, method_name, &mut |_mod, _cached, sym| {
             use std::ops::ControlFlow;
             if sym.name != method_name {
                 return ControlFlow::Continue(());

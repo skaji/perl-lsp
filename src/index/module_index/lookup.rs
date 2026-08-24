@@ -152,6 +152,27 @@ impl ModuleIndex {
         // `Break` stops the walk BEFORE the next candidate's `symbols_present`
         // — the rehydrate is the cost, so a first-match caller that could not
         // stop the iteration paid a decode per bridging module for nothing.
+        visit: impl FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        self.bridged_walk(class_name, None, visit)
+    }
+
+    /// The one speller of the bridged-entity loop. `name_hint` is the
+    /// first-match-by-name callers' pre-filter license: a candidate whose
+    /// syms rows PROVE nothing named `name_hint` is skipped before its
+    /// `symbols_present` rehydrate — the per-miss decode of every bridging
+    /// module was the cost the early exit alone could not remove. Fail-open
+    /// everywhere the store cannot speak, container-BLIND (an entity's
+    /// container is the plugin's home package, not the bridged class), and
+    /// the visitor's semantics are unchanged for every candidate reached.
+    fn bridged_walk(
+        &self,
+        class_name: &str,
+        name_hint: Option<&str>,
         mut visit: impl FnMut(
             &str,
             &Arc<CachedModule>,
@@ -163,6 +184,12 @@ impl ModuleIndex {
             // Every candidate file of the name — the bridging namespace may
             // live in a losing candidate.
             for cached in CrossFileLookup::def_candidates(self, &mod_name) {
+            if let Some(name) = name_hint {
+                if !self.candidate_may_name(&cached, name) {
+                    crate::util::ghost_stats::count("bridged.candidate_prefiltered");
+                    continue;
+                }
+            }
             // Entities index into `symbols`, which may be evicted on the
             // resident copy — resolve them against the symbols-axis view
             // (same generation: the LRU is invalidated on every rewrite).
@@ -189,6 +216,33 @@ impl ModuleIndex {
             }
             }
         }
+    }
+
+    /// The name-only sibling of `candidate_may_declare`, for walks whose
+    /// member test is container-blind (bridged entities live under the
+    /// plugin's home package). Same guards, same skip license: only a
+    /// covered store's proven absence skips.
+    fn candidate_may_name(&self, cached: &Arc<CachedModule>, name: &str) -> bool {
+        if !cached.analysis.symbols_are_evicted() {
+            return true;
+        }
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED
+            .get_or_init(|| std::env::var_os("PERL_LSP_NO_MEMBER_PREFILTER").is_some())
+        {
+            return true;
+        }
+        let rows = self.with_rows_conn(|conn| {
+            crate::index::module_cache::sym_name_row_exists(
+                conn,
+                &cached.path.to_string_lossy(),
+                name,
+            )
+        });
+        member_prefilter_may_declare(
+            !cached.analysis.plugin.gated_emissions.is_empty(),
+            rows,
+        )
     }
 
     /// Block until `module_name` appears in the cache, or timeout.
@@ -597,6 +651,19 @@ impl CrossFileLookup for ModuleIndex {
         ) -> std::ops::ControlFlow<()>,
     ) {
         self.for_each_entity_bridged_to(class_name, f)
+    }
+
+    fn for_each_entity_bridged_to_named(
+        &self,
+        class_name: &str,
+        name: &str,
+        f: &mut dyn FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        self.bridged_walk(class_name, Some(name), f)
     }
 
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
