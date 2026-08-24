@@ -2502,16 +2502,23 @@ fn surface_fp(c: &Arc<CachedModule>) -> u64 {
     ))
 }
 
-/// The torn-read pin: one walk reads conclusions from ONE generation.
+/// A walk reads every row whose FINGERPRINT is valid, whatever generation
+/// published it.
 ///
-/// A flush publishes a whole round at generation N+1 while walks are in
-/// flight. Without the pin a walk can read file A's map from N and file B's
-/// from N+1 and compose them into a single cross-file answer — two halves of
-/// one answer taken from different worlds, and nothing downstream can tell.
-/// The pin costs at worst a decode, which is the fallback the layer already
-/// has for an absent row.
+/// The fingerprint is the whole validity decision. A row passes only against
+/// the world the index currently believes, and the bake is deterministic, so
+/// two rows that both pass carry the same content — reading one from
+/// generation N and one from N+1 is the same answer twice, not a torn read.
+///
+/// This replaces a generation pin that refused the second generation a walk
+/// met. That was worse than the problem it addressed: the walk went blind for
+/// the rest of the corpus, and WHICH rows it lost depended on the order
+/// consults happened to arrive in — nondeterminism shaped by wall-clock,
+/// which is the class this layer exists to delete. Base-verify by restoring
+/// the refusal: `later` then reads absent inside the walk and present outside
+/// it, which is the shape the bug had.
 #[test]
-fn one_walk_reads_conclusions_from_one_generation() {
+fn a_walk_reads_valid_rows_across_generations() {
     use crate::index::conclusion_cache::ConclusionCache;
     use crate::index::module_cache::{Generation, RowStamp};
     use crate::model::file_analysis::CrossFileLookup;
@@ -2523,7 +2530,8 @@ fn one_walk_reads_conclusions_from_one_generation() {
     let fa_l = parse_source_to_cached("package Later;\nsub b { 2 }\n1;\n", "Later");
 
     // Both rows are FRESH — each stamp matches what the index records. The
-    // only thing separating them is the generation they were published at.
+    // only thing separating them is the generation they were published at,
+    // which is exactly what must NOT matter.
     let (fp_e, fp_l) = (surface_fp(&fa_e), surface_fp(&fa_l));
     let (e_path, l_path) = (early.clone(), later.clone());
     let idx = ModuleIndex::new_for_cli();
@@ -2540,25 +2548,36 @@ fn one_walk_reads_conclusions_from_one_generation() {
     idx.record_surface(&early, &fa_e.analysis);
     idx.record_surface(&later, &fa_l.analysis);
 
-    // No walk open: independent consults make no coherence claim, so both
-    // answer. This is also the control — without it the assertions below
-    // would pass against a `conclusions_for` that answered nothing at all.
+    // Outside a walk — the control. Without it the assertions below would
+    // pass against a `conclusions_for` that answered everything blindly.
     assert!(idx.conclusions_for(&early).is_some());
     assert!(idx.conclusions_for(&later).is_some());
 
     let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+    assert!(idx.conclusions_for(&early).is_some(), "generation 7 must read");
+    assert!(
+        idx.conclusions_for(&later).is_some(),
+        "a row from generation 8 read as absent inside a walk that had already \
+         seen generation 7 — the walk goes dark for every later generation, \
+         and which rows it loses depends on consult order"
+    );
     assert!(
         idx.conclusions_for(&early).is_some(),
-        "the first row consumed sets the pin; it must be readable"
+        "generation 7 must still read after 8 was seen"
     );
+
+    // A stale fingerprint is still refused — the compare that replaced the
+    // pin has to be doing the work, not merely absent.
+    let moved = parse_source_to_cached(
+        "package Later;\nsub b { 2 }\nsub c { 3 }\n1;\n",
+        "Later",
+    );
+    assert_ne!(surface_fp(&moved), fp_l, "fixture must move the surface");
+    idx.record_surface(&later, &moved.analysis);
+    idx.invalidate_derived_copies(&later);
     assert!(
         idx.conclusions_for(&later).is_none(),
-        "a row from a different generation was composed into a walk already \
-         reading generation 7 — half of this answer is from another world"
-    );
-    assert!(
-        idx.conclusions_for(&early).is_some(),
-        "the pin must admit its own generation for the rest of the walk"
+        "a row whose fingerprint no longer matches must read absent"
     );
 }
 
