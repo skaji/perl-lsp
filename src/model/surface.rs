@@ -471,12 +471,17 @@ struct SurfaceRecord {
     stale_provided: Vec<String>,
 }
 
-/// Process-local surface identity. In-memory only (SipHash keys are
-/// per-process) — the persisted form carries its own stable encoding.
-/// Streams the serialization straight into the hasher: record() runs per
-/// keystroke on open docs, so no intermediate buffer.
 /// The value `FreshnessIndex` records for a surface, and the value a
 /// persisted conclusion row is stamped with.
+///
+/// `DefaultHasher::new()` is fixed-key and therefore stable ACROSS
+/// processes — it is `RandomState` that is seeded per process. That
+/// distinction is load-bearing now that the value outlives the process
+/// in a row stamp: swapping in `RandomState` would leave every persisted
+/// stamp unmatchable, silently and with no error.
+///
+/// Streams the serialization straight into the hasher: record() runs per
+/// keystroke on open docs, so no intermediate buffer.
 ///
 /// Deterministic for a given build, and that is all it has to be: the
 /// conclusion-derivation fingerprint already wipes the lane whenever

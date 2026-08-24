@@ -2091,3 +2091,49 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
         "a repaired file must leave the frontier"
     );
 }
+
+/// A surface write that does not produce a row must leave the path ABSENT,
+/// never carrying the PREVIOUS content's projection at the current version.
+///
+/// Absence costs a re-projection; a stale row is a wrong answer that cannot be
+/// detected downstream and does not heal. `load_surface` keys on
+/// `(path, version)`, so a leftover row at the current version reads as valid;
+/// `paths_needing_repair` only asks `NOT EXISTS`, so a present-but-wrong row
+/// never joins the repair frontier. The pairing that produces — a pre-edit
+/// fingerprint against a post-edit blob — makes every consumer's freshness
+/// verdict read `Unchanged` for a file that did change, which is the same
+/// wrong-answer class this store exists to close.
+///
+/// Fails against the pre-fix writer, whose empty-encode early return ran
+/// before any delete and left the prior row in place.
+#[test]
+fn a_surface_write_that_stores_nothing_leaves_no_stale_row() {
+    let conn = test_db();
+    let path = std::path::Path::new("/surfstale/App.pm");
+
+    let before = parse_source_to_cached("package My::App;\nsub alpha { 1 }\n1;\n", path);
+    assert!(save_to_db(&conn, "My::App", &Some(before), "workspace"));
+    assert!(
+        load_surface(&conn, "/surfstale/App.pm").is_some(),
+        "precondition: the first persist stored a surface"
+    );
+
+    // The file changed, and this time the surface half produces no bytes.
+    // The modules row still commits, so the store must not be left pairing the
+    // OLD surface with the NEW blob.
+    let empty = EncodedAnalysis {
+        analysis: Vec::new(),
+        conclusions: Vec::new(),
+        surface: Vec::new(),
+        source_fingerprint: 0,
+        bag: Vec::new(),
+    };
+    persist_surface(&conn, "/surfstale/App.pm", &empty);
+
+    assert!(
+        load_surface(&conn, "/surfstale/App.pm").is_none(),
+        "a surface write that stored nothing left the previous content's \
+         projection readable at the current version — the reader cannot tell \
+         it is stale, and the repair frontier's NOT EXISTS will never see it"
+    );
+}

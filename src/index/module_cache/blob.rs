@@ -639,6 +639,14 @@ pub fn encode_surface(s: &crate::model::surface::Surface) -> Option<Vec<u8>> {
 /// row's surface one my `Surface::project` would produce", and a
 /// database-wide stamp answers that only until the first mixed write.
 pub fn persist_surface(conn: &Connection, path: &str, enc: &EncodedAnalysis) {
+    // Delete unconditionally FIRST, the way a modules-row rewrite drops the
+    // path's stub: every exit below this line — empty encode, failed insert —
+    // must leave the row ABSENT, never carrying the previous content's
+    // projection at the current version. A stale row is the one outcome the
+    // reader cannot detect (`load_surface` keys on (path, version), and
+    // `paths_needing_repair` only sees NOT EXISTS), so it would pair a
+    // pre-edit fingerprint with a post-edit blob and read Unchanged forever.
+    let _ = conn.execute("DELETE FROM surfaces WHERE path = ?1", params![path]);
     if enc.surface.is_empty() {
         return;
     }
