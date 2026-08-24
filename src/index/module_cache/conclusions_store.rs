@@ -37,15 +37,14 @@ impl Generation {
 
 /// The store's current generation — what a fresh reader should pin.
 pub fn current_generation(conn: &Connection) -> Generation {
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = 'conclusion_generation'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|v| v.parse::<i64>().ok())
-    .map(Generation)
-    .unwrap_or(Generation::INITIAL)
+    // `prepare_cached` for the same reason as `load_conclusions_stamped`:
+    // read per consult-path load on a retained connection.
+    conn.prepare_cached("SELECT value FROM meta WHERE key = 'conclusion_generation'")
+        .ok()
+        .and_then(|mut s| s.query_row([], |row| row.get::<_, String>(0)).ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(Generation)
+        .unwrap_or(Generation::INITIAL)
 }
 
 /// Load one file's conclusions AS OF a pinned generation.
@@ -80,14 +79,19 @@ pub fn load_conclusions_stamped(
     path: &str,
     at: Generation,
 ) -> Option<(ConclusionMap, RowStamp)> {
+    // `prepare_cached`: the consult path runs this once per unique file on a
+    // RETAINED connection, so the parsed statement amortizes; a plain
+    // `query_row` re-parses the SQL on every load.
     let (blob, fp, gen): (Vec<u8>, i64, i64) = conn
-        .query_row(
+        .prepare_cached(
             "SELECT map, source_fingerprint, flush_generation FROM conclusions \
              WHERE path = ?1 AND generation <= ?2 \
              ORDER BY generation DESC LIMIT 1",
-            params![path, at.0],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
+        .ok()?
+        .query_row(params![path, at.0], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .ok()?;
     let bin = zstd::decode_all(blob.as_slice()).ok()?;
     let map = bincode::deserialize(&bin).ok()?;

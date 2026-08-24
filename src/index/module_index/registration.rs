@@ -976,9 +976,7 @@ impl ModuleIndex {
             *g = Some(opener);
         }
         // The retained conn belongs to the previous opener's DB.
-        if let Ok(mut c) = self.ref_rows_conn.lock() {
-            *c = None;
-        }
+        self.ref_rows_conn.reset();
     }
 
     /// Drop `path`'s rehydrated analysis from this index's LRU (a
@@ -1239,41 +1237,7 @@ impl ModuleIndex {
     /// connection per index so the statement cache amortizes across queries.
     pub(super) fn with_rows_conn<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> Option<R> {
         let opener = self.ref_rows_opener.read().ok().and_then(|g| g.clone())?;
-        fn db_ino(conn: &rusqlite::Connection) -> u64 {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                return conn
-                    .path()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.ino())
-                    .unwrap_or(0);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = conn;
-                0
-            }
-        }
-        // Poison-proof: the Option is a pure cache — a panic in some earlier
-        // holder must not permanently disable retrieval.
-        let mut guard = self
-            .ref_rows_conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((conn, ino)) = guard.as_ref() {
-            if db_ino(conn) != *ino {
-                *guard = None; // file unlinked/recreated — reopen below
-            }
-        }
-        if guard.is_none() {
-            *guard = opener().map(|c| {
-                let ino = db_ino(&c);
-                (c, ino)
-            });
-        }
-        let (conn, _) = guard.as_ref()?;
-        Some(f(conn))
+        self.ref_rows_conn.with(|| opener(), f)
     }
 
     /// Rows-backed workspace/symbol scan over THIS index's store — the

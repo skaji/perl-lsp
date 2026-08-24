@@ -22,7 +22,7 @@ impl ModuleIndex {
             enrichment_key_memo: Arc::new(DashMap::new()),
             foreign_bag_cache: std::sync::RwLock::new(None),
             ref_rows_opener: std::sync::RwLock::new(None),
-            ref_rows_conn: std::sync::Mutex::new(None),
+            ref_rows_conn: crate::index::module_cache::RetainedReader::new(),
             workspace_modules: Arc::new(DashMap::new()),
         }
     }
@@ -112,17 +112,30 @@ impl ModuleIndex {
             .and_then(|v| v.parse::<usize>().ok())
             .map(|mb| mb * 1024 * 1024)
             .unwrap_or(16 * 1024 * 1024);
+        // One retained connection for the whole cache's lifetime, not an
+        // open per miss: the consult path misses once per unique path, and
+        // a fresh open (WAL handshake + the CANTOPEN retry ladder) measured
+        // 5.1 ms against the ~µs SELECT it serves — 360 s of a cold
+        // `--check` at 70k paths. `RetainedReader` reopens on inode change,
+        // so `--clear-cache` mid-session is still picked up.
+        let retained = Arc::new(crate::index::module_cache::RetainedReader::new());
         self.set_conclusion_cache(Arc::new(
             crate::index::conclusion_cache::ConclusionCache::new(concl_cap, move |path| {
                 let dir = crate::index::module_cache::cache_dir_for_workspace(ckey.as_deref())?;
                 let db = crate::index::module_cache::db_path_for(&dir, "perl");
-                let conn = crate::index::module_cache::open_reader_retrying(&db).ok()?;
-                let at = crate::index::module_cache::current_generation(&conn);
-                crate::index::module_cache::load_conclusions_stamped(
-                    &conn,
-                    &path.to_string_lossy(),
-                    at,
-                )
+                retained
+                    .with(
+                        || crate::index::module_cache::open_reader_retrying(&db).ok(),
+                        |conn| {
+                            let at = crate::index::module_cache::current_generation(conn);
+                            crate::index::module_cache::load_conclusions_stamped(
+                                conn,
+                                &path.to_string_lossy(),
+                                at,
+                            )
+                        },
+                    )
+                    .flatten()
             }),
         ));
     }

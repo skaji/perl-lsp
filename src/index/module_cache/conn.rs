@@ -266,3 +266,131 @@ pub fn open_rw_shared_at(db_path: &std::path::Path) -> Option<Connection> {
 pub fn open_cache_db_readonly(_workspace_root: Option<&str>, _lang: &str) -> Option<Connection> {
     None
 }
+
+/// A retained read connection: opened once through the caller's opener,
+/// reused across calls, reopened when the DB file was unlinked/recreated
+/// underneath it (inode change — `--clear-cache`, a row-format rebuild).
+///
+/// The ONE speller of retain-with-recheck: `ModuleIndex::with_rows_conn`
+/// and the conclusion cache's loader both ride it. A per-call open costs
+/// milliseconds (file open, WAL handshake, the CANTOPEN retry ladder)
+/// against the microsecond query it serves — measured at 5.1 ms/call over
+/// 70k conclusion-map loads, 360 s of accumulated open cost in one cold
+/// `--check`, 13x the next-largest term in the run.
+pub struct RetainedReader {
+    cell: std::sync::Mutex<Option<(Connection, u64)>>,
+}
+
+impl Default for RetainedReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RetainedReader {
+    pub fn new() -> Self {
+        RetainedReader { cell: std::sync::Mutex::new(None) }
+    }
+
+    fn db_ino(conn: &Connection) -> u64 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return conn
+                .path()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.ino())
+                .unwrap_or(0);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = conn;
+            0
+        }
+    }
+
+    /// Drop the held connection — the next `with` reopens. For callers whose
+    /// OPENER changed (a new workspace root), which the inode recheck cannot
+    /// see: same file may exist at both paths.
+    pub fn reset(&self) {
+        let mut guard = self.cell.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = None;
+    }
+
+    /// Run `f` on the retained connection, opening through `opener` when
+    /// none is held or the file moved underneath it. `None` when the open
+    /// fails — a failure is NOT retained, so a DB created later is picked
+    /// up on the next call.
+    pub fn with<R>(
+        &self,
+        opener: impl FnOnce() -> Option<Connection>,
+        f: impl FnOnce(&Connection) -> R,
+    ) -> Option<R> {
+        // Poison-proof: the Option is a pure cache — a panic in an earlier
+        // holder must not permanently disable retrieval.
+        let mut guard = self.cell.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((conn, ino)) = guard.as_ref() {
+            if Self::db_ino(conn) != *ino {
+                *guard = None; // file unlinked/recreated — reopen below
+            }
+        }
+        if guard.is_none() {
+            *guard = opener().map(|c| {
+                let ino = Self::db_ino(&c);
+                (c, ino)
+            });
+        }
+        let (conn, _) = guard.as_ref()?;
+        Some(f(conn))
+    }
+}
+
+#[cfg(test)]
+mod retained_reader_tests {
+    use super::RetainedReader;
+
+    /// One open serves many calls; a recreated DB file (new inode) forces a
+    /// reopen. The two behaviors this struct exists for, and the second is
+    /// what keeps `--clear-cache` honest mid-session.
+    #[test]
+    fn opens_once_and_reopens_on_inode_change() {
+        let dir = std::env::temp_dir().join(format!("rr_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        super::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t(x)").unwrap();
+
+        let rr = RetainedReader::new();
+        let opens = std::cell::Cell::new(0u32);
+        let opener = || {
+            opens.set(opens.get() + 1);
+            super::Connection::open(&db).ok()
+        };
+        assert!(rr.with(opener, |_| ()).is_some());
+        assert!(rr.with(opener, |_| ()).is_some());
+        assert_eq!(opens.get(), 1, "the second call rides the retained connection");
+
+        std::fs::remove_file(&db).unwrap();
+        super::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t(x)").unwrap();
+        assert!(rr.with(opener, |_| ()).is_some());
+        assert_eq!(opens.get(), 2, "a recreated file (new inode) must reopen");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed open is not retained: a DB that appears later is picked up.
+    #[test]
+    fn a_failed_open_is_retried_next_call() {
+        let dir = std::env::temp_dir().join(format!("rr_late_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("late.db");
+
+        let rr = RetainedReader::new();
+        assert!(rr.with(|| None, |_: &super::Connection| ()).is_none());
+        super::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t(x)").unwrap();
+        assert!(
+            rr.with(|| super::Connection::open(&db).ok(), |_| ()).is_some(),
+            "the earlier failure must not be remembered as permanent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
