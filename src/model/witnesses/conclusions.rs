@@ -561,7 +561,7 @@ pub fn not_local_disabled() -> bool {
 ///
 /// ONE speller, because there are TWO producers of a conclusions row — the
 /// persist path (`encode_analysis`) and the background repair lane
-/// (`repair_conclusions_slice`, seeded from `paths_missing_conclusions`) — and
+/// (`repair_conclusions_slice`, seeded from `paths_needing_repair`) — and
 /// a control that gates only the first is not a control at all. Measured on
 /// the substrate before this existed: an A/B whose OFF arm was primed cold
 /// answered 72,305 provider fetches on its first run and **57,481 on its

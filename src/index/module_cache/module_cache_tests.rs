@@ -1878,7 +1878,7 @@ fn a_derivation_change_clears_conclusions_but_keeps_blobs() {
 /// derivation fingerprint exists to catch, arriving through the repair that
 /// fingerprint triggers.
 ///
-/// Base-verify by dropping `paths_missing_conclusions`' `NOT EXISTS` clause:
+/// Base-verify by dropping `paths_needing_repair`' `NOT EXISTS` clause:
 /// the frontier then also contains the file that already has a map, and the
 /// repair rewrites rows nothing asked for.
 #[test]
@@ -1906,7 +1906,7 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
         "precondition: the map is gone"
     );
 
-    let frontier = paths_missing_conclusions(&conn, at);
+    let frontier = paths_needing_repair(&conn, at);
     assert_eq!(
         frontier,
         vec!["/repair/App.pm".to_string()],
@@ -1935,7 +1935,7 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
     // Idempotent: nothing is left on the frontier, so a second pass is a no-op
     // rather than a rewrite loop.
     assert!(
-        paths_missing_conclusions(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at).is_empty(),
         "a repaired file must leave the frontier, or the background pass never ends"
     );
 }
@@ -1986,4 +1986,108 @@ fn invalidating_a_generation_drops_the_bake_that_came_with_it() {
     );
 
     let _ = std::fs::remove_file(&pm);
+}
+
+/// The persist path stores the projection a warm lane can adopt, and it is the
+/// COLD one — the projection taken from the whole analysis, not from the
+/// stripped copy a warm reader holds.
+///
+/// `Surface::project` reads the witness bag. Re-projecting on the warm side
+/// therefore records a smaller surface for identical bytes, and nothing about
+/// the degraded result says it is partial: 76.7% of conclusions rows read
+/// stale against rows that were correct, and a warm-start freshness verdict
+/// was computed over a file that does not exist in that shape
+/// (`docs/prompt-surface-projection-drift.md`).
+#[test]
+fn the_persisted_surface_is_the_cold_projection() {
+    let conn = test_db();
+    let path = std::path::Path::new("/surf/App.pm");
+    let cached = parse_source_to_cached(
+        "package My::App;\nuse Mojolicious::Lite;\n\
+         plugin 'CloveApp', { alpha => 1, beta => 2 };\n\
+         sub helper { return 'x' }\n1;\n",
+        path,
+    );
+    let whole_fp = crate::model::surface::surface_fingerprint(
+        &crate::model::surface::Surface::project(&cached.analysis),
+    );
+    assert!(save_to_db(&conn, "My::App", &Some(cached.clone()), "workspace"));
+
+    let stored = load_surface(&conn, "/surf/App.pm").expect("the persist path stores a surface");
+    assert_eq!(
+        crate::model::surface::surface_fingerprint(&stored),
+        whole_fp,
+        "the persisted surface is not the one the cold lane projected"
+    );
+
+    // And it is NOT what a warm reader would have produced on its own.
+    let mut stripped = (*cached.analysis).clone();
+    stripped.evict_witness_bag();
+    assert_ne!(
+        crate::model::surface::surface_fingerprint(&crate::model::surface::Surface::project(
+            &stripped
+        )),
+        whole_fp,
+        "fixture no longer carries bag-derived surface content, so it cannot \
+         demonstrate what persisting the projection is for"
+    );
+}
+
+/// A surface written by an older `Surface::project` reads absent, and the
+/// repair frontier picks the file up.
+///
+/// A persisted projection outliving its projector is the same class as a
+/// derivation outliving its source: the bytes deserialize cleanly and simply
+/// describe a shape this build no longer produces. Version-gated per ROW, so
+/// the question a reader asks — "is this one MY projection would make" — is
+/// the question the row answers.
+#[test]
+fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
+    let conn = test_db();
+    let path = std::path::Path::new("/surfver/App.pm");
+    let cached = parse_source_to_cached(
+        "package Ver::App;\nuse Mojolicious::Lite;\n\
+         plugin 'CloveApp', { alpha => 1 };\nsub helper { return 'x' }\n1;\n",
+        path,
+    );
+    assert!(save_to_db(&conn, "Ver::App", &Some(cached.clone()), "workspace"));
+    let at = current_generation(&conn);
+    assert!(load_surface(&conn, "/surfver/App.pm").is_some(), "precondition");
+    assert!(
+        paths_needing_repair(&conn, at).is_empty(),
+        "precondition: a freshly persisted file needs no repair"
+    );
+
+    // What a change to `Surface::project` looks like from the store's side.
+    conn.execute(
+        "UPDATE surfaces SET version = 'from-an-older-projection'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        load_surface(&conn, "/surfver/App.pm").is_none(),
+        "a surface from another projection version must not be adopted — it \
+         describes a shape this build does not produce"
+    );
+    assert_eq!(
+        paths_needing_repair(&conn, at),
+        vec!["/surfver/App.pm".to_string()],
+        "a stale surface must put the file back on the repair frontier, or the \
+         first edit to the projection silently re-opens the drift for every \
+         file already in the cache"
+    );
+
+    repair_conclusions_slice(&conn, &["/surfver/App.pm".to_string()], at);
+    let repaired = load_surface(&conn, "/surfver/App.pm").expect("the repair rewrites the surface");
+    assert_eq!(
+        crate::model::surface::surface_fingerprint(&repaired),
+        crate::model::surface::surface_fingerprint(&crate::model::surface::Surface::project(
+            &cached.analysis
+        )),
+        "the repaired surface is not the cold projection"
+    );
+    assert!(
+        paths_needing_repair(&conn, at).is_empty(),
+        "a repaired file must leave the frontier"
+    );
 }

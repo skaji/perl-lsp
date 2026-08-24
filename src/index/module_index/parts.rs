@@ -568,6 +568,18 @@ impl WorkspaceRegistrationParts {
         &self.arc
     }
 
+    /// Replace the projection this token carries with a PERSISTED one.
+    ///
+    /// The warm lane's analysis is bag-evicted and `Surface::project` reads
+    /// the bag, so the projection minted here describes a smaller file than
+    /// the one on disk — and nothing about the result says it is partial. The
+    /// cold lane's projection was stored beside the blob precisely so the warm
+    /// lane can record what the cold lane recorded instead of re-deriving a
+    /// degraded twin (`docs/prompt-surface-projection-drift.md`).
+    pub(crate) fn adopt_surface(&mut self, surface: crate::model::surface::Surface) {
+        self.surface = Some(surface);
+    }
+
     /// See `PackRegistrationParts::record_surface` — takes, does not clone.
     pub(crate) fn record_surface(
         &mut self,

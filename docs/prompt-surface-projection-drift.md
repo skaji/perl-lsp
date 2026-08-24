@@ -64,9 +64,58 @@ one of them keeps answering against the pre-edit state. That is the failure
 `loader_shapes` was added to the Surface to prevent, arriving through the
 residency door instead of the projection door.
 
-## The fork
+## Resolution: option (1), persisted surfaces
 
-Three shapes, none of them obviously dominant:
+Ruled by the coordinator and landed. `Surface::project`'s output is stored
+beside the blob it was projected from, in a `surfaces` table created with
+`CREATE TABLE IF NOT EXISTS` in the always-run batch — no `SCHEMA_VERSION`
+bump, no cache-wide rebuild. The warm lane adopts the persisted projection
+instead of re-deriving a degraded twin, so cold and warm record the same
+surface for the same bytes by construction.
+
+Option (2) — stamping on something both producers compute identically — was
+disqualified on scope, not cost: it removes the 3.3x that made the wrong-answer
+bug visible while leaving the bug. **Agreement between the lanes is the
+property; the stamp is not.**
+
+Option (3) remains the right END STATE and deliberately did not gate this: it
+is the only shape that makes the degraded projection impossible rather than
+avoided, which is rule #10's "encode the property on the value so consumers
+cannot ask the wrong question". A live wrong-answer bug should not wait behind
+a refactor of the analysis shape.
+
+### Version gate
+
+Per ROW, not per database, and independent of `SCHEMA_VERSION`:
+`PERL_LSP_SURFACE_FINGERPRINT` is derived at compile time over `src/model/` +
+`Cargo.lock`. Narrower than the conclusion fingerprint on purpose — the
+whole-tree hash would invalidate every persisted surface on an edit to an LSP
+handler, paying a corpus-wide re-projection for a change that cannot alter one.
+
+A persisted projection outliving its projector is the same class as a
+derivation outliving its source: the bytes deserialize cleanly and describe a
+shape this build no longer produces. A mismatch reads ABSENT, so the caller
+re-projects — exactly what it did before the store existed — and the file goes
+back on the repair frontier, which shares the conclusion repair's with-bag
+decode and rewrites both products of the one projection.
+
+### Measured, substrate, warm
+
+| | before | after |
+|---|---:|---:|
+| `moc.provider_fetched` | 57,481 | **18,924** |
+| `consult.baked_open` | 2,084 | 11,804 |
+| `conclrow.valid` / `.stale` | 14,578 / 47,967 | 36,143 / **0** |
+| `surface.adopted_persisted` | — | 3,336 |
+
+Stale rejections go to zero. The stamp now costs 8.6% more fetches than
+bypassing it entirely (18,924 vs 17,419) rather than 230%, and that residue is
+the 1,635 `conclrow.unrecorded` — paths the freshness index has no record for
+at all, which is the fail-open direction working as designed.
+
+## The fork, as it stood
+
+Three shapes, none of them obviously dominant at the time:
 
 1. **Persist the Surface** and have the warm lane `record_surface_value` the
    decoded projection instead of re-projecting from a stripped copy. Cold and

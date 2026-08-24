@@ -238,6 +238,12 @@ pub fn index_workspace_with_index(
                         path.clone(),
                         fa,
                         level,
+                        // The cold lane's projection, when the store holds one
+                        // at this projection version. Without it the warm lane
+                        // records a bag-less twin and every cross-boundary
+                        // comparison asks a different question than the cold
+                        // run answered.
+                        module_cache::load_surface(conn, &path_str),
                     ),
                     None => {
                         // No index (CLI-less warm): no feeds to extract —

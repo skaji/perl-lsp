@@ -395,10 +395,12 @@ fn freshness_dirty_walk_covers_renamed_away_providers() {
 /// rejected as stale against rows that were in fact correct, and the chase
 /// they fell back to cost 3.3x the provider fetches.
 ///
-/// Pinned as an EQUALITY-FAILING property on purpose — it records what is
-/// true today so a fix flips this test rather than being invisible. Written
-/// up, with the measurement and the fix options, in
-/// `docs/prompt-surface-projection-drift.md`.
+/// The warm lane now ADOPTS the cold projection out of the `surfaces` store
+/// rather than re-deriving it, so the drift is avoided — but it is still
+/// possible, and this pins that. Making it IMPOSSIBLE means baking the
+/// bag-derived parts of the surface into the analysis at build time, which is
+/// the recorded end state; that fix is what flips this test.
+/// `docs/prompt-surface-projection-drift.md` owns both.
 #[test]
 fn a_bag_evicted_analysis_projects_a_different_surface() {
     let src = "package Alpha;\nuse strict;\n\

@@ -1554,7 +1554,7 @@ fn reregistering_one_file_keeps_evicted_sibling_edges() {
     let pb = PathBuf::from("/fake/pkgid/Beta.pm");
     // The sibling registers through the stripping door: its resident copy
     // has NO symbols, only the pre-strip name record.
-    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), crate::model::file_analysis::Residency::Skeleton);
+    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), crate::model::file_analysis::Residency::Skeleton, None);
     let _ = idx.register_workspace_resident(pa.clone(), Arc::new(build_fa(src_a)));
     assert!(!idx.modules_with_symbol("from_beta").is_empty(), "sibling edges fed");
     // Re-register the whole file; the evicted sibling's names must replay.
@@ -2282,6 +2282,7 @@ fn provider_edges_replay_for_a_symbol_evicted_copy() {
         pp,
         build_fa("package DateTime::PP;\n*{ 'DateTime::_ymd2rd' } = sub { 42 };\n1;\n"),
         crate::model::file_analysis::Residency::Skeleton,
+        None,
     );
     assert_eq!(
         idx.modules_providing_package("DateTime"),

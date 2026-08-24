@@ -120,6 +120,15 @@ pub struct EncodedAnalysis {
     /// answering ABSENT for the file, and absent means "no answer" rather than
     /// "not baked".
     pub conclusions: Vec<u8>,
+    /// The span-free `Surface` projected from the analysis these bytes were
+    /// encoded from, ready to persist.
+    ///
+    /// Carried rather than re-projected at the read side because the READ side
+    /// cannot produce it: the warm lane hands out bag-evicted copies, and
+    /// `Surface::project` reads the bag. Persisting the cold projection is the
+    /// only way the two lanes record the same surface for the same file —
+    /// `docs/prompt-surface-projection-drift.md`.
+    pub surface: Vec<u8>,
     /// The surface fingerprint of the analysis these bytes were baked from —
     /// the row's self-validation stamp. Carried here rather than looked up at
     /// write time so the value describes exactly what was encoded: a writer
@@ -197,16 +206,18 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<EncodedAnalysis> {
     } else {
     bake_conclusions_blob(fa, &bag)
     };
-    // Projected from the SAME analysis the map was baked from, in the same
-    // call — the row's stamp and its contents describe one state by
-    // construction.
-    let source_fingerprint = crate::model::surface::surface_fingerprint(
-        &crate::model::surface::Surface::project(fa),
-    );
+    // ONE projection, used for both the stamp and the persisted surface: the
+    // row's stamp, its map, and the surface a warm lane will record all
+    // describe one state by construction rather than by three callers
+    // agreeing.
+    let projected = crate::model::surface::Surface::project(fa);
+    let source_fingerprint = crate::model::surface::surface_fingerprint(&projected);
+    let surface = encode_surface(&projected).unwrap_or_default();
     Some(EncodedAnalysis {
         analysis,
         bag: bag_blob,
         conclusions,
+        surface,
         source_fingerprint,
     })
 }
@@ -598,6 +609,7 @@ pub fn save_blob_to_db_stamped(
         log::warn!("Failed to save module blob for '{}': {}", module_name, e);
     }
     persist_conclusions(conn, &path.to_string_lossy(), blob);
+    persist_surface(conn, &path.to_string_lossy(), blob);
     // A rewritten modules row orphans any prior stub for the path — a stale
     // skeleton paired with a fresh stamp would be served as valid on the
     // next warm. Writers that have a fresh stub re-insert it right after.
@@ -615,6 +627,48 @@ pub fn save_blob_to_db_stamped(
 /// A failure here is logged, never fatal. The blob is already written and
 /// remains the derivation of record; a missing map costs a decode, which is
 /// the cost we had before this layer existed.
+/// bincode + zstd, the same codec every other derived blob here uses.
+pub fn encode_surface(s: &crate::model::surface::Surface) -> Option<Vec<u8>> {
+    let bin = bincode::serialize(s).ok()?;
+    zstd::encode_all(bin.as_slice(), ZSTD_LEVEL).ok()
+}
+
+/// Store one file's projected surface at the CURRENT projection version.
+///
+/// Version stamped per row rather than per database: a reader wants "is THIS
+/// row's surface one my `Surface::project` would produce", and a
+/// database-wide stamp answers that only until the first mixed write.
+pub fn persist_surface(conn: &Connection, path: &str, enc: &EncodedAnalysis) {
+    if enc.surface.is_empty() {
+        return;
+    }
+    let r = conn.execute(
+        "INSERT OR REPLACE INTO surfaces (path, version, surface) VALUES (?1, ?2, ?3)",
+        params![path, super::surface_version(), enc.surface],
+    );
+    if let Err(e) = r {
+        log::warn!("Failed to save surface for '{path}': {e}");
+    }
+}
+
+/// One file's persisted surface, or `None` when there is none AT THE CURRENT
+/// PROJECTION VERSION.
+///
+/// A version mismatch reads absent rather than stale: the caller re-projects,
+/// which is exactly what it did before this store existed. Absence is a cost
+/// here, never a wrong answer.
+pub fn load_surface(conn: &Connection, path: &str) -> Option<crate::model::surface::Surface> {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT surface FROM surfaces WHERE path = ?1 AND version = ?2",
+            params![path, super::surface_version()],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let bin = zstd::decode_all(blob.as_slice()).ok()?;
+    bincode::deserialize(&bin).ok()
+}
+
 fn persist_conclusions(conn: &Connection, path: &str, enc: &EncodedAnalysis) {
     if enc.conclusions.is_empty() {
         // The bake produced nothing encodable. Leaving no row is right: absent
@@ -718,6 +772,7 @@ pub fn save_to_db(
     if !path_str.is_empty() {
         if let Some(enc) = analysis_blob.as_ref() {
             persist_conclusions(conn, &path_str, enc);
+            persist_surface(conn, &path_str, enc);
         }
         // Same stale-stub guard as `save_blob_to_db_stamped`.
         delete_stub(conn, &path_str);

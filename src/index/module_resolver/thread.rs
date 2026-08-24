@@ -156,7 +156,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
         .filter(|_| !crate::model::witnesses::bake_disabled())
         .map(|conn| {
             let at = module_cache::current_generation(conn);
-            let f = module_cache::paths_missing_conclusions(conn, at);
+            let f = module_cache::paths_needing_repair(conn, at);
             if !f.is_empty() {
                 log::info!(
                     "Conclusion repair: {} file(s) hold a blob with no map; \

@@ -55,6 +55,36 @@ fn main() {
     // build), an unspecified hash is a poor thing to hang a cache invariant
     // on when the specified one is four lines.
     println!("cargo:rustc-env=PERL_LSP_CONCLUSION_FINGERPRINT={acc:016x}");
+
+    // The SURFACE lane's own gate, narrower on purpose.
+    //
+    // A persisted `Surface` outlives the `Surface::project` that wrote it, so
+    // it needs a version that moves when the projection does — the same class
+    // as a derivation outliving its source, and the same reason a
+    // hand-bumped constant is the wrong instrument. Scoped to `src/model/`
+    // because that is what determines a projection's OUTPUT, and because the
+    // whole-tree fingerprint above would invalidate every persisted surface on
+    // an edit to an LSP handler, paying a corpus-wide re-projection for a
+    // change that cannot alter one.
+    //
+    // Cargo.lock rides along: a grammar bump reshapes the CST, which reshapes
+    // the analysis a surface is projected from.
+    let mut model = Vec::new();
+    collect(Path::new("src/model"), &mut model);
+    if Path::new("Cargo.lock").is_file() {
+        model.push(PathBuf::from("Cargo.lock"));
+    }
+    model.sort();
+    let mut sacc: u64 = 0xcbf2_9ce4_8422_2325;
+    for path in &model {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        fnv(&mut sacc, path.to_string_lossy().as_bytes());
+        fnv(&mut sacc, b"\0");
+        fnv(&mut sacc, &bytes);
+        fnv(&mut sacc, b"\0");
+    }
+    println!("cargo:rustc-env=PERL_LSP_SURFACE_FINGERPRINT={sacc:016x}");
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -219,7 +219,12 @@ pub fn prune_generations_below(conn: &Connection, keep: Generation) -> usize {
     .unwrap_or(0)
 }
 
-/// Paths holding a valid blob but no conclusion row a reader could use.
+/// Paths holding a valid blob but no conclusion row a reader could use, OR no
+/// persisted surface at the current projection version.
+///
+/// Both lanes share one frontier because they share the expensive step: a
+/// with-bag decode. Splitting them would decode each file twice to fix two
+/// products of one projection.
 ///
 /// The repair frontier. `validate_conclusion_fingerprint` clears conclusions
 /// and deliberately keeps the blobs, "because the repair is a re-bake" — but
@@ -238,14 +243,18 @@ pub fn prune_generations_below(conn: &Connection, keep: Generation) -> usize {
 ///
 /// Version-filtered: a row below `EXTRACT_VERSION` is going to be re-parsed
 /// anyway, and baking it would spend the work twice.
-pub fn paths_missing_conclusions(conn: &Connection, at: Generation) -> Vec<String> {
+pub fn paths_needing_repair(conn: &Connection, at: Generation) -> Vec<String> {
     let mut stmt = match conn.prepare(
         "SELECT DISTINCT m.path FROM modules m \
          WHERE m.analysis IS NOT NULL AND m.extract_version = ?1 \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM conclusions c \
-             WHERE c.path = m.path AND c.generation <= ?2 \
-           )",
+           AND (NOT EXISTS ( \
+                 SELECT 1 FROM conclusions c \
+                 WHERE c.path = m.path AND c.generation <= ?2 \
+               ) \
+             OR NOT EXISTS ( \
+                 SELECT 1 FROM surfaces s \
+                 WHERE s.path = m.path AND s.version = ?3 \
+               ))",
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -253,7 +262,9 @@ pub fn paths_missing_conclusions(conn: &Connection, at: Generation) -> Vec<Strin
             return Vec::new();
         }
     };
-    let rows = stmt.query_map(params![EXTRACT_VERSION, at.0], |r| r.get::<_, String>(0));
+    let rows = stmt.query_map(params![EXTRACT_VERSION, at.0, super::surface_version()], |r| {
+        r.get::<_, String>(0)
+    });
     match rows {
         Ok(it) => it.filter_map(|r| r.ok()).collect(),
         Err(e) => {
@@ -284,7 +295,7 @@ pub fn repair_conclusions_slice(
     paths: &[String],
     at: Generation,
 ) -> usize {
-    let baked: Vec<(&String, Vec<u8>, u64)> = paths
+    let baked: Vec<(&String, Vec<u8>, u64, Vec<u8>)> = paths
         .iter()
         .filter_map(|path| {
             // WITH the bag: the bake reads witnesses, and a bagless decode
@@ -296,16 +307,20 @@ pub fn repair_conclusions_slice(
             // Stamped from the analysis the repair actually decoded, not from
             // the index: a repair races the writers, and a fingerprint read
             // elsewhere could describe a newer state than these bytes.
-            let fingerprint = crate::model::surface::surface_fingerprint(
-                &crate::model::surface::Surface::project(&fa),
-            );
+            let projected = crate::model::surface::Surface::project(&fa);
+            let fingerprint = crate::model::surface::surface_fingerprint(&projected);
+            // The repair is the ONLY lane that decodes with the bag after a
+            // projection-version change, so it is where a surface written by
+            // an older `Surface::project` gets replaced. Free here: the
+            // fingerprint above already paid for the projection.
+            let surface = super::encode_surface(&projected).unwrap_or_default();
             if blob.is_empty() {
                 // Nothing encodable. Leaving the row absent is right: the
                 // reader falls back to a decode, which is where it already was.
                 crate::util::ghost_stats::count("repair.nothing_to_bake");
                 return None;
             }
-            Some((path, blob, fingerprint))
+            Some((path, blob, fingerprint, surface))
         })
         .collect();
     if baked.is_empty() {
@@ -316,7 +331,16 @@ pub fn repair_conclusions_slice(
         log::warn!("conclusion repair: txn open failed; the slice defers to the next pass");
         return 0;
     }
-    for (path, blob, fingerprint) in &baked {
+    for (path, blob, fingerprint, surface) in &baked {
+        if !surface.is_empty() {
+            let r = conn.execute(
+                "INSERT OR REPLACE INTO surfaces (path, version, surface) VALUES (?1, ?2, ?3)",
+                params![path, super::surface_version(), surface],
+            );
+            if let Err(e) = r {
+                log::warn!("conclusion repair: surface store failed for '{path}': {e}");
+            }
+        }
         let r = conn.execute(
             "INSERT OR REPLACE INTO conclusions \
              (path, generation, map, source_fingerprint, flush_generation) \

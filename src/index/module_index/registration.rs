@@ -811,13 +811,27 @@ impl ModuleIndex {
     /// arc for the caller's FileStore mirror. Synchronous-persistence
     /// callers only (the warm path — the blob already exists on disk);
     /// the bulk fresh path splits the halves around the writer's COMMIT.
+    /// `persisted` is the surface the COLD lane recorded for this file, when
+    /// the store has one at the current projection version. A warm caller
+    /// passes it because its own analysis is bag-evicted and `Surface::project`
+    /// reads the bag — re-projecting there records a degraded twin of what the
+    /// cold lane recorded, for identical bytes
+    /// (`docs/prompt-surface-projection-drift.md`). `None` keeps the
+    /// projection this token already carries.
     pub fn register_workspace_stripping(
         &self,
         path: std::path::PathBuf,
         fa: FileAnalysis,
         level: crate::model::file_analysis::Residency,
+        persisted: Option<crate::model::surface::Surface>,
     ) -> Arc<FileAnalysis> {
         let mut parts = self.prepare_workspace_parts(&path, fa, level);
+        if let Some(s) = persisted {
+            crate::util::ghost_stats::count("surface.adopted_persisted");
+            parts.adopt_surface(s);
+        } else {
+            crate::util::ghost_stats::count("surface.reprojected");
+        }
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_workspace_residency(path, parts);

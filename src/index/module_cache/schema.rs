@@ -62,6 +62,25 @@ pub fn conclusion_fingerprint() -> &'static str {
     })
 }
 
+/// The projection version a persisted `Surface` is stamped with.
+///
+/// `Surface::project` reads the witness bag, so a warm lane that re-projects
+/// from a bag-EVICTED copy records a different surface for the same unchanged
+/// file than the cold lane did — measured at 76.7% of conclusions rows
+/// rejected against rows that were in fact correct, and a warm-start freshness
+/// verdict computed over a degraded projection
+/// (`docs/prompt-surface-projection-drift.md`). Persisting the cold projection
+/// is what makes the two lanes agree.
+///
+/// Its own gate, independent of `SCHEMA_VERSION`: a change to the projection
+/// must invalidate persisted surfaces without dropping blobs, and a version
+/// somebody has to remember to bump is the wrong instrument for a failure
+/// nothing downstream can see — a stale surface deserializes cleanly and
+/// simply describes a file that no longer exists in that shape.
+pub fn surface_version() -> &'static str {
+    env!("PERL_LSP_SURFACE_FINGERPRINT")
+}
+
 /// The env vars that change what a bake STORES. Consult-side flags do not
 /// belong here — see `conclusion_fingerprint`.
 const BAKE_STEERING_FLAGS: [&str; 2] = ["PERL_LSP_MINT_LINKS", "PERL_LSP_NO_BAKE"];
@@ -177,6 +196,11 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS stubs (
             path TEXT PRIMARY KEY,
             stub BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS surfaces (
+            path    TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            surface BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_modules_path ON modules(path);
         CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(module_name);",
