@@ -27,7 +27,14 @@ thread_local! {
 struct SweepMemo {
     stamp: u64,
     map: std::collections::HashMap<std::path::PathBuf, Arc<FileAnalysis>>,
+    /// Bytes this file's memo holds (estimates) — the crest attribution:
+    /// per-worker in-flight working sets are bounded by the largest single
+    /// file's memo, and `sweep.memo_peak_file_bytes` reports the max seen.
+    bytes: u64,
 }
+
+/// High-water of any single file's sweep-memo footprint, across the run.
+static SWEEP_MEMO_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The SWEEP-WIDE consult-verdict store: (candidate path, point-free query)
 /// → that candidate's whole contribution, shared across files AND rayon
@@ -1307,10 +1314,23 @@ impl ModuleIndex {
                                 // suspect holder. `bytes_inserted` bounds what
                                 // a sweep cycles through; entries × giant
                                 // sizes is what a peak reader compares RSS to.
+                                let est = full.heap_estimate().total() as u64;
                                 crate::util::ghost_stats::add_n(
                                     "sweep.memo_bytes_inserted",
-                                    full.heap_estimate().total() as u64,
+                                    est,
                                 );
+                                memo.bytes += est;
+                                // Max via summed deltas: the tag's TOTAL in the
+                                // shutdown dump equals the largest single
+                                // file's memo footprint across the run.
+                                let prev = SWEEP_MEMO_PEAK
+                                    .fetch_max(memo.bytes, std::sync::atomic::Ordering::Relaxed);
+                                if memo.bytes > prev {
+                                    crate::util::ghost_stats::add_n(
+                                        "sweep.memo_peak_file_bytes",
+                                        memo.bytes - prev,
+                                    );
+                                }
                                 memo.map.insert(cached.path.clone(), Arc::clone(&full));
                             }
                         }
