@@ -501,6 +501,54 @@ pub fn open_and_load_diag(
     Err(RehydrateMiss::NoRow)
 }
 
+/// `open_and_load_diag` with the happy path on a RETAINED connection — the
+/// same per-call-open disease the conclusion loader had (`RetainedReader`):
+/// every bag-LRU miss paid a fresh open + WAL handshake before its decode.
+/// A row served by the long-lived reader pays no open at all; ANY other
+/// outcome — no retained conn obtainable, row invisible, read error — falls
+/// back to the full per-call policy, whose RW recovery genuinely needs fresh
+/// opens and whose failure discrimination the residency tripwire reads.
+/// The fallback re-runs the readonly probe (a genuine miss pays ~one extra
+/// open); hits are the overwhelming population and hits pay zero.
+#[cfg(not(test))]
+pub fn open_and_load_diag_retained(
+    retained: &RetainedReader,
+    cache_key: Option<&str>,
+    lang: &str,
+    paths: &[String],
+    want_bag: bool,
+) -> Result<FileAnalysis, RehydrateMiss> {
+    if let Some(dir) = cache_dir_for_workspace(cache_key) {
+        let db = db_path_for(&dir, lang);
+        let hit = retained
+            .with(
+                || open_reader_retrying(&db).ok(),
+                |conn| {
+                    paths
+                        .iter()
+                        .find_map(|p| load_one_diag(conn, p, want_bag).ok())
+                },
+            )
+            .flatten();
+        if let Some(fa) = hit {
+            return Ok(fa);
+        }
+    }
+    crate::util::ghost_stats::count("bagload.retained_fallback");
+    open_and_load_diag(cache_key, lang, paths, want_bag)
+}
+
+#[cfg(test)]
+pub fn open_and_load_diag_retained(
+    _retained: &RetainedReader,
+    _cache_key: Option<&str>,
+    _lang: &str,
+    _paths: &[String],
+    _want_bag: bool,
+) -> Result<FileAnalysis, RehydrateMiss> {
+    Err(RehydrateMiss::NoRow)
+}
+
 /// Rehydrate one file from an explicit cache DB, discriminating every
 /// failure and surviving the readonly/WAL-checkpoint race. Path-taking so the
 /// whole policy is unit-testable.

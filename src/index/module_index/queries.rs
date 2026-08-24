@@ -68,6 +68,11 @@ impl ModuleIndex {
         // rehydrate through this, same as the pack sub-indexes. Fixed
         // 128 MiB cap (Perl analyses are 10-100x smaller than cpp ones).
         let ckey = key.clone();
+        // Retained across rehydrates — a per-call open was the same disease
+        // the conclusion loader had (`RetainedReader`); the LRU's whole job
+        // is to make misses rare, and each miss was paying a fresh open on
+        // top of its decode.
+        let bag_retained = Arc::new(crate::index::module_cache::RetainedReader::new());
         let loader = move |path: &std::path::Path, want_bag: bool| {
             // Raw walk path first (preserves the pre-diag behavior), canonical
             // as a fallback spelling; the discriminated helper survives the
@@ -83,7 +88,8 @@ impl ModuleIndex {
                     spellings.push(c);
                 }
             }
-            crate::index::module_cache::open_and_load_diag(
+            crate::index::module_cache::open_and_load_diag_retained(
+                &bag_retained,
                 key.as_deref(),
                 "perl",
                 &spellings,
