@@ -26,33 +26,11 @@ thread_local! {
 #[derive(Default)]
 struct SweepMemo {
     stamp: u64,
-    map: std::collections::HashMap<std::path::PathBuf, (Arc<FileAnalysis>, u64)>,
-    /// Insertion order, for drop-oldest when the byte cap bites.
-    order: std::collections::VecDeque<std::path::PathBuf>,
+    map: std::collections::HashMap<std::path::PathBuf, Arc<FileAnalysis>>,
     /// Bytes this file's memo holds (estimates) — the crest attribution:
     /// per-worker in-flight working sets are bounded by the largest single
     /// file's memo, and `sweep.memo_peak_file_bytes` reports the max seen.
     bytes: u64,
-}
-
-/// Per-file sweep-memo byte cap. Measured before it was set: one FHEM
-/// file's memo reached 633 MB, and the sweep's RSS crest is workers × the
-/// giant files' in-flight sets (peak fell 67% when worker count did — the
-/// per-file quantity was invariant). A byte cap bounds the crest for ANY
-/// worker count without touching parallelism — the corpus-neutral shape: a
-/// flat worker cap tuned on FHEM (memory-bound there, 4.9% wall for -67%
-/// RSS) could cost real wall on a CPU-bound corpus. Drop-OLDEST, so a
-/// giant file's hot providers (touched throughout its sweep) survive.
-/// `PERL_LSP_SWEEP_MEMO_MB` overrides; 0 = unbounded.
-fn sweep_memo_cap_bytes() -> u64 {
-    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("PERL_LSP_SWEEP_MEMO_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|mb| if mb == 0 { u64::MAX } else { mb * 1024 * 1024 })
-            .unwrap_or(256 * 1024 * 1024)
-    })
 }
 
 /// High-water of any single file's sweep-memo footprint, across the run.
@@ -1303,13 +1281,11 @@ impl ModuleIndex {
                 let memo = slot.as_mut()?;
                 if memo.stamp != stamp {
                     memo.map.clear();
-                    memo.order.clear();
-                    memo.bytes = 0;
                     memo.stamp = stamp;
                     crate::util::ghost_stats::count("sweep.memo_invalidated");
                     return None;
                 }
-                memo.map.get(&cached.path).map(|(a, _)| Arc::clone(a))
+                memo.map.get(&cached.path).cloned()
             });
             if let Some(hit) = memoed {
                 crate::util::ghost_stats::count("sweep.memo_hit");
@@ -1355,21 +1331,7 @@ impl ModuleIndex {
                                         memo.bytes - prev,
                                     );
                                 }
-                                if memo
-                                    .map
-                                    .insert(cached.path.clone(), (Arc::clone(&full), est))
-                                    .is_none()
-                                {
-                                    memo.order.push_back(cached.path.clone());
-                                }
-                                let cap = sweep_memo_cap_bytes();
-                                while memo.bytes > cap {
-                                    let Some(victim) = memo.order.pop_front() else { break };
-                                    if let Some((_, vbytes)) = memo.map.remove(&victim) {
-                                        memo.bytes = memo.bytes.saturating_sub(vbytes);
-                                        crate::util::ghost_stats::count("sweep.memo_evicted");
-                                    }
-                                }
+                                memo.map.insert(cached.path.clone(), Arc::clone(&full));
                             }
                         }
                     });
