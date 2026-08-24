@@ -86,6 +86,28 @@ the relation that answers it, and the soundness constraint.
    shows the name-only probe leaking (a plugin file declaring the queried
    name OUTSIDE the bridging namespace still decodes — over-approx, sound).
 
+4a. **Cross-file consults are point-free, memoized per walk and per sweep —
+   LANDED** (`24f66e0a`), and it is the arc's largest single win. The chain
+   that found it: FHEM (a package-main corpus, ~n providers of one name ×
+   n files × keys) drove 12.3M SlotType chase ATTEMPTS through an arm with
+   no memo tier; the session memo was inert on the enrichment cascade (no
+   session open — `session.absent` was the tell) and keyed on the consumer's
+   POINT (meaningless in provider coordinates; every call site a fresh
+   miss); and first-encounter pairs PER BUILD are the n², which no
+   thread-local memo can span. The fix: point-free cross-file sub-queries
+   (gold's 503 exact assertions license the semantics), a session around
+   the overlay build, and `SweepAnswerGuard` — a sweep-wide, stamp-guarded,
+   worker-shared (candidate, point-free query) → verdict store. Measured:
+   attempts 918x down, wall 2.06x at n=250, n=500 from killed to
+   completing, overlay builds 8.9x cheaper at unchanged count (the overlay
+   was a CARRIER of chase cost, not a cost). The surviving ~keys×n attempts
+   are the linear first-encounter floor — do NOT gold-plate this arm
+   further (key-set gating exists as an idea; 918x is past the knee and
+   the residual wall lives elsewhere). A failed first cut (reverted) is
+   part of this row's record: a memo added where no session existed and
+   keyed with the point displaced 20 of 12.3M — inert by construction,
+   found by measurement.
+
 4. **The registry chase's no-answer fetches, and `main`'s program scope.**
    Measured on a real-CPAN corpus (12k files, 54% package-less scripts)
    against the substrate: top-level `PackageSymbol` query DENSITY is nearly
