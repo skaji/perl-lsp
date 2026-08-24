@@ -648,6 +648,31 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         self.whole_present(cached)
     }
+    /// A sweep-scoped cross-file consult verdict: "what did candidate `path`
+    /// contribute to this (point-free) query". `None` = not remembered.
+    /// The default remembers nothing — only an index under an open sweep
+    /// (the CLI's whole-corpus diagnostics) serves these. The seam exists
+    /// because the SESSION memo is thread-local and per-verb, while a batch
+    /// sweep's repeats span files and rayon workers: without a shared tier,
+    /// every file's build re-chases every (query, candidate) pair the sweep
+    /// already settled — the measured n² on package-main corpora.
+    fn sweep_consult_answer(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ReducedValue>> {
+        let _ = (path, key);
+        None
+    }
+    /// Remember a sweep-scoped verdict. No-op by default.
+    fn remember_sweep_consult(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+        value: &crate::model::witnesses::ReducedValue,
+    ) {
+        let _ = (path, key, value);
+    }
     /// May `cached`'s file declare a member named `name` attributed to
     /// package `class`? The rows-backed pre-filter for the ancestor walk's
     /// per-candidate existence probe (`docs/prompt-relational-iteration.md`):

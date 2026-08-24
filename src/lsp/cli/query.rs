@@ -1213,6 +1213,12 @@ fn for_each_enriched_diagnostic(
     // `&mut` and stays on this thread — only the diagnostics cross.
     let (tx, rx) =
         std::sync::mpsc::channel::<(String, tower_lsp::lsp_types::Diagnostic)>();
+    // The sweep-wide consult-verdict store: one (query, candidate) chase per
+    // SWEEP instead of per file. The per-build session memo cannot span
+    // files (thread-local, per-build), and first-encounter pairs per build
+    // are the n² a package-main corpus produces. Shared across the rayon
+    // workers; stamp-cleared on any index shape change.
+    let _answers = module_index::SweepAnswerGuard::open();
     std::thread::scope(|scope| {
         scope.spawn(move || {
             use rayon::prelude::*;

@@ -383,6 +383,48 @@ impl CrossFileLookup for ModuleIndex {
         self.rehydrate_rows_or_resident(cached)
     }
 
+    fn sweep_consult_answer(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+    ) -> Option<Arc<crate::model::witnesses::ReducedValue>> {
+        let guard = super::registration::sweep_answers_read()?;
+        let sa = guard.as_ref()?;
+        let stamp = self.core.shape_bumps.load(std::sync::atomic::Ordering::Relaxed);
+        if sa.stamp_load() != stamp {
+            // Lazy reset, same rule as SweepMemo: a shape change mid-sweep
+            // voids every remembered verdict.
+            sa.reset_to(stamp);
+            crate::util::ghost_stats::count("sweepans.invalidated");
+            return None;
+        }
+        let hit = sa.get(path, key);
+        crate::util::ghost_stats::count(if hit.is_some() {
+            "sweepans.hit"
+        } else {
+            "sweepans.miss"
+        });
+        hit
+    }
+
+    fn remember_sweep_consult(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+        value: &crate::model::witnesses::ReducedValue,
+    ) {
+        if let Some(guard) = super::registration::sweep_answers_read() {
+            if let Some(sa) = guard.as_ref() {
+                let stamp =
+                    self.core.shape_bumps.load(std::sync::atomic::Ordering::Relaxed);
+                if sa.stamp_load() == stamp {
+                    sa.insert(path, key, value);
+                    crate::util::ghost_stats::count("sweepans.store");
+                }
+            }
+        }
+    }
+
     fn candidate_may_declare(
         &self,
         cached: &Arc<CachedModule>,

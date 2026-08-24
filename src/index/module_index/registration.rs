@@ -29,6 +29,95 @@ struct SweepMemo {
     map: std::collections::HashMap<std::path::PathBuf, Arc<FileAnalysis>>,
 }
 
+/// The SWEEP-WIDE consult-verdict store: (candidate path, point-free query)
+/// → that candidate's whole contribution, shared across files AND rayon
+/// workers for the lifetime of one batch sweep. The per-file `SweepMemo`
+/// below makes a FETCH cheap; this makes the CHASE run once per (query,
+/// candidate) per sweep instead of once per consuming file — first-encounter
+/// pairs per build are the n² a package-main corpus produces (FHEM: 12.3M
+/// attempts ≈ keys × providers × files). Stamp-guarded like `SweepMemo`:
+/// any shape bump clears it, so a mid-sweep registration cannot serve a
+/// verdict from a previous world.
+pub(super) struct SweepAnswers {
+    stamp: std::sync::atomic::AtomicU64,
+    map: DashMap<
+        (std::path::PathBuf, crate::model::witnesses::ConsultVerdictKey),
+        Arc<crate::model::witnesses::ReducedValue>,
+    >,
+}
+
+static SWEEP_ANSWERS: std::sync::RwLock<Option<SweepAnswers>> = std::sync::RwLock::new(None);
+
+impl SweepAnswers {
+    pub(super) fn stamp_load(&self) -> u64 {
+        self.stamp.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Void every verdict and adopt the new shape stamp. Runs under the
+    /// READ lock deliberately — `DashMap::clear` is concurrent-safe, and a
+    /// racing reader that sees a half-cleared map only misses, never serves
+    /// a stale verdict (the stamp is re-checked per access).
+    pub(super) fn reset_to(&self, stamp: u64) {
+        self.map.clear();
+        self.stamp.store(stamp, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(super) fn get(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+    ) -> Option<Arc<crate::model::witnesses::ReducedValue>> {
+        self.map
+            .get(&(path.to_path_buf(), key.clone()))
+            .map(|e| Arc::clone(e.value()))
+    }
+    pub(super) fn insert(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+        value: &crate::model::witnesses::ReducedValue,
+    ) {
+        self.map
+            .insert((path.to_path_buf(), key.clone()), Arc::new(value.clone()));
+    }
+}
+
+/// The open sweep store, if any — `lookup.rs`'s access seam.
+pub(super) fn sweep_answers_read(
+) -> Option<std::sync::RwLockReadGuard<'static, Option<SweepAnswers>>> {
+    SWEEP_ANSWERS.read().ok()
+}
+
+/// Opens the sweep-wide verdict store; closes (and drops it) on drop.
+/// `PERL_LSP_NO_SWEEP_ANSWERS=1` leaves it closed — the A/B control.
+pub struct SweepAnswerGuard(());
+
+impl SweepAnswerGuard {
+    pub fn open() -> Self {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| {
+            std::env::var("PERL_LSP_NO_SWEEP_ANSWERS").as_deref() == Ok("1")
+        });
+        if !off {
+            if let Ok(mut slot) = SWEEP_ANSWERS.write() {
+                *slot = Some(SweepAnswers {
+                    // Sentinel: the first access stamps the real shape and
+                    // clears, so an open never inherits a stale world.
+                    stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
+                    map: DashMap::new(),
+                });
+            }
+        }
+        SweepAnswerGuard(())
+    }
+}
+
+impl Drop for SweepAnswerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SWEEP_ANSWERS.write() {
+            *slot = None;
+        }
+    }
+}
+
 /// Opens a rehydration memo for one file's sweep; closes it on drop.
 pub struct SweepMemoGuard(());
 
@@ -548,7 +637,18 @@ impl ModuleIndex {
         // them back — an enriched copy of a DEGRADED analysis claimed to be
         // whole. Clone carries them.
         let mut copy: FileAnalysis = (*whole).clone();
-        copy.enrich_imported_types_with_keys_for(Some(self), Some(&cached.path));
+        // A session around the build, same as `enrich_open`'s: the overlay's
+        // enrichment is where the cross-file consult cascade lives (FHEM
+        // measured 12.3M SlotType attempts inside these builds, every one
+        // `session.absent`), and without a session the candidate-answer memo
+        // is inert on exactly the path that repeats. A caller already holding
+        // a session (server verbs) nests — this owns only when outermost.
+        {
+            let _session = crate::model::witnesses::ResolutionSession::enter(Some(
+                self as &dyn crate::model::file_analysis::CrossFileLookup,
+            ));
+            copy.enrich_imported_types_with_keys_for(Some(self), Some(&cached.path));
+        }
         let arc = Arc::new(copy);
         // Cycle-tainted: some dep declined mid-enrich (mutual imports), so
         // this copy baked a RAW view of that dep. Caching it would serve

@@ -56,6 +56,35 @@ struct CandidateKey {
     framework: FrameworkFact,
 }
 
+/// The SESSION-independent spelling of a candidate consult: what one
+/// (point-free) query asks of one candidate file, minus the path (the
+/// sweep-tier store pairs it with the path itself). The public sibling of
+/// `CandidateKey`, carried across `CrossFileLookup::sweep_consult_answer`
+/// so a batch sweep can remember verdicts ACROSS files and workers — the
+/// session memo is thread-local and per-verb, and first-encounter pairs
+/// per build are exactly the n² a package-main corpus produces.
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct ConsultVerdictKey {
+    pub attachment: WitnessAttachment,
+    pub receiver: Option<String>,
+    pub arity: Option<u32>,
+    pub framework: FrameworkFact,
+}
+
+impl ConsultVerdictKey {
+    /// The key for `q`, point-normalized by construction (the sweep tier
+    /// only ever stores point-free verdicts — cross-file sub-queries
+    /// normalize the consumer's point out).
+    pub fn of(q: &ReducerQuery) -> ConsultVerdictKey {
+        ConsultVerdictKey {
+            attachment: q.attachment.clone(),
+            receiver: q.receiver.as_ref().map(|t| format!("{t:?}")),
+            arity: q.arity_hint,
+            framework: q.framework,
+        }
+    }
+}
+
 struct SessionState {
     /// Data address of the lookup this session was opened on. Entries are
     /// only valid under it (see the visibility-scope gate above).
