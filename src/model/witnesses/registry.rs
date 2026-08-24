@@ -440,6 +440,19 @@ impl ReducerRegistry {
         // being counted, not separate questions.
         let top_moc = matches!(q.attachment, WitnessAttachment::PackageSymbol { .. });
         if top_moc {
+            // Attribution: what share of top-level moc queries are main-keyed?
+            // Two buckets, not per-package keys — a script-heavy corpus mints
+            // these from every plain call, and the question a fix must answer
+            // is main's SHARE, not a cardinality-unbounded census.
+            if crate::util::ghost_stats::enabled() {
+                if let WitnessAttachment::PackageSymbol { package, .. } = &q.attachment {
+                    crate::util::ghost_stats::count(if package == "main" {
+                        "mocpkg.main"
+                    } else {
+                        "mocpkg.other"
+                    });
+                }
+            }
             TOUCHED_EXPR.with(|c| c.set(false));
         }
         // Sole boundary where an owned `ReducedValue` is required; the
@@ -1340,6 +1353,13 @@ impl ReducerRegistry {
                 continue;
             }
             crate::util::ghost_stats::count("moc.provider_fetched");
+            // Attribution twin of `mocpkg.*`: which class family drives the
+            // FETCHES (each one a decode on LRU miss), not just the queries.
+            crate::util::ghost_stats::count(if package == "main" {
+                "mocfetch.main"
+            } else {
+                "mocfetch.other"
+            });
             // The three costs of one cross-file consult, split
             // because a conclusion layer would remove the first
             // two and CANNOT remove the third (enrichment is bag

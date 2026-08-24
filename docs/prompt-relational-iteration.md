@@ -73,32 +73,59 @@ the relation that answers it, and the soundness constraint.
    candidate's decode) — that bounds a first-match hit at the matching module;
    the name relation is still what deletes the scan for misses.
 
-4. **The `MethodCall` stamp as a `Link`.** The frozen `MethodTarget` exists so
+4. **The registry chase's no-answer fetches, and `main`'s program scope.**
+   Measured on a real-CPAN corpus (12k files, 54% package-less scripts)
+   against the substrate: top-level `PackageSymbol` query DENSITY is nearly
+   equal (~180–200/file both), so query volume is not the differentiator —
+   the OUTCOME MIX is. Substrate: ~3% of queries reach a candidate bag fetch
+   and 52% of fetches answer nothing; real-CPAN: ~44% fetch and **94% of
+   1.06M fetches answer nothing** — a million decodes to learn nothing,
+   at ~1.5 candidates per escalation (so candidate-set narrowing is NOT the
+   lever; the fan-out was never large). Three levers, separable:
+   - **Don't decode to learn nothing**: the slice-1 syms-rows probe applied
+     before the chase's `bag_present` (the `moc.provider_fetched` sites)
+     kills the symbol-absent subset of no-answer fetches. Its coverage —
+     what fraction of no-answer fetches are symbol-absent vs
+     present-but-unanswerable — is the slice's own first measurement.
+   - **`main` is program-scoped**: an empty package resolves to `"main"`
+     (`resolve/collect.rs`), and two scripts never share a stash, so a
+     workspace-relation answer for a script's `main` is cross-program
+     pollution — wrong, not just wasteful. Fix is the ScopedLookup/T3
+     shape: main's candidates from asker F = F plus F's load closure's
+     explicit-`package main` files; a scope rule keyed on program-locality,
+     never a string match. Cost share is measured by the `mocpkg.*` /
+     `mocfetch.*` attribution counters (negligible on the substrate, whose
+     indexed root holds few scripts; unmeasured on script-heavy corpora).
+   - **The R4 escalation lane**: `consult.moc_primary` counts raw-bag-None
+     escalations to `enriched_present` — each is an overlay consult, its
+     cost read directly from `consult.enriched` accumulated ns.
+
+5. **The `MethodCall` stamp as a `Link`.** The frozen `MethodTarget` exists so
    an answer cannot depend on which verb asked; a conclusion `Link` is
    verb-independent by construction and cheap to evaluate. If the stamp's
    product were the ladder rather than the resolved value, the enrichment
    re-stamp collapses into the flush worklist's cutoff.
 
-5. **Return-type consults through conclusions.** `MethodOnClass` is 96.0% of
+6. **Return-type consults through conclusions.** `MethodOnClass` is 96.0% of
    measured cross-file consults; serving them from the conclusion map removes
    the chase's bag decodes and the transitive overlay recursion behind them.
    This is the conclusion layer's own roadmap; listed here because it retires
    the `enriched_present` fallback that makes enrichment recursive.
 
-6. **Residency policy for digests.** The export gate won because
+7. **Residency policy for digests.** The export gate won because
    `export`/`export_ok` happen to be non-evictable axes; per-package
    method-name sets and bridge entity names lose because they happen not to
    be. "What survives the strip" should be derived from what the confirm
    loops read, not from field placement. The Surface already computes
    per-file method names and throws them away.
 
-7. **Overlay key honesty.** `enriched_snapshot`'s key fingerprints the file
+8. **Overlay key honesty.** `enriched_snapshot`'s key fingerprints the file
    plus its *declared* providers, but enrichment also reads bridges and
    loader shapes from undeclared files. Today the staleness channel is masked
    by how rarely an overlay survives to be reused; any retention improvement
    makes it a live correctness hole. Close it before improving retention.
 
-8. **Enrichment as a delta artifact.** Every recursive consumer of an
+9. **Enrichment as a delta artifact.** Every recursive consumer of an
    enriched analysis reads only the bag (`docs/adr/enrichment-build-cost.md`,
    consumer matrix), and the measured enrichment delta is 4.13% of base heap.
    The truncate-to-baseline + swap dance is imperative state management for
