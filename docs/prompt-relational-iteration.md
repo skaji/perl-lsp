@@ -108,6 +108,20 @@ the relation that answers it, and the soundness constraint.
    keyed with the point displaced 20 of 12.3M — inert by construction,
    found by measurement.
 
+   **The RSS half closed as two mechanisms, seven dead suspects later**
+   (walk residency, overlay clones, sweep path memo, arena retention,
+   diagnostics channel — each killed by a control arm or a byte counter,
+   never by arithmetic): (a) **brk retention of decode-and-drop churn**
+   owns the SUSTAINED figure — `MALLOC_MMAP_THRESHOLD_=65536` returns 53%
+   (the server's number; ship posture is a product trade — jemalloc /
+   threshold / accept); (b) **per-worker in-flight working sets** own the
+   CREST — one file's sweep memo measured 633 MB, peak linear in worker
+   count at an invariant per-file footprint — fixed by byte-capping the
+   per-file sweep memo (256 MB drop-oldest, `PERL_LSP_SWEEP_MEMO_MB`),
+   the corpus-neutral shape: a worker cap was measured nearly free on
+   FHEM (memory-bound) but would tax a CPU-bound corpus. The path memo
+   itself is LOAD-BEARING (1.55x wall) and stays.
+
 4. **The registry chase's no-answer fetches, and `main`'s program scope.**
    Measured on a real-CPAN corpus (12k files, 54% package-less scripts)
    against the substrate: top-level `PackageSymbol` query DENSITY is nearly
