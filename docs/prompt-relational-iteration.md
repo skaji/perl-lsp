@@ -69,20 +69,22 @@ the relation that answers it, and the soundness constraint.
    asks the `syms` rows first and skips the rehydrate on proven absence.
    Constraints honored: fail-open everywhere the store cannot speak (below).
 
-2. **`module_declaring_method_in_package`** — same probe, same guardrails,
-   different loop (`queries.rs`): the typeglob-install last resort scans the
-   class's provider bucket with a `symbols_present` per candidate, and it runs
-   on exactly the misses. One call into the same pre-filter.
+2. **`module_declaring_method_in_package`** — LANDED. Same probe, same
+   guardrails, different loop; it runs on exactly the misses. Cold
+   substrate: 24,506 of 25,523 candidate scans skipped (96%), found-rate
+   unchanged; slice 1's equivalence evidence covers it a fortiori
+   (`has_sub_in_package` is a strict subset of the walk's member test).
 
-3. **Bridge entities by name.** `for_each_entity_bridged_to` decodes every
-   module bridging to a class to enumerate entity names, because
-   `PluginNamespace.entities` are `SymbolId`s into the evicted symbols vec —
-   the bridge survives the strip, the names it points at do not. Either a
-   `(class, entity_name, file)` row family or entity names denormalized into
-   the plugin lane deletes the per-helper-call scan of every plugin file. The
-   visitor's missing early exit is FIXED (`ControlFlow`, Break before the next
-   candidate's decode) — that bounds a first-match hit at the matching module;
-   the name relation is still what deletes the scan for misses.
+3. **Bridge entities by name — LANDED, without the row family.** Bridged
+   entities are standard symbols of their file, already shredded, so a
+   container-BLIND rows probe (`sym_name_row_exists` — an entity's container
+   is the plugin's home package, not the bridged class) gates each
+   candidate's decode. `for_each_entity_bridged_to_named` carries the name
+   as a pre-filter license; the first-match-by-name consumers ride it, the
+   early exit bounds hits, the probe deletes the per-miss scan. The
+   `(class, entity_name, file)` row family stays unbuilt unless a corpus
+   shows the name-only probe leaking (a plugin file declaring the queried
+   name OUTSIDE the bridging namespace still decodes — over-approx, sound).
 
 4. **The registry chase's no-answer fetches, and `main`'s program scope.**
    Measured on a real-CPAN corpus (12k files, 54% package-less scripts)
