@@ -512,18 +512,30 @@ pub fn open_and_load_diag(
 /// open); hits are the overwhelming population and hits pay zero.
 ///
 /// WHY the blob lane may ride a retained connection even though
-/// `load_one_diag`'s single-row path skips stamp validation: the stale read
-/// an out-of-process clear could serve is CAUSALLY unreachable. A rehydrate
-/// for a changed file exists only after that file's copy was evicted, and
-/// eviction happens only AFTER its new blob's chunk COMMITS (the residency
-/// discipline's own ordering) — so the loader call, and the per-call inode
-/// recheck inside `with`, postdate the commit they must observe. Either the
-/// writer still holds the old inode (reads of it see its own writes —
-/// consistent), or the recheck sees the recreated file and reopens. The
-/// multi-row (dual-homed) path additionally prefers a stamp-matching row.
+/// `load_one_diag`'s single-row path skips stamp validation (its caller
+/// invalidates on file change — the note above `load_one_diag` is the other
+/// half of this invariant): the two eviction branches close by two
+/// DIFFERENT arguments, and both must hold.
+///
+/// CAPACITY eviction (`PackBagCache::evict_to_cap` — the common branch on a
+/// working set over the cap) is not downstream of any commit, but its
+/// rehydrates are for UNCHANGED files: under an out-of-process clear the
+/// retained old inode serves last-committed data that still matches the
+/// files as they are — consistent-but-old, degrading together with every
+/// other read on the same snapshot.
+///
+/// The stale-vs-new hazard — a CHANGED file's pre-change blob served after
+/// its re-index — needs the CHANGE branch, and there eviction happens only
+/// AFTER the new blob's chunk COMMITS (the residency discipline's own
+/// ordering), so the loader call and the per-call inode recheck inside
+/// `with` postdate the commit they must observe: either the writer still
+/// holds the old inode (reads of it see its own writes — consistent) or
+/// the recheck sees the recreated file and reopens. The multi-row
+/// (dual-homed) path additionally prefers a stamp-matching row.
+///
 /// A future lane on this connection whose reads neither self-validate nor
-/// inherit this eviction-after-commit causality re-opens the hole — do not
-/// reuse the retained reader for such a lane without its own argument.
+/// fit one of these two arguments re-opens the hole — do not reuse the
+/// retained reader for such a lane without its own argument.
 #[cfg(not(test))]
 pub fn open_and_load_diag_retained(
     retained: &RetainedReader,
