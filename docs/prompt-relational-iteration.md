@@ -82,11 +82,19 @@ the relation that answers it, and the soundness constraint.
    1.06M fetches answer nothing** — a million decodes to learn nothing,
    at ~1.5 candidates per escalation (so candidate-set narrowing is NOT the
    lever; the fan-out was never large). Three levers, separable:
-   - **Don't decode to learn nothing**: the slice-1 syms-rows probe applied
-     before the chase's `bag_present` (the `moc.provider_fetched` sites)
-     kills the symbol-absent subset of no-answer fetches. Its coverage —
-     what fraction of no-answer fetches are symbol-absent vs
-     present-but-unanswerable — is the slice's own first measurement.
+   - **Don't decode to learn nothing** — RETIRED as a new probe by the
+     consult decomposition (12k real-CPAN corpus: `baked_open` 59.9%,
+     `not_local` 12.1%, `absent_but_inherits` 0.3%). The conclusion map's
+     `NotLocal` verdict IS the symbol-absence skip, already live and
+     carrying an eighth of consults; adding a rows probe beside it would be
+     a third absence oracle where the leak is elsewhere. The leak:
+     `OpenReason::AbsentNotClosed` — absence proves nothing for a class
+     whose ancestry leaves the file (measured 70.3% of decodes, 97.6% on
+     classes the map DOES conclude about) — i.e. **closedness is a
+     cross-file property and only per-file bakes exist**. The lever is a
+     world-level closedness verdict (the flush evaluates against a world;
+     its product can stamp classes whose full ancestry enumeration is
+     known), which is the conclusion layer's roadmap, not a new oracle.
    - **`main` is program-scoped**: an empty package resolves to `"main"`
      (`resolve/collect.rs`), and two scripts never share a stash, so a
      workspace-relation answer for a script's `main` is cross-program
