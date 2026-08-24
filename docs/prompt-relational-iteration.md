@@ -88,13 +88,21 @@ the relation that answers it, and the soundness constraint.
      `NotLocal` verdict IS the symbol-absence skip, already live and
      carrying an eighth of consults; adding a rows probe beside it would be
      a third absence oracle where the leak is elsewhere. The leak:
-     `OpenReason::AbsentNotClosed` — absence proves nothing for a class
-     whose ancestry leaves the file (measured 70.3% of decodes, 97.6% on
-     classes the map DOES conclude about) — i.e. **closedness is a
-     cross-file property and only per-file bakes exist**. The lever is a
-     world-level closedness verdict (the flush evaluates against a world;
-     its product can stamp classes whose full ancestry enumeration is
-     known), which is the conclusion layer's roadmap, not a new oracle.
+     the OpenReason distribution, which is CORPUS-SHAPED — substrate-era
+     prior: `AbsentNotClosed` 70.3% of decodes; 12k real-CPAN reading:
+     `no_answer_linkable` 49.7%, `no_answer_self_only` 25.5%,
+     `absent_not_closed` 22.8%. Two levers, both conclusion-layer roadmap,
+     ranked by that reading: (a) **`Link` minting** — built, flag-gated
+     (`PERL_LSP_MINT_LINKS`), parked on a substrate measurement (decodes
+     4,103→4,104; "a follow abandons at the first rung whose own map says
+     Decode") that predates knowing the linkable population is half of all
+     open reasons on real CPAN — unparked-by-corpus is one A/B away, and a
+     follow's win is bounded by TARGET-side closedness, so score
+     `baked_follow` vs `baked_follow_incomplete` in both arms, not just
+     decode count; (b) **world-level closedness** (the flush evaluates
+     against a world; its product can stamp classes whose full ancestry
+     enumeration is known) — converts the `absent_not_closed` fifth and
+     raises every follow's completion odds, so it compounds (a).
    - **`main` is program-scoped**: an empty package resolves to `"main"`
      (`resolve/collect.rs`), and two scripts never share a stash, so a
      workspace-relation answer for a script's `main` is cross-program
