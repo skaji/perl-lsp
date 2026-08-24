@@ -636,6 +636,12 @@ impl ModuleIndex {
         // silently reset them to false and `after_deserialize` never put
         // them back — an enriched copy of a DEGRADED analysis claimed to be
         // whole. Clone carries them.
+        // Byte accounting for the RSS attribution (the clone + its source are
+        // both live per worker for the build's duration): what one build holds.
+        crate::util::ghost_stats::add_n(
+            "overlay.clone_bytes",
+            whole.heap_estimate().total() as u64,
+        );
         let mut copy: FileAnalysis = (*whole).clone();
         // A session around the build, same as `enrich_open`'s: the overlay's
         // enrichment is where the cross-file consult cascade lives (FHEM
@@ -1294,6 +1300,17 @@ impl ModuleIndex {
                     SWEEP_MEMO.with(|c| {
                         if let Some(memo) = c.borrow_mut().as_mut() {
                             if memo.stamp == stamp {
+                                // Byte accounting for the RSS attribution: the
+                                // memo holds WHOLE decoded analyses for one
+                                // file's entire sweep, per worker — on a
+                                // wide-provider corpus that lifetime is the
+                                // suspect holder. `bytes_inserted` bounds what
+                                // a sweep cycles through; entries × giant
+                                // sizes is what a peak reader compares RSS to.
+                                crate::util::ghost_stats::add_n(
+                                    "sweep.memo_bytes_inserted",
+                                    full.heap_estimate().total() as u64,
+                                );
                                 memo.map.insert(cached.path.clone(), Arc::clone(&full));
                             }
                         }
