@@ -201,7 +201,10 @@ pub struct ModuleIndex {
     /// Perl hub only today: pack languages have no open-doc surface
     /// recorder yet, so guarding their background writes would freeze
     /// records staleward.
-    open_doc_paths: Arc<DashMap<std::path::PathBuf, ()>>,
+    /// Open documents, and whether the OPEN-DOC lane has actually recorded a
+    /// surface for each yet. The flag is what `Background` suppression tests:
+    /// yielding to "a doc is open here" yields to a writer that may not exist.
+    open_doc_paths: Arc<DashMap<std::path::PathBuf, bool>>,
     /// Every pack file registered, keyed by canonical path — including files
     /// that declare NOTHING registrable (a header-only `#include` shim). The
     /// name-keyed views can't reach those, but whole-project sweeps

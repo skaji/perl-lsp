@@ -1264,17 +1264,19 @@ fn close_reconciles_the_disk_record() {
     let disk = build_fa("package Gadget;\nsub base { 1 }\n1;\n");
     let buffer = build_fa("package Gadget;\nsub base { 1 }\nsub unsaved { 2 }\n1;\n");
 
-    // The indexed disk copy (registration records Background — but the doc
-    // opens first here, so the registration's record is suppressed and the
-    // copy still registers).
+    // The indexed disk copy. The doc opens first, but the open-doc lane has
+    // recorded nothing yet, so the registration's Background write LANDS —
+    // suppression protects an open-doc baseline and there is none to protect.
     idx.mark_doc_open(&path);
     let _ = idx.register_workspace_resident(path.clone(), Arc::new(disk));
-    // Open-doc record: the buffer's unsaved contract change. FirstSeen —
-    // the registration's background record above was suppressed, so this
-    // is the freshness index's first sight of the path.
+    // Open-doc record: the buffer's unsaved contract change, against the disk
+    // state the registration just recorded. Changed, and truthfully so — the
+    // buffer really does differ from disk. This read FirstSeen while a
+    // Background write on a never-recorded open path was suppressed, which is
+    // the same window that left an open file declaring no dependencies.
     assert_eq!(
         idx.record_and_dirty(&path, &buffer, SurfaceWrite::OpenDoc).verdict,
-        SurfaceVerdict::FirstSeen
+        SurfaceVerdict::Changed
     );
 
     // Close: reconcile against the registered disk copy.
@@ -2756,5 +2758,64 @@ fn a_rejected_row_enqueues_its_path_for_repair_exactly_once() {
         1,
         "a rejected row must enqueue its path for repair — and five \
          rejections of one path are one repair, not five"
+    );
+}
+
+/// A Background write LANDS on an open path the open-doc lane has not
+/// recorded yet — and the consumer edge it declares exists immediately.
+///
+/// The suppression rule protects an open-doc BASELINE, so it only means
+/// something once one exists. Keyed on mere openness it yielded to a writer
+/// that did not exist: between `didOpen` and the first debounced refresh the
+/// file had no record at all, declared no dependencies, and a watcher-driven
+/// wave over one of its providers found no consumer and marked nobody. The
+/// verdict lied too — `Unchanged` about a path the index had never seen.
+///
+/// Two-sided on purpose. The `FirstSeen` assertion cannot be satisfied by the
+/// fail-open default, and the suppression assertion below it pins that the
+/// fix did not simply delete the rule.
+#[test]
+fn a_background_write_lands_until_the_open_doc_lane_has_recorded() {
+    use crate::index::module_index::SurfaceWrite;
+    use crate::model::surface::{Surface, SurfaceVerdict};
+
+    let idx = ModuleIndex::new_for_cli();
+    let consumer = std::path::PathBuf::from("/fake/Con.pm");
+    let provider = std::path::PathBuf::from("/fake/Prov.pm");
+    let con = parse_source_to_cached("package Con;\nuse Prov;\nsub r { 1 }\n1;\n", "Con");
+    let prov = parse_source_to_cached("package Prov;\nsub m { 1 }\n1;\n", "Prov");
+    idx.record_surface(&provider, &prov.analysis);
+
+    idx.mark_doc_open(&consumer);
+    let v = idx.record_surface(&consumer, &con.analysis);
+    assert_eq!(
+        v,
+        SurfaceVerdict::FirstSeen,
+        "a Background write on an open path with NO open-doc record was \
+         suppressed, and told its caller `Unchanged` about a file the index \
+         has never seen"
+    );
+    assert!(
+        idx.dirty_consumers(&provider).contains(&consumer),
+        "the consumer edge must exist as soon as the record does — without \
+         it a wave over Prov marks nobody, which is 6a's whole inert lane"
+    );
+
+    // The rule still applies once there IS a baseline to protect: an
+    // open-doc write claims the path, and Background yields to it again.
+    idx.record_and_dirty_value(
+        &consumer,
+        Surface::project(&con.analysis),
+        SurfaceWrite::OpenDoc,
+    );
+    let moved = parse_source_to_cached(
+        "package Con;\nuse Prov;\nsub r { 1 }\nsub s { 2 }\n1;\n",
+        "Con",
+    );
+    assert_eq!(
+        idx.record_surface(&consumer, &moved.analysis),
+        SurfaceVerdict::Unchanged,
+        "a Background write must yield once the open-doc lane owns the record \
+         — consumers read the buffer, and the disk state is not what they see"
     );
 }
