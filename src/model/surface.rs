@@ -118,6 +118,18 @@ pub struct Surface {
     pub imports: Vec<String>,
     pub exports: Vec<String>,
     pub exports_ok: Vec<String>,
+    /// Plugin loads that carry a config value: load-name → the value's shape,
+    /// sorted.
+    ///
+    /// Cross-file-visible even though it names nothing this file exports. The
+    /// LOADED module's `register($self, $conf)` gets `$conf` typed from here,
+    /// and its consumers' unknown-hash-key diagnostics key off the resulting
+    /// CLOSED shape — so an edit that only adds a key to the config hash
+    /// changes no member anywhere and must still flip the verdict. Without it
+    /// the verdict reads Unchanged, no open consumer re-enriches, and every one
+    /// of them keeps diagnosing against the old key set for the rest of the
+    /// session.
+    pub loader_shapes: Vec<(String, InferredType)>,
     /// `%EXPORT_TAGS` membership, tag → sorted members. A member moving
     /// between tags (or a tag rename) changes what a consumer's
     /// `use Foo qw(:tag)` binds even when the flat `exports_ok` set is
@@ -314,6 +326,21 @@ impl Surface {
             .collect();
         imports.sort_unstable();
         imports.dedup();
+        // Resolved here rather than carried on the fact: `project` runs on the
+        // WHOLE analysis before any eviction (`prepare_workspace_parts` /
+        // `prepare_pack_parts` own that ordering), so the bag is present and
+        // this needs no second copy of the answer to keep in sync.
+        let mut loader_shapes: Vec<(String, InferredType)> = feed
+            .plugin_loads
+            .iter()
+            .filter_map(|f| {
+                let t = fa.expr_type_at_span(f.config_span?, None)?;
+                Some((f.name.clone(), despan(&t)))
+            })
+            .collect();
+        loader_shapes
+            .sort_by(|a, b| (&a.0, format!("{:?}", a.1)).cmp(&(&b.0, format!("{:?}", b.1))));
+        loader_shapes.dedup();
         let sorted = |v: &[String]| {
             let mut v = v.to_vec();
             v.sort_unstable();
@@ -363,6 +390,7 @@ impl Surface {
             imports,
             exports: sorted(feed.export),
             exports_ok: sorted(feed.export_ok),
+            loader_shapes,
             export_tags,
             reexports: sorted(feed.reexport_modules),
             plugin_bridges,

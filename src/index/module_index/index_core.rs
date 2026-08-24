@@ -71,6 +71,31 @@ pub(crate) struct IndexCore {
     /// missed bump is silent staleness, so mutators bump even when a gen
     /// mint usually accompanies them.
     pub(crate) shape_bumps: std::sync::atomic::AtomicU64,
+    /// The flush clock, and the per-file marks compared against it.
+    ///
+    /// The re-stamp gate's whole mechanism: a flush bumps `flush_epoch` once,
+    /// then records that epoch for every consumer it enqueued
+    /// (`provider_diff_gen`). A file whose own `stamped_at` is at or past its
+    /// mark has had no provider move since it last stamped, so its re-stamp is
+    /// re-deriving what it already froze.
+    ///
+    /// Sessional on purpose: `FileAnalysis::stamped_at` is `#[serde(skip)]`,
+    /// so both halves die with the process and a fresh one fails open. A
+    /// persisted mark table paired with sessional stamps would be sound; a
+    /// persisted STAMP paired with sessional marks would silently skip a
+    /// re-stamp that was owed, so neither half may outlive the other.
+    ///
+    /// **A dedicated clock, and not the conclusion store's generation** — the
+    /// obvious-looking consolidation, ruled out on purpose. A comparison clock
+    /// must share its lifetime with the operands it orders, and these operands
+    /// are sessional. A persistent clock over sessional operands fails the
+    /// mirror of the half-persistence case above: a restart resets stamps and
+    /// marks while the store generation carries on, so any path that ever
+    /// seeded `stamped_at` from a persisted value would compare a new-session
+    /// stamp against an old-session clock. This counter cannot express that
+    /// bug. If the marks are ever persisted, all three move together.
+    pub(crate) flush_epoch: std::sync::atomic::AtomicU64,
+    pub(crate) provider_diff_gen: DashMap<std::path::PathBuf, u64>,
     /// The witness seams' fallback-on-miss enriched retries only pay off
     /// when the process lives long enough to amortize the overlay (each
     /// miss is a whole-analysis deep copy + enrich). Off by default; the
@@ -89,6 +114,10 @@ pub(crate) struct IndexCore {
     /// install stays visible to them. See `docs/adr/memory-slice-2-lru.md`.
     pub(crate) bag_cache:
         Arc<std::sync::RwLock<Option<Arc<crate::index::pack_bag_cache::PackBagCache>>>>,
+    /// Resident baked conclusions, byte-bounded. Installed alongside the bag
+    /// cache; absent on an index with no store, which simply keeps decoding.
+    pub(crate) conclusion_cache:
+        Arc<std::sync::RwLock<Option<Arc<crate::index::conclusion_cache::ConclusionCache>>>>,
 }
 
 impl IndexCore {
@@ -116,8 +145,11 @@ impl IndexCore {
             registration_gen: DashMap::new(),
             gen_counter: std::sync::atomic::AtomicU64::new(1),
             shape_bumps: std::sync::atomic::AtomicU64::new(0),
+            flush_epoch: std::sync::atomic::AtomicU64::new(0),
+            provider_diff_gen: DashMap::new(),
             long_lived: std::sync::atomic::AtomicBool::new(false),
             bag_cache: Arc::new(std::sync::RwLock::new(None)),
+            conclusion_cache: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 

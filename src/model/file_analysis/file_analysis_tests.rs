@@ -2776,3 +2776,68 @@ fn deep_isa_chain_within_visit_budget_still_resolves() {
         "depth 149 > the graph walker's 21, visits 150 < the isa budget 200: must hold"
     );
 }
+
+/// The re-stamp gate, honoured end to end — the skip actually happens, and the
+/// next wave un-skips it.
+///
+/// `restamp_gate_tests` covers the decision; this covers enrichment obeying it,
+/// which is the half that can rot silently. A gate that always answered "skip"
+/// and a gate that was never consulted look identical from the decision tests,
+/// and both look identical from every other suite, because a `MethodTarget`
+/// that is never re-derived simply keeps answering whatever it last held.
+///
+/// The observable is a poisoned binding: a re-stamp overwrites it, a skip
+/// leaves it. Nothing else in enrichment writes a baseline ref's binding, so
+/// the sentinel surviving means exactly one thing.
+#[test]
+fn a_marked_file_re_stamps_and_an_unmarked_one_skips() {
+    use crate::index::module_index::ModuleIndex;
+    use crate::model::file_analysis::{MethodTarget, RefBinding};
+
+    let path = std::path::PathBuf::from("/tmp/RestampGate.pm");
+    let mut fa = build_fa_from_source(
+        "package RestampGate;\nsub go { my $self = shift; return $self->hit }\nsub hit { return 1 }\n1;\n",
+    );
+    let idx = ModuleIndex::new_for_test();
+
+    let mc = |fa: &FileAnalysis| {
+        fa.refs
+            .iter()
+            .position(|r| matches!(r.kind, RefKind::MethodCall { .. }) && r.target_name == "hit")
+            .expect("the `$self->hit` MethodCall ref")
+    };
+    let i = mc(&fa);
+
+    // A wave marks the file, so the next enrichment is owed a re-stamp.
+    let epoch = idx.mark_provider_diff([path.clone()]);
+    fa.enrich_imported_types_with_keys_for(Some(&idx), Some(&path));
+    assert_eq!(
+        fa.stamped_at,
+        Some(epoch),
+        "the stamp records the clock as it read it"
+    );
+    let stamped = fa.refs[i].method_target().cloned();
+    assert!(stamped.is_some(), "precondition: the stamp resolves this call");
+
+    // Poison it. With no NEW mark, the file's stamp is at or past the only
+    // mark there is, so the gate must skip and the poison must survive.
+    fa.refs[i].binding = Some(RefBinding::Method(MethodTarget::CrossFile {
+        invocant_class: "SENTINEL".into(),
+    }));
+    fa.enrich_imported_types_with_keys_for(Some(&idx), Some(&path));
+    assert_eq!(
+        fa.refs[i].method_target().map(|t| t.invocant_class()),
+        Some("SENTINEL"),
+        "no provider moved since the last stamp, so the re-stamp is re-deriving \
+         what it already froze — the gate must skip it"
+    );
+
+    // A second wave re-opens the debt; the poison is overwritten.
+    idx.mark_provider_diff([path.clone()]);
+    fa.enrich_imported_types_with_keys_for(Some(&idx), Some(&path));
+    assert_eq!(
+        fa.refs[i].method_target().cloned(),
+        stamped,
+        "a provider moved, so the re-stamp runs and re-derives the real target"
+    );
+}

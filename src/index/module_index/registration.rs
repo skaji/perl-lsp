@@ -537,7 +537,7 @@ impl ModuleIndex {
         // them back — an enriched copy of a DEGRADED analysis claimed to be
         // whole. Clone carries them.
         let mut copy: FileAnalysis = (*whole).clone();
-        copy.enrich_imported_types_with_keys(Some(self));
+        copy.enrich_imported_types_with_keys_for(Some(self), Some(&cached.path));
         let arc = Arc::new(copy);
         // Cycle-tainted: some dep declined mid-enrich (mutual imports), so
         // this copy baked a RAW view of that dep. Caching it would serve
@@ -914,6 +914,22 @@ impl ModuleIndex {
         self.core.bag_cache.read().ok().and_then(|g| g.clone())
     }
 
+    pub fn set_conclusion_cache(
+        &self,
+        cache: Arc<crate::index::conclusion_cache::ConclusionCache>,
+    ) {
+        if let Ok(mut g) = self.core.conclusion_cache.write() {
+            *g = Some(cache);
+        }
+    }
+
+    pub(super) fn conclusion_cache_ref(
+        &self,
+    ) -> Option<Arc<crate::index::conclusion_cache::ConclusionCache>> {
+        self.core.conclusion_cache.read().ok().and_then(|g| g.clone())
+    }
+
+
     /// Install the relational ref index's read-connection opener (once).
     /// Callable post-`Arc` (interior `OnceLock`) because the hub is shared
     /// before the workspace root — and therefore the cache path — is known.
@@ -934,9 +950,59 @@ impl ModuleIndex {
     /// changed/saved file's copy is stale). Pack sub-indexes AND the Perl
     /// hub each carry one — the watcher and the bulk-index writers rely on
     /// this taking effect on both.
-    pub fn invalidate_bag_cache(&self, path: &std::path::Path) {
+    /// Record that a provider of each path moved. Returns the epoch used.
+    ///
+    /// The push half of the re-stamp gate. The epoch is minted before the
+    /// marks are written, which is safe only because the CALLER has already
+    /// registered the changed files' fresh analyses by the time it gets here:
+    /// a stamp that reads the new clock therefore also sees the new provider,
+    /// so honouring its own mark is correct. A caller that marked BEFORE
+    /// publishing the change would break that and needs a different ordering —
+    /// stated here rather than left as an accident of one call site.
+    ///
+    /// Called with the wave's ENQUEUED set, not its moved set: a consumer
+    /// whose own answers did not move can still dispatch differently once its
+    /// provider changed, and cutting the mark where the wave cut would skip
+    /// exactly those.
+    pub fn mark_provider_diff(
+        &self,
+        paths: impl IntoIterator<Item = std::path::PathBuf>,
+    ) -> u64 {
+        use std::sync::atomic::Ordering;
+        let epoch = self.core.flush_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut n = 0u64;
+        for p in paths {
+            // Max, not overwrite: marks arrive from concurrent waves and the
+            // gate is a `>=` against the LATEST provider move. A lower epoch
+            // landing last would license a skip the newer wave forbade.
+            self.core
+                .provider_diff_gen
+                .entry(p)
+                .and_modify(|g| *g = (*g).max(epoch))
+                .or_insert(epoch);
+            n += 1;
+        }
+        crate::util::ghost_stats::count_by("restamp.marked", n);
+        epoch
+    }
+
+    /// Drop every resident copy DERIVED from a path's blob — the decoded bag
+    /// and the baked conclusion map together.
+    ///
+    /// One call rather than two because they are void for the same reason and
+    /// at the same moment, and dropping only one is silently wrong in
+    /// different ways: a stale bag costs a wrong reference walk, a stale map
+    /// costs a wrong ANSWER (the cross-file primary consults it before it
+    /// decodes anything, and an `Outcome::Answer` short-circuits the chase).
+    /// The conclusion half went unwired for exactly as long as it was a
+    /// separate method someone had to remember. The store-side twin is
+    /// `module_cache::invalidate_generation`.
+    pub fn invalidate_derived_copies(&self, path: &std::path::Path) {
         if let Some(bc) = self.bag_cache_ref() {
             bc.invalidate(path);
+        }
+        if let Some(c) = self.conclusion_cache_ref() {
+            c.invalidate(path);
         }
     }
 

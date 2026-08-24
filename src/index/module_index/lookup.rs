@@ -242,6 +242,38 @@ impl CrossFileLookup for ModuleIndex {
         self.enrichment_epoch()
     }
 
+    fn flush_epoch(&self) -> u64 {
+        self.core.flush_epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn restamp_owed(&self, path: &std::path::Path, stamped_at: Option<u64>) -> bool {
+        // Never stamped: owed, unconditionally. Every rehydrated copy reads
+        // `None` (the field is `serde(skip)`), so this is the arm that keeps a
+        // cold process behaving exactly as it did before the gate existed.
+        let Some(stamped_at) = stamped_at else {
+            crate::util::ghost_stats::count("restamp.owed_never_stamped");
+            return true;
+        };
+        match self.core.provider_diff_gen.get(path) {
+            Some(mark) if stamped_at >= *mark => {
+                crate::util::ghost_stats::count("restamp.skipped");
+                false
+            }
+            Some(_) => {
+                crate::util::ghost_stats::count("restamp.owed_provider_moved");
+                true
+            }
+            // No mark at all. Not "no provider moved" — "no wave has ever
+            // spoken about this file", which is also what a lost mark, a
+            // never-flushed session and an uncovered freshness edge all look
+            // like. Fail open; the gate is worth only what it can prove.
+            None => {
+                crate::util::ghost_stats::count("restamp.owed_no_mark");
+                true
+            }
+        }
+    }
+
     fn get_cached(&self, module_name: &str) -> Option<Arc<CachedModule>> {
         self.get_cached(module_name)
     }
@@ -330,6 +362,34 @@ impl CrossFileLookup for ModuleIndex {
         self.enriched_snapshot(cached)
             .unwrap_or_else(|| self.bag_present(cached))
     }
+    fn class_is_bridged_to(&self, class: &str) -> bool {
+        // Bucket NON-EMPTY, not key-present: `purge_module` can leave an empty
+        // bucket behind, and a key-exists test would then report a bridge that
+        // no longer exists — permanently pessimising a class that used to be
+        // bridged.
+        self.core
+            .edges
+            .bridges
+            .get(class)
+            .is_some_and(|b| !b.is_empty())
+    }
+
+    fn conclusions_for(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ConclusionMap>> {
+        use crate::index::conclusion_cache::Cached;
+        match self.conclusion_cache_ref()?.get(path) {
+            // The Arc, not a clone of what it holds. Handing back an owned map
+            // deep-copies a ~72-entry HashMap per consult, and the consult path
+            // runs this tens of thousands of times per check — measured at a
+            // 6.7% REGRESSION against no conclusions at all, which is the whole
+            // saving spent on copying the thing that produced it.
+            Cached::Map(m) => Some(m),
+            Cached::NotBaked => None,
+        }
+    }
+
     fn bag_present(&self, cached: &Arc<CachedModule>) -> Arc<FileAnalysis> {
         // Never-evicted copy (open docs, degraded files kept whole): a cheap
         // Arc bump, no I/O.

@@ -23,8 +23,19 @@ on:
     types: [opened, synchronize, reopened, edited]
 
 # Cancel superseded runs when a PR branch is re-pushed.
+#
+# The no-op runs get their OWN group, and that is not a nicety. Every job here
+# carries `action != 'edited' || changes.base`, so a title or description edit
+# produces a run whose jobs all skip — but the run still exists, and under one
+# shared group `cancel-in-progress` had it CANCEL the real run in flight for
+# the same ref. Editing a PR description therefore killed its CI and left the
+# PR showing three skipped checks: a green-looking result from a run that did
+# nothing, which is the one failure mode a status check must never produce.
+# Keying the no-op runs on `run_id` gives each of them a group of its own, so
+# they cancel nothing; real runs keep sharing a group and keep superseding
+# each other.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ (github.event.action == 'edited' && !github.event.changes.base) && github.run_id || 'real' }}
   cancel-in-progress: true
 
 env:

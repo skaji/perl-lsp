@@ -224,9 +224,179 @@ impl FileAnalysis {
         self.rebuild_enrichment_indices();
     }
 
+}
+
+/// What a verb's consumers actually READ out of enrichment.
+///
+/// `LanguageScope`'s shape, applied one tier down: the verb declares what it
+/// needs and the machinery obeys, never asking which verb it serves. Soundness
+/// is by construction rather than by freshness — a product no consumer reads
+/// need not be produced, and that argument does not decay the way a cache's
+/// does.
+///
+/// The license for the first profile is an ablation, not a reading of the
+/// code: `--check`'s diagnostics lanes type invocants through the bag and
+/// resolve methods directly, so none of them consults `method_target()`. The
+/// re-stamp that fills it is therefore pure cost for that verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrichmentProfile {
+    stamp_method_targets: bool,
+}
+
+impl EnrichmentProfile {
+    /// Everything. The default, and what every server verb gets.
+    pub const fn full() -> Self {
+        EnrichmentProfile { stamp_method_targets: true }
+    }
+
+    /// Diagnostics only — no `MethodCall` dispatch-target re-stamp.
+    pub const fn diagnostics() -> Self {
+        EnrichmentProfile { stamp_method_targets: false }
+    }
+
+    /// Asked of the profile, never derived from a verb name by a consumer.
+    pub const fn stamps_method_targets(self) -> bool {
+        self.stamp_method_targets
+    }
+}
+
+/// The process's declared profile. `full()` until a verb says otherwise.
+static PROFILE: std::sync::OnceLock<EnrichmentProfile> = std::sync::OnceLock::new();
+
+/// Declare the profile for this process. **One-shot CLI verbs only.**
+///
+/// A process-wide cell is the verb's declaration precisely because a one-shot
+/// CLI process serves exactly one verb: there is no second consumer to be
+/// surprised, and nothing it enriches outlives the process — the
+/// `enriched_snapshot` overlay is resident, not persisted.
+///
+/// A SERVER verb must never call this. The overlay there is shared and
+/// fingerprint-keyed, so a partial copy cached under a profile-blind key would
+/// be served to a verb that reads more than it does — silently, and as a
+/// missing answer rather than an error. If a server verb ever wants a partial
+/// profile, the profile belongs IN the overlay key, and this cell is the wrong
+/// mechanism rather than one to extend. That form is deliberately not built:
+/// nothing wants it yet, and building it now would be a key change with no
+/// consumer to validate it.
+pub fn declare_enrichment_profile(profile: EnrichmentProfile) {
+    let _ = PROFILE.set(profile);
+}
+
+/// The profile in force. `full()` when nobody declared one.
+///
+/// `PERL_LSP_FULL_ENRICHMENT=1` overrides any declaration back to `full()`.
+/// That is the A/B CONTROL, and it is not optional decoration: once a verb
+/// declares a partial profile, the full behaviour is no longer reachable, and
+/// a claim of "set-identical output" becomes unfalsifiable the moment it
+/// cannot be re-run. `PERL_LSP_SKIP_MC_STAMP` only skips harder — it is the
+/// same direction as the profile, so it cannot serve as the control.
+pub fn enrichment_profile() -> EnrichmentProfile {
+    static FULL_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let forced = *FULL_OVERRIDE
+        .get_or_init(|| std::env::var_os("PERL_LSP_FULL_ENRICHMENT").is_some());
+    resolve_profile(PROFILE.get().copied(), forced)
+}
+
+/// The precedence rule, separated from the cells that hold it so it can be
+/// tested. Both cells are `OnceLock`s — a test that set either would decide
+/// the answer for every other test in the process, so the rule has to be
+/// reachable without them.
+///
+/// This is where a mistake would be quiet rather than loud: get the precedence
+/// backwards and the CONTROL stops working, which does not fail anything — it
+/// just makes every future "set-identical" claim unfalsifiable, because the
+/// full behaviour is no longer reachable to compare against.
+pub(crate) fn resolve_profile(
+    declared: Option<EnrichmentProfile>,
+    full_override: bool,
+) -> EnrichmentProfile {
+    if full_override {
+        return EnrichmentProfile::full();
+    }
+    declared.unwrap_or_else(EnrichmentProfile::full)
+}
+
+/// Does this run fill the `MethodCall` dispatch-target edge?
+///
+/// Two independent reasons not to, and they are different in kind: the PROFILE
+/// is policy (no consumer of this verb reads the edge) and the ABLATION is
+/// measurement (the flag that licensed the policy, kept alive so the claim
+/// stays re-checkable). Either suppresses; neither implies the other.
+pub(crate) fn should_stamp_method_targets(
+    profile: EnrichmentProfile,
+    ablation_set: bool,
+) -> bool {
+    profile.stamps_method_targets() && !ablation_set
+}
+
+/// Score every re-stamp the gate skipped, by running it anyway and comparing.
+///
+/// The gate's soundness is inherited, not proved: it is exactly as sound as
+/// the freshness edges that feed `dirty_consumers`, and a provider whose change
+/// never reaches them marks nobody. A wrong skip is silent — the frozen
+/// `MethodTarget` simply stays as it was, and goto-def keeps answering it — so
+/// the assumption ships with the switch that checks it, the same discipline as
+/// `PERL_LSP_CONCL_EQUIV` and `PERL_LSP_FLUSH_EQUIV`.
+///
+/// Costs strictly more than not gating at all, by design. It is a measurement
+/// mode, not a safety net for production.
+fn restamp_gate_equiv() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PERL_LSP_RESTAMP_EQUIV").is_ok())
+}
+
+impl FileAnalysis {
+    /// Run the skipped re-stamp and report whether it would have changed an
+    /// answer. `PERL_LSP_RESTAMP_EQUIV` only.
+    fn score_restamp_gate_skip(
+        &mut self,
+        module_index: Option<&dyn CrossFileLookup>,
+        path: Option<&std::path::Path>,
+    ) {
+        let before: Vec<Option<MethodTarget>> =
+            self.refs.iter().map(|r| r.method_target().cloned()).collect();
+        self.stamp_method_call_targets(module_index);
+        let diverged = self
+            .refs
+            .iter()
+            .map(|r| r.method_target().cloned())
+            .zip(before.iter())
+            .filter(|(now, was)| now != *was)
+            .count();
+        if diverged > 0 {
+            crate::util::ghost_stats::count_by("restampequiv.break", diverged as u64);
+            log::warn!(
+                "restamp equiv: the gate skipped {} target(s) that WOULD have \
+                 changed in {:?} — a provider moved without marking this file, \
+                 so the freshness edge that should have covered it does not",
+                diverged,
+                path
+            );
+        } else {
+            crate::util::ghost_stats::count("restampequiv.agreed");
+        }
+    }
+
+    /// Enrich without saying which file this is.
+    ///
+    /// The re-stamp gate needs a path — a `FileAnalysis` does not know its own
+    /// — so this spelling always fails the gate open and re-stamps, which is
+    /// the behavior every caller had before the gate existed. Production
+    /// enrichment writers, which do hold the path, call
+    /// `enrich_imported_types_with_keys_for`.
     pub fn enrich_imported_types_with_keys(
         &mut self,
         module_index: Option<&dyn CrossFileLookup>,
+    ) {
+        self.enrich_imported_types_with_keys_for(module_index, None)
+    }
+
+    /// Enrich as `path`, so the re-stamp gate can ask whether any provider of
+    /// this file has moved since it last stamped.
+    pub fn enrich_imported_types_with_keys_for(
+        &mut self,
+        module_index: Option<&dyn CrossFileLookup>,
+        path: Option<&std::path::Path>,
     ) {
         crate::util::ghost_stats::count("enrich_imported_types_with_keys");
         // Truncate back to baseline so repeated enrichment doesn't
@@ -619,11 +789,48 @@ impl FileAnalysis {
         // edge; this re-derives it with the index so cross-file-typed
         // invocants resolve. Single-sourced: refs_to / find_def / hover
         // read this frozen edge, never re-derive at query time.
-        // ABLATION GATE (measurement, not a mode): `PERL_LSP_SKIP_MC_STAMP=1`
-        // skips the re-stamp so a verb can be diffed byte-for-byte with and
-        // without it — the decisive test for "does this verb read the edge".
-        if std::env::var_os("PERL_LSP_SKIP_MC_STAMP").is_none() {
-            self.stamp_method_call_targets(module_index);
+        // Two gates, and they are different things.
+        //
+        // The PROFILE is policy: a verb whose consumers never read
+        // `method_target()` does not pay to fill it. Asked of the profile, so
+        // this code never learns which verb it serves.
+        //
+        // `PERL_LSP_SKIP_MC_STAMP` stays as MEASUREMENT: it is how the profile
+        // was licensed in the first place ("does this verb read the edge?"),
+        // and keeping the A/B alive is what lets the next person re-check the
+        // claim instead of trusting this comment.
+        //
+        // The GATE is neither: it is the freshness question. A re-stamp
+        // re-derives what the build already froze unless some provider of
+        // this file has moved, and the flush is what knows that — see
+        // `CrossFileLookup::restamp_owed`. Every unknown fails open.
+        let profile_wants = enrichment_profile().stamps_method_targets();
+        let ablation = std::env::var_os("PERL_LSP_SKIP_MC_STAMP").is_some();
+        if should_stamp_method_targets(enrichment_profile(), ablation) {
+            let owed = match (path, module_index) {
+                (Some(p), Some(idx)) => idx.restamp_owed(p, self.stamped_at),
+                _ => true,
+            };
+            if owed {
+                self.stamp_method_call_targets(module_index);
+                if let Some(idx) = module_index {
+                    // Recorded only for a stamp that ran WITH the index: a
+                    // build-time stamp resolved nothing cross-file, so
+                    // treating it as a stamp would license skipping the very
+                    // first enrichment re-stamp — the one with the most to
+                    // add. The clock is read AFTER the stamp, so a wave that
+                    // lands mid-stamp is not credited to it.
+                    self.stamped_at = Some(idx.flush_epoch());
+                }
+            } else if restamp_gate_equiv() {
+                self.score_restamp_gate_skip(module_index, path);
+            }
+        } else {
+            crate::util::ghost_stats::count(if profile_wants {
+                "enrich.mc_stamp_skipped_by_ablation"
+            } else {
+                "enrich.mc_stamp_skipped_by_profile"
+            });
         }
         self.rebuild_enrichment_indices();
     }
@@ -1077,4 +1284,227 @@ impl FileAnalysis {
     }
 
 
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    /// The A/B control must win over a declared profile.
+    ///
+    /// Get this backwards and nothing fails: the control silently stops
+    /// working, and every future "output is set-identical with the profile"
+    /// claim becomes unfalsifiable because the full behaviour is no longer
+    /// reachable to compare against. That is the same shape as a watcher that
+    /// cannot tell quiet from blind — it reports success by being unable to
+    /// look.
+    #[test]
+    fn the_full_override_beats_a_declared_profile() {
+        assert!(
+            resolve_profile(Some(EnrichmentProfile::diagnostics()), true)
+                .stamps_method_targets(),
+            "PERL_LSP_FULL_ENRICHMENT must restore the full profile, or the A/B \
+             that licensed the partial one can never be re-run"
+        );
+        assert!(
+            !resolve_profile(Some(EnrichmentProfile::diagnostics()), false)
+                .stamps_method_targets(),
+            "without the override, the declared profile stands"
+        );
+        assert!(
+            resolve_profile(None, false).stamps_method_targets(),
+            "an undeclared profile is FULL — a server verb must never get a \
+             partial one by omission"
+        );
+    }
+
+    /// Profile and ablation are independent suppressors, and the truth table
+    /// is the whole contract: policy says "no consumer reads it", measurement
+    /// says "prove that". Collapsing them into one flag would make the
+    /// licensing evidence and the thing it licenses the same switch.
+    #[test]
+    fn either_the_profile_or_the_ablation_suppresses_the_stamp() {
+        let full = EnrichmentProfile::full();
+        let diag = EnrichmentProfile::diagnostics();
+        assert!(should_stamp_method_targets(full, false), "full + no ablation stamps");
+        assert!(!should_stamp_method_targets(full, true), "the ablation alone suppresses");
+        assert!(!should_stamp_method_targets(diag, false), "the profile alone suppresses");
+        assert!(!should_stamp_method_targets(diag, true), "both suppress");
+    }
+}
+
+#[cfg(test)]
+mod restamp_gate_tests {
+    use crate::model::file_analysis::CrossFileLookup;
+    use std::path::{Path, PathBuf};
+
+    /// A lookup that answers only the gate, so the gate's rules can be tested
+    /// without an index. Everything else takes the trait's defaults.
+    struct Marks {
+        epoch: u64,
+        marks: Vec<(PathBuf, u64)>,
+    }
+    /// The required-method boilerplate every `CrossFileLookup` double pays.
+    /// None of it participates in the gate — the gate's inputs are the path
+    /// and the file's own `stamped_at`, by design.
+    macro_rules! inert_lookup {
+        () => {
+            fn get_cached(
+                &self,
+                _m: &str,
+            ) -> Option<std::sync::Arc<crate::model::file_analysis::CachedModule>> {
+                None
+            }
+            fn modules_with_symbol(&self, _n: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn find_exporters(&self, _n: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn defining_module_cached(
+                &self,
+                _e: &str,
+                _n: &str,
+            ) -> Option<std::sync::Arc<crate::model::file_analysis::CachedModule>> {
+                None
+            }
+            fn module_declaring_method_in_package(
+                &self,
+                _p: &str,
+                _m: &str,
+            ) -> Option<String> {
+                None
+            }
+            fn for_each_cached(
+                &self,
+                _f: &mut dyn FnMut(&str, &std::sync::Arc<crate::model::file_analysis::CachedModule>),
+            ) {
+            }
+            fn for_each_reexport_module(
+                &self,
+                _s: Vec<String>,
+                _v: &mut dyn FnMut(
+                    &std::sync::Arc<crate::model::file_analysis::CachedModule>,
+                ) -> std::ops::ControlFlow<()>,
+            ) {
+            }
+            fn for_each_entity_bridged_to(
+                &self,
+                _c: &str,
+                _f: &mut dyn FnMut(
+                    &str,
+                    &std::sync::Arc<crate::model::file_analysis::CachedModule>,
+                    &crate::model::file_analysis::Symbol,
+                ),
+            ) {
+            }
+            fn direct_children_of(&self, _p: &str) -> Vec<(String, String)> {
+                Vec::new()
+            }
+            fn for_each_loader_shape(
+                &self,
+                _f: &mut dyn FnMut(&str, &crate::model::file_analysis::InferredType),
+            ) {
+            }
+        };
+    }
+
+    impl CrossFileLookup for Marks {
+        inert_lookup!();
+        fn flush_epoch(&self) -> u64 {
+            self.epoch
+        }
+        fn restamp_owed(&self, path: &Path, stamped_at: Option<u64>) -> bool {
+            let Some(stamped_at) = stamped_at else { return true };
+            match self.marks.iter().find(|(p, _)| p == path) {
+                Some((_, m)) => stamped_at < *m,
+                None => true,
+            }
+        }
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// Every unknown fails OPEN — to a re-stamp, never away from one.
+    ///
+    /// This is the property that lets the gate land before the flush is the
+    /// standing path: with no marks written, it says "owed" everywhere and
+    /// behaviour is what it was before the gate existed. A gate whose default
+    /// were "skip" would silently freeze stale dispatch targets across a whole
+    /// session and look like a speedup.
+    #[test]
+    fn every_unknown_fails_open_to_a_re_stamp() {
+        let none = Marks { epoch: 7, marks: Vec::new() };
+        assert!(
+            none.restamp_owed(&p("/A.pm"), Some(5)),
+            "no mark means no wave has spoken about this file — which is also \
+             what a lost mark and an uncovered freshness edge look like"
+        );
+        assert!(
+            none.restamp_owed(&p("/A.pm"), None),
+            "never stamped is owed unconditionally: a rehydrated copy always \
+             reads None, because `stamped_at` is serde(skip)"
+        );
+        let marked = Marks { epoch: 7, marks: vec![(p("/A.pm"), 6)] };
+        assert!(
+            marked.restamp_owed(&p("/A.pm"), None),
+            "never stamped beats any mark — the very first enrichment re-stamp \
+             is the one with the most to add"
+        );
+        assert!(
+            marked.restamp_owed(&p("/B.pm"), Some(5)),
+            "a mark on A says nothing about B"
+        );
+    }
+
+    /// The gate skips only on positive evidence: this file stamped at or after
+    /// the last epoch a provider of it moved.
+    #[test]
+    fn a_stamp_at_or_after_the_mark_skips() {
+        let m = Marks { epoch: 9, marks: vec![(p("/A.pm"), 4)] };
+        assert!(!m.restamp_owed(&p("/A.pm"), Some(4)), "stamped AT the mark: covered");
+        assert!(!m.restamp_owed(&p("/A.pm"), Some(9)), "stamped after it: covered");
+        assert!(
+            m.restamp_owed(&p("/A.pm"), Some(3)),
+            "stamped before the provider moved: the frozen targets predate the \
+             change and must be re-derived"
+        );
+    }
+
+    /// Clock reading 0 is a REAL stamp, not "never".
+    ///
+    /// Every stamp taken before the first flush records 0. Collapsing that
+    /// into the never-stamped sentinel makes it compare equal to the first
+    /// wave's mark — which is 1 — only if the sentinel is bumped to 1 to stay
+    /// distinguishable, and then the pre-flush stamp silently satisfies a mark
+    /// that postdates it. `Option` is what keeps the two apart; this is the
+    /// case that fails without it.
+    #[test]
+    fn a_stamp_taken_before_any_flush_is_still_owed_after_the_first_one() {
+        let m = Marks { epoch: 1, marks: vec![(p("/A.pm"), 1)] };
+        assert!(
+            m.restamp_owed(&p("/A.pm"), Some(0)),
+            "the stamp read the clock as 0, the wave marked at 1: the stamp \
+             predates the provider move and the re-stamp is owed"
+        );
+    }
+
+    /// The trait's own default is fail-open.
+    ///
+    /// Every `CrossFileLookup` that does not implement the gate — the test
+    /// doubles, the scoped wrappers, anything added later — must re-stamp. An
+    /// implementor that silently inherited "skip" would disable the re-stamp
+    /// for a whole class of lookups and nothing would fail.
+    #[test]
+    fn the_trait_default_re_stamps() {
+        struct Bare;
+        impl CrossFileLookup for Bare {
+            inert_lookup!();
+        }
+        assert!(Bare.restamp_owed(&p("/A.pm"), Some(42)));
+        assert!(Bare.restamp_owed(&p("/A.pm"), None));
+        assert_eq!(Bare.flush_epoch(), 0);
+    }
 }

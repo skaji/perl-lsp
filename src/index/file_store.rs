@@ -174,7 +174,10 @@ impl FileStore {
         }
         crate::util::ghost_stats::count("enrich_open.perl");
         let mut fa = (*base).clone();
-        fa.enrich_imported_types_with_keys(Some(idx));
+        fa.enrich_imported_types_with_keys_for(
+            Some(idx),
+            url.to_file_path().ok().as_deref(),
+        );
         let enriched = Arc::new(fa);
         if let Some(mut doc) = self.open.get_mut(url) {
             if Arc::ptr_eq(&doc.analysis, &base) {

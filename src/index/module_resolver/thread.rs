@@ -35,6 +35,13 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
             conn,
             &crate::build::plugin::rhai_host::plugin_fingerprint(),
         );
+        // Beside the plugin gate, and for the same reason: a cached artifact
+        // that describes a derivation we no longer run. This one clears
+        // conclusions only — the blobs stay, because the repair is a re-bake.
+        let _ = module_cache::validate_conclusion_fingerprint(
+            conn,
+            module_cache::conclusion_fingerprint(),
+        );
         if server.is_some() {
             // Hydrate Perl builtin hover docs (cached in SQLite, re-parsed
             // from perlfunc.pod only when the perl version tag changes).
@@ -129,9 +136,35 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
         }
     }
 
+    // The conclusion-repair frontier: paths holding a valid blob whose map the
+    // derivation-fingerprint gate cleared. Enumerated ONCE here rather than
+    // re-queried per slice — the set only shrinks as we drain it, and a
+    // re-query per slice would be an O(corpus) scan for every 32 files.
+    //
+    // Deliberately NOT drained before the loop. It has no deadline, and the
+    // resolver thread is what answers a real cross-file request; a corpus-sized
+    // repair run ahead of the loop would put minutes in front of the first
+    // resolve. It runs in the gap where this thread would otherwise be blocked
+    // on its condvar, which is the definition of "post-ready background".
+    let mut repair_frontier: Vec<String> = db
+        .as_ref()
+        .map(|conn| {
+            let at = module_cache::current_generation(conn);
+            let f = module_cache::paths_missing_conclusions(conn, at);
+            if !f.is_empty() {
+                log::info!(
+                    "Conclusion repair: {} file(s) hold a blob with no map; \
+                     re-baking in the background",
+                    f.len()
+                );
+            }
+            f
+        })
+        .unwrap_or_default();
+
     // Main resolve loop — drain priority first, then pending.
     loop {
-        let batch = drain_next_batch(&core.queue);
+        let batch = drain_or_repair(&core.queue, &mut repair_frontier, db.as_ref());
 
         // One diagnostics refresh per drained BATCH, not per module: a
         // resolve takes longer than the refresh debounce's settle window,
@@ -336,6 +369,55 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
 ///
 /// Lock order here is pending-then-priority; producers must never hold
 /// `priority` while acquiring `pending`.
+/// `drain_next_batch`, except the idle wait is spent re-baking conclusions.
+///
+/// Real work always wins: the queue is checked before every slice, so a resolve
+/// request waits at most one slice (32 files) behind repair rather than behind
+/// the whole frontier. When the frontier is empty this is exactly the old
+/// blocking drain.
+fn drain_or_repair(
+    queue: &ResolveQueue,
+    frontier: &mut Vec<String>,
+    db: Option<&rusqlite::Connection>,
+) -> Vec<String> {
+    while !frontier.is_empty() {
+        if let Some(batch) = try_drain_next_batch(queue) {
+            return batch;
+        }
+        let Some(conn) = db else {
+            // No store to repair into; forget the frontier rather than
+            // spinning on it forever.
+            frontier.clear();
+            break;
+        };
+        let take = module_cache::REPAIR_SLICE.min(frontier.len());
+        let slice: Vec<String> = frontier.split_off(frontier.len() - take);
+        let at = module_cache::current_generation(conn);
+        module_cache::repair_conclusions_slice(conn, &slice, at);
+        if frontier.is_empty() {
+            log::info!("Conclusion repair: frontier drained");
+        }
+    }
+    drain_next_batch(queue)
+}
+
+/// The non-blocking half of `drain_next_batch`. `None` means "nothing queued
+/// right now", which is a different answer from the blocking form's "nothing
+/// queued, so I waited".
+fn try_drain_next_batch(queue: &ResolveQueue) -> Option<Vec<String>> {
+    let mut pending = queue.pending.lock().unwrap();
+    {
+        let mut priority = queue.priority.lock().unwrap();
+        if !priority.is_empty() {
+            return Some(std::mem::take(&mut *priority));
+        }
+    }
+    if !pending.is_empty() {
+        return Some(std::mem::take(&mut *pending));
+    }
+    None
+}
+
 pub(super) fn drain_next_batch(queue: &ResolveQueue) -> Vec<String> {
     let mut pending = queue.pending.lock().unwrap();
     loop {

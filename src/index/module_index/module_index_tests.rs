@@ -2289,3 +2289,87 @@ fn provider_edges_replay_for_a_symbol_evicted_copy() {
         "the stripped copy's provider edge must come from the pre-strip record"
     );
 }
+
+/// One eraser drops BOTH derived copies.
+///
+/// They are void for the same reason and at the same moment, and dropping only
+/// one is silently wrong in different ways — a stale bag costs a wrong
+/// reference walk, a stale map costs a wrong ANSWER, because the cross-file
+/// primary consults the map before it decodes anything and an
+/// `Outcome::Answer` short-circuits the chase. The conclusion half sat unwired
+/// for as long as it was a separate method a caller had to remember; this
+/// pins that it no longer can be.
+#[test]
+fn invalidating_derived_copies_takes_the_bake_as_well_as_the_bag() {
+    use crate::index::conclusion_cache::{Cached, ConclusionCache};
+    use crate::model::witnesses::ConclusionMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let path = std::path::PathBuf::from("/derived/A.pm");
+    let loads = Arc::new(AtomicUsize::new(0));
+    let l = Arc::clone(&loads);
+    let cache = Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        l.fetch_add(1, Ordering::Relaxed);
+        Some(ConclusionMap::default())
+    }));
+
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::clone(&cache));
+
+    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert_eq!(loads.load(Ordering::Relaxed), 1, "precondition: memoized");
+
+    idx.invalidate_derived_copies(&path);
+
+    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert_eq!(
+        loads.load(Ordering::Relaxed),
+        2,
+        "the baked map survived a derived-copy invalidation — the next \
+         consult would be answered from the previous version of the file"
+    );
+}
+
+/// The push half of the re-stamp gate, over the real index.
+///
+/// What IS tested here: a mark postdates every clock reading taken before it,
+/// so a stamp from before the wave is owed a re-stamp; a second wave re-opens
+/// the debt; and never-stamped is owed regardless.
+///
+/// What is NOT: the `max` on the mark guards two waves whose writes interleave
+/// across threads, which this single-threaded API cannot produce. It rests on
+/// the argument in `mark_provider_diff`, not on this test — said plainly so
+/// nobody reads a green suite as covering it.
+#[test]
+fn a_mark_postdates_every_stamp_that_preceded_it() {
+    use crate::model::file_analysis::CrossFileLookup;
+    let idx = ModuleIndex::new_for_cli();
+    let a = std::path::PathBuf::from("/mark/A.pm");
+
+    let before = idx.flush_epoch();
+    assert!(
+        idx.restamp_owed(&a, Some(before)),
+        "no mark yet: the gate has nothing to prove a skip with, so it fails open"
+    );
+
+    let e1 = idx.mark_provider_diff([a.clone()]);
+    assert!(
+        e1 > before,
+        "the mark postdates every clock reading a racing stamp could have taken"
+    );
+    assert!(
+        idx.restamp_owed(&a, Some(before)),
+        "a stamp taken before the wave is owed a re-stamp, even though it \
+         happened after this file's previous one"
+    );
+    assert!(!idx.restamp_owed(&a, Some(e1)), "stamped after the wave: covered");
+
+    let e2 = idx.mark_provider_diff([a.clone()]);
+    assert!(e2 > e1, "the clock is monotone across waves");
+    assert!(idx.restamp_owed(&a, Some(e1)), "a second wave re-opens the debt");
+    assert!(
+        idx.restamp_owed(&a, None),
+        "never stamped is owed regardless — a rehydrated copy always reads None"
+    );
+}

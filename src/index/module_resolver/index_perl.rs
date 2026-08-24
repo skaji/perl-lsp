@@ -132,6 +132,13 @@ pub fn index_workspace_with_index(
             conn,
             &crate::build::plugin::rhai_host::plugin_fingerprint(),
         );
+        // Beside the plugin gate, and for the same reason: a cached artifact
+        // that describes a derivation we no longer run. This one clears
+        // conclusions only — the blobs stay, because the repair is a re-bake.
+        let _ = module_cache::validate_conclusion_fingerprint(
+            conn,
+            module_cache::conclusion_fingerprint(),
+        );
     }
     // Persistence and eviction are independent: blobs + rows are written
     // whenever a DB exists (the parity harness runs under PERL_LSP_NO_EVICT
@@ -332,7 +339,7 @@ pub fn index_workspace_with_index(
                         // Clear any stale LRU pin BEFORE the stripped copy
                         // becomes reachable, so its first rehydration reads
                         // the just-committed blob.
-                        idx.invalidate_bag_cache(&e.path);
+                        idx.invalidate_derived_copies(&e.path);
                     }
                     if e.deferred {
                         files.insert_workspace_arc(e.path.clone(), e.arc.clone());
@@ -348,7 +355,7 @@ pub fn index_workspace_with_index(
                     // beyond the persistence itself (disk full / lock storm
                     // stays loud AND self-heals) — up to the budget.
                     if let Some(idx) = module_index {
-                        idx.invalidate_bag_cache(&e.path);
+                        idx.invalidate_derived_copies(&e.path);
                     }
                     if let Some(fa) = e.blob.decode_whole() {
                         let bytes = fa.heap_estimate().total();

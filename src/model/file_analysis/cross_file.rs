@@ -430,6 +430,78 @@ pub trait CrossFileLookup {
     fn resolution_epoch(&self) -> u64 {
         0
     }
+
+    /// Is a MethodCall re-stamp owed for `path`, last stamped at
+    /// `stamped_at`?
+    ///
+    /// The re-stamp is the dominant driver of cross-file bag rehydration, and
+    /// most of it re-derives an answer the build already froze. What licenses
+    /// skipping it is knowing that no provider of this file has moved since
+    /// the last stamp — which is a question about the FLUSH, not about this
+    /// file, and answering it by walking `providers(F)` here would resurrect
+    /// the transitive closure the enrichment-key memo exists to contain.
+    ///
+    /// So the flush PUSHES: enqueuing a consumer stamps that consumer's mark,
+    /// and this is an O(1) comparison against it. Every unknown — never
+    /// stamped, no mark recorded, no index, a caller with no path — **fails
+    /// open to today's behavior**, which is why the gate can land before the
+    /// flush is the standing path and simply do nothing until it is.
+    ///
+    /// The gate is exactly as sound as the freshness edge coverage it rides
+    /// on, and no more: a provider whose change never reaches
+    /// `dirty_consumers` never marks anyone, and the skip would then be
+    /// wrong. New and deleted files are covered because registration and
+    /// removal already route through `record_and_dirty`.
+    fn restamp_owed(&self, _path: &std::path::Path, _stamped_at: Option<u64>) -> bool {
+        true
+    }
+
+    /// The monotone flush clock a stamp records itself against. Sessional and
+    /// deliberately not persisted — see `FileAnalysis::stamped_at`.
+    fn flush_epoch(&self) -> u64 {
+        0
+    }
+    /// Does ANY file bridge plugin-synthesized entities onto `class`?
+    ///
+    /// The guard on every conclusion form that encodes "everything before the
+    /// bridge arm answered None" — trusted absence and `Link`. The live ladder
+    /// is local → primary → parents → bridges, so a baked `Value`/`ReturnOf`
+    /// came from an arm that beats bridges in every world and needs no guard;
+    /// the other two are exactly the set that could be contradicted by a
+    /// bridged answer they never saw.
+    ///
+    /// Asked HERE rather than baked, and that is the whole point. A bake-time
+    /// "no file bridges to C" is a negative GLOBAL fact stored in a map whose
+    /// invalidation covers the derivation code and the file's own stamp —
+    /// foreign registry state is covered by neither, by design. A newly indexed
+    /// file that starts bridging to C would change nothing about the consumer,
+    /// no re-bake would fire, and the stale map would durably skip the bridged
+    /// answer. Asking the index at trust time is self-healing in both
+    /// directions with no invalidation machinery at all.
+    ///
+    /// Defaults to `true` — the conservative answer. An index that cannot say
+    /// makes its callers decode rather than trust, which is slow and never
+    /// wrong.
+    fn class_is_bridged_to(&self, _class: &str) -> bool {
+        true
+    }
+
+    /// This file's baked conclusions, if the store has them at the reader's
+    /// pinned generation.
+    ///
+    /// `None` means NOT BAKED — the caller decodes, exactly as before this
+    /// layer existed. It emphatically does not mean "no answer": that is what
+    /// a key being absent from a returned map means, and conflating the two
+    /// turns an unbaked file into a file that concludes nothing.
+    ///
+    /// Defaulted so an index with no store (tests, pack sub-indexes) is
+    /// unaffected and simply keeps decoding.
+    fn conclusions_for(
+        &self,
+        _path: &std::path::Path,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ConclusionMap>> {
+        None
+    }
     fn get_cached(&self, module_name: &str) -> Option<std::sync::Arc<CachedModule>>;
     /// `get_cached` scoped to a querying file's VISIBILITY set (its own path +
     /// its `#include` closure) — see `ModuleIndex::get_cached_scoped`. Default:

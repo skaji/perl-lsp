@@ -1597,3 +1597,393 @@ fn pre_split_rows_are_filtered_not_guessed() {
     );
     let _ = std::fs::remove_file(&pm);
 }
+
+
+/// The conclusion fingerprint must describe the tree as it is RIGHT NOW.
+///
+/// The failure this catches is a stale constant: if `build.rs` ever stops
+/// re-running when a source file changes — a directory-level
+/// `rerun-if-changed`, a path it hashes but forgets to declare — the compiled
+/// constant keeps describing an older tree. Every baked conclusion then
+/// validates against a fingerprint that no longer means anything, which is
+/// exactly the hand-maintained version the derived one exists to replace, only
+/// now with nobody watching it.
+///
+/// The hash is recomputed here rather than shared with `build.rs`. A shared
+/// helper would agree with itself whatever it computed; two independent
+/// spellings that must agree is the only arrangement that can fail.
+#[test]
+fn the_conclusion_fingerprint_is_not_stale() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => walk(&p, out),
+                Ok(t) if t.is_file() => out.push(p),
+                _ => {}
+            }
+        }
+    }
+    walk(&root.join("src"), &mut files);
+    if root.join("Cargo.lock").is_file() {
+        files.push(root.join("Cargo.lock"));
+    }
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "walked only {} files — this test would pass vacuously",
+        files.len()
+    );
+
+    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut fnv = |acc: &mut u64, bytes: &[u8]| {
+        for b in bytes {
+            *acc ^= *b as u64;
+            *acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for path in &files {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        // Paths are hashed relative to the manifest, so the fingerprint does
+        // not change when the same tree is checked out somewhere else — a
+        // worktree and its origin must agree or every worktree re-bakes.
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        fnv(&mut acc, rel.to_string_lossy().as_bytes());
+        fnv(&mut acc, b"\0");
+        fnv(&mut acc, &bytes);
+        fnv(&mut acc, b"\0");
+    }
+    // A tree edited AFTER this binary was built is a tree this test cannot
+    // conclude anything about: the fingerprint compiled in describes the
+    // sources as they were at build time, and comparing it to the sources as
+    // they are now measures the edit, not the guard. That is an ordinary
+    // developer workflow — a test run racing an editor — and failing on it
+    // reports a stale-fingerprint bug that does not exist. Say "I could not
+    // look" instead of "nothing there"; the same rule the instruments in this
+    // arc keep having to learn.
+    let built_at = std::env::current_exe()
+        .and_then(|p| p.metadata())
+        .and_then(|m| m.modified())
+        .ok();
+    if let Some(built_at) = built_at {
+        let edited_after = files.iter().any(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .map(|t| t > built_at)
+                .unwrap_or(false)
+        });
+        if edited_after {
+            eprintln!(
+                "the_conclusion_fingerprint_is_not_stale: SKIPPED — a hashed \
+                 source file is newer than this test binary, so the tree moved \
+                 after the build and the comparison would measure the edit"
+            );
+            return;
+        }
+    }
+    assert_eq!(
+        format!("{acc:016x}"),
+        conclusion_fingerprint(),
+        "the compiled-in conclusion fingerprint does not match the current \
+         source tree — build.rs did not re-run for some file it hashes, so \
+         the guard is describing a tree that no longer exists"
+    );
+}
+
+/// A reader pinned to a generation must keep seeing it while a later one is
+/// published.
+///
+/// This is the failure the `(path, generation)` key exists to prevent. Keyed
+/// on `path` alone, publishing N+1 REPLACES the gen-N row, and a reader still
+/// pinned to N finds nothing — which the evaluator reads as a definite `None`.
+/// The pin would then be a way to GET wrong answers rather than avoid them,
+/// and nothing downstream could tell, because "this file concludes nothing"
+/// is a perfectly ordinary thing for the store to say.
+#[test]
+fn a_pinned_reader_does_not_see_a_later_generation() {
+    use crate::model::witnesses::{Conclusion, ConclusionKey, ConclusionMap};
+    let conn = test_db();
+    let mk = |t: &str| {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            ConclusionKey::SubByName("f".into()),
+            Conclusion::Value(crate::model::file_analysis::InferredType::ClassName(t.into())),
+        );
+        ConclusionMap(m, Default::default(), Default::default(), Default::default())
+    };
+
+    let g1 = Generation(1);
+    publish_generation(&conn, g1, &[("/a.pm".to_string(), mk("One"))]).expect("publish 1");
+    assert_eq!(current_generation(&conn), g1);
+
+    let pinned = load_conclusions(&conn, "/a.pm", g1).expect("gen 1 visible at gen 1");
+
+    let g2 = Generation(2);
+    publish_generation(&conn, g2, &[("/a.pm".to_string(), mk("Two"))]).expect("publish 2");
+
+    // The pin still resolves, and to the OLD content.
+    let after = load_conclusions(&conn, "/a.pm", g1).expect(
+        "a reader pinned to gen 1 lost its row when gen 2 published — it would \
+         read absence as a definite None",
+    );
+    assert_eq!(after, pinned, "the pin resolved to a different generation");
+
+    // And a fresh reader sees the new one.
+    let fresh = load_conclusions(&conn, "/a.pm", current_generation(&conn)).expect("gen 2");
+    assert_ne!(fresh, pinned, "gen 2 served gen 1's content");
+}
+
+/// Pruning must not delete the row a live pin resolves to.
+#[test]
+fn pruning_keeps_what_the_pin_still_needs() {
+    use crate::model::witnesses::{Conclusion, ConclusionKey, ConclusionMap};
+    let conn = test_db();
+    let mk = |t: &str| {
+        let mut m = std::collections::HashMap::new();
+        m.insert(
+            ConclusionKey::SubByName("f".into()),
+            Conclusion::Value(crate::model::file_analysis::InferredType::ClassName(t.into())),
+        );
+        ConclusionMap(m, Default::default(), Default::default(), Default::default())
+    };
+    for g in 1..=4i64 {
+        publish_generation(&conn, Generation(g), &[("/a.pm".to_string(), mk(&format!("G{g}")))])
+            .expect("publish");
+    }
+    // A reader is pinned at 3; everything strictly older than what gen 3
+    // resolves to is unreachable, and gen 3's own row is not.
+    prune_generations_below(&conn, Generation(3));
+    assert!(
+        load_conclusions(&conn, "/a.pm", Generation(3)).is_some(),
+        "pruning deleted the row a pin at gen 3 resolves to"
+    );
+    assert!(
+        load_conclusions(&conn, "/a.pm", Generation(4)).is_some(),
+        "pruning deleted a generation newer than the prune floor"
+    );
+}
+
+/// A failed round must not advance the generation.
+///
+/// Half a round published under a complete-looking generation is the same
+/// absence-as-answer failure: the files that did land are read as current, the
+/// ones that did not are read as concluding nothing.
+#[test]
+fn a_failed_round_leaves_the_previous_generation_intact() {
+    use crate::model::witnesses::ConclusionMap;
+    let conn = test_db();
+    publish_generation(&conn, Generation(1), &[("/a.pm".to_string(), ConclusionMap::default())])
+        .expect("publish 1");
+    // Force a failure mid-round by dropping the table the second write needs.
+    conn.execute_batch("DROP TABLE conclusions").unwrap();
+    let r = publish_generation(
+        &conn,
+        Generation(2),
+        &[("/b.pm".to_string(), ConclusionMap::default())],
+    );
+    assert!(r.is_err(), "a round that could not write reported success");
+    assert_eq!(
+        current_generation(&conn),
+        Generation(1),
+        "a failed round advanced the generation, so its partial writes would \
+         be served as complete"
+    );
+}
+
+/// Persisting an analysis persists its conclusions, and they come back.
+///
+/// The bake rides inside `encode_analysis` precisely so a writer cannot
+/// persist the blob and forget the map. This is the test that says so: it
+/// exercises the real writer, not the bake in isolation.
+#[test]
+fn persisting_an_analysis_persists_its_conclusions() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("concl_roundtrip.pm");
+    std::fs::write(
+        &pm,
+        "package CR;\nsub build { return LWP::UserAgent->new }\nsub s { return 'x' }\n1;\n",
+    )
+    .unwrap();
+    let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
+    let pm_str = pm.to_string_lossy().into_owned();
+    save_to_db(&conn, &pm_str, &Some(cached), "workspace");
+
+    let map = load_conclusions(&conn, &pm_str, current_generation(&conn)).expect(
+        "the writer persisted a blob but no conclusions — the store answers \
+         'not baked' for a file that was just baked",
+    );
+    assert!(!map.is_empty(), "an empty map round-tripped as success");
+
+    use crate::model::witnesses::{ConclusionKey, Outcome};
+    let key = ConclusionKey::MethodOnClass {
+        class: "CR".into(),
+        name: "build".into(),
+    };
+    match map.evaluate(&key, None, None, &[]) {
+        Outcome::Answer(t) => assert_eq!(
+            t.class_name().as_deref(),
+            Some("LWP::UserAgent"),
+            "the round-tripped conclusion changed meaning"
+        ),
+        other => panic!("expected a baked answer for {key:?}, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// A derivation change clears conclusions and KEEPS blobs.
+///
+/// The repair for a stale conclusion is one re-bake, which needs the blob.
+/// Dropping blobs here would turn it into a corpus re-parse for nothing — and
+/// the failure would be invisible, since everything still works, just slowly.
+#[test]
+fn a_derivation_change_clears_conclusions_but_keeps_blobs() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("concl_fingerprint.pm");
+    std::fs::write(&pm, "package CF;\nsub f { return 'x' }\n1;\n").unwrap();
+    let cached = parse_source_to_cached(&std::fs::read_to_string(&pm).unwrap(), &pm);
+    let pm_str = pm.to_string_lossy().into_owned();
+    save_to_db(&conn, &pm_str, &Some(cached), "workspace");
+    assert!(load_conclusions(&conn, &pm_str, current_generation(&conn)).is_some());
+
+    validate_conclusion_fingerprint(&conn, "a-different-derivation").unwrap();
+
+    assert!(
+        load_conclusions(&conn, &pm_str, current_generation(&conn)).is_none(),
+        "conclusions survived a derivation change — they now describe a \
+         derivation that no longer exists, and nothing downstream can tell"
+    );
+    assert!(
+        load_one_diag(&conn, &pm_str, true).is_ok(),
+        "the blob was dropped along with the conclusions — the re-bake it \
+         exists to feed now costs a re-parse instead of a decode"
+    );
+    let _ = std::fs::remove_file(&pm);
+}
+
+/// A blob whose map the fingerprint gate cleared must get its map back, and
+/// the map it gets back must be the one the persist path would have written.
+///
+/// Both halves matter and they fail differently. Without the enumeration the
+/// layer stays dark after every source edit until someone runs a full
+/// `--clear-cache` by hand — `conclcache.known_absent` read 156,746 in that
+/// state, which is purely a cost but a permanent one, and it silently made
+/// every measurement taken after a rebuild a measurement of an empty layer.
+/// Without the SHARED bake, the repair writes well-formed bytes carrying a
+/// different answer than the persist path — the exact failure mode the
+/// derivation fingerprint exists to catch, arriving through the repair that
+/// fingerprint triggers.
+///
+/// Base-verify by dropping `paths_missing_conclusions`' `NOT EXISTS` clause:
+/// the frontier then also contains the file that already has a map, and the
+/// repair rewrites rows nothing asked for.
+#[test]
+fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
+    let conn = test_db();
+    let path = std::path::Path::new("/repair/App.pm");
+    let cached = parse_source_to_cached(
+        "package My::App;\nuse Mojolicious::Lite;\n\
+         plugin 'CloveApp', { alpha => 1, beta => 2 };\n\
+         sub helper { return 'x' }\n1;\n",
+        path,
+    );
+    let some = Some(cached.clone());
+    assert!(save_to_db(&conn, "My::App", &some, "workspace"));
+
+    let at = current_generation(&conn);
+    let persisted = load_conclusions(&conn, "/repair/App.pm", at)
+        .expect("precondition: the persist path writes a map");
+
+    // What `validate_conclusion_fingerprint` does: clear the maps, keep the
+    // blobs, on the promise that each file re-bakes from the blob it has.
+    conn.execute("DELETE FROM conclusions", []).unwrap();
+    assert!(
+        load_conclusions(&conn, "/repair/App.pm", at).is_none(),
+        "precondition: the map is gone"
+    );
+
+    let frontier = paths_missing_conclusions(&conn, at);
+    assert_eq!(
+        frontier,
+        vec!["/repair/App.pm".to_string()],
+        "the file holds a blob and no map, so it is the repair frontier"
+    );
+
+    assert_eq!(repair_conclusions_slice(&conn, &frontier, at), 1);
+    let repaired = load_conclusions(&conn, "/repair/App.pm", at)
+        .expect("the repair puts a map back");
+
+    // Same map, not merely A map. A repair that concluded something else
+    // would look identical to a working one from every angle but this.
+    assert_eq!(
+        repaired.0.len(),
+        persisted.0.len(),
+        "the repair baked a different number of keys than the persist path"
+    );
+    for (k, v) in persisted.0.iter() {
+        assert_eq!(
+            repaired.0.get(k),
+            Some(v),
+            "key {k:?} concludes differently after a repair than it did at persist"
+        );
+    }
+
+    // Idempotent: nothing is left on the frontier, so a second pass is a no-op
+    // rather than a rewrite loop.
+    assert!(
+        paths_missing_conclusions(&conn, at).is_empty(),
+        "a repaired file must leave the frontier, or the background pass never ends"
+    );
+}
+
+/// A changed file's blob is dropped; its BAKE must go with it.
+///
+/// `invalidate_generation` is the "this path's persisted derivation is void"
+/// eraser — it takes the modules row, the stub and the ref rows. The
+/// conclusion map is a derivation of that same blob, and leaving it behind
+/// risks a wrong answer rather than a slow one: `moc_cross_file_primary`
+/// consults the map before it decodes anything, and `Outcome::Answer`
+/// short-circuits the chase.
+///
+/// Scope, stated because it was overstated once: this pins the INVARIANT. No
+/// end-to-end path is known that actually reads an orphaned map — the routes
+/// that produce one re-persist the file or answer from the open-document tier
+/// first. The invariant is still worth holding, because "a derivation outlives
+/// its source" has consequences that stay invisible until some future caller
+/// order exposes them.
+#[test]
+fn invalidating_a_generation_drops_the_bake_that_came_with_it() {
+    let conn = test_db();
+    let dir = std::env::temp_dir();
+    let pm = dir.join("perl_lsp_invalidate_bake.pm");
+    std::fs::write(&pm, "package InvBake;\nsub val { return 'x' }\n1;\n").unwrap();
+    let source = std::fs::read_to_string(&pm).unwrap();
+    let path_str = pm.to_string_lossy().into_owned();
+    let cached = parse_source_to_cached(&source, &pm);
+    assert!(save_to_db(&conn, &path_str, &Some(cached), "workspace"));
+
+    let at = current_generation(&conn);
+    assert!(
+        load_conclusions(&conn, &path_str, at).is_some(),
+        "precondition: the persist wrote a map beside the blob"
+    );
+
+    invalidate_generation(&conn, &path_str);
+
+    assert!(
+        load_one_diag(&conn, &path_str, true).is_err(),
+        "precondition: the blob is gone"
+    );
+    assert!(
+        load_conclusions(&conn, &path_str, at).is_none(),
+        "the map outlived the blob it was baked from — a consult would be \
+         answered from the previous version of the file, and nothing \
+         downstream can tell"
+    );
+
+    let _ = std::fs::remove_file(&pm);
+}

@@ -232,6 +232,44 @@ pub fn invalidate_generation(conn: &Connection, path: &str) {
     let _ = conn.execute("DELETE FROM modules WHERE path = ?1", params![path]);
     delete_stub(conn, path);
     delete_ref_rows(conn, path);
+    forget_orphaned_conclusions(conn, path);
+}
+
+/// Drop a path's baked map once no blob is left to have derived it.
+///
+/// The bake is a derivation of the blob, so it must not outlive it. What an
+/// orphaned map RISKS is a wrong answer rather than a slow one — the
+/// cross-file primary consults the map before it decodes anything, and an
+/// `Outcome::Answer` short-circuits the chase.
+///
+/// Honest about its own reach: no end-to-end path has been demonstrated that
+/// reads an orphaned map. Both routes that produce one re-persist the file
+/// (blob and map together) or answer from the open-document tier before any
+/// consult reaches the stale row. This closes the invariant, not a reproduced
+/// bug — and it is worth closing regardless, because "a derivation outlives
+/// its source" is exactly the shape whose consequences are invisible until a
+/// future caller order makes them visible.
+///
+/// Conditioned on the modules row rather than unconditional, because the
+/// tier-scoped eraser legitimately leaves one behind: a dual-homed file whose
+/// import-tier rows the walk GC'd still has a valid workspace blob, and its
+/// map still describes it. Dropping maps for every tier eviction would darken
+/// the layer across a whole GC sweep and put the survivors on the repair
+/// frontier for nothing.
+///
+/// The RAM twin is `ModuleIndex::invalidate_conclusions`; both halves are
+/// needed and neither is sufficient.
+fn forget_orphaned_conclusions(conn: &Connection, path: &str) {
+    let still_persisted: bool = conn
+        .query_row(
+            "SELECT 1 FROM modules WHERE path = ?1 LIMIT 1",
+            params![path],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if !still_persisted {
+        super::forget_conclusions(conn, path);
+    }
 }
 
 /// Tier-scoped eraser: drops the generation ONLY when its rows carry
@@ -262,6 +300,7 @@ pub fn invalidate_generation_tier(conn: &Connection, path: &str, source: &str) {
         "DELETE FROM files WHERE path = ?1 AND source = ?2",
         params![path, source],
     );
+    forget_orphaned_conclusions(conn, path);
 }
 
 /// Remove a deleted file's rows (the removal half of `shred_derived_rows`).

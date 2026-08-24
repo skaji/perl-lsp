@@ -92,6 +92,7 @@ impl FileAnalysis {
         } = parts;
         witnesses.rebuild_index();
         let mut fa = FileAnalysis {
+            stamped_at: None,
             pack,
             plugin,
             scopes,
