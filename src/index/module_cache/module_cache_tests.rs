@@ -1716,13 +1716,13 @@ fn a_pinned_reader_does_not_see_a_later_generation() {
     };
 
     let g1 = Generation(1);
-    publish_generation(&conn, g1, &[("/a.pm".to_string(), mk("One"))]).expect("publish 1");
+    publish_generation(&conn, g1, &[("/a.pm".to_string(), mk("One"), 111)]).expect("publish 1");
     assert_eq!(current_generation(&conn), g1);
 
     let pinned = load_conclusions(&conn, "/a.pm", g1).expect("gen 1 visible at gen 1");
 
     let g2 = Generation(2);
-    publish_generation(&conn, g2, &[("/a.pm".to_string(), mk("Two"))]).expect("publish 2");
+    publish_generation(&conn, g2, &[("/a.pm".to_string(), mk("Two"), 222)]).expect("publish 2");
 
     // The pin still resolves, and to the OLD content.
     let after = load_conclusions(&conn, "/a.pm", g1).expect(
@@ -1750,7 +1750,7 @@ fn pruning_keeps_what_the_pin_still_needs() {
         ConclusionMap(m, Default::default(), Default::default(), Default::default())
     };
     for g in 1..=4i64 {
-        publish_generation(&conn, Generation(g), &[("/a.pm".to_string(), mk(&format!("G{g}")))])
+        publish_generation(&conn, Generation(g), &[("/a.pm".to_string(), mk(&format!("G{g}")), g as u64)])
             .expect("publish");
     }
     // A reader is pinned at 3; everything strictly older than what gen 3
@@ -1775,14 +1775,14 @@ fn pruning_keeps_what_the_pin_still_needs() {
 fn a_failed_round_leaves_the_previous_generation_intact() {
     use crate::model::witnesses::ConclusionMap;
     let conn = test_db();
-    publish_generation(&conn, Generation(1), &[("/a.pm".to_string(), ConclusionMap::default())])
+    publish_generation(&conn, Generation(1), &[("/a.pm".to_string(), ConclusionMap::default(), 1)])
         .expect("publish 1");
     // Force a failure mid-round by dropping the table the second write needs.
     conn.execute_batch("DROP TABLE conclusions").unwrap();
     let r = publish_generation(
         &conn,
         Generation(2),
-        &[("/b.pm".to_string(), ConclusionMap::default())],
+        &[("/b.pm".to_string(), ConclusionMap::default(), 2)],
     );
     assert!(r.is_err(), "a round that could not write reported success");
     assert_eq!(

@@ -379,14 +379,47 @@ impl CrossFileLookup for ModuleIndex {
         path: &std::path::Path,
     ) -> Option<std::sync::Arc<crate::model::witnesses::ConclusionMap>> {
         use crate::index::conclusion_cache::Cached;
-        match self.conclusion_cache_ref()?.get(path) {
-            // The Arc, not a clone of what it holds. Handing back an owned map
-            // deep-copies a ~72-entry HashMap per consult, and the consult path
-            // runs this tens of thousands of times per check — measured at a
-            // 6.7% REGRESSION against no conclusions at all, which is the whole
-            // saving spent on copying the thing that produced it.
-            Cached::Map(m) => Some(m),
-            Cached::NotBaked => None,
+        // The Arc, not a clone of what it holds. Handing back an owned map
+        // deep-copies a ~72-entry HashMap per consult, and the consult path
+        // runs this tens of thousands of times per check — measured at a
+        // 6.7% REGRESSION against no conclusions at all, which is the whole
+        // saving spent on copying the thing that produced it.
+        let Cached::Map(m, stamp) = self.conclusion_cache_ref()?.get(path) else {
+            return None;
+        };
+        // THE validity decision, and the only one. A row asserts the surface
+        // fingerprint of the analysis it was baked from; the index knows what
+        // that path's surface fingerprints to NOW. Equal means the map still
+        // describes what a consumer can see of this file.
+        //
+        // Never re-hash here. The fingerprint is looked UP, not computed —
+        // consults run tens of thousands of times per check, and hashing a
+        // projected surface on that path would cost more than the chase this
+        // layer exists to avoid.
+        //
+        // One compare, three failure modes: an ORPHANED row whose `modules`
+        // row was erased, a STALE row for an edited file, and a row from an
+        // INTERRUPTED write all fail it identically and read as absent, which
+        // falls back to the live chase. Correctness therefore stops depending
+        // on any caller remembering an eraser — `invalidate_derived_copies`
+        // survives for space and hygiene, not for truth.
+        //
+        // No freshness record means absent, not valid: a path the index has
+        // never recorded is one we cannot vouch for, and the fail-open
+        // direction here is "decode", never "trust".
+        match self.freshness.fingerprint_of(path) {
+            Some(fp) if fp == stamp.source_fingerprint => {
+                crate::util::ghost_stats::count("conclrow.valid");
+                Some(m)
+            }
+            Some(_) => {
+                crate::util::ghost_stats::count("conclrow.stale");
+                None
+            }
+            None => {
+                crate::util::ghost_stats::count("conclrow.unrecorded");
+                None
+            }
         }
     }
 

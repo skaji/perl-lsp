@@ -120,6 +120,12 @@ pub struct EncodedAnalysis {
     /// answering ABSENT for the file, and absent means "no answer" rather than
     /// "not baked".
     pub conclusions: Vec<u8>,
+    /// The surface fingerprint of the analysis these bytes were baked from —
+    /// the row's self-validation stamp. Carried here rather than looked up at
+    /// write time so the value describes exactly what was encoded: a writer
+    /// that re-read the index could stamp a fingerprint the map does not
+    /// correspond to, which is the one lie the compare cannot catch.
+    pub source_fingerprint: u64,
     /// The witness bag alone. NEVER empty for a row this code writes — the
     /// `bag IS NULL` test is how a reader tells a pre-split row (bag inline
     /// in `analysis`) from a post-split one, so an empty encoding here would
@@ -191,10 +197,17 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<EncodedAnalysis> {
     } else {
     bake_conclusions_blob(fa, &bag)
     };
+    // Projected from the SAME analysis the map was baked from, in the same
+    // call — the row's stamp and its contents describe one state by
+    // construction.
+    let source_fingerprint = crate::model::surface::surface_fingerprint(
+        &crate::model::surface::Surface::project(fa),
+    );
     Some(EncodedAnalysis {
         analysis,
         bag: bag_blob,
         conclusions,
+        source_fingerprint,
     })
 }
 
@@ -611,8 +624,10 @@ fn persist_conclusions(conn: &Connection, path: &str, enc: &EncodedAnalysis) {
     }
     let at = current_generation(conn);
     let r = conn.execute(
-        "INSERT OR REPLACE INTO conclusions (path, generation, map) VALUES (?1, ?2, ?3)",
-        params![path, at.0, enc.conclusions],
+        "INSERT OR REPLACE INTO conclusions \
+         (path, generation, map, source_fingerprint, flush_generation) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![path, at.0, enc.conclusions, enc.source_fingerprint as i64, at.0],
     );
     if let Err(e) = r {
         log::warn!("Failed to save conclusions for '{path}': {e}");

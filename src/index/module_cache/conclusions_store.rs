@@ -66,16 +66,51 @@ pub fn load_conclusions(
     path: &str,
     at: Generation,
 ) -> Option<ConclusionMap> {
-    let blob: Vec<u8> = conn
+    load_conclusions_stamped(conn, path, at).map(|(m, _)| m)
+}
+
+/// `load_conclusions` plus the row's own stamps — what a validity check needs.
+///
+/// The map is returned WITHOUT judging it. Validity is the caller's compare,
+/// because only the caller knows the fingerprint the index currently records
+/// for this path, and re-deriving it here would mean hashing a surface on the
+/// consult path — which is the hot path this whole layer exists to shorten.
+pub fn load_conclusions_stamped(
+    conn: &Connection,
+    path: &str,
+    at: Generation,
+) -> Option<(ConclusionMap, RowStamp)> {
+    let (blob, fp, gen): (Vec<u8>, i64, i64) = conn
         .query_row(
-            "SELECT map FROM conclusions WHERE path = ?1 AND generation <= ?2 \
+            "SELECT map, source_fingerprint, flush_generation FROM conclusions \
+             WHERE path = ?1 AND generation <= ?2 \
              ORDER BY generation DESC LIMIT 1",
             params![path, at.0],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok()?;
     let bin = zstd::decode_all(blob.as_slice()).ok()?;
-    bincode::deserialize(&bin).ok()
+    let map = bincode::deserialize(&bin).ok()?;
+    Some((map, RowStamp { source_fingerprint: fp as u64, flush_generation: Generation(gen) }))
+}
+
+/// What a persisted conclusion row asserts about itself.
+///
+/// `source_fingerprint` is the surface fingerprint of the analysis the map was
+/// baked from — the same value `FreshnessIndex` records for the path. A row
+/// whose fingerprint differs from what the index currently records describes a
+/// file that has moved, and reads as absent.
+///
+/// That one compare subsumes three failure modes that used to need three
+/// different erasers to remember them: an ORPHANED row whose `modules` row was
+/// erased, a STALE row for an edited file, and a row from an INTERRUPTED write.
+/// None of them can match, so correctness stops depending on any caller
+/// remembering to delete anything — the erasers remain for space, not for
+/// truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowStamp {
+    pub source_fingerprint: u64,
+    pub flush_generation: Generation,
 }
 
 /// Write one file's conclusions at a generation.
@@ -95,6 +130,7 @@ pub fn save_conclusions(
     path: &str,
     at: Generation,
     map: &ConclusionMap,
+    stamp: RowStamp,
 ) -> bool {
     let Ok(bin) = bincode::serialize(map) else {
         return false;
@@ -103,8 +139,10 @@ pub fn save_conclusions(
         return false;
     };
     conn.execute(
-        "INSERT OR REPLACE INTO conclusions (path, generation, map) VALUES (?1, ?2, ?3)",
-        params![path, at.0, blob],
+        "INSERT OR REPLACE INTO conclusions \
+         (path, generation, map, source_fingerprint, flush_generation) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![path, at.0, blob, stamp.source_fingerprint as i64, stamp.flush_generation.0],
     )
     .is_ok()
 }
@@ -123,12 +161,16 @@ pub fn save_conclusions(
 pub fn publish_generation(
     conn: &Connection,
     at: Generation,
-    entries: &[(String, ConclusionMap)],
+    entries: &[(String, ConclusionMap, u64)],
 ) -> rusqlite::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> rusqlite::Result<()> {
-        for (path, map) in entries {
-            if !save_conclusions(conn, path, at, map) {
+        for (path, map, fingerprint) in entries {
+            let stamp = RowStamp {
+                source_fingerprint: *fingerprint,
+                flush_generation: at,
+            };
+            if !save_conclusions(conn, path, at, map, stamp) {
                 // An entry that will not encode cannot be published, and
                 // publishing the rest under this generation would present a
                 // partial round as complete. Fail the round instead.
@@ -245,7 +287,7 @@ pub fn repair_conclusions_slice(
     paths: &[String],
     at: Generation,
 ) -> usize {
-    let baked: Vec<(&String, Vec<u8>)> = paths
+    let baked: Vec<(&String, Vec<u8>, u64)> = paths
         .iter()
         .filter_map(|path| {
             // WITH the bag: the bake reads witnesses, and a bagless decode
@@ -254,13 +296,19 @@ pub fn repair_conclusions_slice(
             // repair exists to undo.
             let fa = super::load_one_diag(conn, path, true).ok()?;
             let blob = super::bake_conclusions_blob(&fa, &fa.witnesses);
+            // Stamped from the analysis the repair actually decoded, not from
+            // the index: a repair races the writers, and a fingerprint read
+            // elsewhere could describe a newer state than these bytes.
+            let fingerprint = crate::model::surface::surface_fingerprint(
+                &crate::model::surface::Surface::project(&fa),
+            );
             if blob.is_empty() {
                 // Nothing encodable. Leaving the row absent is right: the
                 // reader falls back to a decode, which is where it already was.
                 crate::util::ghost_stats::count("repair.nothing_to_bake");
                 return None;
             }
-            Some((path, blob))
+            Some((path, blob, fingerprint))
         })
         .collect();
     if baked.is_empty() {
@@ -271,10 +319,12 @@ pub fn repair_conclusions_slice(
         log::warn!("conclusion repair: txn open failed; the slice defers to the next pass");
         return 0;
     }
-    for (path, blob) in &baked {
+    for (path, blob, fingerprint) in &baked {
         let r = conn.execute(
-            "INSERT OR REPLACE INTO conclusions (path, generation, map) VALUES (?1, ?2, ?3)",
-            params![path, at.0, blob],
+            "INSERT OR REPLACE INTO conclusions \
+             (path, generation, map, source_fingerprint, flush_generation) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![path, at.0, blob, *fingerprint as i64, at.0],
         );
         match r {
             Ok(_) => landed += 1,

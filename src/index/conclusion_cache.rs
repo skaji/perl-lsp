@@ -18,6 +18,7 @@
 //! `None`. Collapsing the two would turn every unbaked file into a file that
 //! concludes nothing.
 
+use crate::index::module_cache::RowStamp;
 use crate::model::witnesses::ConclusionMap;
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
@@ -27,17 +28,19 @@ use std::sync::Arc;
 /// What a lookup found, kept distinct so a caller cannot accidentally read
 /// "nothing stored" as "nothing concluded".
 pub enum Cached {
-    /// The store has a map for this path.
-    Map(Arc<ConclusionMap>),
+    /// The store has a map for this path, with the stamps it asserts about
+    /// itself. The map is NOT judged here — validity is the caller's compare
+    /// against what the freshness index currently records.
+    Map(Arc<ConclusionMap>, RowStamp),
     /// The store has no map for this path — it was never baked, or its bake
     /// was cleared. Decode.
     NotBaked,
 }
 
-type Loader = Box<dyn Fn(&Path) -> Option<ConclusionMap> + Send + Sync>;
+type Loader = Box<dyn Fn(&Path) -> Option<(ConclusionMap, RowStamp)> + Send + Sync>;
 
 pub struct ConclusionCache {
-    entries: DashMap<PathBuf, (Arc<ConclusionMap>, usize)>,
+    entries: DashMap<PathBuf, (Arc<ConclusionMap>, RowStamp, usize)>,
     /// Paths the loader has already reported absent. Without this, every
     /// consult against an unbaked file re-queries SQLite forever — the
     /// negative answer is the one a hot loop hits most while a workspace is
@@ -51,7 +54,7 @@ pub struct ConclusionCache {
 impl ConclusionCache {
     pub fn new(
         cap_bytes: usize,
-        loader: impl Fn(&Path) -> Option<ConclusionMap> + Send + Sync + 'static,
+        loader: impl Fn(&Path) -> Option<(ConclusionMap, RowStamp)> + Send + Sync + 'static,
     ) -> Self {
         Self {
             entries: DashMap::new(),
@@ -65,14 +68,15 @@ impl ConclusionCache {
     pub fn get(&self, path: &Path) -> Cached {
         if let Some(hit) = self.entries.get(path) {
             crate::util::ghost_stats::count("conclcache.hit");
-            return Cached::Map(hit.value().0.clone());
+            let e = hit.value();
+            return Cached::Map(e.0.clone(), e.1);
         }
         if self.absent.contains_key(path) {
             crate::util::ghost_stats::count("conclcache.known_absent");
             return Cached::NotBaked;
         }
         crate::util::ghost_stats::count("conclcache.miss");
-        let Some(map) = crate::util::ghost_stats::timed("conclcache.load", || {
+        let Some((map, stamp)) = crate::util::ghost_stats::timed("conclcache.load", || {
             (self.loader)(path)
         }) else {
             self.absent.insert(path.to_path_buf(), ());
@@ -82,17 +86,19 @@ impl ConclusionCache {
         let arc = Arc::new(map);
         if self.cap_bytes > 0 {
             self.bytes.fetch_add(sz, Ordering::Relaxed);
-            if let Some((_, old)) = self.entries.insert(path.to_path_buf(), (arc.clone(), sz)) {
+            if let Some((_, _, old)) =
+                self.entries.insert(path.to_path_buf(), (arc.clone(), stamp, sz))
+            {
                 self.bytes.fetch_sub(old.min(self.bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
             }
             self.evict_to_cap(path);
         }
-        Cached::Map(arc)
+        Cached::Map(arc, stamp)
     }
 
     /// Forget one path — its file changed, so its bake is void.
     pub fn invalidate(&self, path: &Path) {
-        if let Some((_, (_, sz))) = self.entries.remove(path) {
+        if let Some((_, (_, _, sz))) = self.entries.remove(path) {
             self.bytes
                 .fetch_sub(sz.min(self.bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
         }
@@ -129,7 +135,7 @@ impl ConclusionCache {
                 .map(|e| e.key().clone())
                 .find(|p| p != keep);
             let Some(victim) = victim else { break };
-            if let Some((_, (_, sz))) = self.entries.remove(&victim) {
+            if let Some((_, (_, _, sz))) = self.entries.remove(&victim) {
                 self.bytes
                     .fetch_sub(sz.min(self.bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
                 crate::util::ghost_stats::count("conclcache.evicted");

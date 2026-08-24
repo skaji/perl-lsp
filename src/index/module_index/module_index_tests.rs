@@ -2310,19 +2310,25 @@ fn invalidating_derived_copies_takes_the_bake_as_well_as_the_bag() {
     let l = Arc::clone(&loads);
     let cache = Arc::new(ConclusionCache::new(1 << 20, move |_p| {
         l.fetch_add(1, Ordering::Relaxed);
-        Some(ConclusionMap::default())
+        Some((
+            ConclusionMap::default(),
+            crate::index::module_cache::RowStamp {
+                source_fingerprint: 0,
+                flush_generation: crate::index::module_cache::Generation(0),
+            },
+        ))
     }));
 
     let idx = ModuleIndex::new_for_cli();
     idx.set_conclusion_cache(Arc::clone(&cache));
 
-    assert!(matches!(cache.get(&path), Cached::Map(_)));
-    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert!(matches!(cache.get(&path), Cached::Map(..)));
+    assert!(matches!(cache.get(&path), Cached::Map(..)));
     assert_eq!(loads.load(Ordering::Relaxed), 1, "precondition: memoized");
 
     idx.invalidate_derived_copies(&path);
 
-    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert!(matches!(cache.get(&path), Cached::Map(..)));
     assert_eq!(
         loads.load(Ordering::Relaxed),
         2,
@@ -2372,4 +2378,121 @@ fn a_mark_postdates_every_stamp_that_preceded_it() {
         idx.restamp_owed(&a, None),
         "never stamped is owed regardless — a rehydrated copy always reads None"
     );
+}
+
+/// SPEC 3's correctness argument, positive control.
+///
+/// A conclusions row carries the surface fingerprint of the analysis it was
+/// baked from. When that still matches what the index records for the path,
+/// the row describes the file a consumer can see, and the consult is answered
+/// from it — which is the entire point of persisting the layer.
+#[test]
+fn a_conclusions_row_matching_the_recorded_surface_is_used() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Steady.pm");
+    let fa = parse_source_to_cached("package Steady;\nsub a { 1 }\n1;\n", "Steady");
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&fa),
+        flush_generation: Generation(0),
+    };
+
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    idx.record_surface(&path, &fa.analysis);
+
+    assert!(
+        idx.conclusions_for(&path).is_some(),
+        "a row whose stamp matches the recorded surface was rejected — the \
+         persisted layer would never be read and every consult pays the chase"
+    );
+}
+
+/// The stale arm: the file moved since the row was written.
+///
+/// This is the failure the stamp exists to catch. A row baked from a previous
+/// version of the file is not a slow answer, it is a WRONG one — it concludes
+/// over code that no longer exists, and nothing downstream can tell.
+#[test]
+fn a_conclusions_row_whose_source_moved_reads_absent() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Moved.pm");
+    let before = parse_source_to_cached("package Moved;\nsub a { 1 }\n1;\n", "Moved");
+    let after =
+        parse_source_to_cached("package Moved;\nsub a { 1 }\nsub b { 2 }\n1;\n", "Moved");
+    assert_ne!(
+        surface_fp(&before),
+        surface_fp(&after),
+        "fixture must actually move the cross-file-visible surface"
+    );
+
+    // The row on disk was baked from the OLD analysis...
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&before),
+        flush_generation: Generation(0),
+    };
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    // ...while the index has since recorded the NEW one.
+    idx.record_surface(&path, &after.analysis);
+
+    assert!(
+        idx.conclusions_for(&path).is_none(),
+        "a row baked from a previous version of the file was served as its \
+         conclusions — consults would answer from deleted code"
+    );
+}
+
+/// The unrecorded arm, which is also the ORPHANED arm.
+///
+/// A row can outlive the `modules` row it was written beside (a partial clear,
+/// an interrupted write, a deleted file whose freshness record was removed),
+/// and a fresh process starts with an empty in-memory index regardless. In all
+/// of those the index has nothing to vouch with, and the only safe direction
+/// is to decode — never to trust a stamp we cannot compare against.
+#[test]
+fn a_conclusions_row_for_an_unrecorded_path_reads_absent() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Orphan.pm");
+    let fa = parse_source_to_cached("package Orphan;\nsub a { 1 }\n1;\n", "Orphan");
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&fa),
+        flush_generation: Generation(0),
+    };
+
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    // Deliberately no `record_surface`: the row's own stamp is self-consistent
+    // and would pass any check that only asked the ROW whether it was valid.
+
+    assert!(
+        idx.conclusions_for(&path).is_none(),
+        "a row for a path the index has never recorded was trusted — an \
+         orphaned row survives a clear and its stamp always agrees with itself"
+    );
+}
+
+/// The fingerprint a conclusions row stamps itself with, spelled once for the
+/// row-validity tests so they cannot drift from what the writer computes.
+fn surface_fp(c: &Arc<CachedModule>) -> u64 {
+    crate::model::surface::surface_fingerprint(&crate::model::surface::Surface::project(
+        &c.analysis,
+    ))
 }

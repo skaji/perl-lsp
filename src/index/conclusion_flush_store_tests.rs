@@ -291,8 +291,8 @@ fn flush_refresh_set_moves_a_consumer_over_a_real_store() {
         &conn,
         Generation(1),
         &[
-            (a.to_string_lossy().into_owned(), a_old),
-            (b.to_string_lossy().into_owned(), b_map),
+            (a.to_string_lossy().into_owned(), a_old, 1),
+            (b.to_string_lossy().into_owned(), b_map, 2),
         ],
     )
     .expect("baseline");
