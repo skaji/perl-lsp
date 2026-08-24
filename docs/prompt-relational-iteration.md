@@ -1,7 +1,18 @@
 # Prompt: move iteration to relational
 
-**Status: direction brief for the scaling push. First slice landed (the
-member pre-filter, below); everything else is ranked, not started.**
+**Status: direction brief for the scaling push. Landed so far: the member
+pre-filter (ladder 1), the bridged-walk early exit (ladder 3's cheap half),
+the seam-retry gate (`serves_enriched`), and `RetainedReader` under both the
+conclusion loader and the bag-rehydrate loaders. The rest is ranked, not
+started.**
+
+**Honest sizing note for the retained-connection family**: connection-per-miss
+was the dominant term ONLY on a synthetic no-locality corpus (551 unrelated
+dists: 69,933 conclusion-cache misses; real apps measured 511 on crm and 668
+on Koha — misses are a LOCALITY property, not a file-count one). On real code
+the fix saves ~0.4 s per cold check. It stays because per-call open is the
+wrong shape regardless and the cliff exists for whoever indexes a dep-mirror
+tree — but nothing further in this family is worth cutting on cost grounds.
 
 ## The thesis
 
