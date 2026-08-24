@@ -146,8 +146,14 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
     // repair run ahead of the loop would put minutes in front of the first
     // resolve. It runs in the gap where this thread would otherwise be blocked
     // on its condvar, which is the definition of "post-ready background".
+    //
+    // Not seeded at all when baking is switched off: the repair lane is the
+    // SECOND producer of a conclusions row, so leaving it on would let the
+    // control's own arm bake the whole corpus in the background and measure a
+    // full layer from its second warm run onward.
     let mut repair_frontier: Vec<String> = db
         .as_ref()
+        .filter(|_| !crate::model::witnesses::bake_disabled())
         .map(|conn| {
             let at = module_cache::current_generation(conn);
             let f = module_cache::paths_missing_conclusions(conn, at);

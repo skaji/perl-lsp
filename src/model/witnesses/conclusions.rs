@@ -557,6 +557,26 @@ pub fn not_local_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("PERL_LSP_NO_NOT_LOCAL").is_ok())
 }
 
+/// Is baking switched off?
+///
+/// ONE speller, because there are TWO producers of a conclusions row — the
+/// persist path (`encode_analysis`) and the background repair lane
+/// (`repair_conclusions_slice`, seeded from `paths_missing_conclusions`) — and
+/// a control that gates only the first is not a control at all. Measured on
+/// the substrate before this existed: an A/B whose OFF arm was primed cold
+/// answered 72,305 provider fetches on its first run and **57,481 on its
+/// third**, byte-identical to the ON arm, because the repair lane had quietly
+/// baked the entire frontier in between. The flag disabled itself after one
+/// warm run and nothing said so.
+///
+/// Read through `conclusions::bake_disabled()` from every producer;
+/// `layering_tests::the_bake_gate_has_one_reader` pins that there is no
+/// second `std::env::var` for this name.
+pub fn bake_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("PERL_LSP_NO_BAKE").is_ok())
+}
+
 pub fn mint_links_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PERL_LSP_MINT_LINKS").is_ok())

@@ -192,7 +192,7 @@ pub fn encode_analysis(fa: &FileAnalysis) -> Option<EncodedAnalysis> {
     // Escape hatch and A/B control, same shape as `PERL_LSP_PD_NO_COMBINE`:
     // a new cost on the persist path should be switchable off without a
     // rebuild, so its price can be measured rather than argued about.
-    let conclusions = if std::env::var("PERL_LSP_NO_BAKE").is_ok() {
+    let conclusions = if crate::model::witnesses::bake_disabled() {
         Vec::new()
     } else {
     bake_conclusions_blob(fa, &bag)
