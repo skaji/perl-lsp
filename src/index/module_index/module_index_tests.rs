@@ -2496,3 +2496,64 @@ fn surface_fp(c: &Arc<CachedModule>) -> u64 {
         &c.analysis,
     ))
 }
+
+/// The torn-read pin: one walk reads conclusions from ONE generation.
+///
+/// A flush publishes a whole round at generation N+1 while walks are in
+/// flight. Without the pin a walk can read file A's map from N and file B's
+/// from N+1 and compose them into a single cross-file answer — two halves of
+/// one answer taken from different worlds, and nothing downstream can tell.
+/// The pin costs at worst a decode, which is the fallback the layer already
+/// has for an absent row.
+#[test]
+fn one_walk_reads_conclusions_from_one_generation() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::{ConclusionMap, ResolutionSession};
+
+    let early = std::path::PathBuf::from("/fake/Early.pm");
+    let later = std::path::PathBuf::from("/fake/Later.pm");
+    let fa_e = parse_source_to_cached("package Early;\nsub a { 1 }\n1;\n", "Early");
+    let fa_l = parse_source_to_cached("package Later;\nsub b { 2 }\n1;\n", "Later");
+
+    // Both rows are FRESH — each stamp matches what the index records. The
+    // only thing separating them is the generation they were published at.
+    let (fp_e, fp_l) = (surface_fp(&fa_e), surface_fp(&fa_l));
+    let (e_path, l_path) = (early.clone(), later.clone());
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |p| {
+        let stamp = if p == e_path {
+            RowStamp { source_fingerprint: fp_e, flush_generation: Generation(7) }
+        } else if p == l_path {
+            RowStamp { source_fingerprint: fp_l, flush_generation: Generation(8) }
+        } else {
+            return None;
+        };
+        Some((ConclusionMap::default(), stamp))
+    })));
+    idx.record_surface(&early, &fa_e.analysis);
+    idx.record_surface(&later, &fa_l.analysis);
+
+    // No walk open: independent consults make no coherence claim, so both
+    // answer. This is also the control — without it the assertions below
+    // would pass against a `conclusions_for` that answered nothing at all.
+    assert!(idx.conclusions_for(&early).is_some());
+    assert!(idx.conclusions_for(&later).is_some());
+
+    let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+    assert!(
+        idx.conclusions_for(&early).is_some(),
+        "the first row consumed sets the pin; it must be readable"
+    );
+    assert!(
+        idx.conclusions_for(&later).is_none(),
+        "a row from a different generation was composed into a walk already \
+         reading generation 7 — half of this answer is from another world"
+    );
+    assert!(
+        idx.conclusions_for(&early).is_some(),
+        "the pin must admit its own generation for the rest of the walk"
+    );
+}
+

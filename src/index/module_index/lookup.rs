@@ -409,6 +409,16 @@ impl CrossFileLookup for ModuleIndex {
         // direction here is "decode", never "trust".
         match self.freshness.fingerprint_of(path) {
             Some(fp) if fp == stamp.source_fingerprint => {
+                // Fresh, but is it from the world this walk already
+                // committed to? A flush publishes a whole round while walks
+                // are in flight; mixing generations within one walk takes
+                // two halves of a cross-file answer from different worlds.
+                if !crate::model::witnesses::ResolutionSession::admit_conclusion_generation(
+                    self,
+                    stamp.flush_generation.0,
+                ) {
+                    return None;
+                }
                 crate::util::ghost_stats::count("conclrow.valid");
                 Some(m)
             }

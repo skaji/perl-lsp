@@ -54,6 +54,12 @@ pub struct FlushOutcome {
     /// because a dispatch target is resolved through the index rather than
     /// read off a surface. Marking only what moved would skip exactly those.
     pub enqueued: Vec<PathBuf>,
+    /// The generation this flush published its seeds at, if it published.
+    ///
+    /// `None` means nothing was written: no seeds, a non-convergent wave, or
+    /// a failed transaction. Absent is always safe — the store keeps the
+    /// previous generation and a consult falls back to a decode.
+    pub published: Option<module_cache::Generation>,
     /// The round cap fired: the surfaces never stopped moving. The flush is
     /// abandoned rather than published — a half-propagated generation is worse
     /// than none, because a consult pinned to it would compose answers from a
@@ -321,27 +327,29 @@ fn flush_over_world(
 /// `candidates_of` maps a class to the files that declare it, the same
 /// relation the live `follow_link` resolves through.
 ///
-/// Deliberately does NOT publish. The seeds' fresh maps belong in the store —
-/// that is what keeps a consult on a just-edited file cheap — but their blobs
-/// were invalidated a moment ago, and a conclusion row with no `modules` row
-/// behind it can never be caught by a stamp check, because the stamp lives on
-/// the `modules` row. Writing one would re-open, by a different door, exactly
-/// the "a bake outlived its blob" hole that `invalidate_generation` was just
-/// taught to close. Publishing wants the conclusions table to carry its own
-/// freshness stamp first.
+/// Publishes the seeds at generation N+1 before returning, which is safe
+/// because each conclusions row now carries its OWN `source_fingerprint`: a
+/// row whose `modules` row was invalidated a moment ago is not trusted on the
+/// strength of that row's absence, it is checked against what the freshness
+/// index records for the path and reads absent when they disagree.
 ///
 /// The generation is read ONCE and frozen for the whole wave: reading it again
 /// mid-flush could compose answers from two worlds, which is the failure the
 /// pin exists to prevent.
 pub fn flush_refresh_set(
     conn: &Connection,
-    fresh: Vec<(PathBuf, ConclusionMap)>,
+    fresh: Vec<FreshBake>,
     frontier: Vec<PathBuf>,
     consumers_of: &dyn Fn(&Path) -> Vec<PathBuf>,
     candidates_of: &dyn Fn(&str) -> Vec<PathBuf>,
 ) -> FlushOutcome {
     let at = module_cache::current_generation(conn);
-    let supplied: HashMap<PathBuf, ConclusionMap> = fresh.into_iter().collect();
+    let fingerprints: HashMap<PathBuf, u64> = fresh
+        .iter()
+        .map(|f| (f.path.clone(), f.source_fingerprint))
+        .collect();
+    let supplied: HashMap<PathBuf, ConclusionMap> =
+        fresh.into_iter().map(|f| (f.path, f.map)).collect();
     let seeds: Vec<PathBuf> = supplied.keys().cloned().collect();
     let frozen_src = |path: &Path| {
         module_cache::load_conclusions(conn, &path.to_string_lossy(), at)
@@ -360,7 +368,79 @@ pub fn flush_refresh_set(
         Some(module_cache::bake_conclusion_map(&fa, &fa.witnesses))
     };
     let world = FlushWorld::new(&frozen_src, &re_bake, candidates_of, seeds);
-    flush_over_world(&world, frontier, consumers_of)
+    let mut out = flush_over_world(&world, frontier, consumers_of);
+    out.published = publish_seeds(conn, at, &out, &supplied, &fingerprints);
+    out
+}
+
+/// Write the seeds' fresh maps as one generation.
+///
+/// Only the SEEDS. A file the wave merely reached has the right map already —
+/// the bake is index-free, so a downstream change moves its answers without
+/// moving its map — and re-writing it would spend a transaction to store what
+/// is already stored.
+///
+/// A non-convergent wave publishes nothing: its refresh set is a half-finished
+/// propagation, and a consult pinned to that generation would compose answers
+/// from a wave that never settled.
+///
+/// The stamp is the fingerprint the CALLER computed from the analysis it baked
+/// from, carried through untouched. Reading it back from the freshness index
+/// here would let a concurrent record put a different file's fingerprint on
+/// this map, which is the one lie the consult-time compare cannot catch.
+fn publish_seeds(
+    conn: &Connection,
+    at: module_cache::Generation,
+    out: &FlushOutcome,
+    supplied: &HashMap<PathBuf, ConclusionMap>,
+    fingerprints: &HashMap<PathBuf, u64>,
+) -> Option<module_cache::Generation> {
+    if out.non_convergent || supplied.is_empty() {
+        return None;
+    }
+    let next = module_cache::Generation(at.0 + 1);
+    let entries: Vec<(String, ConclusionMap, u64)> = supplied
+        .iter()
+        .filter_map(|(path, map)| {
+            // No fingerprint means no publishable stamp. Skipping is right:
+            // an unstamped row would have to be trusted rather than checked.
+            let fp = fingerprints.get(path)?;
+            Some((path.to_string_lossy().into_owned(), map.clone(), *fp))
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+    if let Err(e) = module_cache::publish_generation(conn, next, &entries) {
+        // Never fatal. The previous generation stands, every consult falls
+        // back to a decode, and the next flush republishes.
+        crate::util::ghost_stats::count("flush.publish_failed");
+        log::warn!("conclusion flush: publishing generation {} failed: {e}", next.0);
+        return None;
+    }
+    crate::util::ghost_stats::count_by("flush.published", entries.len() as u64);
+    // Reclaim superseded rows immediately, which is safe precisely BECAUSE of
+    // the session pin: a walk still reading an older generation finds its row
+    // gone, reads absent, and decodes. The retention that made pruning
+    // dangerous protected correctness; the pin protects it better, so what is
+    // left to protect is only speed.
+    let reclaimed = module_cache::prune_generations_below(conn, next);
+    if reclaimed > 0 {
+        crate::util::ghost_stats::count_by("flush.pruned", reclaimed as u64);
+    }
+    Some(next)
+}
+
+/// One seed of a flush: a file whose blob just changed, the map the caller
+/// baked from its new analysis, and that analysis's surface fingerprint.
+///
+/// The three travel together because they must describe ONE state — the stamp
+/// is what a consult checks the map against, so a stamp gathered separately
+/// from the map is a stamp that can describe a different file.
+pub struct FreshBake {
+    pub path: PathBuf,
+    pub map: ConclusionMap,
+    pub source_fingerprint: u64,
 }
 
 #[cfg(test)]

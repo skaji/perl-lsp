@@ -379,3 +379,45 @@ fn freshness_dirty_walk_covers_renamed_away_providers() {
         "stale-provided names last exactly one re-record: Bar has no consumers"
     );
 }
+
+/// A Surface projected from a bag-EVICTED analysis is a different Surface.
+///
+/// `Surface::project` reads the witness bag — `despan`ed `InferredType`s on
+/// methods and values, and the loader shapes — so a stripped copy projects a
+/// SMALLER surface that still claims to describe the file. Nothing about the
+/// result says it is partial.
+///
+/// This is why a warm lane cannot record a projection taken from a resident
+/// (stripped) copy: the cold run records one fingerprint for a file and the
+/// warm run records another for the same unchanged bytes, so anything
+/// comparing the two across the boundary is comparing two different questions.
+/// Measured on the substrate: 47,967 of 62,545 conclusions-row consults were
+/// rejected as stale against rows that were in fact correct, and the chase
+/// they fell back to cost 3.3x the provider fetches.
+///
+/// Pinned as an EQUALITY-FAILING property on purpose — it records what is
+/// true today so a fix flips this test rather than being invisible. Written
+/// up, with the measurement and the fix options, in
+/// `docs/prompt-surface-projection-drift.md`.
+#[test]
+fn a_bag_evicted_analysis_projects_a_different_surface() {
+    let src = "package Alpha;\nuse strict;\n\
+               sub new { my $c = shift; return bless {}, $c }\n\
+               sub name { my $s = shift; return 'alpha' }\n1;\n";
+    let mut parser = crate::build::builder::create_parser();
+    let tree = parser.parse(src, None).expect("parse");
+    let whole = crate::build::builder::build(&tree, src.as_bytes());
+    let fp_whole = surface_fingerprint(&Surface::project(&whole));
+
+    let mut stripped = whole.clone();
+    stripped.evict_witness_bag();
+    let fp_stripped = surface_fingerprint(&Surface::project(&stripped));
+
+    assert_ne!(
+        fp_whole, fp_stripped,
+        "bag eviction no longer moves the projected surface — if that is a \
+         FIX, delete this test and its write-up with it; if it is a \
+         fixture that stopped exercising the bag, make the fixture carry \
+         bag-derived surface content again"
+    );
+}

@@ -8,7 +8,7 @@
 use super::*;
 use crate::model::file_analysis::InferredType;
 use crate::model::witnesses::{Conclusion, ConclusionKey, ReceiverRule};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn key(class: &str, name: &str) -> ConclusionKey {
     ConclusionKey::MethodOnClass { class: class.into(), name: name.into() }
@@ -22,6 +22,12 @@ fn map_of(class: &str, name: &str, c: Conclusion) -> ConclusionMap {
     let mut enumerated = HashSet::new();
     enumerated.insert(class.to_string());
     ConclusionMap(m, HashSet::new(), enumerated, HashMap::new())
+}
+
+/// One flush seed. Spelled here so the publication tests and the propagation
+/// test agree on how a seed is built.
+fn seed(path: &PathBuf, map: ConclusionMap, fingerprint: u64) -> FreshBake {
+    FreshBake { path: path.clone(), map, source_fingerprint: fingerprint }
 }
 
 fn p(s: &str) -> PathBuf {
@@ -308,7 +314,7 @@ fn flush_refresh_set_moves_a_consumer_over_a_real_store() {
 
     let out = flush_refresh_set(
         &conn,
-        vec![(a.clone(), a_new)],
+        vec![seed(&a, a_new, 11)],
         vec![a.clone()],
         &consumers_of,
         &candidates_of,
@@ -319,5 +325,128 @@ fn flush_refresh_set_moves_a_consumer_over_a_real_store() {
         moved,
         vec![a.clone(), b.clone()],
         "A moved, and B moved through it — B's stored map never changed"
+    );
+}
+
+/// Publication, end to end: the seed's fresh map is in the store afterwards,
+/// at the next generation, carrying the fingerprint the caller supplied.
+///
+/// This is what makes a consult on a just-edited file cheap. Without it the
+/// flush computes the right answer and throws it away — the edited file's row
+/// still holds the pre-edit bake, so every consult against it either serves
+/// the old map or (once the stamp rejects it) decodes, forever.
+#[test]
+fn a_flush_publishes_its_seeds_at_the_next_generation() {
+    use crate::index::module_cache::{load_conclusions_stamped, publish_generation, Generation};
+    let conn = store_db();
+    let a = p("/pub/A.pm");
+    let old_map = map_of("A", "m", Conclusion::Value(InferredType::ClassName("Old".into())));
+    let new_map = map_of("A", "m", Conclusion::Value(InferredType::ClassName("New".into())));
+    publish_generation(&conn, Generation(1), &[(a.to_string_lossy().into_owned(), old_map, 1)])
+        .expect("baseline");
+
+    let none = |_: &str| Vec::new();
+    let no_consumers = |_: &Path| Vec::new();
+    let out = flush_refresh_set(
+        &conn,
+        vec![seed(&a, new_map.clone(), 42)],
+        vec![a.clone()],
+        &no_consumers,
+        &none,
+    );
+
+    assert_eq!(out.published, Some(Generation(2)), "the seed round must land");
+    let (stored, stamp) =
+        load_conclusions_stamped(&conn, &a.to_string_lossy(), Generation(2)).expect("published row");
+    assert_eq!(stored, new_map, "the published row holds the FRESH map");
+    assert_eq!(
+        stamp.source_fingerprint, 42,
+        "the caller's fingerprint must ride through untouched — a stamp \
+         gathered anywhere else can describe a different state than the map"
+    );
+    assert_eq!(stamp.flush_generation, Generation(2));
+}
+
+/// A wave that never settled publishes nothing.
+///
+/// Its refresh set is a half-finished propagation. A consult pinned to that
+/// generation would compose answers from a wave that did not converge, which
+/// is strictly worse than the decode it would otherwise have paid.
+///
+/// Driven at `publish_seeds` rather than through `flush_refresh_set`: a
+/// store-shaped world cannot be made to diverge on demand — `MAX_FOLLOW_HOPS`
+/// truncates a long chain, and the flush's own cutoff terminates a cycle,
+/// which is exactly what those are for. Fabricating divergence by defeating
+/// them would test the fabrication. `run_flush`'s own cap is covered by
+/// `conclusion_flush_tests::a_non_convergent_flush_reports_no_refresh_set`;
+/// this covers what publication does when it is told so.
+#[test]
+fn a_non_convergent_flush_publishes_nothing() {
+    use crate::index::module_cache::{current_generation, publish_generation, Generation};
+    let conn = store_db();
+    let a = p("/nonconv/A.pm");
+    let m = |v: &str| map_of("A", "m", Conclusion::Value(InferredType::ClassName(v.into())));
+    publish_generation(&conn, Generation(1), &[(a.to_string_lossy().into_owned(), m("Old"), 1)])
+        .expect("baseline");
+
+    let supplied: HashMap<PathBuf, ConclusionMap> = [(a.clone(), m("New"))].into_iter().collect();
+    let fingerprints: HashMap<PathBuf, u64> = [(a.clone(), 42)].into_iter().collect();
+
+    let abandoned = FlushOutcome { non_convergent: true, ..Default::default() };
+    assert_eq!(
+        publish_seeds(&conn, Generation(1), &abandoned, &supplied, &fingerprints),
+        None,
+        "a wave that never settled must not publish"
+    );
+    assert_eq!(
+        current_generation(&conn),
+        Generation(1),
+        "the generation must not advance past a wave that was abandoned"
+    );
+
+    // The control: identical inputs, convergent outcome. Without it the
+    // assertion above would hold against a publish that never works.
+    let settled = FlushOutcome::default();
+    assert_eq!(
+        publish_seeds(&conn, Generation(1), &settled, &supplied, &fingerprints),
+        Some(Generation(2))
+    );
+}
+
+/// Publishing reclaims what it supersedes.
+///
+/// Retaining every generation is what made a pin safe when absence could not
+/// be told from staleness; with the row stamp and the session pin, a walk that
+/// loses its generation reads absent and decodes. So the table must not grow a
+/// row per file per edit for the life of a session.
+#[test]
+fn publishing_reclaims_superseded_rows() {
+    use crate::index::module_cache::{publish_generation, Generation};
+    let conn = store_db();
+    let a = p("/prune/A.pm");
+    let m = |s: &str| map_of("A", "m", Conclusion::Value(InferredType::ClassName(s.into())));
+    publish_generation(&conn, Generation(1), &[(a.to_string_lossy().into_owned(), m("v1"), 1)])
+        .expect("baseline");
+    let none = |_: &str| Vec::new();
+    let no_consumers = |_: &Path| Vec::new();
+    for (i, v) in ["v2", "v3", "v4"].iter().enumerate() {
+        let out = flush_refresh_set(
+            &conn,
+            vec![seed(&a, m(v), 100 + i as u64)],
+            vec![a.clone()],
+            &no_consumers,
+            &none,
+        );
+        assert_eq!(out.published, Some(Generation(2 + i as i64)));
+    }
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM conclusions WHERE path = ?1", [a.to_string_lossy()], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "four publications left {rows} rows for one file — the table grows \
+         per edit for the life of the session"
     );
 }

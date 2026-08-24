@@ -62,6 +62,17 @@ struct SessionState {
     index_id: usize,
     /// `resolution_epoch()` when the memo was last known good.
     epoch: u64,
+    /// The store generation this walk has committed to reading conclusions
+    /// at, set by the first row it consumes.
+    ///
+    /// A flush publishes a whole round at generation N+1 while a walk is in
+    /// flight, so without this a walk could read file A's map from N and
+    /// file B's from N+1 — two halves of a cross-file answer taken from
+    /// different worlds. Pinning costs at worst a decode: a row from another
+    /// generation reads as absent, which is the fallback the layer already
+    /// has. It is never wrong, and there is no version of this that is
+    /// cheaper AND coherent.
+    conclusion_generation: Option<i64>,
     paths: HashMap<PathBuf, u32>,
     memo: HashMap<CandidateKey, Arc<ReducedValue>>,
     /// `visible_def_candidates` is a clone + sort of the whole candidate
@@ -164,6 +175,7 @@ impl ResolutionSession {
             *slot = Some(SessionState {
                 index_id: id,
                 epoch,
+                conclusion_generation: None,
                 paths: HashMap::new(),
                 memo: HashMap::new(),
                 candidates: HashMap::new(),
@@ -200,6 +212,34 @@ impl ResolutionSession {
     /// `None` when no session is open.
     pub fn stats() -> Option<SessionStats> {
         SESSION.with(|s| s.borrow().as_ref().map(|st| st.stats))
+    }
+
+    /// May this walk read a conclusions row published at `generation`?
+    ///
+    /// The first row consumed sets the pin; every later row must agree with
+    /// it or read as absent for the rest of the walk. With no session open
+    /// the answer is always yes — a background cascade issues independent
+    /// consults and makes no cross-file coherence claim for the pin to
+    /// protect.
+    ///
+    /// Called with the index the consult is running against so a foreign
+    /// index's rows can't set (or trip over) this session's pin.
+    pub fn admit_conclusion_generation(
+        idx: &dyn CrossFileLookup,
+        generation: i64,
+    ) -> bool {
+        with_session(idx, |st| match st.conclusion_generation {
+            None => {
+                st.conclusion_generation = Some(generation);
+                true
+            }
+            Some(pinned) if pinned == generation => true,
+            Some(_) => {
+                crate::util::ghost_stats::count("conclrow.generation_skew");
+                false
+            }
+        })
+        .unwrap_or(true)
     }
 
     /// Declare that this walk answered with less than it could have. Any
@@ -261,6 +301,9 @@ fn with_session<R>(
         if now != st.epoch {
             crate::util::ghost_stats::count("session.epoch_clear");
             st.epoch = now;
+            // The pin goes with the memo: the index moved, so a later
+            // generation is not a torn read, it is the new truth.
+            st.conclusion_generation = None;
             st.memo.clear();
             st.candidates.clear();
             st.paths.clear();
