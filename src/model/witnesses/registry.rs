@@ -830,46 +830,7 @@ impl ReducerRegistry {
                     note_slot_exit(state, class, key);
                 }
                 if let Some(idx) = ctx.module_index {
-                    // The memo/map tiers the PRIMARY loop has, mirrored here —
-                    // measured on FHEM: this arm carried 99.99% of 12.3M
-                    // provider fetches (each a rehydrate) while the primary's
-                    // machinery ran 1,320 times. Same ladder, same order:
-                    // session memo (cheapest) → consult budget → baked answer
-                    // → fetch. Conservative on the map: only a positive
-                    // `Answer` is taken; absence/NotLocal for slots is not
-                    // trusted here (slot writes chase ancestry, and the
-                    // absence gates were designed against the method walk).
-                    for cached in super::session::visible_def_candidates(idx, class).iter() {
-                        if let Some(hit) =
-                            super::session::candidate_answer(idx, &cached.path, q)
-                        {
-                            if *hit != ReducedValue::None {
-                                return (*hit).clone();
-                            }
-                            continue;
-                        }
-                        if !super::session::spend_consult(idx) {
-                            break;
-                        }
-                        if let Some(key) =
-                            super::ConclusionKey::from_attachment(q.attachment)
-                        {
-                            if let Some(map) = idx.conclusions_for(&cached.path) {
-                                if let super::Outcome::Answer(t) = map.evaluate(
-                                    &key,
-                                    q.receiver.as_ref(),
-                                    q.arity_hint,
-                                    &q.args,
-                                ) {
-                                    crate::util::ghost_stats::count("slotarm.baked_answer");
-                                    let v = ReducedValue::Type(t);
-                                    super::session::remember_candidate_answer(
-                                        idx, &cached.path, q, &v,
-                                    );
-                                    return v;
-                                }
-                            }
-                        }
+                    for cached in idx.visible_def_candidates(class) {
                         let attempt =
                             |full: &std::sync::Arc<crate::model::file_analysis::FileAnalysis>,
                              state: &mut _| {
@@ -902,9 +863,6 @@ impl ReducerRegistry {
                                 "moc.provider_answered"
                             });
                             if v != ReducedValue::None {
-                                super::session::remember_candidate_answer(
-                                    idx, &cached.path, q, &v,
-                                );
                                 return v;
                             }
                             // Fallback-on-miss (R4), symmetric with the
@@ -926,23 +884,10 @@ impl ReducerRegistry {
                                     state.pins.push(std::sync::Arc::clone(&enriched));
                                     let v = attempt(&enriched, state);
                                     if v != ReducedValue::None {
-                                        super::session::remember_candidate_answer(
-                                            idx, &cached.path, q, &v,
-                                        );
                                         return v;
                                     }
                                 }
                             }
-                            // Both views answered None — remember it, the
-                            // same memo discipline as the primary loop: this
-                            // candidate is asked once per (walk, key) instead
-                            // of once per call site.
-                            super::session::remember_candidate_answer(
-                                idx,
-                                &cached.path,
-                                q,
-                                &ReducedValue::None,
-                            );
                         }
                     }
                 }
