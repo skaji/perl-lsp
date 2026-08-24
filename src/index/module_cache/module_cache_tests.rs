@@ -1955,7 +1955,7 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
         "precondition: the map is gone"
     );
 
-    let frontier = paths_needing_repair(&conn, at);
+    let frontier = paths_needing_repair(&conn, at, true);
     assert_eq!(
         frontier,
         vec!["/repair/App.pm".to_string()],
@@ -1984,7 +1984,7 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
     // Idempotent: nothing is left on the frontier, so a second pass is a no-op
     // rather than a rewrite loop.
     assert!(
-        paths_needing_repair(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at, true).is_empty(),
         "a repaired file must leave the frontier, or the background pass never ends"
     );
 }
@@ -2103,7 +2103,7 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
     let at = current_generation(&conn);
     assert!(load_surface(&conn, "/surfver/App.pm").is_some(), "precondition");
     assert!(
-        paths_needing_repair(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at, true).is_empty(),
         "precondition: a freshly persisted file needs no repair"
     );
 
@@ -2119,7 +2119,7 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
          describes a shape this build does not produce"
     );
     assert_eq!(
-        paths_needing_repair(&conn, at),
+        paths_needing_repair(&conn, at, true),
         vec!["/surfver/App.pm".to_string()],
         "a stale surface must put the file back on the repair frontier, or the \
          first edit to the projection silently re-opens the drift for every \
@@ -2136,7 +2136,7 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
         "the repaired surface is not the cold projection"
     );
     assert!(
-        paths_needing_repair(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at, true).is_empty(),
         "a repaired file must leave the frontier"
     );
 }

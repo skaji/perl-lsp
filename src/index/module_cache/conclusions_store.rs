@@ -247,8 +247,21 @@ pub fn prune_generations_below(conn: &Connection, keep: Generation) -> usize {
 ///
 /// Version-filtered: a row below `EXTRACT_VERSION` is going to be re-parsed
 /// anyway, and baking it would spend the work twice.
-pub fn paths_needing_repair(conn: &Connection, at: Generation) -> Vec<String> {
-    let mut stmt = match conn.prepare(
+///
+/// The two disjuncts repair different PRODUCTS, and only one obeys the bake
+/// control: `include_missing_maps=false` (a `PERL_LSP_NO_BAKE` arm) selects
+/// surface-missing paths only, because the map half of the repair is the
+/// second conclusions producer — while the surface half is the freshness
+/// machinery's product, which the control does not claim to ablate. Gating
+/// the WHOLE frontier on the bake flag left a NO_BAKE arm running against
+/// un-repaired surfaces: a control that ablated more than the thing it
+/// controls, the `the_bake_gate_has_one_reader` failure shape one level up.
+pub fn paths_needing_repair(
+    conn: &Connection,
+    at: Generation,
+    include_missing_maps: bool,
+) -> Vec<String> {
+    let sql = if include_missing_maps {
         "SELECT DISTINCT m.path FROM modules m \
          WHERE m.analysis IS NOT NULL AND m.extract_version = ?1 \
            AND (NOT EXISTS ( \
@@ -258,8 +271,18 @@ pub fn paths_needing_repair(conn: &Connection, at: Generation) -> Vec<String> {
              OR NOT EXISTS ( \
                  SELECT 1 FROM surfaces s \
                  WHERE s.path = m.path AND s.version = ?3 \
-               ))",
-    ) {
+               ))"
+    } else {
+        // Same bind list as the other shape; `?2` (the generation) does not
+        // participate in a surface-only selection.
+        "SELECT DISTINCT m.path FROM modules m \
+         WHERE m.analysis IS NOT NULL AND m.extract_version = ?1 AND ?2 = ?2 \
+           AND NOT EXISTS ( \
+                 SELECT 1 FROM surfaces s \
+                 WHERE s.path = m.path AND s.version = ?3 \
+               )"
+    };
+    let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("conclusion repair: could not enumerate frontier: {e}");
@@ -299,6 +322,12 @@ pub fn repair_conclusions_slice(
     paths: &[String],
     at: Generation,
 ) -> usize {
+    // The map half obeys the bake control (the repair lane is the SECOND
+    // conclusions producer — letting it bake under PERL_LSP_NO_BAKE would
+    // hand the control's own arm a full layer from its second warm run);
+    // the surface half runs regardless — the same split as the frontier
+    // query, or the control ablates a lane it does not claim.
+    let bake_on = !crate::model::witnesses::bake_disabled();
     let baked: Vec<(&String, Vec<u8>, u64, Vec<u8>)> = paths
         .iter()
         .filter_map(|path| {
@@ -307,7 +336,11 @@ pub fn repair_conclusions_slice(
             // successful repair — the same silent-empty shape this whole
             // repair exists to undo.
             let fa = super::load_one_diag(conn, path, true).ok()?;
-            let blob = super::bake_conclusions_blob(&fa, &fa.witnesses);
+            let blob = if bake_on {
+                super::bake_conclusions_blob(&fa, &fa.witnesses)
+            } else {
+                Vec::new()
+            };
             // Stamped from the analysis the repair actually decoded, not from
             // the index: a repair races the writers, and a fingerprint read
             // elsewhere could describe a newer state than these bytes.
@@ -318,9 +351,12 @@ pub fn repair_conclusions_slice(
             // an older `Surface::project` gets replaced. Free here: the
             // fingerprint above already paid for the projection.
             let surface = super::encode_surface(&projected).unwrap_or_default();
-            if blob.is_empty() {
-                // Nothing encodable. Leaving the row absent is right: the
-                // reader falls back to a decode, which is where it already was.
+            if blob.is_empty() && surface.is_empty() {
+                // Nothing encodable in EITHER product. Leaving both rows
+                // absent is right: the reader falls back to a decode, which
+                // is where it already was. (An unencodable map alone must
+                // not drop the surface write — that was the executor's own
+                // copy of the half-gate.)
                 crate::util::ghost_stats::count("repair.nothing_to_bake");
                 return None;
             }
@@ -344,6 +380,12 @@ pub fn repair_conclusions_slice(
             if let Err(e) = r {
                 log::warn!("conclusion repair: surface store failed for '{path}': {e}");
             }
+        }
+        if blob.is_empty() {
+            // Surface-only repair (bake gated, or the map would not encode):
+            // the surface write above is the whole product.
+            landed += 1;
+            continue;
         }
         let r = conn.execute(
             "INSERT OR REPLACE INTO conclusions \

@@ -510,6 +510,20 @@ pub fn open_and_load_diag(
 /// opens and whose failure discrimination the residency tripwire reads.
 /// The fallback re-runs the readonly probe (a genuine miss pays ~one extra
 /// open); hits are the overwhelming population and hits pay zero.
+///
+/// WHY the blob lane may ride a retained connection even though
+/// `load_one_diag`'s single-row path skips stamp validation: the stale read
+/// an out-of-process clear could serve is CAUSALLY unreachable. A rehydrate
+/// for a changed file exists only after that file's copy was evicted, and
+/// eviction happens only AFTER its new blob's chunk COMMITS (the residency
+/// discipline's own ordering) — so the loader call, and the per-call inode
+/// recheck inside `with`, postdate the commit they must observe. Either the
+/// writer still holds the old inode (reads of it see its own writes —
+/// consistent), or the recheck sees the recreated file and reopens. The
+/// multi-row (dual-homed) path additionally prefers a stamp-matching row.
+/// A future lane on this connection whose reads neither self-validate nor
+/// inherit this eviction-after-commit causality re-opens the hole — do not
+/// reuse the retained reader for such a lane without its own argument.
 #[cfg(not(test))]
 pub fn open_and_load_diag_retained(
     retained: &RetainedReader,

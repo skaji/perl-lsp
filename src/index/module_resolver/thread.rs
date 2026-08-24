@@ -147,16 +147,23 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
     // resolve. It runs in the gap where this thread would otherwise be blocked
     // on its condvar, which is the definition of "post-ready background".
     //
-    // Not seeded at all when baking is switched off: the repair lane is the
-    // SECOND producer of a conclusions row, so leaving it on would let the
-    // control's own arm bake the whole corpus in the background and measure a
-    // full layer from its second warm run onward.
+    // With baking switched off, the frontier narrows to the SURFACE half
+    // rather than emptying: the map half is the second producer of a
+    // conclusions row (leaving it on would let the control's own arm bake
+    // the whole corpus in the background and measure a full layer from its
+    // second warm run onward), but the surface half is the freshness
+    // machinery's product, which the control does not claim to ablate —
+    // gating the whole frontier left a NO_BAKE arm running against
+    // un-repaired surfaces.
     let mut repair_frontier: Vec<String> = db
         .as_ref()
-        .filter(|_| !crate::model::witnesses::bake_disabled())
         .map(|conn| {
             let at = module_cache::current_generation(conn);
-            let f = module_cache::paths_needing_repair(conn, at);
+            let f = module_cache::paths_needing_repair(
+                conn,
+                at,
+                !crate::model::witnesses::bake_disabled(),
+            );
             if !f.is_empty() {
                 log::info!(
                     "Derivation repair: {} file(s) hold a blob whose map or \
