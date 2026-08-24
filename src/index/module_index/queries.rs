@@ -466,6 +466,15 @@ impl ModuleIndex {
     /// CLI sessions previously carried NO resolver, so they could never
     /// resolve a module the editor hadn't already cached. The thread
     /// blocks until `set_workspace_root` fires in `cli_full_startup`.
+    /// How many paths consults have pushed to the repair lane but the
+    /// resolver has not yet adopted. Test-only: the drain is on the resolver
+    /// thread, so a unit test asserting the push half needs to read the
+    /// handoff without one.
+    #[cfg(test)]
+    pub fn repair_pushed_len_for_test(&self) -> usize {
+        self.core.repair_pushed.len()
+    }
+
     pub fn new_for_cli() -> Self {
         let core = Arc::new(IndexCore::new());
         module_resolver::spawn_test_resolver(Arc::clone(&core));

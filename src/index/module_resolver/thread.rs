@@ -178,7 +178,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
 
     // Main resolve loop — drain priority first, then pending.
     loop {
-        let batch = drain_or_repair(&core.queue, &mut repair_frontier, db.as_ref());
+        let batch = drain_or_repair(&core, &core.queue, &mut repair_frontier, db.as_ref());
 
         // One diagnostics refresh per drained BATCH, not per module: a
         // resolve takes longer than the refresh debounce's settle window,
@@ -390,10 +390,32 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
 /// the whole frontier. When the frontier is empty this is exactly the old
 /// blocking drain.
 fn drain_or_repair(
+    core: &IndexCore,
     queue: &ResolveQueue,
     frontier: &mut Vec<String>,
     db: Option<&rusqlite::Connection>,
 ) -> Vec<String> {
+    // Adopt whatever consults pushed since the last pass. The frontier was
+    // enumerated once from the store's own "what is missing" query; this is
+    // the other half — paths whose row EXISTS and was rejected, which that
+    // query cannot see.
+    //
+    // Adopted HERE rather than signalled, so a push costs a consult one map
+    // insert and nothing else. The cost is latency, not correctness: a push
+    // that lands while this thread is blocked on the queue waits for the next
+    // resolve request. Repair has no deadline, and the set is path-keyed, so
+    // the wait bounds at one entry per stale file rather than one per
+    // rejection.
+    if !core.repair_pushed.is_empty() {
+        let pushed: Vec<String> = core
+            .repair_pushed
+            .iter()
+            .map(|e| e.key().to_string_lossy().into_owned())
+            .collect();
+        core.repair_pushed.clear();
+        crate::util::ghost_stats::count_by("repair.pushed", pushed.len() as u64);
+        frontier.extend(pushed);
+    }
     while !frontier.is_empty() {
         if let Some(batch) = try_drain_next_batch(queue) {
             return batch;

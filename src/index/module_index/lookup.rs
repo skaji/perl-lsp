@@ -578,6 +578,13 @@ impl CrossFileLookup for ModuleIndex {
             }
             Some(_) => {
                 crate::util::ghost_stats::count("conclrow.stale");
+                // Push half of the repair lane. This site is the only one
+                // that KNOWS the row is wrong rather than missing — the
+                // frontier query sees absence, and a fingerprint join would
+                // turn a check we just performed into an O(corpus) scan. One
+                // entry per path: a stale row rejected ten thousand times in
+                // a sweep is still one repair.
+                self.core.repair_pushed.insert(path.to_path_buf(), ());
                 None
             }
             None => {

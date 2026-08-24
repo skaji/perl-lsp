@@ -2713,3 +2713,48 @@ fn a_new_bridge_to_the_consumers_class_moves_the_enrichment_key() {
          the overlay froze bridged resolution state the dep-name walk cannot see"
     );
 }
+
+/// A consult that rejects a stale row says so, once.
+///
+/// The repair frontier is enumerated from the store's own "what is missing"
+/// query, which sees absence and cannot see a row that exists and is simply
+/// wrong. Without this push the residual drift never self-heals: the row is
+/// rejected on every consult, forever, and the layer pays a decode each time
+/// while a correct row sits one repair away.
+///
+/// Once, because a stale path is rejected as many times as it is consulted —
+/// tens of thousands per sweep — and that is still one repair.
+#[test]
+fn a_rejected_row_enqueues_its_path_for_repair_exactly_once() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Drifted.pm");
+    let before = parse_source_to_cached("package Drifted;\nsub a { 1 }\n1;\n", "Drifted");
+    let after =
+        parse_source_to_cached("package Drifted;\nsub a { 1 }\nsub b { 2 }\n1;\n", "Drifted");
+    assert_ne!(surface_fp(&before), surface_fp(&after), "fixture must move");
+
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&before),
+        flush_generation: Generation(1),
+    };
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    idx.record_surface(&path, &after.analysis);
+
+    assert_eq!(idx.repair_pushed_len_for_test(), 0, "precondition");
+    for _ in 0..5 {
+        assert!(idx.conclusions_for(&path).is_none(), "the row is stale");
+    }
+    assert_eq!(
+        idx.repair_pushed_len_for_test(),
+        1,
+        "a rejected row must enqueue its path for repair — and five \
+         rejections of one path are one repair, not five"
+    );
+}
