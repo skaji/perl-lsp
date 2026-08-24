@@ -258,6 +258,29 @@ impl EnrichmentProfile {
     pub const fn stamps_method_targets(self) -> bool {
         self.stamp_method_targets
     }
+
+    /// Is a copy enriched under `self` usable by a request that needs
+    /// `needed`? The lattice's ≥, and the whole never-serve-partial-to-fuller
+    /// guarantee.
+    ///
+    /// Directional on purpose: `full` serves a `diagnostics` request (it
+    /// contains everything that one reads), and `diagnostics` does NOT serve a
+    /// `full` request. Getting this backwards is silent — the fuller verb
+    /// receives a copy missing exactly the product it asked for, and reads it
+    /// as a missing ANSWER.
+    pub const fn covers(self, needed: EnrichmentProfile) -> bool {
+        !needed.stamp_method_targets || self.stamp_method_targets
+    }
+
+    /// The least profile covering both — what a fuller request re-enriches
+    /// at. Joining rather than replacing means a `full` request arriving
+    /// after a `diagnostics` one leaves an entry that still serves the
+    /// diagnostics verb, instead of two verbs evicting each other forever.
+    pub const fn join(self, other: EnrichmentProfile) -> EnrichmentProfile {
+        EnrichmentProfile {
+            stamp_method_targets: self.stamp_method_targets || other.stamp_method_targets,
+        }
+    }
 }
 
 /// The process's declared profile. `full()` until a verb says otherwise.
@@ -270,14 +293,13 @@ static PROFILE: std::sync::OnceLock<EnrichmentProfile> = std::sync::OnceLock::ne
 /// surprised, and nothing it enriches outlives the process — the
 /// `enriched_snapshot` overlay is resident, not persisted.
 ///
-/// A SERVER verb must never call this. The overlay there is shared and
-/// fingerprint-keyed, so a partial copy cached under a profile-blind key would
-/// be served to a verb that reads more than it does — silently, and as a
-/// missing answer rather than an error. If a server verb ever wants a partial
-/// profile, the profile belongs IN the overlay key, and this cell is the wrong
-/// mechanism rather than one to extend. That form is deliberately not built:
-/// nothing wants it yet, and building it now would be a key change with no
-/// consumer to validate it.
+/// A SERVER verb must never call this — not because a partial profile is
+/// unavailable there, but because the cell is the wrong scope for it: one
+/// process serves many verbs, and a value set here outlives the verb that
+/// wanted it and answers the next one. A server verb declares its profile on
+/// its `ResolutionSession` instead (`ResolutionSession::declare_profile`),
+/// which is per-walk, and the overlay records the profile each copy was built
+/// under so a partial one is never served to a fuller request.
 pub fn declare_enrichment_profile(profile: EnrichmentProfile) {
     let _ = PROFILE.set(profile);
 }
@@ -294,7 +316,11 @@ pub fn enrichment_profile() -> EnrichmentProfile {
     static FULL_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let forced = *FULL_OVERRIDE
         .get_or_init(|| std::env::var_os("PERL_LSP_FULL_ENRICHMENT").is_some());
-    resolve_profile(PROFILE.get().copied(), forced)
+    // The open walk's declaration wins over the process cell: a server serves
+    // many verbs from one process, and the cell cannot tell them apart.
+    let declared = crate::model::witnesses::ResolutionSession::declared_profile()
+        .or_else(|| PROFILE.get().copied());
+    resolve_profile(declared, forced)
 }
 
 /// The precedence rule, separated from the cells that hold it so it can be
@@ -1330,6 +1356,28 @@ mod profile_tests {
         assert!(!should_stamp_method_targets(full, true), "the ablation alone suppresses");
         assert!(!should_stamp_method_targets(diag, false), "the profile alone suppresses");
         assert!(!should_stamp_method_targets(diag, true), "both suppress");
+    }
+
+    /// The lattice's order, in the direction that matters.
+    ///
+    /// `covers` is not equality and not symmetry. A full copy contains
+    /// everything a diagnostics request reads, so refusing it would make two
+    /// verbs evict each other on every alternation; a diagnostics copy is
+    /// missing exactly what a full request came for, so serving it is a
+    /// silently short answer.
+    #[test]
+    fn the_profile_lattice_orders_full_above_diagnostics() {
+        let full = EnrichmentProfile::full();
+        let diag = EnrichmentProfile::diagnostics();
+        assert!(full.covers(diag), "full must serve a diagnostics request");
+        assert!(!diag.covers(full), "diagnostics must NOT serve a full request");
+        assert!(full.covers(full));
+        assert!(diag.covers(diag));
+        // The join is the least profile serving both, and it is full here
+        // because full is the top of a single-axis lattice.
+        assert_eq!(diag.join(full), full);
+        assert_eq!(full.join(diag), full);
+        assert_eq!(diag.join(diag), diag);
     }
 }
 

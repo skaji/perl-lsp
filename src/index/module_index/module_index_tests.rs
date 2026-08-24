@@ -1554,7 +1554,7 @@ fn reregistering_one_file_keeps_evicted_sibling_edges() {
     let pb = PathBuf::from("/fake/pkgid/Beta.pm");
     // The sibling registers through the stripping door: its resident copy
     // has NO symbols, only the pre-strip name record.
-    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), crate::model::file_analysis::Residency::Skeleton);
+    let _ = idx.register_workspace_stripping(pb.clone(), build_fa(src_b), crate::model::file_analysis::Residency::Skeleton, None);
     let _ = idx.register_workspace_resident(pa.clone(), Arc::new(build_fa(src_a)));
     assert!(!idx.modules_with_symbol("from_beta").is_empty(), "sibling edges fed");
     // Re-register the whole file; the evicted sibling's names must replay.
@@ -2282,6 +2282,7 @@ fn provider_edges_replay_for_a_symbol_evicted_copy() {
         pp,
         build_fa("package DateTime::PP;\n*{ 'DateTime::_ymd2rd' } = sub { 42 };\n1;\n"),
         crate::model::file_analysis::Residency::Skeleton,
+        None,
     );
     assert_eq!(
         idx.modules_providing_package("DateTime"),
@@ -2310,19 +2311,25 @@ fn invalidating_derived_copies_takes_the_bake_as_well_as_the_bag() {
     let l = Arc::clone(&loads);
     let cache = Arc::new(ConclusionCache::new(1 << 20, move |_p| {
         l.fetch_add(1, Ordering::Relaxed);
-        Some(ConclusionMap::default())
+        Some((
+            ConclusionMap::default(),
+            crate::index::module_cache::RowStamp {
+                source_fingerprint: 0,
+                flush_generation: crate::index::module_cache::Generation(0),
+            },
+        ))
     }));
 
     let idx = ModuleIndex::new_for_cli();
     idx.set_conclusion_cache(Arc::clone(&cache));
 
-    assert!(matches!(cache.get(&path), Cached::Map(_)));
-    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert!(matches!(cache.get(&path), Cached::Map(..)));
+    assert!(matches!(cache.get(&path), Cached::Map(..)));
     assert_eq!(loads.load(Ordering::Relaxed), 1, "precondition: memoized");
 
     idx.invalidate_derived_copies(&path);
 
-    assert!(matches!(cache.get(&path), Cached::Map(_)));
+    assert!(matches!(cache.get(&path), Cached::Map(..)));
     assert_eq!(
         loads.load(Ordering::Relaxed),
         2,
@@ -2371,5 +2378,256 @@ fn a_mark_postdates_every_stamp_that_preceded_it() {
     assert!(
         idx.restamp_owed(&a, None),
         "never stamped is owed regardless — a rehydrated copy always reads None"
+    );
+}
+
+/// SPEC 3's correctness argument, positive control.
+///
+/// A conclusions row carries the surface fingerprint of the analysis it was
+/// baked from. When that still matches what the index records for the path,
+/// the row describes the file a consumer can see, and the consult is answered
+/// from it — which is the entire point of persisting the layer.
+#[test]
+fn a_conclusions_row_matching_the_recorded_surface_is_used() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Steady.pm");
+    let fa = parse_source_to_cached("package Steady;\nsub a { 1 }\n1;\n", "Steady");
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&fa),
+        flush_generation: Generation(0),
+    };
+
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    idx.record_surface(&path, &fa.analysis);
+
+    assert!(
+        idx.conclusions_for(&path).is_some(),
+        "a row whose stamp matches the recorded surface was rejected — the \
+         persisted layer would never be read and every consult pays the chase"
+    );
+}
+
+/// The stale arm: the file moved since the row was written.
+///
+/// This is the failure the stamp exists to catch. A row baked from a previous
+/// version of the file is not a slow answer, it is a WRONG one — it concludes
+/// over code that no longer exists, and nothing downstream can tell.
+#[test]
+fn a_conclusions_row_whose_source_moved_reads_absent() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Moved.pm");
+    let before = parse_source_to_cached("package Moved;\nsub a { 1 }\n1;\n", "Moved");
+    let after =
+        parse_source_to_cached("package Moved;\nsub a { 1 }\nsub b { 2 }\n1;\n", "Moved");
+    assert_ne!(
+        surface_fp(&before),
+        surface_fp(&after),
+        "fixture must actually move the cross-file-visible surface"
+    );
+
+    // The row on disk was baked from the OLD analysis...
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&before),
+        flush_generation: Generation(0),
+    };
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    // ...while the index has since recorded the NEW one.
+    idx.record_surface(&path, &after.analysis);
+
+    assert!(
+        idx.conclusions_for(&path).is_none(),
+        "a row baked from a previous version of the file was served as its \
+         conclusions — consults would answer from deleted code"
+    );
+}
+
+/// The unrecorded arm, which is also the ORPHANED arm.
+///
+/// A row can outlive the `modules` row it was written beside (a partial clear,
+/// an interrupted write, a deleted file whose freshness record was removed),
+/// and a fresh process starts with an empty in-memory index regardless. In all
+/// of those the index has nothing to vouch with, and the only safe direction
+/// is to decode — never to trust a stamp we cannot compare against.
+#[test]
+fn a_conclusions_row_for_an_unrecorded_path_reads_absent() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Orphan.pm");
+    let fa = parse_source_to_cached("package Orphan;\nsub a { 1 }\n1;\n", "Orphan");
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&fa),
+        flush_generation: Generation(0),
+    };
+
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    // Deliberately no `record_surface`: the row's own stamp is self-consistent
+    // and would pass any check that only asked the ROW whether it was valid.
+
+    assert!(
+        idx.conclusions_for(&path).is_none(),
+        "a row for a path the index has never recorded was trusted — an \
+         orphaned row survives a clear and its stamp always agrees with itself"
+    );
+}
+
+/// The fingerprint a conclusions row stamps itself with, spelled once for the
+/// row-validity tests so they cannot drift from what the writer computes.
+fn surface_fp(c: &Arc<CachedModule>) -> u64 {
+    crate::model::surface::surface_fingerprint(&crate::model::surface::Surface::project(
+        &c.analysis,
+    ))
+}
+
+/// The torn-read pin: one walk reads conclusions from ONE generation.
+///
+/// A flush publishes a whole round at generation N+1 while walks are in
+/// flight. Without the pin a walk can read file A's map from N and file B's
+/// from N+1 and compose them into a single cross-file answer — two halves of
+/// one answer taken from different worlds, and nothing downstream can tell.
+/// The pin costs at worst a decode, which is the fallback the layer already
+/// has for an absent row.
+#[test]
+fn one_walk_reads_conclusions_from_one_generation() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::{ConclusionMap, ResolutionSession};
+
+    let early = std::path::PathBuf::from("/fake/Early.pm");
+    let later = std::path::PathBuf::from("/fake/Later.pm");
+    let fa_e = parse_source_to_cached("package Early;\nsub a { 1 }\n1;\n", "Early");
+    let fa_l = parse_source_to_cached("package Later;\nsub b { 2 }\n1;\n", "Later");
+
+    // Both rows are FRESH — each stamp matches what the index records. The
+    // only thing separating them is the generation they were published at.
+    let (fp_e, fp_l) = (surface_fp(&fa_e), surface_fp(&fa_l));
+    let (e_path, l_path) = (early.clone(), later.clone());
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |p| {
+        let stamp = if p == e_path {
+            RowStamp { source_fingerprint: fp_e, flush_generation: Generation(7) }
+        } else if p == l_path {
+            RowStamp { source_fingerprint: fp_l, flush_generation: Generation(8) }
+        } else {
+            return None;
+        };
+        Some((ConclusionMap::default(), stamp))
+    })));
+    idx.record_surface(&early, &fa_e.analysis);
+    idx.record_surface(&later, &fa_l.analysis);
+
+    // No walk open: independent consults make no coherence claim, so both
+    // answer. This is also the control — without it the assertions below
+    // would pass against a `conclusions_for` that answered nothing at all.
+    assert!(idx.conclusions_for(&early).is_some());
+    assert!(idx.conclusions_for(&later).is_some());
+
+    let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+    assert!(
+        idx.conclusions_for(&early).is_some(),
+        "the first row consumed sets the pin; it must be readable"
+    );
+    assert!(
+        idx.conclusions_for(&later).is_none(),
+        "a row from a different generation was composed into a walk already \
+         reading generation 7 — half of this answer is from another world"
+    );
+    assert!(
+        idx.conclusions_for(&early).is_some(),
+        "the pin must admit its own generation for the rest of the walk"
+    );
+}
+
+
+/// The profile lattice's whole guarantee: never serve a partial copy to a
+/// fuller request, and always serve a full copy to a partial one.
+///
+/// Getting the direction backwards is silent. A `full` verb handed a
+/// `diagnostics` copy finds `method_target()` empty on every `MethodCall` and
+/// reports it as "no definition" — a missing ANSWER, not an error, and
+/// indistinguishable from a file that genuinely has none.
+///
+/// The profile rides the entry as a FIELD rather than the key, so the fuller
+/// build REPLACES the partial one; keying on it would keep two copies of one
+/// file's analysis for a distinction only one of them needs.
+#[test]
+fn the_overlay_never_serves_a_partial_copy_to_a_fuller_request() {
+    use crate::model::file_analysis::EnrichmentProfile;
+    use crate::model::witnesses::ResolutionSession;
+
+    if std::env::var_os("PERL_LSP_FULL_ENRICHMENT").is_some() {
+        // The A/B control forces `full()` everywhere, which is exactly what
+        // this test needs NOT to be in force.
+        return;
+    }
+
+    let idx = ModuleIndex::new_for_test();
+    let lib = parse_source_to_cached(
+        "package Lib;\nour @EXPORT_OK = ('make');\nsub make { my %h = (id => 1); return \\%h }\n1;\n",
+        "Lib",
+    );
+    let consumer = parse_source_to_cached(
+        "package App;\nuse Lib 'make';\nsub go { my $x = make(); return $x }\n1;\n",
+        "App",
+    );
+    idx.register_workspace_module(lib.path.to_path_buf(), Arc::clone(&lib.analysis));
+    idx.register_workspace_module(consumer.path.to_path_buf(), Arc::clone(&consumer.analysis));
+
+    // A diagnostics walk builds and caches a partial copy.
+    let partial = {
+        let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+        ResolutionSession::declare_profile(EnrichmentProfile::diagnostics());
+        let a = idx.enriched_snapshot(&consumer).expect("diagnostics snapshot");
+        let b = idx.enriched_snapshot(&consumer).expect("diagnostics snapshot again");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "a request at the SAME profile must hit — otherwise the lattice \
+             just disabled the overlay"
+        );
+        a
+    };
+
+    // A full walk must NOT be handed it.
+    let full = {
+        let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+        ResolutionSession::declare_profile(EnrichmentProfile::full());
+        idx.enriched_snapshot(&consumer).expect("full snapshot")
+    };
+    assert!(
+        !Arc::ptr_eq(&partial, &full),
+        "a copy enriched for diagnostics was served to a request that reads \
+         the dispatch-target edge it never filled"
+    );
+
+    // ...and the fuller copy now serves the partial verb, in place.
+    let partial_again = {
+        let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+        ResolutionSession::declare_profile(EnrichmentProfile::diagnostics());
+        idx.enriched_snapshot(&consumer).expect("diagnostics snapshot after full")
+    };
+    assert!(
+        Arc::ptr_eq(&full, &partial_again),
+        "the full copy contains everything diagnostics reads — refusing it \
+         makes the two verbs evict each other on every alternation"
     );
 }

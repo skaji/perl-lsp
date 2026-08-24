@@ -2,7 +2,14 @@
 
 use super::*;
 use crate::model::witnesses::{Conclusion, ConclusionKey};
+use crate::index::module_cache::{Generation, RowStamp};
 use std::sync::atomic::AtomicUsize;
+
+/// Tests exercise the cache's memo/eviction behaviour, not row validity —
+/// judging a stamp is the consult path's job, so any stamp will do here.
+fn stamp() -> RowStamp {
+    RowStamp { source_fingerprint: 0, flush_generation: Generation(0) }
+}
 
 fn map_of(n: usize) -> ConclusionMap {
     let mut m = std::collections::HashMap::new();
@@ -54,14 +61,14 @@ fn invalidating_clears_the_absent_memo() {
         if c.fetch_add(1, Ordering::Relaxed) == 0 {
             None
         } else {
-            Some(map_of(1))
+            Some((map_of(1), stamp()))
         }
     });
     let p = Path::new("/later.pm");
     assert!(matches!(cache.get(p), Cached::NotBaked));
     cache.invalidate(p);
     assert!(
-        matches!(cache.get(p), Cached::Map(_)),
+        matches!(cache.get(p), Cached::Map(..)),
         "a file baked after being probed stayed permanently 'not baked'"
     );
 }
@@ -70,7 +77,7 @@ fn invalidating_clears_the_absent_memo() {
 #[test]
 fn the_cache_respects_its_cap() {
     let one = 64 + 10 * 160;
-    let cache = ConclusionCache::new(one * 2, |_p| Some(map_of(10)));
+    let cache = ConclusionCache::new(one * 2, |_p| Some((map_of(10), stamp())));
     for i in 0..20 {
         cache.get(&PathBuf::from(format!("/f{i}.pm")));
     }

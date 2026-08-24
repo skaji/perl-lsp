@@ -75,7 +75,7 @@ impl Backend {
             // starts. They differ for a DELETED file: it has no map and
             // nothing to evaluate, so it enters the wave as its direct
             // consumers instead.
-            let mut fresh: Vec<(PathBuf, crate::model::witnesses::ConclusionMap)> = Vec::new();
+            let mut fresh: Vec<crate::index::conclusion_flush::FreshBake> = Vec::new();
             let mut frontier: Vec<PathBuf> = Vec::new();
             // The persisted generation (blob + ref rows) is now stale for
             // these paths; drop it so warm starts re-parse and the
@@ -145,13 +145,26 @@ impl Backend {
                                 // The caller bakes: the analysis is in hand
                                 // and its blob was just invalidated, so the
                                 // flush has nothing to decode it from.
-                                fresh.push((
-                                    canon.clone(),
-                                    crate::index::module_cache::bake_conclusion_map(
-                                        &arc,
-                                        &arc.witnesses,
-                                    ),
-                                ));
+                                fresh.push(
+                                    crate::index::conclusion_flush::FreshBake {
+                                        path: canon.clone(),
+                                        map: crate::index::module_cache::bake_conclusion_map(
+                                            &arc,
+                                            &arc.witnesses,
+                                        ),
+                                        // Projected from the SAME analysis the
+                                        // map was baked from. For a path that
+                                        // is ALSO open, the freshness index
+                                        // holds the buffer's fingerprint
+                                        // instead, so this row reads absent —
+                                        // correctly, since consumers of an
+                                        // open file read its buffer.
+                                        source_fingerprint:
+                                            crate::model::surface::surface_fingerprint(
+                                                &crate::model::surface::Surface::project(&arc),
+                                            ),
+                                    },
+                                );
                                 frontier.push(canon.clone());
                             }
                         }

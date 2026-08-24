@@ -118,7 +118,7 @@ impl ModuleIndex {
                 let db = crate::index::module_cache::db_path_for(&dir, "perl");
                 let conn = crate::index::module_cache::open_reader_retrying(&db).ok()?;
                 let at = crate::index::module_cache::current_generation(&conn);
-                crate::index::module_cache::load_conclusions(
+                crate::index::module_cache::load_conclusions_stamped(
                     &conn,
                     &path.to_string_lossy(),
                     at,

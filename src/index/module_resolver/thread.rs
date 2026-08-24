@@ -146,15 +146,22 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
     // repair run ahead of the loop would put minutes in front of the first
     // resolve. It runs in the gap where this thread would otherwise be blocked
     // on its condvar, which is the definition of "post-ready background".
+    //
+    // Not seeded at all when baking is switched off: the repair lane is the
+    // SECOND producer of a conclusions row, so leaving it on would let the
+    // control's own arm bake the whole corpus in the background and measure a
+    // full layer from its second warm run onward.
     let mut repair_frontier: Vec<String> = db
         .as_ref()
+        .filter(|_| !crate::model::witnesses::bake_disabled())
         .map(|conn| {
             let at = module_cache::current_generation(conn);
-            let f = module_cache::paths_missing_conclusions(conn, at);
+            let f = module_cache::paths_needing_repair(conn, at);
             if !f.is_empty() {
                 log::info!(
-                    "Conclusion repair: {} file(s) hold a blob with no map; \
-                     re-baking in the background",
+                    "Derivation repair: {} file(s) hold a blob whose map or \
+                     surface is missing or from another version; re-deriving \
+                     in the background",
                     f.len()
                 );
             }
@@ -395,7 +402,7 @@ fn drain_or_repair(
         let at = module_cache::current_generation(conn);
         module_cache::repair_conclusions_slice(conn, &slice, at);
         if frontier.is_empty() {
-            log::info!("Conclusion repair: frontier drained");
+            log::info!("Derivation repair: frontier drained");
         }
     }
     drain_next_batch(queue)

@@ -18,6 +18,14 @@ pub const EXTRACT_VERSION: i64 = 184;
 /// next warm re-shreds rows from the already-decoded analyses for free.
 pub(super) const REF_ROWS_VERSION: &str = "6";
 
+/// Row format of the `conclusions` lane. Bump on any change to the row's
+/// SHAPE or to what its stamp means.
+///
+/// Separate from `REF_ROWS_VERSION` because the lanes fail differently: a
+/// stale ref row answers a retrieval wrongly, a stale conclusion row answers
+/// a TYPE wrongly. Sharing one version would make either change wipe both.
+pub(super) const CONCLUSION_ROWS_VERSION: &str = "1";
+
 /// Fingerprint over everything that can change what a derivation CONCLUDES,
 /// computed by `build.rs` at compile time.
 ///
@@ -52,6 +60,25 @@ pub fn conclusion_fingerprint() -> &'static str {
             .collect();
         fingerprint_with(CONCLUSION_SOURCE_FINGERPRINT, &set)
     })
+}
+
+/// The projection version a persisted `Surface` is stamped with.
+///
+/// `Surface::project` reads the witness bag, so a warm lane that re-projects
+/// from a bag-EVICTED copy records a different surface for the same unchanged
+/// file than the cold lane did — measured at 76.7% of conclusions rows
+/// rejected against rows that were in fact correct, and a warm-start freshness
+/// verdict computed over a degraded projection
+/// (`docs/prompt-surface-projection-drift.md`). Persisting the cold projection
+/// is what makes the two lanes agree.
+///
+/// Its own gate, independent of `SCHEMA_VERSION`: a change to the projection
+/// must invalidate persisted surfaces without dropping blobs, and a version
+/// somebody has to remember to bump is the wrong instrument for a failure
+/// nothing downstream can see — a stale surface deserializes cleanly and
+/// simply describes a file that no longer exists in that shape.
+pub fn surface_version() -> &'static str {
+    env!("PERL_LSP_SURFACE_FINGERPRINT")
 }
 
 /// The env vars that change what a bake STORES. Consult-side flags do not
@@ -170,6 +197,11 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             path TEXT PRIMARY KEY,
             stub BLOB NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS surfaces (
+            path    TEXT PRIMARY KEY,
+            version TEXT NOT NULL,
+            surface BLOB NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_modules_path ON modules(path);
         CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(module_name);",
     )?;
@@ -248,6 +280,42 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
         // The rebuild above DROPPED `strings`; every id a live writer memoized
         // for the previous generation is now dangling.
         bump_strings_generation(conn)?;
+    }
+
+    // The conclusions lane's own version + shape probe, same policy and same
+    // reason: a DB stamped current by a build whose migration did not reshape
+    // the table would keep serving rows whose stamp columns do not exist, and
+    // every validity compare would fail open to "no stamp" — which reads as a
+    // usable row rather than an unusable one.
+    //
+    // Wipe and re-bake, never a blob drop: the blobs are the derivation of
+    // record and the repair frontier re-bakes from them.
+    let concl_version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'conclusion_rows_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let concl_shape_ok = conn
+        .prepare("SELECT source_fingerprint, flush_generation FROM conclusions LIMIT 1")
+        .is_ok();
+    if concl_version.as_deref() != Some(CONCLUSION_ROWS_VERSION) || !concl_shape_ok {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS conclusions;
+             CREATE TABLE conclusions (
+                path               TEXT NOT NULL,
+                generation         INTEGER NOT NULL,
+                map                BLOB NOT NULL,
+                source_fingerprint INTEGER NOT NULL,
+                flush_generation   INTEGER NOT NULL,
+                PRIMARY KEY (path, generation)
+             ) WITHOUT ROWID;",
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('conclusion_rows_version', ?1)",
+            params![CONCLUSION_ROWS_VERSION],
+        )?;
     }
     // Pre-existing tables (same schema version) predate `deps_stamp`; add it
     // in place rather than bumping SCHEMA_VERSION (a bump drops every row —

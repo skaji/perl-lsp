@@ -1273,3 +1273,44 @@ fn every_reduced_value_match_names_its_variants() {
         violations.join("\n")
     );
 }
+
+/// A bake-steering control must have exactly ONE reader.
+///
+/// There are two producers of a conclusions row — the persist path's
+/// `encode_analysis` and the background repair lane — and a control that gates
+/// only one of them is not a control. That was the shipped state: an A/B whose
+/// OFF arm was primed cold reported 72,305 provider fetches on its first run
+/// and 57,481 on its third, byte-identical to the ON arm, because repair had
+/// baked the frontier in between. The flag disabled itself after one warm run,
+/// the conclusions row count looked full and correct throughout, and no output
+/// distinguished a control that ran from a control that controlled.
+///
+/// Pinned as a source rule rather than a behaviour test because the failure is
+/// a MISSING call: no assertion about the two producers we know of would catch
+/// a third one added later reading the env directly.
+#[test]
+fn the_bake_gate_has_one_reader() {
+    let needle = "std::env::var(\"PERL_LSP_NO_BAKE\")";
+    let mut sites = Vec::new();
+    for (f, _layer, _module) in source_files() {
+        let text = fs::read_to_string(&f).expect("read source");
+        for (ln, line) in text.lines().enumerate() {
+            if line.contains(needle) {
+                sites.push(format!("{}:{}", f.display(), ln + 1));
+            }
+        }
+    }
+    assert_eq!(
+        sites.len(),
+        1,
+        "PERL_LSP_NO_BAKE must be read only by `conclusions::bake_disabled()` — \
+         every producer of a conclusions row asks it. Found:\n{}",
+        sites.join("\n")
+    );
+    assert!(
+        sites[0].contains("conclusions.rs"),
+        "the single reader must be the accessor in `model/witnesses/conclusions.rs`, \
+         found it at {}",
+        sites[0]
+    );
+}

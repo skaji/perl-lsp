@@ -457,9 +457,20 @@ impl ModuleIndex {
         });
         let path = &cached.path;
         let key = self.enrichment_key_memoized(cached);
+        // What THIS request reads. A walk declares it on its session; a
+        // one-shot CLI verb on the process cell; anything else gets `full()`.
+        let needed = crate::model::file_analysis::enrichment_profile();
         if let Some(e) = self.enriched.get(path) {
-            if e.0 == key {
-                let hit = e.1.clone();
+            // Fresh AND at least as full as this request needs. A fresh entry
+            // that does not cover falls through to the rebuild below — which
+            // is a cache miss, not an error: the partial copy is missing
+            // exactly the product this verb asked for, and serving it would
+            // read as a missing ANSWER.
+            if e.key == key && !e.profile.covers(needed) {
+                crate::util::ghost_stats::count("enriched_snapshot.profile_miss");
+            }
+            if e.key == key && e.profile.covers(needed) {
+                let hit = e.analysis.clone();
                 drop(e);
                 // LRU touch — a FIFO would let any sweep evict the hot dep
                 // entries the witness seams lean on, in insertion order.
@@ -556,7 +567,17 @@ impl ModuleIndex {
         let stored: Option<Arc<FileAnalysis>> =
             if tainted || bytes > enriched_byte_cap { None } else { Some(arc) };
         let entry_bytes = if stored.is_some() { bytes } else { 0 };
-        self.enriched.insert(path.clone(), (key, stored.clone(), entry_bytes));
+        // Recorded as what the build actually ran under. With one profile axis
+        // that IS the join with whatever the replaced entry held, because the
+        // only way `covers` fails is a partial entry meeting a fuller request.
+        // A second axis would make this a lossy replacement — still SOUND
+        // (every entry states exactly what it is, so `covers` keeps answering
+        // correctly), just a rebuild for the other verb. Join here if that
+        // ever costs more than it saves.
+        self.enriched.insert(
+            path.clone(),
+            EnrichedEntry { key, analysis: stored.clone(), bytes: entry_bytes, profile: needed },
+        );
         {
             let mut order = self.enriched_order.lock().unwrap();
             order.retain(|p| p != path);
@@ -565,7 +586,7 @@ impl ModuleIndex {
                 order
                     .iter()
                     .filter_map(|p| self.enriched.get(p))
-                    .map(|e| e.2)
+                    .map(|e| e.bytes)
                     .sum::<usize>()
             };
             while order.len() > 1
@@ -790,13 +811,27 @@ impl ModuleIndex {
     /// arc for the caller's FileStore mirror. Synchronous-persistence
     /// callers only (the warm path — the blob already exists on disk);
     /// the bulk fresh path splits the halves around the writer's COMMIT.
+    /// `persisted` is the surface the COLD lane recorded for this file, when
+    /// the store has one at the current projection version. A warm caller
+    /// passes it because its own analysis is bag-evicted and `Surface::project`
+    /// reads the bag — re-projecting there records a degraded twin of what the
+    /// cold lane recorded, for identical bytes
+    /// (`docs/prompt-surface-projection-drift.md`). `None` keeps the
+    /// projection this token already carries.
     pub fn register_workspace_stripping(
         &self,
         path: std::path::PathBuf,
         fa: FileAnalysis,
         level: crate::model::file_analysis::Residency,
+        persisted: Option<crate::model::surface::Surface>,
     ) -> Arc<FileAnalysis> {
         let mut parts = self.prepare_workspace_parts(&path, fa, level);
+        if let Some(s) = persisted {
+            crate::util::ghost_stats::count("surface.adopted_persisted");
+            parts.adopt_surface(s);
+        } else {
+            crate::util::ghost_stats::count("surface.reprojected");
+        }
         parts.record_surface(self, &path);
         let arc = Arc::clone(parts.arc());
         self.register_workspace_residency(path, parts);
@@ -1611,4 +1646,24 @@ impl ModuleIndex {
             }
         }
     }
+}
+
+/// One entry in the enrichment overlay.
+///
+/// `profile` is a FIELD, not part of the key. Keying on it would let a
+/// `diagnostics` copy and a `full` copy of the same file coexist under one
+/// fingerprint, doubling the bytes for a distinction only one of them needs;
+/// as a field, the fuller build replaces the partial one and serves both.
+/// Acceptance is `profile.covers(needed)` — a copy enriched under a profile at
+/// least as full as the request's. Never equality: `full` must serve a
+/// `diagnostics` request, or every verb mix thrashes.
+pub(crate) struct EnrichedEntry {
+    /// Fingerprint of the file plus its providers — the freshness half.
+    pub key: u64,
+    /// `None` = a remembered DECLINE (byte-cap giant / cycle-tainted) at this
+    /// key: repeat queries skip the deep-copy until the key moves.
+    pub analysis: Option<Arc<FileAnalysis>>,
+    pub bytes: usize,
+    /// What this copy was actually enriched under.
+    pub profile: crate::model::file_analysis::EnrichmentProfile,
 }

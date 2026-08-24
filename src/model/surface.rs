@@ -471,11 +471,30 @@ struct SurfaceRecord {
     stale_provided: Vec<String>,
 }
 
-/// Process-local surface identity. In-memory only (SipHash keys are
-/// per-process) — the persisted form carries its own stable encoding.
+/// The value `FreshnessIndex` records for a surface, and the value a
+/// persisted conclusion row is stamped with.
+///
+/// `DefaultHasher::new()` is fixed-key and therefore stable ACROSS
+/// processes — it is `RandomState` that is seeded per process. That
+/// distinction is load-bearing now that the value outlives the process
+/// in a row stamp: swapping in `RandomState` would leave every persisted
+/// stamp unmatchable, silently and with no error.
+///
 /// Streams the serialization straight into the hasher: record() runs per
 /// keystroke on open docs, so no intermediate buffer.
-fn surface_fingerprint(s: &Surface) -> u64 {
+///
+/// Deterministic for a given build, and that is all it has to be: the
+/// conclusion-derivation fingerprint already wipes the lane whenever
+/// `src/**` changes, so a hasher that shifted between compiler versions
+/// costs one re-bake it was going to pay anyway. A mismatch always reads as
+/// "not valid", which degrades to the live chase.
+///
+/// Surface-keyed, not content-keyed, and deliberately: the map exists to
+/// answer CROSS-FILE consults, so two analyses with the same cross-file-
+/// visible projection give the same answers to every question the map is
+/// asked. A body edit that moves no surface moves no conclusion a consumer
+/// can observe.
+pub fn surface_fingerprint(s: &Surface) -> u64 {
     use std::hash::Hasher;
     struct HashWriter(std::collections::hash_map::DefaultHasher);
     impl std::io::Write for HashWriter {
