@@ -62,6 +62,13 @@ struct SessionState {
     index_id: usize,
     /// `resolution_epoch()` when the memo was last known good.
     epoch: u64,
+    /// What this walk's verb READS out of enrichment.
+    ///
+    /// A server serves many verbs from one process, so the process-wide
+    /// declaration cell cannot express it — a partial profile set there would
+    /// outlive the verb that wanted it and answer the next one. The session is
+    /// the natural scope: it is opened per walk by the verb that knows.
+    profile: Option<crate::model::file_analysis::EnrichmentProfile>,
     /// The store generation this walk has committed to reading conclusions
     /// at, set by the first row it consumes.
     ///
@@ -175,6 +182,7 @@ impl ResolutionSession {
             *slot = Some(SessionState {
                 index_id: id,
                 epoch,
+                profile: None,
                 conclusion_generation: None,
                 paths: HashMap::new(),
                 memo: HashMap::new(),
@@ -212,6 +220,26 @@ impl ResolutionSession {
     /// `None` when no session is open.
     pub fn stats() -> Option<SessionStats> {
         SESSION.with(|s| s.borrow().as_ref().map(|st| st.stats))
+    }
+
+    /// Declare what this walk's verb reads out of enrichment.
+    ///
+    /// Call on an OPEN session. A verb that declares nothing gets `full()`,
+    /// so a new verb is never silently under-served — the failure direction is
+    /// "did more work than it needed", never "was handed a copy missing what
+    /// it asked for".
+    pub fn declare_profile(profile: crate::model::file_analysis::EnrichmentProfile) {
+        SESSION.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                st.profile = Some(profile);
+            }
+        });
+    }
+
+    /// The profile the open walk declared, if any. `None` means no walk, or a
+    /// walk that declared nothing — both resolve to the process cell.
+    pub fn declared_profile() -> Option<crate::model::file_analysis::EnrichmentProfile> {
+        SESSION.with(|s| s.borrow().as_ref().and_then(|st| st.profile))
     }
 
     /// May this walk read a conclusions row published at `generation`?

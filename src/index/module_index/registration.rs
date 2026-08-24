@@ -457,9 +457,20 @@ impl ModuleIndex {
         });
         let path = &cached.path;
         let key = self.enrichment_key_memoized(cached);
+        // What THIS request reads. A walk declares it on its session; a
+        // one-shot CLI verb on the process cell; anything else gets `full()`.
+        let needed = crate::model::file_analysis::enrichment_profile();
         if let Some(e) = self.enriched.get(path) {
-            if e.0 == key {
-                let hit = e.1.clone();
+            // Fresh AND at least as full as this request needs. A fresh entry
+            // that does not cover falls through to the rebuild below — which
+            // is a cache miss, not an error: the partial copy is missing
+            // exactly the product this verb asked for, and serving it would
+            // read as a missing ANSWER.
+            if e.key == key && !e.profile.covers(needed) {
+                crate::util::ghost_stats::count("enriched_snapshot.profile_miss");
+            }
+            if e.key == key && e.profile.covers(needed) {
+                let hit = e.analysis.clone();
                 drop(e);
                 // LRU touch — a FIFO would let any sweep evict the hot dep
                 // entries the witness seams lean on, in insertion order.
@@ -556,7 +567,17 @@ impl ModuleIndex {
         let stored: Option<Arc<FileAnalysis>> =
             if tainted || bytes > enriched_byte_cap { None } else { Some(arc) };
         let entry_bytes = if stored.is_some() { bytes } else { 0 };
-        self.enriched.insert(path.clone(), (key, stored.clone(), entry_bytes));
+        // Recorded as what the build actually ran under. With one profile axis
+        // that IS the join with whatever the replaced entry held, because the
+        // only way `covers` fails is a partial entry meeting a fuller request.
+        // A second axis would make this a lossy replacement — still SOUND
+        // (every entry states exactly what it is, so `covers` keeps answering
+        // correctly), just a rebuild for the other verb. Join here if that
+        // ever costs more than it saves.
+        self.enriched.insert(
+            path.clone(),
+            EnrichedEntry { key, analysis: stored.clone(), bytes: entry_bytes, profile: needed },
+        );
         {
             let mut order = self.enriched_order.lock().unwrap();
             order.retain(|p| p != path);
@@ -565,7 +586,7 @@ impl ModuleIndex {
                 order
                     .iter()
                     .filter_map(|p| self.enriched.get(p))
-                    .map(|e| e.2)
+                    .map(|e| e.bytes)
                     .sum::<usize>()
             };
             while order.len() > 1
@@ -1611,4 +1632,24 @@ impl ModuleIndex {
             }
         }
     }
+}
+
+/// One entry in the enrichment overlay.
+///
+/// `profile` is a FIELD, not part of the key. Keying on it would let a
+/// `diagnostics` copy and a `full` copy of the same file coexist under one
+/// fingerprint, doubling the bytes for a distinction only one of them needs;
+/// as a field, the fuller build replaces the partial one and serves both.
+/// Acceptance is `profile.covers(needed)` — a copy enriched under a profile at
+/// least as full as the request's. Never equality: `full` must serve a
+/// `diagnostics` request, or every verb mix thrashes.
+pub(crate) struct EnrichedEntry {
+    /// Fingerprint of the file plus its providers — the freshness half.
+    pub key: u64,
+    /// `None` = a remembered DECLINE (byte-cap giant / cycle-tainted) at this
+    /// key: repeat queries skip the deep-copy until the key moves.
+    pub analysis: Option<Arc<FileAnalysis>>,
+    pub bytes: usize,
+    /// What this copy was actually enriched under.
+    pub profile: crate::model::file_analysis::EnrichmentProfile,
 }

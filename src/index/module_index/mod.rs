@@ -161,6 +161,7 @@ pub(crate) use index_core::strip_import_copy_one;
 mod lookup;
 mod queries;
 mod registration;
+use registration::EnrichedEntry;
 pub use registration::SweepMemoGuard;
 
 /// Every file that provides one module name, in provider order. `[0]` is
@@ -218,7 +219,7 @@ pub struct ModuleIndex {
     /// `None` payload = a DECLINED build (byte-cap giant / cycle-tainted)
     /// at this key: repeat queries skip the deep-copy entirely until a
     /// provider change moves the key.
-    enriched: Arc<DashMap<std::path::PathBuf, (u64, Option<Arc<FileAnalysis>>, usize)>>,
+    enriched: Arc<DashMap<std::path::PathBuf, EnrichedEntry>>,
     enriched_order: Arc<std::sync::Mutex<std::collections::VecDeque<std::path::PathBuf>>>,
     /// Report-only ghost-list accounting for the overlay
     /// (`PERL_LSP_GHOST_STATS`). `None` when the gate is off.
