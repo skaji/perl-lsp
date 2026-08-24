@@ -662,7 +662,9 @@ impl ModuleIndex {
                 return m.1;
             }
         }
-        let key = self.enrichment_key(cached);
+        let key = crate::util::ghost_stats::timed("enrichment_key.compute", || {
+            self.enrichment_key(cached)
+        });
         if self.enrichment_epoch() == epoch {
             // One overwritten-in-place entry per consulted path: bounded by
             // the number of registered files (~100 bytes each), never a
