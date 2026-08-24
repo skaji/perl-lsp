@@ -733,6 +733,11 @@ pub fn persist_surface(conn: &Connection, path: &str, enc: &EncodedAnalysis) {
     }
 }
 
+/// Drop a path's persisted surface — the blob it was projected from is gone.
+pub fn forget_surface(conn: &Connection, path: &str) {
+    let _ = conn.execute("DELETE FROM surfaces WHERE path = ?1", params![path]);
+}
+
 /// One file's persisted surface, or `None` when there is none AT THE CURRENT
 /// PROJECTION VERSION.
 ///

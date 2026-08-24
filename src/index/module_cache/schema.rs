@@ -391,7 +391,8 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     }
 }
 
-/// Wipe the derived relational tables (`refs`/`files`/`strings`). Runs
+/// Wipe the derived tables (`refs`/`syms`/`files`/`strings`/`stubs`/
+/// `surfaces`). Runs
 /// alongside every `DELETE FROM modules` hard-clear: the rows are shredded
 /// from the blobs, so a generation that invalidates the blobs invalidates
 /// the rows with it. Cheap to rebuild — the next warm re-shreds from the
@@ -399,7 +400,7 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
 pub fn clear_derived_rows(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "DELETE FROM refs; DELETE FROM syms; DELETE FROM files; DELETE FROM strings; \
-         DELETE FROM stubs;",
+         DELETE FROM stubs; DELETE FROM surfaces;",
     )?;
     bump_strings_generation(conn)
 }
