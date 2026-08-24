@@ -1147,6 +1147,60 @@ fn enriched_tree_diagnostics(
 /// parallel drivers cannot drift — the thread-locals it touches (the stall
 /// watchdog's current file, the sweep memo, `enriched_snapshot`'s cycle guard
 /// and depth counter) are per-worker by construction, which is what makes the
+/// The sweep's in-flight source-byte budget, or `None` when disabled.
+fn sweep_admission_budget() -> Option<u64> {
+    let mb = std::env::var("PERL_LSP_SWEEP_INFLIGHT_SOURCE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8);
+    (mb != 0).then_some(mb * 1024 * 1024)
+}
+
+/// A byte-weighted admission gate (see the call site's rationale). A single
+/// file's want is clamped to the whole budget, so the largest file is always
+/// admissible alone — no starvation, no deadlock.
+struct SweepAdmission {
+    budget: u64,
+    avail: std::sync::Mutex<u64>,
+    cv: std::sync::Condvar,
+}
+
+struct SweepPermit<'a> {
+    gate: &'a SweepAdmission,
+    held: u64,
+}
+
+impl SweepAdmission {
+    fn new(budget: u64) -> Self {
+        SweepAdmission {
+            budget,
+            avail: std::sync::Mutex::new(budget),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, want: u64) -> SweepPermit<'_> {
+        let want = want.clamp(1, self.budget);
+        let mut avail = self.avail.lock().unwrap();
+        if *avail < want {
+            crate::util::ghost_stats::count("sweep.admission_waited");
+        }
+        while *avail < want {
+            avail = self.cv.wait(avail).unwrap();
+        }
+        *avail -= want;
+        SweepPermit { gate: self, held: want }
+    }
+}
+
+impl Drop for SweepPermit<'_> {
+    fn drop(&mut self) {
+        let mut avail = self.gate.avail.lock().unwrap();
+        *avail += self.held;
+        self.gate.cv.notify_all();
+    }
+}
+
 /// body safe to run concurrently.
 fn sweep_one_file(
     idx: &module_index::ModuleIndex,
@@ -1219,6 +1273,22 @@ fn for_each_enriched_diagnostic(
     // are the n² a package-main corpus produces. Shared across the rayon
     // workers; stamp-cleared on any index shape change.
     let _answers = module_index::SweepAnswerGuard::open();
+    // Byte-budgeted ADMISSION for the sweep: the RSS crest is the PRODUCT of
+    // worker count and per-worker in-flight working set (memo + overlay clone
+    // pair + rehydrated wholes), measured at ~414 MB marginal per worker on a
+    // giant-file corpus — and bounding either factor alone failed: a flat
+    // worker cap is corpus-tuned (memory-bound FHEM paid 4.9% wall for -67%
+    // RSS; a CPU-bound corpus would pay real wall for nothing), and byte-
+    // capping the memo slice measured NET-NEGATIVE (+51% wall, +15% RSS at
+    // n=500: 19,929 drop-oldest evictions converted retention into re-decode
+    // churn). Admission bounds the product WITHOUT converting anything — a
+    // queued file is decoded later, not twice. Permits are the file's SOURCE
+    // size (the a-priori proxy: analysis footprint measured ~65x source bytes
+    // on the estimator probe; no decode needed to know it), so small-file
+    // corpora never approach the budget and the gate provably no-ops there,
+    // while giants queue among themselves and ordinary files flow around
+    // them. `PERL_LSP_SWEEP_INFLIGHT_SOURCE_MB` overrides; 0 disables.
+    let admission = sweep_admission_budget().map(SweepAdmission::new);
     // Channel attribution: the unbounded mpsc holds diagnostics until the
     // single consumer drains them — a sweep-proportional holder candidate for
     // the FHEM RSS knee. Measured, not fit: sends, bytes, and PEAK BACKLOG
@@ -1230,9 +1300,14 @@ fn for_each_enriched_diagnostic(
     std::thread::scope(|scope| {
         let pending_ref = &pending;
         let peak_ref = &peak_pending;
+        let admission_ref = &admission;
         scope.spawn(move || {
             use rayon::prelude::*;
             entries.par_iter().for_each_with(tx, |tx, (path, fa)| {
+                let src_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(1);
+                let _permit = admission_ref
+                    .as_ref()
+                    .map(|a| a.acquire(src_bytes.max(1)));
                 for (file, d) in sweep_one_file(idx, options, path, fa) {
                     crate::util::ghost_stats::count("diag.sent");
                     crate::util::ghost_stats::add_n(
