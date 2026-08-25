@@ -32,6 +32,8 @@ mod session;
 pub use session::*;
 mod conclusions;
 pub use conclusions::*;
+mod closedness;
+pub use closedness::*;
 
 // ---- Witness bag ----
 

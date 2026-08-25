@@ -11,6 +11,7 @@ impl ModuleIndex {
             loaded_modules: Arc::new(DashMap::new()),
             pack_indexes: Arc::new(DashMap::new()),
             open_doc_paths: Arc::new(DashMap::new()),
+            closedness: Arc::new(Default::default()),
             all_files: Arc::new(DashMap::new()),
             registered_names: Arc::new(DashMap::new()),
             freshness: Arc::new(crate::model::surface::FreshnessIndex::default()),

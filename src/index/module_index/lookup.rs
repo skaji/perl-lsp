@@ -522,6 +522,25 @@ impl CrossFileLookup for ModuleIndex {
             .is_some_and(|b| !b.is_empty())
     }
 
+    fn surface_fingerprint_of(&self, path: &std::path::Path) -> Option<u64> {
+        self.freshness.fingerprint_of(path)
+    }
+
+    fn closedness_certificate(
+        &self,
+        class: &str,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ClosednessCertificate>> {
+        self.closedness.get(class)
+    }
+
+    fn store_closedness_certificate(
+        &self,
+        class: &str,
+        cert: std::sync::Arc<crate::model::witnesses::ClosednessCertificate>,
+    ) {
+        self.closedness.put(class, cert);
+    }
+
     fn conclusions_for(
         &self,
         path: &std::path::Path,
