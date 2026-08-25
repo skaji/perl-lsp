@@ -23,6 +23,18 @@ That band is what normal looks like. Two things fall outside it.
 [FHEM](https://github.com/fhem/fhem-mirror) — 991k LOC, 973 Perl files, zero
 vendored — does not complete `--check` on a machine with 31 GB of RAM.
 
+**Scope, established by using it rather than by measuring it: this is a
+BATCH-VERB limit, not a server limit.** FHEM opens fine in an editor. Startup is
+slow, and after that it behaves. The difference is structural rather than
+lucky — `--check` runs the enriched-diagnostic sweep across *every* workspace
+file, while the server indexes nothing at `initialize` and enriches only the
+documents you actually open. The crest below is 20 rayon workers each holding a
+per-file working set; an editor session has no such sweep to run.
+
+So: `--check`, `--heatmap` and the other whole-workspace verbs are the affected
+surface. Interactive editing of a `main`-monoculture codebase is not, and this
+file said otherwise until someone opened FHEM in nvim and found it usable.
+
 **The shape:** 503 of its 614 `.pm` files declare `package main` explicitly, and
 31 more declare nothing. **534 of 614 files (87%) provide one package name.**
 This is not a mistake in FHEM: `fhem.pl` `do`-loads all of them into a single
