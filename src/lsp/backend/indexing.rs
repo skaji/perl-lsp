@@ -600,20 +600,58 @@ impl Backend {
     /// it snapshots the `ReadyGate` Arc out of the `opening` map and drops that
     /// guard before awaiting. Callers snapshot `analysis` fresh AFTER it.
     pub(super) async fn await_open_ready(&self, uri: &Url, policy: WaitPolicy) {
+        /// Interactive floor for THIS wait specifically. The 400 ms
+        /// `cold_wait_ms` default was sized for the workspace-index wait; the
+        /// document's own initial build is the thing the verb is ABOUT, and a
+        /// giant Perl file's build is seconds — answering early means
+        /// answering null, which the client caches as "nothing there". Post
+        /// the fold fixes almost every build fits under this floor, so the
+        /// common case is a correct answer a moment later, and only the
+        /// multi-MB tail falls through to the ContentModified terminal
+        /// (`not_ready_or_null`). `cold_wait_ms == 0` still opts out of
+        /// waiting entirely.
+        const OPEN_BUILD_WAIT_MS: u64 = 5_000;
         if self.files.get_open(uri).is_some() {
             return; // already built
         }
         let Some(gate) = self.opening.get(uri).map(|n| Arc::clone(n.value())) else {
             return; // not an in-flight open (unknown/closed file)
         };
-        let cap = self.wait_cap(policy);
+        let mut cap = self.wait_cap(policy);
         if cap == 0 {
             return; // opt-out
+        }
+        if matches!(policy, WaitPolicy::Interactive) {
+            cap = cap.max(OPEN_BUILD_WAIT_MS);
         }
         let waited = gate.armed_wait(|| self.files.get_open(uri).is_some());
         if let Some(waited) = waited {
             self.bounded_wait_with_progress(cap, waited, "Waiting for file analysis")
                 .await;
+        }
+    }
+
+    /// The degraded terminal for a pull verb whose document ISN'T in the
+    /// store after the bounded wait. A `null` here is a lie the client
+    /// believes: LSP `null` means "nothing at this position" — a final
+    /// answer, cached, never re-requested — so a build that outruns the wait
+    /// makes the editor look dead until a server-initiated refresh happens to
+    /// cover the verb (tokens have one; hover/definition don't). When the
+    /// initial build is still in flight, answer `ContentModified` instead —
+    /// the protocol's "computed against in-flux state, retry" — and keep the
+    /// honest null for a URI with no build coming.
+    pub(super) fn not_ready_or_null<T>(
+        &self,
+        uri: &Url,
+    ) -> tower_lsp::jsonrpc::Result<Option<T>> {
+        if self.opening.contains_key(uri) {
+            Err(tower_lsp::jsonrpc::Error {
+                code: tower_lsp::jsonrpc::ErrorCode::ContentModified,
+                message: "initial analysis still in flight; retry".into(),
+                data: None,
+            })
+        } else {
+            Ok(None)
         }
     }
 
