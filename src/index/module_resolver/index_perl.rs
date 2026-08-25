@@ -91,14 +91,37 @@ pub fn index_workspace_with_index(
     types_builder.select("perl");
     let types = types_builder.build().unwrap();
 
+    let mut oversize: Vec<(PathBuf, u64)> = Vec::new();
     let mut paths: Vec<PathBuf> = WalkBuilder::new(root)
         .types(types)
         .build()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .filter(|e| e.metadata().map(|m| m.len() < 1_000_000).unwrap_or(false))
+        .filter(|e| {
+            let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+            if len >= 1_000_000 {
+                oversize.push((e.path().to_path_buf(), len));
+                return false;
+            }
+            true
+        })
         .map(|e| e.into_path())
         .collect();
+    // Say what the size cap dropped, once per walk: a skipped file gets no
+    // diagnostics from `--check` or the workspace index, and silence there
+    // reads as "no problems found" (FHEM ships four such files). The open-doc
+    // path has no cap — the editor still analyzes these on didOpen.
+    if !oversize.is_empty() {
+        oversize.sort();
+        eprintln!(
+            "perl-lsp: {} file(s) over the 1 MB workspace-index cap were skipped \
+             (no --check/workspace diagnostics for them; opening in an editor still works):",
+            oversize.len()
+        );
+        for (p, len) in &oversize {
+            eprintln!("perl-lsp:   {:.1} MB  {}", *len as f64 / 1e6, p.display());
+        }
+    }
 
     // Extensionless entrypoint SCRIPTS (`#!/usr/bin/env perl` — crm's
     // `jobs`/`login`/… Mojo::Lite apps) carry no glob, so a SHALLOW
