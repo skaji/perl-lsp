@@ -162,7 +162,7 @@ mod lookup;
 mod queries;
 mod registration;
 use registration::EnrichedEntry;
-pub use registration::{SweepAnswerGuard, SweepMemoGuard};
+pub use registration::{SweepAnswerGuard, SweepMemoGuard, SweepProviderGuard};
 
 /// Every file that provides one module name, in provider order. `[0]` is
 /// the winner — what `require` would load for an `@INC` set, the derived

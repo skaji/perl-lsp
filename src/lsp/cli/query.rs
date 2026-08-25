@@ -1273,6 +1273,12 @@ fn for_each_enriched_diagnostic(
     // are the n² a package-main corpus produces. Shared across the rayon
     // workers; stamp-cleared on any index shape change.
     let _answers = module_index::SweepAnswerGuard::open();
+    // The sweep-wide shared PROVIDER cache: each provider decodes once per
+    // sweep and is resident once, replacing up to worker-count OVERLAPPING
+    // per-file memos (measured: 13,456 rehydrates for ~500 distinct
+    // providers in one n=250 sweep — the majority component of the
+    // per-worker in-flight sets that own the RSS crest).
+    let _providers = module_index::SweepProviderGuard::open();
     // Byte-budgeted ADMISSION for the sweep: the RSS crest is the PRODUCT of
     // worker count and per-worker in-flight working set (memo + overlay clone
     // pair + rehydrated wholes), measured at ~414 MB marginal per worker on a

@@ -26,7 +26,9 @@ thread_local! {
 #[derive(Default)]
 struct SweepMemo {
     stamp: u64,
-    map: std::collections::HashMap<std::path::PathBuf, Arc<FileAnalysis>>,
+    /// Keyed by (path, want_bag) — same axis-mixing hazard as the shared
+    /// provider cache's key comment.
+    map: std::collections::HashMap<(std::path::PathBuf, bool), Arc<FileAnalysis>>,
     /// Bytes this file's memo holds (estimates) — the crest attribution:
     /// per-worker in-flight working sets are bounded by the largest single
     /// file's memo, and `sweep.memo_peak_file_bytes` reports the max seen.
@@ -91,6 +93,116 @@ impl SweepAnswers {
 pub(super) fn sweep_answers_read(
 ) -> Option<std::sync::RwLockReadGuard<'static, Option<SweepAnswers>>> {
     SWEEP_ANSWERS.read().ok()
+}
+
+/// The sweep-wide shared PROVIDER cache: decoded provider analyses, shared
+/// across files and rayon workers for one batch sweep. The per-file
+/// `SweepMemo` shields one file's sweep from LRU thrash but holds providers
+/// PER WORKER — measured: 13,456 rehydrates for ~500 distinct providers in
+/// one n=250 sweep (~27x redundant decoding), held in up to 20 OVERLAPPING
+/// per-file maps that are the majority component of the sweep's per-worker
+/// in-flight set. One shared, byte-budgeted, stamp-guarded map decodes each
+/// provider once per sweep and keeps it resident once. When open it
+/// REPLACES the per-file memo's role entirely (same shield, deduplicated);
+/// eviction over budget is unspecified-order, the conclusion cache's
+/// precedent — near-uniform entries under a near-uniform access pattern.
+pub(super) struct SweepProviders {
+    stamp: std::sync::atomic::AtomicU64,
+    /// Keyed by (path, want_bag): the two rehydrate lanes return DIFFERENT
+    /// axis sets (rows lane = refs+symbols sans bag; bag lane = bag view),
+    /// and a path-only key serves a bag-less copy to a bag-wanting consumer
+    /// — the invocant type silently vanishes and diagnostics' false
+    /// positives disappear for the WRONG reason (gold's diag-09 note
+    /// describes exactly this; its XPASS is how the path-only first draft
+    /// of this cache was caught).
+    map: DashMap<(std::path::PathBuf, bool), (Arc<FileAnalysis>, u64)>,
+    bytes: std::sync::atomic::AtomicU64,
+    budget: u64,
+}
+
+static SWEEP_PROVIDERS: std::sync::RwLock<Option<SweepProviders>> =
+    std::sync::RwLock::new(None);
+
+/// Opens the shared provider cache for one batch sweep; drops it on drop.
+/// `PERL_LSP_SWEEP_PROVIDER_CACHE_MB` sizes it (default 1024; 0 disables,
+/// which leaves the per-file memo path in sole effect — the A/B control).
+pub struct SweepProviderGuard(());
+
+impl SweepProviderGuard {
+    pub fn open() -> Self {
+        let mb = std::env::var("PERL_LSP_SWEEP_PROVIDER_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024);
+        if mb != 0 {
+            if let Ok(mut slot) = SWEEP_PROVIDERS.write() {
+                *slot = Some(SweepProviders {
+                    stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
+                    map: DashMap::new(),
+                    bytes: std::sync::atomic::AtomicU64::new(0),
+                    budget: mb * 1024 * 1024,
+                });
+            }
+        }
+        SweepProviderGuard(())
+    }
+}
+
+impl Drop for SweepProviderGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SWEEP_PROVIDERS.write() {
+            *slot = None;
+        }
+    }
+}
+
+impl SweepProviders {
+    fn validate(&self, stamp: u64) -> bool {
+        if self.stamp.load(std::sync::atomic::Ordering::Relaxed) != stamp {
+            // Lazy reset under the read lock — DashMap::clear is concurrent-
+            // safe, and a racing reader only misses, never serves stale.
+            self.map.clear();
+            self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.stamp.store(stamp, std::sync::atomic::Ordering::Relaxed);
+            crate::util::ghost_stats::count("sweepprov.invalidated");
+            return false;
+        }
+        true
+    }
+
+    fn get(&self, path: &std::path::Path, want_bag: bool) -> Option<Arc<FileAnalysis>> {
+        self.map
+            .get(&(path.to_path_buf(), want_bag))
+            .map(|e| Arc::clone(&e.value().0))
+    }
+
+    fn insert(&self, path: &std::path::Path, want_bag: bool, fa: &Arc<FileAnalysis>) {
+        let est = fa.heap_estimate().total() as u64;
+        if self
+            .map
+            .insert((path.to_path_buf(), want_bag), (Arc::clone(fa), est))
+            .is_none()
+        {
+            self.bytes.fetch_add(est, std::sync::atomic::Ordering::Relaxed);
+        }
+        while self.bytes.load(std::sync::atomic::Ordering::Relaxed) > self.budget {
+            let victim = self
+                .map
+                .iter()
+                .map(|e| e.key().clone())
+                .find(|(p, wb)| !(p == path && *wb == want_bag));
+            let Some(victim) = victim else { break };
+            if let Some((_, (_, vbytes))) = self.map.remove(&victim) {
+                self.bytes.fetch_sub(
+                    vbytes.min(self.bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                crate::util::ghost_stats::count("sweepprov.evicted");
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 /// Opens the sweep-wide verdict store; closes (and drops it) on drop.
@@ -1276,6 +1388,26 @@ impl ModuleIndex {
                 .core
                 .shape_bumps
                 .load(std::sync::atomic::Ordering::Relaxed);
+            // The SHARED provider cache first, when a batch sweep opened it —
+            // it subsumes the per-file memo (one decode per provider per
+            // SWEEP, resident once, instead of once per consuming file's
+            // worker-held map).
+            let shared_active = {
+                let guard = SWEEP_PROVIDERS.read().ok();
+                match guard.as_ref().and_then(|g| g.as_ref()) {
+                    Some(sp) => {
+                        if sp.validate(stamp) {
+                            if let Some(hit) = sp.get(&cached.path, want_bag) {
+                                crate::util::ghost_stats::count("sweepprov.hit");
+                                return hit;
+                            }
+                            crate::util::ghost_stats::count("sweepprov.miss");
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            };
             let memoed = SWEEP_MEMO.with(|c| {
                 let mut slot = c.borrow_mut();
                 let memo = slot.as_mut()?;
@@ -1285,7 +1417,7 @@ impl ModuleIndex {
                     crate::util::ghost_stats::count("sweep.memo_invalidated");
                     return None;
                 }
-                memo.map.get(&cached.path).cloned()
+                memo.map.get(&(cached.path.clone(), want_bag)).cloned()
             });
             if let Some(hit) = memoed {
                 crate::util::ghost_stats::count("sweep.memo_hit");
@@ -1304,6 +1436,19 @@ impl ModuleIndex {
             });
             match got {
                 Ok(full) => {
+                    if shared_active {
+                        // The shared cache subsumes the per-file memo (and
+                        // its byte accounting — sweepprov's own counters
+                        // carry the attribution when it is open).
+                        if let Ok(guard) = SWEEP_PROVIDERS.read() {
+                            if let Some(sp) = guard.as_ref() {
+                                if sp.validate(stamp) {
+                                    sp.insert(&cached.path, want_bag, &full);
+                                }
+                            }
+                        }
+                        return full;
+                    }
                     SWEEP_MEMO.with(|c| {
                         if let Some(memo) = c.borrow_mut().as_mut() {
                             if memo.stamp == stamp {
@@ -1331,7 +1476,8 @@ impl ModuleIndex {
                                         memo.bytes - prev,
                                     );
                                 }
-                                memo.map.insert(cached.path.clone(), Arc::clone(&full));
+                                memo.map
+                                    .insert((cached.path.clone(), want_bag), Arc::clone(&full));
                             }
                         }
                     });
