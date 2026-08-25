@@ -199,14 +199,33 @@ index rebuild** (cloning every String-bearing attachment) on each call.
 (`WitnessBag::remove_attachment_sources_at`).
 
 ```
-build()             29.1 s -> 7.8 s
 fold::call_binding  21.6 s -> 16.5 ms
 bag length          57,228 -> 57,228   (unchanged)
 fold iterations          3 -> 3        (unchanged)
 ```
 
-Identical bag and iteration count with a 3.7x wall drop is what makes this a fix
-rather than a tuning: the same fixed point, reached without the quadratic.
+Identical bag and iteration count with the wall dropping is what makes this a
+fix rather than a tuning: the same fixed point, reached without the quadratic.
+
+Ladder measured through `didOpen`, pre-fix vs post-fix:
+
+| lines | pre-fix | post-fix | |
+|---:|---:|---:|---|
+| 3,268 | 188 ms | 181 ms | flat |
+| 5,607 | 276 ms | 271 ms | flat |
+| 20,669 | 2,374 ms | **1,424 ms** | 1.7x |
+| 46,522 | 33,180 ms | **10,698 ms** | 3.1x |
+
+Small files are untouched, as expected — the pass only matters at scale. The
+top-end exponent falls from **3.33 to 2.47**: still superlinear, but the cliff
+is gone, and the gain growing with size is the signature of removing a term
+that scaled with the file rather than a constant.
+
+**Measurement caveat.** Pre-fix points are single measurements, and this box
+shows real variance — three repeats of the 20,669 point read 1552 / 1386 / 1424
+ms, while a single pass earlier read 3,869 (2.7x the median) and briefly looked
+like a regression. The ratios are directionally sound; the exact multipliers are
+not precise. Repeat before quoting any of them as a target.
 
 ### Two corrections to the first version of this section
 
