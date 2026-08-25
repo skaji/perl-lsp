@@ -284,7 +284,7 @@ which is the entire 0.39 s / 29 s gap. `build()` has no module-index access, so
 `@INC` cannot affect it either way.
 
 **A consequence worth its own line: files over 1 MB silently receive no
-`--check` diagnostics.** FHEM has four. "No diagnostics" reads exactly like "no
+`--check` diagnostics.** FHEM has five (contrib ships a second `76_SolarForecast.pm`). "No diagnostics" reads exactly like "no
 problems found," and nothing in the output distinguishes them.
 
 ### Residual
