@@ -211,6 +211,29 @@ the relation that answers it, and the soundness constraint.
    what is logically a small immutable overlay. This is also the "make a
    build cheap" prerequisite that priced out level-indexed enrichment — the
    algebra was right, the carrier (whole-FA copies) was too heavy.
+   **Design written: `docs/prompt-enrichment-delta.md`** (four stages, each
+   land-alone; stage 2's bag view is where the clone leaves the hot path).
+
+10. **The FA multiplier (density).** A giant Perl file's analysis costs
+    ~2.2 KB per source line — refs 41.5% (a ref per meaningful token, each
+    with an OWNED `target_name: String`), witness vec+index 39.4% (a
+    witness per meaningful expression, each with an OWNED
+    `WitnessSource::Builder(String)` tag) — ~10x release's footprint, and
+    the term behind FHEM's brk churn, the crest's per-worker sets, and the
+    rehydrate unit price. Options, cheapest-first, measurement-gated:
+    (a) representation shrink — intern source tags (a closed set of
+    static strings carried as per-witness heap allocations today) and
+    dedupe repeated names within a file's tables; no semantic change,
+    EXTRACT_VERSION bump; (b) consultation census — ghost counters on
+    which witness kinds are ever READ per corpus, making elision of
+    never-consulted emissions evidence-based rather than speculative;
+    (c) density budget — per-file emission caps with the honest `degraded`
+    mark (the MAX_CST_DEPTH precedent) for files past a size threshold;
+    (d) chunked/lazy bag storage — shard the persisted bag so rehydration
+    loads only the shard a query touches; composes with rung 9's bag view.
+    Chunking the FILE itself (multiple FAs per source file) is the
+    non-option: scopes, packages, and SymbolIds are file-scoped
+    invariants, and every consumer assumes them.
 
 ## The discipline (every slice obeys these)
 
