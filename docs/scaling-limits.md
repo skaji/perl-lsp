@@ -207,25 +207,43 @@ fold iterations          3 -> 3        (unchanged)
 Identical bag and iteration count with the wall dropping is what makes this a
 fix rather than a tuning: the same fixed point, reached without the quadratic.
 
-Ladder measured through `didOpen`, pre-fix vs post-fix:
+Ladder through `didOpen`, first build in a fresh server, median of 3:
 
-| lines | pre-fix | post-fix | |
-|---:|---:|---:|---|
-| 3,268 | 188 ms | 181 ms | flat |
-| 5,607 | 276 ms | 271 ms | flat |
-| 20,669 | 2,374 ms | **1,424 ms** | 1.7x |
-| 46,522 | 33,180 ms | **10,698 ms** | 3.1x |
+| lines | pre-fix | + call_binding fix | + chain_pre fix |
+|---:|---:|---:|---:|
+| 3,268 | 188 ms | 424 ms | 627 ms |
+| 5,607 | 276 ms | 599 ms | 639 ms |
+| 20,669 | 2,374 ms | 1,424 ms | 2,290 ms |
+| **46,522** | **33,180 ms** | **10,698 ms** | **5,364 ms** |
 
-Small files are untouched, as expected — the pass only matters at scale. The
-top-end exponent falls from **3.33 to 2.47**: still superlinear, but the cliff
-is gone, and the gain growing with size is the signature of removing a term
-that scaled with the file rather than a constant.
+**6.2x at the top.** The small rows are NOT a regression — see below, and the
+reason two people chased one anyway is worth more than the table.
 
-**Measurement caveat.** Pre-fix points are single measurements, and this box
-shows real variance — three repeats of the 20,669 point read 1552 / 1386 / 1424
-ms, while a single pass earlier read 3,869 (2.7x the median) and briefly looked
-like a regression. The ratios are directionally sound; the exact multipliers are
-not precise. Repeat before quoting any of them as a target.
+### Measure the SECOND build in a process, not the first
+
+Every row above is a fresh server, and **the first `build()` in a process
+carries a one-time ~600 ms cost that is not the build**: `rhai` plugin
+compilation (`default_plugin_registry`, a `OnceLock`) is lazily forced by the
+first `didOpen` and lands inside its `[PHASE] build()`.
+
+A fresh-server-per-point ladder therefore pays that constant at *every* point on
+*every* commit, and on small files it dominates the quantity being compared.
+`[05]` established this by bisect — first-build on a 1,760-line file is ~700 ms
+at all three commits (721/696, 688/685, 696/701, indistinguishable) — then by
+opening two files in one process: **712 ms, then 121 ms.**
+
+Per-build cost measured correctly, 3,268 lines: **121 ms post-fix against 181 ms
+pre-fix. Small files improve too.** The apparent 424 → 627 "regression" was that
+constant wobbling with box state. Tight bands either side of a shared constant
+look exactly like a real difference, which is how it survived two rounds of
+scrutiny.
+
+**Protocol: quote the second build in a process, or state the first-build
+constant explicitly. Never compare first-builds across commits.**
+
+**Separate lead, worth a ticket:** pre-warming the plugin registry from
+`initialize` on `spawn_blocking` would take ~600 ms off every editor cold open,
+independent of anything above.
 
 ### Two corrections to the first version of this section
 
