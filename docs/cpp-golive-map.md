@@ -341,6 +341,9 @@ ARC 4  cpp LSP experience .............................. 🔵 IN PROGRESS
          eviction + open-consumer refresh path. ✅
 
 ARC 5  SHIP cpp ...................................... ⬜ THE GOAL
+       Status answered for now: ALPHA — see docs/cpp-status.md. Godot
+       (7,041 files) does not complete; 30-66s stalls on large vendored
+       headers. Memory is fine; the gate is per-file wall.
 ```
 
 ## The load-bearing insight: the tier is SHARED, not Perl-specific
