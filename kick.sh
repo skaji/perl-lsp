@@ -7,6 +7,7 @@
 #   ./kick.sh bmo --list      show the ten biggest files, pick by number
 #   ./kick.sh --nodeps bmo    leave PERL5LIB unset (deps unresolvable)
 #   ./kick.sh --dry bmo       print what it would open, launch nothing
+#   ./kick.sh --debug bmo     debug log + phase timing + counters, paths printed
 #
 # Dependencies live OUTSIDE each workspace (corpus/README.md) so they land on
 # the @INC tier instead of joining the indexed workspace. This script sets
@@ -17,10 +18,11 @@ cd "$(dirname "$0")"
 
 BULK=${PERL_CORPORA:-$HOME/perl-corpora}/bulk
 DEPS=${PERL_CORPORA:-$HOME/perl-corpora}/deps
-NODEPS=""; DRY=""
+NODEPS=""; DRY=""; DEBUG=""
 while :; do case "${1:-}" in
   --nodeps) NODEPS=1; shift;;
   --dry)    DRY=1; shift;;
+  --debug)  DEBUG=1; shift;;
   *) break;; esac; done
 
 # name|dir|cold wall|note   — walls are measured, deps installed, this box
@@ -33,7 +35,7 @@ ROWS=(
 "webmin|Webmin|8.8s|path-based require, few packages — odd shape"
 "koha|../koha|10.2s|library ILS (separate tree)"
 "znuny|Znuny|79s|HEAVY: 8.2 GB, 3k files"
-"fhem|FHEM|--|WILL NOT COMPLETE: dies at 12+ GB, see docs/scaling-limits.md"
+"fhem|FHEM|slow start|editor OK; --check dies at 12+ GB (batch verb only)"
 )
 
 pick_menu() {
@@ -54,9 +56,8 @@ fi
 
 ROOT="$BULK/$DIR"
 [ -d "$ROOT" ] || { echo "missing: $ROOT — run corpus/bootstrap.sh" >&2; exit 1; }
-case "$N" in *"WILL NOT COMPLETE"*)
-  printf '\n  !! %s\n     The editor will hang and the box may OOM. Ctrl-C now unless\n     that is what you came for.\n     Survivable as: RAYON_NUM_THREADS=4 MALLOC_MMAP_THRESHOLD_=65536 ./kick.sh fhem\n\n' "$N" >&2
-  printf '  continue anyway? [y/N]: ' >&2; read -r y </dev/tty; [ "$y" = y ] || exit 0;;
+case "$N" in *"batch verb only"*)
+  printf '\n  note: FHEM startup is slow (534 files declare `package main`), but the\n        editor is fine — the 12 GB blowup is --check sweeping every file,\n        not the server, which only enriches what you open.\n\n' >&2;;
 esac
 
 # Biggest files first: a 20-line module tells you nothing about how it feels.
@@ -84,5 +85,21 @@ fi
 
 printf '\n  %s  ·  %s cold  ·  %s\n  %s (%s lines)\n\n' \
   "$KEY" "$W" "$DEPNOTE" "${TARGET#$ROOT/}" "$(wc -l <"$TARGET")" >&2
+if [ -n "$DEBUG" ]; then
+  STAMP=$(date +%H%M%S)
+  RUN=/tmp/perl-lsp-kick/$KEY-$STAMP; mkdir -p "$RUN"
+  export PERL_LSP_DEBUG=1                    # server log -> /tmp/perl-lsp.log (dev.sh's path)
+  export PERL_LSP_PHASE_TIMING=1             # cli::*/phase attribution
+  export PERL_LSP_GHOST_STATS="$RUN/ghost.txt"   # counters, flushed at shutdown
+  : > /tmp/perl-lsp.log
+  cat >&2 <<EOF
+  debug on:
+    tail -f /tmp/perl-lsp.log            server log (live)
+    $RUN/ghost.txt
+                                         counters — written at SHUTDOWN, so
+                                         :q the editor before reading them.
+                                         A killed server writes nothing.
+EOF
+fi
 [ -n "$DRY" ] && { echo "  (--dry: not launching)" >&2; exit 0; }
 exec ./dev.sh "$TARGET"
