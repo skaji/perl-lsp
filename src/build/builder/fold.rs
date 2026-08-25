@@ -118,7 +118,9 @@ impl<'a> Builder<'a> {
     ) {
         match mode {
             ChainPassMode::PreFold => {
-                self.apply_chain_typing_assignments(idx);
+                crate::util::ghost_stats::timed("chain::assignments", || {
+                    self.apply_chain_typing_assignments(idx)
+                });
                 // Refresh `invocant_class` each iteration too.
                 // Variable invocants whose TC just landed in the
                 // worklist's previous iteration become resolvable
@@ -128,7 +130,9 @@ impl<'a> Builder<'a> {
                 // see them until the loop already terminated.
                 // `apply_chain_typing_invocants` is idempotent (skips
                 // refs whose class is already pinned).
-                self.apply_chain_typing_invocants(idx);
+                crate::util::ghost_stats::timed("chain::invocants", || {
+                    self.apply_chain_typing_invocants(idx)
+                });
             }
             ChainPassMode::PostFold => {
                 self.apply_chain_typing_invocants(idx);
@@ -223,12 +227,16 @@ impl<'a> Builder<'a> {
                 );
                 break;
             }
-            self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
+            {
+                let _t = crate::util::ghost_stats::ScopedNs::start("fold::chain_pre");
+                self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
+            }
             self.resolve_return_types(idx, &reg, &ref_by_span, &method_sym_by_name);
             // Mutation extension: fold key writes into variable shapes
             // (re-emittable, clear-and-emit). After the return-type
             // passes so call-binding-propagated shapes are visible.
             {
+                let _t = crate::util::ghost_stats::ScopedNs::start("fold::mutation_ext");
                 let ctx = crate::model::witnesses::BagContext {
                     scopes: &self.scopes,
                     package_framework: &self.package_framework,
@@ -243,13 +251,18 @@ impl<'a> Builder<'a> {
                     true,
                 );
             }
-            let cur = self.fold_state_snapshot(&reg);
+            let cur = crate::util::ghost_stats::timed("fold::snapshot", || {
+                self.fold_state_snapshot(&reg)
+            });
             if cur == prev {
                 break;
             }
             prev = cur;
         }
-        self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
+        {
+            let _t = crate::util::ghost_stats::ScopedNs::start("fold::chain_post");
+            self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
+        }
         // Totals, not a line per file: at corpus scale the per-file form is
         // 138k unreadable lines, and the average is what says whether the
         // lattice is settling. `build::fold_to_fixed_point`'s sample count is
@@ -356,6 +369,33 @@ impl<'a> Builder<'a> {
     /// a point-query gives the right answer at any byte.
     pub(super) fn apply_chain_typing_assignments(&mut self, idx: &ChainTypingIndex<'a>) {
         let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
+        crate::util::ghost_stats::count_by(
+            "chain.assignment_nodes",
+            idx.assignment_nodes.len() as u64,
+        );
+        // Snapshot of the bag's typed-Variable witnesses, keyed by
+        // (name, span.start) — the idempotency checks below ask exactly this
+        // question per assignment, and a full-bag scan per assignment is
+        // O(assignments * bag) (6+ s of a 46k-line file's fold). Safe as a
+        // snapshot: the RHS typer takes `&self`, and this pass's own pushes
+        // land only after the loop, so the bag cannot change mid-loop.
+        let mut typed_at: std::collections::HashMap<(String, Point), Vec<usize>> =
+            std::collections::HashMap::new();
+        {
+            let _t = crate::util::ghost_stats::ScopedNs::start("chain::already_index");
+            for (i, w) in self.bag.all().iter().enumerate() {
+                if let (
+                    crate::model::witnesses::WitnessAttachment::Variable { name, .. },
+                    crate::model::witnesses::WitnessPayload::InferredType(_),
+                ) = (&w.attachment, &w.payload)
+                {
+                    typed_at
+                        .entry((name.clone(), w.span.start))
+                        .or_default()
+                        .push(i);
+                }
+            }
+        }
         for &node in &idx.assignment_nodes {
             let (Some(left), Some(right)) = (
                 node.child_by_field_name("left"),
@@ -408,14 +448,18 @@ impl<'a> Builder<'a> {
                     let row_ty = InferredType::ClassName(row);
                     let sid = self.innermost_scope_id_at(span.start);
                     for name in list_scalars {
-                        let already = self.bag.all().iter().any(|w| {
-                            let crate::model::witnesses::WitnessPayload::InferredType(t) = &w.payload else {
-                                return false;
-                            };
-                            matches!(&w.attachment, crate::model::witnesses::WitnessAttachment::Variable { name: n, .. } if n == &name)
-                                && w.span.start == span.start
-                                && t.subsumes_narrowing(&row_ty)
-                        });
+                        let already = typed_at
+                            .get(&(name.clone(), span.start))
+                            .is_some_and(|idxs| {
+                                idxs.iter().any(|&i| {
+                                    let crate::model::witnesses::WitnessPayload::InferredType(t) =
+                                        &self.bag.all()[i].payload
+                                    else {
+                                        return false;
+                                    };
+                                    t.subsumes_narrowing(&row_ty)
+                                })
+                            });
                         if !already {
                             to_push.push((name, sid, span, row_ty.clone()));
                         }
@@ -430,9 +474,11 @@ impl<'a> Builder<'a> {
             // already-resolved RHS.)
             let saved_pkg_probe = self.current_package.clone();
             self.current_package = self.package_at_pos(span.start).map(|s| s.to_string());
-            let fresh = self
-                .invocant_type_at_node(right)
-                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName));
+            let fresh = {
+                let _t = crate::util::ghost_stats::ScopedNs::start("chain::rhs_probe");
+                self.invocant_type_at_node(right)
+                    .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
+            };
             self.current_package = saved_pkg_probe;
 
             // Idempotency: skip if an already-pushed Variable witness at
@@ -442,18 +488,21 @@ impl<'a> Builder<'a> {
             // walk-time materialization on a later fold iteration; once
             // the brand is in the bag it subsumes the next (identical)
             // brand and the loop settles.
-            let already_typed = self.bag.all().iter().any(|w| {
-                let crate::model::witnesses::WitnessPayload::InferredType(t) = &w.payload else {
-                    return false;
-                };
-                matches!(&w.attachment, crate::model::witnesses::WitnessAttachment::Variable { name, .. } if name == &var)
-                    && w.span.start == span.start
-                    && fresh.as_ref().map_or(true, |f| t.subsumes_narrowing(f))
+            let already_typed = typed_at.get(&(var.clone(), span.start)).is_some_and(|idxs| {
+                idxs.iter().any(|&i| {
+                    let crate::model::witnesses::WitnessPayload::InferredType(t) =
+                        &self.bag.all()[i].payload
+                    else {
+                        return false;
+                    };
+                    fresh.as_ref().map_or(true, |f| t.subsumes_narrowing(f))
+                })
             });
             if already_typed {
                 continue;
             }
             // Innermost scope containing this assignment.
+            let _t_scope = crate::util::ghost_stats::ScopedNs::start("chain::scope_pick");
             let scope_idx = self
                 .scopes
                 .iter()
@@ -469,13 +518,8 @@ impl<'a> Builder<'a> {
                     r * 1_000_000 + c
                 })
                 .map(|(i, _)| i);
+            drop(_t_scope);
 
-            let scope_pkg = self.package_at_pos(span.start).map(|s| s.to_string());
-
-            let saved_pkg = self.current_package.clone();
-            if scope_pkg.is_some() {
-                self.current_package = scope_pkg;
-            }
             // Read the RHS's full `InferredType` first — Parametric
             // shapes need to land on the variable as Parametric, not
             // unwrapped to their `base` via `class_name()`. Falls
@@ -483,11 +527,21 @@ impl<'a> Builder<'a> {
             // for the bareword-degrade tail (a non-class type on a
             // bareword maps to "treat the syntactic text as a
             // class") which the type-aware path doesn't model.
-            let ty_opt = self
-                .invocant_type_at_node(right)
-                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
-                .or(fresh);
-            self.current_package = saved_pkg;
+            //
+            // When `package_at_pos` answered Some, the `fresh` probe above
+            // already ran this exact computation under this exact package
+            // override — the typer is `&self` and deterministic, so
+            // recomputing is a straight 2x on the symbolic executor. Only
+            // the None case differs (the probe typed under `None`, this
+            // path types under the walk's stale `current_package`).
+            let ty_opt = if self.package_at_pos(span.start).is_some() {
+                fresh
+            } else {
+                let _t = crate::util::ghost_stats::ScopedNs::start("chain::rhs_type");
+                self.invocant_type_at_node(right)
+                    .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
+                    .or(fresh)
+            };
 
             if let Some(ty) = ty_opt {
                 let sid = scope_idx.map(|i| self.scopes[i].id).unwrap_or(ScopeId(0));
@@ -533,6 +587,8 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        crate::util::ghost_stats::count_by("chain.invocants_pending", pending.len() as u64);
+        let _t = crate::util::ghost_stats::ScopedNs::start("chain::invoc_resolve");
         for (i, node) in pending {
             if let Some(class) = self.resolve_invocant_class_tree(node) {
                 self.method_call_invocant.insert(i, class);
@@ -834,18 +890,20 @@ impl<'a> Builder<'a> {
         ref_by_span: &std::collections::HashMap<(Point, Point), usize>,
         method_sym_by_name: &std::collections::HashMap<String, Vec<usize>>,
     ) {
-        self.emit_arity_return_witnesses();
+        use crate::util::ghost_stats::timed;
+        timed("fold::arity", || self.emit_arity_return_witnesses());
         // Brand BEFORE method-call edges so `route_branded_refs` is
         // current when `emit_method_call_return_edges` consults it to
         // skip route calls — otherwise the skip set lags one iteration
         // and the bag oscillates (the fold never reaches a fixed point).
-        self.emit_route_brand_witnesses(idx, ref_by_span);
-        self.emit_method_call_return_edges();
-        self.emit_defined_narrowing_witnesses();
-        let (return_types, return_provenance) = self.seed_return_types_from_bag(reg, method_sym_by_name);
-        self.write_back_sub_return_types(&return_provenance);
-        self.propagate_call_bindings_to_constraints(&return_types);
-        self.fixup_call_bound_hash_key_owners(&return_types);
+        timed("fold::route_brand", || self.emit_route_brand_witnesses(idx, ref_by_span));
+        timed("fold::mc_edges", || self.emit_method_call_return_edges());
+        timed("fold::narrowing", || self.emit_defined_narrowing_witnesses());
+        let (return_types, return_provenance) =
+            timed("fold::seed", || self.seed_return_types_from_bag(reg, method_sym_by_name));
+        timed("fold::writeback", || self.write_back_sub_return_types(&return_provenance));
+        timed("fold::call_binding", || self.propagate_call_bindings_to_constraints(&return_types));
+        timed("fold::fixup_hko", || self.fixup_call_bound_hash_key_owners(&return_types));
     }
 
     /// Re-emittable: stamp the resolved `BrandedRoute` onto the
@@ -1725,6 +1783,14 @@ impl<'a> Builder<'a> {
     ) {
         use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
 
+        // Batched: collect every replacement first, then ONE bulk removal and
+        // the pushes. The per-binding remove-then-push spelling costs a full
+        // bag retain + index rebuild PER BINDING — O(bindings * bag), the
+        // dominant term of the giant-file fold (~22 s of a 46k-line file's
+        // 30 s build). Each (attachment, point) names one binding site, so
+        // removing them together is equivalent.
+        let mut to_remove: Vec<(WitnessAttachment, tree_sitter::Point)> = Vec::new();
+        let mut to_push: Vec<Witness> = Vec::new();
         for binding in &self.call_bindings {
             let rt = return_types
                 .get(&binding.func_name)
@@ -1735,9 +1801,8 @@ impl<'a> Builder<'a> {
                     name: binding.variable.clone(),
                     scope: binding.scope,
                 };
-                self.bag
-                    .remove_attachment_source_at(&att, "call_binding", binding.span.start);
-                self.bag.push(Witness {
+                to_remove.push((att.clone(), binding.span.start));
+                to_push.push(Witness {
                     attachment: att,
                     source: WitnessSource::Builder("call_binding".into()),
                     payload: WitnessPayload::InferredType(rt),
@@ -1747,6 +1812,10 @@ impl<'a> Builder<'a> {
                     },
                 });
             }
+        }
+        self.bag.remove_attachment_sources_at(&to_remove, "call_binding");
+        for w in to_push {
+            self.bag.push(w);
         }
     }
 

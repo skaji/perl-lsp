@@ -126,6 +126,8 @@ impl WitnessBag {
     }
 
     pub fn rebuild_index(&mut self) {
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::rebuild_index");
+        crate::util::ghost_stats::count_by("bag.rebuild_index_witnesses", self.witnesses.len() as u64);
         self.index.clear();
         for (i, w) in self.witnesses.iter().enumerate() {
             self.index.entry(w.attachment.clone()).or_default().push(i);
@@ -160,6 +162,7 @@ impl WitnessBag {
     /// at the start of each fold iteration so the bag stays
     /// duplicate-free no matter how many times the fold runs.
     pub fn remove_by_source_tag(&mut self, tag: &str) -> usize {
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::remove_tag");
         let before = self.witnesses.len();
         self.witnesses.retain(|w| match &w.source {
             WitnessSource::Builder(s) => s != tag,
@@ -205,11 +208,42 @@ impl WitnessBag {
         tag: &str,
         at: Point,
     ) -> usize {
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::remove_at");
         let before = self.witnesses.len();
         self.witnesses.retain(|w| {
             !(&w.attachment == att
                 && w.span.start == at
                 && matches!(&w.source, WitnessSource::Builder(s) if s == tag))
+        });
+        let removed = before - self.witnesses.len();
+        if removed > 0 {
+            self.rebuild_index();
+        }
+        removed
+    }
+
+    /// Batch form of `remove_attachment_source_at`: one retain + at most one
+    /// index rebuild for the whole set. The per-binding form costs a full
+    /// bag scan AND a full index rebuild per call, which turns a pass with N
+    /// bindings into O(N * bag) — 20+ seconds of the 46k-line-file fold was
+    /// exactly this. Each (attachment, point) pair identifies one binding
+    /// site, so removing them together is equivalent to removing them one at
+    /// a time.
+    pub fn remove_attachment_sources_at(
+        &mut self,
+        items: &[(WitnessAttachment, Point)],
+        tag: &str,
+    ) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::remove_at_batch");
+        let keys: std::collections::HashSet<(&WitnessAttachment, Point)> =
+            items.iter().map(|(a, p)| (a, *p)).collect();
+        let before = self.witnesses.len();
+        self.witnesses.retain(|w| {
+            !(matches!(&w.source, WitnessSource::Builder(s) if s == tag)
+                && keys.contains(&(&w.attachment, w.span.start)))
         });
         let removed = before - self.witnesses.len();
         if removed > 0 {

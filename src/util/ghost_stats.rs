@@ -129,6 +129,7 @@ pub fn count(tag: &str) {
     if !enabled() {
         return;
     }
+    scope_count(tag, 1);
     {
         let mut c = counters().lock().unwrap_or_else(|e| e.into_inner());
         *c.entry(tag.to_string()).or_insert(0) += 1;
@@ -173,11 +174,116 @@ pub fn count_by(tag: &str, n: u64) {
     if !enabled() || n == 0 {
         return;
     }
+    scope_count(tag, n);
     {
         let mut c = counters().lock().unwrap_or_else(|e| e.into_inner());
         *c.entry(tag.to_string()).or_insert(0) += n;
     }
     maybe_reemit_attribution();
+}
+
+// ---------------------------------------------------------------------------
+// Per-build scope: a thread-local delta of the SAME counters and timers,
+// opened around one build() and emitted as one self-contained block. The
+// global maps are process-cumulative and re-emitted on an interval, which
+// makes per-FILE numbers unrecoverable three ways at once: concurrent builds
+// pollute the totals, repeated re-emits compound when a log is summed, and a
+// killed run loses the tail. This scope is exact by construction — a build's
+// fold runs on one thread, and only that thread's events land in its scope —
+// so one grep gives one file's counters regardless of what else the process
+// was doing.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static BUILD_SCOPE: std::cell::RefCell<Option<ScopeData>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct ScopeData {
+    counts: HashMap<String, u64>,
+    ns: HashMap<String, (u128, u64)>,
+}
+
+fn scope_count(tag: &str, n: u64) {
+    BUILD_SCOPE.with(|s| {
+        if let Some(d) = s.borrow_mut().as_mut() {
+            *d.counts.entry(tag.to_string()).or_insert(0) += n;
+        }
+    });
+}
+
+fn scope_add_ns(tag: &str, nanos: u128) {
+    BUILD_SCOPE.with(|s| {
+        if let Some(d) = s.borrow_mut().as_mut() {
+            let e = d.ns.entry(tag.to_string()).or_insert((0, 0));
+            e.0 += nanos;
+            e.1 += 1;
+        }
+    });
+}
+
+/// Scope guard: captures every `count`/`count_by`/`add_ns` on THIS thread
+/// between construction and drop, then emits one `[build-scope]` block to the
+/// sink. Inert when the gate is off. Nesting restores the outer scope (the
+/// inner build's events are attributed to the inner scope only).
+///
+/// The gate itself is not free: with `PERL_LSP_GHOST_STATS` set, a
+/// witness-heavy build pays for every hop counter and timed region it crosses
+/// (measured ~25% wall on a 46k-line Perl file). The block's RELATIVE shares
+/// are trustworthy; its `ms=` total is not comparable to a gate-off run, so
+/// never quote gate-on and gate-off walls against each other.
+pub struct BuildScope {
+    started: Option<std::time::Instant>,
+    prev: Option<ScopeData>,
+    label: String,
+    bytes: usize,
+}
+
+impl BuildScope {
+    /// `label` names the input (file path when the caller knows it);
+    /// `bytes` is the source size, the stable join key for size-ladder runs.
+    pub fn start(label: Option<String>, bytes: usize) -> Self {
+        if !enabled() {
+            return BuildScope { started: None, prev: None, label: String::new(), bytes };
+        }
+        let prev = BUILD_SCOPE.with(|s| s.borrow_mut().replace(ScopeData::default()));
+        BuildScope {
+            started: Some(std::time::Instant::now()),
+            prev,
+            label: label.unwrap_or_else(|| "?".into()),
+            bytes,
+        }
+    }
+}
+
+impl Drop for BuildScope {
+    fn drop(&mut self) {
+        let Some(t) = self.started else { return };
+        let data = BUILD_SCOPE
+            .with(|s| std::mem::replace(&mut *s.borrow_mut(), self.prev.take()));
+        let Some(data) = data else { return };
+        let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let mut out = format!(
+            "[build-scope] bytes={} ms={total_ms:.1} file={}\n",
+            self.bytes, self.label
+        );
+        let mut times: Vec<(&String, &(u128, u64))> = data.ns.iter().collect();
+        times.sort_by(|x, y| y.1 .0.cmp(&x.1 .0).then_with(|| x.0.cmp(y.0)));
+        for (k, (ns, n)) in times {
+            out.push_str(&format!(
+                "[build-scope]   {:>10.1} ms  n={n:<8} {k}\n",
+                *ns as f64 / 1e6
+            ));
+        }
+        let mut counts: Vec<(&String, &u64)> = data.counts.iter().collect();
+        counts.sort_by(|x, y| y.1.cmp(x.1).then_with(|| x.0.cmp(y.0)));
+        for (k, v) in counts {
+            out.push_str(&format!("[build-scope]   count {v:<12} {k}\n"));
+        }
+        out.push_str("[build-scope-end]\n");
+        emit_text(&out);
+    }
 }
 
 /// tag -> (total nanos, call count). A per-call `[PHASE]` line is useless for
@@ -193,6 +299,7 @@ pub fn add_ns(tag: &str, nanos: u128) {
     if !enabled() {
         return;
     }
+    scope_add_ns(tag, nanos);
     let mut a = accum().lock().unwrap_or_else(|e| e.into_inner());
     let e = a.entry(tag.to_string()).or_insert((0, 0));
     e.0 += nanos;

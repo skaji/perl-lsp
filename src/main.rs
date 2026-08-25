@@ -184,6 +184,17 @@ async fn main() {
     let stdin = stdio_bridge::reader();
     let stdout = stdio_bridge::writer();
 
+    // Warm the plugin registry NOW, overlapping the client's own startup and
+    // the initialize handshake — the compile is ~600 ms, and paid lazily it
+    // lands inside the first didOpen's build (measured: first build() 712 ms
+    // vs 121 ms for the second, same file class). The workspace root isn't
+    // known yet, but the registry cell is keyed by the resolved plugin-source
+    // paths: when `initialize`'s root doesn't change the on-disk plugin set
+    // (any workspace without a repo-local `.perl-lsp/`), this warm is the
+    // registry the first build uses; when it does, `initialize`'s own warm
+    // rebuilds with the right set and this one cost only background CPU.
+    std::thread::spawn(build::plugin::default_plugin_registry);
+
     let (service, socket) = LspService::new(Backend::new);
 
     // Wrap the service so a panic in any handler degrades to a logged warning +

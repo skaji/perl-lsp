@@ -18,16 +18,37 @@ use crate::model::file_analysis::{
 
 pub mod rhai_host;
 
-/// Process-wide plugin registry, built once with the bundled Rhai plugins
-/// plus anything in `plugin_search_dirs()` (`$PERL_LSP_PLUGIN_DIR` and the
+/// Process-wide plugin registry, built with the bundled Rhai plugins plus
+/// anything in `plugin_search_dirs()` (`$PERL_LSP_PLUGIN_DIR` and the
 /// nearest repo-local `.perl-lsp/`). All `build()` calls share it; tests
 /// that need isolation use `build_with_plugins()`.
+///
+/// Keyed by `plugin_source_paths()` rather than built once: the ~600 ms
+/// compile (rhai plugins + pattern/flow queries) can then start at PROCESS
+/// start, before the workspace root is known. If `initialize`'s root leaves
+/// the on-disk plugin set unchanged — every workspace without a repo-local
+/// `.perl-lsp/`, i.e. almost all of them — the early warm IS the registry
+/// and the first `didOpen` build pays nothing. A root that does change the
+/// set rebuilds here, exactly as expensive as the old lazy path. Racing
+/// callers block on the mutex while one builds, same as the old `OnceLock`.
 pub fn default_plugin_registry() -> std::sync::Arc<PluginRegistry> {
-    use std::sync::{Arc, OnceLock};
-    static REG: OnceLock<Arc<PluginRegistry>> = OnceLock::new();
-    REG.get_or_init(|| {
-        let engine = Arc::new(rhai_host::make_engine());
-        let mut reg = PluginRegistry::new();
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cell = Mutex<Option<(Vec<std::path::PathBuf>, Arc<PluginRegistry>)>>;
+    static REG: OnceLock<Cell> = OnceLock::new();
+    let key = rhai_host::plugin_source_paths();
+    let mut cell = REG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((cached_key, reg)) = cell.as_ref() {
+        if *cached_key == key {
+            return reg.clone();
+        }
+    }
+    let engine =
+        crate::util::timings::phase("registry::engine", || Arc::new(rhai_host::make_engine()));
+    let mut reg = PluginRegistry::new();
+    crate::util::timings::phase("registry::rhai_compile", || {
         for p in rhai_host::load_bundled(engine.clone()) {
             reg.register(p);
         }
@@ -36,16 +57,25 @@ pub fn default_plugin_registry() -> std::sync::Arc<PluginRegistry> {
                 reg.register(p);
             }
         }
-        // Compile every pattern query now, once, while we're single-threaded —
-        // before the parallel workspace index charges `Query::new` to per-file
-        // build. See `pattern_dispatch::warm_pattern_queries`.
-        crate::build::builder::pattern_dispatch::warm_pattern_queries(
-            reg.plugins.iter().flat_map(|p| p.patterns().iter()),
-        );
-        crate::build::builder::warm_flow_query();
-        Arc::new(reg)
-    })
-    .clone()
+    });
+    // Compile every pattern query now, once, while the cell is held —
+    // before the parallel workspace index charges `Query::new` to per-file
+    // build. See `pattern_dispatch::warm_pattern_queries`. The flow query
+    // is independent of the pattern set, so it compiles alongside rather
+    // than after.
+    crate::util::timings::phase("registry::queries", || {
+        rayon::join(
+            || {
+                crate::build::builder::pattern_dispatch::warm_pattern_queries(
+                    reg.plugins.iter().flat_map(|p| p.patterns().iter()),
+                )
+            },
+            crate::build::builder::warm_flow_query,
+        )
+    });
+    let reg = Arc::new(reg);
+    *cell = Some((key, reg.clone()));
+    reg
 }
 
 // ---- Context snapshots passed to plugins ----

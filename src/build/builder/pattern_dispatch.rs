@@ -126,12 +126,20 @@ fn cached_pattern_query(source: &str) -> Result<&'static Query, String> {
 /// the memo here, single-threaded before any parallel build starts, makes
 /// every per-file dispatch a pure cache hit and removes the race entirely.
 pub(crate) fn warm_pattern_queries<'a>(specs: impl Iterator<Item = &'a PatternSpec>) {
-    for spec in specs {
-        if spec.language != "perl" {
-            continue;
-        }
-        let _ = cached_pattern_query(&spec.query);
-    }
+    use rayon::prelude::*;
+    let sources: Vec<&str> = specs
+        .filter(|s| s.language == "perl")
+        .map(|s| s.query.as_str())
+        .collect();
+    // Distinct sources compile independently, and `cached_pattern_query`
+    // compiles outside its lock — parallel warming populates the same memo,
+    // it just pays the wall of the slowest single `Query::new` instead of
+    // the sum (~520 ms serial for the bundled set; the whole registry warm
+    // sits on the first didOpen's critical path when a client opens a file
+    // immediately after the handshake).
+    sources.par_iter().for_each(|src| {
+        let _ = cached_pattern_query(src);
+    });
 }
 
 /// Verify a pattern's `expect` snippets against the real grammar:
