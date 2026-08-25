@@ -166,73 +166,107 @@ step for anyone who needs `--heatmap` to be faster.
 Memory is mild by comparison (Webmin 0.47 → 0.95 GB, BMO 0.49 → 0.70 GB), so
 this is a wall cost, not a memory one.
 
-## 6. Single huge files: `build()` goes cubic past ~20k lines
+## 6. Single huge files: one accidental O(bindings x bag) pass, now fixed
 
 Found by opening FHEM's biggest file in an editor and waiting 30 seconds for
-semantic tokens. The server was responsive throughout — it just had no analysis
-to answer from yet.
+semantic tokens. Root-caused and fixed by `[05]`; this section records the
+corrected story, because the first version of it got two things wrong.
 
-Measured through the LSP, real workspace, `@INC` live (`PERL_LSP_PHASE_TIMING=1`):
+### The symptom
 
-| lines | parse | `build()` |
-|---:|---:|---:|
-| 1,760 | 10 ms | 71 ms |
-| 3,268 | 20 ms | 188 ms |
-| 5,607 | 30 ms | 276 ms |
-| 20,669 | 160 ms | 2,374 ms |
-| **46,522** | **318 ms** | **35,304 ms** |
+`76_SolarForecast.pm`, 46,522 lines / 2.6 MB, opened via `didOpen`:
 
 ```
-parse   ~ lines^1.05                      (linear; the parser is not the problem)
-build() ~ lines^1.58 → 0.71 → 1.65 → 3.33 (exponent RISES with size)
+[PHASE] parse       349.01 ms
+[PHASE] build()   33179.55 ms     <- 33.2 s
 ```
 
-**The knee is between 20k and 46k lines.** Under ~6k, build is sub-300 ms.
-At 20k it is 2.4 s. At 46k it is 35 s, and the file is unusable interactively
-until it finishes.
+Inside `build()`, `fold_to_fixed_point` was 30.7 s — 92% — while the CST walk
+was 0.74 s. The fold converged in **3 iterations**, so it was never spinning.
 
-### Where the time goes
+### The cause: a full index rebuild per binding
 
-`build()` is 33.2 s of a 33.6 s open, and inside it:
-
-```
-build::fold_to_fixed_point   30,680 ms    <- 92%
-build::pattern_dispatch         913 ms
-build::walk                     740 ms
-build::finalize_post_walk       442 ms
-```
-
-The CST walk is 0.74 s. **The worklist fold is the whole cost**, and the
-counters say what it is folding:
+`propagate_call_bindings_to_constraints` called `remove_attachment_source_at`
+once per binding, and that helper does a **full-bag retain plus a full witness
+index rebuild** (cloning every String-bearing attachment) on each call.
 
 ```
-hop.edge            1,838,748
-hop.OBSERVATION       503,918
-hop.fact              271,500
-hop.inferred_type     232,585
-build.fold_bag_len     57,228   <- witnesses in the bag
+4,857 calls -> 3,246 rebuilds -> 185,757,638 cumulative index re-insertions
+                                = 20.7 s of the 30 s
 ```
 
-A 57k-witness bag re-walked to a fixed point at 1.8M edge hops. `Expr(span)`
-witnesses are emitted per meaningful expression, so bag size tracks expression
-count, and the fold is superlinear in bag size — which is why the exponent
-climbs rather than holding.
+**Fix: batch the removals** — one retain and one rebuild per pass
+(`WitnessBag::remove_attachment_sources_at`).
 
-### What this is and is not
+```
+build()             29.1 s -> 7.8 s
+fold::call_binding  21.6 s -> 16.5 ms
+bag length          57,228 -> 57,228   (unchanged)
+fold iterations          3 -> 3        (unchanged)
+```
 
-**Not** the `--check` memory story above; that is whole-workspace sweep
-residency, this is one file's analysis, and they share no mechanism. **Not**
-`@INC` size either, though `@INC` is required to see it: the same file with an
-empty module universe builds in **0.39 s**, so a single-file reproduction
-without a real workspace measures nothing. That trap cost an hour here.
+Identical bag and iteration count with a 3.7x wall drop is what makes this a fix
+rather than a tuning: the same fixed point, reached without the quadratic.
 
-**Interactive symptom, precisely:** verbs answer *fast* and return empty
-(`null`) while the build runs, rather than blocking. The client renders nothing
-and does not retry, so it looks like a dead server until the build finishes and
-the server sends `semanticTokens/refresh` — at which point everything appears
-at once. Answering "not ready" in a way clients retry on would mask the whole
-delay without making the build any faster.
+### Two corrections to the first version of this section
 
-**Who hits it:** anyone with a single module past ~20k lines. Rare, but not
-FHEM-exclusive — a few generated or accreted modules that size exist in plenty
-of long-lived codebases.
+**The superlinearity was accidental, not intrinsic.** This section previously
+said the fold is "superlinear in bag size — which is why the exponent climbs."
+Wrong. The exponent climbed because one pass was O(bindings x bag). The registry
+chases the first analysis blamed are cheap: `fold::seed` 30 ms and
+`fold::snapshot` 27 ms for **all** 1.8M hops. A "16.7 µs per hop" figure was
+derived by dividing total fold time by a hop count that was not the cost — a
+ratio of two unrelated quantities, and it read as a smoking gun.
+
+**Consequence for design: chunking the solver would have masked a bug.** The bag
+was not too big; one pass was rebuilding an index 3,246 times.
+
+### The 1 MB cap — why the same file measures 0.39 s or 29 s
+
+The first version claimed `@INC` was required to reproduce, citing an isolated
+one-file `--check` that took 0.39 s against 33 s in a real workspace. That was
+wrong twice over, and the real reason is a one-line filter:
+
+```
+index_perl.rs:52,99   m.len() < 1_000_000
+76_SolarForecast.pm = 2,652,209 bytes
+```
+
+**The workspace walk skips files over 1 MB, so `--check` never built it** —
+there is no `[PHASE] build()` line in that run at all. `didOpen` has no such
+cap. The same file is skipped by batch verbs and always built by the editor,
+which is the entire 0.39 s / 29 s gap. `build()` has no module-index access, so
+`@INC` cannot affect it either way.
+
+**A consequence worth its own line: files over 1 MB silently receive no
+`--check` diagnostics.** FHEM has four. "No diagnostics" reads exactly like "no
+problems found," and nothing in the output distinguishes them.
+
+### Residual
+
+After the fix, `fold::chain_pre` (chain typing PreFold) is 5.3 s on the 46k
+file — **96% of what remains** — and is the next target if 7.8 s is still too
+slow.
+
+### The interactive symptom is separate, and separately fixable
+
+While the build runs, verbs answer **fast and return `null`** rather than
+blocking: on the 46k file hover 0.82 s, definition 1.22 s, completion 1.62 s,
+semanticTokens 2.02 s, every one empty. The client renders nothing and **never
+retries**, so it looks like a dead server until the build finishes and the
+server sends `workspace/semanticTokens/refresh` — then everything appears at
+once. Confirmed in nvim's log: 22 s of answered `documentHighlight` and nothing
+else, then `refresh`, then the client's first `semanticTokens/full`.
+
+Answering "not ready" in a way clients retry on (`ContentModified`) would mask
+the remaining delay regardless of how fast the fold gets. Not done.
+
+### Instrumentation note
+
+Per-build counters were previously unobtainable: the ghost-stats sink is written
+by an activity-driven re-emit, so the default interval never fires on a short
+build and a short interval **re-adds per emission** (a 3,268-line file reported
+1,117,581 witnesses and 1,995 iterations against the real 57,228 and 3 — ~665x).
+`[05]` added a thread-local per-build scope emitting one `[build-scope]` block
+at build end, delta'd per build. That is what made this root-cause possible, and
+it is immune to both failure modes.
