@@ -586,3 +586,63 @@ Getting a usable N took three corrections, all the same family:
 
 The floor in that comparator (refuse a comparison below N) earned its keep
 within minutes of being written, against its own author.
+
+## §6l: does residualization have a population? Measured — no
+
+The self-only floor is the population this brief opened on: a fold that
+reached no answer and named no portable exit, so `OpenNone` is all the bake
+can store. The proposal was to store the RESIDUAL instead — `ReturnOf(Receiver)`
+rather than `OpenNone(self_only)` — and let the consult evaluate it with its
+own binders. The gate before building it: what share of self-only folds
+actually terminate in a binder-dependent shape?
+
+**One hop reads zero.** No self-only attachment on the substrate carries a
+`ReturnExpr` witness of its own: 8,643 self-only bakes, `selfonly.residualizable`
+never fires. The floor is made entirely of `Edge` witnesses (8,695), 8,676 of
+them pointing at a local `Symbol` and 19 elsewhere — no `InferredType`, no
+`Observation`, no `Fact`, and no attachment with nothing on it at all.
+
+`selfonly.edge_is_self_mirror` also reads zero, and it is worth saying what
+that does NOT show: `ConclusionKey::from_attachment(Symbol(_))` is `None` by
+construction, so for 8,676 of the 8,695 edges the mirror question is not
+asked. `edge_to_pkgsym` is 0, which is the finding — the floor's edges do not
+point at portable keys at all.
+
+**The fold, not the attachment, is what the gate asks about**, so the verdict
+follows the edges (`walk_reachable`: seen-set, depth cap 8, truncation answers
+"not residualizable" so the verdict under-approximates):
+
+| | n | share |
+|---|---|---|
+| `selfonly.floor_confirmed` | 8,435 | 97.6% |
+| `selfonly.residualizable_via_edges` | 116 | 1.34% |
+| `selfonly.floor_unproven_depth_capped` | 92 | 1.06% |
+
+Exact partition. The 116 reach `Receiver` (116) and `ReceiverOr` (2); no
+`UnionOnArgs`.
+
+**And a bake-side share is the wrong number.** `OpenReason`'s own doc says why:
+a bake tally counts KEYS, and an unweighted key total has mis-sized every step
+of this arc. So the verdict rides the row — `NoAnswerSelfOnlyResidualizable`,
+measurement-bearing like every other `OpenReason` — and the consult site's
+existing `reason.tag()` weights it by decodes:
+
+| | n |
+|---|---|
+| `concl.open.no_answer_self_only` | 4,234 |
+| ↳ `.wasted` / `.paid` | 2,136 / 4 |
+| `concl.open.no_answer_self_only_residualizable` | **0** |
+
+**Zero of 4,234 self-only decodes land on a residualizable key.** The 116 keys
+that could residualize are never consulted cross-file here. Residualization as
+specified converts nothing on this substrate — not one of the 2,136 wasted
+decodes, and not the 4 paid ones either, all of which sit on
+`floor_confirmed` keys.
+
+The three denominators, since they differ and the difference is the point:
+8,643 counts KEYS baked, 4,234 counts DECODES, 2,140 counts PROVIDER decodes
+within those (smaller because a consult whose only candidate is its own bag
+takes the `ptr::eq` shortcut and attributes no provider).
+
+`OpenNone(self_only)` is the honest floor. The instrument stays armed: a
+workload where that last row is non-zero is the one that reopens this.
