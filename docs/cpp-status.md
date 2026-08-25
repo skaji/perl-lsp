@@ -5,8 +5,9 @@ Opt-in behind `--features cpp`; default builds stay Perl-only.
 
 The tier is a promise about whether to trust the ANSWERS, and by the bar the
 enum sets — *"broad gold coverage, known gaps documented"* — C/C++ meets it:
-503 gold rows assert the verb surface with `lang-skip 0`, plus 1,676 unit
-tests (+64 over Perl-only) and 24 e2e-cpp tests across 8 suites.
+255 C/C++ gold rows assert the verb surface (of 520 total, run with
+`lang-skip 0`), plus 1,676 unit tests (+64 over Perl-only) and 24 e2e-cpp
+tests across 8 suites.
 
 **What beta does not promise is scaling.** That is the honest answer to the
 "good enough to ship?" gate `cpp-golive-map.md` ARC 5 leaves open: yes for
