@@ -153,7 +153,8 @@ rewrite deletes the path's stub (inside `save_to_db`/
 `save_blob_to_db_stamped`, so writers can't forget); hard-clears wipe via
 `clear_derived_rows`.
 
-Measured (abseil): warm start 0.4 s, warm peak RSS 34 MB (cold unchanged);
+Measured (abseil): warm peak RSS **~90 MB** (re-measured 2026-08-26;
+was 34 MB in July);
 references byte-identical, `--refs-parity` clean, gold unaffected.
 
 ## Registration inverse under symbol eviction
