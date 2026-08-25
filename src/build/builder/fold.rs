@@ -1736,6 +1736,14 @@ impl<'a> Builder<'a> {
     ) {
         use crate::model::witnesses::{Witness, WitnessAttachment, WitnessPayload, WitnessSource};
 
+        // Batched: collect every replacement first, then ONE bulk removal and
+        // the pushes. The per-binding remove-then-push spelling costs a full
+        // bag retain + index rebuild PER BINDING — O(bindings * bag), the
+        // dominant term of the giant-file fold (~22 s of a 46k-line file's
+        // 30 s build). Each (attachment, point) names one binding site, so
+        // removing them together is equivalent.
+        let mut to_remove: Vec<(WitnessAttachment, tree_sitter::Point)> = Vec::new();
+        let mut to_push: Vec<Witness> = Vec::new();
         for binding in &self.call_bindings {
             let rt = return_types
                 .get(&binding.func_name)
@@ -1746,9 +1754,8 @@ impl<'a> Builder<'a> {
                     name: binding.variable.clone(),
                     scope: binding.scope,
                 };
-                self.bag
-                    .remove_attachment_source_at(&att, "call_binding", binding.span.start);
-                self.bag.push(Witness {
+                to_remove.push((att.clone(), binding.span.start));
+                to_push.push(Witness {
                     attachment: att,
                     source: WitnessSource::Builder("call_binding".into()),
                     payload: WitnessPayload::InferredType(rt),
@@ -1758,6 +1765,10 @@ impl<'a> Builder<'a> {
                     },
                 });
             }
+        }
+        self.bag.remove_attachment_sources_at(&to_remove, "call_binding");
+        for w in to_push {
+            self.bag.push(w);
         }
     }
 

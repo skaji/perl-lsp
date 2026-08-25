@@ -222,6 +222,36 @@ impl WitnessBag {
         removed
     }
 
+    /// Batch form of `remove_attachment_source_at`: one retain + at most one
+    /// index rebuild for the whole set. The per-binding form costs a full
+    /// bag scan AND a full index rebuild per call, which turns a pass with N
+    /// bindings into O(N * bag) — 20+ seconds of the 46k-line-file fold was
+    /// exactly this. Each (attachment, point) pair identifies one binding
+    /// site, so removing them together is equivalent to removing them one at
+    /// a time.
+    pub fn remove_attachment_sources_at(
+        &mut self,
+        items: &[(WitnessAttachment, Point)],
+        tag: &str,
+    ) -> usize {
+        if items.is_empty() {
+            return 0;
+        }
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::remove_at_batch");
+        let keys: std::collections::HashSet<(&WitnessAttachment, Point)> =
+            items.iter().map(|(a, p)| (a, *p)).collect();
+        let before = self.witnesses.len();
+        self.witnesses.retain(|w| {
+            !(matches!(&w.source, WitnessSource::Builder(s) if s == tag)
+                && keys.contains(&(&w.attachment, w.span.start)))
+        });
+        let removed = before - self.witnesses.len();
+        if removed > 0 {
+            self.rebuild_index();
+        }
+        removed
+    }
+
     pub fn len(&self) -> usize {
         self.witnesses.len()
     }
