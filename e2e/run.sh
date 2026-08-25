@@ -116,6 +116,28 @@ for test in "${suites[@]}"; do
   echo
 done
 
+# Raw-LSP suite: the not-ready-vs-no-result net (message ORDERING relative to
+# the in-flight build is the assertion, which nvim's own client would mask by
+# gating on readiness — so this one speaks stdio directly, via python).
+echo "── not_ready.py (raw LSP) ──"
+if command -v python3 >/dev/null 2>&1; then
+  if output=$(python3 e2e/not_ready.py "$bin" 2>&1); then rc=0; else rc=$?; fi
+  echo "$output"
+  summary=$(echo "$output" | grep -E '^[0-9]+ passed, [0-9]+ failed' | tail -1 || true)
+  p=0; f=0
+  if [[ -n "$summary" ]]; then
+    p=$(echo "$summary" | sed -E 's/^([0-9]+) passed.*/\1/')
+    f=$(echo "$summary" | sed -E 's/.* ([0-9]+) failed/\1/')
+  fi
+  total_passed=$((total_passed + p))
+  total_failed=$((total_failed + f))
+  [[ $rc -ne 0 || $f -ne 0 ]] && failed_suites+=("not_ready.py")
+else
+  # Loud skip, not silence — a silently missing suite reads as coverage.
+  echo "  ⚠ SKIPPED: python3 not found (CI has it; install locally to run)"
+fi
+echo
+
 echo "════════════════════════════════════════════"
 if [[ ${#failed_suites[@]} -eq 0 ]] && [[ $total_failed -eq 0 ]]; then
   printf '\033[32mTOTAL: %d passed, 0 failed\033[0m across %d suites\n' \

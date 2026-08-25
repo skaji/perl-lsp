@@ -6,115 +6,77 @@ crate / VS Code extension versions.
 
 ## Unreleased
 
-### The CST walk no longer grows the stack per level
+A large accumulation: a full second language (C/C++ in beta, plus alpha-tier
+Python/R/CMake packs) now serves alongside Perl, cross-file analysis persists
+to disk with bounded memory, and a long tail of hangs, crashes, and
+stale/partial answers closed — surfaced by dogfooding against real corpora
+(curl, redis, re2, Bugzilla, Mojolicious, DBIx::Class, abseil, a 138k-file
+synthetic monorepo).
 
-- **The builder walk is iterative.** `visit_node` dispatches a node and
-  *queues* what it wants walked next; one loop drains the queue. Depth costs
-  heap instead of native stack, so a deeply-nested file is analyzed rather
-  than aborting the process — a stack overflow is a fatal abort no
-  `catch_unwind` can net, which made one generated file able to take the whole
-  server down. Measured on a 2 MiB rayon worker stack, release: the recursive
-  descent gave a real analysis at 1,803 CST levels and aborted by 2,503; the
-  iterative walk reaches **1,000,003**, which was the probe's ceiling and not
-  the code's.
-- Two further depth-proportional recursions went with it, since removing only
-  the walk would have left the cliff standing: the chain-typing index walk is
-  now an explicit stack, and expression-shape typing — which is inherently
-  post-order and cannot be queued — is bounded by `MAX_EXPR_TYPE_DEPTH`,
-  degrading a pathologically-nested literal's type to plain `ArrayRef`/
-  `HashRef` exactly as it already did for an element it could not type. The
-  file still gets a full analysis; only that one type coarsens.
-- **`MAX_CST_DEPTH` is 100,000**, up from 500, and is now a bound on the
-  absurd rather than the thing keeping the process alive. The number follows
-  from the measurement above: ~19x above the deepest input ever observed
-  (5,336, a generated data table; the deepest real Perl in 138,806 files is
-  247) and 10x below the verified survivable depth. Files past it still
-  degrade honestly with a `cst-too-deep` diagnostic.
-- **Same analysis, proven.** Both walks are compared over every Perl file in
-  the repo on an ordinary `cargo test`, and over every file the whole suite
-  touches under `PERL_LSP_WALK_EQUIV=1`. The comparison is on the serde
-  projection rather than bincode bytes, because `HashMap` iteration order
-  differs between two builds in one thread and would report differences that
-  are not there.
+### C/C++ support — beta (opt-in build feature `cpp`)
 
-### Builds are deterministic again
+perl-lsp now serves C/C++ alongside Perl from one server. Default builds
+stay Perl-only; `cargo build --release --features cpp` turns the rest on.
+The same query-driven extraction seam hosts alpha-tier Python, R, and CMake
+packs. `perl-lsp --languages` reports each language's maturity tier
+(Stable / beta / alpha), so a lightly-tested pack isn't mistaken for Perl's
+coverage.
 
-- Three fold-phase passes emitted witnesses in `HashMap`/`HashSet` iteration
-  order, so **the same file built twice produced a different `WitnessBag`** —
-  and therefore a different cached blob for an unchanged file, churning cache
-  writes and falsifying the "same input, same output" assumption the storage
-  layer's freshness and stamp comparisons rest on. Several reducers are
-  documented latest-wins, and the protection against that was accidental
-  ordering. Inheritance edges (`package_parents`), `push @arr` contributions
-  and arity-discriminated returns now emit in document order.
+**Beta means the answers are covered, not the scale.** Small and mid-size
+projects work well. Very large ones don't finish indexing yet — a few huge
+vendored headers dominate, and excluding `thirdparty/` avoids most of it.
+See `docs/cpp-status.md`.
 
-
-### Four new LSP verbs, all projections of existing machinery
-
-- **Go to type definition** — `$obj` jumps to the definition of its
-  inferred class (every file declaring a split package). Strictly
-  type-driven: when nothing infers, it answers nothing. CLI:
-  `--type-definition <root> <file> <line> <col>`.
-- **Type hierarchy** — supertypes/subtypes one inheritance level per
-  request over the same edge graph goto-implementation walks. Advertised
-  via dynamic registration (lsp-types 0.94 cannot spell the static
-  capability). CLI: `--type-hierarchy`.
-- **Call hierarchy** — incoming calls are the same references projection
-  the heatmap counts fan-in from (the two agree by construction); outgoing
-  calls are the in-body call refs behind heatmap fan-out, each resolved to
-  its definition. CLI: `--call-hierarchy`.
-- **Document links** — only the ranges goto-def cannot reach: POD `L<...>`
-  links, URLs in comments/POD, and existence-checked string-path loads
-  (`require "path.pl"`, `use lib 'lib'`). Module names in `use`/`require`
-  stay goto-def's job. Unresolvable targets yield no link. CLI:
-  `--document-link <root> <file>`.
-
-## v0.7.0 — 2026-07-12
-
-### C/C++ support (opt-in build feature `cpp`)
-
-perl-lsp now serves C/C++ alongside Perl from one server: goto-definition,
-references (including cross-translation-unit), member and in-scope
-completion, hover, outline, semantic tokens, and `#include` navigation.
-Extraction is query-driven behind a generic language seam, so the same
-machinery hosts experimental Python / R / CMake packs. Default builds
-remain Perl-only; `cargo build --release --features cpp` turns the rest on.
+- **Navigation.** Goto-definition, references (cross-translation-unit),
+  hover, outline, semantic tokens, and `#include` navigation. Goto-def
+  reaches the actual out-of-line definition — not just the header
+  prototype — for both free functions and class members.
+- **Templates.** Lazy instantiation typing and a partial-specialization
+  selection ladder; overload resolution by argument count.
+- **Macros.** Function-like macros type from their argument, `#ifdef`-guarded
+  config variants are modeled, and goto-def prefers a `#define` over a
+  same-named symbol; include-guard `#define`s no longer pollute
+  outline/workspace-symbol.
+- **Type narrowing.** `dynamic_cast` guards and `std::optional`
+  engaged-state checks narrow, the same way Perl's `defined`/`blessed`
+  guards do.
+- **New diagnostic: use-after-move** — a decidable, zero-false-positive
+  subset of the check.
+- **Completion.** Member completion is inheritance-aware; qualified-path
+  completion (`ns::`, `Class::`) filters by owner; member-receiver chains
+  (`this->`, `field_->`) narrow correctly.
 
 ### Storage engine — warm starts, bounded memory
 
-Cross-file analysis now persists per project (SQLite, `~/.cache/perl-lsp`):
+The on-disk cache (`~/.cache/perl-lsp`) now covers your whole workspace, not
+just installed modules:
 
-- **Relational ref index.** References/rename candidates resolve through
-  indexed rows instead of a full in-memory sweep; `--refs-parity <root>`
-  is the built-in A/B verification harness.
-- **Warm starts.** Workspace and dependency analyses reload from disk —
-  unchanged files are never re-parsed at startup.
-- **Bounded residency.** In-memory copies are stripped once persisted and
-  rehydrate on demand through byte-capped LRUs; a large C++ workspace
-  (abseil) idles around 34 MB warm. Structural tripwires guard against
-  regressions, and `PERL_LSP_STRICT_RESIDENCY=1` turns any would-be
-  silently-degraded answer into a loud failure (the gold harness runs
-  with it on).
-- **Freshness gating.** Edits that don't change a file's cross-file-visible
-  surface no longer trigger dependent re-analysis; open-buffer state is
-  tracked separately from on-disk state so consumers are never refreshed
-  against the wrong baseline.
-- `perl-lsp --clear-cache [<root>]` wipes a project's cache (or all of it).
+- **Warm starts.** Unchanged files are never re-parsed at startup, and each
+  language's index loads on demand, so opening a C++ file doesn't wait on
+  the rest of the tree.
+- **Bounded memory.** Analyses live on disk and are pulled in as needed
+  rather than all held in RAM, so a big workspace costs a fraction of what
+  it used to and stays steady while you work in it.
+- **References and rename** resolve through the index rather than sweeping
+  the whole workspace.
+- **Edits propagate.** Saving a file refreshes the open files that depend on
+  it, and an edit that changes nothing other files can see no longer
+  triggers a re-analysis of them.
+- `perl-lsp --clear-cache [<root>]` wipes a project's cache (or all of it);
+  `--gc-cache <root>` reclaims space from deleted files.
 
 ### Query-declared plugins
 
-Framework plugins (`.rhai`) now declare the syntax they care about as
-tree-sitter query patterns with `on_match` handlers — no more hand-rolled
-capture plumbing — and can publish their own diagnostics. Editing a plugin
-invalidates the affected cache automatically. `--plugin-check` validates a
-plugin bundle, and legacy hook styles are rejected with a porting hint.
+Framework plugins (`.rhai`) declare the syntax they care about as
+tree-sitter query patterns with `on_match` handlers, and can publish their
+own diagnostics. Editing a plugin invalidates the affected cache.
+`--plugin-check` validates a bundle; older hook styles are rejected with a
+porting hint.
 
 ### Usage heatmap
 
-`perl-lsp --heatmap <root> [--csv|--html]` reports per-symbol fan-in /
-fan-out, an unreferenced-symbol review queue, and a dead-exports queue
-(exported subs no other file references — sound: a listed export is truly
-unused by consumers). `--html` emits a self-contained offline viewer.
+- `--heatmap` now covers C/C++ and the other pack languages, not just Perl.
+- New dead-exports queue: exported subs no other file references.
 
 ### Cross-file type inference
 
@@ -123,6 +85,128 @@ Closed files now answer type queries with their imports applied
 across module chains (A → B → C). Inheritance-aware method resolution,
 receiver-gated dispatch, and structural hash-shape typing all ride the
 same witness engine.
+
+- **A Perl package is a set of files, not one "winner."** Perl lets one
+  package be declared or reopened across multiple files; goto-def/hover/
+  completion on a symbol living in a non-"winning" file used to silently
+  answer from the wrong file (or nothing), and which file won was racy
+  across cold starts. Package lookups now resolve to the full set.
+- **Per-asker module resolution.** A module name can mean different files
+  to different files asking about it (Perl's `@INC`/`use lib` search-path
+  semantics) — goto-def/references/hover now resolve it relative to the
+  asking file's own search path (longest-prefix ranking), not one global
+  answer for everyone.
+- Mojo helpers whose names come from a structural enumeration (a `for`
+  loop over a list of names) now resolve, matching the hardcoded-list case.
+
+### Reliability — hangs and crashes closed
+
+- **One expensive file can no longer freeze the server.** Its analysis used
+  to block hover, goto-def, and completion for every other file too.
+- **`references` stays bounded on huge workspaces** — it returns instead of
+  running away, and warns you when the answer had to be capped.
+- A handler panic degrades one answer instead of crashing the server. POD
+  containing non-English text could take out a whole file's analysis; fixed.
+- Fixed several ways the process could hang instead of starting or exiting:
+  client attach, teardown on EOF, and a malformed CLI flag.
+- Diagnostics on a just-opened file no longer report false positives while
+  the workspace is still loading.
+- **A deeply nested file no longer takes the server down.** Generated files
+  with thousands of nesting levels could overflow the stack — an abort
+  nothing could catch. They get analyzed now; anything past a very high
+  ceiling degrades with a `cst-too-deep` diagnostic instead of dying.
+
+### Answer honesty
+
+References, rename, and outline could return a quietly incomplete answer
+while the workspace was still loading. They now wait for the full index,
+and show "Waiting for workspace index…" if that wait is long enough to
+notice.
+
+### Performance & responsiveness
+
+- Cross-file return-type resolution no longer blows up exponentially on
+  deep call chains.
+- `references` on a warm workspace returns in milliseconds.
+- Repeat CLI runs start warm — module resolution comes from cache.
+- The `--check` diagnostics sweep runs in parallel.
+- A request that arrives while a file is still doing its first analysis now
+  tells the client to retry, instead of returning an empty answer it might
+  cache as the real one.
+- A warm server sitting idle stays idle — it no longer burns CPU in the
+  background re-checking dependencies nothing asked about.
+- Startup indexing scales linearly with file count, and only indexes the
+  languages a query can actually consult.
+
+### Builds are reproducible
+
+Building the same file twice could produce different cached output,
+churning cache writes for files that never changed. Fixed.
+
+### Four new LSP verbs
+
+- **Go to type definition** — `$obj` jumps to the definition of its inferred
+  class. When nothing infers, it answers nothing rather than guessing.
+  CLI: `--type-definition`.
+- **Type hierarchy** — supertypes and subtypes, one inheritance level per
+  request. CLI: `--type-hierarchy`.
+- **Call hierarchy** — incoming and outgoing calls, each resolved to its
+  definition. CLI: `--call-hierarchy`.
+- **Document links** — POD `L<...>` links, URLs in comments and POD, and
+  file paths that actually exist (`require "path.pl"`, `use lib 'lib'`).
+  Module names stay goto-def's job. CLI: `--document-link`.
+
+### Completion
+
+- Bare-cursor variable completion no longer drops the sigil (`self`
+  instead of `$self`).
+- Completion ordering is stable run-to-run.
+- An empty result while the server is still warming up no longer gets cached
+  by the client as the real answer.
+- In-scope local variables could rank below unrelated workspace symbols;
+  fixed.
+
+### CLI
+
+- **`--at <line>:<col>`** takes editor-native cursor input, and every verb's
+  output now matches its input convention — no more 0-based/1-based mixups.
+- **`--languages`** lists every supported language with its maturity tier.
+- The workspace-index startup spinner now reports incremental percentage
+  instead of sitting at an opaque "indexing…".
+
+### Correctness — goto-def / references / hover / rename agreement
+
+A long tail of cases where these verbs disagreed with each other on the
+same target, found by dogfooding against real corpora (curl, redis, re2,
+Bugzilla, Mojolicious, DBIx::Class):
+
+- Qualified calls (`CORE::stat()`, `Other::Pkg::stat()`) no longer resolve
+  to an unrelated same-named local sub.
+- `map { BLOCK }` (not just `map EXPR, LIST`) folds for role-list goto-def;
+  bareword `require Foo::Bar` is navigable.
+- Rename no longer over-fans a synthesized DBIC column / Moo accessor
+  rename into unrelated sibling classes.
+- `--implementations` surfaces sibling/mixin overrides assembled via
+  multiple inheritance, not just direct descendants; C/C++ base-class
+  edges feed it too.
+- References agrees with `--implementations` on a sibling-role target it
+  previously missed; references no longer misses a package's own
+  qualified declaration.
+- Hover, goto-def, and references agreed to disagree on a handful of
+  targets — an inherited hash key, a template method defined only in a
+  subclass, a module name, the qualifier segment of `SUPER::name`/
+  `Foo::Bar::name` — all now resolve the same way everywhere.
+- Builtin calls (`shift`, `uc`, `time`, …) mint their own reference bound
+  to a `CORE` namespace, fixing goto-def on `shift->SUPER::new`'s
+  invocant position.
+- Several DBIC / Mojolicious / receiver-polymorphic-constructor
+  type-inference gaps closed.
+
+### Non-ASCII files
+
+The server now negotiates UTF-8 position encoding with clients that
+support it (LSP 3.17) — previously every position on a line with a
+non-ASCII character before the cursor was silently misaligned.
 
 ## v0.6.1 - 2026-07-20
 

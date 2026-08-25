@@ -543,7 +543,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Complete).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let syms = symbols::extract_symbols(&doc.analysis);
         Ok(Some(DocumentSymbolResponse::Nested(syms)))
@@ -568,7 +568,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, text, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let uri = uri.clone();
         self.run_query(move |cx| {
@@ -659,7 +659,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let uri = uri.clone();
         self.run_query(move |cx| {
@@ -691,7 +691,7 @@ impl LanguageServer for Backend {
         }
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let uri = uri.clone();
         self.run_query(move |cx| {
@@ -775,7 +775,7 @@ impl LanguageServer for Backend {
         }
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let uri = uri.clone();
         self.run_query(move |cx| {
@@ -870,7 +870,7 @@ impl LanguageServer for Backend {
         // appears once registration lands.
         let (text, language) = match self.files.get_open(uri) {
             Some(doc) => (doc.text.clone(), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let self_dir = uri
             .to_file_path()
@@ -923,7 +923,7 @@ impl LanguageServer for Backend {
         // concurrently queued writer. See `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
 
         // The family/descendants/domain projection of the same set references
@@ -960,7 +960,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
 
         let point = symbols::position_to_point(pos);
@@ -1052,7 +1052,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(&params.text_document.uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(&params.text_document.uri),
         };
         let point = symbols::position_to_point(params.position);
         let uri = params.text_document.uri.clone();
@@ -1106,7 +1106,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
 
         let point = symbols::position_to_point(pos);
@@ -1143,7 +1143,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, text, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.text.clone(), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         // Both languages present the set's resolution — constructed exactly
         // like the goto-def handler's set, so the two verbs can't disagree
@@ -1222,7 +1222,7 @@ impl LanguageServer for Backend {
                     doc.path.clone(),
                     doc.stable_outline.package_lines().to_vec(),
                 ),
-                None => return Ok(None),
+                None => return self.not_ready_or_null(uri),
             };
         // Both gathers run through `run_query`'s blocking hop: at workspace
         // scale the in-scope tier is tens of thousands of items (multi-MB,
@@ -1328,7 +1328,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         if !crate::build::language_driver::LanguageRegistry::caps(doc.language).signature_help {
             return Ok(None); // the verb is declared per language
@@ -1347,7 +1347,7 @@ impl LanguageServer for Backend {
         // `for_each_open`); see `Document::analysis`.
         let (analysis, language) = match self.files.get_open(uri) {
             Some(doc) => (Arc::clone(&doc.analysis), doc.language),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         // Same construction as references — highlights is its origin-narrowed
         // projection, so the two verbs answer one resolution.
@@ -1376,7 +1376,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         if !crate::build::language_driver::LanguageRegistry::caps(doc.language).selection_range {
             return Ok(None); // tree-shape handler, declared per language
@@ -1397,7 +1397,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let ranges = symbols::folding_ranges(&doc.analysis);
         if ranges.is_empty() {
@@ -1417,7 +1417,7 @@ impl LanguageServer for Backend {
         // concurrent didChange (which needs the write lock) on the same file.
         let source = match self.files.get_open(uri) {
             Some(doc) => doc.text.clone(),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
 
         // Shell out to perltidy
@@ -1472,7 +1472,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let actions = symbols::code_actions(&params.context.diagnostics, &doc.analysis, uri);
         if actions.is_empty() {
@@ -1490,7 +1490,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let tokens = symbols::semantic_tokens(&doc.analysis);
         Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
@@ -1504,7 +1504,7 @@ impl LanguageServer for Backend {
         self.await_open_ready(uri, WaitPolicy::Interactive).await;
         let doc = match self.files.get_open(uri) {
             Some(doc) => doc,
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
         let hints = symbols::inlay_hints(&doc.analysis, params.range);
         if hints.is_empty() {
@@ -1641,7 +1641,7 @@ impl LanguageServer for Backend {
         // deadlocks concurrent didChange on the same file.
         let source = match self.files.get_open(uri) {
             Some(doc) => doc.text.clone(),
-            None => return Ok(None),
+            None => return self.not_ready_or_null(uri),
         };
 
         // Extract lines for the range

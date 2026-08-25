@@ -382,7 +382,9 @@ move again.
 
 Measured (abseil, 875 files): resident payload **11.2 MB** (symbols
 0.0 MB, closures 1.8 MB — the residual is `include_directives` strings);
-warm RSS **47 MB**. Bugzilla warm RSS: 75 MB.
+warm RSS **~90 MB** (re-measured 2026-08-26: flat at 93 MB after ~15 s,
+89 MB under `MALLOC_ARENA_MAX=2`, so the growth over the July 47 MB is
+not allocator retention). Bugzilla warm RSS: 75 MB.
 
 **Whole-tree Chromium** (4-core/15 GB box): **132,659 files, cold index
 3 h 02 m wall, peak RSS 7.3 GB; warm start 9 m 01 s, peak 6.7 GB**
