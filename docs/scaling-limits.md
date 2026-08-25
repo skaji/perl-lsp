@@ -165,3 +165,74 @@ step for anyone who needs `--heatmap` to be faster.
 
 Memory is mild by comparison (Webmin 0.47 → 0.95 GB, BMO 0.49 → 0.70 GB), so
 this is a wall cost, not a memory one.
+
+## 6. Single huge files: `build()` goes cubic past ~20k lines
+
+Found by opening FHEM's biggest file in an editor and waiting 30 seconds for
+semantic tokens. The server was responsive throughout — it just had no analysis
+to answer from yet.
+
+Measured through the LSP, real workspace, `@INC` live (`PERL_LSP_PHASE_TIMING=1`):
+
+| lines | parse | `build()` |
+|---:|---:|---:|
+| 1,760 | 10 ms | 71 ms |
+| 3,268 | 20 ms | 188 ms |
+| 5,607 | 30 ms | 276 ms |
+| 20,669 | 160 ms | 2,374 ms |
+| **46,522** | **318 ms** | **35,304 ms** |
+
+```
+parse   ~ lines^1.05                      (linear; the parser is not the problem)
+build() ~ lines^1.58 → 0.71 → 1.65 → 3.33 (exponent RISES with size)
+```
+
+**The knee is between 20k and 46k lines.** Under ~6k, build is sub-300 ms.
+At 20k it is 2.4 s. At 46k it is 35 s, and the file is unusable interactively
+until it finishes.
+
+### Where the time goes
+
+`build()` is 33.2 s of a 33.6 s open, and inside it:
+
+```
+build::fold_to_fixed_point   30,680 ms    <- 92%
+build::pattern_dispatch         913 ms
+build::walk                     740 ms
+build::finalize_post_walk       442 ms
+```
+
+The CST walk is 0.74 s. **The worklist fold is the whole cost**, and the
+counters say what it is folding:
+
+```
+hop.edge            1,838,748
+hop.OBSERVATION       503,918
+hop.fact              271,500
+hop.inferred_type     232,585
+build.fold_bag_len     57,228   <- witnesses in the bag
+```
+
+A 57k-witness bag re-walked to a fixed point at 1.8M edge hops. `Expr(span)`
+witnesses are emitted per meaningful expression, so bag size tracks expression
+count, and the fold is superlinear in bag size — which is why the exponent
+climbs rather than holding.
+
+### What this is and is not
+
+**Not** the `--check` memory story above; that is whole-workspace sweep
+residency, this is one file's analysis, and they share no mechanism. **Not**
+`@INC` size either, though `@INC` is required to see it: the same file with an
+empty module universe builds in **0.39 s**, so a single-file reproduction
+without a real workspace measures nothing. That trap cost an hour here.
+
+**Interactive symptom, precisely:** verbs answer *fast* and return empty
+(`null`) while the build runs, rather than blocking. The client renders nothing
+and does not retry, so it looks like a dead server until the build finishes and
+the server sends `semanticTokens/refresh` — at which point everything appears
+at once. Answering "not ready" in a way clients retry on would mask the whole
+delay without making the build any faster.
+
+**Who hits it:** anyone with a single module past ~20k lines. Rare, but not
+FHEM-exclusive — a few generated or accreted modules that size exist in plenty
+of long-lived codebases.
