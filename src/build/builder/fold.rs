@@ -223,12 +223,16 @@ impl<'a> Builder<'a> {
                 );
                 break;
             }
-            self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
+            {
+                let _t = crate::util::ghost_stats::ScopedNs::start("fold::chain_pre");
+                self.run_chain_typing_reducer(idx, ChainPassMode::PreFold);
+            }
             self.resolve_return_types(idx, &reg, &ref_by_span, &method_sym_by_name);
             // Mutation extension: fold key writes into variable shapes
             // (re-emittable, clear-and-emit). After the return-type
             // passes so call-binding-propagated shapes are visible.
             {
+                let _t = crate::util::ghost_stats::ScopedNs::start("fold::mutation_ext");
                 let ctx = crate::model::witnesses::BagContext {
                     scopes: &self.scopes,
                     package_framework: &self.package_framework,
@@ -243,13 +247,18 @@ impl<'a> Builder<'a> {
                     true,
                 );
             }
-            let cur = self.fold_state_snapshot(&reg);
+            let cur = crate::util::ghost_stats::timed("fold::snapshot", || {
+                self.fold_state_snapshot(&reg)
+            });
             if cur == prev {
                 break;
             }
             prev = cur;
         }
-        self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
+        {
+            let _t = crate::util::ghost_stats::ScopedNs::start("fold::chain_post");
+            self.run_chain_typing_reducer(idx, ChainPassMode::PostFold);
+        }
         // Totals, not a line per file: at corpus scale the per-file form is
         // 138k unreadable lines, and the average is what says whether the
         // lattice is settling. `build::fold_to_fixed_point`'s sample count is
@@ -834,18 +843,20 @@ impl<'a> Builder<'a> {
         ref_by_span: &std::collections::HashMap<(Point, Point), usize>,
         method_sym_by_name: &std::collections::HashMap<String, Vec<usize>>,
     ) {
-        self.emit_arity_return_witnesses();
+        use crate::util::ghost_stats::timed;
+        timed("fold::arity", || self.emit_arity_return_witnesses());
         // Brand BEFORE method-call edges so `route_branded_refs` is
         // current when `emit_method_call_return_edges` consults it to
         // skip route calls — otherwise the skip set lags one iteration
         // and the bag oscillates (the fold never reaches a fixed point).
-        self.emit_route_brand_witnesses(idx, ref_by_span);
-        self.emit_method_call_return_edges();
-        self.emit_defined_narrowing_witnesses();
-        let (return_types, return_provenance) = self.seed_return_types_from_bag(reg, method_sym_by_name);
-        self.write_back_sub_return_types(&return_provenance);
-        self.propagate_call_bindings_to_constraints(&return_types);
-        self.fixup_call_bound_hash_key_owners(&return_types);
+        timed("fold::route_brand", || self.emit_route_brand_witnesses(idx, ref_by_span));
+        timed("fold::mc_edges", || self.emit_method_call_return_edges());
+        timed("fold::narrowing", || self.emit_defined_narrowing_witnesses());
+        let (return_types, return_provenance) =
+            timed("fold::seed", || self.seed_return_types_from_bag(reg, method_sym_by_name));
+        timed("fold::writeback", || self.write_back_sub_return_types(&return_provenance));
+        timed("fold::call_binding", || self.propagate_call_bindings_to_constraints(&return_types));
+        timed("fold::fixup_hko", || self.fixup_call_bound_hash_key_owners(&return_types));
     }
 
     /// Re-emittable: stamp the resolved `BrandedRoute` onto the

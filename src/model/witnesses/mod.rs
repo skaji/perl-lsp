@@ -126,6 +126,8 @@ impl WitnessBag {
     }
 
     pub fn rebuild_index(&mut self) {
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::rebuild_index");
+        crate::util::ghost_stats::count_by("bag.rebuild_index_witnesses", self.witnesses.len() as u64);
         self.index.clear();
         for (i, w) in self.witnesses.iter().enumerate() {
             self.index.entry(w.attachment.clone()).or_default().push(i);
@@ -160,6 +162,7 @@ impl WitnessBag {
     /// at the start of each fold iteration so the bag stays
     /// duplicate-free no matter how many times the fold runs.
     pub fn remove_by_source_tag(&mut self, tag: &str) -> usize {
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::remove_tag");
         let before = self.witnesses.len();
         self.witnesses.retain(|w| match &w.source {
             WitnessSource::Builder(s) => s != tag,
@@ -205,6 +208,7 @@ impl WitnessBag {
         tag: &str,
         at: Point,
     ) -> usize {
+        let _t = crate::util::ghost_stats::ScopedNs::start("bag::remove_at");
         let before = self.witnesses.len();
         self.witnesses.retain(|w| {
             !(&w.attachment == att

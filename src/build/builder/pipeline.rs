@@ -220,6 +220,10 @@ pub(super) fn build_with_plugins_inner(
     plugins: Arc<PluginRegistry>,
     extra_re_fold: bool,
 ) -> FileAnalysis {
+    let _scope = crate::util::ghost_stats::BuildScope::start(
+        crate::util::timings::current_file(),
+        source.len(),
+    );
     let fa = build_once(tree, source, plugins.clone(), extra_re_fold);
     // `PERL_LSP_WALK_EQUIV=1 cargo test` re-builds every file the suite
     // touches with the recursive descent and asserts the two agree. Running
