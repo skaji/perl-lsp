@@ -590,6 +590,55 @@ fn shred_sym_rows_same_generation() {
     let _ = std::fs::remove_file(&pm);
 }
 
+/// The member pre-filter's rows probe is three-valued, and the boundary
+/// between the values is what the ancestor walk's skip soundness leans on:
+/// `Some(false)` — covered and provably absent — is the ONLY skip verdict;
+/// `None` (never shredded) must stay distinguishable from it, or an
+/// unindexed file's methods silently stop resolving.
+#[test]
+fn sym_member_probe_is_three_valued() {
+    let conn = test_db();
+    let source = "package My::Base;\nsub render { 1 }\n1;\n";
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_member_probe.pm");
+    std::fs::write(&pm, source).unwrap();
+    let cached = parse_source_to_cached(source, &pm);
+    let path_str = pm.to_string_lossy().to_string();
+
+    assert_eq!(
+        sym_member_row_exists(&conn, &path_str, "render", "My::Base"),
+        None,
+        "never shredded: the store cannot speak for the file"
+    );
+
+    shred_derived_rows(
+        &conn,
+        &path_str,
+        "workspace",
+        &cached.analysis.ref_row_seeds(),
+        &cached.analysis.sym_row_seeds(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        sym_member_row_exists(&conn, &path_str, "render", "My::Base"),
+        Some(true),
+        "a matching (name, container) row warrants the decode"
+    );
+    assert_eq!(
+        sym_member_row_exists(&conn, &path_str, "nonesuch", "My::Base"),
+        Some(false),
+        "covered and absent: the one verdict that licenses a skip"
+    );
+    assert_eq!(
+        sym_member_row_exists(&conn, &path_str, "render", "Other::Pkg"),
+        Some(false),
+        "the container gates: the same name under another package is absent"
+    );
+
+    let _ = std::fs::remove_file(&pm);
+}
+
 /// `FLAG_EXPORTED` is minted from the real `@EXPORT`/`@EXPORT_OK` surface
 /// (`exports_name`), so the rows agree with the source the Surface projects —
 /// never a parallel notion of exportedness.
@@ -1906,7 +1955,7 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
         "precondition: the map is gone"
     );
 
-    let frontier = paths_needing_repair(&conn, at);
+    let frontier = paths_needing_repair(&conn, at, true);
     assert_eq!(
         frontier,
         vec!["/repair/App.pm".to_string()],
@@ -1935,7 +1984,7 @@ fn a_cleared_conclusion_row_is_re_baked_to_the_same_map() {
     // Idempotent: nothing is left on the frontier, so a second pass is a no-op
     // rather than a rewrite loop.
     assert!(
-        paths_needing_repair(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at, true).is_empty(),
         "a repaired file must leave the frontier, or the background pass never ends"
     );
 }
@@ -2054,7 +2103,7 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
     let at = current_generation(&conn);
     assert!(load_surface(&conn, "/surfver/App.pm").is_some(), "precondition");
     assert!(
-        paths_needing_repair(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at, true).is_empty(),
         "precondition: a freshly persisted file needs no repair"
     );
 
@@ -2070,7 +2119,7 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
          describes a shape this build does not produce"
     );
     assert_eq!(
-        paths_needing_repair(&conn, at),
+        paths_needing_repair(&conn, at, true),
         vec!["/surfver/App.pm".to_string()],
         "a stale surface must put the file back on the repair frontier, or the \
          first edit to the projection silently re-opens the drift for every \
@@ -2087,7 +2136,7 @@ fn a_surface_from_another_projection_version_reads_absent_and_is_repaired() {
         "the repaired surface is not the cold projection"
     );
     assert!(
-        paths_needing_repair(&conn, at).is_empty(),
+        paths_needing_repair(&conn, at, true).is_empty(),
         "a repaired file must leave the frontier"
     );
 }

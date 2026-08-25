@@ -88,6 +88,9 @@ pub fn index_pack_languages(
         // decodes the one requested file's full bag.
         let bag_cache = {
             let cache_key_owned = cache_key.map(|s| s.to_string());
+            // Retained across rehydrates — same seam as the Perl hub's bag
+            // loader; a per-call open on every LRU miss was pure overhead.
+            let bag_retained = Arc::new(module_cache::RetainedReader::new());
             let loader = move |path: &std::path::Path, want_bag: bool| {
                 // The blob is persisted under the CANONICAL path (both feed
                 // paths write `canon`), while the resident copy may be
@@ -101,7 +104,8 @@ pub fn index_pack_languages(
                 if raw != spellings[0] {
                     spellings.push(raw);
                 }
-                module_cache::open_and_load_diag(
+                module_cache::open_and_load_diag_retained(
+                    &bag_retained,
                     cache_key_owned.as_deref(),
                     lang,
                     &spellings,

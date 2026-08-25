@@ -26,7 +26,215 @@ thread_local! {
 #[derive(Default)]
 struct SweepMemo {
     stamp: u64,
-    map: std::collections::HashMap<std::path::PathBuf, Arc<FileAnalysis>>,
+    /// Keyed by (path, want_bag) — same axis-mixing hazard as the shared
+    /// provider cache's key comment.
+    map: std::collections::HashMap<(std::path::PathBuf, bool), Arc<FileAnalysis>>,
+    /// Bytes this file's memo holds (estimates) — the crest attribution:
+    /// per-worker in-flight working sets are bounded by the largest single
+    /// file's memo, and `sweep.memo_peak_file_bytes` reports the max seen.
+    bytes: u64,
+}
+
+/// High-water of any single file's sweep-memo footprint, across the run.
+static SWEEP_MEMO_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The SWEEP-WIDE consult-verdict store: (candidate path, point-free query)
+/// → that candidate's whole contribution, shared across files AND rayon
+/// workers for the lifetime of one batch sweep. The per-file `SweepMemo`
+/// below makes a FETCH cheap; this makes the CHASE run once per (query,
+/// candidate) per sweep instead of once per consuming file — first-encounter
+/// pairs per build are the n² a package-main corpus produces (FHEM: 12.3M
+/// attempts ≈ keys × providers × files). Stamp-guarded like `SweepMemo`:
+/// any shape bump clears it, so a mid-sweep registration cannot serve a
+/// verdict from a previous world.
+pub(super) struct SweepAnswers {
+    stamp: std::sync::atomic::AtomicU64,
+    map: DashMap<
+        (std::path::PathBuf, crate::model::witnesses::ConsultVerdictKey),
+        Arc<crate::model::witnesses::ReducedValue>,
+    >,
+}
+
+static SWEEP_ANSWERS: std::sync::RwLock<Option<SweepAnswers>> = std::sync::RwLock::new(None);
+
+impl SweepAnswers {
+    pub(super) fn stamp_load(&self) -> u64 {
+        self.stamp.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Void every verdict and adopt the new shape stamp. Runs under the
+    /// READ lock deliberately — `DashMap::clear` is concurrent-safe, and a
+    /// racing reader that sees a half-cleared map only misses, never serves
+    /// a stale verdict (the stamp is re-checked per access).
+    pub(super) fn reset_to(&self, stamp: u64) {
+        self.map.clear();
+        self.stamp.store(stamp, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(super) fn get(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+    ) -> Option<Arc<crate::model::witnesses::ReducedValue>> {
+        self.map
+            .get(&(path.to_path_buf(), key.clone()))
+            .map(|e| Arc::clone(e.value()))
+    }
+    pub(super) fn insert(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+        value: &crate::model::witnesses::ReducedValue,
+    ) {
+        self.map
+            .insert((path.to_path_buf(), key.clone()), Arc::new(value.clone()));
+    }
+}
+
+/// The open sweep store, if any — `lookup.rs`'s access seam.
+pub(super) fn sweep_answers_read(
+) -> Option<std::sync::RwLockReadGuard<'static, Option<SweepAnswers>>> {
+    SWEEP_ANSWERS.read().ok()
+}
+
+/// The sweep-wide shared PROVIDER cache: decoded provider analyses, shared
+/// across files and rayon workers for one batch sweep. The per-file
+/// `SweepMemo` shields one file's sweep from LRU thrash but holds providers
+/// PER WORKER — measured: 13,456 rehydrates for ~500 distinct providers in
+/// one n=250 sweep (~27x redundant decoding), held in up to 20 OVERLAPPING
+/// per-file maps that are the majority component of the sweep's per-worker
+/// in-flight set. One shared, byte-budgeted, stamp-guarded map decodes each
+/// provider once per sweep and keeps it resident once. When open it
+/// REPLACES the per-file memo's role entirely (same shield, deduplicated);
+/// eviction over budget is unspecified-order, the conclusion cache's
+/// precedent — near-uniform entries under a near-uniform access pattern.
+pub(super) struct SweepProviders {
+    stamp: std::sync::atomic::AtomicU64,
+    /// Keyed by (path, want_bag): the two rehydrate lanes return DIFFERENT
+    /// axis sets (rows lane = refs+symbols sans bag; bag lane = bag view),
+    /// and a path-only key serves a bag-less copy to a bag-wanting consumer
+    /// — the invocant type silently vanishes and diagnostics' false
+    /// positives disappear for the WRONG reason (gold's diag-09 note
+    /// describes exactly this; its XPASS is how the path-only first draft
+    /// of this cache was caught).
+    map: DashMap<(std::path::PathBuf, bool), (Arc<FileAnalysis>, u64)>,
+    bytes: std::sync::atomic::AtomicU64,
+    budget: u64,
+}
+
+static SWEEP_PROVIDERS: std::sync::RwLock<Option<SweepProviders>> =
+    std::sync::RwLock::new(None);
+
+/// Opens the shared provider cache for one batch sweep; drops it on drop.
+/// `PERL_LSP_SWEEP_PROVIDER_CACHE_MB` sizes it (default 1024; 0 disables,
+/// which leaves the per-file memo path in sole effect — the A/B control).
+pub struct SweepProviderGuard(());
+
+impl SweepProviderGuard {
+    pub fn open() -> Self {
+        let mb = std::env::var("PERL_LSP_SWEEP_PROVIDER_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1024);
+        if mb != 0 {
+            if let Ok(mut slot) = SWEEP_PROVIDERS.write() {
+                *slot = Some(SweepProviders {
+                    stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
+                    map: DashMap::new(),
+                    bytes: std::sync::atomic::AtomicU64::new(0),
+                    budget: mb * 1024 * 1024,
+                });
+            }
+        }
+        SweepProviderGuard(())
+    }
+}
+
+impl Drop for SweepProviderGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SWEEP_PROVIDERS.write() {
+            *slot = None;
+        }
+    }
+}
+
+impl SweepProviders {
+    fn validate(&self, stamp: u64) -> bool {
+        if self.stamp.load(std::sync::atomic::Ordering::Relaxed) != stamp {
+            // Lazy reset under the read lock — DashMap::clear is concurrent-
+            // safe, and a racing reader only misses, never serves stale.
+            self.map.clear();
+            self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.stamp.store(stamp, std::sync::atomic::Ordering::Relaxed);
+            crate::util::ghost_stats::count("sweepprov.invalidated");
+            return false;
+        }
+        true
+    }
+
+    fn get(&self, path: &std::path::Path, want_bag: bool) -> Option<Arc<FileAnalysis>> {
+        self.map
+            .get(&(path.to_path_buf(), want_bag))
+            .map(|e| Arc::clone(&e.value().0))
+    }
+
+    fn insert(&self, path: &std::path::Path, want_bag: bool, fa: &Arc<FileAnalysis>) {
+        let est = fa.heap_estimate().total() as u64;
+        if self
+            .map
+            .insert((path.to_path_buf(), want_bag), (Arc::clone(fa), est))
+            .is_none()
+        {
+            self.bytes.fetch_add(est, std::sync::atomic::Ordering::Relaxed);
+        }
+        while self.bytes.load(std::sync::atomic::Ordering::Relaxed) > self.budget {
+            let victim = self
+                .map
+                .iter()
+                .map(|e| e.key().clone())
+                .find(|(p, wb)| !(p == path && *wb == want_bag));
+            let Some(victim) = victim else { break };
+            if let Some((_, (_, vbytes))) = self.map.remove(&victim) {
+                self.bytes.fetch_sub(
+                    vbytes.min(self.bytes.load(std::sync::atomic::Ordering::Relaxed)),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                crate::util::ghost_stats::count("sweepprov.evicted");
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Opens the sweep-wide verdict store; closes (and drops it) on drop.
+/// `PERL_LSP_NO_SWEEP_ANSWERS=1` leaves it closed — the A/B control.
+pub struct SweepAnswerGuard(());
+
+impl SweepAnswerGuard {
+    pub fn open() -> Self {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| {
+            std::env::var("PERL_LSP_NO_SWEEP_ANSWERS").as_deref() == Ok("1")
+        });
+        if !off {
+            if let Ok(mut slot) = SWEEP_ANSWERS.write() {
+                *slot = Some(SweepAnswers {
+                    // Sentinel: the first access stamps the real shape and
+                    // clears, so an open never inherits a stale world.
+                    stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
+                    map: DashMap::new(),
+                });
+            }
+        }
+        SweepAnswerGuard(())
+    }
+}
+
+impl Drop for SweepAnswerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SWEEP_ANSWERS.write() {
+            *slot = None;
+        }
+    }
 }
 
 /// Opens a rehydration memo for one file's sweep; closes it on drop.
@@ -547,8 +755,25 @@ impl ModuleIndex {
         // silently reset them to false and `after_deserialize` never put
         // them back — an enriched copy of a DEGRADED analysis claimed to be
         // whole. Clone carries them.
+        // Byte accounting for the RSS attribution (the clone + its source are
+        // both live per worker for the build's duration): what one build holds.
+        crate::util::ghost_stats::add_n(
+            "overlay.clone_bytes",
+            whole.heap_estimate().total() as u64,
+        );
         let mut copy: FileAnalysis = (*whole).clone();
-        copy.enrich_imported_types_with_keys_for(Some(self), Some(&cached.path));
+        // A session around the build, same as `enrich_open`'s: the overlay's
+        // enrichment is where the cross-file consult cascade lives (FHEM
+        // measured 12.3M SlotType attempts inside these builds, every one
+        // `session.absent`), and without a session the candidate-answer memo
+        // is inert on exactly the path that repeats. A caller already holding
+        // a session (server verbs) nests — this owns only when outermost.
+        {
+            let _session = crate::model::witnesses::ResolutionSession::enter(Some(
+                self as &dyn crate::model::file_analysis::CrossFileLookup,
+            ));
+            copy.enrich_imported_types_with_keys_for(Some(self), Some(&cached.path));
+        }
         let arc = Arc::new(copy);
         // Cycle-tainted: some dep declined mid-enrich (mutual imports), so
         // this copy baked a RAW view of that dep. Caching it would serve
@@ -662,7 +887,9 @@ impl ModuleIndex {
                 return m.1;
             }
         }
-        let key = self.enrichment_key(cached);
+        let key = crate::util::ghost_stats::timed("enrichment_key.compute", || {
+            self.enrichment_key(cached)
+        });
         if self.enrichment_epoch() == epoch {
             // One overwritten-in-place entry per consulted path: bounded by
             // the number of registered files (~100 bytes each), never a
@@ -672,12 +899,59 @@ impl ModuleIndex {
         key
     }
 
+    /// One walked name's share of the BRIDGE and PROVIDER relations, onto
+    /// the key. Enrichment reads both outside the dep-name closure — the
+    /// stamp's bridged arm freezes a bridging module's identity into the
+    /// overlay's `MethodTarget`s, and the typeglob last resort consults the
+    /// provider bucket — but their MEMBERS are not candidates of any walked
+    /// name, so membership and (for bridges, whose content is frozen) each
+    /// member's candidates' registration generations must ride the key or a
+    /// plugin edit leaves every consumer's overlay validating stale.
+    fn hash_relations_for(&self, name: &str, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        let mut bridge_members = self.modules_bridging_to(name);
+        bridge_members.sort_unstable();
+        for m in &bridge_members {
+            m.hash(h);
+            for cm in crate::model::file_analysis::CrossFileLookup::def_candidates(self, m) {
+                self.registration_gen_of(&cm.path).hash(h);
+            }
+        }
+        // Providers: membership only. The bucket's members are the files
+        // declaring content FOR the name, and the typeglob consult re-reads
+        // them per query — the overlay freezes only which module answered,
+        // which membership covers.
+        let mut providers = self.modules_providing_package(name);
+        providers.sort_unstable();
+        for m in &providers {
+            m.hash(h);
+        }
+    }
+
     fn enrichment_key(&self, cached: &Arc<CachedModule>) -> u64 {
         crate::util::ghost_stats::count("enrichment_key");
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.registration_gen_of(&cached.path).hash(&mut h);
         self.freshness.fingerprint_of(&cached.path).unwrap_or(0).hash(&mut h);
+        // The file's OWN packages are bridge targets too (helpers bridged to
+        // a controller's class) and are not in its dep-name closure. Read
+        // the REGISTRATION names (path-keyed, survives symbol eviction; a
+        // bare `package Foo;` mints no PackageFacts entry, so the facts
+        // table under-enumerates), falling back to the Package/Class
+        // symbols for unregistered copies.
+        let mut own: Vec<String> = match self.registered_names.get(&cached.path) {
+            Some(names) => names.iter().map(|(n, _)| n.clone()).collect(),
+            None => crate::index::module_index::package_names(&cached.analysis)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect(),
+        };
+        own.sort_unstable();
+        own.dedup();
+        for pkg in &own {
+            self.hash_relations_for(pkg, &mut h);
+        }
         let mut seen: std::collections::HashSet<String> = Default::default();
         let mut frontier: Vec<String> = self.freshness.deps_of_names(&cached.path);
         frontier.sort_unstable();
@@ -694,6 +968,7 @@ impl ModuleIndex {
                     continue;
                 }
                 dep.hash(&mut h);
+                self.hash_relations_for(&dep, &mut h);
                 // EVERY candidate file of the dep rides the key — a losing
                 // file's re-registration must move consumers' keys too
                 // (over-invalidation, never staleness).
@@ -976,9 +1251,7 @@ impl ModuleIndex {
             *g = Some(opener);
         }
         // The retained conn belongs to the previous opener's DB.
-        if let Ok(mut c) = self.ref_rows_conn.lock() {
-            *c = None;
-        }
+        self.ref_rows_conn.reset();
     }
 
     /// Drop `path`'s rehydrated analysis from this index's LRU (a
@@ -1115,6 +1388,26 @@ impl ModuleIndex {
                 .core
                 .shape_bumps
                 .load(std::sync::atomic::Ordering::Relaxed);
+            // The SHARED provider cache first, when a batch sweep opened it —
+            // it subsumes the per-file memo (one decode per provider per
+            // SWEEP, resident once, instead of once per consuming file's
+            // worker-held map).
+            let shared_active = {
+                let guard = SWEEP_PROVIDERS.read().ok();
+                match guard.as_ref().and_then(|g| g.as_ref()) {
+                    Some(sp) => {
+                        if sp.validate(stamp) {
+                            if let Some(hit) = sp.get(&cached.path, want_bag) {
+                                crate::util::ghost_stats::count("sweepprov.hit");
+                                return hit;
+                            }
+                            crate::util::ghost_stats::count("sweepprov.miss");
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            };
             let memoed = SWEEP_MEMO.with(|c| {
                 let mut slot = c.borrow_mut();
                 let memo = slot.as_mut()?;
@@ -1124,7 +1417,7 @@ impl ModuleIndex {
                     crate::util::ghost_stats::count("sweep.memo_invalidated");
                     return None;
                 }
-                memo.map.get(&cached.path).cloned()
+                memo.map.get(&(cached.path.clone(), want_bag)).cloned()
             });
             if let Some(hit) = memoed {
                 crate::util::ghost_stats::count("sweep.memo_hit");
@@ -1143,10 +1436,48 @@ impl ModuleIndex {
             });
             match got {
                 Ok(full) => {
+                    if shared_active {
+                        // The shared cache subsumes the per-file memo (and
+                        // its byte accounting — sweepprov's own counters
+                        // carry the attribution when it is open).
+                        if let Ok(guard) = SWEEP_PROVIDERS.read() {
+                            if let Some(sp) = guard.as_ref() {
+                                if sp.validate(stamp) {
+                                    sp.insert(&cached.path, want_bag, &full);
+                                }
+                            }
+                        }
+                        return full;
+                    }
                     SWEEP_MEMO.with(|c| {
                         if let Some(memo) = c.borrow_mut().as_mut() {
                             if memo.stamp == stamp {
-                                memo.map.insert(cached.path.clone(), Arc::clone(&full));
+                                // Byte accounting for the RSS attribution: the
+                                // memo holds WHOLE decoded analyses for one
+                                // file's entire sweep, per worker — on a
+                                // wide-provider corpus that lifetime is the
+                                // suspect holder. `bytes_inserted` bounds what
+                                // a sweep cycles through; entries × giant
+                                // sizes is what a peak reader compares RSS to.
+                                let est = full.heap_estimate().total() as u64;
+                                crate::util::ghost_stats::add_n(
+                                    "sweep.memo_bytes_inserted",
+                                    est,
+                                );
+                                memo.bytes += est;
+                                // Max via summed deltas: the tag's TOTAL in the
+                                // shutdown dump equals the largest single
+                                // file's memo footprint across the run.
+                                let prev = SWEEP_MEMO_PEAK
+                                    .fetch_max(memo.bytes, std::sync::atomic::Ordering::Relaxed);
+                                if memo.bytes > prev {
+                                    crate::util::ghost_stats::add_n(
+                                        "sweep.memo_peak_file_bytes",
+                                        memo.bytes - prev,
+                                    );
+                                }
+                                memo.map
+                                    .insert((cached.path.clone(), want_bag), Arc::clone(&full));
                             }
                         }
                     });
@@ -1239,41 +1570,7 @@ impl ModuleIndex {
     /// connection per index so the statement cache amortizes across queries.
     pub(super) fn with_rows_conn<R>(&self, f: impl FnOnce(&rusqlite::Connection) -> R) -> Option<R> {
         let opener = self.ref_rows_opener.read().ok().and_then(|g| g.clone())?;
-        fn db_ino(conn: &rusqlite::Connection) -> u64 {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                return conn
-                    .path()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.ino())
-                    .unwrap_or(0);
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = conn;
-                0
-            }
-        }
-        // Poison-proof: the Option is a pure cache — a panic in some earlier
-        // holder must not permanently disable retrieval.
-        let mut guard = self
-            .ref_rows_conn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some((conn, ino)) = guard.as_ref() {
-            if db_ino(conn) != *ino {
-                *guard = None; // file unlinked/recreated — reopen below
-            }
-        }
-        if guard.is_none() {
-            *guard = opener().map(|c| {
-                let ino = db_ino(&c);
-                (c, ino)
-            });
-        }
-        let (conn, _) = guard.as_ref()?;
-        Some(f(conn))
+        self.ref_rows_conn.with(|| opener(), f)
     }
 
     /// Rows-backed workspace/symbol scan over THIS index's store — the

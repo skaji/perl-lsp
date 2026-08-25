@@ -148,13 +148,48 @@ impl ModuleIndex {
         // — the authoritative handle for a follow-up `get_cached(mod_name)`.
         // Don't re-derive it from the analysis: the registration name and the
         // file's first `package` can differ.
-        mut visit: impl FnMut(&str, &Arc<CachedModule>, &crate::model::file_analysis::Symbol),
+        //
+        // `Break` stops the walk BEFORE the next candidate's `symbols_present`
+        // — the rehydrate is the cost, so a first-match caller that could not
+        // stop the iteration paid a decode per bridging module for nothing.
+        visit: impl FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        self.bridged_walk(class_name, None, visit)
+    }
+
+    /// The one speller of the bridged-entity loop. `name_hint` is the
+    /// first-match-by-name callers' pre-filter license: a candidate whose
+    /// syms rows PROVE nothing named `name_hint` is skipped before its
+    /// `symbols_present` rehydrate — the per-miss decode of every bridging
+    /// module was the cost the early exit alone could not remove. Fail-open
+    /// everywhere the store cannot speak, container-BLIND (an entity's
+    /// container is the plugin's home package, not the bridged class), and
+    /// the visitor's semantics are unchanged for every candidate reached.
+    fn bridged_walk(
+        &self,
+        class_name: &str,
+        name_hint: Option<&str>,
+        mut visit: impl FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
     ) {
         use crate::model::file_analysis::CrossFileLookup;
         for mod_name in self.modules_bridging_to(class_name) {
             // Every candidate file of the name — the bridging namespace may
             // live in a losing candidate.
             for cached in CrossFileLookup::def_candidates(self, &mod_name) {
+            if let Some(name) = name_hint {
+                if !self.candidate_may_name(&cached, name) {
+                    crate::util::ghost_stats::count("bridged.candidate_prefiltered");
+                    continue;
+                }
+            }
             // Entities index into `symbols`, which may be evicted on the
             // resident copy — resolve them against the symbols-axis view
             // (same generation: the LRU is invalidated on every rewrite).
@@ -174,11 +209,40 @@ impl ModuleIndex {
                 for sym_id in &ns.entities {
                     let idx = sym_id.0 as usize;
                     let Some(sym) = whole.symbols().get(idx) else { continue };
-                    visit(&mod_name, &cached, sym);
+                    if visit(&mod_name, &cached, sym).is_break() {
+                        return;
+                    }
                 }
             }
             }
         }
+    }
+
+    /// The name-only sibling of `candidate_may_declare`, for walks whose
+    /// member test is container-blind (bridged entities live under the
+    /// plugin's home package). Same guards, same skip license: only a
+    /// covered store's proven absence skips.
+    fn candidate_may_name(&self, cached: &Arc<CachedModule>, name: &str) -> bool {
+        if !cached.analysis.symbols_are_evicted() {
+            return true;
+        }
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED
+            .get_or_init(|| std::env::var_os("PERL_LSP_NO_MEMBER_PREFILTER").is_some())
+        {
+            return true;
+        }
+        let rows = self.with_rows_conn(|conn| {
+            crate::index::module_cache::sym_name_row_exists(
+                conn,
+                &cached.path.to_string_lossy(),
+                name,
+            )
+        });
+        member_prefilter_may_declare(
+            !cached.analysis.plugin.gated_emissions.is_empty(),
+            rows,
+        )
     }
 
     /// Block until `module_name` appears in the cache, or timeout.
@@ -319,6 +383,83 @@ impl CrossFileLookup for ModuleIndex {
         self.rehydrate_rows_or_resident(cached)
     }
 
+    fn sweep_consult_answer(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+    ) -> Option<Arc<crate::model::witnesses::ReducedValue>> {
+        let guard = super::registration::sweep_answers_read()?;
+        let sa = guard.as_ref()?;
+        let stamp = self.core.shape_bumps.load(std::sync::atomic::Ordering::Relaxed);
+        if sa.stamp_load() != stamp {
+            // Lazy reset, same rule as SweepMemo: a shape change mid-sweep
+            // voids every remembered verdict.
+            sa.reset_to(stamp);
+            crate::util::ghost_stats::count("sweepans.invalidated");
+            return None;
+        }
+        let hit = sa.get(path, key);
+        crate::util::ghost_stats::count(if hit.is_some() {
+            "sweepans.hit"
+        } else {
+            "sweepans.miss"
+        });
+        hit
+    }
+
+    fn remember_sweep_consult(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+        value: &crate::model::witnesses::ReducedValue,
+    ) {
+        if let Some(guard) = super::registration::sweep_answers_read() {
+            if let Some(sa) = guard.as_ref() {
+                let stamp =
+                    self.core.shape_bumps.load(std::sync::atomic::Ordering::Relaxed);
+                if sa.stamp_load() == stamp {
+                    sa.insert(path, key, value);
+                    crate::util::ghost_stats::count("sweepans.store");
+                }
+            }
+        }
+    }
+
+    fn candidate_may_declare(
+        &self,
+        cached: &Arc<CachedModule>,
+        name: &str,
+        class: &str,
+    ) -> bool {
+        // Gate on eviction FIRST: a symbols-resident copy answers the member
+        // probe from RAM for free, and it may be fresher than its rows (the
+        // whole-copy registration paths precede persist). Stripped copies
+        // register only AFTER their chunk commits, so for them the rows are
+        // at least as fresh as the copy — the freshness argument the skip
+        // leans on.
+        if !cached.analysis.symbols_are_evicted() {
+            return true;
+        }
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED
+            .get_or_init(|| std::env::var_os("PERL_LSP_NO_MEMBER_PREFILTER").is_some())
+        {
+            return true;
+        }
+        let rows = self.with_rows_conn(|conn| {
+            crate::index::module_cache::sym_member_row_exists(
+                conn,
+                &cached.path.to_string_lossy(),
+                name,
+                class,
+            )
+        });
+        member_prefilter_may_declare(
+            !cached.analysis.plugin.gated_emissions.is_empty(),
+            rows,
+        )
+    }
+
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         self.with_rows_conn(|conn| {
             crate::index::module_cache::ref_candidate_files(conn, keys)
@@ -361,6 +502,13 @@ impl CrossFileLookup for ModuleIndex {
         }
         self.enriched_snapshot(cached)
             .unwrap_or_else(|| self.bag_present(cached))
+    }
+
+    fn serves_enriched(&self) -> bool {
+        // The overlay is long-lived-only (the deep copies never pay for
+        // themselves in a one-shot process), so a not-long-lived index's
+        // `enriched_present` is `bag_present` — never distinct.
+        self.core.long_lived.load(std::sync::atomic::Ordering::Relaxed)
     }
     fn class_is_bridged_to(&self, class: &str) -> bool {
         // Bucket NON-EMPTY, not key-present: `purge_module` can leave an empty
@@ -538,9 +686,26 @@ impl CrossFileLookup for ModuleIndex {
     fn for_each_entity_bridged_to(
         &self,
         class_name: &str,
-        f: &mut dyn FnMut(&str, &Arc<CachedModule>, &crate::model::file_analysis::Symbol),
+        f: &mut dyn FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
     ) {
         self.for_each_entity_bridged_to(class_name, f)
+    }
+
+    fn for_each_entity_bridged_to_named(
+        &self,
+        class_name: &str,
+        name: &str,
+        f: &mut dyn FnMut(
+            &str,
+            &Arc<CachedModule>,
+            &crate::model::file_analysis::Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        self.bridged_walk(class_name, Some(name), f)
     }
 
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
@@ -603,5 +768,62 @@ impl CrossFileLookup for ModuleIndex {
         visible: &std::collections::HashSet<String>,
     ) -> Vec<(String, Arc<CachedModule>)> {
         self.visible_defs_with_prefix(prefix, visible)
+    }
+}
+
+/// The member pre-filter's verdict, separated from the store and the copy so
+/// the truth table is testable without either. `rows` is
+/// `sym_member_row_exists` behind `with_rows_conn`: outer `None` = no store,
+/// inner `None` = file never shredded.
+///
+/// The ONLY skip is (no post-shred emissions, store present, file covered,
+/// provably no matching row). Deferred plugin emissions materialize into the
+/// resident copy AFTER the shred (`materialize_gated_emissions`), so their
+/// symbols have no rows — a file carrying any must fail open or a DBIC result
+/// class's synthesized accessors silently stop resolving.
+pub(crate) fn member_prefilter_may_declare(
+    has_gated_emissions: bool,
+    rows: Option<Option<bool>>,
+) -> bool {
+    if has_gated_emissions {
+        return true;
+    }
+    !matches!(rows, Some(Some(false)))
+}
+
+#[cfg(test)]
+mod member_prefilter_tests {
+    use super::member_prefilter_may_declare;
+
+    /// Every unknown fails OPEN — to a decode, never away from one. The
+    /// same discipline as `restamp_owed`: the skip needs positive evidence,
+    /// and a wrong skip is a silently missing method, not an error.
+    #[test]
+    fn only_proven_absence_skips() {
+        assert!(
+            member_prefilter_may_declare(false, None),
+            "no row store: the filter cannot speak, decode"
+        );
+        assert!(
+            member_prefilter_may_declare(false, Some(None)),
+            "file never shredded: the store does not cover it, decode"
+        );
+        assert!(
+            member_prefilter_may_declare(false, Some(Some(true))),
+            "a matching row: the decode is warranted"
+        );
+        assert!(
+            !member_prefilter_may_declare(false, Some(Some(false))),
+            "covered and provably absent: the one skip"
+        );
+    }
+
+    /// Post-shred plugin emissions beat everything: their symbols exist only
+    /// on the materialized resident copy, so the rows' "provably absent" is
+    /// a lie for exactly these files.
+    #[test]
+    fn gated_emissions_fail_open_over_a_provably_absent_row() {
+        assert!(member_prefilter_may_declare(true, Some(Some(false))));
+        assert!(member_prefilter_may_declare(true, None));
     }
 }

@@ -162,7 +162,7 @@ mod lookup;
 mod queries;
 mod registration;
 use registration::EnrichedEntry;
-pub use registration::SweepMemoGuard;
+pub use registration::{SweepAnswerGuard, SweepMemoGuard, SweepProviderGuard};
 
 /// Every file that provides one module name, in provider order. `[0]` is
 /// the winner — what `require` would load for an `@INC` set, the derived
@@ -269,7 +269,7 @@ pub struct ModuleIndex {
     /// file, and an fd pinning the dead inode would serve frozen rows
     /// forever — an inode change (or missing file) drops the conn so the
     /// next query reopens the recreated DB.
-    ref_rows_conn: std::sync::Mutex<Option<(rusqlite::Connection, u64)>>,
+    ref_rows_conn: crate::index::module_cache::RetainedReader,
 }
 
 /// The store `ModuleIndex::lookup_for` routed a language to. Owning enum:

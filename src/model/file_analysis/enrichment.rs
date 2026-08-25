@@ -595,15 +595,17 @@ impl FileAnalysis {
                         );
                         if ty.is_none() {
                             crate::util::ghost_stats::count("chase.return_miss");
-                            let en = enriched.get_or_insert_with(|| {
-                                crate::util::ghost_stats::count("chase.enriched_present");
-                                crate::util::ghost_stats::timed(
-                                    "chase.enriched_present",
-                                    || idx.enriched_present(&cached),
-                                )
-                            });
-                            if !std::sync::Arc::ptr_eq(en, &whole) {
-                                ty = en.symbol_return_type_via_bag(sym.id, None);
+                            if idx.serves_enriched() {
+                                let en = enriched.get_or_insert_with(|| {
+                                    crate::util::ghost_stats::count("chase.enriched_present");
+                                    crate::util::ghost_stats::timed(
+                                        "chase.enriched_present",
+                                        || idx.enriched_present(&cached),
+                                    )
+                                });
+                                if !std::sync::Arc::ptr_eq(en, &whole) {
+                                    ty = en.symbol_return_type_via_bag(sym.id, None);
+                                }
                             }
                         }
                         if let Some(ty) = ty {
@@ -1443,7 +1445,7 @@ mod restamp_gate_tests {
                     &str,
                     &std::sync::Arc<crate::model::file_analysis::CachedModule>,
                     &crate::model::file_analysis::Symbol,
-                ),
+                ) -> std::ops::ControlFlow<()>,
             ) {
             }
             fn direct_children_of(&self, _p: &str) -> Vec<(String, String)> {

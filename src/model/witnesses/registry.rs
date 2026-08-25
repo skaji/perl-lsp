@@ -440,6 +440,19 @@ impl ReducerRegistry {
         // being counted, not separate questions.
         let top_moc = matches!(q.attachment, WitnessAttachment::PackageSymbol { .. });
         if top_moc {
+            // Attribution: what share of top-level moc queries are main-keyed?
+            // Two buckets, not per-package keys — a script-heavy corpus mints
+            // these from every plain call, and the question a fix must answer
+            // is main's SHARE, not a cardinality-unbounded census.
+            if crate::util::ghost_stats::enabled() {
+                if let WitnessAttachment::PackageSymbol { package, .. } = &q.attachment {
+                    crate::util::ghost_stats::count(if package == "main" {
+                        "mocpkg.main"
+                    } else {
+                        "mocpkg.other"
+                    });
+                }
+            }
             TOUCHED_EXPR.with(|c| c.set(false));
         }
         // Sole boundary where an owned `ReducedValue` is required; the
@@ -734,6 +747,7 @@ impl ReducerRegistry {
                     let mut bridge_seen = false;
                     idx.for_each_entity_bridged_to(package, &mut |_m, _c, _s| {
                         bridge_seen = true;
+                        std::ops::ControlFlow::Break(())
                     });
                     crate::util::ghost_stats::count(if bridge_seen {
                         "bridge.live_yields"
@@ -752,27 +766,26 @@ impl ReducerRegistry {
                         crate::util::ghost_stats::count(&format!("bridgecls.{package}"));
                     }
                     let mut found: Option<InferredType> = None;
-                    idx.for_each_entity_bridged_to(package, &mut |_mod, cached, sym| {
-                        if found.is_some() {
-                            return;
-                        }
+                    idx.for_each_entity_bridged_to_named(package, name, &mut |_mod, cached, sym| {
+                        use std::ops::ControlFlow;
                         if !matches!(
                             sym.kind,
                             crate::model::file_analysis::SymKind::Sub
                                 | crate::model::file_analysis::SymKind::Method
                         ) {
-                            return;
+                            return ControlFlow::Continue(());
                         }
                         if &sym.name != name {
-                            return;
+                            return ControlFlow::Continue(());
                         }
                         // Bridged Method's return lives in the bridging file's
                         // bag — rehydrate it if evicted before querying.
                         crate::util::ghost_stats::count("moc.provider_fetched");
+                        crate::util::ghost_stats::count("mocsite.bridged");
                         let full = idx.bag_present(cached);
                         if let Some(t) = full.symbol_return_type_via_bag(sym.id, None) {
                             found = Some(t);
-                            return;
+                            return ControlFlow::Break(());
                         }
                         // Fallback-on-miss (R4): the bridged Method's return may
                         // chain through the bridging file's OWN imports — baked
@@ -784,12 +797,18 @@ impl ReducerRegistry {
                         // ENRICHING-guarded bake is the safe route to the same
                         // transitive answer.
                         crate::util::ghost_stats::count("consult.bridged");
-                        let enriched = idx.enriched_present(cached);
-                        if !std::sync::Arc::ptr_eq(&enriched, &full) {
-                            if let Some(t) = enriched.symbol_return_type_via_bag(sym.id, None) {
-                                found = Some(t);
+                        if idx.serves_enriched() {
+                            let enriched = idx.enriched_present(cached);
+                            if !std::sync::Arc::ptr_eq(&enriched, &full) {
+                                if let Some(t) =
+                                    enriched.symbol_return_type_via_bag(sym.id, None)
+                                {
+                                    found = Some(t);
+                                    return ControlFlow::Break(());
+                                }
                             }
                         }
+                        ControlFlow::Continue(())
                     });
                     if let Some(t) = found {
                         return ReducedValue::Type(t);
@@ -811,7 +830,45 @@ impl ReducerRegistry {
                     note_slot_exit(state, class, key);
                 }
                 if let Some(idx) = ctx.module_index {
-                    for cached in idx.visible_def_candidates(class) {
+                    // The point-free memo spelling, same as the primary's:
+                    // answers below are computed point-free, so one (class,
+                    // key, candidate) verdict serves every call site in the
+                    // sweep. This arm carried 99.99% of FHEM's 12.3M provider
+                    // ATTEMPTS — the sweep memo made each attempt's fetch an
+                    // Arc bump, but the CHASE per attempt (a full query_rec
+                    // into the provider bag) is what the answer memo removes.
+                    let memo_q = ReducerQuery {
+                        attachment: q.attachment,
+                        point: None,
+                        framework: q.framework,
+                        arity_hint: None,
+                        receiver: q.receiver.clone(),
+                        args: q.args.clone(),
+                        context: None,
+                    };
+                    let verdict_key = super::ConsultVerdictKey::of(&memo_q);
+                    for cached in super::session::visible_def_candidates(idx, class).iter() {
+                        if let Some(hit) =
+                            super::session::candidate_answer(idx, &cached.path, &memo_q)
+                        {
+                            if *hit != ReducedValue::None {
+                                return (*hit).clone();
+                            }
+                            continue;
+                        }
+                        // The sweep tier, behind the session memo — a verdict
+                        // another file's build already derived this sweep.
+                        if let Some(hit) =
+                            idx.sweep_consult_answer(&cached.path, &verdict_key)
+                        {
+                            super::session::remember_candidate_answer(
+                                idx, &cached.path, &memo_q, &hit,
+                            );
+                            if *hit != ReducedValue::None {
+                                return (*hit).clone();
+                            }
+                            continue;
+                        }
                         let attempt =
                             |full: &std::sync::Arc<crate::model::file_analysis::FileAnalysis>,
                              state: &mut _| {
@@ -824,7 +881,13 @@ impl ReducerRegistry {
                                 };
                                 let sub_q = ReducerQuery {
                                     attachment: q.attachment,
-                                    point: q.point,
+                                    // Cross-file: the point is CONSUMER-file
+                                    // coordinates, meaningless against the
+                                    // provider's spans (the imported-sub
+                                    // recursion in query.rs already passes
+                                    // None). Point-free is also what lets a
+                                    // memo key collapse across call sites.
+                                    point: None,
                                     framework: q.framework,
                                     arity_hint: None,
                                     receiver: q.receiver.clone(),
@@ -834,6 +897,7 @@ impl ReducerRegistry {
                                 (*self.query_rec(&full.witnesses, &sub_q, state)).clone()
                             };
                         crate::util::ghost_stats::count("moc.provider_fetched");
+                        crate::util::ghost_stats::count("mocsite.slot_type");
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
                             let v = attempt(&full, state);
@@ -843,6 +907,10 @@ impl ReducerRegistry {
                                 "moc.provider_answered"
                             });
                             if v != ReducedValue::None {
+                                super::session::remember_candidate_answer(
+                                    idx, &cached.path, &memo_q, &v,
+                                );
+                                idx.remember_sweep_consult(&cached.path, &verdict_key, &v);
                                 return v;
                             }
                             // Fallback-on-miss (R4), symmetric with the
@@ -856,16 +924,33 @@ impl ReducerRegistry {
                             // enriched Arc: this chase threads the SHARED
                             // QueryState, whose memo keys on bag pointers.
                             crate::util::ghost_stats::count("consult.slot_type");
-                            let enriched = idx.enriched_present(&cached);
-                            if !std::sync::Arc::ptr_eq(&enriched, &full)
-                                && !std::ptr::eq(bag, &enriched.witnesses)
-                            {
-                                state.pins.push(std::sync::Arc::clone(&enriched));
-                                let v = attempt(&enriched, state);
-                                if v != ReducedValue::None {
-                                    return v;
+                            if idx.serves_enriched() {
+                                let enriched = idx.enriched_present(&cached);
+                                if !std::sync::Arc::ptr_eq(&enriched, &full)
+                                    && !std::ptr::eq(bag, &enriched.witnesses)
+                                {
+                                    state.pins.push(std::sync::Arc::clone(&enriched));
+                                    let v = attempt(&enriched, state);
+                                    if v != ReducedValue::None {
+                                        super::session::remember_candidate_answer(
+                                            idx, &cached.path, &memo_q, &v,
+                                        );
+                                        idx.remember_sweep_consult(
+                                            &cached.path, &verdict_key, &v,
+                                        );
+                                        return v;
+                                    }
                                 }
                             }
+                            super::session::remember_candidate_answer(
+                                idx,
+                                &cached.path,
+                                &memo_q,
+                                &ReducedValue::None,
+                            );
+                            idx.remember_sweep_consult(
+                                &cached.path, &verdict_key, &ReducedValue::None,
+                            );
                         }
                     }
                 }
@@ -913,6 +998,7 @@ impl ReducerRegistry {
                 if let Some(idx) = ctx.module_index {
                     for cached in idx.visible_def_candidates(name) {
                         crate::util::ghost_stats::count("moc.provider_fetched");
+                        crate::util::ghost_stats::count("mocsite.type_name");
                         let full = idx.bag_present(&cached);
                         if !std::ptr::eq(bag, &full.witnesses) {
                             let cached_ctx = BagContext {
@@ -924,7 +1010,8 @@ impl ReducerRegistry {
                             };
                             let sub_q = ReducerQuery {
                                 attachment: q.attachment,
-                                point: q.point,
+                                // Cross-file: point normalized (see the slot arm).
+                                point: None,
                                 framework: q.framework,
                                 arity_hint: None,
                                 receiver: q.receiver.clone(),
@@ -985,6 +1072,22 @@ impl ReducerRegistry {
         idx: &dyn crate::model::file_analysis::CrossFileLookup,
         package: &str,
     ) -> Option<ReducedValue> {
+        // The memo spelling of this query: point-free, because the answers
+        // below are computed point-free (cross-file sub-queries normalize the
+        // consumer's point out) and a point-carrying key made every call site
+        // a fresh memo miss.
+        let memo_q = ReducerQuery {
+            attachment: q.attachment,
+            point: None,
+            framework: q.framework,
+            arity_hint: q.arity_hint,
+            receiver: q.receiver.clone(),
+            args: q.args.clone(),
+            context: None,
+        };
+        // The sweep-tier spelling of the same key — shared across files and
+        // workers where a batch sweep opened the store (SweepAnswerGuard).
+        let verdict_key = super::ConsultVerdictKey::of(&memo_q);
         for cached in super::session::visible_def_candidates(idx, package).iter() {
             // Rehydrate the target file's bag if its resident copy
             // was Slice-2-evicted; the cross-file chase reads its
@@ -1001,7 +1104,14 @@ impl ReducerRegistry {
                     };
                     let sub_q = ReducerQuery {
                         attachment: q.attachment,
-                        point: q.point,
+                        // Cross-file: the point is CONSUMER-file coordinates,
+                        // meaningless against the provider's spans (the
+                        // imported-sub recursion in query.rs already passes
+                        // None). Point-free is also what lets the memo key
+                        // below collapse across call sites — keyed WITH the
+                        // point, a hash key read at 500 sites was 500 memo
+                        // misses per candidate.
+                        point: None,
                         framework: q.framework,
                         arity_hint: q.arity_hint,
                         receiver: q.receiver.clone(),
@@ -1012,12 +1122,21 @@ impl ReducerRegistry {
                 };
             // This candidate's contribution, remembered ACROSS
             // top-level queries. `attempt` is a pure function of
-            // (candidate file, attachment, receiver, arity, point,
-            // framework) — the whole key — so one walk derives it
-            // once instead of once per call site.
+            // (candidate file, attachment, receiver, arity, framework) —
+            // the whole key now that the point is normalized out — so one
+            // walk derives it once instead of once per call site.
             if let Some(hit) =
-                super::session::candidate_answer(idx, &cached.path, q)
+                super::session::candidate_answer(idx, &cached.path, &memo_q)
             {
+                if *hit != ReducedValue::None {
+                    return Some((*hit).clone());
+                }
+                continue;
+            }
+            // The sweep tier, behind the (cheaper) session memo: a verdict
+            // another file's build already derived this sweep.
+            if let Some(hit) = idx.sweep_consult_answer(&cached.path, &verdict_key) {
+                super::session::remember_candidate_answer(idx, &cached.path, &memo_q, &hit);
                 if *hit != ReducedValue::None {
                     return Some((*hit).clone());
                 }
@@ -1074,8 +1193,9 @@ impl ReducerRegistry {
                             // baked hit is cheap but not free, and
                             // the memo is the tier above it.
                             super::session::remember_candidate_answer(
-                                idx, &cached.path, q, &v,
+                                idx, &cached.path, &memo_q, &v,
                             );
+                            idx.remember_sweep_consult(&cached.path, &verdict_key, &v);
                             return Some(v);
                         }
                         // ABSENT. The spec lets this mean a proven
@@ -1177,8 +1297,11 @@ impl ReducerRegistry {
                                 super::session::remember_candidate_answer(
                                     idx,
                                     &cached.path,
-                                    q,
+                                    &memo_q,
                                     &ReducedValue::None,
+                                );
+                                idx.remember_sweep_consult(
+                                    &cached.path, &verdict_key, &ReducedValue::None,
                                 );
                                 continue;
                             }
@@ -1231,7 +1354,10 @@ impl ReducerRegistry {
                                     } else {
                                         let v = ReducedValue::Type(t);
                                         super::session::remember_candidate_answer(
-                                            idx, &cached.path, q, &v,
+                                            idx, &cached.path, &memo_q, &v,
+                                        );
+                                        idx.remember_sweep_consult(
+                                            &cached.path, &verdict_key, &v,
                                         );
                                         return Some(v);
                                     }
@@ -1333,12 +1459,21 @@ impl ReducerRegistry {
                 super::session::remember_candidate_answer(
                     idx,
                     &cached.path,
-                    q,
+                    &memo_q,
                     &ReducedValue::None,
                 );
+                idx.remember_sweep_consult(&cached.path, &verdict_key, &ReducedValue::None);
                 continue;
             }
             crate::util::ghost_stats::count("moc.provider_fetched");
+                        crate::util::ghost_stats::count("mocsite.primary");
+            // Attribution twin of `mocpkg.*`: which class family drives the
+            // FETCHES (each one a decode on LRU miss), not just the queries.
+            crate::util::ghost_stats::count(if package == "main" {
+                "mocfetch.main"
+            } else {
+                "mocfetch.other"
+            });
             // The three costs of one cross-file consult, split
             // because a conclusion layer would remove the first
             // two and CANNOT remove the third (enrichment is bag
@@ -1389,13 +1524,20 @@ impl ReducerRegistry {
                 // invisible to the raw bag, present in the
                 // enriched overlay.
                 crate::util::ghost_stats::count("consult.moc_primary");
-                let enriched = crate::util::ghost_stats::timed(
-                    "consult.enriched", || idx.enriched_present(cached));
-                if !std::sync::Arc::ptr_eq(&enriched, &full)
-                    && !std::ptr::eq(bag, &enriched.witnesses)
-                {
-                    state.pins.push(std::sync::Arc::clone(&enriched));
-                    attempt(&enriched, state)
+                // `serves_enriched` first: when the overlay is off (one-shot
+                // CLI) the fetch below returns the bag it already has, so the
+                // retry is a guaranteed no-op paid per escalation.
+                if idx.serves_enriched() {
+                    let enriched = crate::util::ghost_stats::timed(
+                        "consult.enriched", || idx.enriched_present(cached));
+                    if !std::sync::Arc::ptr_eq(&enriched, &full)
+                        && !std::ptr::eq(bag, &enriched.witnesses)
+                    {
+                        state.pins.push(std::sync::Arc::clone(&enriched));
+                        attempt(&enriched, state)
+                    } else {
+                        ReducedValue::None
+                    }
                 } else {
                     ReducedValue::None
                 }
@@ -1479,7 +1621,8 @@ impl ReducerRegistry {
                     "conclusion absence disagreed with the chase; see log"
                 );
             }
-            super::session::remember_candidate_answer(idx, &cached.path, q, &v);
+            super::session::remember_candidate_answer(idx, &cached.path, &memo_q, &v);
+            idx.remember_sweep_consult(&cached.path, &verdict_key, &v);
             if v != ReducedValue::None {
                 return Some(v);
             }

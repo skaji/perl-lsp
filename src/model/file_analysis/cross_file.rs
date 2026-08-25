@@ -602,6 +602,18 @@ pub trait CrossFileLookup {
     ) -> std::sync::Arc<FileAnalysis> {
         self.bag_present(cached)
     }
+    /// Can `enriched_present` ever hand back a view DISTINCT from the bag?
+    /// The witness seams' fallback-on-miss arms ask this BEFORE calling it:
+    /// when the answer is no (one-shot CLI — the overlay is long-lived-only),
+    /// the retry is a guaranteed no-op, and skipping it saves a redundant
+    /// per-escalation fetch — measured at 706k calls / 5.3% of a cold
+    /// `--check` wall on a script-heavy corpus — plus the re-chase hazard
+    /// when the LRU evicts between the two fetches. Default `true`: an
+    /// implementor that overrides `enriched_present` without this probe
+    /// keeps its retries.
+    fn serves_enriched(&self) -> bool {
+        true
+    }
     /// A cached module's analysis whole on EVERY evictable axis — bag, refs,
     /// AND symbols present. Consumers that read more than one axis from the
     /// same copy (the diagnostics sweep, the `refs_to` matcher, `sub_info`
@@ -635,6 +647,49 @@ pub trait CrossFileLookup {
         cached: &std::sync::Arc<CachedModule>,
     ) -> std::sync::Arc<FileAnalysis> {
         self.whole_present(cached)
+    }
+    /// A sweep-scoped cross-file consult verdict: "what did candidate `path`
+    /// contribute to this (point-free) query". `None` = not remembered.
+    /// The default remembers nothing — only an index under an open sweep
+    /// (the CLI's whole-corpus diagnostics) serves these. The seam exists
+    /// because the SESSION memo is thread-local and per-verb, while a batch
+    /// sweep's repeats span files and rayon workers: without a shared tier,
+    /// every file's build re-chases every (query, candidate) pair the sweep
+    /// already settled — the measured n² on package-main corpora.
+    fn sweep_consult_answer(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ReducedValue>> {
+        let _ = (path, key);
+        None
+    }
+    /// Remember a sweep-scoped verdict. No-op by default.
+    fn remember_sweep_consult(
+        &self,
+        path: &std::path::Path,
+        key: &crate::model::witnesses::ConsultVerdictKey,
+        value: &crate::model::witnesses::ReducedValue,
+    ) {
+        let _ = (path, key, value);
+    }
+    /// May `cached`'s file declare a member named `name` attributed to
+    /// package `class`? The rows-backed pre-filter for the ancestor walk's
+    /// per-candidate existence probe (`docs/prompt-relational-iteration.md`):
+    /// `false` licenses skipping the `symbols_present` rehydrate outright, so
+    /// it requires POSITIVE evidence of absence — a store that covers the
+    /// file and holds no matching sym row. Everything else — no store, file
+    /// never shredded, a resident (unevicted) copy, post-shred plugin
+    /// emissions — answers `true`, which is this default: an implementor
+    /// that cannot prove absence inherits the decode, never the skip.
+    fn candidate_may_declare(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+        name: &str,
+        class: &str,
+    ) -> bool {
+        let _ = (cached, name, class);
+        true
     }
     /// The ROWS-axes view — refs AND symbols populated: the backward-walk
     /// matcher's axes (usage sites + declaration sites). The @INC strip is
@@ -761,11 +816,41 @@ pub trait CrossFileLookup {
         start: Vec<String>,
         visit: &mut dyn FnMut(&std::sync::Arc<CachedModule>) -> std::ops::ControlFlow<()>,
     );
+    /// `visit` returns `Break` to stop the walk — and, more importantly, the
+    /// per-candidate rehydrates behind it: entity resolution decodes each
+    /// bridging module's symbols, so a first-match caller that cannot stop
+    /// the iteration pays a decode per plugin file in the workspace for
+    /// answers it already has (same shape as `for_each_reexport_module`).
     fn for_each_entity_bridged_to(
         &self,
         class_name: &str,
-        f: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>, &Symbol),
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
     );
+    /// The bridged walk for a caller that wants one NAMED entity — the
+    /// first-match-by-name consumers (the MRO walk's bridged arm, the
+    /// opaque-return check, the registry's bridged consult). `name` is a
+    /// pre-filter LICENSE, not a semantic change: the visitor still sees
+    /// every entity of every candidate it reaches, but an implementor with
+    /// a row store may skip candidates that provably declare nothing named
+    /// `name` — killing the per-miss decode of every bridging module. The
+    /// default ignores the hint (fail-open) and delegates.
+    fn for_each_entity_bridged_to_named(
+        &self,
+        class_name: &str,
+        name: &str,
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        let _ = name;
+        self.for_each_entity_bridged_to(class_name, f)
+    }
     /// Direct children/composers of `class` as (package, module) pairs
     /// — the `children_index` inverse, depth 1 (the graph walker
     /// supplies transitivity).
@@ -1073,6 +1158,9 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // enrichment overlay.
         self.inner.enriched_present(cached)
     }
+    fn serves_enriched(&self) -> bool {
+        self.inner.serves_enriched()
+    }
     fn whole_present(
         &self,
         cached: &std::sync::Arc<CachedModule>,
@@ -1095,6 +1183,16 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     ) -> std::sync::Arc<FileAnalysis> {
         // Same delegation rule as `symbols_present`.
         self.inner.refs_present(cached)
+    }
+    fn candidate_may_declare(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+        name: &str,
+        class: &str,
+    ) -> bool {
+        // Same delegation rule as `symbols_present` — the inner index owns
+        // the row store; the default would fail open and lose the skip.
+        self.inner.candidate_may_declare(cached, name, class)
     }
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         // Unscoped by design, like `def_candidates`: the backward walk applies
@@ -1156,9 +1254,27 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
     fn for_each_entity_bridged_to(
         &self,
         class_name: &str,
-        f: &mut dyn FnMut(&str, &std::sync::Arc<CachedModule>, &Symbol),
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
     ) {
         self.inner.for_each_entity_bridged_to(class_name, f)
+    }
+    fn for_each_entity_bridged_to_named(
+        &self,
+        class_name: &str,
+        name: &str,
+        f: &mut dyn FnMut(
+            &str,
+            &std::sync::Arc<CachedModule>,
+            &Symbol,
+        ) -> std::ops::ControlFlow<()>,
+    ) {
+        // Same delegation rule as the unnamed walk — the inner index owns
+        // the row store the name pre-filter reads.
+        self.inner.for_each_entity_bridged_to_named(class_name, name, f)
     }
     fn direct_children_of(&self, class: &str) -> Vec<(String, String)> {
         self.inner.direct_children_of(class)

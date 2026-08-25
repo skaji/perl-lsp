@@ -273,6 +273,7 @@ impl<'a> GraphView<'a> {
                             if seen_mods.insert(module.to_string()) {
                                 out.push(Node::Module(module.to_string()));
                             }
+                            std::ops::ControlFlow::Continue(())
                         });
                     }
                 }
