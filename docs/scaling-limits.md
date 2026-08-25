@@ -94,3 +94,62 @@ Useful report: `PERL_LSP_GHOST_STATS=/tmp/g.txt perl-lsp --check <root>` plus
 (`grep -rhc '^package ' --include='*.pm' . | sort | uniq -c | sort -rn | head`).
 Those three tell us within minutes which of the shapes above you have, or that
 you have a new one.
+
+## 3. Dependencies are not free — every historical number here understates load
+
+Measured on the eight-repo corpus, cold `--check`, same binary both arms, deps
+on `@INC` via `PERL5LIB` (never in the workspace — see `corpus/README.md`):
+
+| repo | wall nodeps → deps | Δ | RSS nodeps → deps |
+|---|---|---:|---|
+| BMO | 7.82 → 13.76 s | **+76%** | 0.48 → 0.62 GB |
+| openfoodfacts | 9.51 → 12.76 s | +34% | 0.37 → 0.47 GB |
+| WeBWorK | 7.40 → 9.89 s | +34% | 0.30 → 0.36 GB |
+| FHEM | 41.06 → 54.23 s | +32% | both killed |
+| Evergreen | 13.37 → 17.18 s | +29% | 0.53 → 0.65 GB |
+| Foswiki | 10.80 → 12.83 s | +19% | 0.48 → 0.53 GB |
+| Webmin | 9.26 → 8.76 s | −5% | flat |
+| Znuny | 85.30 → 79.07 s | −7% | flat |
+
+**+19–76% wall, +2–29% RSS** where it bites. The two flat rows are controls
+rather than noise: Webmin uses path-based `require` and barely touches CPAN, and
+Znuny vendors 723 `cpan-lib` modules *inside* its workspace so its imports
+already resolved.
+
+Wall and fetch counts do **not** track each other — BMO gains 76% wall on 16%
+more fetches, openfoodfacts 34% on 168% more. The expense is what a *successful*
+resolution pulls in, not the lookup count.
+
+**Consequence:** any benchmark run without dependencies installed understates
+real resolution load by roughly a third. State which shape a number was measured
+on.
+
+## 4. Memory and fan-out are independent axes
+
+`Znuny` is the correction to an earlier framing here. It has the **lowest**
+provider fan-out of 28 corpora (8 attempts/file) and is entirely healthy on that
+axis — and it still peaks at **8.15 GB** on 3,078 files, second only to FHEM.
+Low fan-out does not imply low memory; file count does not predict either. A
+corpus needs both measured.
+
+## 5. `--heatmap` is a batch verb, not an interactive one
+
+| corpus | `--check` | `--heatmap` | ratio | max fan-in |
+|---|---:|---:|---:|---:|
+| WeBWorK (225 files) | 3.80 s | 5.00 s | 1.3x | 81 |
+| Webmin (1,333) | 4.76 s | 31.07 s | 6.5x | 199 |
+| BMO (739) | 5.39 s | 91.69 s | **17x** | 340 |
+
+Cost tracks **fan-in**, not file count — BMO is smaller than Webmin and costs
+3x more. That follows from what the verb does: it mints the `references()`
+projection at every declaration, so the work is declarations x their fan-in.
+
+**It also runs on one core.** Measured at 104-105% CPU throughout, where
+`--check`'s diagnostics sweep parallelises across all of them. So the ratios
+above are two effects compounding — more work per declaration, done serially —
+and the serial half looks addressable with the same `par_iter` + channel shape
+the diagnostics sweep already uses. Not attempted; recorded as the obvious next
+step for anyone who needs `--heatmap` to be faster.
+
+Memory is mild by comparison (Webmin 0.47 → 0.95 GB, BMO 0.49 → 0.70 GB), so
+this is a wall cost, not a memory one.
