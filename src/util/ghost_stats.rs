@@ -227,6 +227,12 @@ fn scope_add_ns(tag: &str, nanos: u128) {
 /// between construction and drop, then emits one `[build-scope]` block to the
 /// sink. Inert when the gate is off. Nesting restores the outer scope (the
 /// inner build's events are attributed to the inner scope only).
+///
+/// The gate itself is not free: with `PERL_LSP_GHOST_STATS` set, a
+/// witness-heavy build pays for every hop counter and timed region it crosses
+/// (measured ~25% wall on a 46k-line Perl file). The block's RELATIVE shares
+/// are trustworthy; its `ms=` total is not comparable to a gate-off run, so
+/// never quote gate-on and gate-off walls against each other.
 pub struct BuildScope {
     started: Option<std::time::Instant>,
     prev: Option<ScopeData>,

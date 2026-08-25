@@ -118,7 +118,9 @@ impl<'a> Builder<'a> {
     ) {
         match mode {
             ChainPassMode::PreFold => {
-                self.apply_chain_typing_assignments(idx);
+                crate::util::ghost_stats::timed("chain::assignments", || {
+                    self.apply_chain_typing_assignments(idx)
+                });
                 // Refresh `invocant_class` each iteration too.
                 // Variable invocants whose TC just landed in the
                 // worklist's previous iteration become resolvable
@@ -128,7 +130,9 @@ impl<'a> Builder<'a> {
                 // see them until the loop already terminated.
                 // `apply_chain_typing_invocants` is idempotent (skips
                 // refs whose class is already pinned).
-                self.apply_chain_typing_invocants(idx);
+                crate::util::ghost_stats::timed("chain::invocants", || {
+                    self.apply_chain_typing_invocants(idx)
+                });
             }
             ChainPassMode::PostFold => {
                 self.apply_chain_typing_invocants(idx);
@@ -365,6 +369,10 @@ impl<'a> Builder<'a> {
     /// a point-query gives the right answer at any byte.
     pub(super) fn apply_chain_typing_assignments(&mut self, idx: &ChainTypingIndex<'a>) {
         let mut to_push: Vec<(String, ScopeId, Span, InferredType)> = Vec::new();
+        crate::util::ghost_stats::count_by(
+            "chain.assignment_nodes",
+            idx.assignment_nodes.len() as u64,
+        );
         for &node in &idx.assignment_nodes {
             let (Some(left), Some(right)) = (
                 node.child_by_field_name("left"),
@@ -439,9 +447,11 @@ impl<'a> Builder<'a> {
             // already-resolved RHS.)
             let saved_pkg_probe = self.current_package.clone();
             self.current_package = self.package_at_pos(span.start).map(|s| s.to_string());
-            let fresh = self
-                .invocant_type_at_node(right)
-                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName));
+            let fresh = {
+                let _t = crate::util::ghost_stats::ScopedNs::start("chain::rhs_probe");
+                self.invocant_type_at_node(right)
+                    .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
+            };
             self.current_package = saved_pkg_probe;
 
             // Idempotency: skip if an already-pushed Variable witness at
@@ -463,6 +473,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             // Innermost scope containing this assignment.
+            let _t_scope = crate::util::ghost_stats::ScopedNs::start("chain::scope_pick");
             let scope_idx = self
                 .scopes
                 .iter()
@@ -478,6 +489,7 @@ impl<'a> Builder<'a> {
                     r * 1_000_000 + c
                 })
                 .map(|(i, _)| i);
+            drop(_t_scope);
 
             let scope_pkg = self.package_at_pos(span.start).map(|s| s.to_string());
 
@@ -492,10 +504,12 @@ impl<'a> Builder<'a> {
             // for the bareword-degrade tail (a non-class type on a
             // bareword maps to "treat the syntactic text as a
             // class") which the type-aware path doesn't model.
-            let ty_opt = self
-                .invocant_type_at_node(right)
-                .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
-                .or(fresh);
+            let ty_opt = {
+                let _t = crate::util::ghost_stats::ScopedNs::start("chain::rhs_type");
+                self.invocant_type_at_node(right)
+                    .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
+                    .or(fresh)
+            };
             self.current_package = saved_pkg;
 
             if let Some(ty) = ty_opt {
@@ -542,6 +556,8 @@ impl<'a> Builder<'a> {
                 }
             }
         }
+        crate::util::ghost_stats::count_by("chain.invocants_pending", pending.len() as u64);
+        let _t = crate::util::ghost_stats::ScopedNs::start("chain::invoc_resolve");
         for (i, node) in pending {
             if let Some(class) = self.resolve_invocant_class_tree(node) {
                 self.method_call_invocant.insert(i, class);
