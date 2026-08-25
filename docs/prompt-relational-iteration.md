@@ -268,6 +268,20 @@ the relation that answers it, and the soundness constraint.
   (`sweep.memo_hit + memo_miss ≈ attempts`; only `rehydrate.loader`'s n
   decodes) was done. State which kind any quoted counter is, and show the
   reconciliation when the two could diverge.
+- **Verify the corpus contains what the mechanism KEYS ON**, not just that
+  it is the right size — a giant-file gate was A/B'd against a subset built
+  to exclude the giants, and separately its threshold sat above what the
+  full corpus could reach. And the quantified corollary: installing real
+  dependencies costs 19–76% cold wall across six corpora (Webmin, nearly
+  CPAN-free, flat as the control) — every no-deps number understates real
+  resolution load by roughly a third, so a sizing argument states which
+  shape it measured.
+- **One claim per shell invocation when the output is evidence.** Three
+  commands in one line put a dirty-tree diff directly under a truncated
+  `git show`, and the juxtaposition was read as provenance — 20 lines
+  attributed to a commit they were never in. Separators are not
+  attribution; the pipeline's shape can lie exactly like `tail`'s exit
+  code and mawk's silent `\b`.
 - **Counters, not vibes.** Every pre-filter counts skip/decode/unknown so the
   hit rate is a ghost-stats read, and the next ranking pass starts from
   numbers (`docs/adr/skipping-cross-file-work.md`'s denominator rules apply).
