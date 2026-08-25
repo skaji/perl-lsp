@@ -883,6 +883,28 @@ pub fn plugin_fingerprint() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// The on-disk `.rhai` files the next `default_plugin_registry()` build
+/// would load, sorted — the registry cache's identity key. Paths only, no
+/// content reads: the registry never hot-reloads an edited plugin within a
+/// process (that has always required a restart), so content is not part of
+/// this identity; what CAN legitimately change mid-process is the search
+/// path itself, when `initialize` delivers a workspace root and repo-local
+/// `.perl-lsp/` discovery kicks in. Cheap enough to call per build.
+pub fn plugin_source_paths() -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for dir in plugin_search_dirs() {
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            out.extend(
+                read.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("rhai")),
+            );
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Load all `*.rhai` files from a directory. Used for user-installed plugins.
 pub fn load_plugin_dir(
     dir: &std::path::Path,

@@ -27,16 +27,16 @@ impl LanguageServer for Backend {
         // Same root drives repo-local `.perl-lsp/` plugin discovery, so the
         // plugin set and the per-project cache key can't disagree.
         crate::build::plugin::rhai_host::set_workspace_root(root);
-        // The registry's one-time cost (rhai-compiling the bundled plugins,
-        // warming every pattern query + the flow query) is ~1 s of CPU.
-        // Paid lazily it lands inside the FIRST didOpen's build — the exact
-        // window the cold-open bounded wait (400 ms) cannot cover, so a
-        // session's first pull verb answers null on any box where that
-        // second runs long. Warm it here instead, off the handler, where it
-        // overlaps the client's own startup; the first build then finds the
-        // registry ready (`OnceLock` — a racing build blocks on this warm
-        // rather than duplicating it). AFTER set_workspace_root, so the
-        // repo-local plugin set is the one being warmed.
+        // Re-validate the plugin registry now that the root is known. The
+        // heavy compile (~600 ms: rhai plugins + pattern/flow queries)
+        // already started at PROCESS start (`main`), before the handshake —
+        // the registry cell is keyed by the resolved plugin-source paths, so
+        // when this root doesn't change the on-disk set (no repo-local
+        // `.perl-lsp/`) this call is a cache hit and the first didOpen build
+        // pays nothing. When the root DOES add repo-local plugins, this is
+        // the rebuild with the right set — off the handler, and a racing
+        // build blocks on the cell rather than duplicating the work. AFTER
+        // set_workspace_root, so the repo-local plugin set is the one warmed.
         tokio::task::spawn_blocking(crate::build::plugin::default_plugin_registry);
 
         // LSP spec: `initialize` carries the client `processId`; "if the parent
