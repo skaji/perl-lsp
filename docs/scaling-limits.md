@@ -219,31 +219,39 @@ Ladder through `didOpen`, first build in a fresh server, median of 3:
 **6.2x at the top.** The small rows are NOT a regression — see below, and the
 reason two people chased one anyway is worth more than the table.
 
-### Measure the SECOND build in a process, not the first
+### The first-build constant — found, attributed, and removed
 
-Every row above is a fresh server, and **the first `build()` in a process
-carries a one-time ~600 ms cost that is not the build**: `rhai` plugin
-compilation (`default_plugin_registry`, a `OnceLock`) is lazily forced by the
-first `didOpen` and lands inside its `[PHASE] build()`.
+Every row above is a fresh server, and the first `build()` in a process used to
+carry ~600 ms that was **not the build**. On small files it dominated the
+quantity being compared, which produced an apparent 424 → 627 ms "regression"
+that two people chased.
 
-A fresh-server-per-point ladder therefore pays that constant at *every* point on
-*every* commit, and on small files it dominates the quantity being compared.
-`[05]` established this by bisect — first-build on a 1,760-line file is ~700 ms
-at all three commits (721/696, 688/685, 696/701, indistinguishable) — then by
-opening two files in one process: **712 ms, then 121 ms.**
+`[05]` bisected it: first-build on a 1,760-line file was ~700 ms at all three
+commits (721/696, 688/685, 696/701 — indistinguishable), and two `didOpen`s in
+one process gave **712 ms then 121 ms**.
 
-Per-build cost measured correctly, 3,268 lines: **121 ms post-fix against 181 ms
-pre-fix. Small files improve too.** The apparent 424 → 627 "regression" was that
-constant wobbling with box state. Tight bands either side of a shared constant
-look exactly like a real difference, which is how it survived two rounds of
-scrutiny.
+The first attribution — lazy `rhai` plugin compilation — was **wrong, and `[05]`
+retracted it themselves**. The phases now print, and they name the real cost:
 
-**Protocol: quote the second build in a process, or state the first-build
-constant explicitly. Never compare first-builds across commits.**
+```
+registry::engine          0.65 ms
+registry::rhai_compile    7.45 ms     <- rhai was never the problem
+registry::queries       119.02 ms     <- 14 tree-sitter Query::new + the flow query,
+                                         ~597 ms when run serially
+```
 
-**Separate lead, worth a ticket:** pre-warming the plugin registry from
-`initialize` on `spawn_blocking` would take ~600 ms off every editor cold open,
-independent of anything above.
+Fixed three ways (`0e33a8d4`): the registry cell is keyed by resolved `.rhai`
+paths so a pre-root warm is safe, the warm runs in `main()` before the
+handshake, and the query compiles run rayon-parallel (597 → ~140 ms). A latent
+bug went with it — the old `OnceLock` would have baked a wrong pre-root plugin
+set permanently.
+
+Result, 3,268 lines: **627 → 223 ms** (223/229/223, tight). The 46k file is
+unchanged at 5,335 ms, which is the correct signature for removing a fixed cost.
+
+**Protocol, now enforced by the code rather than by discipline:** the registry
+phases print, so a ladder cannot silently eat this constant again. Still prefer
+the second build in a process when quoting per-build cost.
 
 ### Two corrections to the first version of this section
 
