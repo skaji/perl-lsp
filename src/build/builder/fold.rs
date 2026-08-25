@@ -373,6 +373,29 @@ impl<'a> Builder<'a> {
             "chain.assignment_nodes",
             idx.assignment_nodes.len() as u64,
         );
+        // Snapshot of the bag's typed-Variable witnesses, keyed by
+        // (name, span.start) — the idempotency checks below ask exactly this
+        // question per assignment, and a full-bag scan per assignment is
+        // O(assignments * bag) (6+ s of a 46k-line file's fold). Safe as a
+        // snapshot: the RHS typer takes `&self`, and this pass's own pushes
+        // land only after the loop, so the bag cannot change mid-loop.
+        let mut typed_at: std::collections::HashMap<(String, Point), Vec<usize>> =
+            std::collections::HashMap::new();
+        {
+            let _t = crate::util::ghost_stats::ScopedNs::start("chain::already_index");
+            for (i, w) in self.bag.all().iter().enumerate() {
+                if let (
+                    crate::model::witnesses::WitnessAttachment::Variable { name, .. },
+                    crate::model::witnesses::WitnessPayload::InferredType(_),
+                ) = (&w.attachment, &w.payload)
+                {
+                    typed_at
+                        .entry((name.clone(), w.span.start))
+                        .or_default()
+                        .push(i);
+                }
+            }
+        }
         for &node in &idx.assignment_nodes {
             let (Some(left), Some(right)) = (
                 node.child_by_field_name("left"),
@@ -425,14 +448,18 @@ impl<'a> Builder<'a> {
                     let row_ty = InferredType::ClassName(row);
                     let sid = self.innermost_scope_id_at(span.start);
                     for name in list_scalars {
-                        let already = self.bag.all().iter().any(|w| {
-                            let crate::model::witnesses::WitnessPayload::InferredType(t) = &w.payload else {
-                                return false;
-                            };
-                            matches!(&w.attachment, crate::model::witnesses::WitnessAttachment::Variable { name: n, .. } if n == &name)
-                                && w.span.start == span.start
-                                && t.subsumes_narrowing(&row_ty)
-                        });
+                        let already = typed_at
+                            .get(&(name.clone(), span.start))
+                            .is_some_and(|idxs| {
+                                idxs.iter().any(|&i| {
+                                    let crate::model::witnesses::WitnessPayload::InferredType(t) =
+                                        &self.bag.all()[i].payload
+                                    else {
+                                        return false;
+                                    };
+                                    t.subsumes_narrowing(&row_ty)
+                                })
+                            });
                         if !already {
                             to_push.push((name, sid, span, row_ty.clone()));
                         }
@@ -461,13 +488,15 @@ impl<'a> Builder<'a> {
             // walk-time materialization on a later fold iteration; once
             // the brand is in the bag it subsumes the next (identical)
             // brand and the loop settles.
-            let already_typed = self.bag.all().iter().any(|w| {
-                let crate::model::witnesses::WitnessPayload::InferredType(t) = &w.payload else {
-                    return false;
-                };
-                matches!(&w.attachment, crate::model::witnesses::WitnessAttachment::Variable { name, .. } if name == &var)
-                    && w.span.start == span.start
-                    && fresh.as_ref().map_or(true, |f| t.subsumes_narrowing(f))
+            let already_typed = typed_at.get(&(var.clone(), span.start)).is_some_and(|idxs| {
+                idxs.iter().any(|&i| {
+                    let crate::model::witnesses::WitnessPayload::InferredType(t) =
+                        &self.bag.all()[i].payload
+                    else {
+                        return false;
+                    };
+                    fresh.as_ref().map_or(true, |f| t.subsumes_narrowing(f))
+                })
             });
             if already_typed {
                 continue;
@@ -491,12 +520,6 @@ impl<'a> Builder<'a> {
                 .map(|(i, _)| i);
             drop(_t_scope);
 
-            let scope_pkg = self.package_at_pos(span.start).map(|s| s.to_string());
-
-            let saved_pkg = self.current_package.clone();
-            if scope_pkg.is_some() {
-                self.current_package = scope_pkg;
-            }
             // Read the RHS's full `InferredType` first — Parametric
             // shapes need to land on the variable as Parametric, not
             // unwrapped to their `base` via `class_name()`. Falls
@@ -504,13 +527,21 @@ impl<'a> Builder<'a> {
             // for the bareword-degrade tail (a non-class type on a
             // bareword maps to "treat the syntactic text as a
             // class") which the type-aware path doesn't model.
-            let ty_opt = {
+            //
+            // When `package_at_pos` answered Some, the `fresh` probe above
+            // already ran this exact computation under this exact package
+            // override — the typer is `&self` and deterministic, so
+            // recomputing is a straight 2x on the symbolic executor. Only
+            // the None case differs (the probe typed under `None`, this
+            // path types under the walk's stale `current_package`).
+            let ty_opt = if self.package_at_pos(span.start).is_some() {
+                fresh
+            } else {
                 let _t = crate::util::ghost_stats::ScopedNs::start("chain::rhs_type");
                 self.invocant_type_at_node(right)
                     .or_else(|| self.resolve_invocant_class_tree(right).map(InferredType::ClassName))
                     .or(fresh)
             };
-            self.current_package = saved_pkg;
 
             if let Some(ty) = ty_opt {
                 let sid = scope_idx.map(|i| self.scopes[i].id).unwrap_or(ScopeId(0));
