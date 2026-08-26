@@ -237,6 +237,27 @@ through it, would freeze a degradation).
 registry chase — paid per-key. Sibling keys in the same file still answer
 from the map.
 
+**Residualization does not have a population here.** The tempting move is to
+store the residual — `ReturnOf(Receiver)` — instead of `OpenNone(self_only)`,
+and let the consult evaluate it with its own binders. Measured against the
+substrate, it converts nothing: of 4,234 self-only decodes, **zero** land on a
+key that could residualize. The self-only floor is made of `Edge` witnesses
+(8,695, of which 8,676 point at a local `Symbol`), and following those edges —
+seen-set, depth cap 8, truncation answering "not residualizable" so the
+verdict under-approximates — partitions them exactly: 97.6% floor-confirmed,
+1.34% residualizable, 1.06% depth-capped. The 116 residualizable keys are
+never consulted cross-file.
+
+Two things this pins. A bake-side share is the wrong denominator for a
+question about decodes — a bake tally counts KEYS, and the three denominators
+here (8,643 keys baked, 4,234 decodes, 2,140 provider decodes) differ enough
+that picking the wrong one mis-sizes the work. And the verdict therefore rides
+the row as `NoAnswerSelfOnlyResidualizable`, measurement-bearing like every
+other `OpenReason`, so the consult's existing `reason.tag()` weights it with
+no new instrument. `OpenNone(self_only)` is the honest floor; the instrument
+stays armed, and a workload where that row is non-zero is the one that reopens
+this.
+
 **Where it breaks.** `OpenNone` is honest but blunt: it cannot say *how
 much* of the derivation was open, so one unrecognized witness on a hot
 class's method subgraph makes every consult of that key pay full price.
@@ -256,6 +277,59 @@ fallback that would consult the index residualizes as `Link` instead. Key
 enumeration is the bag's attachment index plus symbol names plus declared
 bridges. Degradation rule: a cap hit or unrecognized payload writes
 `OpenNone`, never a truncated or guessed answer.
+
+## World-level closedness
+
+A per-class **certificate**, consulted beside the map, that turns the bake's
+silence about a member from "decode to find out" into a trusted `None`.
+
+The population is `OpenReason::AbsentNotClosed`: a class the baking file never
+declared, so its map's silence carries no information — 22.8–27.6% of open
+reasons and 96.8% wasted, the forced decode answering nothing in nearly every
+case.
+
+**This is the one fact in this layer whose staleness yields a wrong answer.**
+Everywhere else absence costs a decode; here, trusted silence about a method
+that has since come into existence is a confident lie. What discharges it is
+the rule the conclusion rows already use: the certificate self-validates
+against the live index, correctness never depends on an eraser, and every path
+out that is not a validated certificate reads as not-closed and falls open to
+exactly the decode the caller was already going to do. There is no arm where
+uncertainty becomes trust.
+
+**The validity key is one structure**: per ancestor name, the sorted
+`(provider path, surface fingerprint)` list. The sorted path list *is* the
+provider-set identity, which catches a new file arriving to provide an
+ancestor name — the case per-provider fingerprints structurally cannot see.
+The fingerprints *are* the per-provider half, catching edits to providers
+already known; a parent-list change surfaces here because `Surface` carries
+parents. Both halves sit in one structure deliberately: there is no way to
+record one without the other, so a later edit cannot drop the arrival case and
+leave something that still looks like it validates.
+
+**Every exclusion lives in `providers_of`**, the one path both `mint` and
+`is_valid` take. An exclusion checked only at mint outlives the condition it
+was minted under — a bridge arriving afterwards moves no provider and no
+fingerprint, so nothing in the recorded key can see it, and only re-asking
+catches it. The exclusions: a plugin bridge onto any class in the closure, a
+declared-dynamic parent list, a provider the index holds no freshness record
+for, and a closure wider than `MAX_CLOSURE`.
+
+Consulted at the **consumption** site — the registry's `Decode` arm, where the
+index is in hand — never where the verdict is produced, which is index-free
+inside the bake. Maps stay index-free and both EQUIV disciplines stand
+unchanged. Minting is lazy, at a consult already bound for a decode, which has
+therefore already paid the ancestry walk a mint needs.
+
+The store is byte-capped with coarse bulk-clear eviction and takes no
+invalidation hooks: a re-mint is one walk the caller was about to pay anyway,
+and validity is self-checked rather than maintained.
+
+Measured on the substrate, warm: `absent_not_closed.wasted` 323 → 15, wall
+flat. `PERL_LSP_CLOSED_EQUIV` runs the decode anyway on every trusted absence
+and reports any answer the trust claimed could not exist — zero breaks on the
+substrate and across gold. `PERL_LSP_NO_CLOSED` is the off switch and A/B
+control.
 
 ## Constraints
 

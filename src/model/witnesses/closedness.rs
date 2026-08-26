@@ -1,7 +1,8 @@
 //! World-level closedness: a per-class certificate that makes the bake's
 //! silence about a member a TRUSTED None instead of a decode.
 //!
-//! `docs/prompt-enrichment-alternatives.md` §6j owns the design. The
+//! `docs/adr/conclusion-layer.md` ("World-level closedness") owns the
+//! design. The
 //! population this serves is `OpenReason::AbsentNotClosed` — a class the
 //! baking file never declared, so its map's silence says nothing at all.
 //! Measured at 22.8–27.6% of open reasons and 96.8% WASTED: the decode that
@@ -87,18 +88,6 @@ impl ClosednessCertificate {
 
         let mut closure = Vec::with_capacity(names.len());
         for name in names {
-            // Exclusions ride the VALUE, not the name (rule #10): we ask each
-            // class whether it can be vouched for rather than matching a list
-            // of classes we happen to know about.
-            if idx.class_is_bridged_to(&name) {
-                // A plugin namespace can bridge content onto this class
-                // without any file declaring it, so the ancestry walk does not
-                // see the whole world. v1 declines rather than guessing;
-                // whether bridge-set identity can join the key is a measured
-                // follow-up, not an assumption.
-                crate::util::ghost_stats::count("closed.decline_bridged");
-                return None;
-            }
             let providers = Self::providers_of(idx, &name)?;
             closure.push((name, providers));
         }
@@ -109,10 +98,29 @@ impl ClosednessCertificate {
     /// The evidence for one name: its provider set, each with the fingerprint
     /// the index currently records. `None` if any provider cannot be vouched
     /// for, which makes the whole certificate decline.
+    ///
+    /// Every exclusion lives HERE, in the one path `mint` and `is_valid` both
+    /// take, for the same reason the validity key is one structure: an
+    /// exclusion checked only at mint holds forever on a world that has since
+    /// moved. A bridge arriving after minting moves no provider and no
+    /// fingerprint, so nothing in the recorded key can see it — only asking
+    /// again can.
     fn providers_of(
         idx: &dyn CrossFileLookup,
         name: &str,
     ) -> Option<Vec<(PathBuf, u64)>> {
+        // Exclusions ride the VALUE, not the name (rule #10): we ask each
+        // class whether it can be vouched for rather than matching a list of
+        // classes we happen to know about.
+        if idx.class_is_bridged_to(name) {
+            // A plugin namespace can bridge content onto this class without
+            // any file declaring it, so the ancestry walk does not see the
+            // whole world. v1 declines rather than guessing; whether
+            // bridge-set identity can join the key is a measured follow-up,
+            // not an assumption.
+            crate::util::ghost_stats::count("closed.decline_bridged");
+            return None;
+        }
         let cands: Arc<Vec<Arc<CachedModule>>> =
             super::session::visible_def_candidates(idx, name);
         let mut out = Vec::with_capacity(cands.len());

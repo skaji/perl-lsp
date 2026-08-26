@@ -170,6 +170,25 @@ fn a_bridged_class_in_the_closure_declines() {
 }
 
 #[test]
+fn a_bridge_arriving_after_mint_invalidates() {
+    let w = world();
+    let origin = build(CHILD);
+    let cert = ClosednessCertificate::mint(&w, &origin, "Child").expect("mintable");
+    assert!(cert.is_valid(&w));
+
+    let mut after = world();
+    after.bridged.insert("Base".to_string());
+    assert!(
+        !cert.is_valid(&after),
+        "a plugin bridged content onto an ancestor AFTER the certificate was \
+         minted. No provider arrived and no fingerprint moved, so nothing in \
+         the recorded key can see it — the exclusion has to be re-asked, not \
+         just checked at mint. Trusting this serves silence about a method \
+         that now exists."
+    );
+}
+
+#[test]
 fn a_dynamic_parent_list_in_the_closure_declines() {
     let mut w = World::default();
     w.provide("Child", "/w/Child.pm", CHILD, 11);
