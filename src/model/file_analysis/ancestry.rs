@@ -221,10 +221,30 @@ impl FileAnalysis {
         &self,
         class_name: &str,
         module_index: Option<&dyn CrossFileLookup>,
-        mut visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+        visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
     ) {
+        let _ = self.for_each_ancestor_class_reporting_truncation(
+            class_name,
+            module_index,
+            visit,
+        );
+    }
+
+    /// [`Self::for_each_ancestor_class`], plus whether the walk was cut off
+    /// by a graph bound.
+    ///
+    /// A truncated walk is indistinguishable from a small hierarchy: the
+    /// visitor simply stops seeing ancestors. That is fine for a best-effort
+    /// consumer and wrong for one whose answer means "this is the whole
+    /// ancestry" — it would claim a closure it never enumerated.
+    pub fn for_each_ancestor_class_reporting_truncation(
+        &self,
+        class_name: &str,
+        module_index: Option<&dyn CrossFileLookup>,
+        mut visit: impl FnMut(&str) -> std::ops::ControlFlow<()>,
+    ) -> bool {
         if visit(class_name).is_break() {
-            return;
+            return false;
         }
         let graph = crate::model::graph::GraphView::new(self, module_index);
         graph.walk(
@@ -240,7 +260,7 @@ impl FileAnalysis {
                 },
                 _ => crate::model::graph::WalkControl::Continue,
             },
-        );
+        )
     }
 
     /// Test-only access to the include-self ancestor walk.

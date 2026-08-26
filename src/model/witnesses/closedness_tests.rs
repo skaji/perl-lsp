@@ -20,6 +20,12 @@ struct World {
     providers: HashMap<String, Vec<Arc<CachedModule>>>,
     fingerprints: HashMap<PathBuf, u64>,
     bridged: HashSet<String>,
+    /// Moves when something registers. `mint` brackets itself with this.
+    epoch: std::cell::Cell<u64>,
+    /// Land a registration mid-mint: the ancestry walk has been read, the
+    /// fingerprint reads are starting. That is the exact straddle, because a
+    /// registration records its surface before publishing its candidate.
+    bump_on_fingerprint: std::cell::Cell<bool>,
 }
 
 impl World {
@@ -34,6 +40,9 @@ impl World {
 }
 
 impl CrossFileLookup for World {
+    fn resolution_epoch(&self) -> u64 {
+        self.epoch.get()
+    }
     fn get_cached(&self, _m: &str) -> Option<Arc<CachedModule>> {
         None
     }
@@ -78,6 +87,9 @@ impl CrossFileLookup for World {
         self.providers.get(name).cloned().unwrap_or_default()
     }
     fn surface_fingerprint_of(&self, path: &Path) -> Option<u64> {
+        if self.bump_on_fingerprint.replace(false) {
+            self.epoch.set(self.epoch.get() + 1);
+        }
         self.fingerprints.get(path).copied()
     }
     // The trait DEFAULTS this to `true` (pessimistic). A fake that forgot to
@@ -223,5 +235,57 @@ fn an_unvouched_provider_declines() {
     assert!(
         ClosednessCertificate::mint(&w, &origin, "Child").is_none(),
         "no freshness record means the index cannot vouch for the provider"
+    );
+}
+
+#[test]
+fn a_registration_across_the_mint_declines() {
+    // The closure is read from the candidates and the fingerprints from the
+    // freshness index — two reads of shared mutable state. A registration
+    // records its surface BEFORE it publishes its candidate, so a mint that
+    // straddles one pairs NEW fingerprints with an OLD closure. Every
+    // recorded pair then reads as current, and it validates forever over an
+    // ancestry it never enumerated.
+    let w = world();
+    let origin = build(CHILD);
+    w.bump_on_fingerprint.set(true);
+    assert!(
+        ClosednessCertificate::mint(&w, &origin, "Child").is_none(),
+        "a registration landed between the ancestry walk and the fingerprint \
+         reads and the mint still produced a certificate — its pairs are \
+         individually current, so nothing downstream can ever notice that the \
+         closure half is stale"
+    );
+
+    // Control: the same world, still, mints.
+    w.bump_on_fingerprint.set(false);
+    assert!(ClosednessCertificate::mint(&w, &origin, "Child").is_some());
+}
+
+#[test]
+fn a_truncated_ancestry_walk_declines() {
+    // `mint` declines on closure WIDTH. Depth is cut off by the graph bound
+    // with no signal to the visitor, so without an explicit truncation report
+    // a chain deeper than the bound certifies a PREFIX of its ancestry and
+    // the names below the cut never invalidate it.
+    let mut w = World::default();
+    // A chain longer than WalkBound::GRAPH's depth.
+    let n = 40usize;
+    for i in 0..n {
+        let cls = format!("C{i}");
+        let src = if i + 1 < n {
+            format!("package C{i};\nuse parent -norequire, 'C{}';\n1;\n", i + 1)
+        } else {
+            format!("package C{i};\nsub leaf {{ 1 }}\n1;\n")
+        };
+        w.provide(&cls, &format!("/w/C{i}.pm"), &src, 100 + i as u64);
+    }
+    let origin = build("package C0;\nuse parent -norequire, 'C1';\n1;\n");
+    assert!(
+        ClosednessCertificate::mint(&w, &origin, "C0").is_none(),
+        "a chain deeper than the graph bound minted a certificate over the \
+         prefix the walk happened to see — the ancestors below the cut are \
+         absent from the closure, so their providers change without ever \
+         invalidating it"
     );
 }

@@ -160,12 +160,19 @@ impl WalkBound {
 /// are reverse-pushed to preserve their order under LIFO); the origin is
 /// never visited (depth 0 is the caller's hand). A node AT `max_depth`
 /// is visited but not expanded; a visit past `max_visits` stops the walk.
+///
+/// Returns whether the walk was TRUNCATED — a node went unexpanded because a
+/// bound cut it off, so the visitor saw less than the graph holds. A caller
+/// that merely wants a best-effort enumeration ignores it; a caller whose
+/// correctness rests on having seen the WHOLE reachable set must not, because
+/// truncation is otherwise silent and looks exactly like a small graph.
 pub(crate) fn bounded_dfs<N: std::hash::Hash + Eq + Clone>(
     origin: N,
     bound: WalkBound,
     mut edges: impl FnMut(&N, &mut Vec<N>),
     visit: &mut dyn FnMut(&N) -> WalkControl,
-) {
+) -> bool {
+    let mut truncated = false;
     let mut seen: std::collections::HashSet<N> = std::collections::HashSet::new();
     seen.insert(origin.clone());
     let mut stack: Vec<(N, usize)> = vec![(origin, 0)];
@@ -174,16 +181,19 @@ pub(crate) fn bounded_dfs<N: std::hash::Hash + Eq + Clone>(
     while let Some((node, depth)) = stack.pop() {
         if depth > 0 {
             if visits >= bound.max_visits {
-                return;
+                return true;
             }
             visits += 1;
             match visit(&node) {
                 WalkControl::Continue => {}
                 WalkControl::PruneChildren => continue,
-                WalkControl::Stop => return,
+                WalkControl::Stop => return truncated,
             }
         }
         if depth >= bound.max_depth {
+            // Visited but not expanded: anything below it is invisible to the
+            // visitor and indistinguishable from absence.
+            truncated = true;
             continue;
         }
         next.clear();
@@ -194,6 +204,7 @@ pub(crate) fn bounded_dfs<N: std::hash::Hash + Eq + Clone>(
             }
         }
     }
+    truncated
 }
 
 impl<'a> GraphView<'a> {
@@ -207,12 +218,16 @@ impl<'a> GraphView<'a> {
     /// [`WalkControl`] verdict. On INHERITS the order is Perl's
     /// left-to-right DFS MRO, so method resolution sees ancestors in the
     /// order dispatch demands.
+    ///
+    /// Returns whether the walk was truncated by a bound — see
+    /// [`bounded_dfs`]. Best-effort callers ignore it; a caller claiming to
+    /// have seen the whole reachable set must not.
     pub fn walk(
         &self,
         origin: Node,
         mask: EdgeKindMask,
         visit: &mut dyn FnMut(&Node) -> WalkControl,
-    ) {
+    ) -> bool {
         bounded_dfs(
             origin,
             WalkBound::GRAPH,

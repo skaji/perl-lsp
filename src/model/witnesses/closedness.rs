@@ -70,8 +70,18 @@ impl ClosednessCertificate {
         origin: &FileAnalysis,
         class: &str,
     ) -> Option<Self> {
+        // The world must not move UNDER the mint. The closure is read from
+        // the registered candidates and the fingerprints from the freshness
+        // index — two reads of shared mutable state, and a registration
+        // records a surface BEFORE it publishes the candidate. Straddle one
+        // and this mints NEW fingerprints against an OLD closure: every
+        // recorded pair is current, so it validates forever over an ancestry
+        // it never enumerated. The epoch is the same counter the resolution
+        // memo rides; moving it means decline, not repair.
+        let epoch_before = idx.resolution_epoch();
+
         let mut names: Vec<String> = Vec::new();
-        origin.for_each_ancestor_class(class, Some(idx), |a| {
+        let truncated = origin.for_each_ancestor_class_reporting_truncation(class, Some(idx), |a| {
             names.push(a.to_string());
             if names.len() > MAX_CLOSURE {
                 std::ops::ControlFlow::Break(())
@@ -83,6 +93,14 @@ impl ClosednessCertificate {
             crate::util::ghost_stats::count("closed.decline_closure_size");
             return None;
         }
+        // Width declines above; depth would otherwise pass silently. A walk
+        // cut off by the graph bound saw a PREFIX of the ancestry, and the
+        // names below the cut are absent from the closure — so their
+        // providers can change without anything here noticing.
+        if truncated {
+            crate::util::ghost_stats::count("closed.decline_truncated_walk");
+            return None;
+        }
         names.sort();
         names.dedup();
 
@@ -92,6 +110,14 @@ impl ClosednessCertificate {
             closure.push((name, providers));
         }
         closure.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Both reads have happened; if anything registered across them the
+        // pair may be incoherent. Declining costs the caller nothing — it is
+        // already bound for the decode.
+        if idx.resolution_epoch() != epoch_before {
+            crate::util::ghost_stats::count("closed.decline_epoch_moved");
+            return None;
+        }
         Some(ClosednessCertificate { closure })
     }
 

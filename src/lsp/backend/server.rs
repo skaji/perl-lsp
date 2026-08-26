@@ -407,11 +407,17 @@ impl LanguageServer for Backend {
                     //
                     // Through `DiagCtx::record_surface`, not a second
                     // spelling: it owns the hub-language gate, the canonical
-                    // key and the record→verdict→dirty seam, and the
-                    // scheduled refresh below still catches an
-                    // open-after-external-change (buffer's surface vs the
-                    // indexer's record → Changed → refresh).
-                    self.diag_ctx().record_surface(&uri);
+                    // key and the record→verdict→dirty seam.
+                    //
+                    // The dirty set is acted on HERE, not left to the
+                    // scheduled refresh: this record consumes the transition,
+                    // so by the time the refresh runs the surface is already
+                    // recorded and its verdict is `Unchanged` with an empty
+                    // set. Dropping it strands the open-after-external-change
+                    // case it looks like it defers.
+                    if let Some(sd) = self.diag_ctx().record_surface(&uri) {
+                        self.spawn_republish(sd.dirty);
+                    }
                 }
             }
         }
