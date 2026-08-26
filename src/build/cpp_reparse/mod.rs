@@ -1,6 +1,6 @@
-//! SPIKE: the C++ reparse seam — macro expansion before extraction.
+//! The C++ reparse seam — macro expansion before extraction.
 //!
-//! The C++ instance of `docs/prompt-cpp-reparse.md`'s reparse-hook
+//! The C++ instance of `docs/adr/reparse-stratification.md`'s reparse-hook
 //! flavor. The obstacle course proved the worst, most common damage is
 //! a declarator-position macro: `class API_EXPORT Widget {...}` reparses
 //! as a `function_definition`, so the class evaporates. The fix is not
@@ -27,8 +27,9 @@
 //! pre-expanded bodies. Macros whose expansion itself contains further
 //! macro CALLS (X-macros: `COLOR_LIST(X)` → `X(RED) X(GREEN)`) need
 //! iterative source passes — out of scope here; that nested tail is
-//! exactly the "amortize full cpp to once" case. Deliberately not wired
-//! into the build pipeline; measured by `cpp_reparse_tests.rs`.
+//! exactly the "amortize full cpp to once" case. Wired into the `cpp`
+//! feature's `PackDriver` (`language_driver.rs::cpp_driver`); measured by
+//! `cpp_reparse_tests.rs`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;

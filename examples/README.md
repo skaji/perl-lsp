@@ -2,8 +2,8 @@
 
 Hand-readable examples for the multi-language reparse spikes. These are
 illustrative source files, NOT wired into the LSP server yet — the
-machinery lives in measured tests. Design: `docs/prompt-cpp-reparse.md`
-and `docs/spike-query-extraction.md`.
+machinery lives in measured tests. Design: `docs/adr/reparse-stratification.md`
+and `docs/adr/query-extraction-rings.md`.
 
 - **`cpp/macro_reparse.cpp`** — the showpiece. A declarator-position
   macro destroys a class; the reparse seam expands it back, and the

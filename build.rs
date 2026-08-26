@@ -5,7 +5,7 @@
 //! perfectly well-formed. Nothing downstream can catch that — the bytes
 //! decode, the shape validates, the answer is simply wrong — so the guard has
 //! to be a fingerprint that moves on its own when the derivation moves.
-//! `docs/prompt-conclusion-layer.md` owns the decision.
+//! `docs/adr/conclusion-layer.md` owns the decision.
 //!
 //! Two properties this file exists to guarantee, both of which fail silently
 //! if broken:

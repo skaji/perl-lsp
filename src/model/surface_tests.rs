@@ -400,7 +400,7 @@ fn freshness_dirty_walk_covers_renamed_away_providers() {
 /// possible, and this pins that. Making it IMPOSSIBLE means baking the
 /// bag-derived parts of the surface into the analysis at build time, which is
 /// the recorded end state; that fix is what flips this test.
-/// `docs/prompt-surface-projection-drift.md` owns both.
+/// `docs/adr/storage-engine.md` owns both.
 #[test]
 fn a_bag_evicted_analysis_projects_a_different_surface() {
     let src = "package Alpha;\nuse strict;\n\

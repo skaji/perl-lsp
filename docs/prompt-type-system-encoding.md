@@ -1,7 +1,19 @@
 # Type-system encoding for type axes + bag attachments
 
-**Status:** discussion. Two related questions deferred to graph-
-walking (or sooner if cheap).
+**Status:** discussion. Neither problem adopted the encodings proposed
+below. Problem 1 shipped as plain caller-side accessor methods
+(`dispatch_class()` / `hash_key_class()` on `InferredType`) with the
+axis discipline documented in CLAUDE.md rule #10 — option C's "lint-style
+discipline," not option A or B. Problem 2 shipped as "document and live
+with it" — the `Expr(span)` vs. `Expression(refidx)` emission contract is
+now in CLAUDE.md's build-pipeline description (step 1 and step 6). Graph
+walking (`docs/adr/graph-walking.md`) landed without collapsing the two
+attachments. What remains open is the meta-question at the bottom: does a
+FUTURE axis — especially a plugin-emitted one (DBIC's parametric
+semantics, `docs/prompt-dbic-as-plugin.md`) — want the stronger encoding
+this brief describes, or does the plain-method discipline keep scaling?
+Revisit only if a new axis produces a wrong-axis-read bug the way the
+dual-class case did.
 
 ## Problem 1 — the dual-class read
 

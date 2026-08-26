@@ -575,7 +575,7 @@ impl WorkspaceRegistrationParts {
     /// the one on disk — and nothing about the result says it is partial. The
     /// cold lane's projection was stored beside the blob precisely so the warm
     /// lane can record what the cold lane recorded instead of re-deriving a
-    /// degraded twin (`docs/prompt-surface-projection-drift.md`).
+    /// degraded twin (`docs/adr/storage-engine.md`).
     pub(crate) fn adopt_surface(&mut self, surface: crate::model::surface::Surface) {
         self.surface = Some(surface);
     }

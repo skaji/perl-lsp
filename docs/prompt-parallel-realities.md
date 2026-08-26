@@ -6,8 +6,8 @@
 
 
 **Status: PARKED — needs deep thought before any build.** Branch
-`spike/cpp-support`. Sibling to `docs/prompt-cpp-reparse.md` (the reparse
-seam) and the strategy context in
+`spike/cpp-support`. Sibling to `docs/adr/reparse-stratification.md` (the
+reparse seam) and the strategy context in
 `~/personal/resume/research-static-analysis.md` (the Klocwork / MISRA-C
 wedge). A thin proof exists (`c_preproc_tests.rs ::
 a2_parallel_realities_reduce_to_presence_conditions`); everything past it

@@ -2046,7 +2046,7 @@ fn invalidating_a_generation_drops_the_bake_that_came_with_it() {
 /// the degraded result says it is partial: 76.7% of conclusions rows read
 /// stale against rows that were correct, and a warm-start freshness verdict
 /// was computed over a file that does not exist in that shape
-/// (`docs/prompt-surface-projection-drift.md`).
+/// (`docs/adr/storage-engine.md`).
 #[test]
 fn the_persisted_surface_is_the_cold_projection() {
     let conn = test_db();

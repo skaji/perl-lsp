@@ -1111,7 +1111,7 @@ impl ModuleIndex {
     /// passes it because its own analysis is bag-evicted and `Surface::project`
     /// reads the bag — re-projecting there records a degraded twin of what the
     /// cold lane recorded, for identical bytes
-    /// (`docs/prompt-surface-projection-drift.md`). `None` keeps the
+    /// (`docs/adr/storage-engine.md`). `None` keeps the
     /// projection this token already carries.
     pub fn register_workspace_stripping(
         &self,
