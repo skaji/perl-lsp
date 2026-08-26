@@ -1264,17 +1264,19 @@ fn close_reconciles_the_disk_record() {
     let disk = build_fa("package Gadget;\nsub base { 1 }\n1;\n");
     let buffer = build_fa("package Gadget;\nsub base { 1 }\nsub unsaved { 2 }\n1;\n");
 
-    // The indexed disk copy (registration records Background — but the doc
-    // opens first here, so the registration's record is suppressed and the
-    // copy still registers).
+    // The indexed disk copy. The doc opens first, but the open-doc lane has
+    // recorded nothing yet, so the registration's Background write LANDS —
+    // suppression protects an open-doc baseline and there is none to protect.
     idx.mark_doc_open(&path);
     let _ = idx.register_workspace_resident(path.clone(), Arc::new(disk));
-    // Open-doc record: the buffer's unsaved contract change. FirstSeen —
-    // the registration's background record above was suppressed, so this
-    // is the freshness index's first sight of the path.
+    // Open-doc record: the buffer's unsaved contract change, against the disk
+    // state the registration just recorded. Changed, and truthfully so — the
+    // buffer really does differ from disk. This read FirstSeen while a
+    // Background write on a never-recorded open path was suppressed, which is
+    // the same window that left an open file declaring no dependencies.
     assert_eq!(
         idx.record_and_dirty(&path, &buffer, SurfaceWrite::OpenDoc).verdict,
-        SurfaceVerdict::FirstSeen
+        SurfaceVerdict::Changed
     );
 
     // Close: reconcile against the registered disk copy.
@@ -2502,16 +2504,23 @@ fn surface_fp(c: &Arc<CachedModule>) -> u64 {
     ))
 }
 
-/// The torn-read pin: one walk reads conclusions from ONE generation.
+/// A walk reads every row whose FINGERPRINT is valid, whatever generation
+/// published it.
 ///
-/// A flush publishes a whole round at generation N+1 while walks are in
-/// flight. Without the pin a walk can read file A's map from N and file B's
-/// from N+1 and compose them into a single cross-file answer — two halves of
-/// one answer taken from different worlds, and nothing downstream can tell.
-/// The pin costs at worst a decode, which is the fallback the layer already
-/// has for an absent row.
+/// The fingerprint is the whole validity decision. A row passes only against
+/// the world the index currently believes, and the bake is deterministic, so
+/// two rows that both pass carry the same content — reading one from
+/// generation N and one from N+1 is the same answer twice, not a torn read.
+///
+/// This replaces a generation pin that refused the second generation a walk
+/// met. That was worse than the problem it addressed: the walk went blind for
+/// the rest of the corpus, and WHICH rows it lost depended on the order
+/// consults happened to arrive in — nondeterminism shaped by wall-clock,
+/// which is the class this layer exists to delete. Base-verify by restoring
+/// the refusal: `later` then reads absent inside the walk and present outside
+/// it, which is the shape the bug had.
 #[test]
-fn one_walk_reads_conclusions_from_one_generation() {
+fn a_walk_reads_valid_rows_across_generations() {
     use crate::index::conclusion_cache::ConclusionCache;
     use crate::index::module_cache::{Generation, RowStamp};
     use crate::model::file_analysis::CrossFileLookup;
@@ -2523,7 +2532,8 @@ fn one_walk_reads_conclusions_from_one_generation() {
     let fa_l = parse_source_to_cached("package Later;\nsub b { 2 }\n1;\n", "Later");
 
     // Both rows are FRESH — each stamp matches what the index records. The
-    // only thing separating them is the generation they were published at.
+    // only thing separating them is the generation they were published at,
+    // which is exactly what must NOT matter.
     let (fp_e, fp_l) = (surface_fp(&fa_e), surface_fp(&fa_l));
     let (e_path, l_path) = (early.clone(), later.clone());
     let idx = ModuleIndex::new_for_cli();
@@ -2540,25 +2550,36 @@ fn one_walk_reads_conclusions_from_one_generation() {
     idx.record_surface(&early, &fa_e.analysis);
     idx.record_surface(&later, &fa_l.analysis);
 
-    // No walk open: independent consults make no coherence claim, so both
-    // answer. This is also the control — without it the assertions below
-    // would pass against a `conclusions_for` that answered nothing at all.
+    // Outside a walk — the control. Without it the assertions below would
+    // pass against a `conclusions_for` that answered everything blindly.
     assert!(idx.conclusions_for(&early).is_some());
     assert!(idx.conclusions_for(&later).is_some());
 
     let _walk = ResolutionSession::enter(Some(&idx as &dyn CrossFileLookup));
+    assert!(idx.conclusions_for(&early).is_some(), "generation 7 must read");
+    assert!(
+        idx.conclusions_for(&later).is_some(),
+        "a row from generation 8 read as absent inside a walk that had already \
+         seen generation 7 — the walk goes dark for every later generation, \
+         and which rows it loses depends on consult order"
+    );
     assert!(
         idx.conclusions_for(&early).is_some(),
-        "the first row consumed sets the pin; it must be readable"
+        "generation 7 must still read after 8 was seen"
     );
+
+    // A stale fingerprint is still refused — the compare that replaced the
+    // pin has to be doing the work, not merely absent.
+    let moved = parse_source_to_cached(
+        "package Later;\nsub b { 2 }\nsub c { 3 }\n1;\n",
+        "Later",
+    );
+    assert_ne!(surface_fp(&moved), fp_l, "fixture must move the surface");
+    idx.record_surface(&later, &moved.analysis);
+    idx.invalidate_derived_copies(&later);
     assert!(
         idx.conclusions_for(&later).is_none(),
-        "a row from a different generation was composed into a walk already \
-         reading generation 7 — half of this answer is from another world"
-    );
-    assert!(
-        idx.conclusions_for(&early).is_some(),
-        "the pin must admit its own generation for the rest of the walk"
+        "a row whose fingerprint no longer matches must read absent"
     );
 }
 
@@ -2692,5 +2713,109 @@ fn a_new_bridge_to_the_consumers_class_moves_the_enrichment_key() {
         !Arc::ptr_eq(&snap1, &snap2),
         "a new bridge into the consumer's class must move its enrichment key — \
          the overlay froze bridged resolution state the dep-name walk cannot see"
+    );
+}
+
+/// A consult that rejects a stale row says so, once.
+///
+/// The repair frontier is enumerated from the store's own "what is missing"
+/// query, which sees absence and cannot see a row that exists and is simply
+/// wrong. Without this push the residual drift never self-heals: the row is
+/// rejected on every consult, forever, and the layer pays a decode each time
+/// while a correct row sits one repair away.
+///
+/// Once, because a stale path is rejected as many times as it is consulted —
+/// tens of thousands per sweep — and that is still one repair.
+#[test]
+fn a_rejected_row_enqueues_its_path_for_repair_exactly_once() {
+    use crate::index::conclusion_cache::ConclusionCache;
+    use crate::index::module_cache::{Generation, RowStamp};
+    use crate::model::file_analysis::CrossFileLookup;
+    use crate::model::witnesses::ConclusionMap;
+
+    let path = std::path::PathBuf::from("/fake/Drifted.pm");
+    let before = parse_source_to_cached("package Drifted;\nsub a { 1 }\n1;\n", "Drifted");
+    let after =
+        parse_source_to_cached("package Drifted;\nsub a { 1 }\nsub b { 2 }\n1;\n", "Drifted");
+    assert_ne!(surface_fp(&before), surface_fp(&after), "fixture must move");
+
+    let stamp = RowStamp {
+        source_fingerprint: surface_fp(&before),
+        flush_generation: Generation(1),
+    };
+    let idx = ModuleIndex::new_for_cli();
+    idx.set_conclusion_cache(Arc::new(ConclusionCache::new(1 << 20, move |_p| {
+        Some((ConclusionMap::default(), stamp))
+    })));
+    idx.record_surface(&path, &after.analysis);
+
+    assert_eq!(idx.repair_pushed_len_for_test(), 0, "precondition");
+    for _ in 0..5 {
+        assert!(idx.conclusions_for(&path).is_none(), "the row is stale");
+    }
+    assert_eq!(
+        idx.repair_pushed_len_for_test(),
+        1,
+        "a rejected row must enqueue its path for repair — and five \
+         rejections of one path are one repair, not five"
+    );
+}
+
+/// A Background write LANDS on an open path the open-doc lane has not
+/// recorded yet — and the consumer edge it declares exists immediately.
+///
+/// The suppression rule protects an open-doc BASELINE, so it only means
+/// something once one exists. Keyed on mere openness it yielded to a writer
+/// that did not exist: between `didOpen` and the first debounced refresh the
+/// file had no record at all, declared no dependencies, and a watcher-driven
+/// wave over one of its providers found no consumer and marked nobody. The
+/// verdict lied too — `Unchanged` about a path the index had never seen.
+///
+/// Two-sided on purpose. The `FirstSeen` assertion cannot be satisfied by the
+/// fail-open default, and the suppression assertion below it pins that the
+/// fix did not simply delete the rule.
+#[test]
+fn a_background_write_lands_until_the_open_doc_lane_has_recorded() {
+    use crate::index::module_index::SurfaceWrite;
+    use crate::model::surface::{Surface, SurfaceVerdict};
+
+    let idx = ModuleIndex::new_for_cli();
+    let consumer = std::path::PathBuf::from("/fake/Con.pm");
+    let provider = std::path::PathBuf::from("/fake/Prov.pm");
+    let con = parse_source_to_cached("package Con;\nuse Prov;\nsub r { 1 }\n1;\n", "Con");
+    let prov = parse_source_to_cached("package Prov;\nsub m { 1 }\n1;\n", "Prov");
+    idx.record_surface(&provider, &prov.analysis);
+
+    idx.mark_doc_open(&consumer);
+    let v = idx.record_surface(&consumer, &con.analysis);
+    assert_eq!(
+        v,
+        SurfaceVerdict::FirstSeen,
+        "a Background write on an open path with NO open-doc record was \
+         suppressed, and told its caller `Unchanged` about a file the index \
+         has never seen"
+    );
+    assert!(
+        idx.dirty_consumers(&provider).contains(&consumer),
+        "the consumer edge must exist as soon as the record does — without \
+         it a wave over Prov marks nobody, which is 6a's whole inert lane"
+    );
+
+    // The rule still applies once there IS a baseline to protect: an
+    // open-doc write claims the path, and Background yields to it again.
+    idx.record_and_dirty_value(
+        &consumer,
+        Surface::project(&con.analysis),
+        SurfaceWrite::OpenDoc,
+    );
+    let moved = parse_source_to_cached(
+        "package Con;\nuse Prov;\nsub r { 1 }\nsub s { 2 }\n1;\n",
+        "Con",
+    );
+    assert_eq!(
+        idx.record_surface(&consumer, &moved.analysis),
+        SurfaceVerdict::Unchanged,
+        "a Background write must yield once the open-doc lane owns the record \
+         — consumers read the buffer, and the disk state is not what they see"
     );
 }

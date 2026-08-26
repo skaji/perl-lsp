@@ -47,6 +47,40 @@ return function(opts)
     end
   end
 
+  -- telescope.nvim, same OPTIMISTIC + interactive-only contract as aerial:
+  -- never loads headless, never errors when the clone is absent, and lives
+  -- outside the global nvim config. Sets `telescope_ok` for the LSP keymaps
+  -- below, which fall back to the built-in quickfix pickers without it.
+  local telescope_ok = false
+  if #vim.api.nvim_list_uis() > 0 then
+    local dev = vim.fn.expand("~/.local/share/nvim-dev-plugins")
+    local plenary, tele = dev .. "/plenary.nvim", dev .. "/telescope.nvim"
+    if vim.fn.isdirectory(plenary) == 1 and vim.fn.isdirectory(tele) == 1 then
+      vim.opt.runtimepath:prepend(plenary)
+      vim.opt.runtimepath:prepend(tele)
+      local ok, telescope = pcall(require, "telescope")
+      if ok then
+        -- `fname_width` matters here: perl-lsp answers with deep @INC and
+        -- vendor paths, and the default truncation hides exactly the segment
+        -- that distinguishes two providers of one package name.
+        telescope_ok = pcall(telescope.setup, {
+          defaults = {
+            path_display = { "truncate" },
+            layout_strategy = "vertical",
+            layout_config = { vertical = { width = 0.9, height = 0.9, preview_height = 0.5 } },
+          },
+          pickers = {
+            lsp_references = { fname_width = 60, include_declaration = true },
+            lsp_definitions = { fname_width = 60 },
+            lsp_implementations = { fname_width = 60 },
+            lsp_dynamic_workspace_symbols = { fname_width = 60 },
+            lsp_document_symbols = { fname_width = 60 },
+          },
+        })
+      end
+    end
+  end
+
   -- Indexing progress spinner, interactive-only (never headless — e2e stays
   -- quiet + plugin-free). The server emits window/workDoneProgress for the
   -- workspace index (perl + pack tokens); this shows a top-right spinner so you
@@ -151,15 +185,39 @@ return function(opts)
       vim.lsp.completion.enable(true, client_id, buf, { autotrigger = true })
       vim.lsp.inlay_hint.enable(true, { bufnr = buf })
 
-      -- Navigation
-      vim.keymap.set("n", "gd", vim.lsp.buf.definition, kopts)
-      vim.keymap.set("n", "gi", vim.lsp.buf.implementation, kopts)
-      vim.keymap.set("n", "gr", vim.lsp.buf.references, kopts)
+      -- Navigation. Telescope when it loaded, the built-ins otherwise — the
+      -- verbs are identical either way, only the result UI differs, so a
+      -- missing clone costs presentation and never coverage.
+      local function pick(name, builtin)
+        if not telescope_ok then
+          return builtin
+        end
+        return function()
+          local ok, tb = pcall(require, "telescope.builtin")
+          if ok and tb[name] then
+            tb[name]()
+          else
+            builtin()
+          end
+        end
+      end
+
+      vim.keymap.set("n", "gd", pick("lsp_definitions", vim.lsp.buf.definition), kopts)
+      vim.keymap.set("n", "gi", pick("lsp_implementations", vim.lsp.buf.implementation), kopts)
+      vim.keymap.set("n", "gr", pick("lsp_references", vim.lsp.buf.references), kopts)
       vim.keymap.set("n", "K", vim.lsp.buf.hover, kopts)
 
       -- Rename / outline
       vim.keymap.set("n", "<leader>rn", vim.lsp.buf.rename, kopts)
-      vim.keymap.set("n", "<leader>o", vim.lsp.buf.document_symbol, kopts)
+      vim.keymap.set("n", "<leader>o", pick("lsp_document_symbols", vim.lsp.buf.document_symbol), kopts)
+
+      -- Workspace symbols. `lsp_dynamic_workspace_symbols` re-queries the
+      -- server on every keystroke rather than filtering one initial response,
+      -- which is the point: it exercises the relational sym-row path per
+      -- prefix instead of once.
+      vim.keymap.set("n", "<leader>s", pick("lsp_dynamic_workspace_symbols", function()
+        vim.lsp.buf.workspace_symbol("")
+      end), kopts)
 
       -- Document highlight: symbol under cursor
       vim.api.nvim_create_autocmd({ "CursorHold", "CursorHoldI" }, {

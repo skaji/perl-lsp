@@ -2186,3 +2186,43 @@ fn a_surface_write_that_stores_nothing_leaves_no_stale_row() {
          it is stale, and the repair frontier's NOT EXISTS will never see it"
     );
 }
+
+/// A surface must not outlive the blob it was projected from.
+///
+/// It is a derivation of the analysis, exactly as the baked map is, and it is
+/// written by the same `encode_analysis` call. An orphaned surface is the
+/// "a derivation outlived its source" shape one table over: the warm lane
+/// adopts a projection of a file the store no longer holds, and records it as
+/// this path's freshness surface. Both erasers are covered — the per-path
+/// invalidation and the hard clear.
+#[test]
+fn a_surface_does_not_outlive_its_blob() {
+    let conn = test_db();
+    let path = std::path::Path::new("/erase/App.pm");
+    let cached = parse_source_to_cached(
+        "package Erase::App;\nuse Mojolicious::Lite;\n\
+         plugin 'CloveApp', { alpha => 1 };\nsub helper { return 'x' }\n1;\n",
+        path,
+    );
+    assert!(save_to_db(&conn, "Erase::App", &Some(cached.clone()), "workspace"));
+    assert!(load_surface(&conn, "/erase/App.pm").is_some(), "precondition");
+
+    // Per-path: the blob goes, so the projection of it must go too.
+    invalidate_generation(&conn, "/erase/App.pm");
+    assert!(
+        load_surface(&conn, "/erase/App.pm").is_none(),
+        "the surface survived the blob it was projected from — a warm lane \
+         would adopt it and record a projection of a file the store no \
+         longer holds"
+    );
+
+    // Hard clear: same rule, the other door.
+    assert!(save_to_db(&conn, "Erase::App", &Some(cached.clone()), "workspace"));
+    assert!(load_surface(&conn, "/erase/App.pm").is_some(), "precondition");
+    conn.execute("DELETE FROM modules", []).unwrap();
+    clear_derived_rows(&conn).unwrap();
+    assert!(
+        load_surface(&conn, "/erase/App.pm").is_none(),
+        "a hard clear left the surfaces table behind"
+    );
+}

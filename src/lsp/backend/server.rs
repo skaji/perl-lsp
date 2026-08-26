@@ -390,14 +390,34 @@ impl LanguageServer for Backend {
         if opened {
             if let (Ok(path), Some(doc)) = (uri.to_file_path(), self.files.get_open(&uri)) {
                 // Hub-integrated languages record @INC residency here; pack
-                // freshness is the invalidator's disk-side gate. The Surface
-                // record rides the scheduled refresh (`DiagCtx::record_surface`),
-                // which also catches an open-after-external-change (buffer's
-                // surface vs the indexer's record → Changed → refresh).
+                // freshness is the invalidator's disk-side gate.
                 if crate::build::language_driver::LanguageRegistry::caps(doc.language)
                     .hub_enrichment
                 {
                     self.module_index.mark_doc_open(&path);
+                    // Record the buffer's surface NOW rather than waiting for
+                    // the debounced refresh. Until this lands the file
+                    // declares no dependencies, so a watcher-driven wave over
+                    // one of its providers finds no consumer edge and marks
+                    // nobody — a real window, 150 ms wide, that opens on every
+                    // didOpen. `Document::baseline_surface` is the value the
+                    // architecture already designates: build-time and
+                    // pre-enrichment, which keeps the record
+                    // enrichment-invariant exactly as the debounced write is.
+                    //
+                    // Through `DiagCtx::record_surface`, not a second
+                    // spelling: it owns the hub-language gate, the canonical
+                    // key and the record→verdict→dirty seam.
+                    //
+                    // The dirty set is acted on HERE, not left to the
+                    // scheduled refresh: this record consumes the transition,
+                    // so by the time the refresh runs the surface is already
+                    // recorded and its verdict is `Unchanged` with an empty
+                    // set. Dropping it strands the open-after-external-change
+                    // case it looks like it defers.
+                    if let Some(sd) = self.diag_ctx().record_surface(&uri) {
+                        self.spawn_republish(sd.dirty);
+                    }
                 }
             }
         }

@@ -29,6 +29,19 @@ pub(crate) struct IndexCore {
     /// retraction is one lookup miss and a contributor's touches only its own
     /// names.
     shapes_by_contributor: DashMap<String, Vec<String>>,
+    /// Paths whose persisted derivation a consult found STALE — the repair
+    /// lane's push half.
+    ///
+    /// The frontier query detects ABSENCE (no map, or no surface at this
+    /// projection version); it cannot see a row that exists and is simply
+    /// wrong, and teaching it a fingerprint join would make an O(corpus) scan
+    /// out of a check the consult already performed. So the site that
+    /// rejected the row says so, and residual drift self-heals through the
+    /// same lane as absence.
+    ///
+    /// A set, not a queue: a stale path rejected ten thousand times in one
+    /// sweep is one repair.
+    pub(crate) repair_pushed: DashMap<std::path::PathBuf, ()>,
     /// Modules loaded from cache with an old extract_version.
     /// Eligible for priority re-resolution when requested.
     pub(crate) stale_modules: DashMap<String, ()>,
@@ -127,6 +140,7 @@ impl IndexCore {
             edges: ModuleEdgeIndexes::new(),
             loader_config_shapes: DashMap::new(),
             shapes_by_contributor: DashMap::new(),
+            repair_pushed: DashMap::new(),
             stale_modules: DashMap::new(),
             builtins: DashMap::new(),
             available_modules: DashMap::new(),

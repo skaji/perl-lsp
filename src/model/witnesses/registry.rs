@@ -1172,6 +1172,10 @@ impl ReducerRegistry {
             // building: a decode whose chase then answers nothing locally was
             // spent walking to a parent the map could have named.
             let mut decode_cause: Option<super::OpenReason> = None;
+            // Set when a certificate said this candidate's silence is real and
+            // `PERL_LSP_CLOSED_EQUIV` asked for the decode anyway, so the arm
+            // below can report an answer the trust claimed could not exist.
+            let mut closed_absence = false;
             // Under the equivalence flag a followed answer is held
             // rather than returned, so the chase below runs and can
             // contradict it.
@@ -1384,7 +1388,43 @@ impl ReducerRegistry {
                         super::Outcome::Decode(reason) => {
                             crate::util::ghost_stats::count("consult.baked_open");
                             crate::util::ghost_stats::count(reason.tag());
-                            decode_cause = Some(reason);
+                            // World-level closedness (§6j). `AbsentNotClosed`
+                            // means "this file never declared the class, so
+                            // its silence says nothing" — but if the class's
+                            // whole ancestry is enumerable AND every provider
+                            // still matches what a certificate recorded, then
+                            // silence across that closure is a real None and
+                            // the decode buys nothing. Measured at 96.8%
+                            // wasted in this population.
+                            //
+                            // The certificate is consulted HERE, at the
+                            // consumption site, because this is where the
+                            // index is in hand — the verdict itself is
+                            // produced index-free inside the bake, which is
+                            // what keeps maps index-free and both EQUIV
+                            // disciplines intact.
+                            if reason == super::OpenReason::AbsentNotClosed
+                                && super::closedness::class_is_closed(
+                                    idx,
+                                    &cached.analysis,
+                                    package,
+                                )
+                            {
+                                crate::util::ghost_stats::count(
+                                    "closed.trusted_absence",
+                                );
+                                if super::verify_closedness() {
+                                    // Score the read: decode anyway and let
+                                    // the arm below report any answer this
+                                    // trusted absence claimed could not exist.
+                                    closed_absence = true;
+                                    decode_cause = Some(reason);
+                                } else {
+                                    continue;
+                                }
+                            } else {
+                                decode_cause = Some(reason);
+                            }
                         }
                     }
                 } else {
@@ -1515,6 +1555,19 @@ impl ReducerRegistry {
                             if v == ReducedValue::None { "wasted" } else { "paid" }
                         ));
                     }
+                }
+                if closed_absence && v != ReducedValue::None {
+                    // The certificate validated and the class's whole
+                    // ancestry was enumerable, yet the chase found an answer
+                    // there. Trusting that silence would have served a
+                    // confident `None` — the one failure in this arc whose
+                    // cost is a wrong answer rather than a decode.
+                    crate::util::ghost_stats::count("closedequiv.break");
+                    log::warn!(
+                        "closed equiv: trusted absence for '{package}' but the \
+                         chase answered — the certificate's closure is not the \
+                         whole world for this class"
+                    );
                 }
                 if v != ReducedValue::None {
                     v

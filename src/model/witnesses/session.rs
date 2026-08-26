@@ -98,16 +98,18 @@ struct SessionState {
     /// outlive the verb that wanted it and answer the next one. The session is
     /// the natural scope: it is opened per walk by the verb that knows.
     profile: Option<crate::model::file_analysis::EnrichmentProfile>,
-    /// The store generation this walk has committed to reading conclusions
-    /// at, set by the first row it consumes.
+    /// The store generation of the FIRST conclusions row this walk consumed
+    /// — an audit mark, not a gate.
     ///
-    /// A flush publishes a whole round at generation N+1 while a walk is in
-    /// flight, so without this a walk could read file A's map from N and
-    /// file B's from N+1 — two halves of a cross-file answer taken from
-    /// different worlds. Pinning costs at worst a decode: a row from another
-    /// generation reads as absent, which is the fallback the layer already
-    /// has. It is never wrong, and there is no version of this that is
-    /// cheaper AND coherent.
+    /// Rows carry a content fingerprint, and one passes only against the
+    /// world the index currently believes; the bake is deterministic, so two
+    /// rows that pass carry the same content whatever generation published
+    /// them. Per-row fingerprint validity therefore IS the torn-read
+    /// protection, and a generation compare at admission adds only darkness:
+    /// a walk that refused the first differing generation went blind for the
+    /// rest of the corpus, and WHICH rows it lost depended on consult order
+    /// — nondeterminism shaped by wall-clock, which is the class this layer
+    /// exists to delete.
     conclusion_generation: Option<i64>,
     paths: HashMap<PathBuf, u32>,
     memo: HashMap<CandidateKey, Arc<ReducedValue>>,
@@ -271,32 +273,24 @@ impl ResolutionSession {
         SESSION.with(|s| s.borrow().as_ref().and_then(|st| st.profile))
     }
 
-    /// May this walk read a conclusions row published at `generation`?
+    /// Record that this walk read a conclusions row published at
+    /// `generation`, and count it when a walk spans more than one.
     ///
-    /// The first row consumed sets the pin; every later row must agree with
-    /// it or read as absent for the rest of the walk. With no session open
-    /// the answer is always yes — a background cascade issues independent
-    /// consults and makes no cross-file coherence claim for the pin to
-    /// protect.
+    /// Observation only — it admits nothing and refuses nothing. Whether a
+    /// row may be read is settled by its fingerprint before this is called
+    /// (see the field's doc for why that is sufficient). The count is worth
+    /// keeping because a walk spanning generations means a flush published
+    /// underneath it, which is the thing to look at first if a cross-file
+    /// answer ever does turn out incoherent.
     ///
     /// Called with the index the consult is running against so a foreign
-    /// index's rows can't set (or trip over) this session's pin.
-    pub fn admit_conclusion_generation(
-        idx: &dyn CrossFileLookup,
-        generation: i64,
-    ) -> bool {
+    /// index's rows can't mark this session.
+    pub fn note_conclusion_generation(idx: &dyn CrossFileLookup, generation: i64) {
         with_session(idx, |st| match st.conclusion_generation {
-            None => {
-                st.conclusion_generation = Some(generation);
-                true
-            }
-            Some(pinned) if pinned == generation => true,
-            Some(_) => {
-                crate::util::ghost_stats::count("conclrow.generation_skew");
-                false
-            }
-        })
-        .unwrap_or(true)
+            None => st.conclusion_generation = Some(generation),
+            Some(seen) if seen == generation => {}
+            Some(_) => crate::util::ghost_stats::count("conclrow.generation_skew"),
+        });
     }
 
     /// Declare that this walk answered with less than it could have. Any
@@ -358,8 +352,8 @@ fn with_session<R>(
         if now != st.epoch {
             crate::util::ghost_stats::count("session.epoch_clear");
             st.epoch = now;
-            // The pin goes with the memo: the index moved, so a later
-            // generation is not a torn read, it is the new truth.
+            // The mark goes with the memo: the index moved, so a later
+            // generation is the new truth rather than a skew worth counting.
             st.conclusion_generation = None;
             st.memo.clear();
             st.candidates.clear();

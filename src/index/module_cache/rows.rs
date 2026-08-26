@@ -232,7 +232,7 @@ pub fn invalidate_generation(conn: &Connection, path: &str) {
     let _ = conn.execute("DELETE FROM modules WHERE path = ?1", params![path]);
     delete_stub(conn, path);
     delete_ref_rows(conn, path);
-    forget_orphaned_conclusions(conn, path);
+    forget_orphaned_derivations(conn, path);
 }
 
 /// Drop a path's baked map once no blob is left to have derived it.
@@ -257,9 +257,15 @@ pub fn invalidate_generation(conn: &Connection, path: &str) {
 /// the layer across a whole GC sweep and put the survivors on the repair
 /// frontier for nothing.
 ///
+/// Covers BOTH derivations of the blob — the baked map and the projected
+/// surface. They are written together by one `encode_analysis` and share this
+/// condition exactly, so they are erased together; a surviving surface would
+/// be the same "a derivation outlived its source" shape one table over, and
+/// the warm lane would adopt a projection of a file the store no longer holds.
+///
 /// The RAM twin is `ModuleIndex::invalidate_conclusions`; both halves are
 /// needed and neither is sufficient.
-fn forget_orphaned_conclusions(conn: &Connection, path: &str) {
+fn forget_orphaned_derivations(conn: &Connection, path: &str) {
     let still_persisted: bool = conn
         .query_row(
             "SELECT 1 FROM modules WHERE path = ?1 LIMIT 1",
@@ -269,6 +275,7 @@ fn forget_orphaned_conclusions(conn: &Connection, path: &str) {
         .is_ok();
     if !still_persisted {
         super::forget_conclusions(conn, path);
+        super::forget_surface(conn, path);
     }
 }
 
@@ -300,7 +307,7 @@ pub fn invalidate_generation_tier(conn: &Connection, path: &str, source: &str) {
         "DELETE FROM files WHERE path = ?1 AND source = ?2",
         params![path, source],
     );
-    forget_orphaned_conclusions(conn, path);
+    forget_orphaned_derivations(conn, path);
 }
 
 /// Remove a deleted file's rows (the removal half of `shred_derived_rows`).

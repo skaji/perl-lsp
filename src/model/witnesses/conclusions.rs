@@ -122,6 +122,16 @@ pub enum OpenReason {
     /// No answer, and the only rung the chase named was the key being baked.
     /// A `Link` here would walk to where the consult already is.
     NoAnswerSelfOnly,
+    /// Self-only, AND the fold reaches a binder-dependent shape through its
+    /// edges — so a residualizing form (`ReturnOf` evaluated with the
+    /// consult's own binders) could serve it where `OpenNone` cannot.
+    ///
+    /// Split out from `NoAnswerSelfOnly` for one reason: the share that
+    /// residualization could convert is a question about DECODES, and a
+    /// bake-side tally counts KEYS. Carrying the verdict on the row is what
+    /// lets the consult-side `.wasted`/`.paid` weighting answer it. Behaves
+    /// identically — both are `Outcome::Decode`.
+    NoAnswerSelfOnlyResidualizable,
     /// No answer, and the chase named rungs a `Link` could carry. This is the
     /// population a widening would convert, and the only one that is.
     NoAnswerLinkable,
@@ -157,6 +167,9 @@ impl OpenReason {
         match self {
             OpenReason::NoAnswerOpaque => "concl.open.no_answer_opaque",
             OpenReason::NoAnswerSelfOnly => "concl.open.no_answer_self_only",
+            OpenReason::NoAnswerSelfOnlyResidualizable => {
+                "concl.open.no_answer_self_only_residualizable"
+            }
             OpenReason::NoAnswerLinkable => "concl.open.no_answer_linkable",
             OpenReason::BinderDependent => "concl.open.binder_dependent",
             OpenReason::KindDisagreement => "concl.open.kind_disagreement",
@@ -935,7 +948,14 @@ fn bake_one(
             // richer conclusion FORM would reach this key. It is the bag's own
             // openness, and it is the population a widening cannot touch.
             None => OpenReason::NoAnswerOpaque,
-            Some(t) if t.is_empty() => OpenReason::NoAnswerSelfOnly,
+            Some(t) if t.is_empty() => {
+                census_self_only(bag, att);
+                if self_only_residualizable(bag, att) {
+                    OpenReason::NoAnswerSelfOnlyResidualizable
+                } else {
+                    OpenReason::NoAnswerSelfOnly
+                }
+            }
             Some(_) => OpenReason::NoAnswerLinkable,
         };
         if mint_links_enabled() {
@@ -1010,6 +1030,177 @@ fn bake_one(
             demote("bake.demoted_by_binder_probe", OpenReason::BinderDependent)
         }
     }
+}
+
+/// Shape breakdown of the self-only population, one hop: does the attachment
+/// itself carry a binder-dependent `ReturnExpr`, and if not, what is the
+/// floor made of?
+///
+/// `sole_return_expr` already bakes the single-witness case, so what lands
+/// here with witnesses is the SEVERAL case — which is why the shapes matter:
+/// several branches of one `UnionOnArgs` are combinable, several unrelated
+/// shapes may not be.
+///
+/// Counters only. The verdict that rides the row comes from
+/// `self_only_residualizable`, which asks the same question of the whole
+/// fold rather than of one attachment.
+fn census_self_only(bag: &WitnessBag, att: &WitnessAttachment) {
+    if !crate::util::ghost_stats::enabled() {
+        return;
+    }
+    let mut n = 0usize;
+    for w in bag.for_attachment(att) {
+        let super::types::WitnessPayload::ReturnExpr(re) = &w.payload else {
+            continue;
+        };
+        n += 1;
+        crate::util::ghost_stats::count(match re {
+            ReturnExpr::Receiver => "selfonly.shape_receiver",
+            ReturnExpr::ReceiverOr(_) => "selfonly.shape_receiver_or",
+            ReturnExpr::UnionOnArgs { .. } => "selfonly.shape_union_on_args",
+            ReturnExpr::Concrete(_) => "selfonly.shape_concrete",
+            ReturnExpr::Operator(_) => "selfonly.shape_operator",
+            _ => "selfonly.shape_other",
+        });
+    }
+    crate::util::ghost_stats::count(if n == 0 {
+        // No binder-dependent shape to store. This is the floor — and what
+        // the attachment DOES carry says what the floor is made of, which is
+        // the difference between "nothing to store" and "something we have
+        // not thought of a form for".
+        for w in bag.for_attachment(att) {
+            crate::util::ghost_stats::count(match &w.payload {
+                super::types::WitnessPayload::InferredType(_) => "selfonly.floor_inferred_type",
+                super::types::WitnessPayload::Edge(t) => {
+                    // WHERE the edge points decides whether this floor is the
+                    // documented residualizing-registry gap or something new.
+                    crate::util::ghost_stats::count(match t {
+                        WitnessAttachment::Symbol(_) => "selfonly.edge_to_symbol",
+                        WitnessAttachment::PackageSymbol { .. } => "selfonly.edge_to_pkgsym",
+                        WitnessAttachment::Variable { .. } => "selfonly.edge_to_variable",
+                        WitnessAttachment::Expression(_) => "selfonly.edge_to_expression",
+                        _ => "selfonly.edge_to_other",
+                    });
+                    // Does the target project onto the SAME conclusion key —
+                    // the writeback's mirror pointing back at the key being
+                    // baked? Only answerable for a target that HAS a portable
+                    // key: `Edge(Symbol(_))` projects to `None`, so a zero
+                    // here is a property of the projection and not evidence
+                    // about the edge. Read it against `edge_to_pkgsym`.
+                    if let (Some(a), Some(b)) = (
+                        ConclusionKey::from_attachment(t),
+                        ConclusionKey::from_attachment(att),
+                    ) {
+                        if a == b {
+                            crate::util::ghost_stats::count("selfonly.edge_is_self_mirror");
+                        }
+                    }
+                    "selfonly.floor_edge"
+                }
+                super::types::WitnessPayload::Observation(_) => "selfonly.floor_observation",
+                super::types::WitnessPayload::Fact { .. } => "selfonly.floor_fact",
+                _ => "selfonly.floor_other",
+            });
+        }
+        if bag.for_attachment(att).is_empty() {
+            crate::util::ghost_stats::count("selfonly.floor_no_witnesses_at_all");
+        }
+        "selfonly.not_residualizable"
+    } else {
+        "selfonly.residualizable"
+    });
+    if n > 1 {
+        crate::util::ghost_stats::count("selfonly.residualizable_several");
+    }
+    census_reachable_shapes(bag, att);
+}
+
+/// Does the fold behind this self-only key terminate in a binder-dependent
+/// shape? That is the whole of §6l's gate: `ReturnOf(Receiver)` can be stored
+/// and evaluated with the consult's own binders, where `OpenNone` can only
+/// say "go decode".
+///
+/// The question is about the FOLD, not about this attachment — a fold ends
+/// wherever the edge chase ends — so the walk follows the edges the bag
+/// holds. Bounded by a seen-set and a depth cap because those edges are a
+/// graph, not a tree: the writeback's `PackageSymbol -> Edge(Symbol)` mirrors
+/// make cycles. A truncated walk answers `false`, so the verdict
+/// under-approximates rather than over-claims.
+///
+/// Runs unconditionally, not behind the stats gate: the answer is stored on
+/// the row so the consult side can weight it by decodes. It is confined to
+/// the self-only branch — 3.3% of bakes on the substrate, ~3.6 attachments
+/// each.
+fn self_only_residualizable(bag: &WitnessBag, att: &WitnessAttachment) -> bool {
+    walk_reachable(bag, att, &mut |_re| {}).0
+}
+
+/// Shape breakdown of what the walk reaches. Gated: this is the census, not
+/// the verdict.
+fn census_reachable_shapes(bag: &WitnessBag, att: &WitnessAttachment) {
+    if !crate::util::ghost_stats::enabled() {
+        return;
+    }
+    let (found, truncated, visited) = walk_reachable(bag, att, &mut |re| {
+        crate::util::ghost_stats::count(match re {
+            ReturnExpr::Receiver => "selfonly.reach_receiver",
+            ReturnExpr::ReceiverOr(_) => "selfonly.reach_receiver_or",
+            ReturnExpr::UnionOnArgs { .. } => "selfonly.reach_union_on_args",
+            ReturnExpr::Concrete(_) => "selfonly.reach_concrete",
+            ReturnExpr::Operator(_) => "selfonly.reach_operator",
+            _ => "selfonly.reach_other",
+        });
+    });
+    crate::util::ghost_stats::count(if found {
+        "selfonly.residualizable_via_edges"
+    } else if truncated {
+        "selfonly.floor_unproven_depth_capped"
+    } else {
+        "selfonly.floor_confirmed"
+    });
+    crate::util::ghost_stats::count_by("selfonly.reach_attachments", visited as u64);
+}
+
+/// The shared walk: `(reached a ReturnExpr, truncated, attachments visited)`.
+/// One speller so the verdict and the census cannot disagree about what
+/// "reachable" means.
+fn walk_reachable(
+    bag: &WitnessBag,
+    att: &WitnessAttachment,
+    on_shape: &mut dyn FnMut(&ReturnExpr),
+) -> (bool, bool, usize) {
+    use super::types::WitnessPayload;
+    const MAX_DEPTH: usize = 8;
+    let mut seen: Vec<WitnessAttachment> = vec![att.clone()];
+    let mut frontier: Vec<WitnessAttachment> = vec![att.clone()];
+    let mut found = false;
+    let mut depth = 0usize;
+    while !frontier.is_empty() {
+        if depth == MAX_DEPTH {
+            return (found, !found, seen.len());
+        }
+        depth += 1;
+        let mut next = Vec::new();
+        for a in frontier.drain(..) {
+            for w in bag.for_attachment(&a) {
+                match &w.payload {
+                    WitnessPayload::ReturnExpr(re) => {
+                        found = true;
+                        on_shape(re);
+                    }
+                    WitnessPayload::Edge(t) => {
+                        if !seen.contains(t) {
+                            seen.push(t.clone());
+                            next.push(t.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        frontier = next;
+    }
+    (found, false, seen.len())
 }
 
 /// The single `ReturnExpr` an attachment carries, if it carries exactly one.

@@ -486,6 +486,39 @@ pub trait CrossFileLookup {
         true
     }
 
+    /// The surface fingerprint the freshness index currently records for
+    /// `path`, if any.
+    ///
+    /// The per-provider half of a closedness certificate's validity key
+    /// (`model/witnesses/closedness.rs`). `None` means the index cannot vouch
+    /// for this path — never recorded, or an impl with no freshness engine —
+    /// and the caller declines to certify. Defaulted for the same reason
+    /// `conclusions_for` is: an index without one simply never certifies,
+    /// which is the fail-open direction.
+    fn surface_fingerprint_of(&self, _path: &std::path::Path) -> Option<u64> {
+        None
+    }
+
+    /// This class's cached closedness certificate, if one was minted and is
+    /// still resident. `None` means "mint it if you want one" — never "this
+    /// class is not closed".
+    fn closedness_certificate(
+        &self,
+        _class: &str,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ClosednessCertificate>> {
+        None
+    }
+
+    /// Remember a freshly minted certificate. Defaulted to a no-op: an impl
+    /// with nowhere to put it re-mints, which costs a walk the consult had
+    /// already paid for.
+    fn store_closedness_certificate(
+        &self,
+        _class: &str,
+        _cert: std::sync::Arc<crate::model::witnesses::ClosednessCertificate>,
+    ) {
+    }
+
     /// This file's baked conclusions, if the store has them at the reader's
     /// pinned generation.
     ///

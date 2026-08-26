@@ -520,17 +520,34 @@ impl ModuleIndex {
     }
 
     /// The ONE freshness write (`canon` pre-canonicalized): applies the
-    /// `SurfaceWrite` provenance rule — a `Background` write on an open
-    /// doc's path is suppressed (Unchanged: consumers read the buffer, and
-    /// what they read didn't move).
+    /// `SurfaceWrite` provenance rule — a `Background` write is suppressed on
+    /// a path the OPEN-DOC lane has already recorded, because consumers read
+    /// that buffer and what they read didn't move.
+    ///
+    /// Keyed on "an open-doc write has landed", NOT on "a doc is open here".
+    /// The protection only means something once there is an open-doc baseline
+    /// to protect; before one exists the disk state is the only truth anyone
+    /// holds, and the old predicate yielded to a writer that did not exist.
+    /// An open file then had NO record at all between `didOpen` and the first
+    /// debounced refresh — so it declared no dependencies, no consumer edge
+    /// existed, and a watcher-driven wave over its provider marked nobody.
+    /// Suppression resumes the instant the first open-doc record lands, so
+    /// the case the rule exists for is untouched.
     fn record_surface_write(
         &self,
         canon: &std::path::Path,
         surface: crate::model::surface::Surface,
         write: SurfaceWrite,
     ) -> crate::model::surface::SurfaceVerdict {
-        if write == SurfaceWrite::Background && self.open_doc_paths.contains_key(canon) {
+        if write == SurfaceWrite::Background
+            && self.open_doc_paths.get(canon).is_some_and(|r| *r)
+        {
             return crate::model::surface::SurfaceVerdict::Unchanged;
+        }
+        if write == SurfaceWrite::OpenDoc {
+            if let Some(mut e) = self.open_doc_paths.get_mut(canon) {
+                *e = true;
+            }
         }
         let verdict = self.freshness.record(canon, surface);
         match verdict {
@@ -549,7 +566,10 @@ impl ModuleIndex {
     /// `mark_doc_closed` (see `SurfaceWrite`).
     pub fn mark_doc_open(&self, path: &std::path::Path) {
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        self.open_doc_paths.insert(canon, ());
+        // `false`: open, but the open-doc lane has recorded nothing yet, so a
+        // Background write still lands. A re-open legitimately resets this —
+        // `did_close` re-recorded the disk state on the way out.
+        self.open_doc_paths.insert(canon, false);
     }
 
     /// didClose: release the record to background writers and reconcile —

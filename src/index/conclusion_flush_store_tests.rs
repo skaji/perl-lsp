@@ -415,10 +415,11 @@ fn a_non_convergent_flush_publishes_nothing() {
 
 /// Publishing reclaims what it supersedes.
 ///
-/// Retaining every generation is what made a pin safe when absence could not
-/// be told from staleness; with the row stamp and the session pin, a walk that
-/// loses its generation reads absent and decodes. So the table must not grow a
-/// row per file per edit for the life of a session.
+/// Retention existed so a reader pinned to a generation kept finding it. With
+/// per-row content fingerprints there is nothing to pin: a reader that loses
+/// an older row either finds the newer one — same fingerprint compare, and the
+/// bake is deterministic, so the same content — or decodes. So the table must
+/// not grow a row per file per edit for the life of a session.
 #[test]
 fn publishing_reclaims_superseded_rows() {
     use crate::index::module_cache::{publish_generation, Generation};

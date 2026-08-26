@@ -333,9 +333,10 @@ fn flush_over_world(
 /// strength of that row's absence, it is checked against what the freshness
 /// index records for the path and reads absent when they disagree.
 ///
-/// The generation is read ONCE and frozen for the whole wave: reading it again
-/// mid-flush could compose answers from two worlds, which is the failure the
-/// pin exists to prevent.
+/// The generation is read ONCE and frozen for the whole wave, so the frozen
+/// store the propagation diffs against cannot shift underneath it mid-flush.
+/// That is a property of THIS wave's arithmetic; readers need no such freeze,
+/// because a row's fingerprint settles its validity on its own.
 pub fn flush_refresh_set(
     conn: &Connection,
     fresh: Vec<FreshBake>,
@@ -419,11 +420,12 @@ fn publish_seeds(
         return None;
     }
     crate::util::ghost_stats::count_by("flush.published", entries.len() as u64);
-    // Reclaim superseded rows immediately, which is safe precisely BECAUSE of
-    // the session pin: a walk still reading an older generation finds its row
-    // gone, reads absent, and decodes. The retention that made pruning
-    // dangerous protected correctness; the pin protects it better, so what is
-    // left to protect is only speed.
+    // Reclaim superseded rows immediately. Safe because validity is per-row
+    // and content-keyed: a reader that loses an older row either finds the
+    // newer one — which passes the same fingerprint compare and therefore
+    // carries the same content, the bake being deterministic — or finds
+    // nothing and decodes. Neither outcome is a wrong answer, so retention
+    // buys speed alone.
     let reclaimed = module_cache::prune_generations_below(conn, next);
     if reclaimed > 0 {
         crate::util::ghost_stats::count_by("flush.pruned", reclaimed as u64);

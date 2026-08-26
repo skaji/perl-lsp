@@ -178,7 +178,7 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
 
     // Main resolve loop — drain priority first, then pending.
     loop {
-        let batch = drain_or_repair(&core.queue, &mut repair_frontier, db.as_ref());
+        let batch = drain_or_repair(&core, &core.queue, &mut repair_frontier, db.as_ref());
 
         // One diagnostics refresh per drained BATCH, not per module: a
         // resolve takes longer than the refresh debounce's settle window,
@@ -389,11 +389,44 @@ pub(super) fn resolver_loop(core: Arc<IndexCore>, server: Option<ServerSession>)
 /// request waits at most one slice (32 files) behind repair rather than behind
 /// the whole frontier. When the frontier is empty this is exactly the old
 /// blocking drain.
+/// Move what consults pushed onto the repair frontier.
+///
+/// The frontier is enumerated once from the store's own "what is missing"
+/// query; this is the other half — paths whose row EXISTS and was rejected,
+/// which that query cannot see.
+///
+/// Adopted rather than signalled, so a push costs a consult one map insert and
+/// nothing else. The cost is latency, not correctness: a push landing while
+/// the resolver is blocked on its queue waits for the next resolve request.
+/// Repair has no deadline, and the set is path-keyed, so the wait bounds at
+/// one entry per stale file rather than one per rejection.
+///
+/// Split out of `drain_or_repair` so the handoff is testable on its own: the
+/// caller blocks on the resolve queue, so a test of it through the resolver
+/// would be a test of that race rather than of this transfer. Note the counter
+/// is emitted HERE, at ADOPTION — an absent `repair.pushed` means nothing was
+/// drained, never that nothing was pushed.
+fn adopt_pushed_repairs(core: &IndexCore, frontier: &mut Vec<String>) {
+    if core.repair_pushed.is_empty() {
+        return;
+    }
+    let pushed: Vec<String> = core
+        .repair_pushed
+        .iter()
+        .map(|e| e.key().to_string_lossy().into_owned())
+        .collect();
+    core.repair_pushed.clear();
+    crate::util::ghost_stats::count_by("repair.pushed", pushed.len() as u64);
+    frontier.extend(pushed);
+}
+
 fn drain_or_repair(
+    core: &IndexCore,
     queue: &ResolveQueue,
     frontier: &mut Vec<String>,
     db: Option<&rusqlite::Connection>,
 ) -> Vec<String> {
+    adopt_pushed_repairs(core, frontier);
     while !frontier.is_empty() {
         if let Some(batch) = try_drain_next_batch(queue) {
             return batch;
@@ -470,4 +503,48 @@ fn wait_for_workspace_root(ws_root_channel: &WorkspaceRootChannel) -> Option<Str
 
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     uri.strip_prefix("file://").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod repair_adoption_tests {
+    use super::*;
+
+    /// What consults pushed reaches the repair frontier, once, and the set
+    /// empties behind it.
+    ///
+    /// This is the half neither local instrument could reach: a `--check` run
+    /// never produces a stale row, and a saved-dep e2e produces eight but is
+    /// over in 2.5 s — long before the resolver idles into a repair pass. So
+    /// the transfer is asserted directly rather than by winning that race.
+    ///
+    /// The emptying is the load-bearing half. Without it every later pass
+    /// re-adopts the same paths, and the frontier grows without bound while
+    /// re-repairing files it already repaired.
+    #[test]
+    fn pushed_paths_are_adopted_once_and_the_set_empties() {
+        let core = IndexCore::new();
+        let mut frontier: Vec<String> = vec!["/pre/existing.pm".to_string()];
+
+        core.repair_pushed.insert(std::path::PathBuf::from("/a.pm"), ());
+        core.repair_pushed.insert(std::path::PathBuf::from("/b.pm"), ());
+
+        adopt_pushed_repairs(&core, &mut frontier);
+        frontier.sort();
+        assert_eq!(
+            frontier,
+            vec!["/a.pm".to_string(), "/b.pm".to_string(), "/pre/existing.pm".to_string()],
+            "pushed paths must join the frontier the store's own query built, \
+             not replace it"
+        );
+        assert!(
+            core.repair_pushed.is_empty(),
+            "the set must empty on adoption — otherwise every later pass \
+             re-adopts the same paths and the frontier grows without bound"
+        );
+
+        // A second pass with nothing pushed adds nothing.
+        let before = frontier.len();
+        adopt_pushed_repairs(&core, &mut frontier);
+        assert_eq!(frontier.len(), before, "an empty set must adopt nothing");
+    }
 }

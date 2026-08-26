@@ -522,6 +522,25 @@ impl CrossFileLookup for ModuleIndex {
             .is_some_and(|b| !b.is_empty())
     }
 
+    fn surface_fingerprint_of(&self, path: &std::path::Path) -> Option<u64> {
+        self.freshness.fingerprint_of(path)
+    }
+
+    fn closedness_certificate(
+        &self,
+        class: &str,
+    ) -> Option<std::sync::Arc<crate::model::witnesses::ClosednessCertificate>> {
+        self.closedness.get(class)
+    }
+
+    fn store_closedness_certificate(
+        &self,
+        class: &str,
+        cert: std::sync::Arc<crate::model::witnesses::ClosednessCertificate>,
+    ) {
+        self.closedness.put(class, cert);
+    }
+
     fn conclusions_for(
         &self,
         path: &std::path::Path,
@@ -557,21 +576,34 @@ impl CrossFileLookup for ModuleIndex {
         // direction here is "decode", never "trust".
         match self.freshness.fingerprint_of(path) {
             Some(fp) if fp == stamp.source_fingerprint => {
-                // Fresh, but is it from the world this walk already
-                // committed to? A flush publishes a whole round while walks
-                // are in flight; mixing generations within one walk takes
-                // two halves of a cross-file answer from different worlds.
-                if !crate::model::witnesses::ResolutionSession::admit_conclusion_generation(
+                // The fingerprint is the WHOLE decision, generation included.
+                // A flush can publish a round while this walk is in flight,
+                // but a row passes the compare only against the world the
+                // index currently believes, and the bake is deterministic —
+                // so two rows that both pass carry the same content whichever
+                // generation published them. Reading one from N and one from
+                // N+1 is not a torn read; it is the same answer twice.
+                //
+                // Refusing the second generation was the earlier design and
+                // it was worse than the problem: the walk went blind for the
+                // rest of the corpus, and WHICH rows it lost depended on the
+                // order consults happened to arrive in.
+                crate::model::witnesses::ResolutionSession::note_conclusion_generation(
                     self,
                     stamp.flush_generation.0,
-                ) {
-                    return None;
-                }
+                );
                 crate::util::ghost_stats::count("conclrow.valid");
                 Some(m)
             }
             Some(_) => {
                 crate::util::ghost_stats::count("conclrow.stale");
+                // Push half of the repair lane. This site is the only one
+                // that KNOWS the row is wrong rather than missing — the
+                // frontier query sees absence, and a fingerprint join would
+                // turn a check we just performed into an O(corpus) scan. One
+                // entry per path: a stale row rejected ten thousand times in
+                // a sweep is still one repair.
+                self.core.repair_pushed.insert(path.to_path_buf(), ());
                 None
             }
             None => {
