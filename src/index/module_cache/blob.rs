@@ -127,7 +127,7 @@ pub struct EncodedAnalysis {
     /// cannot produce it: the warm lane hands out bag-evicted copies, and
     /// `Surface::project` reads the bag. Persisting the cold projection is the
     /// only way the two lanes record the same surface for the same file —
-    /// `docs/prompt-surface-projection-drift.md`.
+    /// `docs/adr/storage-engine.md`.
     pub surface: Vec<u8>,
     /// The surface fingerprint of the analysis these bytes were baked from —
     /// the row's self-validation stamp. Carried here rather than looked up at

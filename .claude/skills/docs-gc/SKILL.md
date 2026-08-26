@@ -1,11 +1,11 @@
 ---
 name: docs-gc
-description: Garbage-collect the docs tree — delete landed prompt briefs, repoint their references into the owning ADRs, and scrub ADRs to house voice (no historical narrative). Use after a mission/arc lands, or whenever docs/prompt-*.md piles up.
+description: Garbage-collect the docs tree — delete landed prompt briefs, convert closed working docs (hitlists, measurement ledgers, spike writeups) into their durable form, repoint references into the owning ADRs, and scrub ADRs to house voice (no historical narrative). Use after a mission/arc lands, or whenever docs/prompt-*.md piles up.
 ---
 
 # docs-gc: landed prompts die, ADRs carry the load
 
-The docs tree has two kinds of design docs with OPPOSITE lifecycles:
+The docs tree has three kinds of docs, with different lifecycles:
 
 - `docs/prompt-*.md` — implementation BRIEFS. They exist to drive work.
   When the work lands, the brief is garbage: delete it. Its decisions
@@ -17,6 +17,11 @@ The docs tree has two kinds of design docs with OPPOSITE lifecycles:
   trade-offs, failure modes, measured facts — never what WAS or what
   CHANGED. ("Git remembers; the comment shouldn't" — CLAUDE.md
   Comment style. It governs docs the same as code.)
+- **Working docs** — measurement ledgers, hitlists, status pages, spike
+  writeups, comparison studies. Live scaffolding while an arc is in
+  flight; once it closes they are neither brief nor decision. Deleting
+  loses real content, keeping leaves scaffolding in a permanent tree.
+  They get CONVERTED into their durable form (Job 3).
 
 **Scope defaults to the current branch's docs** — the files
 `git diff --name-only $(git merge-base HEAD <base>)...HEAD -- docs/`
@@ -70,18 +75,54 @@ An ADR that is ENTIRELY a landing log with no reusable design content:
 fold its load-bearing facts into the related ADR and delete it — same
 reference-fixing discipline as Job 1.
 
+## Job 3 — convert closed working docs
+
+A working doc is closed when the arc that produced it is done: its
+measurements are recorded, its hitlist is worked through, its spike
+reached a verdict. Pick ONE disposition per file:
+
+- Durable content is a DECISION, invariant, contract, or failure mode →
+  fold it into the owning `docs/adr/*.md`; promote the file itself to an
+  ADR if it is substantial and no ADR owns it. Then delete the working
+  doc.
+- Durable content is FORWARD work that still needs driving → make it a
+  real `docs/prompt-*.md` brief: strip the status logs, progress tables,
+  and measurement narration; leave the design problem and what is open.
+- Durable content is a REPEATABLE PROCEDURE (how to run the benchmark,
+  how to rebuild the corpus) → keep it, scrubbed to house voice like an
+  ADR: present tense, what IS, no arc narration.
+- Nothing durable survives the scrub → delete, with the usual
+  reference-repointing.
+
+**A doc referenced from a user-facing file is load-bearing** — treat it
+conservatively and repoint in the same commit. `CHANGELOG.md` ships to
+users, so a doc it names cannot silently move or vanish.
+
+Measurements inside a working doc are the content most worth rescuing
+and the most likely to be stale. A number with no date and no rerun is
+a liability once it outlives the branch that measured it: re-measure it,
+or move it with the date attached.
+
 ## Verify (non-negotiable)
 
 ```
 # every doc reference resolves (open-forks.md exempt):
-grep -rn "docs/prompt-\|docs/adr/" src/ CLAUDE.md docs/ gold-corpus/ \
+grep -rn "docs/prompt-\|docs/adr/\|docs/[a-z]" src/ CLAUDE.md CHANGELOG.md docs/ gold-corpus/ \
   --include=*.rs --include=*.md --include=*.pl \
   | grep -v "docs/open-forks.md:" \
-  | grep -oE "docs/(prompt-[a-z-]+|adr/[a-z-]+)\.md" | sort -u \
+  | grep -oE "docs/([a-z]+/)?[A-Za-z0-9_-]+\.md" | sort -u \
   | while read f; do [ -f "$f" ] || echo "DANGLING: $f"; done
 
 cargo test --release   # some tests assert on doc paths
 ```
 
+Two results are NOT bugs: a forward reference to a doc a live brief
+plans to write ("Write `docs/adr/foo.md`" in its own phase list), and a
+ledger entry in `open-forks.md` / `forks-resolved.md`. Everything else
+dangling is a bug — including one an EARLIER gc left behind. A `src/`
+comment pointing at a deleted brief is the exact failure this pass
+exists to prevent, so fix it while you are here rather than filing it.
+
 Both must be clean before committing. Commit message pattern:
-`docs: gc — <N> landed prompts deleted, <M> ADRs scrubbed to house voice`.
+`docs: gc — <N> landed prompts deleted, <M> ADRs scrubbed to house voice`
+(add `, <K> working docs converted` when Job 3 did anything).

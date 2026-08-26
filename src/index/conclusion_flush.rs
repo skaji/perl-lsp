@@ -1,7 +1,7 @@
 //! The flush driver's worklist: propagate a change until the answers stop
 //! moving, then publish one generation.
 //!
-//! `docs/prompt-enrichment-alternatives.md` §3c′/§3c″ owns the design. What
+//! `docs/adr/conclusion-layer.md` ("Change propagation: the flush worklist") owns the design. What
 //! lives here is the loop and its two hard properties — the cutoff and
 //! termination — factored so both are testable without a store, a thread, or a
 //! corpus.

@@ -1,59 +1,28 @@
 # DBIC support as a plugin
 
-**Status: open — and UNGATED (June 2026).** This was queued behind
-type-system-encoding "so the plugin owns its semantics from day one";
-that gate is stale. Since it was set, the plugin system grew the
-muscles the migration needs: decision-ready `CallContext` shapes (the
-`extract_has_options` pattern), the manifest families (`overrides`,
-`param_types`, `dispatch_verbs`, `role_makers`), `return_via_edge`,
-and the moo.rhai seam as the executed playbook for moving native
-synthesis out. Only phase 3 below still touches the axis question.
+Accessor/relationship synthesis already moved to `frameworks/dbic.rhai`
+(trigger `ClassIsa("DBIx::Class")`; the `visit_dbic_*` builder family is
+gone). This brief is the remaining ladder:
 
-## Phase ladder
-
-1. **Accessor/relationship synthesis → `frameworks/dbic.rhai`.** ✅
-   LANDED. The `visit_dbic_*` family is gone; `frameworks/dbic.rhai`
-   (trigger `ClassIsa("DBIx::Class")`) synthesizes column accessors +
-   HashKeyDefs and relationship accessors (typed return: ResultSet for
-   has_many/many_to_many, row class for belongs_to/has_one/might_have).
-   The decision-ready context is the generic `CallContext.arg_names`
-   (the call's args as a flat `(name, span)` string list via the shared
-   `cst::string_list`), populated only for verbs a plugin registers via
-   the `arg_name_verbs()` manifest — core hardcodes no DSL verb. moo was
-   moved onto the same registration gate. `load_components` parent
-   registration stays core (generic parent machinery). Custom-resultset
-   discovery + per-column `data_type` typing are deferred to phase 3.
-2. **Meta-method suppression → manifest.** The DBIC entries in
-   `symbols.rs`' `universal_methods` (comment-flagged debt) become a
+1. **Meta-method suppression → manifest.** The DBIC entries in
+   `diagnostics.rs`' `universal_methods` (comment-flagged debt) become a
    plugin manifest field; core's diagnostic consults the registry.
-3. **Parametric emission + per-method projection** (the tables below)
+2. **Parametric emission + per-method projection** (the tables below)
    — the one genuinely axis-shaped piece. A `parametric_returns`
    manifest field may sidestep full type-system-encoding; decide at
    the boundary, not before.
 
 End state: core is plugin-free except generic dispatch.
 
-## Why move DBIC out
+## Why the rest stays out of core
 
-Today the builder has DBIC-specific code paths inline:
-- `visit_dbic_add_columns` (column accessor + HashKeyDef synthesis)
-- `visit_dbic_relationship` (`has_many` / `belongs_to` / `has_one`
-  / `might_have` / `many_to_many` accessors)
-- `is_dbic_class` gating (parent-walk against `DBIx::Class::*`)
-- `visit_dbic_class_method` dispatching on method names
-- `__PACKAGE__->load_components` parent registration (general but
-  motivated by DBIC)
-- Part 5c additions: `extract_resultset_parametric`,
-  `emit_call_arg_key_accesses_open`,
-  `parametric_emitted_refs` set
-- Built-in DBIC class names hardcoded as base for Parametric
-
-This is a non-trivial DSL surface in core that doesn't conceptually
-belong there. CLAUDE.md invariant #10: never special-case for a
-particular shape. DBIC is a particular shape — the most common
-ORM in Perl, but still one library among many. Other Perl ORMs
-(DBIx::Class::Schema::Loader, Rose::DB::Object, Class::DBI) want
-similar treatment without inheriting DBIC's specifics.
+Some DBIC-specific decisions still live in core (`universal_methods`
+DBIC entries, Parametric semantics for `hash_key_class`/dispatch
+override, custom-resultset-class discovery). CLAUDE.md invariant #10:
+never special-case for a particular shape. DBIC is a particular shape —
+the most common ORM in Perl, but still one library among many. Other
+Perl ORMs (DBIx::Class::Schema::Loader, Rose::DB::Object, Class::DBI)
+want similar treatment without inheriting DBIC's specifics.
 
 The plugin system already supports:
 - `EmitAction::Method` with typed return — the row-class accessor
@@ -244,19 +213,10 @@ test migration. Multi-PR workstream. Worth doing in this order:
 
 ## Sequencing
 
-DBIC-as-plugin is queued behind:
-- `adr/return-expr.md` — landed; the receiver-relative machinery is
-  the contract the plugin's semantics return.
-- `prompt-type-system-encoding.md` — discussion; axis traits clarify
-  what the plugin's semantics return.
-
-The remaining gate is type-system-encoding.
-Then DBIC plugin infra → DBIC plugin port → cleanup of in-builder
-DBIC code.
-
-User direction (from the design conversation): "I plan on moving
-DBIC support out to a plugin, so this may want to wait on that."
-The custom-resultset_class discovery, nested-hashkey Tier 2/3, and
-this whole spec all queue behind the plugin extraction. The current
-in-builder DBIC code is the *baseline*; the plugin port is "do it
-right" once the core enables it.
+The Parametric-emission phase is queued behind
+`docs/prompt-type-system-encoding.md` (still discussion): whether a
+plugin-emitted axis (this DBIC semantics registry) wants the stronger
+type-system encoding that brief weighs, or whether the plain-method
+discipline already shipped for the built-in axes keeps scaling to a
+plugin-declared one. `docs/adr/return-expr.md` supplies the
+receiver-relative machinery the semantics registry plugs into.

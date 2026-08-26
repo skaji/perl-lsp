@@ -1060,7 +1060,7 @@ fn isa_chain(n: usize) -> String {
 /// The fold must not depend on map iteration order — a gate, not a note.
 ///
 /// Today nothing relies on this. Once conclusions are baked into the cache
-/// (`docs/prompt-conclusion-layer.md`) it becomes a correctness precondition:
+/// (`docs/adr/conclusion-layer.md`) it becomes a correctness precondition:
 /// a fold that varies by iteration order produces a stale answer that
 /// MATCHES ITS OWN FINGERPRINT, which is a perfect mechanism protecting a
 /// broken premise. So it fails a build here instead.

@@ -203,7 +203,7 @@ shapes, and `src/plugin/mod.rs::EmitAction` for the full enum.
 
 | Hook | Fires on |
 |---|---|
-| `patterns()` + `on_match(pattern, m)` | any shape you declare as a tree-sitter query — call verbs (`bar(...)`, `$x->bar(...)`), declarations, hash literals, chained receivers. The query is the filter; `on_match` returns the emissions. See `docs/prompt-plugin-queries.md`. |
+| `patterns()` + `on_match(pattern, m)` | any shape you declare as a tree-sitter query — call verbs (`bar(...)`, `$x->bar(...)`), declarations, hash literals, chained receivers. The query is the filter; `on_match` returns the emissions. See `docs/adr/plugin-system.md`. |
 | `on_use(ctx)` | `use Foo qw(...)` |
 
 `patterns()` replaces the old per-call `on_function_call` / `on_method_call`

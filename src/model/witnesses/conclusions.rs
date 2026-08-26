@@ -1,6 +1,6 @@
 //! Conclusions: the registry chase partially evaluated over one file's bag.
 //!
-//! `docs/prompt-conclusion-layer.md` owns the design. The short version: a
+//! `docs/adr/conclusion-layer.md` owns the design. The short version: a
 //! cross-file consult decodes a whole provider bag to answer one question, and
 //! 78% of that cost is the chase rather than the fetch. A conclusion is that
 //! chase run ONCE at persist time with the three query binders
@@ -913,7 +913,7 @@ fn bake_one(
         // nearly every walk, so the consult falls through to the decode it
         // would have done anyway. The `Link` cannot pay off while `OpenNone`
         // dominates the rungs; the leverage is in shrinking that population.
-        // `docs/prompt-residualizing-registry.md` carries the table.
+        // `docs/adr/conclusion-layer.md` ("Widening `Link`: rejected") carries the reasoning.
         // Where the chase would have gone, read UNCONDITIONALLY — not behind
         // the minting flag. The composition of this population is what decides
         // whether widening the `Link` form is worth building, and it cannot be

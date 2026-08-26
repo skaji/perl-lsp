@@ -45,11 +45,58 @@ The enum is intentionally small so it can grow without migration.
 ### Triggers are filters, not logic
 
 Three shapes: `UsesModule(M)`, `ClassIsa(P)`, `Always`. Receiver type / arg
-shape / fold-success decisions live **inside** `on_*` callbacks. The tradeoff
-is simplicity: triggers are one index lookup per call-site.
+shape / fold-success decisions live **inside** the plugin's own callbacks
+(`on_match`, the query-hooks). The tradeoff is simplicity: triggers are one
+index lookup per call-site.
 
 `on_use` is the exception — it runs for every package regardless, because the
 `UsesModule(X)` filter is false until `use X` has been processed.
+
+### Query-declared capture (`patterns()` / `on_match`)
+
+A plugin declares the shapes it cares about as tree-sitter queries
+(`patterns() → [PatternSpec]`) instead of receiving an eagerly pre-built
+`CallContext` for every call site in every file. Every spec that compiles
+across every plugin is concatenated into **one** tree-sitter `Query`; the
+tree is traversed once per round (walk or fold — a `PatternSpec.phase`),
+and `pattern_index` (offset by each spec's own pattern count) routes each
+match back to its owning plugin. A spec whose own query fails to compile is
+dropped before concatenation, so one malformed `.rhai` cannot take dispatch
+out for the rest. Nothing downstream remaps: capture indices are read
+through `query.capture_names()` and quantifiers through
+`capture_quantifiers(pattern_index)`, so the combined query and its combined
+index are the whole translation.
+
+Each match hands the plugin a `MatchContext` built from a closed,
+core-owned **projection vocabulary** — exactly the decision-ready data that
+match's captures named, not a flattened everything (`ArgInfo` for every
+argument, transitive parents, package uses, receiver type) computed whether
+or not any plugin matches. This is the load-bearing efficiency move: capture
+cost is now proportional to what plugins actually ask for, not to every call
+site in every file.
+
+**Two phases, one contract each.** Walk-phase patterns dispatch during the
+tree walk and participate in a gating fixed point (an emission from one
+match can grow what a later match's trigger sees, so the walk round settles
+before moving on). Fold-phase patterns dispatch once, after the worklist
+fold's PostFold pass, so their projections read fold-derived state (chain
+typing already settled); fold-phase matches replay in document order with
+no gating fixed point (fold emissions don't grow trigger inputs). A pattern
+that needs `VarType` / named-sub-param flushes must run at walk phase — the
+fold round runs after those flush.
+
+Diagnostics ride the identical seam as a new `EmitAction` variant
+(`Diagnostic { message, span, severity, code }`), not a parallel mechanism:
+a pattern matches, `on_match` decides, the plugin id is stamped on at
+application and surfaces as the LSP diagnostic source
+(`perl-lsp/<plugin>`). `FileAnalysis.plugin.diagnostics` rides the cache
+blob like any other plugin fact, so workspace `--check` sees plugin lints
+on cached files with no publish-path special-casing.
+
+`PERL_LSP_PD_NO_COMBINE=1` forces per-spec traversals (the A/B control) and
+`PERL_LSP_PD_EQUIV=1` asserts the combined and per-spec paths agree — a
+per-round match-stream comparison from the CLI over a real corpus, and a
+whole-`FileAnalysis` comparison under `cargo test`.
 
 ### Type overrides are priority witnesses, not field writes
 
@@ -195,10 +242,25 @@ trust boundary between bundled and user scripts.
   fingerprint hashing clears the SQLite module cache on startup when it
   changes, so cache doesn't serve stale plugin output.
 
+## Deferred
+
+- Per-pattern trigger overrides (a `when:` clause on one `PatternSpec`) —
+  wanted for plugins whose patterns each want a different trigger (a
+  two-trigger split within one plugin); v1 keeps gating at the plugin
+  level to stay small.
+- Migrating native `has` synthesis (`visit_has_call`) fully onto the moo
+  plugin's patterns — the prerequisite for ever moving `on_use` off its
+  native post-walk path.
+- Unifying the `dispatch_verbs()` / `load_verbs()` manifests into
+  core-generated patterns, so a manifest member stops being a second
+  capture mechanism alongside patterns.
+- A `#in-package-using?` predicate, if per-pattern gating (above) ends up
+  wanting pattern-local expression power.
+
 ## Reading list
 
 - `src/plugin/mod.rs` — authoritative type definitions for `EmitAction`,
-  `CallContext`, `Trigger`, query-hook answer shapes.
+  `PatternSpec`, `MatchContext`, `Trigger`, query-hook answer shapes.
 - `frameworks/*.rhai` — bundled examples; `mojo-routes.rhai` exercises
   `MethodCallRef` + `overrides()`, `minion.rhai` exercises `on_completion` +
   `on_signature_help` + the `ctx["call"]` workaround.

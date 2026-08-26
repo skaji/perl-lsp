@@ -1,4 +1,4 @@
-//! Post-walk query-pattern dispatch — SPIKE of `docs/prompt-plugin-queries.md`.
+//! Post-walk query-pattern dispatch (`docs/adr/plugin-system.md`).
 //!
 //! Plugins declare their items of interest as tree-sitter queries
 //! (`FrameworkPlugin::patterns`); this driver runs them once per file

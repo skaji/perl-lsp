@@ -30,7 +30,7 @@ pub use crate::build::plugin::default_plugin_registry;
 /// while the code lives in its own file (rule #1: still driven by `build()`).
 mod narrowing;
 
-/// Query-declared plugin capture (SPIKE, `docs/prompt-plugin-queries.md`):
+/// Query-declared plugin capture (`docs/adr/plugin-system.md`):
 /// runs plugin-declared tree-sitter patterns post-walk and dispatches
 /// `on_match`. Child module for the same private-field reason as
 /// `narrowing` — still driven by `build()` (rule #1). `pub(crate)` so
