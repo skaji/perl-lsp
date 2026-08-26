@@ -1,6 +1,6 @@
-//! Tests for the query-declared plugin capture spike
+//! Tests for the query-declared plugin capture
 //! (`src/builder/pattern_dispatch.rs`, design in
-//! `docs/prompt-plugin-queries.md`). A child of the `tests` module so
+//! `docs/adr/plugin-system.md`). A child of the `tests` module so
 //! it shares `build_fa` and the bundled registry.
 
 use super::*;

@@ -680,7 +680,7 @@ pub enum EmitAction {
 
 // ---- Query-declared capture (patterns) ----
 //
-// SPIKE of docs/prompt-plugin-queries.md: a plugin declares the shapes
+// A plugin declares the shapes
 // it cares about as tree-sitter queries; core runs them post-walk and
 // hands each match to `on_match` with only the projections that
 // pattern asked for. The emit vocabulary (`EmitAction`) is unchanged.
@@ -1170,7 +1170,7 @@ pub trait FrameworkPlugin: Send + Sync {
     }
 
     /// Query-declared capture patterns — see `PatternSpec` and
-    /// `docs/prompt-plugin-queries.md`. Read once at plugin load;
+    /// `docs/adr/plugin-system.md`. Read once at plugin load;
     /// compiled once per process. Default empty.
     fn patterns(&self) -> &[PatternSpec] {
         &[]

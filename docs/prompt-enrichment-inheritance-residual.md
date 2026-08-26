@@ -115,9 +115,6 @@ What this means per enrichment pass:
 | imported hash-key synthesis + `emit_method_call_binding_edges` | No | Partially — cross-file method-return queries route through the same `PackageSymbol` walk; imported-hash-key COMPLETION on a binding inside a non-open dep file would miss the synthetic `HashKeyDef`, but that's a completion-in-a-dependency scenario the LSP doesn't surface (you complete in open files). |
 | dispatch resolution | N/A (no enrichment pass) | **Yes — query-time.** Gated candidates ride the cache; `resolve::refs_to` for a Handler calls `applicable_dispatches`, which resolves the receiver isa-check on demand against the module index. A `$minion->enqueue('task')` in a non-open workspace file whose receiver isa-Minion is cross-file (and which doesn't `use Minion`) now surfaces. The `ReceiverGated` seam makes the inner handler payload unreadable without that check (`docs/adr/receiver-gated-dispatch.md`). |
 
-Confirmed by `probe_dispatch_promotion_in_unenriched_workspace_file`
-(FAILS).
-
 ### Verdict on B
 
 The cross-file `PackageSymbol` walk (the structural `query_rec` fallback

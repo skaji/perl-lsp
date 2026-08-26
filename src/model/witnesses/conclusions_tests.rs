@@ -139,7 +139,8 @@ fn a_receiver_dependent_answer_is_never_baked_as_a_constant() {
 ///
 /// The sibling of `witnesses_tests::the_fold_does_not_depend_on_map_iteration_order`,
 /// and required for the same reason one level up: the diff-propagation
-/// driver (`docs/prompt-enrichment-alternatives.md`) cuts its worklist on
+/// driver (`docs/adr/conclusion-layer.md`, "Change propagation: the flush
+/// worklist") cuts its worklist on
 /// an EMPTY conclusion diff. An order-dependent bake produces spurious
 /// diffs that never cut the chain, and — worse — spuriously empty ones
 /// that cut a chain which should have propagated, leaving a consumer on a

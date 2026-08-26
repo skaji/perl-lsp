@@ -1,6 +1,6 @@
 //! SPIKE: the stratified reparse seam (Perl prototype reparenthesizer).
 //!
-//! The thinnest end-to-end proof of `docs/prompt-cpp-reparse.md`: a
+//! The thinnest end-to-end proof of `docs/adr/reparse-stratification.md`: a
 //! source transform that runs BEFORE extraction, because a declaration
 //! changes how the file parses. Perl prototypes are the local,
 //! preprocessor-free instance — `sub sner ($) {...}` makes `sner 1, 2`

@@ -1,110 +1,22 @@
 # Multi-language serving — the wiring design
 
-**Status: design, ready to execute.** The four spikes
-(`docs/spike-query-extraction.md`, branch
-`worktree-query-extraction-spike`) proved the engine runs every floor
-verb for pack-built languages with zero engine edits. This doc is the
-remaining piece: how the SERVER routes a second language, written so
-the implementation is a checklist, not a design round. The spike
-deliberately stopped at this seam — it's the only engine-adjacent
-work in the whole program.
+**The `LanguageDriver`/`PackDriver`/`LanguageRegistry` seam this doc
+designed is landed** (`src/build/language_driver.rs`; file-map entry in
+CLAUDE.md). C++/Python/R/CMake ship as pack languages behind opt-in
+Cargo features, each a `PackDriver` constructor plus a `.scm` skeleton
+and predicates — no new types per language. Per-language `ModuleIndex`
+instances and the `FileAnalysis.language` tag (cross-language ref
+pollution guard) are both landed. This brief now carries only what
+hasn't shipped.
 
-## The shape: LanguageDriver + registry
+## What pack languages still don't get
 
-One trait, two implementations on day one:
-
-```rust
-/// Everything the server needs to host a language. Lives beside
-/// `document.rs` (Index layer — drivers call DOWN into Build).
-pub trait LanguageDriver: Send + Sync {
-    /// "perl", "r", "python" — keys FileAnalysis.language and cache rows.
-    fn id(&self) -> &'static str;
-    /// Extensions this driver claims ("pm", "pl", "t" / "R", "r").
-    fn extensions(&self) -> &[&'static str];
-    fn make_parser(&self) -> tree_sitter::Parser;
-    /// Source → FileAnalysis. Perl: `builder::build_with_plugins`
-    /// (the existing path, untouched). Pack languages:
-    /// `query_extract::extract(...).into_file_analysis()`.
-    fn analyze(&self, tree: &Tree, source: &[u8]) -> FileAnalysis;
-    /// Module-name → candidate relative paths (the spike's
-    /// `module_paths` predicate, promoted). Perl's current
-    /// `module_name.replace("::", "/") + ".pm"` in module_resolver.rs
-    /// line ~471 IS this function already — it just isn't named yet.
-    fn module_paths(&self, module: &str) -> Vec<String>;
-    /// Roots to search beyond the workspace (@INC / .libPaths() /
-    /// site-packages). Default: workspace-only.
-    fn library_roots(&self) -> Vec<PathBuf> { vec![] }
-}
-
-pub struct LanguageRegistry { drivers: Vec<Arc<dyn LanguageDriver>> }
-impl LanguageRegistry {
-    pub fn for_path(&self, path: &Path) -> Option<Arc<dyn LanguageDriver>>;
-    pub fn for_language_id(&self, id: &str) -> Option<Arc<dyn LanguageDriver>>;
-    pub fn watcher_globs(&self) -> Vec<String>; // union over drivers
-}
-```
-
-The pack driver is generic over `LangPack`:
-
-```rust
-pub struct PackDriver { id: &'static str, exts: &'static [&'static str],
-                        language: tree_sitter::Language, pack: LangPack }
-impl LanguageDriver for PackDriver { /* extract + into_file_analysis */ }
-```
-
-Registering R is then a constructor call: grammar handle + the spike's
-`r_pack()` + extensions. No new types per language.
-
-## Touch points (the complete list, surveyed)
-
-| site | today | change |
-|---|---|---|
-| `document.rs:25,79` | `create_parser()` + `builder::build` | `Document::new(text, driver)`; store the `Arc<dyn LanguageDriver>` on the Document; reparse uses it |
-| `backend.rs` did_open/did_change | implicit Perl | route via `registry.for_language_id(params.language_id)` falling back to extension; unroutable files: don't attach (current behavior for non-Perl) |
-| `backend.rs:332` watcher globs | hardcoded `**/*.pm`, `**/*.pl` | `registry.watcher_globs()` |
-| `backend.rs:930` watcher re-index parse | inline `create_parser` | route by extension via registry |
-| `module_resolver.rs:471` | `::`→`/` + `.pm` | `driver.module_paths(name)` — this is the spike predicate, landed |
-| `module_resolver.rs:623` workspace walk | `types_builder.add("perl", "*.pm")` | one `add` per driver extension; per-file routing on the Rayon walk |
-| `module_resolver.rs:700` registration name | `.pm`-derived package name | driver hook `module_name_for_path(path)` (Perl: first package decl, current logic; R: file name verbatim — matches `source()` keys) |
-| `main.rs` `parse_file` / `--parse` | Perl parser | route by extension; `--parse` gains whatever the file is |
-
-Nothing else. `symbols.rs`, `resolve.rs`, `file_store.rs`,
-`module_index.rs`, `witnesses.rs`, the cache, and every LSP handler
-are already language-free (the layering test is the proof that holds).
-
-## The two real design decisions
-
-**1. Module-name keyspace: per-language ModuleIndex.** Python's `os`,
-R's `util.R`, and Perl's `POSIX` must not collide in one
-`DashMap<String, _>`. Sharing one index with `(language, name)` keys
-infects every existing call site; separate `ModuleIndex` instances per
-driver infect none — handlers already receive `&ModuleIndex` from the
-backend, so the backend holds `HashMap<&'static str, Arc<ModuleIndex>>`
-and passes the document's. The SQLite cache gains a `language` column
-(schema bump) or per-language db files under the existing hashed dir
-(`modules-r.db`) — prefer the latter, zero migration.
-
-**2. Cross-language ref pollution: a language tag on FileAnalysis.**
-`refs_to` walks every workspace file; a Python `helper` must not match
-an R `helper`. The field is LANDED: `FileAnalysis.language`
-(`#[serde(default = "perl")]`, stamped by `PackDriver::analyze_with_path`)
-— `resolve()` derives pack routing from it at CandidateSet construction.
-Still to do here: filter in exactly two places — `refs_to`'s store walks
-and `workspace/symbol` — with `TargetRef` carrying the origin language.
-
-## What pack languages get on day one vs later
-
-Day one (free, proven by spikes): outline, document/workspace symbols,
-goto-def, references, rename, cross-file via `module_paths`,
-literal/shape/annotation typing, hover-on-type.
-
-Later, per language, all pack-side: completion context
-(`cursor_context` is Perl-only; pack languages start with
-symbol-table completion, which `backend` can serve generically from
-FileAnalysis — acceptable v1), diagnostics (start with NONE for pack
-languages — honesty discipline: no calibration, no diagnostics),
-framework plugins (requires keying rhai hooks on capture events — a
-design round of its own, deferred).
+Per language, all pack-side: completion context (`cursor_context` is
+Perl-only; pack languages serve symbol-table completion generically
+from `FileAnalysis` — acceptable v1), diagnostics (deliberately NONE
+for pack languages until a calibrated substrate exists — see
+"Calibration is the ship gate" below), and framework plugins (requires
+keying rhai hooks on capture events — the open design round, below).
 
 ## Calibration is the ship gate
 
@@ -153,20 +65,10 @@ module conventions). Everything else on this page is enumerable work.
 
 ## Sequencing
 
-1. **Registry + PerlDriver** — pure refactor, behavior-identical,
-   every existing test is the net. Land alone.
-2. **FileAnalysis.language + the two filters** — EXTRACT_VERSION bump.
-3. **PackDriver + R registration behind a flag** (`--lang r` or
-   detect-and-serve) — floor verbs live in-editor.
-4. **R substrate harness** — then, and only then, diagnostics and the
-   ceiling work (S3 predicate, `$` drills, library_roots).
-
-Steps 1–2 are days and de-risk everything; step 3 is the demo; step 4
-is the product. The spike branch carries the working driver, packs,
-and tests to lift from.
-
-Then, and only then, the crate cut (shipping shape above): step 5 is
-`lsp-engine` split along the layer-test seam with the
-`workspace-split` branch as the mechanical playbook; step 6 is
-runtime packs. Neither starts before a pack language has shipped
-in-editor from the single crate.
+Registry/driver wiring, `FileAnalysis.language`, and pack languages
+shipping in-editor (steps 1–4) are done. Remaining: the crate cut
+(shipping shape above) — step 5 is `lsp-engine` split along the
+layer-test seam with the `workspace-split` branch as the mechanical
+playbook; step 6 is runtime packs. Neither starts before a second pack
+language's ceiling work (diagnostics, framework tier) forces the
+split's cost to pay for itself.

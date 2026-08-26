@@ -1,8 +1,9 @@
 //! Persistence for the conclusion layer.
 //!
 //! The store is **generation-stamped**, which is not decoration. The driver
-//! this feeds (`docs/prompt-enrichment-alternatives.md` §3c′) processes a
-//! dirty frontier as one round against a FROZEN generation, and publishes the
+//! this feeds (`docs/adr/conclusion-layer.md`, "Change propagation: the
+//! flush worklist") processes a dirty frontier as one round against a
+//! FROZEN generation, and publishes the
 //! next generation atomically when the round's diffs go empty. Two properties
 //! follow, and both are the store's job rather than the driver's:
 //!

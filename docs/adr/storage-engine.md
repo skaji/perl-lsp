@@ -153,9 +153,8 @@ rewrite deletes the path's stub (inside `save_to_db`/
 `save_blob_to_db_stamped`, so writers can't forget); hard-clears wipe via
 `clear_derived_rows`.
 
-Measured (abseil): warm peak RSS **~90 MB** (re-measured 2026-08-26;
-was 34 MB in July);
-references byte-identical, `--refs-parity` clean, gold unaffected.
+Measured (abseil): warm peak RSS **~90 MB**; references byte-identical,
+`--refs-parity` clean, gold unaffected.
 
 ## Registration inverse under symbol eviction
 
@@ -171,6 +170,47 @@ resident floor. The map is private to `module_index.rs`; a self-healing
 read-side validation could replace it without touching call sites
 outside registration/unregister (`docs/forks-resolved.md`, "Unregister
 inverse under symbol eviction").
+
+## Persisted surfaces: cold and warm must project the same Surface
+
+`Surface::project` reads the witness bag. The warm lane's copies are
+bag-evicted (see `docs/adr/memory-slice-2-lru.md`), so projecting from a
+warm copy is projecting from a *degraded* analysis — the same unchanged
+file fingerprints differently depending on whether the process that
+recorded it built the analysis or decoded a stripped copy of it, and
+nothing about the degraded projection flags it as partial. Left
+unaddressed this corrupts freshness in two ways: a self-comparison
+against a differently-degraded prior record reads every file as changed
+(costly but safe), and — the dangerous direction — an edit that changes
+only bag-derived content can compare equal to an already-degraded
+baseline and read `Unchanged`, so no consumer re-enriches and every one
+of them keeps answering against pre-edit state.
+
+**Resolution: persist the projection.** `Surface::project`'s output is
+stored beside the blob it was projected from, in a `surfaces` table
+(`CREATE TABLE IF NOT EXISTS` in the always-run batch path — no
+`SCHEMA_VERSION` bump, no cache-wide rebuild). The warm lane adopts the
+persisted projection instead of re-deriving a degraded twin, so cold and
+warm record the same surface for the same bytes by construction. Two
+alternatives were considered and rejected: stamping on something both
+producers compute identically (cheaper, but removes the very drift
+signal that made the bug visible while leaving the underlying degraded
+projection possible) and making the projection bag-independent by baking
+bag-derived Surface content into the analysis at build time (the only
+shape that makes the degraded projection impossible rather than avoided
+— the correct long-term end state, but too large a change to gate a live
+wrong-answer fix behind).
+
+**Version gate, independent of `SCHEMA_VERSION`.** Each persisted row
+carries a fingerprint derived at compile time over `src/model/` +
+`Cargo.lock` — narrower than the conclusion fingerprint (above)
+deliberately, since a whole-tree hash would invalidate every persisted
+surface on an LSP-handler edit that cannot alter one. A persisted
+projection outliving its projector (the fingerprint mismatches) reads
+ABSENT rather than being trusted, so the caller re-projects exactly as
+it did before the store existed, and the file re-enters the repair
+frontier the conclusion fingerprint's own mismatch handling already
+uses.
 
 ## Deferred
 

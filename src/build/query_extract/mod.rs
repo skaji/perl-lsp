@@ -1,13 +1,16 @@
-//! SPIKE: query-driven entity extraction.
+//! Query-driven entity extraction for pack languages.
 //!
-//! The question under test: can FileAnalysis's extraction be driven by
-//! declarative tree-sitter queries — entities out, procedural state
-//! managed by a generic driver + per-language predicates — such that
-//! the per-language part is DATA (a .scm query pack) rather than a
-//! hand-written walker? If yes, the core is language-agnostic the way
-//! highlights.scm/tags.scm consumers are.
+//! FileAnalysis extraction for a pack language is driven by declarative
+//! tree-sitter queries — entities out, procedural state managed by a
+//! generic driver + per-language predicates — so the per-language part
+//! is DATA (a .scm query pack) rather than a hand-written walker. The
+//! core is language-agnostic the way highlights.scm/tags.scm consumers
+//! are. See `docs/adr/query-extraction-rings.md` for why this works for
+//! ring-1/2 extraction and deliberately does not attempt ring-3 semantic
+//! synthesis (that stays per-language: plugins for Perl, pack predicates
+//! + the driver's fold contributors for everything else).
 //!
-//! Architecture probed here:
+//! Architecture:
 //!   - `queries/perl/skeleton.scm` — patterns whose CAPTURE NAMES form
 //!     a language-neutral entity vocabulary (`@def.*`, `@ref.*`,
 //!     `@scope`, `@context.*`, `@import`).
@@ -20,9 +23,9 @@
 //!     capture events, maintains the scope stack and sticky contexts,
 //!     and assembles `SkelSymbol`/`SkelRef` rows.
 //!
-//! Findings live in `docs/spike-query-extraction.md`. This module is
-//! deliberately not wired into the build pipeline — it exists to be
-//! measured against the real builder by `query_extract_tests.rs`.
+//! Wired into every pack language's `PackDriver` (`language_driver.rs`);
+//! `query_extract_tests.rs` also measures it differentially against the
+//! real Perl builder as an accuracy net.
 
 use crate::model::file_analysis::{InferredType, Span};
 use tree_sitter::{Language, Point, Query, QueryCursor, StreamingIterator, Tree};

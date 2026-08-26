@@ -47,7 +47,7 @@ Three seams landed for other reasons and are exactly the right carriers:
   shredded in the same transaction as the blob (cannot drift — the failure
   that retired the RAM-side parallel reverse indexes), version-gated, indexed
   by name/key/file. `container` is the symbol's package attribution.
-- **The conclusion layer** (`docs/prompt-conclusion-layer.md`): the registry
+- **The conclusion layer** (`docs/adr/conclusion-layer.md`): the registry
   chase partially evaluated per file; cross-file answers residualize as
   `Link` (an ordered MRO ladder as data), never as baked values — so there is
   nothing to taint.

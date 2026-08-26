@@ -34,7 +34,7 @@ pub(super) const CONCLUSION_ROWS_VERSION: &str = "1";
 /// guards MEANING — a reducer edit leaves bytes that decode perfectly and
 /// answer wrongly — and there is nothing downstream to notice. A version
 /// someone has to remember to bump is the wrong instrument for a failure
-/// nothing else can see (`docs/prompt-conclusion-layer.md`).
+/// nothing else can see (`docs/adr/conclusion-layer.md`).
 const CONCLUSION_SOURCE_FINGERPRINT: &str = env!("PERL_LSP_CONCLUSION_FINGERPRINT");
 
 /// The source fingerprint, plus the ENV that steers what a bake produces.
@@ -69,7 +69,7 @@ pub fn conclusion_fingerprint() -> &'static str {
 /// file than the cold lane did — measured at 76.7% of conclusions rows
 /// rejected against rows that were in fact correct, and a warm-start freshness
 /// verdict computed over a degraded projection
-/// (`docs/prompt-surface-projection-drift.md`). Persisting the cold projection
+/// (`docs/adr/storage-engine.md`). Persisting the cold projection
 /// is what makes the two lanes agree.
 ///
 /// Its own gate, independent of `SCHEMA_VERSION`: a change to the projection

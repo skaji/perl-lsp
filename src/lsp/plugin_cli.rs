@@ -586,7 +586,7 @@ fn lint_source(source: &str, report: &mut CheckReport) {
         if source.contains(&format!("fn {}", legacy)) {
             report.warnings.push(format!(
                 "fn {legacy} is no longer dispatched — port to patterns() + on_match \
-                 (see docs/prompt-plugin-queries.md)"
+                 (see docs/adr/plugin-system.md)"
             ));
         }
     }
