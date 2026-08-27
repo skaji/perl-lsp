@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Reconstruct the scaling corpus on a fresh box (cloud agent, CI, new laptop).
 #
-#   corpus/bootstrap.sh [dest]        # default: ~/perl-corpora/bulk
+#   corpus/bootstrap.sh [dest]        # default: $PERL_CORPORA/bulk
 #   corpus/bootstrap.sh dest FHEM     # one repo
+#
+# `$PERL_CORPORA` (default ~/perl-corpora) is the ONE root, shared with
+# kick.sh: an explicit [dest] that disagrees with it produces a corpus kick.sh
+# cannot find.
 #
 # Needs: git, perl >= 5.20 with Module::CoreList (core), cpm
 #   curl -sSL https://raw.githubusercontent.com/skaji/cpm/main/cpm -o /tmp/cpm && chmod +x /tmp/cpm
 #
 # Idempotent: existing clones are left alone, existing local/ trees are topped up.
 set -u
-DEST="${1:-$HOME/perl-corpora/bulk}"
+DEST="${1:-${PERL_CORPORA:-$HOME/perl-corpora}/bulk}"
 DEPS="$(dirname "$DEST")/deps"
 ONLY="${2:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -300,7 +300,7 @@ emissions as JSON. The output is a diff against a baseline build with
 no plugins, so you see exactly what your plugin contributes.
 
 ```bash
-perl-lsp --plugin-run my-helpers.rhai --on examples/widgets.pl
+perl-lsp --plugin-run my-helpers.rhai --on lib/My/Widgets.pm
 ```
 
 Use during iteration: edit the plugin, re-run, eyeball emissions,
