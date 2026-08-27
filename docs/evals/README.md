@@ -18,9 +18,9 @@ and whose outcome is a recommendation (often "change nothing").
 - One eval per topic: `docs/evals/<topic>.md`, with any spike code beside it
   (`<topic>-spike.rs`, etc.).
 - Spike code here is **not built by the crate** — each file's header says how to
-  run it (typically: drop into a fresh crate / `examples/` and `cargo run`).
-  In-tree runnable experiments belong in `examples/` or `benches/` instead;
-  these live here only because they need a separate dependency tree.
+  run it (typically: drop into a fresh crate and `cargo run`). An in-tree
+  runnable experiment belongs in a measured `#[test]` beside the code it
+  exercises; these live here only because they need a separate dependency tree.
 - State the verdict and a concrete **revisit trigger** up top, so a stale eval
   is obvious.
 
