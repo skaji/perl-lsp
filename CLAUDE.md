@@ -48,6 +48,27 @@ cd gold-corpus && /tmp/cpm install -L local --mirror https://www.cpan.org/ --res
 
 (Outside a restricted sandbox, plain `cpm install -L local --resolver
 snapshot` or `carton install --deployment` from `gold-corpus/` works.)
+**Real-project corpora** (`corpus/README.md`) are a SEPARATE axis from gold:
+gold asserts answers, these measure behaviour at scale — wall, RSS, and the
+pathologies no fixture reproduces. Every scaling limit in
+`docs/scaling-limits.md` came from them, and none reproduced on synthetic
+input. `corpus/bootstrap.sh` reconstructs all eight on a fresh box (idempotent;
+`corpus/bootstrap.sh "" FHEM` for one). `./kick.sh` opens one in an editor
+without typing paths — `--nodeps`, `--dry`, `--debug`.
+
+`$PERL_CORPORA` (default `~/perl-corpora`) is the ONE root both scripts read:
+repos in `bulk/`, dependencies in `deps/<name>/`. **Deps live outside the
+workspace deliberately** — the walker indexes everything under the root, and
+in-tree deps took FHEM from 929 files to 33,912 (97% of them Paws). C/C++
+scale work uses its own tree; abseil sits in `~/personal/cpp-bench/abseil-cpp`.
+
+Measuring one of these is a protocol, not a command — the `edit-bench` skill
+owns it. Two traps that cost real time: a **single run is not a baseline**
+(three minimum; a phantom +400 ms "regression" survived a day on one), and a
+**number without a date rots silently** (abseil's warm RSS sat recorded at
+34 MB and 47 MB in two ADRs, both ~2x low seven weeks later). Stamp the date
+on any measurement you record, or re-measure before citing it.
+
 **`e2e/run.sh` needs `nvim` 0.10+** (the harness calls `vim.lsp.get_clients`).
 Ubuntu ships 0.9.5, which fails. Do NOT fall back to "let CI cover it" — the
 release tarball is a 10 MB download, needs no sudo and no package manager:
