@@ -8,3 +8,4 @@ pub mod json_sink;
 pub mod qual_dump;
 pub mod text;
 pub mod timings;
+pub mod watchdog;

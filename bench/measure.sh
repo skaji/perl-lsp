@@ -2,7 +2,7 @@
 # Measure perl-lsp across the real-project corpora, one JSONL line per fact.
 #
 #   bench/measure.sh                     # every corpus, 3 reps, cold+warm
-#   bench/measure.sh --reps 1 FHEM       # one corpus, one rep (marked as such)
+#   bench/measure.sh FHEM                # one corpus (still 3 reps; 3 is the floor)
 #   bench/measure.sh --out runs/         # where the JSONL lands
 #
 # Output is DELIBERATELY tall and raw: {kind,name,value,unit} per row, no
@@ -22,16 +22,32 @@ BULK="${PERL_CORPORA:-$HOME/perl-corpora}/bulk"
 DEPS="${PERL_CORPORA:-$HOME/perl-corpora}/deps"
 REPS=3
 OUT="$HERE/bench/runs"
+# Caps exist so a pathological corpus cannot take the host down with it. FHEM's
+# --check peaked at 12 GB once; an unbounded sweep across eight corpora is how
+# you lose the box mid-measurement and the run with it.
+MAX_RSS_MB=8000
+MAX_SECS=1200
 ONLY=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --reps) REPS="$2"; shift 2;;
     --out)  OUT="$2"; shift 2;;
+    --max-rss-mb) MAX_RSS_MB="$2"; shift 2;;
+    --max-secs)   MAX_SECS="$2"; shift 2;;
     -h|--help) sed -n '2,16p' "$0"; exit 0;;
     *) ONLY+=("$1"); shift;;
   esac
 done
+
+# Three is the floor, not a default. A one- or two-run baseline is how a
+# phantom +400ms regression survived a day here; the reports mark n<3
+# PROVISIONAL, and there is no reason to collect data that arrives pre-marked
+# as untrustworthy.
+if [ "$REPS" -lt 3 ]; then
+  echo "reps raised $REPS -> 3 (a baseline under 3 runs is noise)" >&2
+  REPS=3
+fi
 
 [ -x "$BIN" ] || { echo "no release binary at $BIN — cargo build --release --features cpp" >&2; exit 1; }
 [ -d "$BULK" ] || { echo "no corpora at $BULK — run corpus/bootstrap.sh" >&2; exit 1; }
@@ -57,9 +73,10 @@ jq -cn \
   --argjson mem_kb "$(awk '/MemTotal/{print $2}' /proc/meminfo)" \
   --argjson load "$(awk '{print $1}' /proc/loadavg)" \
   --argjson reps "$REPS" \
+  --argjson max_rss_mb "$MAX_RSS_MB" --argjson max_secs "$MAX_SECS" \
   '{t:"run",run_id:$run_id,ts:$ts,sha:$sha,dirty:$dirty,features:$features,
     host:$host,kernel:$kernel,nproc:$nproc,mem_kb:$mem_kb,loadavg_at_start:$load,
-    reps_planned:$reps}' >> "$JSONL"
+    reps_planned:$reps,max_rss_mb:$max_rss_mb,max_secs:$max_secs}' >> "$JSONL"
 
 emit() { # corpus rep phase kind name value unit
   jq -cn --arg run_id "$RUN_ID" --arg c "$1" --argjson r "$2" --arg p "$3" \
@@ -82,12 +99,47 @@ measure_one() { # corpus root rep phase cachedir
   emit "$corpus" "$rep" "$phase" "env" "loadavg" "$(awk '{print $1}' /proc/loadavg)" "load"
 
   # /usr/bin/time gives peak RSS the process cannot under-report about itself.
+  # `ulimit -v` is the hard stop: the process dies with ENOMEM instead of
+  # pushing the host into swap, which is the difference between losing one
+  # measurement and losing the machine running the sweep.
   local tf="$SCRATCH/time.txt"
-  PERL5LIB="$pl" XDG_CACHE_HOME="$cache" \
-  PERL_LSP_TIMINGS=1 PERL_LSP_GHOST_STATS=1 \
-  PERL_LSP_GHOST_JSON="$g" PERL_LSP_TIMINGS_JSON="$t" \
-    /usr/bin/time -f '%e %M %P' -o "$tf" \
-    "$BIN" --check "$root" >/dev/null 2>&1
+  # The RSS cap is the BINARY's (PERL_LSP_MAX_RSS_MB): it reads its own
+  # /proc/self/status, which is exact. A shell-side poller has to find the
+  # process through subshell -> timeout -> time -> binary and guess with
+  # pgrep; it guessed wrong and let a 715 MB corpus sail past a 400 MB cap.
+  # The process knows its own size. Ask it.
+  #
+  # SIGTERM is now handled either way, so an external stop (timeout below, a
+  # CI cancellation, a human) also flushes rather than discarding. SIGKILL
+  # stays the escalation and never the first move: it is uncatchable, so it
+  # takes the instrumentation with it. On Znuny an abrupt 8 GB stop cost 40%
+  # of the per-file rows while leaving wall untouched — which is exactly what
+  # a silent kill looks like from outside.
+  #
+  # ulimit and timeout remain HOST backstops set well above the soft cap:
+  # only the kernel catches an allocation that outruns a 250ms poll.
+  ( ulimit -v $(( (MAX_RSS_MB + 4000) * 1024 )) 2>/dev/null
+    PERL5LIB="$pl" XDG_CACHE_HOME="$cache" \
+    PERL_LSP_TIMINGS=1 PERL_LSP_GHOST_STATS=1 \
+    PERL_LSP_MAX_RSS_MB="$MAX_RSS_MB" PERL_LSP_MAX_SECS="$MAX_SECS" \
+    PERL_LSP_GHOST_JSON="$g" PERL_LSP_TIMINGS_JSON="$t" \
+      timeout -k 30 -s TERM $(( MAX_SECS + 120 )) \
+      /usr/bin/time -f '%e %M %P' -o "$tf" \
+      "$BIN" --check "$root" >/dev/null 2>&1 )
+  local rc=$?
+
+  # A capped run MUST be visible. Absent rows look like a collection bug, and
+  # "FHEM has no number" is a finding about FHEM, not about the harness.
+  local outcome=ok
+  case $rc in
+    0)   outcome=ok;;
+    90)  outcome=rss_cap;;    # self-capped: partial data present
+    92)  outcome=sigterm;;   # harness stopped it; instrumentation flushed
+    91)  outcome=time_cap;;   # self-capped: partial data present
+    124|137) outcome=hard_kill;;  # backstop fired — the soft cap did not
+    *)   outcome=error;;
+  esac
+  emit "$corpus" "$rep" "$phase" "outcome" "$outcome" "$rc" "exit_code"
 
   if [ -s "$tf" ]; then
     read -r wall maxrss cpupct < <(tail -1 "$tf")
