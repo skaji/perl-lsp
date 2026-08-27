@@ -17,6 +17,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// One module's timing breakdown. `cached` marks a module served from the
 /// SQLite blob (no parse/build) vs freshly built.
+#[derive(Clone)]
 struct Entry {
     module: String,
     parse: Duration,
@@ -85,12 +86,41 @@ fn record(e: Entry) {
 const TOP_N: usize = 50;
 
 /// Print the slowest-first breakdown to stderr. No-op when disabled or empty.
+/// Dump EVERY module's parse/build to `$PERL_LSP_TIMINGS_JSON`, if set.
+///
+/// `report` prints slowest-first for a human; this writes all of them,
+/// because the distribution is the point. One 33s file inside an otherwise
+/// healthy total is invisible to a mean and to a top-N that happens to be
+/// shorter than the tail — and that exact shape was the giant-file quadratic.
+pub fn write_json() -> bool {
+    use std::fmt::Write as _;
+    let c = collector().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::from("{\n  \"modules\": [");
+    for (i, e) in c.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    {{\"module\": \"{}\", \"parse_ns\": {}, \"build_ns\": {}, \"cached\": {}}}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(&e.module),
+            e.parse.as_nanos(),
+            e.build.as_nanos(),
+            e.cached
+        );
+    }
+    let _ = write!(out, "{}]\n}}\n", if c.is_empty() { "" } else { "\n  " });
+    drop(c);
+    super::json_sink::write_if_requested("PERL_LSP_TIMINGS_JSON", &out)
+}
+
 pub fn report() {
     if !is_enabled() {
         return;
     }
+    // CLONE, never drain. Draining made the collector single-consumer: the
+    // human report and the JSON sink both read it, and whichever ran first
+    // left the other with an empty file that looked like "nothing was built".
     let mut entries = match collector().lock() {
-        Ok(mut v) => std::mem::take(&mut *v),
+        Ok(v) => v.clone(),
         Err(_) => return,
     };
     if entries.is_empty() {

@@ -640,10 +640,81 @@ fn registry() -> &'static Mutex<Vec<Weak<GhostStats>>> {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Dump every raw counter to `$PERL_LSP_GHOST_JSON` as JSON, if set.
+///
+/// The whole map, unrounded and unsorted — a harness slices later, and a
+/// top-N here is a decision the instrument has no business making. Three
+/// families, kept separate because collapsing them loses what a number
+/// MEANS: `counters` are occurrences, `timings` carry ns plus the count they
+/// accumulate over, and `quantities` carry a sum plus its count. Never derive
+/// a mean here; a stored ratio is the shape that let an attempts-vs-completions
+/// mixup stand as a finding once already.
+///
+/// Independent of the `enabled()` gate on purpose: asking for the JSON IS the
+/// request. Callers still need the counters to have been recorded, which the
+/// gate controls.
+pub fn write_json() -> bool {
+    use std::fmt::Write as _;
+    let mut out = String::from("{\n");
+
+    let c = counters().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(out, "  \"counters\": {{");
+    for (i, (k, v)) in c.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(k),
+            v
+        );
+    }
+    let _ = write!(out, "{}}},\n", if c.is_empty() { "" } else { "\n  " });
+    drop(c);
+
+    let a = accum().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(out, "  \"timings\": {{");
+    for (i, (k, (ns, n))) in a.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {{\"ns\": {}, \"n\": {}}}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(k),
+            ns,
+            n
+        );
+    }
+    let _ = write!(out, "{}}},\n", if a.is_empty() { "" } else { "\n  " });
+    drop(a);
+
+    let q = quantities().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(out, "  \"quantities\": {{");
+    for (i, (k, (sum, n))) in q.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {{\"sum\": {}, \"n\": {}}}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(k),
+            sum,
+            n
+        );
+    }
+    let _ = write!(out, "{}}}\n}}\n", if q.is_empty() { "" } else { "\n  " });
+    drop(q);
+
+    super::json_sink::write_if_requested("PERL_LSP_GHOST_JSON", &out)
+}
+
 /// Emit every live cache's report now. Wired to LSP shutdown (explicitly,
 /// before the hard exit) and to CLI end-of-run (via `EmitOnDrop` in `main`).
 /// No-op when the gate is off.
 pub fn emit_all(moment: &str) {
+    // The machine-readable sinks hang off the ONE exit hook every caller
+    // already uses, so a new exit point inherits them instead of forgetting
+    // them. They sit BEFORE the gate deliberately: `PERL_LSP_GHOST_STATS`
+    // controls the human report, and asking for the JSON path is its own
+    // request. Both no-op when their variable is unset.
+    write_json();
+    super::timings::write_json();
     if !enabled() {
         return;
     }

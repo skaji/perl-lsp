@@ -16,3 +16,5 @@ gold-corpus/local
 /sner.pl
 /sner.scm
 __pycache__/
+bench/runs/
+bench/measurements.duckdb

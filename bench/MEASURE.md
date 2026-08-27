@@ -1,0 +1,70 @@
+# Scale measurement harness
+
+`bench/measure.sh` runs perl-lsp over the real-project corpora and writes one
+JSONL line per fact. `bench/load.sql` loads every run into DuckDB;
+`bench/report.sql` slices it.
+
+```
+cargo build --release --features cpp        # features are recorded per run
+bench/measure.sh                            # all corpora, 3 reps, cold+warm
+bench/measure.sh --reps 1 FHEM              # one corpus, quickly
+duckdb bench/measurements.duckdb < bench/load.sql
+duckdb bench/measurements.duckdb < bench/report.sql
+```
+
+Needs `jq`, `/usr/bin/time`, and the corpora (`corpus/bootstrap.sh`). DuckDB
+is only needed to read the results — collection writes plain JSONL, so a box
+that cannot install DuckDB can still collect and ship the files.
+
+## What is recorded
+
+Per corpus × rep × phase (cold/warm): `--check` wall, peak RSS, CPU
+utilization, `modules.db` size, **every** ghost counter, and **every** file's
+parse and build time. Nothing is aggregated or rounded at collection.
+
+The `run` line carries provenance once: run id, timestamp, git SHA, **dirty
+flag**, **build features**, host, kernel, nproc, MemTotal, load average.
+Load average is also recorded per measurement, because a corpus that ran while
+the box was busy is not comparable to one that did not.
+
+## Three rules the schema enforces
+
+**Every repetition is a row.** There is no way to emit "the number" — reps are
+stored individually and reports aggregate. A one-run baseline once produced a
+phantom +400 ms regression that survived a day; `n` and `spread` ride every
+aggregate, and `n<3` prints `PROVISIONAL`.
+
+**Nothing derived is stored.** Attempts and completions are separate rows, ns
+and its count are separate rows. A stored ratio is how an attempts-vs-
+completions mixup became a reported finding once already — let the report
+divide, where the denominator is visible.
+
+**Counters lead, wall lags.** Every quadratic found in the scaling sprint was
+visible as a counter before anyone attributed the wall. Wall tells you
+something is wrong; counters tell you where.
+
+## Adding a metric
+
+Nothing to migrate — rows are `{kind, name, value, unit}`. A new ghost counter
+appears in the data the run after it appears in the code. That is why the
+schema is tall: the counter set grows constantly, and a wide table would need
+a migration each time.
+
+## Traps
+
+**Cold means cold.** Each rep gets a fresh throwaway `XDG_CACHE_HOME`;
+otherwise rep 2 measures rep 1's cache and calls itself cold.
+
+**Build the binary with the features you mean.** A default build serves Perl
+only, and its numbers are not comparable to a `--features cpp` build's. The
+run line records what `--languages` reported, so a mismatch is visible rather
+than silent.
+
+**Never write inside the measured region.** The sinks accumulate in memory and
+serialize at exit. Emitting per-file lines to a stream during the run once
+cost 3.2M lines and 43 minutes, measuring something that no longer resembled
+the thing under test.
+
+**A number without a date rots.** These rows carry a timestamp and a SHA for
+exactly that reason: abseil's warm RSS sat recorded in two ADRs at 34 MB and
+47 MB, both ~2x low, for seven weeks.
