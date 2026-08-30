@@ -201,10 +201,16 @@ def emit_jsonl(args, metrics, root):
             dirty = subprocess.call(["git", "-C", here, "diff", "--quiet"]) != 0
         except Exception:
             pass
+        try:
+            load = os.getloadavg()[0]
+        except OSError:
+            load = None
         rows.append({"t": "run", "run_id": run_id,
                      "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      "sha": sha, "dirty": dirty, "source": "lsp_bench",
-                     "host": platform.node(), "bin": os.path.abspath(args.bin)})
+                     "host": platform.node(), "nproc": os.cpu_count(),
+                     "loadavg_at_start": load,
+                     "bin": os.path.abspath(args.bin)})
 
     def m(kind, name, value, unit, tag=None):
         if value is None:

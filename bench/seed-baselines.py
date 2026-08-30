@@ -48,9 +48,14 @@ def main():
         elif k == "startup":
             vals[(c, p, f"editor.{r['name']}_ms")].append(r["value"])
         elif k == "verb_ms":
-            vals[(c, p, f"editor.verb.{r['name']}_ms")].append(r["value"])
+            # Keyed by the SCENARIO STEP (tag), not just the verb: the same
+            # verb at two points in a scenario is two different promises
+            # (first-definition-after-open vs steady-state), and a median
+            # over a bimodal population describes neither.
+            step = r.get("tag") or r["name"]
+            vals[(c, p, f"editor.verb.{r['name']}.{step}_ms")].append(r["value"])
         elif k == "diag_push_ms":
-            vals[(c, p, "editor.diag_push_ms")].append(r["value"])
+            vals[(c, p, f"editor.diag_push.{r['name']}_ms")].append(r["value"])
         elif k == "server_rss" and r["name"] == "end":
             vals[(c, p, "editor.rss_end_mb")].append(r["value"])
     assert run, "no run line in input"
