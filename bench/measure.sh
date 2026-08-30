@@ -121,7 +121,7 @@ measure_one() { # corpus root rep phase cachedir
   ( ulimit -v $(( (MAX_RSS_MB + 4000) * 1024 )) 2>/dev/null
     PERL5LIB="$pl" XDG_CACHE_HOME="$cache" \
     PERL_LSP_TIMINGS=1 PERL_LSP_GHOST_STATS=1 \
-    PERL_LSP_MAX_RSS_MB="$MAX_RSS_MB" PERL_LSP_MAX_SECS="$MAX_SECS" \
+    PERL_LSP_MAX_RSS_MB="$MAX_RSS_MB" PERL_LSP_MAX_SECONDS="$MAX_SECS" \
     PERL_LSP_GHOST_JSON="$g" PERL_LSP_TIMINGS_JSON="$t" \
       timeout -k 30 -s TERM $(( MAX_SECS + 120 )) \
       /usr/bin/time -f '%e %M %P' -o "$tf" \

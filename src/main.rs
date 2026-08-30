@@ -27,7 +27,7 @@ async fn main() {
     env_logger::init();
     let _ghost_trail = util::ghost_stats::EmitOnDrop::new("cli-eof");
     // Self-imposed caps, armed here so every verb inherits them. Inert unless
-    // PERL_LSP_MAX_RSS_MB / PERL_LSP_MAX_SECS are set. An external kill takes
+    // PERL_LSP_MAX_RSS_MB / PERL_LSP_MAX_SECONDS are set. An external kill takes
     // the instrumentation down with the process; this exits through the front
     // door, so a capped run still reports what it managed to measure.
     util::watchdog::arm();

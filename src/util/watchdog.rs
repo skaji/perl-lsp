@@ -61,7 +61,7 @@ fn rss_kb() -> Option<u64> {
         .and_then(|v| v.split_whitespace().next()?.parse().ok())
 }
 
-/// Arm the caps named by `PERL_LSP_MAX_RSS_MB` / `PERL_LSP_MAX_SECS`.
+/// Arm the caps named by `PERL_LSP_MAX_RSS_MB` / `PERL_LSP_MAX_SECONDS`.
 ///
 /// No-op when neither is set, so a normal run pays one env read and nothing
 /// else. Idempotent in effect: arming twice just costs a second poller.
@@ -69,7 +69,7 @@ pub fn arm() {
     let max_rss_mb: Option<u64> = std::env::var("PERL_LSP_MAX_RSS_MB")
         .ok()
         .and_then(|v| v.parse().ok());
-    let max_secs: Option<u64> = std::env::var("PERL_LSP_MAX_SECS")
+    let max_secs: Option<u64> = std::env::var("PERL_LSP_MAX_SECONDS")
         .ok()
         .and_then(|v| v.parse().ok());
 
