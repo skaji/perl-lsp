@@ -127,6 +127,7 @@ impl FileAnalysis {
             dynamic_dispatch_sites,
             loader_config_params,
             flow_edges,
+            unrowed_attachment_names: Vec::new(),
             degraded: false,
             // Pack drivers re-stamp their id post-construction.
             language: super::default_language(),
@@ -242,22 +243,113 @@ impl FileAnalysis {
     }
 
     pub(crate) fn finalize_post_walk(&mut self) {
-        self.emit_method_call_binding_edges();
+        // Four timed children: finalize measured 0.50ms/call on gold
+        // substrate builds and 18.65ms/call on e2e's tiny fixtures — a 37x
+        // per-call gap on smaller inputs, so one of these steps scales with
+        // something other than file size, and one aggregate tag cannot say
+        // which. (ScopedNs, so each lands per-file with exclusive time.)
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::mcb_edges");
+            self.emit_method_call_binding_edges();
+        }
         // Fill HashKeyAccess owners that are resolvable in-file
         // via the invocant ladder (`method_call_invocant_type`).
         // Cross-file gaps stay None until
         // `enrich_imported_types_with_keys` re-runs the same
         // routine with `module_index`.
-        self.fix_chain_receiver_hash_key_owners(None);
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::hash_key_owners");
+            self.fix_chain_receiver_hash_key_owners(None);
+        }
         // Stamp the build-time-resolved dispatch target on MethodCall
         // refs (local-only here; enrichment re-stamps with the index
         // for OPEN docs). Mutates existing refs in place, so it must run
         // before the ref table seals its baseline — the seal counts the
         // refs, the stamp only sets a field on them.
-        self.stamp_method_call_targets(None);
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::stamp_targets");
+            self.stamp_method_call_targets(None);
+        }
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::seal_unrowed");
+            self.seal_unrowed_attachment_names();
+        }
         self.base_witness_count = self.witnesses.len();
         self.symbols.seal_baseline();
         self.refs.seal_baseline();
+    }
+
+    /// Derive `unrowed_attachment_names` from the FINAL bag: every
+    /// class-keyed attachment name the relational rows would deny.
+    ///
+    /// The mirror must be at least as generous as the row probes it
+    /// licenses skipping against — `sym_member_row_exists` matches a
+    /// symbol's raw name OR its match key under the attachment's package,
+    /// and the mention probe matches any ref's match key — so a name is
+    /// KEPT (fail-open at probe time) unless one of those forms provably
+    /// backs it. Runs before the seals, on the builder path only;
+    /// hand-crafted test FAs carry an empty vec, which the pre-filter
+    /// cannot mis-trust because their rows are never shredded.
+    fn seal_unrowed_attachment_names(&mut self) {
+        use crate::model::witnesses::WitnessAttachment;
+        let mut ref_keys: HashSet<String> = HashSet::new();
+        for r in self.refs().iter() {
+            ref_keys.insert(r.match_key());
+        }
+        // One pass over the symbols, THEN one over the attachments. The
+        // per-attachment symbols scan this replaces was attachments x
+        // symbols — quadratic exactly where the residue matters (a Mojo
+        // file's bridge writeback mints an attachment per entity per
+        // bridged class, against the same file's full symbol table).
+        let mut sym_names: HashMap<&str, HashSet<String>> = HashMap::new();
+        for s in self.symbols().iter() {
+            if let Some(p) = s.package.as_deref() {
+                let names = sym_names.entry(p).or_default();
+                let key = super::name_match_key(&s.name);
+                if key != s.name {
+                    names.insert(key);
+                }
+                names.insert(s.name.clone());
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        for att in self.witnesses.attachments() {
+            match att {
+                WitnessAttachment::PackageSymbol { package, name } => {
+                    // A class with LOCAL parent edges (declared or dynamic)
+                    // fails the pre-filter open at the gate battery for
+                    // EVERY name, so its entries here would be dead weight —
+                    // and the local-inheritance writeback attaches every
+                    // parent method under the child, so a single-file
+                    // Base/Derived pair would otherwise list the whole
+                    // parent surface. Skipping them keeps the residue
+                    // plugin-sized: bridges, parametric declarations,
+                    // overrides.
+                    if !self.declared_parents(package).is_empty()
+                        || self.has_dynamic_parents(package)
+                    {
+                        continue;
+                    }
+                    let backed = sym_names
+                        .get(package.as_str())
+                        .is_some_and(|names| names.contains(name));
+                    if !backed {
+                        out.push(name.clone());
+                    }
+                }
+                WitnessAttachment::SlotType { key, .. } => {
+                    if !ref_keys.contains(key)
+                        && !ref_keys.contains(&super::name_match_key(key))
+                    {
+                        out.push(key.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.sort();
+        out.dedup();
+        self.unrowed_attachment_names = out;
     }
 
     /// Stamp the `Method` binding on every `MethodCall` ref — the NAV
@@ -966,6 +1058,95 @@ impl HeapBreakdown {
     }
 }
 
+impl HeapBreakdown {
+    /// The buckets as (name, bytes) pairs — ONE spelling of the bucket list,
+    /// shared by the Display report and the JSON sink, so a new bucket can't
+    /// appear in one and silently not the other.
+    pub fn buckets(&self) -> [(&'static str, usize); 11] {
+        [
+            ("refs", self.refs),
+            ("symbols", self.symbols),
+            ("witness_vec", self.witness_vec),
+            ("witness_index", self.witness_index),
+            ("include", self.include),
+            ("scopes", self.scopes),
+            ("rebuilt_indices", self.rebuilt_indices),
+            ("bindings", self.bindings),
+            ("cpp_extras", self.cpp_extras),
+            ("misc", self.misc),
+            ("shell", self.shell),
+        ]
+    }
+}
+
+/// Streaming writer for `$PERL_LSP_HEAP_JSON[_DIR]`: per-file heap-bucket
+/// rows plus the aggregate and the path-intern table. Push-style because
+/// both producers iterate under locks that forbid keeping the borrows —
+/// the pack registry walk and the sweep's entry list.
+///
+/// WHAT THE NUMBERS MEAN: the composition of the analyses AS HELD at the
+/// call site. Resident index copies are stripped after persist, so on a
+/// default run this reports the stripped residents (small refs/symbols
+/// buckets ARE the finding — eviction working); under `PERL_LSP_NO_EVICT=1`
+/// it reports whole analyses. It is NOT a peak-RSS attribution — pair it
+/// with /usr/bin/time for totals, and say which mode produced it.
+pub struct HeapJson {
+    out: Option<String>,
+    agg: HeapBreakdown,
+    first: bool,
+}
+
+impl HeapJson {
+    pub fn new() -> Self {
+        let requested = std::env::var_os("PERL_LSP_HEAP_JSON").is_some()
+            || std::env::var_os("PERL_LSP_HEAP_JSON_DIR").is_some();
+        HeapJson {
+            out: requested.then(|| String::from("{\n  \"files\": [")),
+            agg: HeapBreakdown::default(),
+            first: true,
+        }
+    }
+
+    pub fn push(&mut self, path: &std::path::Path, fa: &FileAnalysis) {
+        use std::fmt::Write as _;
+        let Some(out) = self.out.as_mut() else { return };
+        let h = fa.heap_estimate();
+        let _ = write!(
+            out,
+            "{}\n    {{\"path\": \"{}\"",
+            if self.first { "" } else { "," },
+            crate::util::json_sink::esc(&path.display().to_string())
+        );
+        for (name, bytes) in h.buckets() {
+            let _ = write!(out, ", \"{name}\": {bytes}");
+        }
+        let _ = write!(out, "}}");
+        self.agg.add(&h);
+        self.first = false;
+    }
+
+    /// Write the sink. No-op when the env never asked.
+    pub fn finish(self) {
+        use std::fmt::Write as _;
+        let Some(mut out) = self.out else { return };
+        let _ = write!(out, "\n  ],\n  \"total\": {{\"files\": {}", self.agg.files);
+        for (name, bytes) in self.agg.buckets() {
+            let _ = write!(out, ", \"{name}\": {bytes}");
+        }
+        let (paths, bytes) = super::path_intern::table_stats();
+        let _ = write!(
+            out,
+            "}},\n  \"path_intern\": {{\"paths\": {paths}, \"bytes\": {bytes}}}\n}}\n"
+        );
+        crate::util::json_sink::write_if_requested_any(
+            "PERL_LSP_HEAP_JSON",
+            "PERL_LSP_HEAP_JSON_DIR",
+            "heap",
+            &out,
+        );
+    }
+}
+
 impl std::fmt::Display for HeapBreakdown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mb = |b: usize| b as f64 / 1_048_576.0;
@@ -1104,8 +1285,13 @@ impl FileAnalysis {
             + scap(&self.column_keyed_verbs)
             + vcap(&self.export)
             + vcap(&self.export_ok)
-            + vcap(&self.reexport_modules);
+            + vcap(&self.reexport_modules)
+            + vcap(&self.unrowed_attachment_names);
 
         h
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

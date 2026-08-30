@@ -294,3 +294,58 @@ change (`docs/adr/enrichment-build-cost.md`). mojo (`lib`, server path via
 Worth keeping as a caution: a scenario whose overlay hit rate is ~99% cannot
 measure a change to what a MISS costs. Reach for a corpus where the overlay
 thrashes, or count builds first and stop if the count is small.
+
+## 2026-08-30 — the harness measures itself in: first KPI baselines (sha ce16a564)
+
+The JSONL harness (bench/MEASURE.md) landed with per-file exclusive-time
+lanes, and paid for itself before merging:
+
+- **`finalize_post_walk` was the interactive path's biggest build phase** —
+  41% of e2e build-family time, invisible to every `--check` measurement.
+  The exclusive-time split put 98.3% on `seal_unrowed_attachment_names`
+  (O(attachments × symbols), a String allocation per comparison). Fixed:
+  **10.99 → 0.049 ms/call (~220×)**, both arms on buildable binaries.
+- **The instrument was held to its own standard**: armed gold ran +15% over
+  bare; an A/B against the pre-lane binary pinned it to the file lane's
+  per-drop String+lock — sitting inside parents' exclusive times. Per-thread
+  staging brought armed runs inside noise (28.7 s vs 30.3 s bare).
+- **First KPI baselines** seeded to `bench/baselines.jsonl` (reproducible-8,
+  clean tree, n=3 each). Headlines: Znuny `--check` 52.0 s / 9.31 GB cold,
+  24.2 s / 9.23 GB warm; FHEM 65.0 s / 2.26 GB cold, 53.5 s / 2.17 GB warm;
+  BMO 9.7 s / 0.68 GB cold, 2.0 s / 0.71 GB warm.
+- **FHEM's memory variance collapsed**: warm peak was 3.9 GB with a 61%
+  spread on 2026-08-27; it is 2.17 GB at ~5% now — the seal fix plus the
+  consult pre-filter, not a measurement artifact (same harness, same box).
+  Its warm/cold wall ratio moved 0.90 → 0.82; the `package main` consult
+  sweep remains the dominant term and the open lever.
+- Editor-surface KPIs now flow through `lsp_bench.py --jsonl` into the same
+  store (Bugzilla spot-run: ready 624 ms cold, first didChange→diagnostics
+  2.24 s cold then 260–650 ms, server RSS 406 MB). **Editor baselines are
+  deliberately not seeded yet** — they must come from a quiet box, and the
+  batch sweep owned the box today.
+
+## 2026-08-30 — SharedKeys: the N×S clone product deleted at the type (sha pending)
+
+Znuny's 9.3 GB `--check` root-caused to one representation choice: by-value
+transport of `HashWithKeys` meant every consumer querying a variable typed
+by a big generated literal took delivery of the whole key list — N sites ×
+O(S), in three consumers (the sweep's deref lane: 7.3 GB + 17.6 s; the
+build's owner-upgrade pass: 16.1 s to compute 9,724 `None`s; the finalize
+seal, fixed earlier). `SharedKeys` (Arc'd key list, ptr-eq equality fast
+path, copy-on-write for the one mutation site) deletes the product with
+zero consumer changes and rule #10's rich-type contract intact.
+
+Measured (single runs; deltas clear baseline spreads by orders of
+magnitude): Znuny cold 52.0 s / 9,314 MB → **19.0 s / 1,973 MB**; warm
+24.2 s / 9,232 MB → **6.3 s / 1,900 MB**. Glyphs.pm standalone 34.4 s /
+7.58 GB → **15.1 s / 95 MB**. FHEM warm 53.5 → 48.1 s, memory flat (its
+mechanism is consult volume, not shapes). Gold 503/0 warm-clean, e2e
+121/0, unit 1687/0 — answers unchanged by the exact-assertion net, not
+just by argument. No cache invalidation: SharedKeys serializes via
+delegating impls, byte-identical to the Vec it replaced.
+
+Known residual, named: Glyphs standalone still spends 7.9 s (build) +
+6.7 s (sweep) re-FOLDING the ~9.7k witnesses on one attachment per query —
+N queries × W witnesses, clone-free but not fold-free, temporal semantics
+make naive memoization wrong. Separate design question; the checked-in
+baselines will hold the line meanwhile.

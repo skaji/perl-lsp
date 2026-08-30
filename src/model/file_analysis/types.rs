@@ -13,6 +13,66 @@ pub struct TypeConstraint {
     pub inferred_type: InferredType,
 }
 
+/// Shared key list for [`InferredType::HashWithKeys`]. Clone is a refcount.
+///
+/// The by-value spelling cost Znuny 33s and 7.3GB: rule #10's rich-type
+/// returns are the right contract, but every consumer that queried a
+/// variable typed by a 4.8k-key generated literal took delivery of the
+/// whole key list — N sites x O(S), in three separate consumers. Sharing
+/// deletes the product; what remains is O(S) once, linear in the input.
+///
+/// `PartialEq` takes the pointer fast path first: all sites of one literal
+/// share one allocation, so the common comparison is O(1).
+///
+/// Serializes EXACTLY as the inner `Vec` (delegating impls, not a newtype
+/// wrapper), so cache blobs are byte-identical and `EXTRACT_VERSION` does
+/// not move.
+#[derive(Debug, Clone, Eq)]
+pub struct SharedKeys(std::sync::Arc<Vec<(String, Option<Box<InferredType>>)>>);
+
+impl SharedKeys {
+    pub fn new(v: Vec<(String, Option<Box<InferredType>>)>) -> Self {
+        SharedKeys(std::sync::Arc::new(v))
+    }
+
+    /// Copy-on-write access for the one mutation path (shape extension).
+    /// Clones the key list only when the allocation is shared.
+    pub fn to_mut(&mut self) -> &mut Vec<(String, Option<Box<InferredType>>)> {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl std::ops::Deref for SharedKeys {
+    type Target = [(String, Option<Box<InferredType>>)];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl PartialEq for SharedKeys {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Serialize for SharedKeys {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SharedKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::deserialize(d).map(|v| SharedKeys(std::sync::Arc::new(v)))
+    }
+}
+
+impl FromIterator<(String, Option<Box<InferredType>>)> for SharedKeys {
+    fn from_iter<I: IntoIterator<Item = (String, Option<Box<InferredType>>)>>(i: I) -> Self {
+        SharedKeys::new(i.into_iter().collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InferredType {
     /// `$p = Point->new(...)` — variable is an instance of ClassName.
@@ -115,7 +175,7 @@ pub enum InferredType {
     /// END for bincode variant-index stability (bump
     /// `EXTRACT_VERSION`).
     HashWithKeys {
-        keys: Vec<(String, Option<Box<InferredType>>)>,
+        keys: SharedKeys,
         open: bool,
     },
     /// `Optional(Box<T>)` — value-or-undef (Type::Tiny `Maybe[T]` /

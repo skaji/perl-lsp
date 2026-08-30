@@ -90,7 +90,7 @@ impl<'a> Builder<'a> {
         if keys.is_empty() && !open {
             return InferredType::HashRef;
         }
-        InferredType::HashWithKeys { keys, open }
+        InferredType::HashWithKeys { keys: crate::model::file_analysis::SharedKeys::new(keys), open }
     }
 
     /// Type an array literal positionally: `[1, 'x']` →

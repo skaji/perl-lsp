@@ -34,6 +34,11 @@ all-langs = ["cpp", "python", "r", "cmake"]
 perf_bench = []
 
 [dependencies]
+# Signal handling for the graceful-exit path (`util::watchdog`). Already rode
+# in transitively; named because we depend on it directly now — an external
+# SIGTERM has to flush the instrumentation before the process goes, and the
+# corpus that gets killed is the one whose measurements matter most.
+libc = "0.2"
 tower-lsp = "0.20"
 # `tower::Service` + `futures` power the `panic_guard` service wrapper (the
 # process-survival seam). Both already ride in transitively via tower-lsp; named

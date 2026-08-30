@@ -203,6 +203,66 @@ impl QueryState {
 /// is structurally faithful for every `InferredType` variant (each field
 /// is itself `Debug`), so equality of the string implies equality of the
 /// receiver for keying purposes.
+fn consult_prefilter_equiv() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("PERL_LSP_CONSULT_PREFILTER_EQUIV").is_ok())
+}
+
+/// May candidate `cached` contribute ANY answer to a class-keyed consult
+/// (`PackageSymbol{class, name}` when `attributed`, `SlotType{class, key}`
+/// otherwise)? The registry-sweep face of the rows-backed pre-filter
+/// (`docs/prompt-relational-iteration.md`) for the many-provider shape a
+/// package-`main` monoculture mints — where a no-answer sweep walks every
+/// declaring file to learn nothing.
+///
+/// The rows can only speak for the candidate's BAG; the chase has three
+/// candidate-LOCAL routes that answer without any bag witness for the
+/// name, each gated here from the never-evicted lanes:
+///   * the attempt walks the candidate's own `declared_parents` (and its
+///     dynamic-parents marker — undecidable, so it always fails open);
+///   * the synthetic app-surface edge, keyed off the candidate's
+///     `app_surface_consumers`;
+///   * declarative attachment names with no backing row — parametric
+///     method declarations, plugin `Method` overrides, bridged entities
+///     under a foreign container — carried per file as
+///     `unrowed_attachment_names`, derived generically from the final bag
+///     so no push site can bypass it.
+/// Everything else an attempt can relay (the re-entrant sweep, the
+/// idx-wide `parents_cached` union, the global bridge enumeration) is
+/// candidate-INDEPENDENT: the consumer's own chase arms reach it whether
+/// or not this candidate is skipped.
+///
+/// Fail-open everywhere any input cannot speak; ships with
+/// `PERL_LSP_NO_CONSULT_PREFILTER` (disable, in the rows probe) and
+/// `PERL_LSP_CONSULT_PREFILTER_EQUIV` (run the skipped attempt anyway and
+/// scream on divergence).
+pub(super) fn sweep_candidate_may_answer(
+    idx: &dyn crate::model::file_analysis::CrossFileLookup,
+    cached: &std::sync::Arc<crate::model::file_analysis::CachedModule>,
+    class: &str,
+    name: &str,
+    attributed: bool,
+) -> bool {
+    let fa = &cached.analysis;
+    if !fa.declared_parents(class).is_empty() {
+        return true;
+    }
+    if fa.has_dynamic_parents(class) {
+        return true;
+    }
+    if fa.plugin.app_surface_consumers.iter().any(|c| c == class) {
+        return true;
+    }
+    if fa
+        .unrowed_attachment_names
+        .binary_search_by(|n| n.as_str().cmp(name))
+        .is_ok()
+    {
+        return true;
+    }
+    idx.candidate_bag_may_answer(cached, name, class, attributed)
+}
+
 fn receiver_key(r: &Option<InferredType>) -> Option<String> {
     r.as_ref().map(|t| format!("{t:?}"))
 }
@@ -869,6 +929,30 @@ impl ReducerRegistry {
                             }
                             continue;
                         }
+                        // The rows-backed pre-filter — same placement and
+                        // memoized-skip discipline as the primary's (see
+                        // `moc_cross_file_primary`); the un-attributed
+                        // flavor, because a slot key is a hash-key ref,
+                        // not an attributed symbol.
+                        let prefilter_denied =
+                            !sweep_candidate_may_answer(idx, cached, class, key, false);
+                        if prefilter_denied {
+                            crate::util::ghost_stats::count("consult.prefilter_skip");
+                            if !consult_prefilter_equiv() {
+                                super::session::remember_candidate_answer(
+                                    idx,
+                                    &cached.path,
+                                    &memo_q,
+                                    &ReducedValue::None,
+                                );
+                                idx.remember_sweep_consult(
+                                    &cached.path,
+                                    &verdict_key,
+                                    &ReducedValue::None,
+                                );
+                                continue;
+                            }
+                        }
                         let attempt =
                             |full: &std::sync::Arc<crate::model::file_analysis::FileAnalysis>,
                              state: &mut _| {
@@ -907,6 +991,21 @@ impl ReducerRegistry {
                                 "moc.provider_answered"
                             });
                             if v != ReducedValue::None {
+                                if prefilter_denied {
+                                    crate::util::ghost_stats::count(
+                                        "consult.prefilter_break",
+                                    );
+                                    log::error!(
+                                        "consult pre-filter break: rows proved {:?} \
+                                         silent in {:?} but the chase answered {v:?}",
+                                        q.attachment,
+                                        cached.path
+                                    );
+                                    debug_assert!(
+                                        false,
+                                        "consult pre-filter hid an answer; see log"
+                                    );
+                                }
                                 super::session::remember_candidate_answer(
                                     idx, &cached.path, &memo_q, &v,
                                 );
@@ -932,6 +1031,22 @@ impl ReducerRegistry {
                                     state.pins.push(std::sync::Arc::clone(&enriched));
                                     let v = attempt(&enriched, state);
                                     if v != ReducedValue::None {
+                                        if prefilter_denied {
+                                            crate::util::ghost_stats::count(
+                                                "consult.prefilter_break",
+                                            );
+                                            log::error!(
+                                                "consult pre-filter break (enriched): \
+                                                 rows proved {:?} silent in {:?} but \
+                                                 the chase answered {v:?}",
+                                                q.attachment,
+                                                cached.path
+                                            );
+                                            debug_assert!(
+                                                false,
+                                                "consult pre-filter hid an answer; see log"
+                                            );
+                                        }
                                         super::session::remember_candidate_answer(
                                             idx, &cached.path, &memo_q, &v,
                                         );
@@ -1053,7 +1168,9 @@ impl ReducerRegistry {
 
 
     /// The cross-file primary hop of the `PackageSymbol` ladder: every file
-    /// declaring `package`, asked in ladder order, first answer wins.
+    /// declaring `package`, asked in ladder order, first answer wins,
+    /// with the consult pre-filter (`sweep_candidate_may_answer`) skipping
+    /// candidates the rows prove silent.
     ///
     /// Out of line, and `#[inline(never)]`, because of the STACK. This block's
     /// locals — two capture-heavy `attempt` closures, the conclusion-outcome
@@ -1088,6 +1205,10 @@ impl ReducerRegistry {
         // The sweep-tier spelling of the same key — shared across files and
         // workers where a batch sweep opened the store (SweepAnswerGuard).
         let verdict_key = super::ConsultVerdictKey::of(&memo_q);
+        let att_name = match q.attachment {
+            WitnessAttachment::PackageSymbol { name, .. } => name.as_str(),
+            _ => return None,
+        };
         for cached in super::session::visible_def_candidates(idx, package).iter() {
             // Rehydrate the target file's bag if its resident copy
             // was Slice-2-evicted; the cross-file chase reads its
@@ -1141,6 +1262,31 @@ impl ReducerRegistry {
                     return Some((*hit).clone());
                 }
                 continue;
+            }
+            // The rows-backed pre-filter, behind both memo tiers (their hit
+            // is cheaper) and ahead of the budget spend (a skip is not a
+            // consult). A skip is remembered as the `None` verdict it
+            // claims, so each (candidate, key) pair is probed once and
+            // memo-hits thereafter — the same first-encounter floor as the
+            // chase it replaces, at a row probe instead of a decode.
+            let prefilter_denied =
+                !sweep_candidate_may_answer(idx, cached, package, att_name, true);
+            if prefilter_denied {
+                crate::util::ghost_stats::count("consult.prefilter_skip");
+                if !consult_prefilter_equiv() {
+                    super::session::remember_candidate_answer(
+                        idx,
+                        &cached.path,
+                        &memo_q,
+                        &ReducedValue::None,
+                    );
+                    idx.remember_sweep_consult(
+                        &cached.path,
+                        &verdict_key,
+                        &ReducedValue::None,
+                    );
+                    continue;
+                }
             }
             if !super::session::spend_consult(idx) {
                 break;
@@ -1674,13 +1820,28 @@ impl ReducerRegistry {
                     "conclusion absence disagreed with the chase; see log"
                 );
             }
+            if prefilter_denied && v != ReducedValue::None {
+                // Equiv mode ran the attempt the pre-filter would have
+                // skipped, and it answered: some route the gates and rows
+                // cannot see exists. This is the "silently missing method"
+                // failure the fail-open ladder exists to prevent — scream.
+                crate::util::ghost_stats::count("consult.prefilter_break");
+                log::error!(
+                    "consult pre-filter break: rows proved {:?} silent in {:?} \
+                     but the chase answered {v:?} — a bag answer route is \
+                     missing from the gates or the unrowed-names derivation",
+                    q.attachment,
+                    cached.path
+                );
+                debug_assert!(false, "consult pre-filter hid an answer; see log");
+            }
             super::session::remember_candidate_answer(idx, &cached.path, &memo_q, &v);
             idx.remember_sweep_consult(&cached.path, &verdict_key, &v);
             if v != ReducedValue::None {
                 return Some(v);
             }
         }
-                
+
         None
     }
 
@@ -2179,3 +2340,7 @@ fn follow_one(
     crate::util::ghost_stats::count("follow.hop_cap");
     None
 }
+
+#[cfg(test)]
+#[path = "consult_prefilter_tests.rs"]
+mod consult_prefilter_tests;

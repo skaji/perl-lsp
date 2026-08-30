@@ -639,6 +639,57 @@ fn sym_member_probe_is_three_valued() {
     let _ = std::fs::remove_file(&pm);
 }
 
+/// The probes own the spelling policy (`rows::probe_spelling`): callers
+/// pass a RAW — possibly qualified — name, and the store also matches its
+/// match-key normalization, because refs rows are keyed by
+/// `Ref::match_key()`. When call sites threaded the spellings themselves,
+/// a qualified query name probed raw missed the row — turning fail-open
+/// into a wrong skip.
+#[test]
+fn row_probes_match_the_match_key_spelling() {
+    let conn = test_db();
+    let source =
+        "package My::Base;\nsub render { my $s = shift; $s->{cache} = 1; }\n1;\n";
+    let dir = std::env::temp_dir();
+    let pm = dir.join("TestModule_probe_spelling.pm");
+    std::fs::write(&pm, source).unwrap();
+    let cached = parse_source_to_cached(source, &pm);
+    let path_str = pm.to_string_lossy().to_string();
+    shred_derived_rows(
+        &conn,
+        &path_str,
+        "workspace",
+        &cached.analysis.ref_row_seeds(),
+        &cached.analysis.sym_row_seeds(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        sym_member_row_exists(&conn, &path_str, "My::Base::render", "My::Base"),
+        Some(true),
+        "a qualified query name must reach the bare-keyed sym row"
+    );
+    assert_eq!(
+        name_row_exists(&conn, &path_str, "Some::Pkg::cache"),
+        Some(true),
+        "a qualified query name must reach the match-keyed ref row"
+    );
+    assert_eq!(
+        name_row_exists(&conn, &path_str, "nonesuch"),
+        Some(false),
+        "normalization must not weaken the absence verdict"
+    );
+    // The container never normalizes: a package name's match key strips
+    // the qualifier, which would let `Base` claim `My::Base`'s rows.
+    assert_eq!(
+        sym_member_row_exists(&conn, &path_str, "render", "Base"),
+        Some(false),
+        "a bare container must not match a qualified one"
+    );
+
+    let _ = std::fs::remove_file(&pm);
+}
+
 /// `FLAG_EXPORTED` is minted from the real `@EXPORT`/`@EXPORT_OK` surface
 /// (`exports_name`), so the rows agree with the source the Surface projects —
 /// never a parallel notion of exportedness.

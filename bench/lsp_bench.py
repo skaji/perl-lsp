@@ -8,6 +8,12 @@ RSS checkpoints (VmRSS/VmHWM from /proc), and startup timings.
 Usage:
   lsp_bench.py --bin <perl-lsp> --root <project root> --scenario <json> \
                --out <metrics.json> [--label cold|warm]
+               [--jsonl <rows.jsonl> --corpus <name> --rep <n> [--run-id <id>]]
+
+  --jsonl appends harness-schema rows ({t:"m", kind, name, value, unit, ...})
+  so editor-surface KPIs land in the same DuckDB store as the batch sweep.
+  Without --run-id a run line is minted (one per file per run id). Every
+  request is its own row — aggregation belongs to reports, never collectors.
 
 The harness protocol around this driver lives in
 .claude/skills/edit-bench/SKILL.md; committed scenarios in
@@ -170,6 +176,72 @@ class Lsp:
         self.stderr_f.close()
 
 
+
+def emit_jsonl(args, metrics, root):
+    """Translate the metrics dict into the tall harness schema.
+
+    Same row shape as bench/measure.sh so bench/load.sql ingests both:
+    the editor surface and the batch surface become one queryable store.
+    Raw rows only — every request is a sample, phases ride `phase`
+    (the cold/warm label), and nothing is aggregated here.
+    """
+    import platform, subprocess
+    corpus = args.corpus or os.path.basename(root.rstrip("/"))
+    phase = args.label
+    run_id = args.run_id
+    rows = []
+    if not run_id:
+        run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-lspbench-{os.getpid()}"
+        sha, dirty = "unknown", None
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            sha = subprocess.check_output(
+                ["git", "-C", here, "rev-parse", "--short=8", "HEAD"],
+                stderr=subprocess.DEVNULL).decode().strip()
+            dirty = subprocess.call(["git", "-C", here, "diff", "--quiet"]) != 0
+        except Exception:
+            pass
+        try:
+            load = os.getloadavg()[0]
+        except OSError:
+            load = None
+        rows.append({"t": "run", "run_id": run_id,
+                     "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     "sha": sha, "dirty": dirty, "source": "lsp_bench",
+                     "host": platform.node(), "nproc": os.cpu_count(),
+                     "loadavg_at_start": load,
+                     "bin": os.path.abspath(args.bin)})
+
+    def m(kind, name, value, unit, tag=None):
+        if value is None:
+            return
+        r = {"t": "m", "run_id": run_id, "corpus": corpus, "rep": args.rep,
+             "phase": phase, "kind": kind, "name": name, "value": value, "unit": unit}
+        if tag:
+            r["tag"] = tag
+        rows.append(r)
+
+    m("startup", "initialize", metrics.get("initialize_ms"), "ms")
+    m("startup", "ready_from_spawn", metrics.get("ready_ms_from_spawn"), "ms")
+    for step in metrics["steps"]:
+        act, name = step.get("action"), step.get("name")
+        if "ms" in step and act in ("hover", "definition", "references",
+                                    "completion", "documentSymbol"):
+            m("verb_ms", act, step["ms"], "ms", tag=name)
+            m("result_bytes", act, step.get("result_size"), "bytes", tag=name)
+        elif act == "open" and "ms" in step:
+            m("open_ms", name, step["ms"], "ms")
+        if step.get("diagnostics_ms") is not None:
+            m("diag_push_ms", name, step["diagnostics_ms"], "ms")
+    for cp in metrics["rss"]:
+        if cp.get("vmrss_kb"):
+            m("server_rss", cp["at"], cp["vmrss_kb"] / 1024.0, "MB")
+        if cp.get("vmhwm_kb"):
+            m("server_rss_peak", cp["at"], cp["vmhwm_kb"] / 1024.0, "MB")
+    with open(args.jsonl, "a") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
@@ -177,6 +249,10 @@ def main():
     ap.add_argument("--scenario", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", default="run")
+    ap.add_argument("--jsonl", help="append harness-schema JSONL rows here")
+    ap.add_argument("--corpus", help="corpus name for JSONL rows (default: root basename)")
+    ap.add_argument("--rep", type=int, default=1)
+    ap.add_argument("--run-id", dest="run_id", help="join key; minted (with a run line) if absent")
     args = ap.parse_args()
 
     scen = json.load(open(args.scenario))
@@ -288,6 +364,8 @@ def main():
     metrics["rss"].append({"at": "end", **lsp.rss()})
     lsp.shutdown()
     json.dump(metrics, open(args.out, "w"), indent=1)
+    if args.jsonl:
+        emit_jsonl(args, metrics, root)
     print(f"[{args.label}] ready={metrics['ready_ms_from_spawn']:.0f}ms "
           f"peak_rss={metrics['rss'][-1]['vmhwm_kb']}kB steps={len(metrics['steps'])}")
 

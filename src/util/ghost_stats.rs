@@ -289,6 +289,94 @@ impl Drop for BuildScope {
 /// tag -> (total nanos, call count). A per-call `[PHASE]` line is useless for
 /// a region entered once per file across a corpus; what a hot region needs is
 /// the SUM and the call count, so an average and a share are derivable.
+thread_local! {
+    /// Child-time accumulators for the exclusive-time stack. One frame per
+    /// live `ScopedNs` on THIS thread: a region pushes 0 on entry; on drop it
+    /// pops its own children's total, and adds its full elapsed to the new
+    /// top — its parent's child bucket.
+    ///
+    /// Correct exactly when regions nest LIFO on one thread. RAII gives us
+    /// LIFO; "one thread" holds because every `ScopedNs` here lives inside a
+    /// synchronous scope (never across an `.await`), and the sweep's rayon
+    /// fork happens OUTSIDE the per-file region, so no frame is open when
+    /// work moves threads. A region that ever contains a fork has UNDEFINED
+    /// exclusive time — rayon's own docs say a thread blocked on a stolen
+    /// closure "will look for other work while waiting", so an open frame
+    /// absorbs unrelated work unboundedly. Don't instrument across forks;
+    /// this is the same discipline rustc's self-profiler follows.
+    static EXCL_STACK: std::cell::RefCell<Vec<u128>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Per-(file, tag) timing lane: (inclusive ns, exclusive ns, count).
+/// Fed by `ScopedNs` drops while `timings::current_file()` is set — the CLI
+/// sweep and the indexers set it, the server does not, so this lane is inert
+/// on the server path by construction.
+fn file_ns() -> &'static Mutex<HashMap<(String, String), (u128, u128, u64)>> {
+    static M: OnceLock<Mutex<HashMap<(String, String), (u128, u128, u64)>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    /// Per-thread staging for the file lane: (current file, tag -> triple).
+    /// A ScopedNs drop appends HERE — no lock, no allocation — and the whole
+    /// map moves to the global under ONE lock when the thread's file changes.
+    /// The unstaged version took a String allocation plus a global lock per
+    /// drop, which cost gold ~4.5s of wall (measured against the pre-lane
+    /// binary) — and that cost sat inside parents' EXCLUSIVE times, i.e. the
+    /// instrument distorted exactly the number it exists to produce.
+    static FILE_STAGE: std::cell::RefCell<
+        (Option<std::sync::Arc<str>>, HashMap<&'static str, (u128, u128, u64)>),
+    > = std::cell::RefCell::new((None, HashMap::new()));
+}
+
+/// Move this thread's staged file-lane rows into the global map. Called by
+/// `timings::set_current_file` on every transition (including ->None, which
+/// both per-file sites already do), and defensively on a mid-drop file
+/// mismatch — so a site that forgets to clear loses nothing, its rows flush
+/// on the NEXT file. A thread that dies mid-file loses that one file's
+/// partial rows, which is the right trade for a lock-free hot path.
+pub fn flush_file_stage() {
+    FILE_STAGE.with(|st| {
+        let (file, staged) = &mut *st.borrow_mut();
+        let Some(f) = file.take() else { return };
+        if staged.is_empty() {
+            return;
+        }
+        let mut m = file_ns().lock().unwrap_or_else(|e| e.into_inner());
+        for (tag, (incl, excl, n)) in staged.drain() {
+            let e = m.entry((f.to_string(), tag.to_string())).or_insert((0, 0, 0));
+            e.0 += incl;
+            e.1 += excl;
+            e.2 += n;
+        }
+    });
+}
+
+/// Per-(file, tag) counters — the ALLOWLISTED per-file lane. Deliberately a
+/// separate entry point from `count`: attributing every hot counter to a file
+/// would put a string clone and a map probe on paths that fire millions of
+/// times per run, and the instrument must not become the measured thing.
+/// Call sites opt in where per-file attribution answers a real question
+/// (diagnostic yield, budget exhaustion, which enrichment arm ran).
+fn file_counts() -> &'static Mutex<HashMap<(String, String), u64>> {
+    static M: OnceLock<Mutex<HashMap<(String, String), u64>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bump a per-file counter, attributed to the file this thread is analyzing.
+/// No-op when the gate is off or no file is declared.
+pub fn count_for_file(tag: &str, n: u64) {
+    if !enabled() {
+        return;
+    }
+    let Some(file) = super::timings::current_file() else {
+        return;
+    };
+    let mut m = file_counts().lock().unwrap_or_else(|e| e.into_inner());
+    *m.entry((file, tag.to_string())).or_insert(0) += n;
+}
+
 fn accum() -> &'static Mutex<HashMap<String, (u128, u64)>> {
     static A: OnceLock<Mutex<HashMap<String, (u128, u64)>>> = OnceLock::new();
     A.get_or_init(|| Mutex::new(HashMap::new()))
@@ -349,14 +437,60 @@ pub struct ScopedNs {
 
 impl ScopedNs {
     pub fn start(tag: &'static str) -> Self {
-        ScopedNs { tag, started: enabled().then(std::time::Instant::now) }
+        let started = enabled().then(std::time::Instant::now);
+        if started.is_some() {
+            EXCL_STACK.with(|s| s.borrow_mut().push(0));
+        }
+        ScopedNs { tag, started }
+    }
+
+    /// Test-only: bypass the env gate so the exclusive-stack arithmetic is
+    /// testable without racing other tests over the global enable flag.
+    #[cfg(test)]
+    pub fn start_ungated(tag: &'static str) -> Self {
+        EXCL_STACK.with(|s| s.borrow_mut().push(0));
+        ScopedNs { tag, started: Some(std::time::Instant::now()) }
     }
 }
 
 impl Drop for ScopedNs {
     fn drop(&mut self) {
-        if let Some(t) = self.started {
-            add_ns(self.tag, t.elapsed().as_nanos());
+        let Some(t) = self.started else { return };
+        let elapsed = t.elapsed().as_nanos();
+        // Pop own children, credit self to the parent. `saturating_sub` is
+        // belt-and-braces: under the LIFO invariant children are contained,
+        // but a clamped zero beats a wrapped garbage number if that ever
+        // breaks (every surveyed system that subtracts can go negative and
+        // none of them say so).
+        let child = EXCL_STACK.with(|s| {
+            let mut st = s.borrow_mut();
+            let child = st.pop().unwrap_or(0);
+            if let Some(parent) = st.last_mut() {
+                *parent += elapsed;
+            }
+            child
+        });
+        let excl = elapsed.saturating_sub(child);
+        // The global lane stays INCLUSIVE, as it always was — existing
+        // consumers keep their meaning, and global exclusive is derivable by
+        // summing the per-file lane.
+        add_ns(self.tag, elapsed);
+        if let Some(cur) = super::timings::current_file_arc() {
+            FILE_STAGE.with(|st| {
+                {
+                    let stage = st.borrow();
+                    if stage.0.as_deref() != Some(&*cur) && stage.0.is_some() {
+                        drop(stage);
+                        flush_file_stage();
+                    }
+                }
+                let mut stage = st.borrow_mut();
+                stage.0 = Some(cur);
+                let e = stage.1.entry(self.tag).or_insert((0, 0, 0));
+                e.0 += elapsed;
+                e.1 += excl;
+                e.2 += 1;
+            });
         }
     }
 }
@@ -640,10 +774,150 @@ fn registry() -> &'static Mutex<Vec<Weak<GhostStats>>> {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Dump every raw counter to `$PERL_LSP_GHOST_JSON` as JSON, if set.
+///
+/// The whole map, unrounded and unsorted — a harness slices later, and a
+/// top-N here is a decision the instrument has no business making. Three
+/// families, kept separate because collapsing them loses what a number
+/// MEANS: `counters` are occurrences, `timings` carry ns plus the count they
+/// accumulate over, and `quantities` carry a sum plus its count. Never derive
+/// a mean here; a stored ratio is the shape that let an attempts-vs-completions
+/// mixup stand as a finding once already.
+///
+/// Independent of the `enabled()` gate on purpose: asking for the JSON IS the
+/// request. Callers still need the counters to have been recorded, which the
+/// gate controls.
+pub fn write_json() -> bool {
+    use std::fmt::Write as _;
+    let mut out = String::from("{\n");
+
+    let c = counters().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(out, "  \"counters\": {{");
+    for (i, (k, v)) in c.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(k),
+            v
+        );
+    }
+    let _ = write!(out, "{}}},\n", if c.is_empty() { "" } else { "\n  " });
+    drop(c);
+
+    let a = accum().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(out, "  \"timings\": {{");
+    for (i, (k, (ns, n))) in a.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {{\"ns\": {}, \"n\": {}}}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(k),
+            ns,
+            n
+        );
+    }
+    let _ = write!(out, "{}}},\n", if a.is_empty() { "" } else { "\n  " });
+    drop(a);
+
+    let q = quantities().lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write!(out, "  \"quantities\": {{");
+    for (i, (k, (sum, n))) in q.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {{\"sum\": {}, \"n\": {}}}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(k),
+            sum,
+            n
+        );
+    }
+    let _ = write!(out, "{}}},\n", if q.is_empty() { "" } else { "\n  " });
+    drop(q);
+
+    // Per-file lanes, grouped by file so a reader can take one file's whole
+    // story in a single object. Both inclusive and exclusive ride every
+    // entry: exclusive is where time was actually spent, inclusive is what
+    // the subtree costs, and only recording both keeps them answerable —
+    // inclusive cannot be reconstructed from exclusive after the fact.
+    flush_file_stage();
+    let fns_ = file_ns().lock().unwrap_or_else(|e| e.into_inner());
+    let mut by_file: std::collections::BTreeMap<&str, Vec<(&str, &(u128, u128, u64))>> =
+        std::collections::BTreeMap::new();
+    for ((f, tag), v) in fns_.iter() {
+        by_file.entry(f.as_str()).or_default().push((tag.as_str(), v));
+    }
+    let _ = write!(out, "  \"file_ns\": {{");
+    for (i, (f, tags)) in by_file.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {{",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(f)
+        );
+        for (j, (tag, (incl, excl, n))) in tags.iter().enumerate() {
+            let _ = write!(
+                out,
+                "{}\"{}\": {{\"incl_ns\": {}, \"excl_ns\": {}, \"n\": {}}}",
+                if j == 0 { "" } else { ", " },
+                super::json_sink::esc(tag),
+                incl,
+                excl,
+                n
+            );
+        }
+        let _ = write!(out, "}}");
+    }
+    let _ = write!(out, "{}}},\n", if by_file.is_empty() { "" } else { "\n  " });
+    drop(fns_);
+
+    let fc = file_counts().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cby: std::collections::BTreeMap<&str, Vec<(&str, u64)>> =
+        std::collections::BTreeMap::new();
+    for ((f, tag), v) in fc.iter() {
+        cby.entry(f.as_str()).or_default().push((tag.as_str(), *v));
+    }
+    let _ = write!(out, "  \"file_counts\": {{");
+    for (i, (f, tags)) in cby.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    \"{}\": {{",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(f)
+        );
+        for (j, (tag, n)) in tags.iter().enumerate() {
+            let _ = write!(
+                out,
+                "{}\"{}\": {}",
+                if j == 0 { "" } else { ", " },
+                super::json_sink::esc(tag),
+                n
+            );
+        }
+        let _ = write!(out, "}}");
+    }
+    let _ = write!(out, "{}}}\n}}\n", if cby.is_empty() { "" } else { "\n  " });
+    drop(fc);
+
+    super::json_sink::write_if_requested_any(
+        "PERL_LSP_GHOST_JSON",
+        "PERL_LSP_GHOST_JSON_DIR",
+        "ghost",
+        &out,
+    )
+}
+
 /// Emit every live cache's report now. Wired to LSP shutdown (explicitly,
 /// before the hard exit) and to CLI end-of-run (via `EmitOnDrop` in `main`).
 /// No-op when the gate is off.
 pub fn emit_all(moment: &str) {
+    // The machine-readable sinks hang off the ONE exit hook every caller
+    // already uses, so a new exit point inherits them instead of forgetting
+    // them. They sit BEFORE the gate deliberately: `PERL_LSP_GHOST_STATS`
+    // controls the human report, and asking for the JSON path is its own
+    // request. Both no-op when their variable is unset.
+    write_json();
+    super::timings::write_json();
     if !enabled() {
         return;
     }
@@ -1074,4 +1348,47 @@ pub fn mroc_note(path: &std::path::Path) {
 
 pub fn mroc_saw(path: &std::path::Path) -> bool {
     enabled() && MROC_PATHS.with(|c| c.borrow().iter().any(|p| p == path))
+}
+
+#[cfg(test)]
+mod excl_time_tests {
+    use super::*;
+
+    /// The invariant the whole lane rests on: a parent's exclusive time is
+    /// its inclusive time minus its children's inclusive time, computed on
+    /// one thread's LIFO stack. Sleeps are coarse on purpose — the assert is
+    /// on ORDER (child fully inside parent, exclusive strictly less than
+    /// inclusive), not on precise durations.
+    #[test]
+    fn exclusive_subtracts_children_and_never_exceeds_inclusive() {
+        let file = format!("excl-test-{:?}", std::thread::current().id());
+        super::super::timings::set_current_file(Some(std::path::Path::new(&file)));
+        {
+            let _parent = ScopedNs::start_ungated("excl_test.parent");
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            {
+                let _child = ScopedNs::start_ungated("excl_test.child");
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+        super::super::timings::set_current_file(None);
+
+        let m = file_ns().lock().unwrap_or_else(|e| e.into_inner());
+        let (p_incl, p_excl, p_n) =
+            *m.get(&(file.clone(), "excl_test.parent".into())).expect("parent row");
+        let (c_incl, c_excl, _) =
+            *m.get(&(file.clone(), "excl_test.child".into())).expect("child row");
+        assert_eq!(p_n, 1);
+        // Leaf: exclusive == inclusive.
+        assert_eq!(c_incl, c_excl, "a leaf region has no children to subtract");
+        // Parent: exclusive = inclusive - child's inclusive, exactly.
+        assert_eq!(
+            p_excl,
+            p_incl - c_incl,
+            "parent exclusive must be inclusive minus the child's inclusive"
+        );
+        // And the child (25ms) dominates the parent's self-time (15ms) by
+        // construction, so subtraction visibly did something.
+        assert!(p_excl < c_incl, "sleep layout guarantees child > parent self");
+    }
 }

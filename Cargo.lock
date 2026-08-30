@@ -810,6 +810,7 @@ dependencies = [
  "env_logger",
  "futures",
  "ignore",
+ "libc",
  "log",
  "rayon",
  "rhai",

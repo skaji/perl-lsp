@@ -1026,7 +1026,7 @@ pub fn extract(tree: &Tree, source: &[u8], pack: &LangPack) -> Result<SkeletonAn
                 attachment: crate::model::witnesses::WitnessAttachment::Expr(span),
                 source: crate::model::witnesses::WitnessSource::Builder("skeleton-shape".into()),
                 payload: crate::model::witnesses::WitnessPayload::InferredType(
-                    InferredType::HashWithKeys { keys, open: false },
+                    InferredType::HashWithKeys { keys: crate::model::file_analysis::SharedKeys::new(keys), open: false },
                 ),
                 span,
             });

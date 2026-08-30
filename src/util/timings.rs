@@ -17,6 +17,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// One module's timing breakdown. `cached` marks a module served from the
 /// SQLite blob (no parse/build) vs freshly built.
+#[derive(Clone)]
 struct Entry {
     module: String,
     parse: Duration,
@@ -85,12 +86,46 @@ fn record(e: Entry) {
 const TOP_N: usize = 50;
 
 /// Print the slowest-first breakdown to stderr. No-op when disabled or empty.
+/// Dump EVERY module's parse/build to `$PERL_LSP_TIMINGS_JSON`, if set.
+///
+/// `report` prints slowest-first for a human; this writes all of them,
+/// because the distribution is the point. One 33s file inside an otherwise
+/// healthy total is invisible to a mean and to a top-N that happens to be
+/// shorter than the tail — and that exact shape was the giant-file quadratic.
+pub fn write_json() -> bool {
+    use std::fmt::Write as _;
+    let c = collector().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = String::from("{\n  \"modules\": [");
+    for (i, e) in c.iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\n    {{\"module\": \"{}\", \"parse_ns\": {}, \"build_ns\": {}, \"cached\": {}}}",
+            if i == 0 { "" } else { "," },
+            super::json_sink::esc(&e.module),
+            e.parse.as_nanos(),
+            e.build.as_nanos(),
+            e.cached
+        );
+    }
+    let _ = write!(out, "{}]\n}}\n", if c.is_empty() { "" } else { "\n  " });
+    drop(c);
+    super::json_sink::write_if_requested_any(
+        "PERL_LSP_TIMINGS_JSON",
+        "PERL_LSP_TIMINGS_JSON_DIR",
+        "timings",
+        &out,
+    )
+}
+
 pub fn report() {
     if !is_enabled() {
         return;
     }
+    // CLONE, never drain. Draining made the collector single-consumer: the
+    // human report and the JSON sink both read it, and whichever ran first
+    // left the other with an empty file that looked like "nothing was built".
     let mut entries = match collector().lock() {
-        Ok(mut v) => std::mem::take(&mut *v),
+        Ok(v) => v.clone(),
         Err(_) => return,
     };
     if entries.is_empty() {
@@ -318,7 +353,10 @@ pub fn trace_file(path: &std::path::Path) {
 }
 
 thread_local! {
-    static CURRENT_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+    /// The Arc rides beside the PathBuf so per-event readers (the ghost
+    /// per-file lane fires on every ScopedNs drop) pay a refcount bump, not
+    /// a String allocation — an allocation per drop cost gold ~4.5s of wall.
+    static CURRENT_FILE: std::cell::RefCell<Option<(std::path::PathBuf, std::sync::Arc<str>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -330,8 +368,49 @@ thread_local! {
 /// finishes names itself WHILE it is stuck rather than after — a run that
 /// hangs never reaches an after-the-fact report, which is exactly the case
 /// worth reporting.
+/// RAII twin of [`set_current_file`]: names `path` for the enclosed region
+/// and restores the PREVIOUS unit on drop — so a nested analyze (a bulk
+/// indexer's wide per-file region calling a driver that scopes itself)
+/// hands attribution back instead of clearing it. The server's open-doc
+/// builds route through `LanguageDriver::analyze_with_path`, which opens
+/// one of these; before it, only the CLI sweep and the bulk indexers set
+/// the file, and the per-file ghost lane was blind to every server-side
+/// build.
+pub struct CurrentFileScope(Option<(std::path::PathBuf, std::sync::Arc<str>)>);
+
+pub fn current_file_scope(path: Option<&std::path::Path>) -> CurrentFileScope {
+    let prev = CURRENT_FILE.with(|c| c.borrow().clone());
+    set_current_file(path);
+    CurrentFileScope(prev)
+}
+
+impl Drop for CurrentFileScope {
+    fn drop(&mut self) {
+        // Same transition discipline as `set_current_file` — flush the ghost
+        // stage (what's staged belongs to the scope that is ending), then
+        // swap the saved pair back without re-deriving its Arc.
+        super::ghost_stats::flush_file_stage();
+        match self.0.take() {
+            Some((p, a)) => {
+                stall_watch_begin(&p.display().to_string());
+                CURRENT_FILE.with(|c| *c.borrow_mut() = Some((p, a)));
+            }
+            None => {
+                stall_watch_end();
+                CURRENT_FILE.with(|c| *c.borrow_mut() = None);
+            }
+        }
+    }
+}
+
 pub fn set_current_file(path: Option<&std::path::Path>) {
-    CURRENT_FILE.with(|c| *c.borrow_mut() = path.map(|p| p.to_path_buf()));
+    // Flush the ghost lane's per-thread staging BEFORE the file changes —
+    // what is staged belongs to the outgoing file.
+    super::ghost_stats::flush_file_stage();
+    CURRENT_FILE.with(|c| {
+        *c.borrow_mut() = path
+            .map(|p| (p.to_path_buf(), std::sync::Arc::from(p.display().to_string().as_str())));
+    });
     match path {
         Some(p) => stall_watch_begin(&p.display().to_string()),
         None => stall_watch_end(),
@@ -424,5 +503,10 @@ fn ensure_watchdog() {
 
 /// The file this thread is analyzing, if the current work unit declared one.
 pub fn current_file() -> Option<String> {
-    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|p| p.display().to_string()))
+    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|(p, _)| p.display().to_string()))
+}
+
+/// Zero-allocation twin of [`current_file`] for per-event consumers.
+pub fn current_file_arc() -> Option<std::sync::Arc<str>> {
+    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|(_, a)| std::sync::Arc::clone(a)))
 }

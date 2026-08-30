@@ -1314,3 +1314,37 @@ fn the_bake_gate_has_one_reader() {
         sites[0]
     );
 }
+
+/// Rule: a CLI verb leaves through `cli::exit_with`, never bare
+/// `process::exit`. A bare exit skips destructors, which silently discards
+/// everything the run measured — and the failure rots, because the next verb
+/// someone adds exits directly and is unmeasured forever. The one sanctioned
+/// site carries a `sanctioned-exit` marker.
+#[test]
+fn cli_exits_flush_instrumentation() {
+    let mut violations = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = vec!["src/lsp/plugin_cli.rs".into()];
+    for e in fs::read_dir("src/lsp/cli").expect("read cli dir") {
+        let p = e.expect("dir entry").path();
+        if p.extension().is_some_and(|x| x == "rs") {
+            files.push(p);
+        }
+    }
+    for f in files {
+        let text = fs::read_to_string(&f).expect("read source");
+        for (ln, line) in text.lines().enumerate() {
+            if line.contains("process::exit")
+                && !line.contains("sanctioned-exit")
+                && !line.trim_start().starts_with("//")
+            {
+                violations.push(format!("{}:{}", f.display(), ln + 1));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "bare process::exit in CLI code — route through cli::exit_with so \
+         instrumentation flushes:\n{}",
+        violations.join("\n")
+    );
+}

@@ -480,6 +480,12 @@ fn note_exhausted(st: &mut SessionState, out_of_time: bool) {
         );
     }
     crate::util::ghost_stats::count("session.budget_exhausted");
+    // Per-file companion: exhaustion degrades this FILE's answers to an
+    // under-approximation, silently. The aggregate says it happened; only
+    // per-file attribution says to whom — FHEM warm ran 1,246 exhaustions in
+    // one rep with byte-identical output, i.e. one slow box away from warm
+    // diagnostics quietly diverging from cold, with no way to name the files.
+    crate::util::ghost_stats::count_for_file("session.budget_exhausted", 1);
 }
 
 /// Spend one unit of the walk's consult budget. `false` once the budget

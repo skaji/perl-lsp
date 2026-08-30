@@ -527,9 +527,17 @@ pub fn index_pack_languages(
     // Heap-composition of the resident pack `FileAnalysis` set — the Slice-2
     // eviction target (`docs/adr/memory-slice-2-lru.md`). Env-gated, inert by
     // default, no query-path cost.
-    if std::env::var_os("PERL_LSP_HEAP_DUMP").is_some() {
+    if std::env::var_os("PERL_LSP_HEAP_DUMP").is_some()
+        || std::env::var_os("PERL_LSP_HEAP_JSON").is_some()
+        || std::env::var_os("PERL_LSP_HEAP_JSON_DIR").is_some()
+    {
         let mut agg = crate::model::file_analysis::HeapBreakdown::default();
-        hub.for_each_pack_registered_file(&mut |_path, fa| agg.add(&fa.heap_estimate()));
+        let mut hj = crate::model::file_analysis::HeapJson::new();
+        hub.for_each_pack_registered_file(&mut |path, fa| {
+            agg.add(&fa.heap_estimate());
+            hj.push(path, fa);
+        });
+        hj.finish();
         eprintln!("[heap-dump] {agg}");
         let (paths, bytes) = crate::model::file_analysis::path_intern::table_stats();
         eprintln!(

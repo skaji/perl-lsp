@@ -460,6 +460,42 @@ impl CrossFileLookup for ModuleIndex {
         )
     }
 
+    fn candidate_bag_may_answer(
+        &self,
+        cached: &Arc<CachedModule>,
+        name: &str,
+        class: &str,
+        attributed: bool,
+    ) -> bool {
+        // Same freshness gate as `candidate_may_declare`: only a stripped
+        // copy registered AFTER its chunk commit is provably no fresher
+        // than its rows. Whole and RowsOnly (@INC-tier) copies fail open.
+        if !cached.analysis.symbols_are_evicted() {
+            return true;
+        }
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED
+            .get_or_init(|| std::env::var_os("PERL_LSP_NO_CONSULT_PREFILTER").is_some())
+        {
+            return true;
+        }
+        let path = cached.path.to_string_lossy();
+        // Raw name only: the probes own the spelling policy (raw + match
+        // key — `rows::probe_spelling`). `None` (file never shredded)
+        // dominates `Some(false)` — fail open.
+        let rows = self.with_rows_conn(|conn| {
+            if attributed {
+                crate::index::module_cache::sym_member_row_exists(conn, &path, name, class)
+            } else {
+                crate::index::module_cache::name_row_exists(conn, &path, name)
+            }
+        });
+        member_prefilter_may_declare(
+            !cached.analysis.plugin.gated_emissions.is_empty(),
+            rows,
+        )
+    }
+
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         self.with_rows_conn(|conn| {
             crate::index::module_cache::ref_candidate_files(conn, keys)
