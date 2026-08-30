@@ -106,8 +106,7 @@ pub(crate) fn cli_check(args: &[String]) {
         // ENRICHES a whole workspace — the run whose counters are worth the
         // most. Emitting here is the same explicit-before-hard-exit rule the
         // server path already follows.
-        crate::util::ghost_stats::emit_all("check");
-        std::process::exit(1);
+        super::exit_with(1, "check");
     }
 }
 
@@ -149,7 +148,7 @@ pub(crate) fn cli_hover_single_file(file: &str, line_str: &str, col_str: &str) {
         println!("{}", markdown);
     } else {
         eprintln!("No hover info at {}:{}", line_str, col_str);
-        std::process::exit(1);
+        super::exit_with(1, "exit");
     }
 }
 
@@ -174,7 +173,7 @@ pub(crate) fn cli_type_at(file: &str, line_str: &str, col_str: &str) {
         }
     }
     eprintln!("No type info at {}:{}", line_str, col_str);
-    std::process::exit(1);
+    super::exit_with(1, "exit");
 }
 
 /// Run `run_one` and reproduce the single-mode contract: `Ok` to stdout,
@@ -190,7 +189,7 @@ fn print_run_one(
         Ok(s) => println!("{}", s),
         Err(e) => {
             eprintln!("{}", e);
-            std::process::exit(1);
+            super::exit_with(1, "exit");
         }
     }
 }
@@ -207,7 +206,7 @@ pub(crate) fn cli_cursor(q: &str, root: &str, rest: &[String]) {
         eprintln!(
             "perl-lsp --{q}: expected `<root> <file> <line> <col>` or `<root> --at <file>:<line>:<col>`"
         );
-        std::process::exit(2);
+        super::exit_with(2, "exit");
     });
     emit_pos_annotation(&target);
     let (ws, idx) = cli_full_startup(
@@ -267,7 +266,7 @@ pub(crate) fn cli_semantic_tokens(root: &str, file: &str) {
 fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::Document {
     let text = std::fs::read_to_string(file).unwrap_or_else(|e| {
         eprintln!("Cannot read {}: {}", file, e);
-        std::process::exit(1);
+        super::exit_with(1, "exit");
     });
     // Route by driver so the CLI cursor handlers (definition/references/
     // highlight/…) match the LSP server. A hub-enriched language keeps the
@@ -279,12 +278,12 @@ fn cli_open_document(file: &str, idx: &module_index::ModuleIndex) -> document::D
     if !driver.caps().hub_enrichment {
         return tphase!("Document::new_routed", document::Document::new_routed(text, driver, Some(std::path::PathBuf::from(file))).unwrap_or_else(|| {
             eprintln!("Parse failed: {}", file);
-            std::process::exit(1);
+            super::exit_with(1, "exit");
         }));
     }
     let mut doc = tphase!("Document::new (parse+build)", document::Document::new(text).unwrap_or_else(|| {
         eprintln!("Parse failed: {}", file);
-        std::process::exit(1);
+        super::exit_with(1, "exit");
     }));
     tphase!("enrich_imported_types", std::sync::Arc::make_mut(&mut doc.analysis).enrich_imported_types_with_keys(Some(idx)));
     doc
@@ -1225,17 +1224,41 @@ fn sweep_one_file(
     // the volume: enriching a file pulls its providers' analyses, and that
     // happens BEFORE `collect_diagnostics` is entered. Bounding the callee
     // from the inside is worth nothing if the caller is outside every region.
-    let _g_enrich = crate::util::ghost_stats::ScopedNs::start("diag.0_enriched_snapshot");
-    let diags = match idx.enriched_snapshot(&cached) {
-        Some(fa) => symbols::collect_diagnostics(&fa, idx, options),
-        None => {
-            // Index copies may be refs/bag-evicted; diagnostics read refs AND
-            // the bag, so degrade to the whole-on-both-axes view, not the
-            // resident copy.
-            let whole = file_analysis::CrossFileLookup::whole_present(idx, &cached);
-            symbols::collect_diagnostics(&whole, idx, options)
+    // The guard lives in ITS OWN block: it must drop while `CURRENT_FILE` is
+    // still set, or the per-file lane never sees diag.0 — the region that
+    // holds the volume. (Exclusive time makes this guard honest: diag.1-6
+    // subtract out as children, so diag.0's self-time IS enrichment, and a
+    // large self-time here is the signal that something inside it is
+    // uninstrumented.)
+    let diags = {
+        let _g_enrich =
+            crate::util::ghost_stats::ScopedNs::start("diag.0_enriched_snapshot");
+        match idx.enriched_snapshot(&cached) {
+            Some(fa) => {
+                // Which arm served this file is a DIMENSION: the two arms do
+                // very different work, and a distribution that mixes them
+                // describes neither.
+                crate::util::ghost_stats::count_for_file("check.arm_enriched", 1);
+                symbols::collect_diagnostics(&fa, idx, options)
+            }
+            None => {
+                // Index copies may be refs/bag-evicted; diagnostics read refs AND
+                // the bag, so degrade to the whole-on-both-axes view, not the
+                // resident copy.
+                crate::util::ghost_stats::count_for_file("check.arm_whole_fallback", 1);
+                let whole = file_analysis::CrossFileLookup::whole_present(idx, &cached);
+                symbols::collect_diagnostics(&whole, idx, options)
+            }
         }
     };
+    // Yield per check, per file. Cost-per-check divided by this is the number
+    // that justifies gating a lint; neither half alone can.
+    for d in &diags {
+        if let Some(tower_lsp::lsp_types::NumberOrString::String(code)) = &d.code {
+            crate::util::ghost_stats::count_for_file(&format!("yield.{code}"), 1);
+        }
+    }
+    crate::util::ghost_stats::count_for_file("yield.total", diags.len() as u64);
     crate::util::timings::set_current_file(None);
     diags.into_iter().map(|d| (file.clone(), d)).collect()
 }
@@ -1440,7 +1463,7 @@ pub(crate) fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
         eprintln!(
             "perl-lsp --rename: expected `<root> <file> <line> <col> <new>` or `<root> --at <file>:<line>:<col> <new>`"
         );
-        std::process::exit(2);
+        super::exit_with(2, "exit");
     });
     emit_pos_annotation(&target);
     // Full startup so workspace files are built with the same plugins, type
@@ -1453,7 +1476,7 @@ pub(crate) fn cli_rename(root: &str, cursor: &[String], new_name: &str) {
         Ok(s) => println!("{}", s),
         Err(e) => {
             eprintln!("{}", e);
-            std::process::exit(1);
+            super::exit_with(1, "exit");
         }
     }
 }
@@ -1540,7 +1563,7 @@ pub(crate) fn cli_dump_package(root: &str, package_name: &str) {
     let Some((path, cached)) = found else {
         eprintln!("Package '{}' not found in workspace or module cache.", package_name);
         eprintln!("(Run the LSP against this workspace once to populate cached @INC modules.)");
-        std::process::exit(1);
+        super::exit_with(1, "exit");
     };
 
     // The enrichment overlay (R4): the same derived, fingerprint-keyed

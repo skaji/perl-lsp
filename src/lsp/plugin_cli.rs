@@ -39,7 +39,7 @@ pub fn cli_plugin_check(args: &[String]) {
         Some(p) if !p.starts_with("--") => p,
         _ => {
             eprintln!("usage: perl-lsp --plugin-check <file.rhai> [--format json|human]");
-            std::process::exit(2);
+            crate::lsp::cli::exit_with(2, "exit");
         }
     };
     let json_mode = is_json_format(args);
@@ -51,7 +51,7 @@ pub fn cli_plugin_check(args: &[String]) {
         report.print_human(path);
     }
     if !report.is_ok() {
-        std::process::exit(1);
+        crate::lsp::cli::exit_with(1, "exit");
     }
 }
 
@@ -61,14 +61,14 @@ pub fn cli_plugin_run(args: &[String]) {
         Some(p) if !p.starts_with("--") => p,
         _ => {
             eprintln!("usage: perl-lsp --plugin-run <file.rhai> --on <fixture.pl> [--format json|human]");
-            std::process::exit(2);
+            crate::lsp::cli::exit_with(2, "exit");
         }
     };
     let fixture = match get_arg_value(args, "--on") {
         Some(f) => f,
         None => {
             eprintln!("--plugin-run requires --on <fixture.pl>");
-            std::process::exit(2);
+            crate::lsp::cli::exit_with(2, "exit");
         }
     };
     let json_mode = is_json_format(args);
@@ -77,7 +77,7 @@ pub fn cli_plugin_run(args: &[String]) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("plugin load failed: {}", e);
-            std::process::exit(1);
+            crate::lsp::cli::exit_with(1, "exit");
         }
     };
     let plugin_id = plugin.id().to_string();
@@ -112,7 +112,7 @@ pub fn cli_plugin_test(args: &[String]) {
         Some(p) if !p.starts_with("--") => p,
         _ => {
             eprintln!("usage: perl-lsp --plugin-test <plugin-dir> [--update] [--format json|human]");
-            std::process::exit(2);
+            crate::lsp::cli::exit_with(2, "exit");
         }
     };
     let update = args.iter().any(|a| a == "--update");
@@ -122,12 +122,12 @@ pub fn cli_plugin_test(args: &[String]) {
     let plugins = collect_plugins_in_dir(dir);
     if plugins.is_empty() {
         eprintln!("no .rhai plugins found in {}", dir.display());
-        std::process::exit(2);
+        crate::lsp::cli::exit_with(2, "exit");
     }
     let fixtures = collect_fixtures_in_dir(dir);
     if fixtures.is_empty() {
         eprintln!("no fixtures found at {}/tests/*.pl", dir.display());
-        std::process::exit(2);
+        crate::lsp::cli::exit_with(2, "exit");
     }
 
     let mut results: Vec<TestResult> = Vec::new();
@@ -160,7 +160,7 @@ pub fn cli_plugin_test(args: &[String]) {
     }
 
     if fail > 0 || load_failed > 0 {
-        std::process::exit(1);
+        crate::lsp::cli::exit_with(1, "exit");
     }
 }
 
@@ -176,12 +176,12 @@ fn load_single_plugin(path: &Path) -> Result<RhaiPlugin, String> {
 fn run_plugin_on_fixture(plugin: RhaiPlugin, fixture: &Path) -> Value {
     let source = std::fs::read_to_string(fixture).unwrap_or_else(|e| {
         eprintln!("Cannot read {}: {}", fixture.display(), e);
-        std::process::exit(1);
+        crate::lsp::cli::exit_with(1, "exit");
     });
     let mut parser = module_resolver::create_parser();
     let tree = parser.parse(&source, None).unwrap_or_else(|| {
         eprintln!("Parse failed: {}", fixture.display());
-        std::process::exit(1);
+        crate::lsp::cli::exit_with(1, "exit");
     });
 
     let bytes = source.as_bytes();

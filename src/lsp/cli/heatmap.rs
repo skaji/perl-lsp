@@ -350,7 +350,7 @@ pub(crate) fn cli_refs_parity(root: &str, sample: Option<usize>) {
         checked, mismatched
     );
     if mismatched > 0 {
-        std::process::exit(1);
+        super::exit_with(1, "exit");
     }
 }
 

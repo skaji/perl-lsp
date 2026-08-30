@@ -57,3 +57,33 @@ pub fn write_if_requested(var: &str, body: &str) -> bool {
         }
     }
 }
+
+/// Like [`write_if_requested`], but for MULTI-PROCESS harnesses: when
+/// `dir_var` names a directory, write to `<dir>/<prefix>-<pid>-<nanos>.json`
+/// instead of one fixed path. A single-path sink under N processes is
+/// last-write-wins — gold runs one `--batch` per workspace root and e2e runs
+/// one server per suite, so every process needs its own file.
+///
+/// The file var wins when both are set, preserving the single-process
+/// contract measure.sh already relies on.
+pub fn write_if_requested_any(file_var: &str, dir_var: &str, prefix: &str, body: &str) -> bool {
+    if write_if_requested(file_var, body) {
+        return true;
+    }
+    let Some(dir) = std::env::var_os(dir_var) else {
+        return false;
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::path::Path::new(&dir)
+        .join(format!("{prefix}-{}-{nanos}.json", std::process::id()));
+    match std::fs::write(&path, body) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[{dir_var}] could not write {}: {e}", path.display());
+            false
+        }
+    }
+}

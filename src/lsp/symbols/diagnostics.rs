@@ -2,6 +2,22 @@
 
 use super::*;
 
+/// Every diagnostic code this adapter mints, spelled ONCE. Metrics key on
+/// these strings (per-file yield counts in the ghost lane), so a literal at a
+/// mint site is a typo away from a silently separate metric bucket — the
+/// wide-table drift failure in string form.
+pub mod codes {
+    pub const UNRESOLVED_FUNCTION: &str = "unresolved-function";
+    pub const UNRESOLVED_METHOD: &str = "unresolved-method";
+    pub const UNDEF_DEREF: &str = "undef-deref";
+    pub const OPTIONAL_DEREF: &str = "optional-deref";
+    pub const DEREF_SHAPE_MISMATCH: &str = "deref-shape-mismatch";
+    pub const ROLE_REQUIRES_UNFULFILLED: &str = "role-requires-unfulfilled";
+    pub const HELPER_NOT_LOADED: &str = "helper-not-loaded";
+    pub const UNRESOLVED_DISPATCH: &str = "unresolved-dispatch";
+    pub const UNKNOWN_HASH_KEY: &str = "unknown-hash-key";
+}
+
 // ---- Diagnostics ----
 
 /// Opt-in diagnostic toggles. Defaults are all-off for the QA/plugin-author
@@ -237,7 +253,7 @@ pub fn collect_diagnostics(
                 diagnostics.push(Diagnostic {
                     range,
                     severity: Some(DiagnosticSeverity::HINT),
-                    code: Some(NumberOrString::String("unresolved-function".into())),
+                    code: Some(NumberOrString::String(codes::UNRESOLVED_FUNCTION.into())),
                     source: Some("perl-lsp".into()),
                     message: format!(
                         "'{}' is exported by {} but not imported",
@@ -270,7 +286,7 @@ pub fn collect_diagnostics(
                     diagnostics.push(Diagnostic {
                         range,
                         severity: Some(DiagnosticSeverity::HINT),
-                        code: Some(NumberOrString::String("unresolved-function".into())),
+                        code: Some(NumberOrString::String(codes::UNRESOLVED_FUNCTION.into())),
                         source: Some("perl-lsp".into()),
                         message: msg,
                         data: Some(serde_json::json!({
@@ -288,7 +304,7 @@ pub fn collect_diagnostics(
                     diagnostics.push(Diagnostic {
                         range,
                         severity: Some(DiagnosticSeverity::HINT),
-                        code: Some(NumberOrString::String("unresolved-function".into())),
+                        code: Some(NumberOrString::String(codes::UNRESOLVED_FUNCTION.into())),
                         source: Some("perl-lsp".into()),
                         message: format!("'{}' is not defined in this file", name),
                         ..Default::default()
@@ -411,7 +427,7 @@ pub fn collect_diagnostics(
         diagnostics.push(Diagnostic {
             range: span_to_range(r.span),
             severity: Some(DiagnosticSeverity::HINT),
-            code: Some(NumberOrString::String("unresolved-method".into())),
+            code: Some(NumberOrString::String(codes::UNRESOLVED_METHOD.into())),
             source: Some("perl-lsp".into()),
             message: format!(
                 "'{}' is not defined in {}",
@@ -439,7 +455,7 @@ pub fn collect_diagnostics(
                 diagnostics.push(Diagnostic {
                     range: span_to_range(site.span),
                     severity: Some(DiagnosticSeverity::WARNING),
-                    code: Some(NumberOrString::String("undef-deref".into())),
+                    code: Some(NumberOrString::String(codes::UNDEF_DEREF.into())),
                     source: Some("perl-lsp".into()),
                     message: format!(
                         "'{}' is undef here; {} on it dies at runtime",
@@ -453,7 +469,7 @@ pub fn collect_diagnostics(
                 diagnostics.push(Diagnostic {
                     range: span_to_range(site.span),
                     severity: Some(DiagnosticSeverity::INFORMATION),
-                    code: Some(NumberOrString::String("optional-deref".into())),
+                    code: Some(NumberOrString::String(codes::OPTIONAL_DEREF.into())),
                     source: Some("perl-lsp".into()),
                     // The quick-fix reads the receiver back to synthesize
                     // `return unless defined $r;`.
@@ -486,7 +502,7 @@ pub fn collect_diagnostics(
                         diagnostics.push(Diagnostic {
                             range: span_to_range(site.span),
                             severity: Some(DiagnosticSeverity::WARNING),
-                            code: Some(NumberOrString::String("deref-shape-mismatch".into())),
+                            code: Some(NumberOrString::String(codes::DEREF_SHAPE_MISMATCH.into())),
                             source: Some("perl-lsp".into()),
                             message: format!(
                                 "'{}' is {} here; {} dies at runtime",
@@ -553,7 +569,7 @@ pub fn collect_diagnostics(
         diagnostics.push(Diagnostic {
             range: span_to_range(span),
             severity: Some(DiagnosticSeverity::WARNING),
-            code: Some(NumberOrString::String("role-requires-unfulfilled".into())),
+            code: Some(NumberOrString::String(codes::ROLE_REQUIRES_UNFULFILLED.into())),
             source: Some("perl-lsp".into()),
             message: format!(
                 "role {} requires '{}'; {} does not provide it",
@@ -614,7 +630,7 @@ pub fn collect_diagnostics(
             diagnostics.push(Diagnostic {
                 range: span_to_range(r.span),
                 severity: Some(DiagnosticSeverity::HINT),
-                code: Some(NumberOrString::String("helper-not-loaded".into())),
+                code: Some(NumberOrString::String(codes::HELPER_NOT_LOADED.into())),
                 source: Some("perl-lsp".into()),
                 message: format!(
                     "'{}' is provided by {}, which no workspace entrypoint loads",
@@ -631,11 +647,13 @@ pub fn collect_diagnostics(
     // 3-way `GateResult` keeps the two apart so the diagnostic can't spew on
     // every unrelated receiver. QA/plugin-author tool, hence default-off.
     if options.unresolved_dispatch {
+        let _g_dispatch =
+            crate::util::ghost_stats::ScopedNs::start("diag.5_unresolved_dispatch");
         for untyped in analysis.untyped_dispatches(Some(module_index)) {
             diagnostics.push(Diagnostic {
                 range: span_to_range(untyped.call_span),
                 severity: Some(DiagnosticSeverity::INFORMATION),
-                code: Some(NumberOrString::String("unresolved-dispatch".into())),
+                code: Some(NumberOrString::String(codes::UNRESOLVED_DISPATCH.into())),
                 source: Some("perl-lsp".into()),
                 message: format!(
                     "dispatch verb '{}' fired on an untyped receiver; can't confirm it dispatches into {}",
@@ -652,6 +670,7 @@ pub fn collect_diagnostics(
     // on the seams (`closed_shape_key_typos` / `projected_key_typos`);
     // here the site renders. HINT severity, per the quiet-by-design
     // diagnostics convention; long key lists elide past five.
+    let _g_hashkey = crate::util::ghost_stats::ScopedNs::start("diag.6_unknown_hash_key");
     for site in analysis
         .closed_shape_key_typos(Some(module_index))
         .into_iter()
@@ -678,7 +697,7 @@ pub fn collect_diagnostics(
         diagnostics.push(Diagnostic {
             range: span_to_range(site.span),
             severity: Some(DiagnosticSeverity::HINT),
-            code: Some(NumberOrString::String("unknown-hash-key".into())),
+            code: Some(NumberOrString::String(codes::UNKNOWN_HASH_KEY.into())),
             message,
             ..Default::default()
         });

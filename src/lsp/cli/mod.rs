@@ -26,6 +26,18 @@ pub(crate) use query::*;
 /// Print the languages this distribution was compiled to serve. A
 /// default build prints `perl`; a `cpp-lsp` build (`--features cpp`)
 /// prints `perl, cpp`.
+/// The ONE sanctioned CLI exit. `process::exit` skips destructors, so a bare
+/// call silently discards everything the run measured — 42 exit sites vs 13
+/// emit calls is how most verbs came to produce no instrumentation at all,
+/// and the failure rots: the next verb exits directly and is unmeasured
+/// forever. `layering_tests::cli_exits_flush_instrumentation` pins the rule.
+///
+/// `moment` labels the human report; the JSON sinks write regardless of it.
+pub(crate) fn exit_with(code: i32, moment: &str) -> ! {
+    crate::util::ghost_stats::emit_all(moment);
+    std::process::exit(code); // sanctioned-exit
+}
+
 pub(crate) fn cli_languages() {
     let reg = crate::build::language_driver::LanguageRegistry::with_enabled();
     // `id` first, maturity as a trailing parenthetical: consumers that parse
@@ -57,11 +69,11 @@ pub(crate) fn cli_lang_analyze(file: &str) {
     let path = std::path::Path::new(file);
     let Ok(src) = std::fs::read_to_string(path) else {
         eprintln!("cannot read {file}");
-        std::process::exit(1);
+        exit_with(1, "exit");
     };
     let Some(driver) = reg.for_path_sniffed(path, &src) else {
         eprintln!("no driver for {file} (this build serves: {})", reg.languages().join(", "));
-        std::process::exit(1);
+        exit_with(1, "exit");
     };
     // Persist the transitive macro table across invocations — keyed on the
     // file's directory (the CLI has no workspace root). Without this the LSP-only
@@ -186,7 +198,7 @@ pub(crate) fn print_usage() {
 fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnalysis) {
     let source = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("Cannot read {}: {}", path, e);
-        std::process::exit(1);
+        exit_with(1, "exit");
     });
     // Route by driver so the CLI capabilities (--outline, --hover,
     // --batch/gold) match the LSP server; an extension no driver claims
@@ -199,7 +211,7 @@ fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnal
     let mut parser = driver.make_parser();
     let tree = parser.parse(&source, None).unwrap_or_else(|| {
         eprintln!("Parse failed: {}", path);
-        std::process::exit(1);
+        exit_with(1, "exit");
     });
     let analysis = driver
         .analyze_from_tree(&tree, &source)
@@ -210,11 +222,11 @@ fn parse_file(path: &str) -> (String, tree_sitter::Tree, file_analysis::FileAnal
 fn parse_point(line_str: &str, col_str: &str) -> tree_sitter::Point {
     let line: usize = line_str.parse().unwrap_or_else(|_| {
         eprintln!("line must be a number");
-        std::process::exit(1);
+        exit_with(1, "exit");
     });
     let col: usize = col_str.parse().unwrap_or_else(|_| {
         eprintln!("col must be a number");
-        std::process::exit(1);
+        exit_with(1, "exit");
     });
     tree_sitter::Point::new(line, col)
 }
@@ -473,7 +485,7 @@ pub(crate) fn cli_gc_cache(root: &str) {
     let (_, root_uri) = canonical_root_and_uri(root);
     let Some(conn) = module_cache::open_cache_db(Some(&root_uri), "perl") else {
         eprintln!("No cache database for {root}");
-        std::process::exit(1);
+        exit_with(1, "exit");
     };
     let n = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
     let before = n("SELECT COUNT(*) FROM strings");
@@ -529,7 +541,7 @@ pub(crate) fn cli_clear_cache(root: Option<&str>) {
     };
     let Some(path) = target else {
         eprintln!("Cannot determine cache dir: $HOME and $XDG_CACHE_HOME are both unset");
-        std::process::exit(1);
+        exit_with(1, "exit");
     };
     if !path.exists() {
         eprintln!("Cache already absent: {}", path.display());
@@ -539,7 +551,7 @@ pub(crate) fn cli_clear_cache(root: Option<&str>) {
         Ok(()) => eprintln!("Cleared cache: {}", path.display()),
         Err(e) => {
             eprintln!("Failed to remove {}: {}", path.display(), e);
-            std::process::exit(1);
+            exit_with(1, "exit");
         }
     }
 }
@@ -554,7 +566,7 @@ pub(crate) fn cli_parse(path: &str, lang: Option<&str>) {
         let mut s = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut s) {
             eprintln!("read stdin: {}", e);
-            std::process::exit(1);
+            exit_with(1, "exit");
         }
         s
     } else {
@@ -562,7 +574,7 @@ pub(crate) fn cli_parse(path: &str, lang: Option<&str>) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("read {}: {}", path, e);
-                std::process::exit(1);
+                exit_with(1, "exit");
             }
         }
     };
@@ -581,7 +593,7 @@ pub(crate) fn cli_parse(path: &str, lang: Option<&str>) {
                     id,
                     reg.languages().join(", ")
                 );
-                std::process::exit(1);
+                exit_with(1, "exit");
             }
         }
     } else if path != "-" {
@@ -594,7 +606,7 @@ pub(crate) fn cli_parse(path: &str, lang: Option<&str>) {
     };
     let Some(tree) = parser.parse(&source, None) else {
         eprintln!("parse failed");
-        std::process::exit(1);
+        exit_with(1, "exit");
     };
     use std::io::IsTerminal;
     let color = std::io::stdout().is_terminal();

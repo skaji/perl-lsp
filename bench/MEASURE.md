@@ -43,6 +43,42 @@ divide, where the denominator is visible.
 visible as a counter before anyone attributed the wall. Wall tells you
 something is wrong; counters tell you where.
 
+## Per-file check lanes
+
+`--check` cost is attributed per FILE, not just per phase: every `ScopedNs`
+region that runs while a file is current lands in the ghost JSON under
+`file_ns` as `{incl_ns, excl_ns, n}`, and the harness ingests both as
+`check_incl` / `check_excl` rows with a `tag` column. Exclusive time is
+computed on a per-thread LIFO stack (the same shape rustc's self-profiler
+uses); it is exact because the sweep's rayon fork sits OUTSIDE the per-file
+region — never instrument a region that contains a fork, its exclusive time
+is undefined, not approximate.
+
+Both inclusive and exclusive ride every row because only one direction is
+derivable: exclusive can be summed up into inclusive's children, but
+inclusive can never be reconstructed from exclusive alone. A large
+`diag.0_enriched_snapshot` SELF time is the signal that something inside it
+is uninstrumented — that is how two untimed lints were found on day one.
+
+`file_counts` is the allowlisted per-file counter lane (`file_count` rows):
+which enrichment arm served the file (`check.arm_enriched` vs
+`check.arm_whole_fallback` — different work, so a dimension, not noise),
+diagnostic yield per code (`yield.<code>`), and `session.budget_exhausted` —
+the one that names WHICH files run near the budget cliff. It is a separate
+entry point from the global counters on purpose: attributing hot counters
+per-file would put a map probe on paths that fire millions of times.
+
+## Gold and e2e
+
+Multi-process harnesses set the DIR variants — `PERL_LSP_GHOST_JSON_DIR` /
+`PERL_LSP_TIMINGS_JSON_DIR` — and each process writes
+`<prefix>-<pid>-<nanos>.json`; a single-path sink under N processes is
+last-write-wins. Gold's `--batch` returns normally so sinks fire at
+end-of-run; the server flushes on LSP shutdown and on SIGTERM. Every CLI
+error path flushes too: `cli::exit_with` is the one sanctioned exit
+(`layering_tests::cli_exits_flush_instrumentation` pins it), because
+`process::exit` skips destructors and a bare call discards the run.
+
 ## Adding a metric
 
 Nothing to migrate — rows are `{kind, name, value, unit}`. A new ghost counter

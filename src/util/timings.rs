@@ -109,7 +109,12 @@ pub fn write_json() -> bool {
     }
     let _ = write!(out, "{}]\n}}\n", if c.is_empty() { "" } else { "\n  " });
     drop(c);
-    super::json_sink::write_if_requested("PERL_LSP_TIMINGS_JSON", &out)
+    super::json_sink::write_if_requested_any(
+        "PERL_LSP_TIMINGS_JSON",
+        "PERL_LSP_TIMINGS_JSON_DIR",
+        "timings",
+        &out,
+    )
 }
 
 pub fn report() {

@@ -156,7 +156,12 @@ measure_one() { # corpus root rep phase cachedir
       (.timings    | to_entries[] | {kind:"accum_ns",  name:.key, value:.value.ns,  unit:"ns"}),
       (.timings    | to_entries[] | {kind:"accum_n",   name:.key, value:.value.n,   unit:"n"}),
       (.quantities | to_entries[] | {kind:"qty_sum",   name:.key, value:.value.sum, unit:"n"}),
-      (.quantities | to_entries[] | {kind:"qty_n",     name:.key, value:.value.n,   unit:"n"})
+      (.quantities | to_entries[] | {kind:"qty_n",     name:.key, value:.value.n,   unit:"n"}),
+      ((.file_ns // {}) | to_entries[] | .key as $f | .value | to_entries[] |
+        {kind:"check_incl", name:$f, tag:.key, value:(.value.incl_ns/1e6), unit:"ms"},
+        {kind:"check_excl", name:$f, tag:.key, value:(.value.excl_ns/1e6), unit:"ms"}),
+      ((.file_counts // {}) | to_entries[] | .key as $f | .value | to_entries[] |
+        {kind:"file_count", name:$f, tag:.key, value:.value, unit:"n"})
       | {t:"m",run_id:$run_id,corpus:$c,rep:$r,phase:$p} + .' "$g" >> "$JSONL"
 
   [ -s "$t" ] && jq -c --arg run_id "$RUN_ID" --arg c "$corpus" --argjson r "$rep" --arg p "$phase" '
