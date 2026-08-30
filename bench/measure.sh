@@ -133,9 +133,12 @@ measure_one() { # corpus root rep phase cachedir
   local outcome=ok
   case $rc in
     0)   outcome=ok;;
+    1)   outcome=ok_findings;; # --check exit 1 = diagnostics found: lint
+                               # semantics, a HEALTHY run. Labeling it error
+                               # made 30 of 48 baseline runs read as failures.
     90)  outcome=rss_cap;;    # self-capped: partial data present
-    92)  outcome=sigterm;;   # harness stopped it; instrumentation flushed
     91)  outcome=time_cap;;   # self-capped: partial data present
+    92)  outcome=sigterm;;   # harness stopped it; instrumentation flushed
     124|137) outcome=hard_kill;;  # backstop fired — the soft cap did not
     *)   outcome=error;;
   esac

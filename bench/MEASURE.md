@@ -43,6 +43,27 @@ divide, where the denominator is visible.
 visible as a counter before anyone attributed the wall. Wall tells you
 something is wrong; counters tell you where.
 
+## KPIs and baselines
+
+`bench/baselines.jsonl` is the checked-in KPI record: one row per
+(date, sha, host, corpus, phase, metric) with median, n, and spread. Seeded
+DELIBERATELY by `bench/seed-baselines.py` after a sweep you trust — review
+the diff, commit it; never auto-appended. `bench/baseline-check.sql` joins
+the latest run against it and flags only moves that clear both sides'
+measured noise.
+
+The KPIs are the promises, and they live in the seeder in one place:
+batch `--check` wall + peak RSS (cold and warm — the warm/cold ratio is
+derived in reports, never stored), the per-file build p50/p99/max (the
+leading indicator that catches the next 20-second file), and the editor
+surface from `lsp_bench.py --jsonl` (startup-to-ready, per-verb latency,
+diagnostics push, server RSS). Counters and per-file lanes are DIAGNOSTICS,
+never baselined — they attribute a KPI move and legitimately shift with
+every refactor; baselining them means chasing noise.
+
+Editor baselines are taken on a QUIET box only. A latency baseline recorded
+while a sweep thrashes the machine is the loadavg trap in its purest form.
+
 ## Per-file check lanes
 
 `--check` cost is attributed per FILE, not just per phase: every `ScopedNs`

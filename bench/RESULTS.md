@@ -294,3 +294,32 @@ change (`docs/adr/enrichment-build-cost.md`). mojo (`lib`, server path via
 Worth keeping as a caution: a scenario whose overlay hit rate is ~99% cannot
 measure a change to what a MISS costs. Reach for a corpus where the overlay
 thrashes, or count builds first and stop if the count is small.
+
+## 2026-08-30 — the harness measures itself in: first KPI baselines (sha ce16a564)
+
+The JSONL harness (bench/MEASURE.md) landed with per-file exclusive-time
+lanes, and paid for itself before merging:
+
+- **`finalize_post_walk` was the interactive path's biggest build phase** —
+  41% of e2e build-family time, invisible to every `--check` measurement.
+  The exclusive-time split put 98.3% on `seal_unrowed_attachment_names`
+  (O(attachments × symbols), a String allocation per comparison). Fixed:
+  **10.99 → 0.049 ms/call (~220×)**, both arms on buildable binaries.
+- **The instrument was held to its own standard**: armed gold ran +15% over
+  bare; an A/B against the pre-lane binary pinned it to the file lane's
+  per-drop String+lock — sitting inside parents' exclusive times. Per-thread
+  staging brought armed runs inside noise (28.7 s vs 30.3 s bare).
+- **First KPI baselines** seeded to `bench/baselines.jsonl` (reproducible-8,
+  clean tree, n=3 each). Headlines: Znuny `--check` 52.0 s / 9.31 GB cold,
+  24.2 s / 9.23 GB warm; FHEM 65.0 s / 2.26 GB cold, 53.5 s / 2.17 GB warm;
+  BMO 9.7 s / 0.68 GB cold, 2.0 s / 0.71 GB warm.
+- **FHEM's memory variance collapsed**: warm peak was 3.9 GB with a 61%
+  spread on 2026-08-27; it is 2.17 GB at ~5% now — the seal fix plus the
+  consult pre-filter, not a measurement artifact (same harness, same box).
+  Its warm/cold wall ratio moved 0.90 → 0.82; the `package main` consult
+  sweep remains the dominant term and the open lever.
+- Editor-surface KPIs now flow through `lsp_bench.py --jsonl` into the same
+  store (Bugzilla spot-run: ready 624 ms cold, first didChange→diagnostics
+  2.24 s cold then 260–650 ms, server RSS 406 MB). **Editor baselines are
+  deliberately not seeded yet** — they must come from a quiet box, and the
+  batch sweep owned the box today.
