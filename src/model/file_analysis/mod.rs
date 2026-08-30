@@ -283,6 +283,18 @@ pub struct FileAnalysis {
     /// extraction. The general provenance tier above the type witness bag.
     #[serde(default)]
     pub flow_edges: Vec<FlowEdge>,
+    /// Class-keyed bag attachment names (`PackageSymbol{..}.name`,
+    /// `SlotType{..}.key`) with NO backing symbol/ref in this file — the
+    /// declarative residue (parametric method declarations, plugin `Method`
+    /// overrides, bridged entities under a foreign container) the relational
+    /// rows cannot see. Derived generically from the final bag in
+    /// `seal_unrowed_attachment_names`, so every attachment push site —
+    /// current and future — is covered by construction rather than by
+    /// enumeration. The consult pre-filter fails open on membership; sorted
+    /// for binary search. Survives every eviction tier (the whole point:
+    /// it speaks for the evicted bag).
+    #[serde(default)]
+    pub unrowed_attachment_names: Vec<String>,
 
     /// This analysis was produced from degraded inputs — a parse/extract
     /// failure, or a skipped cross-file macro gather (the on-open

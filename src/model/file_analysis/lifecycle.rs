@@ -127,6 +127,7 @@ impl FileAnalysis {
             dynamic_dispatch_sites,
             loader_config_params,
             flow_edges,
+            unrowed_attachment_names: Vec::new(),
             degraded: false,
             // Pack drivers re-stamp their id post-construction.
             language: super::default_language(),
@@ -255,9 +256,69 @@ impl FileAnalysis {
         // before the ref table seals its baseline — the seal counts the
         // refs, the stamp only sets a field on them.
         self.stamp_method_call_targets(None);
+        self.seal_unrowed_attachment_names();
         self.base_witness_count = self.witnesses.len();
         self.symbols.seal_baseline();
         self.refs.seal_baseline();
+    }
+
+    /// Derive `unrowed_attachment_names` from the FINAL bag: every
+    /// class-keyed attachment name the relational rows would deny.
+    ///
+    /// The mirror must be at least as generous as the row probes it
+    /// licenses skipping against — `sym_member_row_exists` matches a
+    /// symbol's raw name OR its match key under the attachment's package,
+    /// and the mention probe matches any ref's match key — so a name is
+    /// KEPT (fail-open at probe time) unless one of those forms provably
+    /// backs it. Runs before the seals, on the builder path only;
+    /// hand-crafted test FAs carry an empty vec, which the pre-filter
+    /// cannot mis-trust because their rows are never shredded.
+    fn seal_unrowed_attachment_names(&mut self) {
+        use crate::model::witnesses::WitnessAttachment;
+        let mut ref_keys: HashSet<String> = HashSet::new();
+        for r in self.refs().iter() {
+            ref_keys.insert(r.match_key());
+        }
+        let mut out: Vec<String> = Vec::new();
+        for att in self.witnesses.attachments() {
+            match att {
+                WitnessAttachment::PackageSymbol { package, name } => {
+                    // A class with LOCAL parent edges (declared or dynamic)
+                    // fails the pre-filter open at the gate battery for
+                    // EVERY name, so its entries here would be dead weight —
+                    // and the local-inheritance writeback attaches every
+                    // parent method under the child, so a single-file
+                    // Base/Derived pair would otherwise list the whole
+                    // parent surface. Skipping them keeps the residue
+                    // plugin-sized: bridges, parametric declarations,
+                    // overrides.
+                    if !self.declared_parents(package).is_empty()
+                        || self.has_dynamic_parents(package)
+                    {
+                        continue;
+                    }
+                    let backed = self.symbols().iter().any(|s| {
+                        s.package.as_deref() == Some(package.as_str())
+                            && (s.name == *name
+                                || super::name_match_key(&s.name) == *name)
+                    });
+                    if !backed {
+                        out.push(name.clone());
+                    }
+                }
+                WitnessAttachment::SlotType { key, .. } => {
+                    if !ref_keys.contains(key)
+                        && !ref_keys.contains(&super::name_match_key(key))
+                    {
+                        out.push(key.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.sort();
+        out.dedup();
+        self.unrowed_attachment_names = out;
     }
 
     /// Stamp the `Method` binding on every `MethodCall` ref — the NAV
@@ -1104,8 +1165,13 @@ impl FileAnalysis {
             + scap(&self.column_keyed_verbs)
             + vcap(&self.export)
             + vcap(&self.export_ok)
-            + vcap(&self.reexport_modules);
+            + vcap(&self.reexport_modules)
+            + vcap(&self.unrowed_attachment_names);
 
         h
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

@@ -128,6 +128,35 @@ the relation that answers it, and the soundness constraint.
    twice; provably no-ops on small-file corpora. The path memo itself is
    LOAD-BEARING (1.55x wall) and stays untouched.
 
+4b. **The registry sweep's per-candidate pre-filter — LANDED for the
+   many-provider shape.** Row 4's "don't decode to learn nothing" was retired
+   on real-CPAN evidence of ~1.5 candidates per escalation — narrowing was
+   not the lever THERE. FHEM measured the opposite shape: 634 of 877 `.pm`
+   files declare `package main`, and the 28-corpus sweep put ~90% of its
+   `--check` wall (both phases — warm ratio 0.90, the corpus outlier) inside
+   the `PackageSymbol`/`SlotType` candidate sweeps, 118k of 171k warm
+   provider fetches answering nothing, conclusions absorbing only 28k.
+   Corpus keying check: 4,755 of FHEM's 4,996 distinct slot keys appear in
+   ≤5 files, and most sub names are defined in exactly one — the probes are
+   selective exactly where the fan-out is wide. The slice:
+   `sweep_candidate_may_answer` (registry) gates each candidate on its
+   never-evicted lanes (declared/dynamic parents for the class, app-surface
+   membership, the per-file `unrowed_attachment_names` residue — declarative
+   attachment names with no backing row, derived generically from the final
+   bag so no push site can bypass it), then asks the rows
+   (`candidate_bag_may_answer`: the `sym_member` probe for attributed
+   `PackageSymbol`, the widest refs∪syms mention probe for `SlotType`). A
+   skip is remembered as the `None` verdict it claims, so each (candidate,
+   key) pair costs one row probe ever — the same first-encounter floor at a
+   probe instead of a decode+chase. Ships `PERL_LSP_NO_CONSULT_PREFILTER`,
+   `PERL_LSP_CONSULT_PREFILTER_EQUIV`, and counters
+   `consult.prefilter_skip` / `consult.prefilter_break`. Row 4's
+   program-scoped `main` stays the semantically right endgame — but note
+   FHEM's inverted load direction (`fhem.pl` requires modules dynamically;
+   modules call `main::` subs the loader defined), where a naive
+   asker-closure rule would orphan every such call: that rule needs the
+   reverse edge before it can land.
+
 4. **The registry chase's no-answer fetches, and `main`'s program scope.**
    Measured on a real-CPAN corpus (12k files, 54% package-less scripts)
    against the substrate: top-level `PackageSymbol` query DENSITY is nearly

@@ -562,6 +562,38 @@ pub fn sym_name_row_exists(conn: &Connection, path: &str, name: &str) -> Option<
     .ok()
 }
 
+/// The widest per-file mention probe: can the store rule out ANY row —
+/// ref (use-site) or sym (declaration) — named `name` in `path`'s file?
+/// Same three-valued contract as its siblings; `Some(false)` is the only
+/// skip license, `None` (never shredded) must stay distinguishable.
+///
+/// For the registry consult pre-filter's un-attributed flavor
+/// (`SlotType{.., key}`): a slot-type witness is minted from a hash-key
+/// WRITE ref, so a file with no ref row for the key provably carries no
+/// such witness. The syms half rides along for over-approximation — a
+/// wasted decode is the cheap error.
+pub fn name_row_exists(conn: &Connection, path: &str, name: &str) -> Option<bool> {
+    let file_id: i64 = conn
+        .prepare_cached("SELECT file_id FROM files WHERE path = ?1")
+        .ok()?
+        .query_row(params![path], |row| row.get(0))
+        .ok()?;
+    conn.prepare_cached(
+        "SELECT EXISTS(
+            SELECT 1 FROM refs r
+             WHERE r.name_id = (SELECT str_id FROM strings WHERE s = ?2)
+               AND r.file_id = ?1)
+         OR EXISTS(
+            SELECT 1 FROM syms y
+             WHERE y.file_id = ?1
+               AND (y.name_id = (SELECT str_id FROM strings WHERE s = ?2)
+                    OR y.key_id = (SELECT str_id FROM strings WHERE s = ?2)))",
+    )
+    .ok()?
+    .query_row(params![file_id, name], |row| row.get(0))
+    .ok()
+}
+
 /// How many FILES carry a ref row for one match key.
 ///
 /// Deliberately not called a reference count: rows are `(name_id, file_id)`

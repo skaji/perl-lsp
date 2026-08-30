@@ -460,6 +460,51 @@ impl CrossFileLookup for ModuleIndex {
         )
     }
 
+    fn candidate_bag_may_answer(
+        &self,
+        cached: &Arc<CachedModule>,
+        name: &str,
+        class: &str,
+        attributed: bool,
+    ) -> bool {
+        // Same freshness gate as `candidate_may_declare`: only a stripped
+        // copy registered AFTER its chunk commit is provably no fresher
+        // than its rows. Whole and RowsOnly (@INC-tier) copies fail open.
+        if !cached.analysis.symbols_are_evicted() {
+            return true;
+        }
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED
+            .get_or_init(|| std::env::var_os("PERL_LSP_NO_CONSULT_PREFILTER").is_some())
+        {
+            return true;
+        }
+        let path = cached.path.to_string_lossy();
+        // Probe both spellings the shredder can key a row under: the raw
+        // attachment name and its match-key normalization. `None` (file
+        // never shredded) dominates `Some(false)` — fail open.
+        let norm = crate::model::file_analysis::name_match_key(name);
+        let rows = self.with_rows_conn(|conn| {
+            let probe = |s: &str| -> Option<bool> {
+                if attributed {
+                    crate::index::module_cache::sym_member_row_exists(conn, &path, s, class)
+                } else {
+                    crate::index::module_cache::name_row_exists(conn, &path, s)
+                }
+            };
+            match probe(name) {
+                None => None,
+                Some(true) => Some(true),
+                Some(false) if norm != name => probe(&norm),
+                Some(false) => Some(false),
+            }
+        });
+        member_prefilter_may_declare(
+            !cached.analysis.plugin.gated_emissions.is_empty(),
+            rows,
+        )
+    }
+
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         self.with_rows_conn(|conn| {
             crate::index::module_cache::ref_candidate_files(conn, keys)

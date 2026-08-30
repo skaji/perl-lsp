@@ -724,6 +724,24 @@ pub trait CrossFileLookup {
         let _ = (cached, name, class);
         true
     }
+    /// The registry-sweep sibling of `candidate_may_declare`: can `cached`'s
+    /// BAG hold any witness for a class-keyed attachment named `name`
+    /// (`PackageSymbol{class, name}` when `attributed`, `SlotType{.., key}`
+    /// otherwise)? Rows half only — the chase-shape gates (declared
+    /// parents, dynamic parents, app-surface membership, the unrowed
+    /// residue) live at the call site, which owns the chase semantics.
+    /// Same three-valued fail-open contract as `candidate_may_declare`;
+    /// default `true` (an impl without a row store cannot speak).
+    fn candidate_bag_may_answer(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+        name: &str,
+        class: &str,
+        attributed: bool,
+    ) -> bool {
+        let _ = (cached, name, class, attributed);
+        true
+    }
     /// The ROWS-axes view — refs AND symbols populated: the backward-walk
     /// matcher's axes (usage sites + declaration sites). The @INC strip is
     /// bag-only, so import-tier copies answer resident; the workspace strip
@@ -1226,6 +1244,18 @@ impl<'a> CrossFileLookup for ScopedLookup<'a> {
         // Same delegation rule as `symbols_present` — the inner index owns
         // the row store; the default would fail open and lose the skip.
         self.inner.candidate_may_declare(cached, name, class)
+    }
+    fn candidate_bag_may_answer(
+        &self,
+        cached: &std::sync::Arc<CachedModule>,
+        name: &str,
+        class: &str,
+        attributed: bool,
+    ) -> bool {
+        // Same delegation rule as `candidate_may_declare` — the default
+        // would fail open and silently disarm the consult pre-filter on
+        // every scoped (pack) sweep.
+        self.inner.candidate_bag_may_answer(cached, name, class, attributed)
     }
     fn ref_candidate_paths(&self, keys: &[String]) -> Vec<std::path::PathBuf> {
         // Unscoped by design, like `def_candidates`: the backward walk applies
