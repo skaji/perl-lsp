@@ -90,8 +90,8 @@ emit() { # corpus rep phase kind name value unit
 # not, and averaging across them silently is the trap.
 measure_one() { # corpus root rep phase cachedir
   local corpus="$1" root="$2" rep="$3" phase="$4" cache="$5"
-  local g="$SCRATCH/g.json" t="$SCRATCH/t.json"
-  rm -f "$g" "$t"
+  local g="$SCRATCH/g.json" t="$SCRATCH/t.json" h="$SCRATCH/h.json"
+  rm -f "$g" "$t" "$h"
 
   local pl=""
   [ -d "$DEPS/$corpus" ] && pl="$DEPS/$corpus/lib/perl5"
@@ -122,7 +122,7 @@ measure_one() { # corpus root rep phase cachedir
     PERL5LIB="$pl" XDG_CACHE_HOME="$cache" \
     PERL_LSP_TIMINGS=1 PERL_LSP_GHOST_STATS=1 \
     PERL_LSP_MAX_RSS_MB="$MAX_RSS_MB" PERL_LSP_MAX_SECONDS="$MAX_SECS" \
-    PERL_LSP_GHOST_JSON="$g" PERL_LSP_TIMINGS_JSON="$t" \
+    PERL_LSP_GHOST_JSON="$g" PERL_LSP_TIMINGS_JSON="$t" PERL_LSP_HEAP_JSON="$h" \
       timeout -k 30 -s TERM $(( MAX_SECS + 120 )) \
       /usr/bin/time -f '%e %M %P' -o "$tf" \
       "$BIN" --check "$root" >/dev/null 2>&1 )
@@ -174,6 +174,20 @@ measure_one() { # corpus root rep phase cachedir
                    {t:"m",run_id:$run_id,corpus:$c,rep:$r,phase:$p,
                     kind:"file_parse", name:.module, value:(.parse_ns/1e6), unit:"ms"}' \
       "$t" >> "$JSONL"
+
+  # Heap composition: one row per (file, bucket) plus the aggregate — the
+  # lane that turns "Znuny uses 9GB" into "whose refs". Written post-sweep,
+  # pre-evict, so it approximates peak, not exit residue.
+  [ -s "$h" ] && jq -c --arg run_id "$RUN_ID" --arg c "$corpus" --argjson r "$rep" --arg p "$phase" '
+      (.files[] | .path as $f | to_entries[] | select(.key != "path") |
+        {t:"m",run_id:$run_id,corpus:$c,rep:$r,phase:$p,
+         kind:"heap_bytes", name:$f, tag:.key, value:.value, unit:"bytes"}),
+      (.total | to_entries[] |
+        {t:"m",run_id:$run_id,corpus:$c,rep:$r,phase:$p,
+         kind:"heap_total_bytes", name:.key, value:.value, unit:"bytes"}),
+      {t:"m",run_id:$run_id,corpus:$c,rep:$r,phase:$p,
+       kind:"heap_total_bytes", name:"path_intern", value:.path_intern.bytes, unit:"bytes"}' \
+      "$h" >> "$JSONL"
 
   local db; db="$(find "$cache" -name 'modules*.db' -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')"
   emit "$corpus" "$rep" "$phase" "store" "modules_db_bytes" "${db:-0}" "bytes"

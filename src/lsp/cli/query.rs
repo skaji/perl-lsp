@@ -1323,6 +1323,16 @@ fn for_each_enriched_diagnostic(
     // corpora never approach the budget and the gate provably no-ops there,
     // while giants queue among themselves and ordinary files flow around
     // them. `PERL_LSP_SWEEP_INFLIGHT_SOURCE_MB` overrides; 0 disables.
+    // Heap composition of the resident set the sweep starts from (see
+    // HeapJson's contract: stripped residents on a default run, whole under
+    // NO_EVICT). Before the sweep scope because it consumes `entries`.
+    {
+        let mut hj = file_analysis::HeapJson::new();
+        for (path, fa) in &entries {
+            hj.push(path, fa);
+        }
+        hj.finish();
+    }
     let admission = sweep_admission_budget().map(SweepAdmission::new);
     // Channel attribution: the unbounded mpsc holds diagnostics until the
     // single consumer drains them — a sweep-proportional holder candidate for
@@ -1365,6 +1375,7 @@ fn for_each_enriched_diagnostic(
         "diag.peak_pending",
         peak_pending.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64,
     );
+
     // Pack-language files (C++/…) live in the per-language sub-indexes, not the
     // Perl-only `FileStore` above. Mirror the backend's language dispatch: they
     // get `pack_diagnostics` (Mode B — member-op swap + peel), so `--batch
@@ -1384,6 +1395,7 @@ fn for_each_enriched_diagnostic(
 
 /// Whole-tree diagnostics as the pretty-JSON array string (warning+; shared by
 /// `--batch` diagnostics requests). Mirrors `cli_check`'s JSON path.
+
 fn batch_diagnostics(ws: &file_store::FileStore, idx: &module_index::ModuleIndex) -> String {
     let options = symbols::DiagnosticOptions::default();
     let mut all = Vec::new();

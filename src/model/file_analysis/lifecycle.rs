@@ -1058,6 +1058,95 @@ impl HeapBreakdown {
     }
 }
 
+impl HeapBreakdown {
+    /// The buckets as (name, bytes) pairs — ONE spelling of the bucket list,
+    /// shared by the Display report and the JSON sink, so a new bucket can't
+    /// appear in one and silently not the other.
+    pub fn buckets(&self) -> [(&'static str, usize); 11] {
+        [
+            ("refs", self.refs),
+            ("symbols", self.symbols),
+            ("witness_vec", self.witness_vec),
+            ("witness_index", self.witness_index),
+            ("include", self.include),
+            ("scopes", self.scopes),
+            ("rebuilt_indices", self.rebuilt_indices),
+            ("bindings", self.bindings),
+            ("cpp_extras", self.cpp_extras),
+            ("misc", self.misc),
+            ("shell", self.shell),
+        ]
+    }
+}
+
+/// Streaming writer for `$PERL_LSP_HEAP_JSON[_DIR]`: per-file heap-bucket
+/// rows plus the aggregate and the path-intern table. Push-style because
+/// both producers iterate under locks that forbid keeping the borrows —
+/// the pack registry walk and the sweep's entry list.
+///
+/// WHAT THE NUMBERS MEAN: the composition of the analyses AS HELD at the
+/// call site. Resident index copies are stripped after persist, so on a
+/// default run this reports the stripped residents (small refs/symbols
+/// buckets ARE the finding — eviction working); under `PERL_LSP_NO_EVICT=1`
+/// it reports whole analyses. It is NOT a peak-RSS attribution — pair it
+/// with /usr/bin/time for totals, and say which mode produced it.
+pub struct HeapJson {
+    out: Option<String>,
+    agg: HeapBreakdown,
+    first: bool,
+}
+
+impl HeapJson {
+    pub fn new() -> Self {
+        let requested = std::env::var_os("PERL_LSP_HEAP_JSON").is_some()
+            || std::env::var_os("PERL_LSP_HEAP_JSON_DIR").is_some();
+        HeapJson {
+            out: requested.then(|| String::from("{\n  \"files\": [")),
+            agg: HeapBreakdown::default(),
+            first: true,
+        }
+    }
+
+    pub fn push(&mut self, path: &std::path::Path, fa: &FileAnalysis) {
+        use std::fmt::Write as _;
+        let Some(out) = self.out.as_mut() else { return };
+        let h = fa.heap_estimate();
+        let _ = write!(
+            out,
+            "{}\n    {{\"path\": \"{}\"",
+            if self.first { "" } else { "," },
+            crate::util::json_sink::esc(&path.display().to_string())
+        );
+        for (name, bytes) in h.buckets() {
+            let _ = write!(out, ", \"{name}\": {bytes}");
+        }
+        let _ = write!(out, "}}");
+        self.agg.add(&h);
+        self.first = false;
+    }
+
+    /// Write the sink. No-op when the env never asked.
+    pub fn finish(self) {
+        use std::fmt::Write as _;
+        let Some(mut out) = self.out else { return };
+        let _ = write!(out, "\n  ],\n  \"total\": {{\"files\": {}", self.agg.files);
+        for (name, bytes) in self.agg.buckets() {
+            let _ = write!(out, ", \"{name}\": {bytes}");
+        }
+        let (paths, bytes) = super::path_intern::table_stats();
+        let _ = write!(
+            out,
+            "}},\n  \"path_intern\": {{\"paths\": {paths}, \"bytes\": {bytes}}}\n}}\n"
+        );
+        crate::util::json_sink::write_if_requested_any(
+            "PERL_LSP_HEAP_JSON",
+            "PERL_LSP_HEAP_JSON_DIR",
+            "heap",
+            &out,
+        );
+    }
+}
+
 impl std::fmt::Display for HeapBreakdown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mb = |b: usize| b as f64 / 1_048_576.0;

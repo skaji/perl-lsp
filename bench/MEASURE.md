@@ -89,6 +89,19 @@ the one that names WHICH files run near the budget cliff. It is a separate
 entry point from the global counters on purpose: attributing hot counters
 per-file would put a map probe on paths that fire millions of times.
 
+## Heap composition
+
+`PERL_LSP_HEAP_JSON[_DIR]` dumps per-file heap-bucket estimates (the
+`HeapBreakdown` lanes: refs, symbols, witness vec/index, includes, rebuilt
+indices, …) as JSON — the Perl `--check` sweep writes it right after
+sweeping, BEFORE eviction, so it approximates peak composition rather than
+exit residue; the pack indexer writes it where its human dump fires.
+measure.sh ingests one `heap_bytes` row per (file, bucket) plus
+`heap_total_bytes` aggregates. This is the attribution lane for memory: RSS
+says a corpus costs 9 GB, the heap rows say whose refs. The estimate is a
+documented undercount (flat capacities plus the dominant string buckets);
+trend and composition are its job, absolute totals are `/usr/bin/time`'s.
+
 ## Gold and e2e
 
 Multi-process harnesses set the DIR variants — `PERL_LSP_GHOST_JSON_DIR` /
