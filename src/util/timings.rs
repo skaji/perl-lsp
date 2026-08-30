@@ -368,6 +368,41 @@ thread_local! {
 /// finishes names itself WHILE it is stuck rather than after — a run that
 /// hangs never reaches an after-the-fact report, which is exactly the case
 /// worth reporting.
+/// RAII twin of [`set_current_file`]: names `path` for the enclosed region
+/// and restores the PREVIOUS unit on drop — so a nested analyze (a bulk
+/// indexer's wide per-file region calling a driver that scopes itself)
+/// hands attribution back instead of clearing it. The server's open-doc
+/// builds route through `LanguageDriver::analyze_with_path`, which opens
+/// one of these; before it, only the CLI sweep and the bulk indexers set
+/// the file, and the per-file ghost lane was blind to every server-side
+/// build.
+pub struct CurrentFileScope(Option<(std::path::PathBuf, std::sync::Arc<str>)>);
+
+pub fn current_file_scope(path: Option<&std::path::Path>) -> CurrentFileScope {
+    let prev = CURRENT_FILE.with(|c| c.borrow().clone());
+    set_current_file(path);
+    CurrentFileScope(prev)
+}
+
+impl Drop for CurrentFileScope {
+    fn drop(&mut self) {
+        // Same transition discipline as `set_current_file` — flush the ghost
+        // stage (what's staged belongs to the scope that is ending), then
+        // swap the saved pair back without re-deriving its Arc.
+        super::ghost_stats::flush_file_stage();
+        match self.0.take() {
+            Some((p, a)) => {
+                stall_watch_begin(&p.display().to_string());
+                CURRENT_FILE.with(|c| *c.borrow_mut() = Some((p, a)));
+            }
+            None => {
+                stall_watch_end();
+                CURRENT_FILE.with(|c| *c.borrow_mut() = None);
+            }
+        }
+    }
+}
+
 pub fn set_current_file(path: Option<&std::path::Path>) {
     // Flush the ghost lane's per-thread staging BEFORE the file changes —
     // what is staged belongs to the outgoing file.

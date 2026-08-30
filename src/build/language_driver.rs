@@ -119,8 +119,11 @@ pub trait LanguageDriver: Send + Sync {
     }
     /// Source + the file's path → `FileAnalysis`. The path lets a driver
     /// resolve cross-file context (C++ gathers `#define`s from `#include`d
-    /// headers so namespace/export macros expand). Default ignores it.
-    fn analyze_with_path(&self, source: &str, _path: Option<&Path>) -> FileAnalysis {
+    /// headers so namespace/export macros expand); every implementation
+    /// also names it for the duration via `timings::current_file_scope`,
+    /// so server-side open-doc builds attribute like indexed ones.
+    fn analyze_with_path(&self, source: &str, path: Option<&Path>) -> FileAnalysis {
+        let _file = crate::util::timings::current_file_scope(path);
         self.analyze(source)
     }
     /// Completion trigger characters for this language — the registry
@@ -380,6 +383,7 @@ impl LanguageDriver for PackDriver {
     /// others below, in order — don't inline new logic into an existing
     /// phase's body.
     fn analyze_with_path(&self, source: &str, path: Option<&Path>) -> FileAnalysis {
+        let _file = crate::util::timings::current_file_scope(path);
         // Every exit stamps the driver id (degraded stand-ins included — a
         // failed cpp parse is still a cpp file): `resolve()` derives pack
         // routing from this origin-identity fact at construction.
