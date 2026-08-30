@@ -96,6 +96,16 @@ only, and its numbers are not comparable to a `--features cpp` build's. The
 run line records what `--languages` reported, so a mismatch is visible rather
 than silent.
 
+**Never compare an armed wall to a bare one.** Measured 2026-08-30 on gold
+(same HEAD, single runs): bare 30.3s; armed with the per-thread staged lanes
+28.7s — within noise. The first cut of the file lane took a String allocation
+and a global lock on EVERY ScopedNs drop and cost 34.8s (+15%), and that
+cost sat inside parents' EXCLUSIVE times: the instrument distorting exactly
+the number it exists to produce. The lane stages per-thread now and flushes
+once per file transition. If armed overhead ever reappears, decompose it the
+same way — a bare control plus a pre-change binary on the same HEAD — before
+optimizing anything.
+
 **Never write inside the measured region.** The sinks accumulate in memory and
 serialize at exit. Emitting per-file lines to a stream during the run once
 cost 3.2M lines and 43 minutes, measuring something that no longer resembled

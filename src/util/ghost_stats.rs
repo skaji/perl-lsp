@@ -317,6 +317,42 @@ fn file_ns() -> &'static Mutex<HashMap<(String, String), (u128, u128, u64)>> {
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+thread_local! {
+    /// Per-thread staging for the file lane: (current file, tag -> triple).
+    /// A ScopedNs drop appends HERE — no lock, no allocation — and the whole
+    /// map moves to the global under ONE lock when the thread's file changes.
+    /// The unstaged version took a String allocation plus a global lock per
+    /// drop, which cost gold ~4.5s of wall (measured against the pre-lane
+    /// binary) — and that cost sat inside parents' EXCLUSIVE times, i.e. the
+    /// instrument distorted exactly the number it exists to produce.
+    static FILE_STAGE: std::cell::RefCell<
+        (Option<std::sync::Arc<str>>, HashMap<&'static str, (u128, u128, u64)>),
+    > = std::cell::RefCell::new((None, HashMap::new()));
+}
+
+/// Move this thread's staged file-lane rows into the global map. Called by
+/// `timings::set_current_file` on every transition (including ->None, which
+/// both per-file sites already do), and defensively on a mid-drop file
+/// mismatch — so a site that forgets to clear loses nothing, its rows flush
+/// on the NEXT file. A thread that dies mid-file loses that one file's
+/// partial rows, which is the right trade for a lock-free hot path.
+pub fn flush_file_stage() {
+    FILE_STAGE.with(|st| {
+        let (file, staged) = &mut *st.borrow_mut();
+        let Some(f) = file.take() else { return };
+        if staged.is_empty() {
+            return;
+        }
+        let mut m = file_ns().lock().unwrap_or_else(|e| e.into_inner());
+        for (tag, (incl, excl, n)) in staged.drain() {
+            let e = m.entry((f.to_string(), tag.to_string())).or_insert((0, 0, 0));
+            e.0 += incl;
+            e.1 += excl;
+            e.2 += n;
+        }
+    });
+}
+
 /// Per-(file, tag) counters — the ALLOWLISTED per-file lane. Deliberately a
 /// separate entry point from `count`: attributing every hot counter to a file
 /// would put a string clone and a map probe on paths that fire millions of
@@ -439,12 +475,22 @@ impl Drop for ScopedNs {
         // consumers keep their meaning, and global exclusive is derivable by
         // summing the per-file lane.
         add_ns(self.tag, elapsed);
-        if let Some(file) = super::timings::current_file() {
-            let mut m = file_ns().lock().unwrap_or_else(|e| e.into_inner());
-            let e = m.entry((file, self.tag.to_string())).or_insert((0, 0, 0));
-            e.0 += elapsed;
-            e.1 += excl;
-            e.2 += 1;
+        if let Some(cur) = super::timings::current_file_arc() {
+            FILE_STAGE.with(|st| {
+                {
+                    let stage = st.borrow();
+                    if stage.0.as_deref() != Some(&*cur) && stage.0.is_some() {
+                        drop(stage);
+                        flush_file_stage();
+                    }
+                }
+                let mut stage = st.borrow_mut();
+                stage.0 = Some(cur);
+                let e = stage.1.entry(self.tag).or_insert((0, 0, 0));
+                e.0 += elapsed;
+                e.1 += excl;
+                e.2 += 1;
+            });
         }
     }
 }
@@ -794,6 +840,7 @@ pub fn write_json() -> bool {
     // entry: exclusive is where time was actually spent, inclusive is what
     // the subtree costs, and only recording both keeps them answerable —
     // inclusive cannot be reconstructed from exclusive after the fact.
+    flush_file_stage();
     let fns_ = file_ns().lock().unwrap_or_else(|e| e.into_inner());
     let mut by_file: std::collections::BTreeMap<&str, Vec<(&str, &(u128, u128, u64))>> =
         std::collections::BTreeMap::new();

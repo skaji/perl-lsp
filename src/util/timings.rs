@@ -353,7 +353,10 @@ pub fn trace_file(path: &std::path::Path) {
 }
 
 thread_local! {
-    static CURRENT_FILE: std::cell::RefCell<Option<std::path::PathBuf>> =
+    /// The Arc rides beside the PathBuf so per-event readers (the ghost
+    /// per-file lane fires on every ScopedNs drop) pay a refcount bump, not
+    /// a String allocation — an allocation per drop cost gold ~4.5s of wall.
+    static CURRENT_FILE: std::cell::RefCell<Option<(std::path::PathBuf, std::sync::Arc<str>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -366,7 +369,13 @@ thread_local! {
 /// hangs never reaches an after-the-fact report, which is exactly the case
 /// worth reporting.
 pub fn set_current_file(path: Option<&std::path::Path>) {
-    CURRENT_FILE.with(|c| *c.borrow_mut() = path.map(|p| p.to_path_buf()));
+    // Flush the ghost lane's per-thread staging BEFORE the file changes —
+    // what is staged belongs to the outgoing file.
+    super::ghost_stats::flush_file_stage();
+    CURRENT_FILE.with(|c| {
+        *c.borrow_mut() = path
+            .map(|p| (p.to_path_buf(), std::sync::Arc::from(p.display().to_string().as_str())));
+    });
     match path {
         Some(p) => stall_watch_begin(&p.display().to_string()),
         None => stall_watch_end(),
@@ -459,5 +468,10 @@ fn ensure_watchdog() {
 
 /// The file this thread is analyzing, if the current work unit declared one.
 pub fn current_file() -> Option<String> {
-    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|p| p.display().to_string()))
+    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|(p, _)| p.display().to_string()))
+}
+
+/// Zero-allocation twin of [`current_file`] for per-event consumers.
+pub fn current_file_arc() -> Option<std::sync::Arc<str>> {
+    CURRENT_FILE.with(|c| c.borrow().as_ref().map(|(_, a)| std::sync::Arc::clone(a)))
 }
