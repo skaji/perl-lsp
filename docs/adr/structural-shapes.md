@@ -151,6 +151,36 @@ bag has no retraction, so a stale closed shape would survive
 latest-wins). When a disagreement fold lands, this clause comes OUT
 of the gate.
 
+### Keys are shared, never cloned — `SharedKeys`
+
+The key list inside `HashWithKeys` is an `Arc` (`SharedKeys`,
+`types.rs`): clone is a refcount, equality takes a pointer fast path
+(every site of one literal shares one allocation), and the one mutation
+path — shape extension in the worklist — goes through copy-on-write,
+paying O(keys) per actual divergence rather than per query. Serde
+delegates to the inner `Vec`, so blobs are byte-identical to the
+unshared spelling and the wire format is not a compatibility surface.
+
+Why this is load-bearing and not an optimization: rule #10 makes
+consumers take rich `InferredType` returns and project at the call
+site. That contract is correct, and by-value transport is what broke it
+at scale — a 4.8k-key generated literal (Znuny's vendored
+`PDF/API2/Resource/Glyphs.pm`) turned every projection into an O(keys)
+copy, N sites x O(keys) across three independent consumers, 9.3 GB and
+~35 s of `--check` on one 274 KB file. Sharing deletes the product;
+what remains is O(keys) once, linear in the input like parsing it. This
+is also why there is NO key-count cap: the cost that motivated capping
+was the transport, not the keys, and a cap would have degraded exact
+answers to fix a representation bug.
+
+**Known boundary:** sharing removes clone cost, not fold cost. A
+pathological literal still mints one witness per key on a single
+attachment, and every query of that attachment re-folds all of them —
+N queries x W witnesses, ~15 s on the Glyphs file standalone. Temporal
+reducer semantics (folds legitimately differ by query point) make naive
+memoization wrong; bounding this is an open design question, not an
+oversight.
+
 ### Calibration is part of done
 
 Every change to the gate, the lattice, or the emission set re-runs
