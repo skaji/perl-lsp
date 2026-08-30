@@ -480,23 +480,14 @@ impl CrossFileLookup for ModuleIndex {
             return true;
         }
         let path = cached.path.to_string_lossy();
-        // Probe both spellings the shredder can key a row under: the raw
-        // attachment name and its match-key normalization. `None` (file
-        // never shredded) dominates `Some(false)` — fail open.
-        let norm = crate::model::file_analysis::name_match_key(name);
+        // Raw name only: the probes own the spelling policy (raw + match
+        // key — `rows::probe_spelling`). `None` (file never shredded)
+        // dominates `Some(false)` — fail open.
         let rows = self.with_rows_conn(|conn| {
-            let probe = |s: &str| -> Option<bool> {
-                if attributed {
-                    crate::index::module_cache::sym_member_row_exists(conn, &path, s, class)
-                } else {
-                    crate::index::module_cache::name_row_exists(conn, &path, s)
-                }
-            };
-            match probe(name) {
-                None => None,
-                Some(true) => Some(true),
-                Some(false) if norm != name => probe(&norm),
-                Some(false) => Some(false),
+            if attributed {
+                crate::index::module_cache::sym_member_row_exists(conn, &path, name, class)
+            } else {
+                crate::index::module_cache::name_row_exists(conn, &path, name)
             }
         });
         member_prefilter_may_declare(

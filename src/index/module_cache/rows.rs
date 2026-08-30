@@ -518,20 +518,33 @@ pub fn sym_member_row_exists(
         .ok()?
         .query_row(params![path], |row| row.get(0))
         .ok()?;
+    let norm = probe_spelling(name);
     // A name or container the strings table never interned yields NULL from
     // the subselect, the comparison is false, and EXISTS answers 0 — which is
-    // correct: no row can reference a string that was never stored.
+    // correct: no row can reference a string that was never stored. The
+    // container stays EXACT-match: it is a package name, and its match key
+    // strips the qualifier, which would let `Base` claim `My::Base`'s rows.
     conn.prepare_cached(
         "SELECT EXISTS(
             SELECT 1 FROM syms y
              WHERE y.file_id = ?1
-               AND y.container_id = (SELECT str_id FROM strings WHERE s = ?3)
-               AND (y.name_id = (SELECT str_id FROM strings WHERE s = ?2)
-                    OR y.key_id = (SELECT str_id FROM strings WHERE s = ?2)))",
+               AND y.container_id = (SELECT str_id FROM strings WHERE s = ?4)
+               AND (y.name_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))
+                    OR y.key_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))))",
     )
     .ok()?
-    .query_row(params![file_id, name, container], |row| row.get(0))
+    .query_row(params![file_id, name, norm, container], |row| row.get(0))
     .ok()
+}
+
+/// The store's spelling policy, in ONE place: callers pass the RAW name and
+/// every per-file probe also matches its match-key normalization, because
+/// refs rows are keyed by `Ref::match_key()` while syms rows carry both the
+/// raw symbol name and its key. A caller threading spellings itself is the
+/// bug this replaces — a qualified query name (`My::Pkg::helper`) probed raw
+/// would miss the `helper`-keyed row and turn fail-open into a wrong skip.
+fn probe_spelling(name: &str) -> String {
+    crate::model::file_analysis::name_match_key(name)
 }
 
 /// The name-only sibling of `sym_member_row_exists`: can the store rule out
@@ -550,15 +563,16 @@ pub fn sym_name_row_exists(conn: &Connection, path: &str, name: &str) -> Option<
         .ok()?
         .query_row(params![path], |row| row.get(0))
         .ok()?;
+    let norm = probe_spelling(name);
     conn.prepare_cached(
         "SELECT EXISTS(
             SELECT 1 FROM syms y
              WHERE y.file_id = ?1
-               AND (y.name_id = (SELECT str_id FROM strings WHERE s = ?2)
-                    OR y.key_id = (SELECT str_id FROM strings WHERE s = ?2)))",
+               AND (y.name_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))
+                    OR y.key_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))))",
     )
     .ok()?
-    .query_row(params![file_id, name], |row| row.get(0))
+    .query_row(params![file_id, name, norm], |row| row.get(0))
     .ok()
 }
 
@@ -578,19 +592,20 @@ pub fn name_row_exists(conn: &Connection, path: &str, name: &str) -> Option<bool
         .ok()?
         .query_row(params![path], |row| row.get(0))
         .ok()?;
+    let norm = probe_spelling(name);
     conn.prepare_cached(
         "SELECT EXISTS(
             SELECT 1 FROM refs r
-             WHERE r.name_id = (SELECT str_id FROM strings WHERE s = ?2)
+             WHERE r.name_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))
                AND r.file_id = ?1)
          OR EXISTS(
             SELECT 1 FROM syms y
              WHERE y.file_id = ?1
-               AND (y.name_id = (SELECT str_id FROM strings WHERE s = ?2)
-                    OR y.key_id = (SELECT str_id FROM strings WHERE s = ?2)))",
+               AND (y.name_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))
+                    OR y.key_id IN (SELECT str_id FROM strings WHERE s IN (?2, ?3))))",
     )
     .ok()?
-    .query_row(params![file_id, name], |row| row.get(0))
+    .query_row(params![file_id, name, norm], |row| row.get(0))
     .ok()
 }
 
