@@ -68,7 +68,7 @@ impl FileAnalysis {
                 for sh in &shapes {
                     match sh {
                         InferredType::HashWithKeys { keys: ks, .. } => {
-                            for (k, v) in ks {
+                            for (k, v) in ks.iter() {
                                 match keys.iter_mut().find(|(ek, _)| ek == k) {
                                     None => keys.push((k.clone(), v.clone())),
                                     Some((_, ev)) => {
@@ -88,7 +88,7 @@ impl FileAnalysis {
                 if !all_keyed {
                     continue;
                 }
-                InferredType::HashWithKeys { keys, open: true }
+                InferredType::HashWithKeys { keys: crate::model::file_analysis::SharedKeys::new(keys), open: true }
             };
             let span = self
                 .scopes

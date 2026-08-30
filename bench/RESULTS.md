@@ -323,3 +323,29 @@ lanes, and paid for itself before merging:
   2.24 s cold then 260–650 ms, server RSS 406 MB). **Editor baselines are
   deliberately not seeded yet** — they must come from a quiet box, and the
   batch sweep owned the box today.
+
+## 2026-08-30 — SharedKeys: the N×S clone product deleted at the type (sha pending)
+
+Znuny's 9.3 GB `--check` root-caused to one representation choice: by-value
+transport of `HashWithKeys` meant every consumer querying a variable typed
+by a big generated literal took delivery of the whole key list — N sites ×
+O(S), in three consumers (the sweep's deref lane: 7.3 GB + 17.6 s; the
+build's owner-upgrade pass: 16.1 s to compute 9,724 `None`s; the finalize
+seal, fixed earlier). `SharedKeys` (Arc'd key list, ptr-eq equality fast
+path, copy-on-write for the one mutation site) deletes the product with
+zero consumer changes and rule #10's rich-type contract intact.
+
+Measured (single runs; deltas clear baseline spreads by orders of
+magnitude): Znuny cold 52.0 s / 9,314 MB → **19.0 s / 1,973 MB**; warm
+24.2 s / 9,232 MB → **6.3 s / 1,900 MB**. Glyphs.pm standalone 34.4 s /
+7.58 GB → **15.1 s / 95 MB**. FHEM warm 53.5 → 48.1 s, memory flat (its
+mechanism is consult volume, not shapes). Gold 503/0 warm-clean, e2e
+121/0, unit 1687/0 — answers unchanged by the exact-assertion net, not
+just by argument. No cache invalidation: SharedKeys serializes via
+delegating impls, byte-identical to the Vec it replaced.
+
+Known residual, named: Glyphs standalone still spends 7.9 s (build) +
+6.7 s (sweep) re-FOLDING the ~9.7k witnesses on one attachment per query —
+N queries × W witnesses, clone-free but not fold-free, temporal semantics
+make naive memoization wrong. Separate design question; the checked-in
+baselines will hold the line meanwhile.

@@ -341,14 +341,18 @@ pub(crate) fn emit_mutation_extension_witnesses(
                         unreachable!()
                     };
                     let vtype = w.rhs_span.and_then(rhs_type);
-                    match keys.iter_mut().find(|(name, _)| name == k) {
+                    // Copy-on-write: `to_mut` clones the key list only when
+                    // the allocation is shared — the extension path pays
+                    // O(S) per ACTUAL divergence, never per query.
+                    let keys_mut = keys.to_mut();
+                    match keys_mut.iter_mut().find(|(name, _)| name == k) {
                         Some(entry) => {
                             if vtype.is_none() || entry.1.as_deref() == vtype.as_ref() {
                                 continue; // no new information
                             }
                             entry.1 = vtype.map(Box::new);
                         }
-                        None => keys.push((k.to_string(), vtype.map(Box::new))),
+                        None => keys_mut.push((k.to_string(), vtype.map(Box::new))),
                     }
                     InferredType::HashWithKeys { keys, open }
                 }
