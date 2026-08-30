@@ -73,12 +73,21 @@ pub fn write_if_requested_any(file_var: &str, dir_var: &str, prefix: &str, body:
     let Some(dir) = std::env::var_os(dir_var) else {
         return false;
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    // ONE file per process, stable across flushes: the server flushes at LSP
+    // shutdown AND at the exit guard, and a fresh timestamp per flush turned
+    // one process into two files — double-counted by any naive sum over the
+    // directory. The stamp is minted once, so a re-flush overwrites with the
+    // later (superset) snapshot; the nanos half keeps pid reuse across a long
+    // harness run from colliding two different processes.
+    static STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let stamp = *STAMP.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    });
     let path = std::path::Path::new(&dir)
-        .join(format!("{prefix}-{}-{nanos}.json", std::process::id()));
+        .join(format!("{prefix}-{}-{stamp}.json", std::process::id()));
     match std::fs::write(&path, body) {
         Ok(()) => true,
         Err(e) => {
