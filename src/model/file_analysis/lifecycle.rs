@@ -243,20 +243,37 @@ impl FileAnalysis {
     }
 
     pub(crate) fn finalize_post_walk(&mut self) {
-        self.emit_method_call_binding_edges();
+        // Four timed children: finalize measured 0.50ms/call on gold
+        // substrate builds and 18.65ms/call on e2e's tiny fixtures — a 37x
+        // per-call gap on smaller inputs, so one of these steps scales with
+        // something other than file size, and one aggregate tag cannot say
+        // which. (ScopedNs, so each lands per-file with exclusive time.)
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::mcb_edges");
+            self.emit_method_call_binding_edges();
+        }
         // Fill HashKeyAccess owners that are resolvable in-file
         // via the invocant ladder (`method_call_invocant_type`).
         // Cross-file gaps stay None until
         // `enrich_imported_types_with_keys` re-runs the same
         // routine with `module_index`.
-        self.fix_chain_receiver_hash_key_owners(None);
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::hash_key_owners");
+            self.fix_chain_receiver_hash_key_owners(None);
+        }
         // Stamp the build-time-resolved dispatch target on MethodCall
         // refs (local-only here; enrichment re-stamps with the index
         // for OPEN docs). Mutates existing refs in place, so it must run
         // before the ref table seals its baseline — the seal counts the
         // refs, the stamp only sets a field on them.
-        self.stamp_method_call_targets(None);
-        self.seal_unrowed_attachment_names();
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::stamp_targets");
+            self.stamp_method_call_targets(None);
+        }
+        {
+            let _g = crate::util::ghost_stats::ScopedNs::start("finalize::seal_unrowed");
+            self.seal_unrowed_attachment_names();
+        }
         self.base_witness_count = self.witnesses.len();
         self.symbols.seal_baseline();
         self.refs.seal_baseline();
@@ -279,6 +296,22 @@ impl FileAnalysis {
         for r in self.refs().iter() {
             ref_keys.insert(r.match_key());
         }
+        // One pass over the symbols, THEN one over the attachments. The
+        // per-attachment symbols scan this replaces was attachments x
+        // symbols — quadratic exactly where the residue matters (a Mojo
+        // file's bridge writeback mints an attachment per entity per
+        // bridged class, against the same file's full symbol table).
+        let mut sym_names: HashMap<&str, HashSet<String>> = HashMap::new();
+        for s in self.symbols().iter() {
+            if let Some(p) = s.package.as_deref() {
+                let names = sym_names.entry(p).or_default();
+                let key = super::name_match_key(&s.name);
+                if key != s.name {
+                    names.insert(key);
+                }
+                names.insert(s.name.clone());
+            }
+        }
         let mut out: Vec<String> = Vec::new();
         for att in self.witnesses.attachments() {
             match att {
@@ -297,11 +330,9 @@ impl FileAnalysis {
                     {
                         continue;
                     }
-                    let backed = self.symbols().iter().any(|s| {
-                        s.package.as_deref() == Some(package.as_str())
-                            && (s.name == *name
-                                || super::name_match_key(&s.name) == *name)
-                    });
+                    let backed = sym_names
+                        .get(package.as_str())
+                        .is_some_and(|names| names.contains(name));
                     if !backed {
                         out.push(name.clone());
                     }
