@@ -14,6 +14,14 @@ A Perl language server with deep semantic intelligence. Built on [tree-sitter-pe
 cargo install perl-lsp
 ```
 
+C/C++ support is **beta** and opt-in at build time — default builds serve Perl
+only, and the prebuilt binaries below are Perl-only. To get it, build with the
+feature:
+
+```bash
+cargo install perl-lsp --features cpp
+```
+
 ## Editor Setup
 
 ### VS Code
@@ -154,13 +162,32 @@ For non-standard layouts, set `PERL5LIB` before launching your editor:
 PERL5LIB=./my-libs/perl5 nvim lib/MyApp.pm
 ```
 
+### C/C++ — beta (`--features cpp`)
+
+perl-lsp serves C/C++ from the same server, through the same query-driven
+extraction seam: goto-definition (reaching the out-of-line definition, not just
+the header prototype), cross-translation-unit references, inheritance-aware
+member completion, hover, outline, semantic tokens, `#include` navigation,
+template instantiation typing with partial-specialization selection, a
+config-variant macro model, `dynamic_cast` / `std::optional` narrowing, and a
+zero-false-positive use-after-move diagnostic.
+
+**Beta is a promise about the answers, not the scale.** Small and mid-size
+projects work well; very large trees don't finish indexing yet, dominated by a
+few huge vendored headers. `perl-lsp --languages` reports each language's tier
+(the same seam hosts alpha-tier Python, R, and CMake packs behind their own
+features). Details and the measured scaling limit: [`docs/cpp-status.md`](docs/cpp-status.md).
+
 ### LSP Capabilities
 
 | Capability | Highlights |
 |-----------|-----------|
 | **Completion** | Variables, methods (type-inferred), hash keys, auto-import, module names on `use` lines, import lists in `qw()` |
 | **Go-to-definition** | Scope-aware variables, cross-file methods via inheritance, hash keys through expression chains |
+| **Go to type definition** | `$obj` jumps to the definition of its inferred class; answers nothing rather than guessing when nothing infers |
 | **Find references** | Scope-aware variables, cross-file functions/methods/packages |
+| **Call hierarchy** | Incoming and outgoing calls, each resolved to its definition |
+| **Type hierarchy** | Supertypes and subtypes, one inheritance level per request |
 | **Rename** | Variables (scope-aware), functions/methods/packages (cross-file via workspace index) |
 | **Hover** | Types, POD docs (tree-sitter-pod AST), signatures, class provenance |
 | **Signature help** | Parameter names with inferred types, cross-file parameter types |
@@ -170,6 +197,7 @@ PERL5LIB=./my-libs/perl5 nvim lib/MyApp.pm
 | **Code actions** | Auto-import for unresolved functions |
 | **Workspace symbol** | Search across all indexed project files |
 | **Document symbols** | Nested outline with packages, subs, classes, fields |
+| **Document links** | POD `L<>` links, URLs in comments and POD, existence-checked `require "path"` / `use lib` paths |
 | **Formatting** | perltidy (full document + range) |
 | **Highlights** | Read/write distinction |
 | **Selection range** | Tree-sitter node hierarchy |
@@ -274,15 +302,25 @@ See `perl-gen/README.md` for full usage and
 ```bash
 git clone https://github.com/tree-sitter-perl/perl-lsp
 cd perl-lsp
-cargo build --release
+cargo build --release                  # Perl only (the default)
+cargo build --release --features cpp   # + C/C++ (beta)
 ```
 
 ## Testing
 
 ```bash
-cargo test                                    # 900+ unit tests
-cargo build --release && ./e2e/run.sh         # 10 nvim-driven e2e suites (requires nvim)
+cargo test --features cpp                     # 1,704 unit tests
+cargo build --release --features cpp
+./e2e/run.sh                                  # 11 nvim-driven Perl suites (121 tests)
+./e2e/run-cpp.sh                              # 8 pack-language suites (24 tests)
+perl gold-corpus/run.pl                       # 520-row gold regression corpus
 ```
+
+Build with `--features cpp` throughout: a plain build serves Perl only, so the
+pack half goes unchecked while the run still reports green — and gold reports
+its C/C++ rows as lang-*skips* rather than failures. Check `lang-skip 0` in the
+gold summary. The gold harness also needs its pinned CPAN substrate
+(`gold-corpus/README.md`).
 
 The e2e harness needs **nvim 0.10+** (it calls `vim.lsp.get_clients`); CI pins
 v0.11.0. Distro packages are often older — Ubuntu 24.04 ships 0.9.5, which fails

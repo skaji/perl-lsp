@@ -6,7 +6,7 @@ Opt-in behind `--features cpp`; default builds stay Perl-only.
 The tier is a promise about whether to trust the ANSWERS, and by the bar the
 enum sets — *"broad gold coverage, known gaps documented"* — C/C++ meets it:
 255 C/C++ gold rows assert the verb surface (of 520 total, run with
-`lang-skip 0`), plus 1,676 unit tests (+64 over Perl-only) and 24 e2e-cpp
+`lang-skip 0`), plus 1,704 unit tests (+64 over Perl-only) and 24 e2e-cpp
 tests across 8 suites.
 
 **What beta does not promise is scaling.** That is the honest answer to the
@@ -18,7 +18,7 @@ correctness one — which is why the tier stays beta rather than dropping.
 
 Goto-def, cross-TU references, member and in-scope completion, hover, include
 navigation, macro-aware extraction (config-variant macro model, splice-mapped
-reparse), diagnostics, and the same SQLite warm-start path Perl uses. 1,676
+reparse), diagnostics, and the same SQLite warm-start path Perl uses. 1,704
 tests pass with `--features cpp` (+64 over Perl-only); the pack e2e lane is
 8 suites / 24 tests.
 

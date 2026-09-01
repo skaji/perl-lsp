@@ -144,6 +144,24 @@ marked otherwise; the drain re-derived each rationale against current code.
   correctness memo cleared on resolve-stack drain vs long-lived
   byte-accounted LRU invalidated on content change. Never unify under one
   cache abstraction. [recorded 2026-07-17]
+- **"Any pack language is on" has no name — it is an 18-fold literal
+  disjunction.** The shared pack machinery (`PackDriver` itself,
+  `query_extract`'s dead-code gate) is gated by
+  `any(feature = "cpp", feature = "python", feature = "r", feature = "cmake")`
+  spelled out 18 times across `build/language_driver.rs` and
+  `build/mod.rs` (16 positive, 2 negated). That is a partial enumeration
+  in rule #10's sense: a fifth pack language must find all 18 sites, and
+  a missed one compiles the machinery OUT silently rather than failing.
+  The per-language features are correctly scoped and stay — 73 of the 89
+  `feature = "cpp"` sites are genuinely C/C++-only, so `cpp` is not a
+  misnomer and must not be renamed to something claiming to cover
+  Python/R/CMake. **Fix:** add `packs = []`, have each language feature
+  enable it (`cpp = ["packs", "dep:tree-sitter-cpp"]`, …), collapse the
+  18 sites to `feature = "packs"`. Additive — no user-facing feature
+  changes meaning. Parked only on release timing: it moves what compiles
+  under which feature, so it wants the four gates re-run across the
+  feature combos rather than riding a tag that is already green.
+  [recorded 2026-08-31]
 
 ## Feature tier (each is a fireable slice)
 

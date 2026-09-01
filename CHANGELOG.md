@@ -4,7 +4,7 @@ All notable changes to perl-lsp are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions are the published
 crate / VS Code extension versions.
 
-## Unreleased
+## v0.7.0 — 2026-08-31
 
 A large accumulation: a full second language (C/C++ in beta, plus alpha-tier
 Python/R/CMake packs) now serves alongside Perl, cross-file analysis persists

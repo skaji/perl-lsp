@@ -9,6 +9,23 @@ repository = "https://github.com/tree-sitter-perl/perl-lsp"
 keywords = ["perl", "lsp", "tree-sitter", "language-server"]
 categories = ["development-tools", "text-editors"]
 
+# Allowlist, not `exclude`: the test estate grows on its own, and a blocklist
+# ships each new directory silently. Patterns are gitignore-style, so the
+# leading `/` is load-bearing — bare `README.md` matches at any depth.
+# The non-`src` dirs are all `include_str!` inputs.
+include = [
+    "/src/**",
+    "/queries/**",
+    "/frameworks/**",
+    "/vendored/**",
+    "/build.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+]
+
 [[bin]]
 name = "perl-lsp"
 path = "src/main.rs"
