@@ -101,11 +101,22 @@ Gated on Phase A. The rule is the one already in force:
    swept over the substrate → per-site triage → default-on at a stated
    severity. The C++ `use-after-move` channel is already registered and
    off by default; it is the template and the first candidate.
+3. **Calibration is one gate; the facts are another.** Several pack
+   codes are not blocked on a substrate at all — they are blocked on
+   analysis that does not exist. `adr/narrowing-diagnostics.md` records
+   that **"D1/D2/D3/D4/D6 have no cpp facts"** and that nothing records
+   cpp guard sites for redundancy; `adr/use-after-move.md` ships a
+   decidable subset explicitly *because* there is no CFG. That tier is
+   **Epic 16**, and its motivating consumer is C++. So when a code fails
+   to promote, say which gate it is waiting on — a substrate, an
+   openness fact (Epic 3), or the path-sensitivity facts (Epic 16).
+   Three different answers with three different owners.
 3. The sweep is over the Phase-A substrate, and the number goes in the
    PR. A code with unexplained hits does not promote — it gets its
    noise class written into `gold-corpus/KNOWN-GAPS.md`.
 4. **Acceptance per code:** the sweep count, the triage, the ladder
-   position recorded in the language's status doc.
+   position recorded in the language's status doc, and — for anything
+   still off — the named gate it waits on.
 
 ### Phase C — the framework tier (the open design round)
 

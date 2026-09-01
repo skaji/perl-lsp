@@ -59,6 +59,9 @@ into one type. Name yours distinctly and say why in the ADR.
    `Node::Scope` must be *earned* by Openness, not ported for its own
    sake.
 5. `docs/adr/narrowing-diagnostics.md` — the flag ladder.
+6. `docs/prompt-cfg-tier.md` §8.2 rung 1 — the path-sensitivity tier
+   (Epic 16) kills a noise class this epic will meet. See the note
+   under Phase D.
 6. `src/model/graph.rs` (read all of it) and the unresolved-method /
    unresolved-function blocks in `src/lsp/symbols/diagnostics.rs`.
 
@@ -175,6 +178,16 @@ can never pass" is wrong.
    { undef }` + subclass overriding it; a `defined $meta` guard in the
    base must NOT flag) and a measured drop in the audit's
    contradictory-guard count.
+4. **Know which noise class is yours and which is Epic 16's.** Open-world
+   dispatch is an *openness* problem and belongs here. **Correlated
+   branches** — `if ($ok) { $x = init() } … if ($ok) { $x->use }` — are
+   a *path-sensitivity* problem, named in `prompt-cfg-tier.md` §8.2 as
+   "the dominant real-world FP class", killed by that tier's rung 1
+   (SAT over atoms along the candidate trail) with no dependencies.
+   Do not build a correlated-branch heuristic here; it would be a
+   partial enumeration of a shape the CFG tier answers structurally
+   (rule #10). Triage them into the audit as a named, deferred class
+   instead.
 
 ### Phase E — promotion
 
@@ -184,7 +197,9 @@ can never pass" is wrong.
    text in `adr/narrowing-diagnostics.md`.
 3. `redundantGuard` / `contradictory`: flip if Phase D put the noise
    classes near zero; otherwise record precisely which class remains
-   and leave them opt-in. Do NOT flip `unresolvedMethodCrossFile` here
+   and leave them opt-in. If what remains is the correlated-branch
+   class, say so by name — that is Epic 16's rung 1, and naming it
+   turns "still noisy" into a scheduled fix. Do NOT flip `unresolvedMethodCrossFile` here
    — its ladder promotes it last, and the named-helper first-param-self
    gap in `gold-corpus/KNOWN-GAPS.md` is still open.
 4. Write `docs/adr/openness.md`: the verdict enum, the single
@@ -224,6 +239,10 @@ What that means for the design:
    silent `Closed` default there is a false-positive flood.
 3. Concretely, leave Epic 13 a hook: the ADR should name what a pack
    language must supply before its diagnostics consult this verdict.
+   Note that openness is not the only thing missing on that side —
+   `adr/narrowing-diagnostics.md` records that "D1/D2/D3/D4/D6 have no
+   cpp facts", which is Epic 16's job, not this one's. A pack code that
+   fails to promote may be waiting on either; say which.
    The C++ analogue is already sitting in the tree —
    `class_has_unresolved_ancestor`'s condition is "an ancestor we
    cannot see", which for C++ means an unresolved `#include`. That is

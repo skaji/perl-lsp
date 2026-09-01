@@ -29,6 +29,39 @@ because per-code objects are their named forcing function.
    pattern every config surface here must keep.
 5. `docs/adr/config-superposition-declarations.md` — the landed
    declaration model; do not contradict it.
+6. `docs/prompt-cfg-tier.md` §7 ("Consumers this is built for") — the
+   automation tier this framework is the delivery vehicle for. Three of
+   its four items are packaging decisions **this epic makes**, and two
+   of them are cheap now and expensive later. See the ordering
+   constraint below.
+
+## Two forward constraints from the CFG tier
+
+`prompt-cfg-tier.md` §7 names the automation tier these seams deliver,
+and it calls SARIF "the highest leverage-to-effort item on the list".
+Two of its requirements are representation decisions that cost nothing
+to honor now and are painful retrofits:
+
+1. **Finding fingerprints key on `(rule, function symbol, Place path)`
+   — never line numbers.** Baselines and inline suppressions ride the
+   fingerprint, so a code edit that shifts a line must not orphan a
+   suppression. `Place` does not exist yet (Epic 16 Phase B), so this
+   epic cannot use it — but Phase C's suppression key and Phase D's
+   SARIF `ruleId`/location shape must be designed so a fingerprint can
+   become the key **without a format break**. Concretely: do not make
+   the line number part of the suppression's identity, and leave the
+   SARIF result shape room for a `partialFingerprints` entry.
+2. **must/may is a structured confidence field, not a severity.** The
+   brief's framing: "must gates CI, may informs review — the zero-FP
+   discipline and a Klocwork-style recall mode become one engine at two
+   thresholds, and **the finding says which it is**." Severity and
+   confidence are different axes; collapsing them into one enum in
+   Phase B's config is the retrofit. Reserve the axis even though
+   nothing populates it yet.
+
+The fourth item, differential CI, is already built — Surface equality +
+`dirty_consumers` + the persisted `modules.db` artifact — so this epic
+inherits it rather than owing it anything.
 
 ## Ordering constraint
 

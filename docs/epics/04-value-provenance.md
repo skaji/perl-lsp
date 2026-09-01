@@ -56,6 +56,9 @@ move on to Phases C/D. Do not leave it dormant for a third time.
    cross-file consult of them falls back to a full decode.
 6. `docs/prompt-long-distance.md` — A4 v2 already landed cross-file
    slot-read narrowing; Part 1 must NOT rebuild it.
+7. `docs/prompt-cfg-tier.md` §3.6 — **before writing Phase C's cycle
+   guard.** It is three paragraphs and it names the one thing that
+   guard must not make harder.
 
 ## Current state — exact anchors
 
@@ -139,6 +142,17 @@ resolves into `$defaults`'s key set.
    Edges — confirm the attachment shapes line up and add a cycle guard
    via the existing `QueryState` visited set. `$a = { %$b }; $b = { %$a }`
    is the test.
+   **Do not entrench the silent drop.** `query_rec`'s visited guard
+   resolves an on-path revisit to *nothing*, so the cyclic arm vanishes
+   from the fold. That is harmless for types — a cyclic edge carries no
+   information, which is why it is correct here — but Epic 16 §3.6 has
+   to replace it with an explicit unknown-marker witness, because for
+   must/may facts a silently-dropped arm folds into a **stronger claim
+   than the paths justify**. Write this guard so the marker can be added
+   later without re-deriving where the cuts happen: cut in ONE place,
+   and leave a comment naming `docs/epics/16-cfg-tier.md` Phase C
+   step 3. A cycle guard spread across three call sites is the retrofit
+   that epic cannot afford.
 4. Owner expansion for the linker (goto-def on a key): **prefer
    index-time expansion** (one def per member) over a
    `HashKeyOwner::Union` enum variant — no serde/rename/match ripple.
@@ -181,9 +195,20 @@ types `get_config('host')` per key.
 ### Phase E — verification + docs
 
 Full gate; update `prompt-type-inference-residual.md` (1, 2, 5a landed
-with pointers), this README's coverage map, and the instance-brands
-PARKED note in `prompt-graph-walking.md` — its prerequisite list
-shrinks to "constructor/field value flow".
+with pointers), the epics README's coverage map, and the
+instance-brands PARKED note in `prompt-graph-walking.md`.
+
+**Be accurate about what that note still says.** Instance brands have
+TWO gates, not one: this value tier, *and* the CFG tier's P1 obligation
+— "brand = the birth-site of the instance, and the birth-site rule is
+this chase in provenance mode", with binding-keyed `Place`s seeing
+through the aliasing that killed the spike's spelling keys, and φ joins
+folding multi-arm receivers to an honest may-set of birth sites
+(`prompt-cfg-tier.md` §8.1; the xref is already in
+`prompt-graph-walking.md`). So this epic **shrinks** the prerequisite
+list, it does not empty it. Say what remains: constructor/field value
+flow, the CFG tier's P1 chase, the brand-key design round
+(`(birth-site, Option<home>)`), and the dispatch-gating consumer.
 
 ## Language-pack beat
 

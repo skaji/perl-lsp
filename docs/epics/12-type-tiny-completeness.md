@@ -55,6 +55,10 @@
    `is_`/`assert_` companion generation) and `base_constant_type`.
 5. `grep -rn 'type_constraint_names' src/build/plugin/mod.rs` — the
    global gate and its "first cut" caveat.
+6. `docs/prompt-cfg-tier.md` §3.3 and §8.1 — **this epic mints new
+   `GuardFact`s over `NarrowSubject`s, which is exactly the
+   representation that tier promotes.** Two obligations land on the
+   arms written here; see below.
 
 ## Phase breakdown
 
@@ -90,7 +94,20 @@
    asks the invocant's TYPE — **no name matching on `$type`** (rule
    #10). This is the payoff of the ADR's "a constraint is a value"
    decision.
-6. **Acceptance:** unit tests per form (`is_ArrayRef` if/unless/postfix;
+6. **Two forward obligations from the CFG tier, both free here and
+   unrecoverable later** (`prompt-cfg-tier.md` §3.3, §8.1):
+   - **`NarrowSubject` becomes `Place`** — spelling→binding, flat key→
+     path steps. The new arms should take the subject from
+     `narrow_subject_of` and never re-spell it as a string; a `String`
+     subject minted here is one more of the three spellings Epic 16
+     Phase B has to converge.
+   - **P2: keep the condition's symbolic form.** A check-guard's
+     condition is `is_X($subject)` — a shape that fits the decidable
+     fragment trivially (equality over a symbolic value). Record it
+     under the atom as the dormant `SymExpr` payload rather than
+     flattening straight to the resolved `NarrowOp`. Nothing reads it
+     yet; that is the point.
+7. **Acceptance:** unit tests per form (`is_ArrayRef` if/unless/postfix;
    `assert_Str` fall-through; the `->check` object form; a NON-imported
    `is_Foo` user sub narrows nothing — see Phase B); **the deref-shape
    diagnostic composes** (an `is_ArrayRef`-guarded `$x->{k}` hash deref

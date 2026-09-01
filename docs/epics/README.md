@@ -38,6 +38,15 @@ Epics 13–15 exist because the two axes have mass with no home in a
 feature epic: the pack-language ceiling, the C++ per-file stall, and
 the Tier-1 query-path residual are each an arc, not a paragraph.
 
+**Epic 16 is a third kind of entry: a tier three shipped features are
+already parked on.** `use-after-move` ships a decidable subset because
+there is no CFG; the cpp D-codes have no facts to read; D9 reachability
+has no pass. It is scheduled late, but **two of its representation
+decisions bind on epics scheduled before it** — they are free today and
+unrecoverable retrofits — so Epics 4, 7 and 12 each carry a pointer
+back to it. Read the ordering note in `16-cfg-tier.md` before starting
+any of those three.
+
 ## The slate
 
 | # | Epic | Size | Depends on |
@@ -57,6 +66,7 @@ the Tier-1 query-path residual are each an arc, not a paragraph.
 | 13 | [Pack-language ceiling: diagnostics, framework tier, calibration](13-pack-language-ceiling.md) | L | — |
 | 14 | [The per-file stall — C++ beta → GA](14-per-file-stall.md) | M | — |
 | 15 | [Query paths at scale — Tier 1 residual](15-query-paths-at-scale.md) | L | 1 interlocks (candidate sets) |
+| 16 | [The CFG tier — path sensitivity on the bag](16-cfg-tier.md) | L | **4, 7 and 12 owe it seams** — see below |
 
 **Suggested order.** 1 first (it is a class of confidently-wrong
 answers, and Veesh named it next); then 14 and 15, because they are the
@@ -106,6 +116,10 @@ residuals, or (d) explicitly out of scope. Nothing is unaccounted for.
 | `open-problems.md` — untyped param/hash-element boundary | Hard boundary; Epic 4 + constructor/field flow are the approach vector |
 | `open-problems.md` — runtime export generators | Hard boundary; MooseX::Role::Parameterized and Sub::Exporter ride it |
 | `prompt-optional-types.md` / `prompt-relational-iteration.md` | Landed (see `adr/relational-ref-index.md`) |
+| `prompt-cfg-tier.md` | **Epic 16** — ladder steps 1–3 (typed regions/exits, the `Place` promotion, the assembler + `JoinFold` + cycle-cut markers + atoms), plus the two binding obligations P1/P2 |
+| `prompt-cfg-tier.md` §5 — interprocedural effects (ladder step 4) | **Blocked on a design round, not on an epic.** §5.2 is a deliberately open hole: parameter identity for dependent effects, where positional vs invocant vs Perl `@_` flattening/aliasing vs kwargs vs unpacking projections disagree about what a parameter *is*. The brief enumerates the axes and the requirements any answer must satisfy. Its own arc once that round closes; note it is also the phase where summaries join the Surface |
+| `prompt-cfg-tier.md` §8 — path-symbolic refinement | **Forward-looking and additive.** Only P1 (the chase reports its arm trail) and P2 (guards keep a decidable-fragment `SymExpr`) bind now, as Epic 16 Phase C items. The checker ladder (atom-SAT → intervals → optional SMT) and its placement are all later |
+| `adr/use-after-move.md` residual classes | **Epic 16** — class-3 arm-scoping is Phase A, class-2 subobject moves are Phase B, must/may is Phase C. The ADR's decidable subset is the honest floor until then |
 | `prompt-lsp-surface-parity.md` | Landed — the type-hierarchy / call-hierarchy / typeDefinition cluster plus a re-scoped documentLink, each with gold rows. The brief's own non-goals stand; `linkedEditingRange` stays OFF |
 | `prompt-wasm-web-extension.md` | **Backburner** (ROADMAP). The crate split it assumes was executed and REJECTED; `workspace-split` is the playbook if wasm ever forces it |
 | `parser-shortcomings.md` | Upstream tree-sitter-perl bugs, handed off to the parser team. Not schedulable here; `adr/error-recovery.md` is what we do about them meanwhile |

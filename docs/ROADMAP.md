@@ -34,10 +34,13 @@ measured scaling envelope, and both are properties of every seam.
 | 13 | [Pack-language ceiling](epics/13-pack-language-ceiling.md) | Calibration is the ship gate; it is half the work |
 | 14 | [The per-file stall](epics/14-per-file-stall.md) | C/C++ is unusable at Godot size; nobody has profiled it yet |
 | 15 | [Query paths at scale](epics/15-query-paths-at-scale.md) | Storage holds at 122x; query paths break |
+| 16 | [The CFG tier](epics/16-cfg-tier.md) | UAM, the cpp D-codes and D9 are all parked on it |
 
 **Suggested order:** 1 first, then 14 and 15 — those two are where the
 product is unusable rather than merely incomplete — then 2–4, then
-pull-driven.
+pull-driven. Epic 16 is scheduled late but **binds early**: its P1/P2
+obligations and its cycle-cut change are free today and unrecoverable
+retrofits, so Epics 4, 7 and 12 carry pointers back to it.
 
 ## Not in an epic
 
