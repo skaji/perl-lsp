@@ -26,7 +26,7 @@ measured scaling envelope, and both are properties of every seam.
 | 5 | [One-seam sweep](epics/05-one-seam-sweep.md) | Small, self-contained; the good warm-up |
 | 6 | [Rename provenance](epics/06-rename-provenance.md) | `folded_from` landed; three residuals left |
 | 7 | [Diagnostic framework](epics/07-diagnostic-framework.md) | The CI-readiness gate |
-| 8 | [Heatmap residuals](epics/08-heatmap-residuals.md) | Closes a verified false positive against the heatmap's own promise |
+| 8 | [Heatmap: parallelize + residuals](epics/08-heatmap-residuals.md) | Runs on one core (up to 17x `--check`); then a verified FP against its own promise |
 | 9 | [Mojo polish](epics/09-mojo-polish.md) | User-facing feature work |
 | 10 | [CLI analysis + `--migrate`](epics/10-cli-analysis-and-migrate.md) | Rounds out the CLI surface |
 | 11 | [Program boundaries](epics/11-program-boundaries.md) | MAIN-1; ~270 FPs each direction on the AWStats shape |
