@@ -3,128 +3,67 @@
 Landed work lives in `docs/adr/` and `CHANGELOG.md` — never here.
 This file is only what's NEXT, in order.
 
-> **`spike/cpp-support` branch:** the multi-language (cpp/python) go-live arc has
-> its own altitude map — `docs/cpp-golive-map.md`. The Flow/value-flow tier
-> (FlowEdge spine, query-driven assignment shapes, narrowing-on-edges) lives
-> there; it's shared seam, not Perl-specific. Consult it before zooming into a
-> Flow slice.
+## The schedule lives in `docs/epics/`
 
-## Now (in order)
+Open work is organized as **epics** — self-contained implementation
+prompts with anchors, phased ladders, per-phase acceptance criteria,
+non-goals and a verification gate. `docs/epics/README.md` is the index,
+the schedule, and the coverage map that accounts for every open design
+doc.
 
-1. **Narrowing / Optional — completeness.** The flow-narrowing +
-   `Optional<T>` + `Undef` lattice and the bug-detection diagnostics it
-   feeds have both landed (decision records: `adr/flow-narrowing.md`,
-   `adr/optional-types.md`, `adr/narrowing-diagnostics.md`). What remains
-   is **completeness** — widen what the narrower recognizes: direct-element
-   places (`$hash{key}`, `$arr[0]`), and dynamic-key places (`$self->{$k}`)
-   where the key scalar is stable enough to stay sound
-   (`prompt-flow-narrowing.md` / `prompt-optional-types.md`) — and graduate
-   the opt-in diagnostic flags to default-on per code as the gold substrate
-   and real projects show no false-positive flood (the promotion path in
-   `adr/narrowing-diagnostics.md`).
-2. **DBIC out of core — phases 2–3.** Phase 1 landed (`visit_dbic_*`
-   gone; `frameworks/dbic.rhai`, trigger `ClassIsa("DBIx::Class")`).
-   Remaining: meta-method suppression → manifest (the `universal_methods`
-   rule-#10 debt still hardcoded in `symbols.rs`) and parametric
-   emission + per-method return projection (the one axis-shaped piece).
-   Ladder in `prompt-dbic-as-plugin.md`. Ends with core plugin-free
-   except generic dispatch.
+Each epic carries three axes, not one: its own ladder, plus a
+**Language-pack beat** (what it owes C/C++ and the other pack languages)
+and a **Scaling beat** (the measured cost it must respect). Those two
+are not a separate workstream — this is a multi-language engine with a
+measured scaling envelope, and both are properties of every seam.
 
-## Queued (pull-driven — QA findings decide order)
+| # | Epic | Why now |
+|---|---|---|
+| 1 | [Provider identity](epics/01-provider-identity.md) | A class of confidently-wrong answers, not misses |
+| 2 | [DBIC out of core](epics/02-dbic-out-of-core.md) | Finishes "core is plugin-free except generic dispatch" |
+| 3 | [Openness](epics/03-openness.md) | One verdict replaces six partial suppression rules; unlocks flag promotion |
+| 4 | [Value provenance, tier 1](epics/04-value-provenance.md) | The named gate for instance brands and the untyped-receiver residual |
+| 5 | [One-seam sweep](epics/05-one-seam-sweep.md) | Small, self-contained; the good warm-up |
+| 6 | [Rename provenance](epics/06-rename-provenance.md) | `folded_from` landed; three residuals left |
+| 7 | [Diagnostic framework](epics/07-diagnostic-framework.md) | The CI-readiness gate |
+| 8 | [Heatmap residuals](epics/08-heatmap-residuals.md) | Closes a verified false positive against the heatmap's own promise |
+| 9 | [Mojo polish](epics/09-mojo-polish.md) | User-facing feature work |
+| 10 | [CLI analysis + `--migrate`](epics/10-cli-analysis-and-migrate.md) | Rounds out the CLI surface |
+| 11 | [Program boundaries](epics/11-program-boundaries.md) | MAIN-1; ~270 FPs each direction on the AWStats shape |
+| 12 | [Type::Tiny completeness](epics/12-type-tiny-completeness.md) | Check-guards feed a lattice that already exists |
+| 13 | [Pack-language ceiling](epics/13-pack-language-ceiling.md) | Calibration is the ship gate; it is half the work |
+| 14 | [The per-file stall](epics/14-per-file-stall.md) | C/C++ is unusable at Godot size; nobody has profiled it yet |
+| 15 | [Query paths at scale](epics/15-query-paths-at-scale.md) | Storage holds at 122x; query paths break |
 
-Type intelligence:
-- Residual fact classes Parts 1–5 (invocant mutations, hash-key
-  unions, method loops, functional operators, value-indexed returns)
-  — `prompt-type-inference-residual.md`.
-- Conditional-reassignment disagreement-to-widen (`$spec = {...}
-  unless ref $spec`) — replaces the `reassigned_scalars` trust-gate
-  clause with a real lattice fold.
-- A4 v2: cross-FILE slot writes (`$self->{k} = Obj->new` in another
-  file) — the `PackageSymbol` bridge pattern.
+**Suggested order:** 1 first, then 14 and 15 — those two are where the
+product is unusable rather than merely incomplete — then 2–4, then
+pull-driven.
 
-Graph / diagnostics (graph-walking pillar landed; residual only):
-- Scope-node taxonomy + Openness diagnostic (`home_namespace`,
-  "when is an unresolved call real?") — forward work in
-  `prompt-graph-walking.md`; subsumes the coarse qualified-name
-  suppression noted in `open-problems.md`.
+## Not in an epic
 
-Plugin genericity:
-- `has_options` final dissolution: the option pairing already moved out
-  of core — the plugin reads accessor options via the shared
-  `classified_pairs` over the flattened, per-arg `value_shape`-classified
-  args. The one Moo-semantic field still in core is the
-  `isa`-string→`InferredType` mapping; moving it onto the
-  `type_constraint_names()` / `type_constraint_inner()` plugin seam is the
-  last step, after which `HasOptions` dissolves entirely (attr names come
-  from `value_shape`/`arg_names`, options from `classified_pairs`).
+Small items that have no epic home and need none. Take them
+opportunistically; each is a commit, not an arc.
 
-Hardening:
-- Options schema: `DiagnosticOptions` is serde-driven (the struct is the
-  schema). A `Config` god-struct (own-at-top, pass-slices), a generated
-  editor schema (`schemars`), and the per-code-config shape wait for their
-  forcing functions — `prompt-config-schema.md`.
-- Fold safety net: `eprintln!` → `tracing::error!` (builder.rs
-  ~12061) + a synthetic-oscillator test so the release-mode
-  `MAX_FOLD_ITERATIONS` break can't bit-rot.
-- Full-bag scans in `apply_chain_typing_assignments` /
-  `FileAnalysis::inferred_type` — index when profiling flags them.
-- DBIC parametric column-key completion at an empty `->search({ | })`
-  (goto-def proves the chain; `complete_keyval_args` lacks the
-  parametric-receiver branch; pin in `e2e/dbic_parametric.lua`).
-- Cursor-context qualified-path/invocant detection should ask the
-  tree, not byte-walk (`extract_package_from_prefix` & sibling).
-- `return_via_edge` chases lack `TypeProvenance` (stamp
-  `Delegation{kind: "callable_return_edge"}` on the chase).
-- cst/conventions migration backlog — `prompt-cst-migration.md`.
-- Unify autoquoted-key-as-literal into `cst::string_list`. Today
-  `string_list` routes `autoquoted_bareword` through the caller's
-  `fold` (const resolution), so the DSL-arg callers (`extract_arg_name_list`)
-  carry a per-caller fold that special-cases autoquoted→literal. An
-  autoquoted bareword is a grammar-certified literal for *every* caller,
-  so the right home for the rule is `string_list` itself — then
-  `extract_arg_name_list` deletes and the DBIC/keyval paths just use
-  `extract_string_list`. **Blocked on** a latent use-import bug it
-  unmasks: `use constant NAME => v`'s autoquoted key gets emitted as a
-  spurious `FunctionCall` import ref (resolved_package `"constant"`) by
-  the use-list walker — the old fold hid it by dropping non-constant
-  barewords. Regression-guarded by `const_call_form_not_double_reffed`.
-  Fix the use-`constant` path to not feed its declared names to the
-  generic import-ref emitter (it already routes them to
-  `accumulate_use_constant`), THEN move the autoquoted arm into
-  `string_list` and drop the per-caller fold. Proper unification; not
-  urgent (the per-caller fold is correct, just not DRY).
-
-QA tail:
-- MAIN-1 (`main::` across `require`) and H1 (duplicate packages) —
-  designs in `docs/open-problems.md`. MooseX::Role::Parameterized — no
-  design yet.
-- Per-row known gaps: `gold-corpus/KNOWN-GAPS.md` (xfail rows are the
-  live tracker).
-
-Protocol surface (breadth, not depth):
-- **Advertised verb surface** — a capability listing reads the
-  `initialize` response, not the answers, so verbs the analysis can
-  already answer should be advertised. The cluster worth doing is type
-  hierarchy + call hierarchy + typeDefinition: all three are projections
-  over machinery that already exists (`GraphView`, the `references()`
-  projection, `dispatch_class()`). Non-goals and the reasoning are in
-  `prompt-lsp-surface-parity.md`; `linkedEditingRange` stays OFF (#117).
-
-## Scale validation (2026-08-17) — the Tier 1 queue
-
-The first measurements outside `crm`: a 4.65 h soak, Koha (3.1x), and a
-5,000-dist CPAN sample (122x — the target rung). Storage and startup hold
-scale-free; query paths break. Findings, tiers, corpora and repros:
-`prompt-scale-validation-hitlist.md`. Tier 1, in order:
-
-1. **Post-cold-index availability hole** — ~10 min where every verb times
-   out; a warm restart of the same state is ready in 1 s. Restarting beats
-   staying up.
-2. **Fatal stack overflow on deep CSTs (P0)** — one XML-as-`.pm` aborts the
-   whole server; `catch_unwind` cannot catch it. Depth gate before build.
-3. **`references` terminal at scale** — no refs-axis reader, so the backward
-   walk decodes a whole blob per candidate (~4x of the cost).
-4. **Completion payload unbounded** — 7.8 MB / ~50k items per keystroke.
+- Fold safety net: `eprintln!` → `tracing::error!` at the release-mode
+  `MAX_FOLD_ITERATIONS` break, plus a synthetic-oscillator test so it
+  can't bit-rot.
+- Full-bag scans in `apply_chain_typing_assignments` — index when
+  profiling flags them.
+- Cursor-context qualified-path/invocant detection should ask the tree,
+  not byte-walk (`extract_package_from_prefix` and sibling).
+- `return_via_edge` chases lack `TypeProvenance` — stamp
+  `Delegation { kind: "callable_return_edge" }` on the chase.
+- Unify autoquoted-key-as-literal into `cst::string_list`. **Blocked
+  on** a latent use-import bug it unmasks: `use constant NAME => v`'s
+  autoquoted key gets emitted as a spurious `FunctionCall` import ref
+  (resolved_package `"constant"`) by the use-list walker — the old fold
+  hid it by dropping non-constant barewords. Regression-guarded by
+  `const_call_form_not_double_reffed`. Fix the use-`constant` path to
+  not feed its declared names to the generic import-ref emitter, THEN
+  move the autoquoted arm into `string_list` and drop the per-caller
+  fold. Proper unification; not urgent.
+- Per-row known gaps: `gold-corpus/KNOWN-GAPS.md` — the xfail rows are
+  the live tracker.
 
 ## Parked (explicit unblock conditions)
 
@@ -141,23 +80,21 @@ scale-free; query paths break. Findings, tiers, corpora and repros:
 - **Type-is-the-gate generalization** — waits for a second motivating
   site. `prompt-type-is-the-gate.md`.
 
-## Backburner (user-facing, ship-when-ready)
+## Backburner (no epic, no unblock condition — just not now)
 
-- Mojo polish: route naming/url_for, stash intelligence, hooks,
-  transitive plugin chains, config completion —
-  `prompt-mojo-todo.md`.
-- CLI diagnostic framework (PL-codes, suppression, SARIF), --migrate —
-  `prompt-cli-tools.md`.
-- Ref provenance: constant-fold `folded_from`, package→file rename,
-  inheritance override scoping — `prompt-ref-provenance.md`.
 - Aspirational type features (effects/throws) —
-  `prompt-type-system-futures.md`.
-- Web extension — `prompt-wasm-web-extension.md` (the crate split it
-  assumed was executed and REJECTED; branch `workspace-split` is the
-  playbook if wasm ever forces it).
-- Multi-language engine — the go-live arc (cpp/python) is live on
-  mainline (`build/language_driver.rs`, altitude map in
-  `docs/cpp-golive-map.md`); design in `docs/prompt-multi-language.md`.
+  `prompt-type-system-futures.md`. Pillar 1 (narrowing) landed; pillar 2
+  is out of the QA loop by its own charter.
+- Web extension — `prompt-wasm-web-extension.md`. The crate split it
+  assumed was executed and REJECTED (layering tests enforce the DAG
+  instead); branch `workspace-split` is the playbook if wasm ever
+  forces it.
+- The `lsp-engine` crate cut — parked by `prompt-multi-language.md`'s
+  own text until a second pack language's ceiling work (Epic 13) makes
+  the split pay for itself.
+- Incremental analysis — `prompt-incremental-build.md`, with a named
+  bar in-doc. Epic 15's diagnostics-after-edit row is its forcing
+  function.
 
 ## Out of scope
 
